@@ -19602,6 +19602,238 @@ severity choice.
   `aurora-render` error, and fixing it would put a shader file into a diff
   that is otherwise comment-and-test-only in `aurora-app`.
 
+- [x] **`LinearBurn` ported to WGSL, admitted at the predicate, and wired
+  through the real dispatch arm — done 2026-09-05 (0.106.0).** The
+  seventh real blend-math mode on the GPU, at exactly the cost the
+  0.85.1 helper merge predicted and the four rounds since have each
+  confirmed: **one WGSL entry point, one `BlendPass` const, one one-line
+  wrapper, one predicate arm, one dispatch arm, one counter variant/field/
+  `counter()` arm, one `TRANSPOSE_COVERAGE` row.** The shared
+  `composite_blend_over_with_opacity` was not touched — a fifth
+  consecutive caller added without a line of change to it. No other
+  mode's shader, const, wrapper, dispatch arm, predicate entry or fixture
+  moved.
+
+  **Mode counts, recomputed rather than incremented.**
+  `document_qualifies_for_gpu_compositing` now admits **nine** modes
+  (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+  `LinearDodge`, `LinearBurn`, `Dissolve`), so **18 of 27** blend modes
+  are still CPU-only there. `shaders/composite.wgsl` now has **seven**
+  blend-math entry points, so **19 of 26** `aurora_render::BlendMode`
+  variants have none — and `Normal` is one of those 19 while not being
+  CPU-only, which is exactly the one mode between the two figures.
+  Eight tests added (1,689 → **1,697**; `aurora-render` 162 → **168**,
+  `aurora-app` 397 → **399**). `CPU_ONLY_BLEND_MODE` stays `Exclusion`,
+  so **no fixture needed retargeting** and both PLAN.md-tracked
+  CPU-fallback benchmarks stay comparable across this round — as in
+  0.104.0 and 0.105.0, and unlike `Screen`'s.
+
+  **The mirror-image hazard, and what was done about it.** `LinearBurn`
+  is `LinearDodge`'s exact mirror image: same sum, opposite offset,
+  opposite clamp direction, `max(Cb + Cs - 1, 0)` against
+  `min(Cb + Cs, 1)`. Written side by side the two blend lines differ by
+  three characters, and — unlike every prior round, where the confusable
+  neighbour was still CPU-only — **`LinearDodge` has had a real GPU entry
+  point since 0.105.0**, so the copy-paste now runs in both directions
+  between two things that both exist and both compile. The new blend line
+  was therefore derived from `blend_channel`'s own Rust arm rather than
+  copied from `fs_composite_linear_dodge` and edited, and three of this
+  round's thirteen mutations ((b), (f), (g)) are exactly that copy-paste
+  performed at three different layers. All three were killed by all seven
+  `LinearBurn` tests.
+
+  **The first mode ported since 0.105.3's standing guard, and the guard
+  worked.** `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_
+  see_a_transposed_argument` made the app fixture's non-unit opacity a
+  *precondition* of the round rather than something discovered inside it
+  (0.105.1) or retrofitted a round later (0.105.2).
+  `NORMAL_MULTIPLY_LINEAR_BURN_STACK`'s `l3` carries opacity `0.5` in its
+  first commit and the golden is derived from that value. **The guard
+  passed on the first attempt**, with no fix needed — which is the
+  outcome it was built for, and is why this round has no "found by hand"
+  paragraph of its own. Mutation (m) below re-confirms it still fires on
+  exactly this mistake.
+
+  **A genuinely new, mode-specific degeneracy, found by testing naive
+  fixtures rather than by reasoning.** `LinearBurn` has six degeneracies
+  that constrain its fixtures, one more than any prior mode, and the
+  fifth is new to this round:
+
+  1. `LinearBurn(0, Cs) = 0` for every `Cs <= 1` — a zero backdrop
+     channel erases the source entirely (the mirror of `LinearDodge`'s
+     saturated-backdrop degeneracy).
+  2. `LinearBurn(1, Cs) = Cs` — indistinguishable from `Normal`,
+     `Darken`, `Lighten` and `Screen` at a saturated backdrop. With 1,
+     that forces every solid-colour operand strictly inside `(0, 1)`.
+  3. A channel whose sum falls under `1.0` clamps to `0` and carries no
+     information about *how far* under: `(0.25, 0.5)` and `(0.1, 0.1)`
+     both give `0`. So every solid-colour fixture straddles the boundary
+     — at least one channel each side.
+  4. No channel with `Cb == Cs`, so a transposed operand pair inside the
+     blend line cannot hide behind an accidental equality.
+  5. **New.** In an *unclamped* channel, `Cb + Cs - 1 == |Cb - Cs|`
+     exactly when `Cb == 0.5` (if `Cs > Cb`) or `Cs == 0.5` (if
+     `Cb > Cs`) — the algebra is `Cb + Cs - 1 = Cs - Cb  <=>  Cb = 0.5`.
+     Such a channel therefore **cannot distinguish `LinearBurn` from
+     `Difference`**, which is itself on the GPU since 0.104.0 and so a
+     live wrong-arm candidate rather than a hypothetical one. Several
+     otherwise-natural fixtures were rejected for this; **no unclamped
+     channel in any solid-colour fixture carries a `0.5`.**
+  6. With both operands strictly inside `(0, 1)`, a *deficit* of `1.0` is
+     unreachable in principle, so `0.625` is close to the practical
+     maximum at exact-binary-fraction magnitudes — the mirror of the
+     `LinearDodge` suite header's own note, and the reason this suite
+     does not match the CPU sibling
+     `composite_tile_cpu_linear_burn_subtracts_and_clamps_to_zero`, which
+     reaches `-1.0` only by putting both operands at exactly `0.0`.
+
+  Degeneracy 5 also bites the one fixture whose values *cannot* be
+  chosen: `patterned_texels`, shared with six other suites, makes red's
+  single unclamped column (`Cb = 0.5, Cs = 0.75`) agree with `Difference`
+  exactly. Disclosed in that test's own doc comment, and it costs nothing
+  overall — the *clamped* columns still separate the two modes, and the
+  whole-tile differential kills a `Difference` mis-dispatch in 95.3% of
+  the tile's 65,536 texels.
+
+  **Seven tests, all on real hardware.** Six in `aurora-render` mirroring
+  the `LinearDodge` suite one for one (arithmetic-and-clamp, translucent
+  accumulator, spatial/`patterned_texels`, half opacity, unclamped source
+  alpha, transparent backdrop), and one `aurora-app` differential end to
+  end. Two disclosures they carry that are **not** copied from the
+  sibling suite, because they do not mirror:
+
+  - **The missing-un-premultiply mutation fails in red and green only;
+    blue is *structurally* blind to it.** Halving `cb` can only push a
+    channel further *below* the `1.0` boundary, so a channel already
+    clamped with the correct `cb` stays clamped with the halved one and
+    this mode's clamp erases the difference. `(0.5625, 0.40625, 0.0625)`
+    against the golden `(0.75, 0.5625, 0.0625)` — blue identical. The
+    `LinearDodge` sibling's "all three channels" claim is right for that
+    mode (halving `cb` moves a channel *off* an upper clamp, which is
+    visible) and was deliberately not carried over.
+  - **Test 6 cannot detect a dropped clamp**, and mutation (c) below
+    confirms it survives there. Blue is the clamped channel, an unclamped
+    shader writes `-0.25` where the correct answer is `0.0`, and both
+    sides of the whole-tile comparison quantise through a `[0, 1]` clamp,
+    so both land on `0`; texel 0 is in the transparent half, where `b` is
+    multiplied by zero. Stated in the test rather than papered over —
+    tests 1, 3, 4 and 5 all kill that mutation.
+
+  Test 5 reads back **negative** channels (`-0.375`, `-0.25`) through
+  `Rgba16Float` and `read_first_texel` unclamped — the exact mirror of
+  the `LinearDodge` sibling's above-`1.0` channels, and confirmed
+  empirically on first run rather than assumed.
+
+  **Mutation-tested: thirteen mutations, each really applied, really run
+  on a real discrete GPU, and reverted** (RTX 3090, Vulkan, DiscreteGpu,
+  `AURORA_REQUIRE_GPU=1`; `aurora-render` and/or `aurora-app` whole test
+  binary each time). More than any prior round, and three of them ((i),
+  (k), (m)) exercise 0.105.3's own guard machinery. Baselines:
+  `aurora-render` **168** passed, `aurora-app` **399** passed.
+
+  | # | mutation | killed | by |
+  |---|---|---|---|
+  | (a) | `LinearBurn` dispatch arm deleted | **1** | app differential's **counter assert only** |
+  | (b) | blend line → `LinearDodge`'s `min(cb + s.rgb, 1)` | **7** | all 6 render + app |
+  | (c) | clamp dropped (`cb + s.rgb - 1.0`) | **6** | render 1–5 + app; **render 6 survives** |
+  | (d) | `- 1.0` offset dropped (`max(cb + s.rgb, 0)`) | **7** | all 6 render + app |
+  | (e) | clamp direction swapped (`min(cb + s.rgb - 1.0, 0)`) | **7** | all 6 render + app |
+  | (f) | `BLEND_PASS_LINEAR_BURN.fragment_entry` → `"fs_composite_linear_dodge"` | **7** | all 6 render + app |
+  | (g) | wrapper mis-delegates to `&BLEND_PASS_LINEAR_DODGE` | **7** | all 6 render + app |
+  | (h) | arm calls `composite_linear_dodge_over_with_opacity`, still notes `LinearBurn` | **1** | app differential only |
+  | (i) | `LinearBurn` removed from the predicate | **4** | admission test, app differential, every-expressible-mode loop, **and the standing guard** |
+  | (j) | `counter()`'s `LinearBurn` arm → `&self.linear_dodge` | **1** | counter-distinctness test only |
+  | (k) | `Self::LinearBurn` removed from `ALL` (variant kept) | **2** | counter-distinctness test **and the standing guard** |
+  | (l) | **`&src_view`/`&current_accumulator.1` transposed in the dispatch arm** | **1** | app differential (both `assert_gpu_matches_cpu` and the golden) |
+  | (m) | fixture `l3` opacity `0.5` → `1.0` | **2** | **the standing guard** (headless, no GPU) and the app differential's golden |
+
+  **Every one of the thirteen matched its prediction exactly**, including
+  the two that were predicted to be *partial*:
+
+  - **(c) survives in render test 6**, as that test's own doc comment
+    says it must. Predicted and confirmed: 5 render kills, not 6.
+  - **(a) is caught by the counter and by nothing else.** Re-run with the
+    failure message captured, the sole assertion that fires is
+    `take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearBurn) == 1`,
+    `left: 0, right: 1` — every pixel assertion in that test stayed
+    green, because the CPU fallback computes the same correct texel.
+    That is the third mode in a row (`Difference` 0.104.0, `LinearDodge`
+    0.105.0) to confirm the counter is the *only* detector of a deleted
+    arm.
+  - **(l), the mandatory transpose mutation, produced exactly the
+    hand-derived transposed texel**: `(0.59375, 0.4375, 0.125, 1.0)`
+    against the golden `(0.375, 0.25, 0.15625, 1.0)` — all three channels
+    — killing both the differential and the absolute golden. Had the
+    fixture's `l3` been left at opacity `1.0`, this would have been a
+    total survivor, which is precisely what (m) demonstrates from the
+    other side.
+  - **(i) is the first round in which the standing guard itself
+    contributes a kill.** Its reverse-direction check ("a
+    `TRANSPOSE_COVERAGE` row for a mode that does not qualify for the GPU
+    path") fires, alongside the admission test and the two setup asserts.
+  - **(m) fires headlessly, with no GPU adapter at all**, reporting the
+    reason rather than a bare inequality — the guard doing the job
+    0.105.3 built it for, on the first new mode since.
+
+  **Goldens, every one hand-derived and then independently confirmed
+  against the real `composite_tile_cpu`** (each render test asserts the
+  literal *and* the CPU differential, so a stale literal cannot outlive a
+  change to either implementation): test 1 `(0.6875, 0.5, 0.125, 1.0)`,
+  test 2 `(0.75, 0.5625, 0.0625, 1.0)`, test 4
+  `(0.6875, 0.1875, 0.125, 1.0)`, test 5 `(0.5, -0.375, -0.25, 1.0)`,
+  test 6 `(0.625, 0.875, 0.25, 1.0)` in the transparent half and
+  `B = (0.375, 0.125, 0.0)` in the opaque one, and the app fixture
+  `(0.375, 0.25, 0.15625, 1.0)`. The app fixture's `assert_ne!` vacuity
+  guard substitutes **`LinearDodge`** rather than the siblings' `Screen`:
+  it is this mode's exact mirror image and the entry point the shader was
+  written from, giving `(0.71875, 0.6875, 0.4375)` CPU-only, differing in
+  all three channels.
+
+  **`l1` deliberately breaks with the shared fixture base.** The
+  `Lighten`/`Screen`/`Difference`/`LinearDodge` fixtures all build on
+  `(0.25, 0.75, 0.5)`, which after the `Multiply` fold gives
+  `Cb = (0.125, 0.375, 0.25)` — a backdrop that, against *any* source
+  strictly inside `(0, 1)`, leaves red's sum under `1.0`. A fixture
+  reusing it could not put red above this mode's clamp boundary at all,
+  which degeneracy 3 requires. `(0.875, 0.75, 0.625)` gives
+  `Cb = (0.4375, 0.375, 0.3125)`, which does.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` (**1,697 passed, 0 failed, 10 ignored**),
+  `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, `cargo deny check all`. `/home`
+  at 81% used and **77G free** when the round started, 82% and **72G
+  free** after it (the delta is `target/`, not the diff), checked per
+  0.104.1's precondition.
+
+  **Verified on Vulkan/NVIDIA only — one backend, one vendor.** Metal and
+  DX12 remain **unverified** for `fs_composite_linear_burn` specifically,
+  and that matters at two points this entry claims things: the
+  transparent-backdrop test's `NaN` behaviour out of the untaken
+  `ab > 0.0` branch is a property of the *backend's* shader compiler
+  rather than of the entry point (which is why each mode gets its own
+  such test at all), and the negative-channel readback in test 5 depends
+  on `Rgba16Float` storage and an unclamped readback path. Neither is
+  claimed beyond the one adapter they ran on.
+
+  **A process note worth recording.** Mid-round, a `git checkout` used to
+  revert a mutation silently discarded the *uncommitted* new WGSL entry
+  point, because nothing had been committed yet — and the resulting test
+  run coincidentally reproduced mutation (b)'s exact kill signature (6
+  render + 1 app), since a missing entry point and a wrong one fail the
+  same seven tests. It was caught by `git status` showing the shader file
+  unmodified when it should have been. The work was restored, committed,
+  and **all thirteen mutations were then run against the committed
+  baseline**, so every number in the table above is from a run where the
+  only difference from `HEAD` was the mutation itself. Recorded because
+  the near-miss is instructive: a mutation harness that reverts with
+  `git checkout` is only sound once the thing being mutated is committed,
+  and a "correct-looking" kill count is not evidence the intended
+  mutation is what ran.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -24444,6 +24676,70 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.106.0) — `LinearBurn` is the seventh real
+blend-math mode on the GPU.** One WGSL entry point, one `BlendPass` const,
+one one-line wrapper, one predicate arm, one dispatch arm, one counter, one
+`TRANSPOSE_COVERAGE` row — the same cost the four rounds before it each
+paid, with the shared `composite_blend_over_with_opacity` untouched for a
+fifth consecutive caller. **18 of 27** blend modes are now still CPU-only
+at the app's GPU predicate; **19 of 26** `aurora_render::BlendMode`
+variants still have no blend-math WGSL entry point (`Normal` is one of
+those 19 and is not CPU-only — that is the single mode between the two
+figures). Eight tests added, 1,689 → **1,697**. No fixture retargeting:
+`CPU_ONLY_BLEND_MODE` stays `Exclusion`, so both tracked CPU-fallback
+benchmarks stay comparable.
+
+**Three things about this round are worth carrying forward rather than
+looking up.**
+
+1. **It is the first mode ported since 0.105.3's standing transpose guard,
+   and the guard did exactly what it was built for.** The app fixture's
+   `LinearBurn` layer carries opacity `0.5` from its first commit, with the
+   golden derived from that value, because the guard makes a fully-opaque
+   mode-bearing layer a headless test failure. **It passed on the first
+   attempt**, so this round has no "found by hand after the fact" item —
+   unlike 0.105.1 (found inside its own round) and 0.105.2 (retrofitted a
+   round later onto three more arms).
+2. **The confusable neighbour is, for the first time, also on the GPU.**
+   `LinearBurn` is `LinearDodge`'s exact mirror image and the two blend
+   lines differ by three characters, and `LinearDodge` has had a real entry
+   point since 0.105.0 — so the copy-paste hazard now runs in both
+   directions between two things that both exist and both compile. The new
+   blend line was derived from `blend_channel`'s Rust arm rather than
+   copied and edited, and three of the round's thirteen mutations perform
+   that copy-paste at three different layers (shader body, `BlendPass`
+   `fragment_entry`, wrapper delegation). All three died to all seven
+   `LinearBurn` tests.
+3. **A new, mode-specific degeneracy, found by testing naive fixtures.**
+   In an *unclamped* channel `Cb + Cs - 1 == |Cb - Cs|` exactly when either
+   operand is `0.5`, so such a channel cannot tell `LinearBurn` from
+   `Difference` — itself on the GPU since 0.104.0. No unclamped channel in
+   any solid-colour fixture carries a `0.5`. The one fixture whose values
+   cannot be chosen (`patterned_texels`, shared with six suites) does hit
+   it in one column and one row; that is disclosed in the test rather than
+   avoided, and costs nothing, since the clamped columns still separate the
+   two modes and the whole-tile differential still kills a `Difference`
+   mis-dispatch across 95.3% of the tile.
+
+**Thirteen mutations, all really run on an RTX 3090 (Vulkan) and reverted,
+and all thirteen matched their predictions** — including the two predicted
+to be *partial*: dropping the clamp kills 6 rather than 7 (render test 6
+survives, exactly as that test's own doc comment says it must, because both
+sides of its 8-bit whole-tile comparison clamp a negative result to `0`),
+and deleting the dispatch arm kills exactly 1, the counter assertion, with
+every pixel assertion in that same test staying green. This round is also
+the first in which the standing guard itself contributes kills: removing
+`LinearBurn` from the predicate trips its reverse-direction check, and
+removing the variant from `GpuBlendDispatch::ALL` trips its completeness
+check. The full matrix, the goldens and their derivations are in the M1.10
+entry above.
+
+**Still Vulkan/NVIDIA only.** Metal and DX12 are unverified for
+`fs_composite_linear_burn`, which matters specifically for the
+transparent-backdrop test's `NaN` behaviour (a property of the backend's
+shader compiler, not of the entry point — which is why every mode gets its
+own such test) and for test 5's negative-channel `Rgba16Float` readback.
 
 **Addendum 2026-09-05 (0.105.3) — 0.105.2's review follow-ups: the
 transpose-coverage property is documented where it lives, and now has a
