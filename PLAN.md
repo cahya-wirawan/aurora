@@ -18250,6 +18250,32 @@ severity choice.
   startup document carries a `Multiply` layer, so it is the arm every
   user's first frame takes.
 
+  **`Multiply` is, however, the one of the five whose arm deletion was
+  *not* silent even before this round** — corrected in 0.103.1 after
+  re-measurement, because the paragraph above invites the opposite
+  inference. Deleting the whole `Multiply` dispatch arm (not its `note`
+  call — that is mutation 1 below, which is genuinely caught by one
+  assertion) fails **5** tests, measured for real:
+  `…composites_a_mixed_normal_and_multiply_stack`,
+  `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile`,
+  `…agree_on_a_lighten_blend_document`, `…agree_on_a_screen_blend_document`
+  and `…composites_a_mixed_normal_multiply_and_darken_stack`. The reason is
+  structural: those fixtures are *mixed* `Normal`/`Multiply`/`Lighten` and
+  `Normal`/`Multiply`/`Screen` stacks, and the defensive `_` arm aborts the
+  **whole tile's** GPU composite rather than just the offending layer's
+  contribution — so `Lighten`'s and `Screen`'s own pre-existing counters
+  read 0 and fail too. `Multiply` appears in many fixtures; the other four
+  each appear in one. The contrast was measured, not reasoned: deleting the
+  `Lighten` arm the same way fails **1** test (its own), 391 passing.
+
+  So the `Multiply` counter's real contribution is **not first detection**
+  — it is precise attribution (the failure now names `Multiply` instead of
+  misleadingly pointing at `Lighten`/`Screen`/`Darken`'s counters, which is
+  what those 5 failures otherwise look like) and an **exact** count rather
+  than a mixed fixture happening to break. For `Darken`, `Lighten`,
+  `Screen` and `Dissolve`, each independently verified, the counter really
+  is the only thing that notices.
+
   What landed, all in `crates/aurora-app/src/lib.rs`:
 
   - **`enum GpuBlendDispatch { Multiply, Darken, Lighten, Screen,
@@ -18352,8 +18378,20 @@ severity choice.
   | 7 | Remove `Dissolve` from `document_qualifies_for_gpu_compositing` | 389 pass, 3 fail | 3 tests — **but see below** |
   | 8 | Move the `Dissolve` counter into `resolve_tile` | 391 pass, 1 fail | `…agree_on_a_dissolve_blend_document`, on the exact count |
 
-  Three things in that table are worth stating rather than leaving to be
+  Four things in that table are worth stating rather than leaving to be
   inferred:
+
+  - **What mutations 1–5 delete is each mode's `note` call, not its
+    dispatch arm, and the distinction matters** (added 0.103.1). Deleting a
+    `note` call is a direct test of "does this counter observe this arm",
+    and there one assertion each is exactly right. It is *not* a test of
+    "would a silent CPU fallback in this mode go unnoticed" — that is the
+    arm deletion, and for `Multiply` the two answers differ sharply: 1
+    failure for the `note` call, **5** for the arm. See the `Multiply`
+    correction paragraph under **Why** above for the measured list and the
+    structural reason (mixed fixtures plus a `_` arm that aborts the whole
+    tile). Do not read row 1 as evidence that `Multiply`'s fallback was
+    previously invisible; rows 2–5 do carry that reading for their modes.
 
   - **Mutation 6, the symmetric mis-wire, is the one this round's new test
     exists for and the only one nothing else could see.** Each per-mode
@@ -23282,6 +23320,91 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-04 (0.103.1) — 0.103.0's review follow-ups: one real
+cfg-gating fix on the hot path, one test made non-vacuous, and four
+doc-accuracy corrections, two of them retractions of this project's own
+overclaims.** No composited pixel, no shader, no blend formula, and no
+`BlendPass` const changed; test count unchanged at 392 for `aurora-app`.
+
+- **The `Dissolve` counter's *guard* ran in the shipping build.** The
+  other four counters cost the shipping build one elided no-op call each,
+  but `Dissolve` has no dispatch arm, so its site needed a
+  `LayerTree::blend_mode` lookup — a `HashMap` probe, written inline and
+  **not** `#[cfg]`-gated, executing once per root layer per composite tile
+  per frame on the path this file measures at ~73% of the GPU-path frame
+  mean. That contradicted the round's own "pure instrumentation, not
+  carried by the editor" framing. The guard now lives in a `#[cfg]`-split
+  `note_dissolve_dispatch(layers, id)` whose `#[cfg(not(test))]` twin
+  discards both arguments unread, so the shipping build never evaluates
+  the probe at all. **A consequence worth recording, because it is why the
+  inline version existed:** moving the only construction of
+  `GpuBlendDispatch::Dissolve` behind `cfg(test)` left that variant
+  `dead_code` in the flagless build, which `cargo check -p aurora-app`
+  correctly reported. The variant now follows its only constructor
+  (`#[cfg(test)]` on the variant) rather than being silenced with an
+  `allow` — so the enum is four variants in the shipping build and five
+  under test, and both configurations compile warning-free.
+- **The `Dissolve` test's control half was vacuous in the way its own
+  message denied.** Its comment claimed the control "must really composite
+  through the GPU path too, or its zero Dissolve count would be vacuous",
+  but the only assertion was `any(|&s| s != 0.0)` — non-blank pixels,
+  which a CPU fallback satisfies identically. The primary half has always
+  asserted `document_qualifies_for_gpu_compositing`; the control half now
+  does too, and the non-blank-texel assertion's message was softened to
+  claim only what it establishes.
+- **`Multiply`'s "would have been silent" framing is retracted and
+  narrowed, on new measurements.** 0.103.0 generalized from its five
+  `note`-call deletions to "~390 other tests cannot see a silent CPU
+  fallback". That is a claim about deleting a mode's *dispatch arm*, which
+  is a different mutation — and for `Multiply` it is false: the arm
+  deletion fails **5** tests, not 1, because the pre-existing mixed
+  `Normal`/`Multiply`/`Lighten` and `Normal`/`Multiply`/`Screen` fixtures
+  and `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_
+  blend_tile` already caught it as a side effect (the defensive `_` arm
+  aborts the *whole tile*, so `Lighten`'s and `Screen`'s own counters read
+  0 and fail too). Measured both directions rather than argued: the same
+  arm deletion applied to `Lighten` fails exactly **1** test, 391 passing.
+  `Multiply` appears in many fixtures; the other four appear in one each.
+  The counter's real contribution for `Multiply` is therefore **precise
+  attribution** — the failure names `Multiply` instead of pointing at three
+  other modes' counters — and an exact count, *not* first detection. For
+  `Darken`, `Lighten`, `Screen` and `Dissolve` the "only its own counter
+  notices" claim stands.
+- **Three intra-doc links pointed from non-`cfg(test)` items at the
+  `#[cfg(test)]`-only `GpuBlendDispatches`**, so they dangle in the only
+  configuration those three items exist in. Demoted to plain backticks,
+  matching the convention already used at `note_composite_write_*` and
+  `RecompositePhases`. This never broke CI, and that is a fact about CI's
+  command rather than about the links: `aurora-app` is almost entirely
+  private and CI does not pass `--document-private-items`.
+- **`document_qualifies_for_gpu_compositing`'s per-mode bullets said only
+  `Lighten` and `Screen` carried counters**, which after 0.103.0 read as if
+  three of the five still did not — the opposite of that round's point. The
+  per-mode clauses are gone and one sentence now states it once for all
+  five, with `GpuBlendDispatches` named as the single place the convention
+  is documented.
+- **CLAUDE.md** undercounted the mutation set as "seven planned" (it was 8,
+  and *why* there are 8 — the seventh not evidencing the claim it was built
+  for — is exactly the self-correction discipline worth keeping), and had
+  reintroduced the "22 of 26 … CPU-only" imprecision that 0.102.1 fixed in
+  `aurora-render/src/composite.rs`: that figure is "no dedicated blend-math
+  WGSL entry point", and `Normal` is one of the 22 while compositing on GPU
+  through the fixed-function path. Both corrected.
+
+**Disclosed, not fixed.** `RUSTDOCFLAGS="-D warnings" cargo doc -p
+aurora-app --no-deps --all-features --document-private-items` still fails,
+and this round did not make it pass. It reported **12** unresolved links
+before this work and **9** after: the 3 `GpuBlendDispatches` ones are
+fixed, and the remaining 9 (`Self::open_file`, `App::handle_menu_event`
+×3, `Tool::Brush`, `Tool::Eraser`, `Self::invalidate_doc_rect`,
+`LayerTree::surface_id`, `aurora_ui::layers_panel::insert_layer_row`) are
+pre-existing, unrelated to any blend-mode work, and were left alone as
+out-of-scope for a correction round. **The review that requested this fix
+predicted that command would go green; it does not, and that prediction was
+wrong** — worth stating plainly rather than quietly reporting a partial
+pass. Making `--document-private-items` a green, CI-adoptable check is a
+named, cheap follow-on: 9 doc links in one crate.
+
 **Addendum 2026-09-04 (0.103.0) — the five GPU-admitted non-`Normal`
 blend modes now all have genuine dispatch proof, through one shared
 mode-indexed counter instead of three copies.** Pure instrumentation: no
@@ -23307,9 +23430,21 @@ per-layer loop, reading the layer's raw `aurora_doc` blend mode past the
 resolve-failure `continue`.
 
 **8 mutations applied for real, all 8 killed, no survivors.** Each of the
-five counter deletions was caught by exactly one assertion — its own —
-confirming again that ~390 other `aurora-app` tests cannot see a silent
-CPU fallback. The symmetric mis-wire (`counter()`'s `Screen` arm
+five counter *deletions* was caught by exactly one assertion — its own.
+**Narrowed in 0.103.1, because the sentence that used to follow here
+("confirming again that ~390 other tests cannot see a silent CPU
+fallback") over-generalized from it:** deleting a mode's `note` call and
+deleting its whole *dispatch arm* are different mutations, and for
+`Multiply` they give different answers — 1 failure versus **5**, since the
+pre-existing mixed `Normal`/`Multiply`/`Lighten` and
+`Normal`/`Multiply`/`Screen` fixtures plus the "exactly one submit" test
+already caught the arm's removal as a side effect (the defensive `_` arm
+aborts the whole tile, so those modes' own counters read 0 too). Measured
+both ways: the same arm deletion applied to `Lighten` fails 1 test. So the
+"only its own counter notices" claim holds for `Darken`, `Lighten`,
+`Screen` and `Dissolve`, and for `Multiply` the counter's contribution is
+precise attribution and an exact count rather than first detection. The
+symmetric mis-wire (`counter()`'s `Screen` arm
 returning `&self.lighten`) was caught **only** by the new GPU-free
 distinctness test, as designed. Two honest corrections came out of the
 mutation set rather than out of review: removing `Dissolve` from

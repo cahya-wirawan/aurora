@@ -6841,11 +6841,10 @@ fn composite_roots_into_tile(
 ///   entry above — the same whole-composite-in-the-shader shape, with a
 ///   per-channel `max(Cb, Cs)` where that one has a `min`. It too
 ///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own
-///   arm and shares the *same single* `spare` ping-pong accumulator, and
-///   its arm is the first to carry a dispatch counter
-///   ([`GpuBlendDispatch::Lighten`]) from its own first round. Not to be
-///   confused with `aurora_doc::BlendMode::LighterColor`, which picks one
-///   whole `(R, G, B)` triple by luminosity and is still CPU-only.
+///   arm and shares the *same single* `spare` ping-pong accumulator. Not
+///   to be confused with `aurora_doc::BlendMode::LighterColor`, which
+///   picks one whole `(R, G, B)` triple by luminosity and is still
+///   CPU-only.
 /// - [`aurora_doc::BlendMode::Screen`] (0.102.0), composited by
 ///   `aurora_render::TileCompositor::composite_screen_over_with_opacity`,
 ///   the fourth mode ported to WGSL and built to the same
@@ -6856,8 +6855,7 @@ fn composite_roots_into_tile(
 ///   line-for-line comparable against `aurora_render`'s own
 ///   `blend_channel` arm. It too reaches [`begin_gpu_composite_tile`]'s
 ///   blend dispatch as its own arm and shares the *same single* `spare`
-///   ping-pong accumulator, and it carries a dispatch counter
-///   ([`GpuBlendDispatch::Screen`]) from its own first round.
+///   ping-pong accumulator.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -6876,6 +6874,14 @@ fn composite_roots_into_tile(
 ///   identical gated texels. `recomposite_visible_tiles_gpu_and_cpu_
 ///   paths_agree_on_a_dissolve_blend_document` pins that on real
 ///   hardware.
+///
+/// **All five non-`Normal` modes above carry a GPU dispatch counter**, as
+/// of 0.103.0 — the per-mode bullets deliberately no longer say so one at
+/// a time, because as of that round it is true of every one of them and
+/// repeating it five times only invites the list to drift out of step
+/// again. `GpuBlendDispatches` is the single place that convention, and
+/// the gap it closes, is documented. `Normal` itself is deliberately
+/// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
 /// layer at any of the other 21 blend modes) routes the *whole document*
@@ -7273,8 +7279,10 @@ fn accumulator_or_create<'slot>(
 
 /// Which of [`begin_gpu_composite_tile`]'s non-`Normal` blend dispatches
 /// a [`note_gpu_blend_dispatch`] call is reporting — the address into
-/// [`GpuBlendDispatches`], and the one part of that mechanism that is
-/// **not** `#[cfg(test)]`.
+/// `GpuBlendDispatches`, and the one part of that mechanism that is
+/// **not** `#[cfg(test)]`. (Plain backticks, not a link, throughout this
+/// comment: the counter does not exist outside `cfg(test)`, and this enum
+/// does, so a link would dangle in the only configuration this item has.)
 ///
 /// It cannot be, because the shipping build's dispatch arms still name a
 /// variant when they call the no-op twin of `note_gpu_blend_dispatch`.
@@ -7287,14 +7295,26 @@ fn accumulator_or_create<'slot>(
 /// `Normal`, which is deliberately absent: the `Normal` arm is shared by
 /// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
 /// has already reduced to `Normal`, so a count taken there could not tell
-/// the two apart. See [`GpuBlendDispatches`] for the `Dissolve` variant's
+/// the two apart. See `GpuBlendDispatches` for the `Dissolve` variant's
 /// call site and why it is where it is.
+///
+/// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
+/// consequence of 0.103.1 rather than an inconsistency.** The other four
+/// are named by real dispatch arms that exist in both builds, so they are
+/// constructed in both. `Dissolve` has no arm; the only thing that ever
+/// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
+/// behind `cfg(test)` so the shipping build stops paying for a
+/// `LayerTree::blend_mode` probe on the hot path. That left the variant
+/// constructed nowhere outside tests, which the flagless `cargo check -p
+/// aurora-app` correctly reports as `dead_code` — so the variant follows
+/// its only constructor rather than being silenced with an `allow`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GpuBlendDispatch {
     Multiply,
     Darken,
     Lighten,
     Screen,
+    #[cfg(test)]
     Dissolve,
 }
 
@@ -7416,7 +7436,12 @@ static GPU_BLEND_DISPATCHES: GpuBlendDispatches = GpuBlendDispatches::new();
 
 /// Increments `which`'s counter in [`GPU_BLEND_DISPATCHES`]. Called from
 /// [`begin_gpu_composite_tile`] once per tile per layer of that mode,
-/// immediately after the compositor call it is reporting.
+/// immediately after the compositor call it is reporting — except
+/// `Dissolve`, whose count is taken from the layer's raw `aurora_doc`
+/// blend mode ahead of the blend `match`, *before* [`resolve_tile`] has
+/// even reduced it to `Normal`, and therefore before any compositor call
+/// at all. See [`note_dissolve_dispatch`] and its call site's own comment
+/// for why that site is the only one that works.
 #[cfg(test)]
 fn note_gpu_blend_dispatch(which: GpuBlendDispatch) {
     GPU_BLEND_DISPATCHES
@@ -7426,12 +7451,48 @@ fn note_gpu_blend_dispatch(which: GpuBlendDispatch) {
 
 /// The shipping build's version: nothing at all. The instrumentation
 /// exists to make a test non-vacuous, not to be carried by the editor —
-/// so [`GpuBlendDispatches`] itself is `#[cfg(test)]` and this no-op is
+/// so `GpuBlendDispatches` itself is `#[cfg(test)]` and this no-op is
 /// what every dispatch arm compiles down to everywhere else. Only
 /// [`GpuBlendDispatch`] survives into the shipping build, and only as the
-/// argument type this discards.
+/// argument type this discards. The counter itself does not exist outside
+/// `cfg(test)`, which is why it is named here in plain backticks rather
+/// than linked.
 #[cfg(not(test))]
 fn note_gpu_blend_dispatch(_which: GpuBlendDispatch) {}
+
+/// Counts a `Dissolve` layer's GPU dispatch, if `id` is one — the whole
+/// guard, not just the increment.
+///
+/// **Why the *check* is inside a `#[cfg]`-split helper and not written
+/// inline at the call site** (0.103.1). Every other mode's dispatch arm
+/// is entered because [`begin_gpu_composite_tile`]'s blend `match`
+/// already matched that mode, so its counter costs the shipping build
+/// exactly one call to the no-op twin of [`note_gpu_blend_dispatch`] with
+/// a `const` argument — elided to nothing. `Dissolve` has no such arm
+/// ([`resolve_tile`] has already reduced it to `Normal`), so proving it
+/// dispatched needs a `LayerTree::blend_mode` lookup, and that lookup is
+/// *not* free: it is a `HashMap` probe, once per root layer per composite
+/// tile per frame, on the path PLAN.md measures at ~73% of the GPU-path
+/// frame mean. Written inline it would have run in the shipping build,
+/// which contradicts the framing this instrumentation is sold under —
+/// test-only, never carried by the editor. Splitting the guard itself
+/// puts the lookup behind the same `cfg(test)` wall as every other
+/// counter's logic, so the shipping build never evaluates it at all.
+#[cfg(test)]
+fn note_dissolve_dispatch(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) {
+    // `None` (no recorded blend mode) means `Normal`, matching
+    // `resolve_tile`'s own `.unwrap_or`, so it is correctly not counted.
+    if layers.blend_mode(id) == Some(aurora_doc::BlendMode::Dissolve) {
+        note_gpu_blend_dispatch(GpuBlendDispatch::Dissolve);
+    }
+}
+
+/// The shipping build's version: nothing at all, and in particular **no
+/// `LayerTree::blend_mode` lookup** — both arguments are discarded
+/// unread. See the `cfg(test)` twin above for why that mattered enough to
+/// split the guard rather than only the increment.
+#[cfg(not(test))]
+fn note_dissolve_dispatch(_layers: &aurora_doc::LayerTree, _id: aurora_doc::LayerId) {}
 
 /// Reads `which`'s counter in [`GPU_BLEND_DISPATCHES`] and resets it to
 /// zero in one atomic step, so a caller gets the count since *its* own
@@ -8603,12 +8664,17 @@ fn begin_gpu_composite_tile(
         // past the `continue` above, so it fires only for a layer that
         // really resolved and really is part of this tile's GPU dispatch,
         // and reading the layer's *raw* `aurora_doc` blend mode, which is
-        // the only place the `Dissolve` fact still exists. `None` (no
-        // recorded blend mode) means `Normal`, matching `resolve_tile`'s
-        // own `.unwrap_or`, so it is correctly not counted.
-        if layers.blend_mode(id) == Some(aurora_doc::BlendMode::Dissolve) {
-            note_gpu_blend_dispatch(GpuBlendDispatch::Dissolve);
-        }
+        // the only place the `Dissolve` fact still exists.
+        //
+        // **The blend-mode *check* lives inside the helper, not here**
+        // (0.103.1). Unlike the four real dispatch arms below, whose
+        // counters cost the shipping build one elided no-op call each,
+        // this one needs a `HashMap` probe to know whether to count --
+        // and this loop body runs once per root layer per composite tile
+        // per frame. Written inline that probe would run in the shipping
+        // build; `note_dissolve_dispatch`'s `#[cfg(not(test))]` twin
+        // discards both arguments unread instead. See its doc comment.
+        note_dissolve_dispatch(layers, id);
 
         // Created on the first layer that resolves, reused by every one
         // after it. Deliberately not `get_or_insert_with` -- see
@@ -29449,7 +29515,13 @@ mod tests {
     /// happens to take, on this exact fixture, forever — a re-seeded
     /// noise function could diverge everywhere else and this test would
     /// never notice.
+    // `too_many_lines`: 103, against a 100 limit — crossed in 0.103.1 by
+    // the control half's `document_qualifies_for_gpu_compositing`
+    // assertion, without which that half's zero `Dissolve` count is
+    // vacuous (a CPU fallback would read zero too). The same allow
+    // several sibling tests in this module already carry.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document() {
         let Some(context) = real_gpu_context() else {
             return;
@@ -29578,12 +29650,26 @@ mod tests {
                 ),
             ],
         );
+        // The control's zero Dissolve count only means anything if the
+        // control really took the GPU path -- a CPU fallback would record
+        // zero too, and vacuously (0.103.1). The primary half above
+        // asserts exactly this about its own fixture; the control half
+        // shipped without it, and a non-blank-pixels check does not
+        // substitute, since the CPU path produces non-blank pixels
+        // identically.
+        assert!(
+            document_qualifies_for_gpu_compositing(&control),
+            "the all-Normal control must itself qualify for the GPU path, or its zero Dissolve \
+             count is vacuous -- it would read zero from never having reached \
+             begin_gpu_composite_tile at all, rather than from the counter correctly declining to \
+             count a Normal layer"
+        );
         let (control_gpu, _control_cpu) =
             gpu_and_cpu_all_texels(&context, &mut control_store, &control);
         assert!(
             control_gpu.iter().any(|&s| s != 0.0),
-            "setup: the control must really composite through the GPU path too, or its zero \
-             Dissolve count would be vacuous"
+            "setup: the control fixture must really composite to something, or it exercises no \
+             dispatch at all"
         );
         assert_eq!(
             take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve),
