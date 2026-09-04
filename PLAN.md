@@ -18229,6 +18229,216 @@ severity choice.
     routine `target/debug/incremental` hygiene step is a candidate cheap
     follow-on, not attempted here.
 
+- [x] **GPU dispatch-proof counters merged into one mode-indexed
+  mechanism, and `Multiply`/`Dissolve` retrofitted onto it — done
+  2026-09-04 (0.103.0).** Pure instrumentation: **no composited pixel, no
+  shader, no `BlendPass` const, and no blend formula changed anywhere in
+  this round.** `cargo test --workspace` went from 1,671 to 1,672 tests —
+  the one addition is the new distinctness test described below.
+
+  **Why.** Each of the four blend-mode ports so far had grown its own
+  copy of the same counter: `DARKEN_GPU_DISPATCHES` (0.85.1, retrofitted),
+  `LIGHTEN_GPU_DISPATCHES` (0.95.0) and `SCREEN_GPU_DISPATCHES` (0.102.0),
+  each with its own `note_*` function, its own `#[cfg(not(test))]` no-op
+  twin, its own `take_*` accessor inside `mod tests`, and its own ~25-line
+  doc comment restating the same argument. `Multiply` and `Dissolve`
+  predate the convention and had **no dispatch proof at all**. The
+  0.102.0 round measured exactly why that matters: deleting `Screen`'s
+  dispatch arm was caught by *one* assertion — its counter — and by 0 of
+  the other ~390 `aurora-app` tests. `Multiply` is the most consequential
+  of the five to have been uncovered, because the app's own default
+  startup document carries a `Multiply` layer, so it is the arm every
+  user's first frame takes.
+
+  What landed, all in `crates/aurora-app/src/lib.rs`:
+
+  - **`enum GpuBlendDispatch { Multiply, Darken, Lighten, Screen,
+    Dissolve }`** — small, `Copy`, and deliberately **not** `#[cfg(test)]`,
+    because the shipping build's dispatch arms still name a variant when
+    they call the no-op twin of `note_gpu_blend_dispatch`. That is what
+    lets one call site serve both builds with no `#[cfg]` at the call site.
+  - **`struct GpuBlendDispatches`** (`#[cfg(test)]`), five named
+    `AtomicU64` fields, one `const fn new()`, and one
+    `counter(&self, which) -> &AtomicU64` whose `match` is exhaustive.
+    One `static GPU_BLEND_DISPATCHES`, one `note_gpu_blend_dispatch`, one
+    `#[cfg(not(test))]` no-op, one `take_gpu_blend_dispatch_count` —
+    replacing three of each.
+  - **Not an `[AtomicU64; N]` indexed by discriminant**, and this is the
+    load-bearing design reason rather than a style preference: the
+    workspace denies `indexing_slicing`, so an array would be read through
+    `.get(i)`, which degrades to `Option`, whose `None` arm is either a
+    denied `panic!` or a **silently dropped count** — exactly the failure
+    class these counters exist to detect. The exhaustive `match` instead
+    makes the compiler refuse to build until every variant has both a
+    field and an arm, so a sixth mode cannot reach the GPU uncounted.
+  - **`take_gpu_blend_dispatch_count` moved out of `mod tests`** to sit
+    beside `note_gpu_blend_dispatch`, so adding a mode no longer churns
+    the `use super::{…}` list. All **8** call sites of the three old
+    per-mode accessors were rewritten to the unified call (4 `Darken`,
+    2 `Lighten`, 2 `Screen`); no thin per-mode wrappers were kept.
+  - **One merged doc comment** absorbing the three it replaces: the gap
+    the counters close, the `Relaxed`-under-`GPU_TEST_LOCK` soundness
+    argument (unchanged and still accurate — the counters are still
+    separate atomics, still only touched by callers holding that lock),
+    and the per-mode history as *evidence* rather than as a claim. The now-
+    false "**Named follow-on:** `Multiply` and `Dissolve` still have this
+    exact gap" sentences were deleted, and ~25 stale references to the
+    three old static names were swept across `aurora-app` and
+    `aurora-render/src/composite.rs`. `RUSTDOCFLAGS="-D warnings" cargo
+    doc --workspace --no-deps --all-features` is clean, which is the check
+    that none were missed.
+
+  **The `Dissolve` counter's site, which is the one genuinely subtle part
+  of this round.** `Dissolve` never reaches `begin_gpu_composite_tile`'s
+  blend `match` as `Dissolve`: `resolve_tile` intercepts it in **both** its
+  `Pixel` and `Group` branches, applies `dissolve_gate` on the CPU, and
+  returns `(gated texels, 1.0, aurora_render::BlendMode::Normal)`. So
+  there is no `Dissolve` arm to instrument, and the two sites that look
+  natural are each wrong in a way that would make the counter useless:
+
+  - **Not inside `resolve_tile`.** That function is the *shared* resolver
+    — `composite_roots_into_tile`, the CPU path, calls it too. A counter
+    there would tick for CPU-only composites, so it would stay non-zero
+    after the very mutation it exists to catch (removing `Dissolve` from
+    `document_qualifies_for_gpu_compositing`, which routes the whole
+    document to the CPU): a non-zero, meaningless count instead of a
+    failing assertion.
+  - **Not inside the shared `Normal` arm.** That arm is taken by real
+    `Normal` layers *and* by `Dissolve`-resolved ones, so a count taken
+    there cannot tell "a `Dissolve` layer dispatched" from "an ordinary
+    `Normal` layer dispatched".
+
+  The site chosen is `begin_gpu_composite_tile`'s own per-layer loop,
+  reading the layer's **raw** `aurora_doc` blend mode — the only place the
+  `Dissolve` fact still exists — positioned *past* the `continue` for a
+  layer that failed to resolve, so it fires only for a layer that really
+  is part of this tile's GPU dispatch. Both halves of that reasoning were
+  then mutated for real (mutations 7 and 8 below) rather than left as
+  argument.
+
+  **Tests.** One new, GPU-free unit test,
+  `every_gpu_blend_dispatch_mode_gets_its_own_counter`, on a **local**
+  `GpuBlendDispatches::new()` instance rather than the global static — no
+  adapter needed, so it runs even on a box where every GPU-gated test
+  self-skips, which is precisely the configuration in which a mis-wire
+  would otherwise go unobserved. It asserts all five counters
+  zero-initialise, that every unordered pair of variants maps to a
+  genuinely different `AtomicU64` (`!std::ptr::eq`), and that
+  incrementing one leaves the other four at zero. Two existing GPU
+  integration tests were extended with **exact** counts (not `> 0`):
+  `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
+  now asserts 2 `Multiply` dispatches (its two `Multiply` layers × the one
+  tile with stored content), and
+  `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document`
+  asserts 1 `Dissolve` dispatch **plus a control half** — the same GPU
+  path, same helper, same viewport, on a separate store holding an
+  all-`Normal` fixture — which must record 0. That control is what proves
+  the `Dissolve` and `Normal` dispatches are not conflated.
+
+  **Mutation testing — 8 mutations, each applied for real to the working
+  tree, run under `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app`
+  (392 tests), and reverted. All 8 killed, no survivors.** The seven
+  planned, plus an eighth added because the double-check below showed the
+  planned set did not actually evidence one of this round's claims:
+
+  | # | Mutation | Result | Killed by |
+  |---|---|---|---|
+  | 1 | Delete the `Multiply` note call | 391 pass, 1 fail | `…composites_a_mixed_normal_and_multiply_stack` **only** |
+  | 2 | Delete the `Darken` note call | 391 pass, 1 fail | `…composites_a_mixed_normal_multiply_and_darken_stack` **only** |
+  | 3 | Delete the `Lighten` note call | 391 pass, 1 fail | `…agree_on_a_lighten_blend_document` **only** |
+  | 4 | Delete the `Screen` note call | 391 pass, 1 fail | `…agree_on_a_screen_blend_document` **only** |
+  | 5 | Delete the `Dissolve` note call | 391 pass, 1 fail | `…agree_on_a_dissolve_blend_document` **only** |
+  | 6 | `counter()`'s `Screen` arm returns `&self.lighten` | 391 pass, 1 fail | `every_gpu_blend_dispatch_mode_gets_its_own_counter` **only** |
+  | 7 | Remove `Dissolve` from `document_qualifies_for_gpu_compositing` | 389 pass, 3 fail | 3 tests — **but see below** |
+  | 8 | Move the `Dissolve` counter into `resolve_tile` | 391 pass, 1 fail | `…agree_on_a_dissolve_blend_document`, on the exact count |
+
+  Three things in that table are worth stating rather than leaving to be
+  inferred:
+
+  - **Mutation 6, the symmetric mis-wire, is the one this round's new test
+    exists for and the only one nothing else could see.** Each per-mode
+    GPU test zeroes its own counter and composites exactly one mode under
+    `GPU_TEST_LOCK`, so a `Screen`↔`Lighten` swap is invisible to both of
+    their own tests — `Screen`'s test still reads 1, from the wrong field.
+    Confirmed empirically, not assumed: 391 of 392 tests passed and the
+    only failure was the new distinctness test.
+  - **Mutation 7 does *not* reach the `Dissolve` counter assertion, and
+    the first version of this round's comment claimed it did.** That claim
+    was checked and is false: the dissolve test's own pre-existing
+    `assert!(document_qualifies_for_gpu_compositing(&layers), …)` fires
+    first, at `lib.rs:29474`, so the counter is never read. The comment
+    was corrected to say so. What the mutation *does* prove is that the
+    predicate is guarded — by three tests — not that the counter site is
+    right.
+  - **Mutation 8 was added to actually evidence the site claim**, since
+    mutation 7 turned out not to. Moving the `Dissolve` counter into
+    `resolve_tile`'s own interception killed the test with
+    `left: 2, right: 1`: `gpu_and_cpu_all_texels` runs the fixture through
+    the GPU path *and then* the CPU path, `resolve_tile` is shared by
+    both, so the wrong site double-counts. **A `> 0` assertion would have
+    survived that mutation** — the exact count is the whole proof, and
+    this is the concrete argument for preferring exact counts here.
+
+  **Disclosed weaknesses, carried forward:**
+
+  - **A counter can tick for a tile whose GPU work is then discarded.** If
+    a later layer in the same tile hits the defensive `_` arm,
+    `begin_gpu_composite_tile` returns `None` and the encoder is dropped
+    unsubmitted — but any earlier mode's count has already been
+    incremented. This is pre-existing (it applied equally to the three old
+    statics) and unreachable through the real caller, which checks
+    `document_qualifies_for_gpu_compositing` first; it is reachable only
+    by calling the private function directly, as
+    `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
+    does. Named, not fixed.
+  - **Distinctness of the mode→field mapping is not compiler-checked.**
+    The `match` guarantees totality, not injectivity — two arms can name
+    one field and still compile. `every_gpu_blend_dispatch_mode_gets_its_own_counter`
+    is the *only* thing standing between that bug and a green suite, as
+    mutation 6 measured. Keep its hand-written variant list in step with
+    the enum.
+  - **`Normal` is deliberately uncounted**, so "an ordinary `Normal`
+    layer dispatched on the GPU" is still not directly observable. A
+    counter in that arm could not distinguish `Normal` from
+    `Dissolve`-resolved-to-`Normal`, which is why it was not added; a
+    separate signal would be needed. Named as possible future work.
+  - **Vulkan/NVIDIA only**, as with every round of this epic. Metal and
+    DX12 are unverified for this mechanism — though since nothing here
+    touches a shader or a pixel, the platform exposure is the same as
+    0.102.1's.
+
+  **Both tracked benchmarks re-run 3× each, release, `AURORA_REQUIRE_GPU=1`
+  — unaffected, and for a stronger reason than "the numbers look the
+  same".** `recomposite_and_present_loop_exercises_the_cpu_fallback_path`:
+  mean 9.64 / 8.96 / 9.17 ms (p50 9.20 / 8.54 / 8.95). `…measures_two_
+  overlapping_roots`: mean 40.79 / 40.29 / 40.66 ms main arm, 24.75 /
+  24.76 / 24.72 ms control. All six runs reported **`gpu_tiles=0`**, which
+  is the point: both fixtures are CPU-fallback benchmarks whose documents
+  never qualify for GPU compositing, so neither one reaches any of this
+  round's call sites at all. The figures are in the same ballpark as
+  0.96.2's and are quoted here as a no-change check, **not** as a new
+  hardware record and not as progress against the 60 FPS gate, which both
+  still miss.
+
+  **Disk-space check, per 0.102.1's named follow-on.** Checked before
+  starting any full rebuild: `/home` at 94% used, **25G free** (403G
+  total), `target/` at 83G with 1.9G of that in
+  `target/debug/incremental`. Above the 20G threshold this round set for
+  itself, so nothing was cleaned; 24G free after the full gate. The
+  pre-gate free-space check 0.102.1 named as a candidate follow-on was
+  performed by hand again rather than automated — still a candidate, still
+  not built.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py` (20 crates), `scripts/check_no_hardcoded_style.py`
+  (28 files), `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo
+  test --workspace` (1,672 passed, 10 ignored, 0 failed), `cargo test
+  --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+  --no-deps --all-features`, `cargo deny check all`. `cargo check -p
+  aurora-app` on its own (the flagless build, which is what would catch a
+  `dead_code` warning on an unconstructed enum variant) also passes.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -23071,6 +23281,48 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.103.0) — the five GPU-admitted non-`Normal`
+blend modes now all have genuine dispatch proof, through one shared
+mode-indexed counter instead of three copies.** Pure instrumentation: no
+composited pixel, no shader, no `BlendPass` const changed. The three
+per-mode statics (`DARKEN_`/`LIGHTEN_`/`SCREEN_GPU_DISPATCHES`), their
+`note_*`/no-op twins and their three `take_*` accessors collapsed into
+one `GpuBlendDispatch` enum plus one `#[cfg(test)] GpuBlendDispatches`
+struct addressed by an exhaustive `match` — chosen over an array indexed
+by discriminant specifically because this workspace denies
+`indexing_slicing`, and an array's `.get(i)` `None` arm would be either a
+denied `panic!` or a silently dropped count, which is the exact failure
+class these counters exist to detect. `Multiply` and `Dissolve`, which had
+no dispatch proof at all, were retrofitted onto it; `Multiply` is the arm
+every user's first frame takes, so it was the most consequential of the
+five to have been uncovered.
+
+`Dissolve`'s counter site is the subtle part and is argued in full in the
+M1.9 entry: it is **not** in `resolve_tile` (shared with the CPU path, so
+it would double-count and would survive the mutation it exists to catch)
+and **not** in the shared `Normal` arm (shared with real `Normal` layers,
+so it could not tell them apart), but in `begin_gpu_composite_tile`'s own
+per-layer loop, reading the layer's raw `aurora_doc` blend mode past the
+resolve-failure `continue`.
+
+**8 mutations applied for real, all 8 killed, no survivors.** Each of the
+five counter deletions was caught by exactly one assertion — its own —
+confirming again that ~390 other `aurora-app` tests cannot see a silent
+CPU fallback. The symmetric mis-wire (`counter()`'s `Screen` arm
+returning `&self.lighten`) was caught **only** by the new GPU-free
+distinctness test, as designed. Two honest corrections came out of the
+mutation set rather than out of review: removing `Dissolve` from
+`document_qualifies_for_gpu_compositing` does *not* reach the `Dissolve`
+counter assertion (the test's own pre-existing predicate assertion fires
+first), so an eighth mutation was added — moving the counter into
+`resolve_tile` — which killed the test with `left: 2, right: 1` and is the
+actual evidence that the site is right. A `> 0` assertion would have
+survived it. Both tracked benchmarks re-run 3× each and unaffected, all
+six runs reporting `gpu_tiles=0` because neither CPU-fallback fixture
+reaches any of this round's call sites at all. Full local gate green
+(1,672 tests). Disk checked before the gate: 25G free, 94% used, `target/`
+83G — above this round's own 20G threshold, so nothing was cleaned.
 
 **Addendum 2026-09-04 (0.102.1) — 0.102.0's "stale counts swept and
 re-derived … not find-and-replaced" claim was overstated; the sweep is now

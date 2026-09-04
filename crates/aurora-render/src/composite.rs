@@ -2071,7 +2071,7 @@ impl TileCompositor {
     /// `Lighten` root layer, through the *same* single ping-pong spare
     /// accumulator a `Multiply` or `Darken` layer would use. Unlike its
     /// two predecessors, its dispatch arm is instrumented from day one
-    /// (`LIGHTEN_GPU_DISPATCHES` in that crate), so no test here can be
+    /// (`GpuBlendDispatch::Lighten` in that crate), so no test here can be
     /// satisfied by a silent CPU fallback.
     ///
     /// All three views must be `Rgba16Float` and the same size; `dst`'s
@@ -2131,9 +2131,11 @@ impl TileCompositor {
     /// `begin_gpu_composite_tile` dispatches to this method for every
     /// `Screen` root layer, through the *same* single ping-pong spare
     /// accumulator a `Multiply`, `Darken` or `Lighten` layer would use.
-    /// Like `Lighten` and unlike `Multiply`, its dispatch arm is
-    /// instrumented from day one (`SCREEN_GPU_DISPATCHES` in that crate),
-    /// so no test here can be satisfied by a silent CPU fallback.
+    /// Like `Lighten` and unlike `Multiply`, its dispatch arm was
+    /// instrumented from day one (`GpuBlendDispatch::Screen` in that
+    /// crate; `Multiply`'s was retrofitted in 0.103.0, so all five modes
+    /// now carry one), so no test here can be satisfied by a silent CPU
+    /// fallback.
     ///
     /// All three views must be `Rgba16Float` and the same size; `dst`'s
     /// owning texture must include `RENDER_ATTACHMENT` usage, and both

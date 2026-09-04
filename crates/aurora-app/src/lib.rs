@@ -6794,7 +6794,7 @@ fn composite_roots_into_tile(
     // condition costs nothing.
     //
     // **The skip has its own regression guard** as of 0.94.1, and needs
-    // one for the same reason `DARKEN_GPU_DISPATCHES` does: being
+    // one for the same reason `GpuBlendDispatches` does: being
     // output-identical is exactly what makes losing it invisible to every
     // output assertion here. Mutating this condition to `true` (the
     // pre-0.94.0 behaviour) left all 384 `aurora-app` tests green. So the
@@ -6843,7 +6843,7 @@ fn composite_roots_into_tile(
 ///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own
 ///   arm and shares the *same single* `spare` ping-pong accumulator, and
 ///   its arm is the first to carry a dispatch counter
-///   ([`LIGHTEN_GPU_DISPATCHES`]) from its own first round. Not to be
+///   ([`GpuBlendDispatch::Lighten`]) from its own first round. Not to be
 ///   confused with `aurora_doc::BlendMode::LighterColor`, which picks one
 ///   whole `(R, G, B)` triple by luminosity and is still CPU-only.
 /// - [`aurora_doc::BlendMode::Screen`] (0.102.0), composited by
@@ -6857,7 +6857,7 @@ fn composite_roots_into_tile(
 ///   `blend_channel` arm. It too reaches [`begin_gpu_composite_tile`]'s
 ///   blend dispatch as its own arm and shares the *same single* `spare`
 ///   ping-pong accumulator, and it carries a dispatch counter
-///   ([`SCREEN_GPU_DISPATCHES`]) from its own first round.
+///   ([`GpuBlendDispatch::Screen`]) from its own first round.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -7271,139 +7271,185 @@ fn accumulator_or_create<'slot>(
     slot.insert(pair)
 }
 
-/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Darken`
-/// arm has actually dispatched a real GPU blend pass.
+/// Which of [`begin_gpu_composite_tile`]'s non-`Normal` blend dispatches
+/// a [`note_gpu_blend_dispatch`] call is reporting — the address into
+/// [`GpuBlendDispatches`], and the one part of that mechanism that is
+/// **not** `#[cfg(test)]`.
 ///
-/// **The gap this closes** (0.85.1). Every `Darken` test before this was
-/// either a differential ("the GPU path's texel equals the CPU path's")
-/// or a predicate assertion ("this document qualifies for the GPU
-/// path"). Neither can see whether the GPU arm *ran*: delete the whole
-/// `Darken` arm from the `match` below and every `Darken` tile falls
-/// through the defensive `_` arm to the CPU path, which computes the
-/// same correct answer — so the differential compares the CPU path
-/// against itself and still passes, and the predicate still holds
-/// because the predicate is a different function. That mutation was
-/// performed against 0.85.0 and the entire suite stayed green. A
-/// refactor could therefore drop `Darken` off the GPU path silently.
+/// It cannot be, because the shipping build's dispatch arms still name a
+/// variant when they call the no-op twin of `note_gpu_blend_dispatch`.
+/// Keeping the enum unconditional and the counters conditional is what
+/// lets one call site serve both builds without a `#[cfg]` at the call
+/// site itself.
 ///
-/// So the arm reports itself, and
-/// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`
-/// asserts the count it expects. Reads and writes are `Relaxed` and the
-/// counter is process-global, which is sound only because every caller
-/// of `begin_gpu_composite_tile` needs a real `GpuContext` and this
-/// module's `real_gpu_context` hands one out only under
-/// `GPU_TEST_LOCK` — so no two GPU tests are ever inside this counter at
-/// once.
-///
-/// **Named follow-on: `Multiply` and `Dissolve` still have this exact
-/// gap.** Both are admitted by `document_qualifies_for_gpu_compositing`,
-/// both are covered only by GPU-vs-CPU differentials, and deleting
-/// either one's dispatch (for `Dissolve`, the `Normal` arm it is reduced
-/// to) would likewise leave the suite green. Instrumenting them is
-/// deliberately *not* done here — it would mean touching two arms this
-/// round did not otherwise change — and is left as its own round.
-/// `Lighten`, the third ported mode, does **not** share the gap: it
-/// arrived with [`LIGHTEN_GPU_DISPATCHES`] in its own first round
-/// (0.95.0) rather than one round later, which is what this static's own
-/// history argues for.
-#[cfg(test)]
-static DARKEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The variants are exactly the modes
+/// [`document_qualifies_for_gpu_compositing`] admits *other than*
+/// `Normal`, which is deliberately absent: the `Normal` arm is shared by
+/// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
+/// has already reduced to `Normal`, so a count taken there could not tell
+/// the two apart. See [`GpuBlendDispatches`] for the `Dissolve` variant's
+/// call site and why it is where it is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuBlendDispatch {
+    Multiply,
+    Darken,
+    Lighten,
+    Screen,
+    Dissolve,
+}
 
-/// Increments [`DARKEN_GPU_DISPATCHES`]. Called from the `Darken` arm
-/// once per tile per `Darken` layer, immediately after the compositor
-/// call it is reporting.
+/// Test-only counts of the times [`begin_gpu_composite_tile`] has
+/// actually dispatched a real GPU blend pass for each non-`Normal` blend
+/// mode the GPU path admits.
+///
+/// **The gap this closes.** Every blend-mode test in this crate is either
+/// a differential ("the GPU path's texel equals the CPU path's") or a
+/// predicate assertion ("this document qualifies for the GPU path").
+/// Neither can see whether the GPU arm *ran*: delete a mode's arm from
+/// [`begin_gpu_composite_tile`]'s `match` and every tile of that mode
+/// falls through the defensive `_` arm to the CPU path, which computes
+/// the same correct pixels — so the differential compares the CPU path
+/// against itself and still passes, and the predicate still holds because
+/// the predicate is a different function. A refactor could therefore drop
+/// a mode off the GPU path silently. So each arm reports itself here, and
+/// that mode's own test asserts the exact count it expects.
+///
+/// **Per-mode history, which is the evidence for the paragraph above**
+/// rather than a claim about it:
+///
+/// - `Darken` (0.85.1): the counter was retrofitted one round after the
+///   port, having first *performed* the deletion against 0.85.0 and
+///   watched the entire suite stay green.
+/// - `Lighten` (0.95.0): instrumented in its own first round rather than
+///   after the fact, which is what `Darken`'s history argued for.
+/// - `Screen` (0.102.0): same, and the mutation was performed for real
+///   against that round's own diff — this counter was the **only**
+///   assertion of ~390 in the crate that caught it (PLAN.md's 0.102.0
+///   entry).
+/// - `Multiply` and `Dissolve` (0.103.0, this struct's own round): both
+///   predate the convention and had no counter at all until the three
+///   per-mode statics were merged into this one indexed struct, at which
+///   point retrofitting them cost a field and an arm each rather than a
+///   copied block each. `Multiply` matters most of the five: the app's
+///   own default startup document carries a `Multiply` layer, so it is
+///   the arm every user's first frame takes.
+///
+/// **Why a struct of named fields and an exhaustive `match`, not a
+/// `[AtomicU64; N]` indexed by discriminant.** This workspace denies
+/// `indexing_slicing`, so an array would have to be read through
+/// `.get(i)`, which degrades to `Option` — and that `Option`'s `None` arm
+/// is either a denied `panic!` or a silently dropped count. A silently
+/// dropped count is *exactly* the failure class these counters exist to
+/// detect, so the array shape would undermine its own purpose. The
+/// `match` in [`GpuBlendDispatches::counter`] instead makes the compiler
+/// refuse to build until every [`GpuBlendDispatch`] variant has both a
+/// field and an arm, so a mode added later cannot reach the GPU
+/// uncounted.
+///
+/// **Soundness.** Reads and writes are `Relaxed` and the counters are
+/// process-global, which is sound only because every caller of
+/// [`begin_gpu_composite_tile`] needs a real `GpuContext` and this
+/// module's `real_gpu_context` hands one out only under `GPU_TEST_LOCK` —
+/// so no two GPU tests are ever inside these counters at once, and the
+/// lock supplies the ordering. Merging the three statics into one struct
+/// does not change that argument: the counters are still separate
+/// `AtomicU64`s, still only touched under that lock, and
+/// `take_gpu_blend_dispatch_count` still reads-and-zeroes one mode at a
+/// time.
+///
+/// **What it cannot see.** It counts the dispatch
+/// [`begin_gpu_composite_tile`] records, and nothing else — not what
+/// `aurora_render::TileCompositor`'s own methods then do, and not whether
+/// the shader behind a given method computes the right formula. The
+/// absolute-golden assertion in each mode's test is what covers the
+/// second of those; `aurora-render`'s own shader tests cover the first.
 #[cfg(test)]
-fn note_darken_gpu_dispatch() {
-    DARKEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+struct GpuBlendDispatches {
+    multiply: std::sync::atomic::AtomicU64,
+    darken: std::sync::atomic::AtomicU64,
+    lighten: std::sync::atomic::AtomicU64,
+    screen: std::sync::atomic::AtomicU64,
+    dissolve: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl GpuBlendDispatches {
+    /// All five counters at zero. `const` so the static below is a
+    /// compile-time initializer rather than a lazily-initialized cell,
+    /// exactly as the three separate `AtomicU64::new(0)` statics it
+    /// replaces were.
+    const fn new() -> Self {
+        Self {
+            multiply: std::sync::atomic::AtomicU64::new(0),
+            darken: std::sync::atomic::AtomicU64::new(0),
+            lighten: std::sync::atomic::AtomicU64::new(0),
+            screen: std::sync::atomic::AtomicU64::new(0),
+            dissolve: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The one counter `which` addresses.
+    ///
+    /// The `match` is exhaustive and total by construction — no `_` arm,
+    /// no fallible lookup, so there is no "which counter?" failure to
+    /// either defend against or drop on the floor. See
+    /// [`GpuBlendDispatches`] for why that mattered enough to spend five
+    /// named fields on.
+    ///
+    /// That every variant maps to a *distinct* counter is not something
+    /// the compiler checks — two arms could name the same field — so
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter` asserts it
+    /// directly, on a local instance rather than the global static.
+    fn counter(&self, which: GpuBlendDispatch) -> &std::sync::atomic::AtomicU64 {
+        match which {
+            GpuBlendDispatch::Multiply => &self.multiply,
+            GpuBlendDispatch::Darken => &self.darken,
+            GpuBlendDispatch::Lighten => &self.lighten,
+            GpuBlendDispatch::Screen => &self.screen,
+            GpuBlendDispatch::Dissolve => &self.dissolve,
+        }
+    }
+}
+
+#[cfg(test)]
+static GPU_BLEND_DISPATCHES: GpuBlendDispatches = GpuBlendDispatches::new();
+
+/// Increments `which`'s counter in [`GPU_BLEND_DISPATCHES`]. Called from
+/// [`begin_gpu_composite_tile`] once per tile per layer of that mode,
+/// immediately after the compositor call it is reporting.
+#[cfg(test)]
+fn note_gpu_blend_dispatch(which: GpuBlendDispatch) {
+    GPU_BLEND_DISPATCHES
+        .counter(which)
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The shipping build's version: nothing at all. The instrumentation
 /// exists to make a test non-vacuous, not to be carried by the editor —
-/// so the counter itself is `#[cfg(test)]` and this no-op is what the
-/// dispatch arm compiles down to everywhere else.
+/// so [`GpuBlendDispatches`] itself is `#[cfg(test)]` and this no-op is
+/// what every dispatch arm compiles down to everywhere else. Only
+/// [`GpuBlendDispatch`] survives into the shipping build, and only as the
+/// argument type this discards.
 #[cfg(not(test))]
-fn note_darken_gpu_dispatch() {}
+fn note_gpu_blend_dispatch(_which: GpuBlendDispatch) {}
 
-/// Test-only count of the times [`begin_gpu_composite_tile`]'s
-/// `Lighten` arm has actually dispatched a real GPU blend pass — the
-/// same instrumentation [`DARKEN_GPU_DISPATCHES`] carries, and for the
-/// same reason, but present from this mode's **first** round rather
-/// than added after the fact (0.95.0).
+/// Reads `which`'s counter in [`GPU_BLEND_DISPATCHES`] and resets it to
+/// zero in one atomic step, so a caller gets the count since *its* own
+/// last call rather than a total accumulated across whatever ran before.
 ///
-/// The gap is identical and worth restating rather than cross-
-/// referencing: delete the `Lighten` arm from the `match` and every
-/// `Lighten` tile falls through the defensive `_` arm to the CPU path,
-/// which computes the same correct pixels — so every differential
-/// compares the CPU path against itself and still passes, and the
-/// predicate still holds because the predicate is a different function.
+/// Deliberately here, beside [`note_gpu_blend_dispatch`], rather than
+/// inside `mod tests` where the three per-mode accessors it replaces
+/// lived: one function for five modes is not worth five lines of `use
+/// super::{…}` churn every time a mode is added.
 ///
-/// Reads and writes are `Relaxed` and the counter is process-global,
-/// sound for exactly the reason [`DARKEN_GPU_DISPATCHES`] documents:
-/// every caller of [`begin_gpu_composite_tile`] needs a real
-/// `GpuContext`, and `real_gpu_context` hands one out only under
-/// `GPU_TEST_LOCK`.
-///
-/// **Named follow-on, unchanged:** `Multiply` and `Dissolve` still have
-/// no such counter.
+/// The swap is `Relaxed` for the same reason the increment is — see
+/// [`GpuBlendDispatches`]'s soundness paragraph.
 #[cfg(test)]
-static LIGHTEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Increments [`LIGHTEN_GPU_DISPATCHES`]. Called from the `Lighten` arm
-/// once per tile per `Lighten` layer, immediately after the compositor
-/// call it is reporting.
-#[cfg(test)]
-fn note_lighten_gpu_dispatch() {
-    LIGHTEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn take_gpu_blend_dispatch_count(which: GpuBlendDispatch) -> u64 {
+    GPU_BLEND_DISPATCHES
+        .counter(which)
+        .swap(0, std::sync::atomic::Ordering::Relaxed)
 }
-
-/// The shipping build's version: nothing at all, exactly as with
-/// [`note_darken_gpu_dispatch`] above.
-#[cfg(not(test))]
-fn note_lighten_gpu_dispatch() {}
-
-/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Screen`
-/// arm has actually dispatched a real GPU blend pass — the same
-/// instrumentation [`DARKEN_GPU_DISPATCHES`] and
-/// [`LIGHTEN_GPU_DISPATCHES`] carry, present from this mode's **first**
-/// round (0.102.0), which is now the established precedent rather than
-/// the exception it was at 0.95.0.
-///
-/// The gap is identical and worth restating rather than cross-
-/// referencing: delete the `Screen` arm from the `match` and every
-/// `Screen` tile falls through the defensive `_` arm to the CPU path,
-/// which computes the same correct pixels — so every differential
-/// compares the CPU path against itself and still passes, and the
-/// predicate still holds because the predicate is a different function.
-/// That mutation was performed for real against this round's own diff and
-/// is recorded in PLAN.md's 0.102.0 entry: this counter was the only
-/// assertion that caught it.
-///
-/// Reads and writes are `Relaxed` and the counter is process-global,
-/// sound for exactly the reason [`DARKEN_GPU_DISPATCHES`] documents:
-/// every caller of [`begin_gpu_composite_tile`] needs a real
-/// `GpuContext`, and `real_gpu_context` hands one out only under
-/// `GPU_TEST_LOCK`, so no two GPU tests are ever inside this counter at
-/// once.
-///
-/// **Named follow-on, unchanged:** `Multiply` and `Dissolve` still have
-/// no such counter. Deliberately not built here — it would mean touching
-/// two arms this round did not otherwise change — and left as its own
-/// round.
-#[cfg(test)]
-static SCREEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Increments [`SCREEN_GPU_DISPATCHES`]. Called from the `Screen` arm
-/// once per tile per `Screen` layer, immediately after the compositor
-/// call it is reporting.
-#[cfg(test)]
-fn note_screen_gpu_dispatch() {
-    SCREEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The shipping build's version: nothing at all, exactly as with
-/// [`note_darken_gpu_dispatch`] above.
-#[cfg(not(test))]
-fn note_screen_gpu_dispatch() {}
 
 /// Test-only count of the `queue.submit` calls
 /// [`begin_gpu_composite_tile`] itself has issued — the whole point of
@@ -7412,7 +7458,7 @@ fn note_screen_gpu_dispatch() {}
 /// it folds.
 ///
 /// **What it can and cannot see** (the same disclosure
-/// [`DARKEN_GPU_DISPATCHES`] carries about itself). It counts the
+/// [`GpuBlendDispatches`] carries about itself). It counts the
 /// submit `begin_gpu_composite_tile` makes, and nothing else. It would
 /// **not** notice a `queue.submit` reintroduced inside one of
 /// `aurora_render::TileCompositor`'s own methods — those are in another
@@ -7424,7 +7470,7 @@ fn note_screen_gpu_dispatch() {}
 /// changed yet. Neither check subsumes the other, and both are needed.
 ///
 /// Reads and writes are `Relaxed` and the counter is process-global,
-/// which is sound for the same reason `DARKEN_GPU_DISPATCHES` is: every
+/// which is sound for the same reason `GpuBlendDispatches` is: every
 /// caller of `begin_gpu_composite_tile` needs a real `GpuContext`, and
 /// this module's `real_gpu_context` hands one out only under
 /// `GPU_TEST_LOCK`, so no two GPU tests are inside this counter at once.
@@ -7440,7 +7486,7 @@ fn note_gpu_composite_submit() {
 }
 
 /// The shipping build's version: nothing at all, exactly as with
-/// [`note_darken_gpu_dispatch`] above.
+/// [`note_gpu_blend_dispatch`] above.
 #[cfg(not(test))]
 fn note_gpu_composite_submit() {}
 
@@ -7457,7 +7503,7 @@ thread_local! {
     /// measured to leave all 384 `aurora-app` tests green, so nothing would
     /// have caught a later refactor quietly handing the whole ~6.5 ms/frame
     /// win back. This is the same gap, and the same remedy, as
-    /// [`DARKEN_GPU_DISPATCHES`]: the only observable that distinguishes
+    /// [`GpuBlendDispatches`]: the only observable that distinguishes
     /// "skipped" from "ran and computed the identical bits" is whether the
     /// call happened, so the call site reports itself and
     /// `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`
@@ -7465,7 +7511,7 @@ thread_local! {
     ///
     /// **Thread-local, deliberately not a process-global atomic.** This is
     /// the counter shape 0.93.1 had to reach for the fold count: unlike
-    /// [`DARKEN_GPU_DISPATCHES`], whose every caller needs a `GpuContext` and
+    /// [`GpuBlendDispatches`], whose every caller needs a `GpuContext` and
     /// therefore holds `GPU_TEST_LOCK`, [`composite_roots_into_tile`] is
     /// called by [`composite_document`] and by many of this crate's own tests
     /// with no lock at all. A process-global would let one thread's
@@ -7651,7 +7697,7 @@ fn note_recomposite_mark_imbalance(by: u64) {
 /// not as "GPU cost".
 ///
 /// Same soundness argument as [`GPU_COMPOSITE_SUBMITS`] and
-/// [`DARKEN_GPU_DISPATCHES`]: the counter is process-global and
+/// [`GpuBlendDispatches`]: the counter is process-global and
 /// `Relaxed`, which is fine because every caller that reaches the GPU
 /// arms holds `GPU_TEST_LOCK` via `real_gpu_context`. A *CPU-only*
 /// caller of `recomposite_visible_tiles` does not hold that lock and
@@ -8531,6 +8577,39 @@ fn begin_gpu_composite_tile(
             continue;
         };
 
+        // **The `Dissolve` dispatch counter, and why it is here rather
+        // than in either of the two places that look more natural**
+        // (0.103.0). `Dissolve` never reaches the `match` below as
+        // `Dissolve`: `resolve_tile` intercepts it in *both* its `Pixel`
+        // and `Group` branches, applies `dissolve_gate` on the CPU, and
+        // returns `(gated texels, 1.0, BlendMode::Normal)`. So there is no
+        // `Dissolve` arm to instrument, and the two obvious alternatives
+        // are each wrong in a way that would make the counter useless:
+        //
+        // - **Not inside `resolve_tile`.** That function is the *shared*
+        //   resolver: `composite_roots_into_tile`, the CPU path, calls it
+        //   too. A counter there would tick for CPU-only composites, so it
+        //   would stay non-zero after the very mutation it exists to catch
+        //   (removing `Dissolve` from
+        //   `document_qualifies_for_gpu_compositing`, which routes the
+        //   whole document to the CPU) -- a non-zero, meaningless count
+        //   instead of a failing assertion.
+        // - **Not inside the shared `Normal` arm below.** That arm is
+        //   taken by real `Normal` layers *and* by `Dissolve`-resolved
+        //   ones, so a count taken there cannot tell "a `Dissolve` layer
+        //   dispatched" from "an ordinary `Normal` layer dispatched".
+        //
+        // Here is the one site that is both GPU-only and `Dissolve`-only:
+        // past the `continue` above, so it fires only for a layer that
+        // really resolved and really is part of this tile's GPU dispatch,
+        // and reading the layer's *raw* `aurora_doc` blend mode, which is
+        // the only place the `Dissolve` fact still exists. `None` (no
+        // recorded blend mode) means `Normal`, matching `resolve_tile`'s
+        // own `.unwrap_or`, so it is correctly not counted.
+        if layers.blend_mode(id) == Some(aurora_doc::BlendMode::Dissolve) {
+            note_gpu_blend_dispatch(GpuBlendDispatch::Dissolve);
+        }
+
         // Created on the first layer that resolves, reused by every one
         // after it. Deliberately not `get_or_insert_with` -- see
         // `accumulator_or_create`'s own doc comment for why that does
@@ -8619,6 +8698,12 @@ fn begin_gpu_composite_tile(
                     &spare_accumulator.1,
                     opacity,
                 );
+                // Retrofitted in 0.103.0, three rounds after this arm
+                // itself landed -- and the most load-bearing of the five,
+                // because the app's own default startup document carries a
+                // `Multiply` layer, so this is the arm every user's first
+                // frame takes. See `GpuBlendDispatches`.
+                note_gpu_blend_dispatch(GpuBlendDispatch::Multiply);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
             // The second ported mode (0.85.0), through the *same*
@@ -8646,11 +8731,9 @@ fn begin_gpu_composite_tile(
                     opacity,
                 );
                 // Reports that this arm really ran -- see
-                // `DARKEN_GPU_DISPATCHES` for the mutation (deleting
-                // this whole arm) that every 0.85.0 test survived, and
-                // for the note that the `Multiply` and `Dissolve` arms
-                // still have that gap.
-                note_darken_gpu_dispatch();
+                // `GpuBlendDispatches` for the mutation (deleting this
+                // whole arm) that every 0.85.0 test survived.
+                note_gpu_blend_dispatch(GpuBlendDispatch::Darken);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
             // The third ported mode (0.95.0), through the *same*
@@ -8660,7 +8743,7 @@ fn begin_gpu_composite_tile(
             // method, and so the WGSL entry point behind it, differs:
             // `max(Cb, Cs)` per channel. Instrumented from its first
             // round rather than retrofitted -- see
-            // `LIGHTEN_GPU_DISPATCHES`.
+            // `GpuBlendDispatches`.
             aurora_render::BlendMode::Lighten => {
                 let spare_accumulator = accumulator_or_create(
                     &mut spare,
@@ -8677,7 +8760,7 @@ fn begin_gpu_composite_tile(
                     &spare_accumulator.1,
                     opacity,
                 );
-                note_lighten_gpu_dispatch();
+                note_gpu_blend_dispatch(GpuBlendDispatch::Lighten);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
             // The fourth ported mode (0.102.0), through the *same*
@@ -8688,7 +8771,7 @@ fn begin_gpu_composite_tile(
             // `Cb + Cs - Cb*Cs` per channel, the first ported formula
             // that is arithmetic on both operands rather than one
             // intrinsic. Instrumented from its first round -- see
-            // `SCREEN_GPU_DISPATCHES`.
+            // `GpuBlendDispatches`.
             aurora_render::BlendMode::Screen => {
                 let spare_accumulator = accumulator_or_create(
                     &mut spare,
@@ -8705,7 +8788,7 @@ fn begin_gpu_composite_tile(
                     &spare_accumulator.1,
                     opacity,
                 );
-                note_screen_gpu_dispatch();
+                note_gpu_blend_dispatch(GpuBlendDispatch::Screen);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
             // Unreachable through the real caller: `document_qualifies_
@@ -14275,40 +14358,39 @@ mod tests {
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
         COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
-        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
-        GPU_COMPOSITE_SUBMITS, Key, KeyChord, LIGHTEN_GPU_DISPATCHES, MIN_WINDOW_HEIGHT,
-        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
-        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
-        RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, SCREEN_GPU_DISPATCHES, ShutdownState, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_roots_into_tile,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
-        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
+        GpuBlendDispatch, GpuBlendDispatches, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS, RECOMPOSITE_MARK_IMBALANCE,
+        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -19363,36 +19445,9 @@ mod tests {
         })
     }
 
-    /// Reads [`DARKEN_GPU_DISPATCHES`] and resets it to zero in one
-    /// atomic step, so a caller gets the count since *its* own last call
-    /// rather than a total accumulated across whatever ran before.
-    ///
-    /// The swap is `Relaxed` for the same reason the increment is: every
-    /// caller of `begin_gpu_composite_tile` holds `GPU_TEST_LOCK` (it
-    /// needs a `GpuContext`, and `real_gpu_context` is the only way to
-    /// get one here), so this is never contended and the lock supplies
-    /// the ordering.
-    fn take_darken_gpu_dispatch_count() -> u64 {
-        DARKEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// [`take_darken_gpu_dispatch_count`]'s sibling for
-    /// [`LIGHTEN_GPU_DISPATCHES`], same read-and-zero shape, same
-    /// `Relaxed`-under-`GPU_TEST_LOCK` reasoning.
-    fn take_lighten_gpu_dispatch_count() -> u64 {
-        LIGHTEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// [`take_darken_gpu_dispatch_count`]'s sibling for
-    /// [`SCREEN_GPU_DISPATCHES`], same read-and-zero shape, same
-    /// `Relaxed`-under-`GPU_TEST_LOCK` reasoning (0.102.0).
-    fn take_screen_gpu_dispatch_count() -> u64 {
-        SCREEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Reads [`GPU_COMPOSITE_SUBMITS`] and resets it to zero in one
-    /// step, exactly as [`take_darken_gpu_dispatch_count`] above does
-    /// for its own counter and for the same reason: a test that only
+    /// step, exactly as [`take_gpu_blend_dispatch_count`] does for the
+    /// per-mode blend counters and for the same reason: a test that only
     /// read it would be counting every earlier GPU test in this binary
     /// too.
     fn take_gpu_composite_submit_count() -> u64 {
@@ -19406,7 +19461,7 @@ mod tests {
     /// thread-local, so what this returns is the calls *this* thread made
     /// since its own last call — see [`COMPOSITE_STRAIGHTEN_PASSES`]'s own
     /// doc comment for why a process-global would have been flaky here
-    /// where it is sound for [`DARKEN_GPU_DISPATCHES`].
+    /// where it is sound for [`GpuBlendDispatches`].
     fn take_composite_straighten_passes() -> u64 {
         COMPOSITE_STRAIGHTEN_PASSES.with(|passes| passes.replace(0))
     }
@@ -28226,6 +28281,13 @@ mod tests {
              ping-pong"
         );
 
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // at the bottom reads is this run's dispatches and nothing else's.
+        // Retrofitted in 0.103.0: this arm had no dispatch proof at all
+        // for three rounds, which mattered more here than for any of the
+        // other four modes -- see `GpuBlendDispatches`.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply);
+
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
 
@@ -28254,6 +28316,25 @@ mod tests {
         );
         let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
 
+        // Two = this stack's two `Multiply` layers (`l2` and `l4`),
+        // dispatched once each for the single tile they actually have
+        // content at. The 256x256 residency viewport marks four tiles
+        // visible at `TILE` = 256; the other three resolve nothing at all
+        // and take `begin_gpu_composite_tile`'s `current?` bail before any
+        // blend pass is recorded (0.87.0). The second, CPU-only run above
+        // adds none, which is itself part of what this pins. **A count of 0
+        // is the failure this assertion exists for**: it means no
+        // `Multiply` tile reached the GPU and the differential below is
+        // comparing the CPU path against itself. A non-zero count that is
+        // not 2 means the viewport or tile geometry moved under this
+        // fixture -- re-derive it rather than loosening the assertion.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply),
+            2,
+            "both Multiply layers must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
         assert_ne!(
             gpu_result,
             (0.0, 0.0, 0.0, 0.0),
@@ -28389,6 +28470,93 @@ mod tests {
         let cpu_result = read_all_texels(store, composite_surface_id(), tile_id);
 
         (gpu_result, cpu_result)
+    }
+
+    /// **Every [`GpuBlendDispatch`] variant addresses its own counter**
+    /// (0.103.0) — the one property of the merged, mode-indexed
+    /// dispatch-proof mechanism that the compiler does *not* check.
+    ///
+    /// [`GpuBlendDispatches::counter`]'s `match` is exhaustive, so the
+    /// compiler guarantees every variant has *an* arm and every field
+    /// exists. It does not guarantee the mapping is injective: two arms
+    /// can name the same field and the code still builds, still passes
+    /// `clippy`, and still produces correct pixels. What such a mis-wire
+    /// breaks is only the counters' *discrimination* — `Screen` ticking
+    /// `lighten` would make `Screen`'s own test pass on a `Lighten`
+    /// dispatch and vice versa. Each per-mode GPU test zeroes its own
+    /// counter and composites exactly one mode, so none of them can see
+    /// that; this test is the only assertion that can, and mutation #6 of
+    /// 0.103.0's set (swapping `counter`'s `Screen` arm to
+    /// `&self.lighten`) was performed for real to confirm it is.
+    ///
+    /// Deliberately on a **local** [`GpuBlendDispatches::new`] instance
+    /// rather than the [`GPU_BLEND_DISPATCHES`] global: no GPU adapter is
+    /// needed (so this runs everywhere, including a runner where every
+    /// GPU-gated test self-skips — precisely the configuration in which a
+    /// mis-wire would otherwise go unobserved), and it cannot land inside
+    /// another test's measurement window, since it never touches the
+    /// static the dispatch arms increment.
+    #[test]
+    fn every_gpu_blend_dispatch_mode_gets_its_own_counter() {
+        // Every variant, listed by hand. The `match` in `counter` is what
+        // makes a *missing* variant a compile error; this list is what
+        // makes a variant missing from the test itself visible, so keep
+        // the two in step when a mode is added.
+        let modes = [
+            GpuBlendDispatch::Multiply,
+            GpuBlendDispatch::Darken,
+            GpuBlendDispatch::Lighten,
+            GpuBlendDispatch::Screen,
+            GpuBlendDispatch::Dissolve,
+        ];
+        let dispatches = GpuBlendDispatches::new();
+
+        for &mode in &modes {
+            assert_eq!(
+                dispatches
+                    .counter(mode)
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "a freshly constructed GpuBlendDispatches must start every counter at zero -- \
+                 {mode:?} did not, so `new` is not zero-initialising the field this variant \
+                 addresses"
+            );
+        }
+
+        // Distinctness by address: every unordered pair of variants, once.
+        for (index, &left) in modes.iter().enumerate() {
+            for &right in modes.iter().skip(index + 1) {
+                assert!(
+                    !std::ptr::eq(dispatches.counter(left), dispatches.counter(right)),
+                    "{left:?} and {right:?} address the *same* AtomicU64 -- two arms of \
+                     GpuBlendDispatches::counter name one field, so each mode's dispatch proof \
+                     now also counts the other's and neither test can tell them apart"
+                );
+            }
+        }
+
+        // And behaviourally, which is the property the tests actually
+        // depend on: incrementing one mode's counter leaves the other
+        // four at zero. Strictly implied by the address check above, and
+        // asserted anyway because it is the failure a reader recognises.
+        for &mode in &modes {
+            dispatches
+                .counter(mode)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for &other in &modes {
+                let expected = u64::from(other == mode);
+                assert_eq!(
+                    dispatches
+                        .counter(other)
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    expected,
+                    "after one {mode:?} dispatch, {other:?}'s counter must read {expected}"
+                );
+            }
+            dispatches
+                .counter(mode)
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Asserts the GPU and CPU composites of the same fixture agree
@@ -28665,7 +28833,7 @@ mod tests {
     ///
     /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
     /// - the absolute golden, which a wrong-arm dispatch fails outright;
-    /// - the [`LIGHTEN_GPU_DISPATCHES`] count, which is what distinguishes
+    /// - the [`GpuBlendDispatch::Lighten`] count, which is what distinguishes
     ///   "the `Lighten` arm ran on the GPU" from "it silently fell back to
     ///   the CPU, which computes the same correct pixels";
     /// - and the `assert_ne!` vacuity guard at the end: the same stack
@@ -28707,7 +28875,7 @@ mod tests {
 
         // Zeroed inside `real_gpu_context`'s lock, so what the assertion
         // below reads is this run's dispatches and nothing else's.
-        let _ = take_lighten_gpu_dispatch_count();
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Lighten);
         let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
         // One = this stack's single `Lighten` layer, dispatched once for
         // the one tile it actually has content at. `solid_root_stack`
@@ -28725,7 +28893,7 @@ mod tests {
         // moved under this fixture -- re-derive it rather than loosening
         // the assertion.
         assert_eq!(
-            take_lighten_gpu_dispatch_count(),
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Lighten),
             1,
             "the Lighten layer must have dispatched a real GPU blend pass on the one visible \
              tile that has stored content -- 0 means the dispatch arm is gone and every \
@@ -28821,7 +28989,7 @@ mod tests {
     ///
     /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
     /// - the absolute golden, which a wrong-arm dispatch fails outright;
-    /// - the [`SCREEN_GPU_DISPATCHES`] count, which is what distinguishes
+    /// - the [`GpuBlendDispatch::Screen`] count, which is what distinguishes
     ///   "the `Screen` arm ran on the GPU" from "it silently fell back to
     ///   the CPU, which computes the same correct pixels" — the one
     ///   mutation in this round's own set that nothing else caught;
@@ -28867,7 +29035,7 @@ mod tests {
 
         // Zeroed inside `real_gpu_context`'s lock, so what the assertion
         // below reads is this run's dispatches and nothing else's.
-        let _ = take_screen_gpu_dispatch_count();
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Screen);
         let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
         // One = this stack's single `Screen` layer, dispatched once for the
         // one tile it actually has content at. `solid_root_stack` fills
@@ -28877,11 +29045,11 @@ mod tests {
         // `begin_gpu_composite_tile`'s `current?` bail before any blend
         // pass is recorded. The second, CPU-only run inside that helper
         // adds none. **A count of 0 is the failure this assertion exists
-        // for** -- see `SCREEN_GPU_DISPATCHES`, and PLAN.md's 0.102.0
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.102.0
         // mutation-testing record, where deleting the dispatch arm left
         // every other assertion in this test green.
         assert_eq!(
-            take_screen_gpu_dispatch_count(),
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Screen),
             1,
             "the Screen layer must have dispatched a real GPU blend pass on the one visible \
              tile that has stored content -- 0 means the dispatch arm is gone and every \
@@ -28985,7 +29153,7 @@ mod tests {
     ///   layers replaced by `Multiply` must composite to something
     ///   *different*, so an arm dispatching the wrong formula cannot
     ///   pass.
-    /// - The [`DARKEN_GPU_DISPATCHES`] assertion (0.85.1): the `Darken`
+    /// - The [`GpuBlendDispatch::Darken`] assertion (0.85.1): the `Darken`
     ///   arm must actually have run on the GPU. Without it, deleting the
     ///   arm outright routes every `Darken` tile to the CPU fallback,
     ///   which produces the same correct texel — so the differential
@@ -29065,7 +29233,7 @@ mod tests {
         // Zero the counter inside `real_gpu_context`'s lock, so what the
         // assertion below reads is this run's dispatches and nothing
         // else's.
-        let _ = take_darken_gpu_dispatch_count();
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken);
         let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
         // Two = this stack's two `Darken` layers, dispatched once each for
         // the single tile they actually have content at. `solid_root_stack`
@@ -29087,7 +29255,7 @@ mod tests {
         // tile geometry moved under this fixture -- re-derive it rather
         // than loosening the assertion.
         assert_eq!(
-            take_darken_gpu_dispatch_count(),
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken),
             2,
             "both Darken layers must have dispatched a real GPU blend pass on the one visible \
              tile that has stored content -- 0 means the dispatch arm is gone and every \
@@ -29310,7 +29478,42 @@ mod tests {
              otherwise this test would compare the CPU path against itself"
         );
 
+        // Zeroed inside `real_gpu_context`'s lock, so what the two
+        // assertions below read is this test's own dispatches (0.103.0).
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve);
+
         let (gpu_texels, cpu_texels) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+        // One = this stack's single `Dissolve` layer, on the one tile it
+        // has content at (the 256x256 viewport's other three resolve
+        // nothing).
+        //
+        // **The exact `1` is what pins the counter's *site*, and that was
+        // measured, not reasoned** (0.103.0). `Dissolve` reaches
+        // `begin_gpu_composite_tile`'s `match` as `Normal`, so the count is
+        // taken in that function's per-layer loop from the layer's raw
+        // `aurora_doc` blend mode -- see the call site's own comment for
+        // why neither `resolve_tile` nor the shared `Normal` arm would do.
+        // Moving this counter into `resolve_tile`'s own `Dissolve`
+        // interception was performed for real as 0.103.0's eighth
+        // mutation, and this assertion killed it with `left: 2, right: 1`:
+        // `gpu_and_cpu_all_texels` runs the document through the GPU path
+        // *and* then the CPU path, `resolve_tile` is shared by both, so a
+        // counter there double-counts. A `> 0` assertion would have
+        // survived that mutation; the exact count is the whole proof.
+        //
+        // Stated honestly, because the reverse is easy to assume: this
+        // assertion is **not** what catches `Dissolve` being dropped from
+        // `document_qualifies_for_gpu_compositing` (0.103.0's seventh
+        // mutation). This test's own `document_qualifies` assertion above
+        // fires first and that mutation never reaches here. What this
+        // assertion uniquely covers is the site and the multiplicity.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve),
+            1,
+            "the Dissolve layer must have taken the GPU path on the one visible tile that has \
+             stored content -- 0 means the document was routed to the CPU path entirely and the \
+             bit-exact agreement below is the CPU path compared against itself"
+        );
         assert_eq!(
             gpu_texels, cpu_texels,
             "Dissolve is decided entirely on the CPU inside resolve_tile, from a \
@@ -29344,6 +29547,50 @@ mod tests {
             saw_dissolved && saw_bottom_only,
             "setup: the gate must show through at some texels and be blocked at others, or \
              this fixture cannot tell a real gate from a pass-everything/fail-everything one"
+        );
+
+        // **The control half** (0.103.0), and the reason the `Dissolve`
+        // count is not taken in `begin_gpu_composite_tile`'s `Normal` arm.
+        // The *same* GPU path, the same helper, the same viewport, on a
+        // fixture whose every layer is genuinely `Normal`: it dispatches
+        // real `Normal` blend passes, and the `Dissolve` counter must
+        // still read zero. A count taken in the shared `Normal` arm --
+        // which is where `Dissolve` layers actually land, `resolve_tile`
+        // having already reduced them -- would read 2 here and make the
+        // assertion above unable to distinguish "a Dissolve layer
+        // dispatched" from "some Normal layer dispatched". A separate
+        // store, so this cannot perturb the fixture above.
+        let (_control_dir, mut control_store) = real_tile_store();
+        let control = solid_root_stack(
+            &mut control_store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.25, 0.5, 0.75, 1.0],
+                ),
+                (
+                    "top",
+                    aurora_doc::BlendMode::Normal,
+                    0.5,
+                    [1.0, 0.0, 0.0, 1.0],
+                ),
+            ],
+        );
+        let (control_gpu, _control_cpu) =
+            gpu_and_cpu_all_texels(&context, &mut control_store, &control);
+        assert!(
+            control_gpu.iter().any(|&s| s != 0.0),
+            "setup: the control must really composite through the GPU path too, or its zero \
+             Dissolve count would be vacuous"
+        );
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve),
+            0,
+            "an all-Normal document must record no Dissolve dispatches -- a non-zero count here \
+             means the counter is being taken somewhere shared with the Normal path, so it can \
+             no longer prove a Dissolve layer specifically reached the GPU"
         );
     }
 
@@ -31483,7 +31730,7 @@ mod tests {
     ///    `backdrop_alpha > 0.0` predicate. It is *not* independently
     ///    observed here. Proving it would need branch-taken instrumentation
     ///    inside `aurora-render` itself, the same shape as
-    ///    `DARKEN_GPU_DISPATCHES`; deliberately not built in this round,
+    ///    `GpuBlendDispatches`; deliberately not built in this round,
     ///    and named as possible future strengthening in PLAN.md's 0.100.1
     ///    correction.
     ///
@@ -37894,7 +38141,7 @@ mod tests {
     /// zero means the encoder was finished and real GPU work executed,
     /// while the `Darken` dispatch count is the one signal that
     /// distinguishes "the blend arm ran" from "it silently fell back",
-    /// which is the gap `DARKEN_GPU_DISPATCHES` exists for.
+    /// which is the gap `GpuBlendDispatches` exists for.
     #[test]
     fn begin_gpu_composite_tile_issues_no_submit_for_a_tile_no_visible_layer_has_ever_painted() {
         let Some(context) = real_gpu_context() else {
@@ -37933,7 +38180,7 @@ mod tests {
         // Zeroed inside `real_gpu_context`'s own lock, so what is read
         // below is this call's work and nothing else's.
         let _ = take_gpu_composite_submit_count();
-        let _ = take_darken_gpu_dispatch_count();
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken);
 
         let mut compositor = aurora_render::TileCompositor::new(context.device());
         let mut budget = CompositeBudget::for_pass(&layers);
@@ -37960,7 +38207,7 @@ mod tests {
              visible layer"
         );
         assert_eq!(
-            take_darken_gpu_dispatch_count(),
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken),
             0,
             "and no blend pass may be recorded for it either -- the Darken layer's own arm is \
              the one that can be observed directly"
