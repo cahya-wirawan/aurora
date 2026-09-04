@@ -29730,9 +29730,13 @@ mod tests {
     ///   whole test binary on a real discrete GPU killed `Multiply` (2
     ///   tests), `Darken` (1) and — after the fixture change above —
     ///   `LinearDodge` (1), while `Lighten`, `Screen` and `Difference`
-    ///   each survived with 396 passed, 0 failed. `Multiply` and `Darken`
-    ///   are covered only incidentally, by pre-existing fixtures whose
-    ///   asymmetric formulas expose the swap even when fully opaque.
+    ///   each survived with 396 passed, 0 failed. `Multiply` (`Cb*Cs`) and
+    ///   `Darken` (`min(Cb,Cs)`) are themselves just as commutative as the
+    ///   three survivors' formulas — what actually catches the swap there
+    ///   is the same mechanism used above: each mode's own fixture layer
+    ///   (`l4`) already sits at a non-`1.0` opacity, for reasons unrelated
+    ///   to this gap, so the outer fold does not collapse to `out = B` and
+    ///   the swap is caught incidentally, not by formula asymmetry.
     ///   Those three survivors are a real, open, disclosed gap, not a
     ///   structural limit: the fix is the one applied here — set that
     ///   mode's own layer to a non-opaque opacity and re-derive the golden
