@@ -33,3 +33,11 @@ wgpu = { workspace = true }
 aurora-gpu = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 aurora-testkit = { workspace = true }
+# `benches/composite.rs` only -- the measurement half of the "is the CPU
+# blend-math loop worth parallelizing?" round. Deliberately a
+# dev-dependency: nothing shipped uses it.
+criterion = { workspace = true }
+
+[[bench]]
+name = "composite"
+harness = false

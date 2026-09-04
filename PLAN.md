@@ -20814,6 +20814,217 @@ severity choice.
   paths PLAN.md's M1.10 tables track — this round restores a budget the
   previous two rounds lost under load, it does not advance the gate.
 
+  **0.97.0 (2026-09-04) — Round B, measurement only: how much does the CPU
+  blend-math loop actually cost, and is it worth parallelizing? A
+  criterion benchmark lands, both pre-registered thresholds PASS, and the
+  implementation is deliberately *not* in this commit.**
+
+  Round A (0.96.0–0.96.2 above) parallelized `TileResidency::sync`'s
+  serialize loop, shipped a `panic = "abort"` crash path, shipped a ~2x
+  contended whole-frame regression, and ended with the frame-critical
+  caller routed back to the sequential path. The lesson it wrote down was
+  "measure the contended case *before* wiring, against a threshold fixed
+  in advance". This round applies that from the first commit: the
+  threshold below was written into this file **in the same commit as the
+  benchmark and before any parallel code exists at all**, so
+  "the bar was set before the result was known" is checkable from
+  `git log`, not merely asserted in prose. (Round A's own equivalent claim
+  cited a scratch file that was never committed — see the 0.96.1
+  correction above. This one cites a file in the tree.)
+
+  **The candidate.** `aurora_render::composite_layer_into`
+  (`crates/aurora-render/src/composite.rs`) — a `chunks_exact_mut(CHANNELS)`
+  loop over one whole 256×256 tile, one independent texel per iteration,
+  writes confined to each iteration's own `dst` chunk, no cross-texel
+  carry. It is the *only* structurally viable shape here, and that is a
+  finding in its own right rather than a preference:
+
+  - **Cross-layer is impossible.** Blend modes do not commute (two opaque
+    layers, bottom `Normal` 0.5 grey, top `Multiply` 0.4, folds to 0.2 in
+    the real bottom-to-top order and 0.5 swapped), *and*
+    `composite_roots_into_tile`'s loop body calls `resolve_tile`, which
+    takes `&mut aurora_tile::TileStore` and `&mut CompositeBudget`. Either
+    one alone rules it out.
+  - **Cross-tile is blocked exactly as Round A found for `sync`.**
+    `recomposite_visible_tiles`'s loop holds `&mut TileStore`, and
+    `TileStore` is `Send` but not `Sync` (its `BackgroundWriter` holds an
+    `mpsc::Receiver`). `CompositeBudget` is *not* the blocker — its node
+    count is recharged per tile by `next_tile` — which is worth stating so
+    a later round does not chase the wrong obstacle.
+
+  **The benchmark**: `crates/aurora-render/benches/composite.rs`,
+  `cargo bench -p aurora-render --bench composite`. Not in the CI gate
+  (CI runs no benches); it is a permanent, re-runnable measurement
+  artifact. All 26 real `BlendMode` variants (`aurora_doc`'s 27th,
+  `Dissolve`, is resolved to `Normal` in `aurora-app` before this crate
+  sees it), each in two conditions, because `composite_layer_into`
+  branches on `backdrop_alpha > 0.0` and folding onto a transparent
+  accumulator takes a short-circuit that skips the straightening division
+  entirely:
+
+  - `fold_onto_transparent` — the real *first*-root fold, onto
+    `transparent_tile()`.
+  - `fold_onto_opaque` — the real *second-root-onward* fold, which pays
+    the division and the full `blend_rgb` dispatch. **The thresholds are
+    read from this condition only.**
+
+  Deterministic xorshift64 input (the generator shape
+  `crates/aurora-tile/benches/tile_store.rs` already established), the
+  accumulator re-cloned in criterion's untimed `iter_batched_ref` setup on
+  every iteration (repeated folds against one accumulator drift its alpha
+  toward 1.0 and silently change which branch is being timed), and the
+  blend mode passed through `std::hint::black_box` so LLVM cannot
+  specialize the `match` for a compile-time constant the real
+  runtime-dispatched caller never has.
+
+  **The threshold, pre-registered.** Both limbs must hold; either one
+  failing is a NO-GO and a complete, reportable outcome.
+
+  - **T1 (per-call cost).** The criterion median for **both** `Normal`
+    **and** `Multiply` — the two modes that dominate real documents,
+    including Aurora's own default startup document; deliberately *not*
+    an exotic mode like `Color` or `HardMix` — in `fold_onto_opaque`, on
+    one 256×256 tile, must each be **≥ 2.0 ms**. Justification: 2.0 ms is
+    ~8x Round A's measured-insufficient dispatch unit of ~0.25 ms/tile,
+    which won idle and lost badly under contention. Anything below that is
+    even less likely to survive contention than Round A's already-marginal
+    case.
+  - **T2 (stage relevance).** T1's median × the real folds-per-frame must
+    be **≥ 20 %** of the CPU-fallback frame benchmark's `recomposite`
+    stage mean. If the blend math is not where `recomposite`'s time goes,
+    parallelizing it cannot help however expensive each call is.
+
+  **T1: PASS, but thinly — 2.0846 ms and 2.0572 ms against a 2.0 ms bar.**
+  RTX 3090 / Vulkan / DiscreteGpu box, i3-10100 (4 physical / 8 logical),
+  idle, release bench profile. Criterion's `[lower median upper]` for the
+  two deciding cells:
+
+  | mode | `fold_onto_transparent` | `fold_onto_opaque` |
+  |---|---|---|
+  | **`Normal`** | [1.7828 **1.7947** 1.8107] ms | [2.0608 **2.0846** 2.1124] ms |
+  | **`Multiply`** | [1.7569 **1.7721** 1.7903] ms | [2.0372 **2.0572** 2.0807] ms |
+
+  Both confidence intervals sit entirely above 2.0 ms, so the pass is not
+  an artifact of reading the point estimate — but **the margin is 2–4 %**,
+  and that is the single most important caveat on this verdict. A slightly
+  slower machine, a build without F16C, or a future cheaper `blend_rgb`
+  would move `Multiply` under the bar. Do not re-quote "T1 passed" without
+  this sentence.
+
+  Context from the other 24 modes (`fold_onto_opaque` medians, ms):
+  `Subtract` 2.0349 and `Exclusion` 2.0446 are the cheapest; the
+  separable family clusters at 2.03–2.22; `Overlay`/`HardLight`/
+  `PinLight`/`VividLight`/`Color`/`Luminosity` at 2.72–2.94; `HardMix`
+  3.0147, `SoftLight` 3.0638, `Saturation` 3.7097, `Hue` 3.7892 — the most
+  expensive mode is ~1.8x the cheapest. So mode choice moves the cost by
+  under 2x while the whole-tile scale (65,536 texels, ~31 ns/texel at
+  `Normal`) sets it. The per-texel cost is dominated by twelve
+  `half::f16` ↔ `f32` conversions plus one division, not by the blend
+  formula.
+
+  **T2: PASS, and by a wide margin — ~81 % against a 20 % bar.** Measured
+  on the same box with `AURORA_REQUIRE_GPU=1 cargo test --release
+  -p aurora-app -- --nocapture --test-threads=1
+  recomposite_and_present_loop_exercises_the_cpu_fallback_path` (n=12,
+  512×512 viewport, 300,000 px document, `Screen`-blend root so
+  `document_qualifies_for_gpu_compositing` is `false` and `gpu_tiles` is
+  0/frame on every frame — confirmed in the run, not assumed):
+
+  - `recomposite` stage mean **6.58 ms/frame** (75.4 % of an 8.74 ms mean
+    frame; `phase1 issue/cpu-composite` 6.58 ms, `phase2`/`phase3` 0.00).
+  - Its `phase1 split`: `cpu_fallback_real` **5.47 ms/frame**,
+    `cpu_fallback_empty` 1.11, both `gpu_issue_*` 0.00,
+    `mark_imbalance=0`.
+  - **Folds per frame: 31 folds / 12 frames = 2.583.** Counted directly
+    off `composite_roots_into_tile`'s own returned fold count, via a
+    throwaway `eprintln!` in `RecompositeTileCosts::mark_cpu_fallback`
+    run once and **reverted before this commit** — it is not in the tree
+    and no shipped file changed to obtain it. A second, unmodified run
+    produced the stage numbers above, so the instrumented run's own
+    printing cost never entered a quoted timing.
+
+  T1 × folds/frame = 2.0846 × 2.583 = **5.386 ms/frame** (`Normal`) and
+  2.0572 × 2.583 = **5.314 ms/frame** (`Multiply`), i.e. **81.9 %** and
+  **80.8 %** of the 6.58 ms `recomposite` mean. Both far over 20 %.
+
+  **An independent cross-check that the T2 arithmetic is not circular.**
+  The instrumentation's own `cpu_fallback_real` slot — measured, not
+  derived — is 5.47 ms/frame, and the modelled blend-math cost above is
+  5.31–5.39 ms/frame from a completely separate benchmark process. Using
+  the mode this fixture actually runs (`Screen`) and the condition it
+  actually hits (one root folded onto a transparent accumulator:
+  1.7910 ms) gives 4.63 ms/frame, leaving ~0.84 ms/frame for
+  `un_premultiply_in_place` plus `write_composited`'s residency check and
+  whole-tile compare. Both readings agree that **the blend loop is
+  essentially all of the real-fold CPU compositing cost**, which is the
+  substantive claim T2 was asked to test.
+
+  **Verdict: GO on both limbs, with the T1 margin disclosed as thin.**
+
+  **What this commit deliberately does *not* contain.** No `rayon` in
+  `aurora-render`'s `[dependencies]` (it is a `[dev-dependencies]` entry
+  for the bench only), no block-size constant, no splitter, no thread
+  pool, no dispatch seam, no feature flag. Phase 2's implementation is a
+  **separate, still-open round** and must not be read as done because the
+  gate opened. What that round owes, in order, and none of it is optional:
+
+  1. An owned, bounded `rayon` pool built with a `Result`-checked
+     `.build()` and a fallback-to-sequential arm — Round A's abort path
+     came from skipping exactly this (0.96.1).
+  2. A block size with `SAMPLES % BLOCK == 0` and `BLOCK % CHANNELS == 0`
+     so no texel straddles a boundary, pinned by a divisibility test
+     mirroring Round A's own.
+  3. **The contended re-measurement, before deciding where it is wired.**
+     Idle *and* under 8 competing `yes > /dev/null` processes, 3 runs
+     each, same methodology as 0.96.1/0.96.2. **If the contended
+     whole-frame mean regresses at all, the two frame-path call sites
+     (`composite_roots_into_tile`'s root fold and `resolve_tile`'s
+     `Group`-isolation fold) stay sequential**, exactly as 0.96.2 left
+     `sync`.
+  4. If (3) rules out the frame path, the only honest remaining home is
+     `composite_document` (the export/save path, reached from
+     `App`'s save at `crates/aurora-app/src/lib.rs:12495`) — which shares
+     `composite_roots_into_tile` with the frame path, so wiring it there
+     means threading a parallel-allowed flag down through
+     `composite_roots_into_tile`/`resolve_tile`, a real API change and not
+     a one-line call swap. If that is not worth its cost, the round must
+     ship *nothing* and report a modified NO-GO. An unused parallel arm is
+     a maintenance liability, not a hedge.
+
+  **What the measurement does and does not license.** It establishes that
+  the blend loop is (a) expensive per call and (b) where this fixture's
+  `recomposite` time actually goes. It establishes **nothing** about
+  whether splitting it across threads is a net win: Round A's per-call
+  cost also looked sufficient idle and still lost ~2x under contention,
+  and this round's dispatch unit, while ~8x Round A's, is still a
+  synchronous `install` on the frame thread. It is also **one
+  configuration** — Linux / Vulkan / NVIDIA / `x86_64`+F16C, one core
+  count, one 12-frame fixture with 2.583 folds/frame. A document with more
+  root layers folds proportionally more and would shift T2 further in
+  favour; a GPU-qualifying document skips this path for most tiles
+  entirely. And none of this advances the 60 FPS gate: the frame mean
+  measured here is 8.74 ms only because the viewport is 512×512, and the
+  M1.10 tables above are still the standing numbers.
+
+  No new production dependency, no new `unsafe`, no new lint exception, no
+  `unwrap`/`expect`/`panic`/`indexing_slicing` (the bench uses none —
+  it is covered by `clippy --all-targets`), no `scripts/layering.json`
+  edit (that checker sees only internal `aurora-*` crates) and no
+  `deny.toml` edit (`criterion` was already a workspace dependency).
+  **0 new tests** — a criterion bench is not a test and the workspace
+  count is unchanged. `cargo test --workspace` on this box counts **1,655
+  passing, 0 failing** across 40 result lines, before and after; note that
+  is higher than the 1,639 the 0.94.1 entry above quotes, so that figure
+  had already drifted stale independently of this round.
+
+  Gate run at this commit, all green: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py` (20 crates),
+  `python3 scripts/check_no_hardcoded_style.py` (28 files),
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
+  `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, `cargo deny check all`.
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
@@ -20965,6 +21176,31 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.97.0) — the CPU blend-math loop is measured, both
+pre-registered thresholds passed, and the implementation is the open
+follow-on.** `crates/aurora-render/benches/composite.rs` now measures
+`composite_layer_into` for real. **T1** (per-call median ≥ 2.0 ms in the
+`fold_onto_opaque` condition): `Normal` 2.0846 ms, `Multiply` 2.0572 ms —
+**PASS, by 2–4 %, and that thin margin is the headline caveat, not a
+footnote**. **T2** (per-frame aggregate ≥ 20 % of the `recomposite` stage
+mean): 2.583 folds/frame × T1 = 5.31–5.39 ms against a 6.58 ms stage mean,
+**~81 % — PASS wide**, and independently corroborated by the fixture's own
+`cpu_fallback_real` slot at 5.47 ms/frame. **Verdict: GO** — but this
+commit contains *no* parallel code, no `rayon` production dependency and no
+dispatch seam, deliberately, so that "the bar was set before the number
+existed" is checkable from `git log`. **The next round owes, in this order:
+an owned bounded pool with a `Result`-checked fallback (Round A's abort
+path came from skipping exactly this), a block size that divides a tile
+evenly, and — before wiring anything — the contended re-measurement.** If
+the contended whole-frame mean regresses at all, the two frame-path call
+sites stay sequential exactly as 0.96.2 left `sync`, and the only honest
+remaining home is `composite_document` (the export path), which shares
+`composite_roots_into_tile` with the frame path and so needs a flag
+threaded down — a real API change. If that is not worth its cost, the
+round ships nothing and reports a modified NO-GO. See the 0.97.0 entry in
+M1.10 for the full tables and every caveat. **None of this advances the
+60 FPS gate.**
 
 **Addendum 2026-09-04 (0.96.2) — the `rayon` tile-upload experiment is
 settled: the panic fix stays, the parallel arm comes off the frame path.**
