@@ -21640,6 +21640,51 @@ severity choice.
   finite/hostile test design above holds in both profiles rather than only
   in the one `cargo test` defaults to.
 
+  **0.99.0 (2026-09-04) — post-0.98.x end-to-end re-measurement, no code
+  change, diagnostic only — the per-call win does not show up at the whole-frame
+  level on this benchmark's fixture, and that is expected, not a
+  contradiction.** Real GPU hardware (`NVIDIA GeForce RTX 3090, Vulkan,
+  DiscreteGpu`, confirmed on every run), `AURORA_REQUIRE_GPU=1`, 3 fresh
+  runs of `recomposite_and_present_loop`:
+
+  | benchmark | whole-frame mean (3 runs) | vs. most recent matched baseline |
+  |---|---|---|
+  | GPU path, idle | 8.40 / 7.98 / 8.18 ms | 0.96.2's own idle table: 8.16 / 8.07 / 8.63 ms — **overlapping ranges, no detectable change** |
+  | CPU-fallback path, idle | 9.61 / 8.94 / 9.47 ms | no equally-recent matched baseline was captured for this exact fixture at 0.97.x; recorded here as the new reference point rather than compared |
+
+  **Why this is the expected result, not a null finding that undercuts
+  0.98.x's own per-call numbers.** Both fixtures fold exactly one root
+  layer per tile (`document_qualifies_for_gpu_compositing`'s admitted set
+  for the GPU-path fixture; the CPU-fallback fixture's single `Screen`
+  root, per its own doc). Every real fold in a single-root document is a
+  **first** fold — `composite_roots_into_tile` always seeds a transparent
+  accumulator — which is exactly `composite_layer_into`'s
+  `fold_onto_transparent` condition, the one 0.98.x's own benchmark
+  measured the *smallest* win in (and where three modes showed a possible
+  or real small regression, per the 0.98.1–0.98.3 corrections above). The
+  large 0.98.x wins (10–32%) are concentrated in `fold_onto_opaque` —
+  second-root-onward folds — which this benchmark's fixtures structurally
+  never reach. This is the identical structural fact 0.97.1 already used
+  to fail T1 for the single-root case; it applies here for the same
+  reason and is not a new discovery, just a confirmation that the two
+  findings are consistent with each other.
+
+  **What would actually show the win at the frame level**: a fixture with
+  two or more real root layers per tile, so at least one fold per tile
+  reaches `fold_onto_opaque`. No such fixture exists in this benchmark
+  suite today — building one is real, scoped work for a future round, not
+  something this diagnostic pass did.
+
+  **Verdict, stated plainly**: 0.98.x's per-call vectorization is real and
+  verified (unchanged by this entry). Its effect on *this specific
+  end-to-end benchmark* is not detectable, because the benchmark's own
+  fixtures don't exercise the code path 0.98.x's win is concentrated in.
+  The 60 FPS gate's standing numbers are therefore correctly left
+  unchanged by 0.98.x, and this re-measurement is why — not because the
+  optimization failed, but because this benchmark cannot see it. **Do not
+  read the GPU-path row above as "0.98.x has no effect"**; read it as
+  "this fixture was never going to show one."
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
@@ -21815,8 +21860,16 @@ round must still gate a parallel path on a document genuinely folding
 multiple roots, never parallelize every call. (4) **The 60 FPS gate is
 untouched by this round, explicitly.** This was a per-call, CPU-only
 constant-factor reduction on the compositing *fallback* path, measured on
-one tile per call; it was never re-measured end-to-end on a frame, and the
-M1.10 pan-while-painting tables remain the standing 60 FPS numbers.
+one tile per call. **Correction (0.99.0): it HAS now been re-measured
+end-to-end on a frame**, and the
+whole-frame numbers show no detectable change on either standing
+benchmark (GPU-path idle: 8.40/7.98/8.18 ms vs. 0.96.2's own 8.16/8.07/
+8.63 ms — overlapping) — expected, not a contradiction, because both
+fixtures are single-root documents whose only real folds are
+`fold_onto_transparent`, the smallest-win arm 0.98.x measured. See the
+new sub-entry above (right after this round's own gate results) for the
+full account. The M1.10 pan-while-painting tables remain the standing 60
+FPS numbers, now confirmed rather than merely assumed unaffected.
 (5) **What 0.98.1 itself corrected**, all reporting accuracy on 0.98.0's
 already-verified code (no implementation change): the three slightly
 slower `fold_onto_transparent` modes (ColorBurn, LinearLight, Color) were
