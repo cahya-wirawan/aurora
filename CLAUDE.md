@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.96.1`: roughly 113,400 lines across 20 crates, 1,655 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.96.2`: roughly 113,500 lines across 20 crates, 1,655 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
 Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
@@ -130,7 +130,7 @@ The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.96.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.96.2`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
@@ -220,10 +220,19 @@ budget**:
 | Same, CPU fallback (smaller viewport) | 16.7 ms | 22.6 ms | **54.1 ms** (~3.2×) |
 
 **This table is the 0.39.0 figure and is now well behind the code.** The same
-two benchmarks have since been re-measured repeatedly on a real RTX 3090 —
-most recently in 0.96.0, where the GPU path's mean frame is 7.5–7.7 ms and its
-worst-of-40 lands in the 21–30 ms range. PLAN.md's 0.96.0 entry is the current
-real-hardware record, and its 0.94.1 entry explains why a "p99" from these
+two benchmarks have since been re-measured repeatedly on a real RTX 3090. On an
+**idle** machine the GPU path's mean frame is ~7.5–8.6 ms with a worst-of-40 in
+the 21–30 ms range. **Do not read that as the whole picture: every one of those
+numbers is measured with the benchmark's caller thread otherwise idle, which
+flatters it.** Re-measured with 8 competing CPU-bound threads — ordinary
+desktop multitasking, not an adversarial setup — the same GPU-path whole-frame
+mean roughly doubles, to ~15–18 ms, i.e. at or over the 16.7 ms budget; and
+0.96.0/0.96.1's parallel tile-upload serializer pushed it to ~34–37 ms, which
+is why 0.96.2 routed the frame path back to the sequential serializer. Quote
+the contended figure alongside the idle one or the claim is misleading.
+PLAN.md's **0.96.2** entry is the current real-hardware record (its 0.96.1
+entry has the full contended tables), and its 0.94.1 entry explains why a "p99"
+from these
 n=40 benchmarks is a single-sample order statistic that must not be quoted as
 a ratio; read those, not this row, for where the numbers stand. The gate is
 still missed either way, which is why this section stays — and `recomposite`

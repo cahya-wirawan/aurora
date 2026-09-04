@@ -20620,6 +20620,19 @@ severity choice.
     editor that must stay responsive while a background tile writer, `tokio`
     I/O and the user's other applications are running — which is the normal
     case, not the adversarial one.
+
+    **RESOLVED in 0.96.2 — do not re-litigate this.** The third option was
+    taken: `TileResidency::sync` calls the sequential core
+    (`serialize_premultiplied_le_bytes`) directly, and the parallel splitter,
+    the bounded pool and the whole panic-safety mechanism stay in place for
+    `upload_mip` and for a future load-sensing design. The deciding evidence
+    is the *whole-frame* numbers in this entry's own table, not the
+    `upload_sync` stage in isolation: idle 8.16/8.07/8.63 ms sequential →
+    7.89/7.69/7.46 ms parallel (a ~0.5 ms win in a case already inside the
+    16.7 ms budget), loaded 14.59/17.95/17.59 ms sequential →
+    34.34/34.57/36.70 ms parallel (~2.1x *over* budget where the sequential
+    path was at or near it). See the 0.96.2 entry below for the change and
+    its re-measurement.
   - **A load-sensing heuristic was considered and deliberately not built**
     inside a patch release. There is no cheap, portable per-frame read of
     "is this machine busy": `getloadavg` is a 1-minute average and not in
@@ -20709,6 +20722,97 @@ severity choice.
   are all still untouched, and the serialized bytes are unchanged on every
   path. 2 tests added, 2 changed, 0 removed (1,653 → 1,655 workspace-wide;
   `aurora-gpu` 74 → 76).
+
+  **0.96.2 (2026-09-04) — the frame path goes back to the sequential
+  serializer; the parallel arm stays, unused there, pending a load-sensing
+  design.** This is the decision the 0.96.1 entry above said the next round
+  owed, made and implemented rather than deferred again. An independent
+  review read that entry's *whole-frame* numbers — not the `upload_sync`
+  stage in isolation — and reached a conclusion the entry itself had
+  half-written ("not obviously a good trade") without acting on:
+
+  | condition | whole-frame mean, sequential | whole-frame mean, 0.96.1 parallel/bounded |
+  |---|---|---|
+  | idle | 8.16 / 8.07 / 8.63 ms | 7.89 / 7.69 / 7.46 ms |
+  | 8 competing CPU-bound threads | 14.59 / 17.95 / 17.59 ms | **34.34 / 34.57 / 36.70 ms** |
+
+  Read as a verdict rather than a table: the parallel path buys ~0.5 ms in a
+  condition that was **already inside** the 16.7 ms budget, and costs ~17 ms
+  in a condition where the sequential path was **at or near** budget and the
+  parallel one is **~2.1x over** it. Desktop multitasking is the normal case
+  for an image editor, not an adversarial one. Shipping that as the default
+  while the round's own text called it a bad trade was the specific thing
+  found wrong; disclosure is not a substitute for a decision when the
+  measured effect is harm under a normal condition (as opposed to the
+  no-gain/no-harm null results elsewhere in this session, where disclosure
+  *was* the whole appropriate response).
+
+  **What changed, exactly one thing.** `TileResidency::sync` now calls
+  `serialize_premultiplied_le_bytes` — the sequential core — directly,
+  instead of `write_premultiplied_le_bytes`. That is the same function
+  0.96.1's fallback already ran, the same function every equivalence test
+  pins, and the same code that produced every upload byte before 0.96.0, so
+  it is a routing change and not a new implementation.
+
+  **What deliberately did *not* change.** All of 0.96.1's panic-safety work
+  stands untouched: the owned, explicitly bounded pool, the captured
+  `ThreadPoolBuildError`, the warn-once fallback, `SERIALIZER_MAX_THREADS`,
+  `serializer_pool_threads`'s `available_parallelism() - 1` clamp, and both
+  of their tests. So do `split_premultiplied_le_bytes`,
+  `write_premultiplied_le_bytes_on`, `write_premultiplied_le_bytes`, the
+  size guard, and every bit-exactness and boundary test around them. The
+  splitter is still **live production code** — `TileResidency::upload_mip`
+  reaches it through `extend_premultiplied_le_bytes`, taking the parallel arm
+  at mip levels 1 and 2 and the inline arm at level 3 — so the pool-init
+  abort path 0.96.1 closed is still reachable and its fix is still
+  load-bearing, not vestigial. Nothing was reverted, deleted, or
+  feature-gated out.
+
+  **Where the decision is written down.** At `sync`'s call site, in the
+  code, with the numbers above and the mechanism (a synchronous `install`
+  blocks the frame thread until the slowest of up to 64 blocks gets a
+  scheduler slice; the sequential walk only ever needs one), plus what a
+  future round must bring before re-enabling it there: either a load-sensing
+  design that can cheaply distinguish a contended machine from an idle one
+  per frame, or measurement across several core counts showing no contended
+  regression at all. Neither exists; `getloadavg` is a 1-minute average and
+  not in `std`, and a per-frame timing feedback loop is a design, not a
+  patch. The 0.96.1 entry above is tagged **RESOLVED** in place so the
+  open-decision wording there cannot be re-litigated as if still open.
+
+  **Re-measured, not assumed.** Same machine, same command, same
+  methodology as 0.96.1 (RTX 3090 / Vulkan / DiscreteGpu; i3-10100, 4
+  physical / 8 logical cores; 3 runs per cell; "load" = 8 `yes > /dev/null`
+  processes started 1 s before the run and killed after it):
+
+  GPU path, n=40, whole-frame mean and the `upload_sync` stage, with the two
+  0.96.1 rows repeated from the table in that entry for comparison:
+
+  | config | idle whole-frame mean | idle `upload_sync` | **loaded whole-frame mean** | loaded `upload_sync` |
+  |---|---|---|---|---|
+  | sequential (pre-0.96.0) | 8.16 / 8.07 / 8.63 | 1.90 / 1.90 / 2.00 | **14.59 / 17.95 / 17.59** | 3.45 / 3.91 / 4.22 |
+  | 0.96.1, parallel bounded to 4 | 7.89 / 7.69 / 7.46 | 1.47 / 1.56 / 1.41 | **34.34 / 34.57 / 36.70** | 19.88 / 20.26 / 22.12 |
+  | **0.96.2, sequential on the frame path** | **8.31 / 8.08 / 8.16** | 1.97 / 1.99 / 1.96 | **17.65 / 18.45 / 17.80** | 4.00 / 4.94 / 4.23 |
+
+  **The regression is gone, and the idle case did not pay for it beyond what
+  was expected.** Loaded whole-frame mean 34–37 ms → 17.7–18.5 ms, back in
+  the pre-0.96.0 sequential band (14.6–18.0 ms) rather than ~2.1x over the
+  budget; loaded `upload_sync` 19.9–22.1 ms → 4.0–4.9 ms, against the
+  sequential baseline's 3.5–4.2 ms. Idle whole-frame mean 7.5–7.9 ms →
+  8.1–8.3 ms, i.e. the ~0.5 ms parallel win is given back exactly as
+  predicted and the result sits on the sequential baseline's own 8.1–8.6 ms
+  — which is the expected outcome of routing back to code that already
+  existed, not a new cost. The control line is byte-identical across all six
+  runs (`mean=6.8 tiles/frame (min=2 max=20), mean=3.41 MB/frame`), so none
+  of this is upload-volume drift. The GPU-path loaded p99 (31.5 / 66.1 /
+  51.8 ms) stays high and noisy at n=40 — read 0.94.1 on why a single-sample
+  order statistic from this benchmark is not a ratio to quote.
+
+  **One configuration, still.** Linux / Vulkan / NVIDIA / `x86_64`+F16C, one
+  core count, `yes` as a crude stand-in for real application load. Neither
+  Metal nor DX12 is measured, and the 60 FPS gate is still missed on the
+  paths PLAN.md's M1.10 tables track — this round restores a budget the
+  previous two rounds lost under load, it does not advance the gate.
 
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
@@ -20861,6 +20965,34 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.96.2) — the `rayon` tile-upload experiment is
+settled: the panic fix stays, the parallel arm comes off the frame path.**
+Two things landed in 0.96.x and they should be read separately. (1) **The
+panic fix is real and permanent.** 0.96.0 reached `rayon`'s implicit global
+pool, whose lazy init `.expect()`s its own `Result`, so a machine that cannot
+spawn threads (`RLIMIT_NPROC`, cgroup `pids.max`, systemd `TasksMax`, memory
+pressure — reproduced under `ulimit -u`) aborted under the release profile's
+`panic = "abort"`, on a path that ran every frame including the default
+startup document's. 0.96.1 replaced it with an owned, bounded pool whose
+`build()` failure degrades to the sequential serializer. That is unchanged
+and stays. (2) **The performance experiment it was part of is closed as a
+loss, not carried forward as a live default.** Parallelizing the per-tile
+serialize loop won ~0.5 ms of whole-frame mean on an idle machine, where the
+16.7 ms budget already passed, and cost ~17 ms under 8 competing CPU-bound
+threads (whole-frame mean 14.59/17.95/17.59 ms sequential →
+34.34/34.57/36.70 ms parallel, ~2.1x over budget) — a net loss against the
+project's own 60 FPS gate under a condition an image editor meets normally.
+0.96.2 therefore routes `TileResidency::sync` back to the sequential core,
+keeping the splitter, the bounded pool and every test in place for
+`upload_mip` and for future measurement. **The named follow-on, if this lever
+is ever revisited:** a load-sensing design that can distinguish a contended
+machine from an idle one cheaply enough to ask per frame (`getloadavg` is a
+1-minute average and not in `std`; a per-frame timing feedback loop is a
+design, not a patch), or measurement across several core counts showing no
+contended regression. Absent one of those, the frame path stays sequential —
+this is decided, not open. Full tables and reasoning: the 0.96.1 and 0.96.2
+entries under M1.10.
 
 **Addendum 2026-09-02 (0.71.4) — the cross-crate frame agreement mask
 persistence hinges on is finally tested, and three doc-comment claims

@@ -87,14 +87,15 @@ const MIP_LEVELS: u32 = 4;
 ///
 /// **Both real upload paths still bottom out in the same one function**,
 /// which is what matters here, but as of 0.96.0 neither reaches it the way
-/// it used to and the chains differ by one hop:
-/// [`TileResidency::sync`] calls [`write_premultiplied_le_bytes`] →
-/// [`serialize_premultiplied_le_bytes`], and
-/// [`TileResidency::upload_mip`] calls
-/// [`extend_premultiplied_le_bytes`] → `write_premultiplied_le_bytes` →
-/// `serialize_premultiplied_le_bytes`. (Through 0.96.0 this paragraph said
-/// both paths call `extend_premultiplied_le_bytes`; that stopped being true
-/// when 0.96.0 moved `sync` off it, and is corrected in 0.96.1.)
+/// it used to and the chains differ in length:
+/// [`TileResidency::sync`] calls [`serialize_premultiplied_le_bytes`]
+/// directly — the sequential core, deliberately, see that call site for the
+/// measurement (0.96.2) — and [`TileResidency::upload_mip`] calls
+/// [`extend_premultiplied_le_bytes`] → [`write_premultiplied_le_bytes`] →
+/// `serialize_premultiplied_le_bytes`, which is where the `rayon` split is
+/// still reached. (Through 0.96.0 this paragraph said both paths call
+/// `extend_premultiplied_le_bytes`; that stopped being true when 0.96.0
+/// moved `sync` off it, and was corrected in 0.96.1.)
 /// The two paths did not share an implementation at all between 0.92.0 and
 /// 0.92.1 — `upload_mip` still ran this function — and that split is
 /// exactly what made them disagree on a double-NaN texel while writing the
@@ -176,18 +177,21 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// them into `out` **in place** rather than appending.
 ///
 /// **This is the hot function**, and as of 0.96.0 it is the *only* place
-/// real upload bytes are produced — reached either in parallel, through
-/// [`write_premultiplied_le_bytes`]'s `rayon` splitter, or sequentially
-/// through that same function's fallback. The substantive *why* below (the
+/// real upload bytes are produced. As of 0.96.2 the frame path
+/// ([`TileResidency::sync`]) calls it *directly*, one tile at a time on the
+/// frame thread; [`TileResidency::upload_mip`] still reaches it through
+/// [`write_premultiplied_le_bytes`], either in parallel via that function's
+/// `rayon` splitter or sequentially via its fallback. See `sync`'s call site
+/// for why the frame path does not take the parallel arm. The substantive
+/// *why* below (the
 /// 0.68.0 buffer history, the 0.88.1 measurement that named this loop
 /// rather than the bus, the 0.89.0 append batching, the `wide`-vs-`half`
 /// crate evaluation, and exactly which bit-exactness guarantees hold
 /// against [`premultiply_rgba`]) was moved here in 0.96.1 from
 /// [`extend_premultiplied_le_bytes`], which carried it while it was
-/// [`TileResidency::sync`]'s entry point and no longer is — `sync` calls
-/// [`write_premultiplied_le_bytes`], and `extend_premultiplied_le_bytes`
-/// is now a `Vec`-sizing wrapper whose only caller is
-/// [`TileResidency::upload_mip`].
+/// [`TileResidency::sync`]'s entry point and no longer is —
+/// `extend_premultiplied_le_bytes` is now a `Vec`-sizing wrapper whose only
+/// caller is [`TileResidency::upload_mip`].
 ///
 /// # Why one buffer, written in place (0.68.0)
 ///
@@ -376,9 +380,10 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// # Panic-freedom, argued rather than asserted
 ///
 /// The release profile
-/// sets `panic = "abort"`, and as of 0.96.0 this function also runs inside
-/// a `rayon` worker closure, so a panic here is a process abort rather
-/// than a recoverable error. There are six places a panic could
+/// sets `panic = "abort"`, and as of 0.96.0 this function can also run inside
+/// a `rayon` worker closure (on [`TileResidency::upload_mip`]'s path; the
+/// frame path calls it inline as of 0.96.2), so a panic here is a process
+/// abort rather than a recoverable error. There are six places a panic could
 /// come from — 0.96.0's own version of this list named four, and both
 /// omissions are called out below — and none of them can fire:
 ///
@@ -422,10 +427,13 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 ///    threads (`RLIMIT_NPROC`, a cgroup `pids.max`, systemd `TasksMax`, or
 ///    plain memory pressure; reproduced here with `ulimit -u`) panicked
 ///    inside `rayon`, i.e. `SIGABRT` under `panic = "abort"`, on a path
-///    that runs on every frame including the default startup document's.
-///    0.96.1 replaced the global pool with an **owned, explicitly bounded**
-///    one whose `build()` `Result` is captured, falling back to calling
-///    *this* function directly when it fails. See
+///    that at the time ran on every frame including the default startup
+///    document's. 0.96.1 replaced the global pool with an **owned, explicitly
+///    bounded** one whose `build()` `Result` is captured, falling back to
+///    calling *this* function directly when it fails; 0.96.2 additionally
+///    took the frame path off the pool entirely, so the abort window is now
+///    narrower still — but the fix stays, because `upload_mip` is real code
+///    and the frame path is one measurement away from being routed back. See
 ///    [`write_premultiplied_le_bytes`] and [`serializer_pool`] for the
 ///    mechanism and the test that exercises the fallback.
 ///
@@ -535,14 +543,21 @@ fn write_texel_le_bytes(r: f16, g: f16, b: f16, a: f16, dest: &mut [u8]) {
 /// `std::thread::available_parallelism()` — every logical core — with no
 /// bound. On an otherwise idle machine that is the fastest choice and it
 /// measured as one (PLAN.md's 0.96.0 table). Under **CPU contention** it is
-/// the opposite: [`TileResidency::sync`] calls this synchronously on the frame
-/// thread and blocks until the *slowest* of up to 64 blocks finishes, so
-/// every worker that has to wait for a scheduler time-slice adds to the
-/// frame's critical path, while the sequential code it replaced only ever
-/// needed one core's slice. An independent review measured that as a **4-5×
-/// regression** with 8 competing CPU-bound threads on a 4-physical/8-logical
-/// core box: `upload_sync` mean 28.5 ms against the sequential path's
-/// 5.2 ms, i.e. one stage alone exceeding the whole 16.7 ms frame budget.
+/// the opposite: a caller that dispatches onto the pool synchronously blocks
+/// until the *slowest* of up to 64 blocks finishes, so every worker that has
+/// to wait for a scheduler time-slice adds to that caller's critical path,
+/// while the sequential code it replaced only ever needed one core's slice.
+/// An independent review measured that as a **4-5× regression** with 8
+/// competing CPU-bound threads on a 4-physical/8-logical core box:
+/// `upload_sync` mean 28.5 ms against the sequential path's 5.2 ms, i.e. one
+/// stage alone exceeding the whole 16.7 ms frame budget.
+///
+/// **The bound is no longer the only mitigation** (0.96.2): the frame path,
+/// [`TileResidency::sync`], now calls the sequential core directly and never
+/// touches this pool, because bounding it cut the contended regression by
+/// only about a quarter. The ceiling stays for the callers that do use the
+/// pool ([`TileResidency::upload_mip`]) and for whatever load-sensing design
+/// eventually re-enables it on the frame path.
 ///
 /// Four is chosen as "a small number that is still real parallel width":
 /// it is the physical core count of the machine both the win and the
@@ -580,8 +595,13 @@ fn serializer_pool_threads() -> usize {
 /// building it. Anything but `is_unsupported()` (which covers wasm, not a
 /// spawn failure) therefore panics *inside `rayon`* — and the release
 /// profile sets `panic = "abort"`, so that is `SIGABRT` with no unwind, no
-/// save and no crash dialog, on a path [`TileResidency::sync`] runs every frame
-/// including for the app's own default startup document. Reproduced under
+/// save and no crash dialog — and in 0.96.0/0.96.1 it sat on a path
+/// [`TileResidency::sync`] ran every frame, including for the app's own
+/// default startup document. (0.96.2 took `sync` off the pool for unrelated
+/// performance reasons, which shrinks the exposure but does not retire this
+/// fix: [`TileResidency::upload_mip`] still dispatches onto the pool, and the
+/// frame path is deliberately kept one routing decision away from doing so
+/// again.) Reproduced under
 /// `ulimit -u`, and equally reachable from a cgroup `pids.max`, systemd
 /// `TasksMax`, or memory pressure:
 ///
@@ -711,7 +731,13 @@ fn serializer_pool() -> Option<&'static rayon::ThreadPool> {
 /// mean of ~6.8 tiles per frame. PLAN.md's 0.96.0 entry carries the costed
 /// across-tile alternative that was considered and not taken, together with
 /// that round's measured result; its 0.96.1 entry carries the contended
-/// re-measurement and the pool bound that came out of it.
+/// re-measurement and the pool bound that came out of it; and its 0.96.2
+/// entry records the resulting decision — the frame path serializes inline
+/// and this splitter serves [`TileResidency::upload_mip`] only, pending a
+/// load-sensing design. Note what that makes the parallel-width argument
+/// above: an argument about *shape*, not a live claim about frame time. An
+/// across-tile scheme would inherit the same contended problem this one has,
+/// at more cost, so nothing here reopens it.
 fn split_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     texels
         .par_chunks(BLOCK_SAMPLES)
@@ -729,19 +755,29 @@ fn split_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
 /// can drive the `None` arm — the arm a machine that cannot spawn threads
 /// takes — with the identical dispatch a real frame uses.
 ///
+/// **Not on the frame path (0.96.2).** [`TileResidency::sync`] called this
+/// through [`write_premultiplied_le_bytes`] in 0.96.0/0.96.1 and no longer
+/// does: it calls [`serialize_premultiplied_le_bytes`] directly, because the
+/// parallel arm was measured regressing the *whole frame* ~2.1x under
+/// ordinary CPU contention (34.34/34.57/36.70 ms mean against the sequential
+/// path's 14.59/17.95/17.59 ms) to buy ~0.5 ms idle, where the budget already
+/// passed. `sync`'s own call site carries the numbers and the argument; this
+/// function and everything below it stay in place, correct, tested, and used.
+///
 /// **The size guard.** A `texels` no longer than one [`BLOCK_SAMPLES`]
 /// yields a single `par_chunks` block, so there is no parallel width to
 /// win; taking it inline skips `install`'s job injection and latch wait
-/// entirely. Real traffic: `sync` always passes a whole tile (64 blocks,
-/// parallel), and [`TileResidency::upload_mip`] passes 16 blocks at mip level 1,
-/// 4 at level 2 and exactly 1 at level 3 (which lands here). A *load*-
-/// sensing heuristic was considered for 0.96.1 and deliberately not built:
-/// there is no cheap, portable way to read "is this machine busy right now"
-/// from inside a frame — `getloadavg` is a 1-minute average and Linux-only
-/// in `std`'s absence, and a per-frame timing feedback loop is a design,
-/// not a patch. Bounding the pool ([`SERIALIZER_MAX_THREADS`]) plus honest
-/// disclosure of the residual contended regression was the accepted
-/// outcome; PLAN.md's 0.96.1 entry states it.
+/// entirely. Real traffic, therefore, is all
+/// [`TileResidency::upload_mip`]'s: 16 blocks at mip level 1 (parallel), 4 at
+/// level 2 (parallel) and exactly 1 at level 3, which lands on the inline
+/// arm. A *load*-sensing heuristic was considered for 0.96.1 and
+/// deliberately not built: there is no cheap, portable way to read "is this
+/// machine busy right now" from inside a frame — `getloadavg` is a 1-minute
+/// average and Linux-only in `std`'s absence, and a per-frame timing feedback
+/// loop is a design, not a patch. Bounding the pool
+/// ([`SERIALIZER_MAX_THREADS`]) was 0.96.1's mitigation and was not enough,
+/// which is what 0.96.2's routing change settles; PLAN.md's 0.96.1 and
+/// 0.96.2 entries state both.
 fn write_premultiplied_le_bytes_on(
     pool: Option<&rayon::ThreadPool>,
     texels: &[f16],
@@ -755,8 +791,13 @@ fn write_premultiplied_le_bytes_on(
     }
 }
 
-/// What every real upload path calls: [`write_premultiplied_le_bytes_on`]
-/// against the process's own [`serializer_pool`].
+/// [`write_premultiplied_le_bytes_on`] against the process's own
+/// [`serializer_pool`].
+///
+/// Through 0.96.1 this was "what every real upload path calls". As of 0.96.2
+/// its only production caller is [`extend_premultiplied_le_bytes`], i.e.
+/// [`TileResidency::upload_mip`]; [`TileResidency::sync`] bypasses it for the
+/// sequential core, for the reason its call site records.
 fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     write_premultiplied_le_bytes_on(serializer_pool(), texels, out);
 }
@@ -772,8 +813,8 @@ fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
 /// caller is [`TileResidency::upload_mip`] (which has no call site in
 /// `aurora-app` yet — see that method's own doc for why what it writes is
 /// not currently visible); [`TileResidency::sync`] calls
-/// `write_premultiplied_le_bytes` directly, against a buffer it has already
-/// sized to exactly one tile and reuses.
+/// [`serialize_premultiplied_le_bytes`] directly, against a buffer it has
+/// already sized to exactly one tile and reuses.
 ///
 /// **The substantive *why* is not here any more.** Through 0.96.0 this doc
 /// comment carried the 0.68.0 one-buffer history, the 0.88.1 measurement
@@ -1469,15 +1510,15 @@ impl TileResidency {
         let mut stats = SyncStats::default();
         let mut bytes_left = byte_budget;
         // *One* buffer, reused across every tile this call uploads, and
-        // the only one: `write_premultiplied_le_bytes` premultiplies as
-        // it serializes, so the store's own tile stays straight alpha
+        // the only one: `serialize_premultiplied_le_bytes` premultiplies
+        // as it serializes, so the store's own tile stays straight alpha
         // without a separate mutable copy of it. 0.68.0 had a staging
         // `Vec<f16>` here *and* a fresh `Vec<u8>` per tile, which is the
         // half-megabyte copy and the per-tile allocation the staging
         // buffer's own comment claimed to be avoiding.
         //
         // **Allocated at full length once (0.96.0), not cleared and
-        // re-grown per tile.** The parallel serializer writes into a
+        // re-grown per tile.** The serializer writes into a
         // pre-sized `&mut [u8]` rather than appending, so this buffer has
         // to be `TILE_BYTES` long before the first tile, not merely
         // reserved. That makes it a *reused* buffer in the literal sense —
@@ -1621,7 +1662,46 @@ impl TileResidency {
                 // convention (it is the test-only reference now; this
                 // function is what actually applies it, on both this path
                 // and `upload_mip`'s). The store's own tile is untouched.
-                write_premultiplied_le_bytes(tile.texels(), &mut bytes);
+                //
+                // **The sequential core, called directly, deliberately
+                // (0.96.2).** `write_premultiplied_le_bytes` -- which
+                // dispatches onto the bounded `rayon` pool when there is
+                // parallel width to win -- is still here, still tested, and
+                // still what `upload_mip` uses. This frame-critical path does
+                // not use it, and that is a measured decision rather than an
+                // oversight:
+                //
+                // - **Idle**, the parallel arm won ~0.5 ms of whole-frame mean
+                //   (8.16/8.07/8.63 ms sequential -> 7.89/7.69/7.46 ms
+                //   parallel), in a case that was already comfortably inside
+                //   the 16.7 ms budget.
+                // - **Under 8 competing CPU-bound threads** on the same box (4
+                //   physical / 8 logical cores) it *lost* the budget outright:
+                //   whole-frame mean 14.59/17.95/17.59 ms sequential ->
+                //   34.34/34.57/36.70 ms parallel, i.e. ~2.1x over budget on a
+                //   path that had been at or near it. `upload_sync` alone rose
+                //   from ~3.9 ms to ~20.8 ms. Bounding the pool to four
+                //   workers (0.96.1) cut that by about a quarter and nowhere
+                //   near removed it.
+                //
+                // The cause is structural, not a tuning miss: this call is
+                // synchronous on the frame thread, so `install` blocks until
+                // the *slowest* of up to 64 blocks gets a scheduler slice,
+                // while the sequential walk only ever needs one. Desktop
+                // multitasking is the normal case for an editor, so trading a
+                // ~0.5 ms win where the budget passed for a ~17 ms loss where
+                // it then fails is net-negative against the project's own
+                // 60 FPS gate.
+                //
+                // **What would justify putting the parallel arm back here**:
+                // either a load-sensing design that can tell a contended
+                // machine from an idle one cheaply enough to ask per frame
+                // (`getloadavg` is a 1-minute average and not in `std`; a
+                // per-frame timing feedback loop is a design, not a patch), or
+                // measurement across several core counts showing no contended
+                // regression at all. Neither exists yet. PLAN.md's 0.96.1 and
+                // 0.96.2 entries carry the full tables.
+                serialize_premultiplied_le_bytes(tile.texels(), &mut bytes);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &self.texture,
@@ -2675,9 +2755,10 @@ mod tests {
         );
     }
 
-    /// The fused serializer and the in-place one must agree exactly, or
-    /// `sync` (which uses the fused one) and `upload_mip` (which uses the
-    /// in-place one) would leave the same atlas texture in two different
+    /// The fused serializer and the scalar reference must agree exactly, or
+    /// the two upload paths (`sync`, which since 0.96.0 calls the in-place
+    /// core directly, and `upload_mip`, which appends through the fused
+    /// wrapper) would leave the same atlas texture in two different
     /// alpha conventions. Bit-for-bit, over a buffer carrying every
     /// interesting alpha: opaque, half, zero, and a faint one near the
     /// bottom of `f16`'s range.
@@ -2764,9 +2845,10 @@ mod tests {
     /// `0.125 = 2^-3 -> 0x3000`, `0.0625 = 2^-4 -> 0x2C00`,
     /// `0.03125 = 2^-5 -> 0x2800`.
     ///
-    /// It also repeats the call after `out.clear()`, which is the reuse
-    /// pattern [`TileResidency::sync`] actually uses: one buffer, cleared
-    /// and refilled per tile. A batched write that carried any state
+    /// It also repeats the call after `out.clear()`, the buffer-reuse
+    /// pattern [`TileResidency::sync`] used through 0.89.x and still uses in
+    /// spirit (one buffer per call, refilled per tile — pre-sized rather
+    /// than cleared since 0.96.0). A batched write that carried any state
     /// between calls would diverge on the second fill.
     #[test]
     fn the_fused_serializer_writes_each_texel_as_eight_little_endian_bytes_in_rgba_order() {
@@ -2814,8 +2896,8 @@ mod tests {
     /// every texel, decoded straight back out of the bytes it wrote.
     ///
     /// This exists because of a real gap found reviewing 0.89.0.
-    /// `extend_premultiplied_le_bytes` is what [`TileResidency::sync`]
-    /// calls on every frame, yet every test it had either compared it
+    /// `extend_premultiplied_le_bytes` was then what [`TileResidency::sync`]
+    /// called on every frame, yet every test it had either compared it
     /// against [`premultiply_rgba`] (its *cold* sibling, reached only
     /// from `upload_mip`) or used two texels whose premultiplied colours
     /// happened to be identical. So the equivalent of
@@ -3558,11 +3640,16 @@ mod tests {
         );
     }
 
-    /// The real upload shape: exactly one whole tile, which is what
-    /// [`TileResidency::sync`] hands the serializer on every frame.
+    /// A whole tile: [`TileResidency::sync`]'s per-frame shape, and the
+    /// largest input the splitter can be handed.
     ///
     /// [`SAMPLES`] is `BLOCK_SAMPLES * 64`, so this is the 64-task case the
-    /// parallelism was added for — no short block, no remainder.
+    /// parallelism was added for — no short block, no remainder. Kept, and
+    /// still exactly the right coverage, even though 0.96.2 routed `sync`
+    /// itself onto the sequential core: the splitter is still live code
+    /// ([`TileResidency::upload_mip`]) and is still the arm a future
+    /// load-sensing design would re-enable here, so a whole tile is the
+    /// bit-exactness case that must keep holding.
     #[test]
     fn the_parallel_serializer_matches_the_scalar_reference_for_a_whole_tile() {
         let source = varied_fixture(SAMPLES);
@@ -3809,9 +3896,11 @@ mod tests {
 
     /// The pool is **bounded** (0.96.1, Issue 2): `rayon`'s global default
     /// takes every logical core, which measured as a 4-5× `upload_sync`
-    /// regression under 8 competing CPU-bound threads because
-    /// [`TileResidency::sync`] blocks the frame thread until the slowest
-    /// block finishes.
+    /// regression under 8 competing CPU-bound threads because a synchronous
+    /// `install` blocks its caller until the slowest block finishes — and
+    /// through 0.96.1 that caller was [`TileResidency::sync`], on the frame
+    /// thread. The bound outlives 0.96.2's routing change because
+    /// [`TileResidency::upload_mip`] still dispatches onto this pool.
     ///
     /// Pinned here rather than argued: the worker count never exceeds
     /// [`SERIALIZER_MAX_THREADS`], never exceeds the machine's own logical

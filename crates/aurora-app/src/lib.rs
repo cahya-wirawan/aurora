@@ -29423,16 +29423,22 @@ mod tests {
         ///   `serialize_premultiplied_le_bytes` -- an
         ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
         ///   every texel of every dirty tile. That loop was
-        ///   single-threaded with no `rayon` when this was probed;
-        ///   **since 0.96.0 it is driven in parallel across fixed-size
-        ///   blocks of one tile** (64 work items for a whole tile), so the
-        ///   share below is stale in that direction too. (The probe named
+        ///   single-threaded with no `rayon` when this was probed, and
+        ///   **is single-threaded on this path again as of 0.96.2**. 0.96.0
+        ///   drove it in parallel across fixed-size blocks of one tile (64
+        ///   work items for a whole tile); that won ~0.5 ms of whole-frame
+        ///   mean on an idle machine and *lost* the 16.7 ms budget under
+        ///   ordinary CPU contention (whole-frame mean ~34-37 ms against
+        ///   ~15-18 ms sequential), so 0.96.2 routed `sync` back to the
+        ///   sequential core and left the splitter for `upload_mip` and for
+        ///   a future load-sensing design. (The probe named
         ///   `extend_premultiplied_le_bytes`, which *was* this path's entry
         ///   point at the time; 0.96.0 moved `sync` off it and 0.96.1
         ///   corrected the name here, since that wrapper is no longer what
         ///   runs in the measured interval.) See PLAN.md's 0.96.0 entry for
-        ///   what the parallelism bought on an idle machine and its 0.96.1
-        ///   entry for what it costs on a contended one.
+        ///   what the parallelism bought on an idle machine, its 0.96.1
+        ///   entry for what it costs on a contended one, and its 0.96.2
+        ///   entry for the resulting decision.
         /// - **12.7%** `queue.write_texture`'s own CPU-side staging
         ///   `memcpy`.
         /// - **~0%** `TileStore::get` (the tile-store read).
@@ -30210,8 +30216,10 @@ mod tests {
     ///   `serialize_premultiplied_le_bytes` loop (the probe named its
     ///   then-entry-point `extend_premultiplied_le_bytes`; renamed here in
     ///   0.96.1 to the function that actually runs) -- single-threaded
-    ///   when probed, driven in parallel across blocks of one tile since
-    ///   0.96.0 -- and ~13%
+    ///   when probed, driven in parallel across blocks of one tile in
+    ///   0.96.0/0.96.1, and single-threaded on this path again since
+    ///   0.96.2 (the parallel arm regressed the whole frame under CPU
+    ///   contention; see `TileResidency::sync`'s call site) -- and ~13%
     ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
     ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
     ///   own `upload_sync` field doc. Those two shares were probed
