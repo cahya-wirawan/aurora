@@ -145,6 +145,18 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // clamping the product here would be a real (if narrow) divergence from
 // the reference for a source alpha above 1.0, which an `f16` tile can
 // legitimately hold.
+//
+// **A named, deliberately deferred follow-on** (recorded 0.106.1): the
+// straighten-backdrop and "over" fold lines below are byte-identical
+// across every blend-math entry point in this file, each of which differs
+// from this one in its single `let b = ...` line and nothing else (the
+// bodies are 13 lines each; 12 are shared verbatim, measured, not
+// eyeballed). Extracting shared
+// `straight_backdrop()` and `fold_over()` WGSL functions would mirror the
+// Rust-side collapse 0.85.1 already made in `composite.rs`, and it is
+// worth doing — but as its own round with no mode port in it, so the
+// refactor's diff is not entangled with a new formula's. Do not fold it
+// into a porting round.
 @fragment
 fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);

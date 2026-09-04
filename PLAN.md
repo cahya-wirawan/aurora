@@ -24677,6 +24677,63 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.106.1) — 0.106.0's review follow-ups: two stale
+doc claims retired, and the standing transpose guard closes a latent hole.**
+Independent Critic and Red-team review of 0.106.0 found **no defect in the
+ported code** — shader formula, wrapper, counter, every golden and all
+thirteen mutation claims re-checked out — so this is a documentation and
+guard round. No shader, wrapper, dispatch-arm, predicate or fixture line for
+any of the seven ported modes changed, no mode was admitted to the GPU path,
+and the test count stays at **1,697**.
+
+1. **`begin_gpu_composite_tile`'s premultiplication comment no longer
+   counts modes.** It said "all six blend-math methods" and listed six by
+   name, having gone stale the moment `LinearBurn` landed. It now names the
+   `composite_*_over_with_opacity` family the way `aurora-render`'s own
+   `BlendPass` doc comment already does, for the stated reason that the list
+   grows by one per port. This is the second place in two rounds where an
+   enumerated mode list went stale; the family form is the fix that stops it
+   recurring.
+2. **The `LinearDodge` app test's coverage bullet now points at the guard
+   instead of a count.** It claimed "all six blend-math dispatch arms now
+   carry transpose coverage (0.105.2)" — true when written, false as a
+   present-tense claim once the roster held eight rows for seven modes. It
+   now defers to
+   `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+   as the live, count-free authority, which is how that guard's own doc
+   comment was deliberately written for exactly this reason.
+3. **The guard's occlusion gap is closed, not just disclosed.** It checked
+   only that *some* layer at the mode under test has effective alpha
+   strictly inside `(0, 1)`. That is necessary but not sufficient: a fully
+   opaque `Normal` layer stacked **above** the mode-bearing one takes the
+   fold to `out = (1 - 1) * bd + 1 * Cs`, discarding the accumulator the arm
+   contributed to — so the fixture would carry a perfectly good `0.5` and
+   still be blind to a transpose. The guard now also requires no such
+   occluding layer above the matched one. **No current row had that shape**
+   (every mode-bearing layer is either topmost or sits under a further layer
+   at its own mode, which composites rather than replaces), so this fixes no
+   present coverage; it stops a future round's fixture acquiring the shape
+   while the guard reports all clear. **Measured, both directions:**
+   retargeting `FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK`'s `l5` from `Multiply`
+   `1.0` to `Normal` `1.0` — the occlusion shape, and nothing else — makes
+   the strengthened guard fail on that row with its new message, while the
+   pre-0.106.1 condition passes the identical fixture. Both mutations were
+   really run and reverted; all eight legitimate rows still pass. The
+   check's own limit is disclosed in the guard's "what it does not do" list:
+   it reads the declared layer table, not real per-pixel coverage, so a
+   future partially-painted or masked occluder would be rejected here even
+   though its uncovered pixels stay observable — a false alarm, which is the
+   safe direction.
+4. **Deferred, deliberately: the WGSL fold duplication.** Critic observed
+   that all seven blend-math entry points in `composite.wgsl` have 13-line
+   bodies of which 12 are shared verbatim, differing only in `let b = ...`
+   (measured, not eyeballed). Extracting shared `straight_backdrop()` and
+   `fold_over()` WGSL functions would mirror 0.85.1's Rust-side collapse and
+   is worth doing — **as its own round with no mode port in it**, so the
+   refactor's diff is not entangled with a new formula's. Named in a comment
+   above `fs_composite_multiply`, the template entry point, so the next
+   porter meets it there rather than here.
+
 **Addendum 2026-09-05 (0.106.0) — `LinearBurn` is the seventh real
 blend-math mode on the GPU.** One WGSL entry point, one `BlendPass` const,
 one one-line wrapper, one predicate arm, one dispatch arm, one counter, one

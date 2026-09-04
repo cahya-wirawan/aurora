@@ -9176,10 +9176,13 @@ fn begin_gpu_composite_tile(
     // fully transparent target leaves exactly the state
     // `aurora_render::composite_layer_into` leaves on the CPU side (a
     // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
-    // not the straight (1.0, 1.0, 1.0, 0.5)), and all six blend-math
-    // methods write premultiplied texels
-    // too, so a `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference` or
-    // `LinearDodge` layer in the
+    // not the straight (1.0, 1.0, 1.0, 0.5)), and every blend-math
+    // `composite_*_over_with_opacity` method writes premultiplied texels
+    // too -- deliberately named as a family rather than enumerated here,
+    // since the list grows by one every time a mode is ported, exactly as
+    // `aurora-render`'s own `BlendPass` doc comment
+    // (`crates/aurora-render/src/composite.rs`) says of the same set, and
+    // for the same reason -- so a layer at any GPU-expressible mode in the
     // stack does not change this. That
     // is left as it is: `finish_tile_readback` straightens the decoded
     // samples on the CPU, in the one shared
@@ -29264,6 +29267,19 @@ mod tests {
     /// layer's own alpha`) is strictly between `0` and `1`, and that the
     /// fixture still qualifies for the GPU path at all.
     ///
+    /// Non-unit opacity on the mode-bearing layer is not quite the whole
+    /// condition, which is why 0.106.1 added a second half: the fold is
+    /// also degenerate if a **fully opaque `Normal` layer sits above** that
+    /// layer, because `out = (1 - 1) * bd + 1 * Cs` throws the accumulator
+    /// away, and with it everything this arm folded into it. Such a
+    /// fixture would carry a perfectly good `0.5` and still be blind to the
+    /// transpose. No row has that shape today — every mode-bearing layer in
+    /// the roster is either the topmost layer or sits under a further layer
+    /// at its own mode, which composites rather than replaces — so this
+    /// half is pure latent-hole insurance, added because the roster is
+    /// meant to be extended by rounds that will read this guard's verdict
+    /// rather than re-derive its reasoning.
+    ///
     /// **What it does not do, stated plainly.**
     ///
     /// - It does not prove a transpose *is* detected. That takes running
@@ -29275,6 +29291,18 @@ mod tests {
     ///   optimised away by a later, unrelated cleanup.
     /// - It does not check the fixture's assertions at all, only its layer
     ///   table.
+    /// - The occlusion half above reads that same table and nothing else,
+    ///   so it reasons about *declared* stacking, opacity and blend mode —
+    ///   not about which pixels a layer actually covers. Every roster
+    ///   fixture is a full-tile solid fill through
+    ///   [`solid_root_stack`], where "a fully opaque `Normal` layer above"
+    ///   really does replace everything; a future fixture whose occluding
+    ///   layer painted only part of the tile, or carried a mask, would be
+    ///   rejected here even though the uncovered pixels stay observable.
+    ///   That direction is the safe one (a false alarm this comment
+    ///   explains, not a false all-clear), and it is why the check tests
+    ///   `Normal` at effective alpha `1.0` specifically rather than trying
+    ///   to model coverage.
     /// - Its roster is hand-maintained. A new mode ported *without* an
     ///   entry fails here (that is the point), but a fixture added and
     ///   never registered is invisible to it.
@@ -29303,19 +29331,39 @@ mod tests {
                     continue;
                 }
                 fixtures += 1;
-                let observable = stack.iter().any(|&(_, entry_mode, opacity, rgba)| {
+                let effective_alpha = |(_, _, opacity, rgba): StackEntry| {
                     let [_, _, _, alpha] = rgba;
-                    entry_mode == mode && opacity * alpha > 0.0 && opacity * alpha < 1.0
+                    opacity * alpha
+                };
+                // A fully opaque `Normal` layer *above* the mode-bearing
+                // one takes the fold to `out = (1 - 1) * bd + 1 * Cs`,
+                // i.e. it discards the accumulator this arm contributed
+                // to -- so its non-unit opacity stops being observable in
+                // the composited texel, exactly as if it had been at
+                // `1.0` itself. No current row has that shape; the check
+                // is here so a later round's fixture cannot acquire it
+                // while this guard still reports all clear.
+                let occluded_above = |index: usize| {
+                    stack.iter().skip(index + 1).any(|&entry| {
+                        entry.1 == aurora_doc::BlendMode::Normal && effective_alpha(entry) >= 1.0
+                    })
+                };
+                let observable = stack.iter().enumerate().any(|(index, &entry)| {
+                    let alpha = effective_alpha(entry);
+                    entry.1 == mode && alpha > 0.0 && alpha < 1.0 && !occluded_above(index)
                 });
                 assert!(
                     observable,
                     "{test_name}'s fixture has no {mode:?} layer at an effective alpha strictly \
-                     between 0 and 1, so a dispatch arm that transposed src and backdrop for \
-                     {mode:?} would be invisible to it: every formula on the GPU path is \
-                     commutative, and the fold (1 - a) * bd + a * blended around it collapses to \
-                     `blended` at a = 1. Restore the non-unit opacity (and its derived golden) \
-                     rather than deleting this row -- PLAN.md's 0.105.1 and 0.105.2 entries \
-                     record the measured mutations this property is what kills."
+                     between 0 and 1 that is also unoccluded from above, so a dispatch arm that \
+                     transposed src and backdrop for {mode:?} would be invisible to it: every \
+                     formula on the GPU path is commutative, and the fold \
+                     (1 - a) * bd + a * blended around it collapses to `blended` at a = 1 -- and \
+                     a fully opaque Normal layer stacked above the mode-bearing one collapses it \
+                     the same way, by replacing the accumulator outright. Restore the non-unit \
+                     opacity (and its derived golden), or move the occluding layer below the one \
+                     under test, rather than deleting this row -- PLAN.md's 0.105.1 and 0.105.2 \
+                     entries record the measured mutations this property is what kills."
                 );
                 assert!(
                     document_qualifies_for_gpu_compositing(&root_stack_tree(stack)),
@@ -30429,10 +30477,17 @@ mod tests {
     ///   on `aurora-app` (PRD §7.2 layering), so no test in that crate can
     ///   reach this dispatch arm. Until 0.105.1 this doc comment claimed
     ///   that test covered the arm; it never did.
-    /// - **All six blend-math dispatch arms now carry transpose coverage**
-    ///   (0.105.2). None of the six gets it from formula asymmetry:
-    ///   `Cb*Cs`, `min(Cb,Cs)`, `max(Cb,Cs)`, `Cb + Cs - Cb*Cs`,
-    ///   `|Cb - Cs|` and `min(Cb + Cs, 1)` are all commutative, so the
+    /// - **Every blend-math dispatch arm carries transpose coverage, and
+    ///   [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    ///   is the live authority on that** — deliberately count-free here, so
+    ///   this bullet does not go stale the next time a mode is ported (it
+    ///   did exactly that between 0.105.2, which said "all six", and
+    ///   0.106.0's `LinearBurn`). That guard fails if any counted mode
+    ///   lacks a registered fixture, so read it, not a number written down
+    ///   here. None of the arms gets its coverage from formula asymmetry:
+    ///   every formula the GPU path implements so far — `Cb*Cs`,
+    ///   `min(Cb,Cs)`, `max(Cb,Cs)`, `Cb + Cs - Cb*Cs`, `|Cb - Cs|`,
+    ///   `min(Cb + Cs, 1)`, `max(Cb + Cs - 1, 0)` — is commutative, so the
     ///   surrounding "over" is the only thing that can ever notice the
     ///   swap, and it only does so where some layer is not fully opaque.
     ///   `Multiply` and `Darken` are covered **incidentally**, and not by
