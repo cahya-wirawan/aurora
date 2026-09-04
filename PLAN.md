@@ -17606,17 +17606,27 @@ severity choice.
   sites in `aurora-app` (the undo/redo compositing-path guard, the
   predicate's own doc, and three test doc comments), and the
   `{Normal, Multiply, Darken, Dissolve}` set literals at eight further
-  sites.
+  sites. **One count survived that sweep, and 0.95.1 fixes it**:
+  `composite_blend_over_with_opacity`'s own doc comment still said "the
+  six values that differed" were lifted into `BlendPass`, a count 0.86.0
+  invalidated when it deleted the per-mode encoder label — while
+  `BlendPass`'s own doc comment correctly says five. So "every stale
+  count was swept" was itself slightly overstated; 0.95.1 scopes that
+  sentence historically rather than just changing the digit.
 
-  **Tests: five in `aurora-render`, not the `Darken` suite's seven —
-  a disclosed reduction, with a reason.** The two omitted are its
-  unclamped-source-alpha-above-1.0 and clamped-out-of-range-opacity
-  cases. Since 0.85.1's merge both properties live in a *single* shared
+  **Tests: six in `aurora-render`, not the `Darken` suite's seven —
+  a disclosed reduction, with a reason.** (**Corrected in 0.95.1**: this
+  originally read *five*, and dropped two tests on one justification
+  that only covered one of them. The unclamped-source-alpha test is
+  *not* a test of the shared opacity clamp — see 0.95.1's entry below,
+  which restores it. What follows is the corrected account.) The one
+  omitted is its clamped-out-of-range-opacity case. Since 0.85.1's merge
+  that property lives in a *single* shared
   line — `composite_blend_over_with_opacity`'s own `let opacity =
   opacity.clamp(0.0, 1.0)`, which every mode's wrapper reaches through
   — and the `Multiply` and `Darken` suites already pin it on real
-  hardware. Re-asserting one shared line once per ported mode grows
-  linearly in modes while covering nothing new. The five kept each
+  hardware. Re-asserting one shared Rust line once per ported mode grows
+  linearly in modes while covering nothing new. The six kept each
   exercise something that genuinely is per-entry-point: this mode's own
   arithmetic against a hand-derived golden cross-checked against
   `composite_tile_cpu` (`(0.5, 0.75, 0.5, 1.0)`, a value the `Normal`,
@@ -17624,7 +17634,8 @@ severity choice.
   its own un-premultiply branch against a translucent accumulator; its
   own spatial addressing across a whole `patterned_texels` tile
   (V-flip, transpose, UV offset, binding transpose); its own
-  opacity-scaled fold at `0.5`; and its own separately-compiled
+  opacity-scaled fold at `0.5`; its own unclamped `s.a * opacity.value`
+  product (restored in 0.95.1); and its own separately-compiled
   `ab > 0.0` guard, where `max(NaN, x)` is a *different* expression
   from the `min(NaN, x)` the `Darken` sibling covers. Fixtures are not
   copied from the `Darken` suite: `Lighten` degenerates whenever the
@@ -17664,7 +17675,9 @@ severity choice.
      `aurora-render` tests failed (the fifth, the fully-transparent
      backdrop, legitimately cannot distinguish them: with `ab == 0` the
      blend term is multiplied by zero — that is a property of the
-     fixture, disclosed, not a hole in the mutation). The `aurora-app`
+     fixture, disclosed, not a hole in the mutation). **0.95.1 closed
+     that survivor** by making the fixture half-transparent instead of
+     uniformly so; see its entry below for the re-run. The `aurora-app`
      test failed at the GPU-vs-CPU differential, which sits *before* the
      absolute golden and so aborts first; re-run with that call
      temporarily removed, the absolute golden failed too, with exactly
@@ -17744,6 +17757,132 @@ severity choice.
   either: this round adds a fast path for a mode that previously took
   the CPU fallback, and no before/after frame timing was taken, so it
   makes no claim about the 60 FPS gate.
+
+- [x] **0.95.1 — a dropped test restored, four documentation bugs fixed,
+  and `report.md` untracked again.** No compositing *behaviour* changed:
+  every item here is a test, a comment, or repo hygiene. Independent
+  review of 0.95.0 confirmed its shader, wrapper, dispatch arm, counter
+  and every mutation-test claim exactly, on the same RTX 3090; what it
+  found was documentation and coverage, not correctness.
+
+  - **`composite_lighten_over_with_opacity_does_not_clamp_a_source_
+    alpha_above_one` restored** (`aurora-render`). 0.95.0 dropped two of
+    the `Darken` suite's seven tests on one justification — "opacity
+    clamping is one shared line since 0.85.1's merge" — which is true of
+    the out-of-range-*opacity* test and false of this one. This test's
+    property is the shader's own `let a = s.a * opacity.value;`
+    deliberately **not** clamping its product, only the Rust-side
+    `opacity` factor having been clamped before it arrives. Each WGSL
+    fragment function is separately compiled, so that is a
+    per-entry-point property — the same argument 0.95.0 itself used to
+    justify *keeping* the transparent-backdrop test. Concretely: a
+    copy-pasted `min(s.a * opacity.value, 1.0)` in `fs_composite_lighten`
+    alone would have passed the entire 0.95.0 suite. Fixture
+    `cb = (0.5, 0.25, 0.375)` under `(0.25, 0.75, 0.5)` at alpha `2.0`
+    (legal in `f16`, §7.3.1b): unclamped folds to
+    `(0.5, 1.25, 0.625, 1.0)`, clamped to `(0.5, 0.75, 0.5, 1.0)`. Note
+    the **alphas are equal** — `2.0 + 1·(1−2) = 1.0` either way — so this
+    rests on the colour channels, and the backdrop deliberately wins only
+    red, since for `Lighten` the two answers differ by `b − cb`, which is
+    zero wherever the backdrop already won. Asserted both differentially
+    against `composite_tile_cpu` and against the hand-derived absolute
+    golden. **`aurora-render`'s `Lighten` suite is six tests, not five**;
+    the out-of-range-opacity test alone stays legitimately dropped.
+  - **The transparent-backdrop test's surviving mutant closed.**
+    Red-team proved by execution that 0.95.0's `max`→`min` mutation was
+    caught by 4 of 5 render tests, the survivor being
+    `..._over_a_fully_transparent_backdrop_is_the_source_alone`. Its
+    disclosed reason was mathematically right — with `ab == 0`
+    everywhere, `b` is annihilated, so no *uniformly* zero-alpha fixture
+    can distinguish the intrinsics — but the property under test (the
+    untaken `ab > 0.0` branch, NaN-safety) only needs *some* texels at
+    zero alpha. So the fixture is now half transparent, half opaque
+    `(0.75, 0.25, 0.5)`, the whole `TILE`×`TILE` result is compared
+    against `composite_tile_cpu` via `read_rgba8`/`rgba8_of`, and both
+    halves are asserted: the transparent half is the source alone
+    `(0.25, 0.5, 0.75, 1.0)` (still `f16`-exact on texel 0, plus the
+    explicit finiteness check), the opaque half is
+    `max(cb, Cs) = (0.75, 0.5, 0.75)` where `min` would give
+    `(0.25, 0.25, 0.5)` — all three channels differ. Renamed to
+    `composite_lighten_over_with_opacity_is_the_source_alone_where_the_
+    backdrop_is_transparent`, since "fully transparent" is no longer
+    true of the fixture. A `NaN` in the transparent half is still caught
+    twice over: `read_rgba8`'s `clamp` maps it to `0`, which cannot match
+    the reference there.
+  - **The headline `aurora-app` test's guard count was self-
+    contradicting.**
+    `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_
+    blend_document` said "**Three** independent guards, the same set the
+    `Darken` five-layer test carries:" and then listed **four** — while
+    this file's own 0.95.0 entry said four. The cross-reference was wrong
+    on a second count too: the `Darken` test's own doc comment names
+    *two* guards and explicitly declines a hand-computed golden, which
+    this test has. Now reads "**Four** independent guards", and states
+    the actual difference instead of claiming sameness.
+  - **`begin_gpu_composite_tile`'s `too_many_lines` growth model.** It
+    predicted "~13 lines per mode", accurate before dispatch counters
+    existed; the `Lighten` arm is **19** non-comment lines, and every
+    future mode is expected to carry a counter from its first round per
+    0.95.0's own precedent. Corrected to "~19-line arm per mode
+    (including its dispatch counter)", with the old figure kept and
+    explained rather than silently replaced.
+  - **The one stale count 0.95.0's sweep missed**, noted in that entry
+    above: `composite_blend_over_with_opacity`'s "the six values that
+    differed" against `BlendPass`'s correct five. Scoped historically —
+    six as of the 0.85.1 extraction, five since 0.86.0 deleted the
+    per-mode encoder label — so a future reader is not left guessing
+    which comment is wrong.
+  - **`report.md` untracked again, and now ignored.** `4592fb7`
+    untracked it as local session scratch; 0.95.0 re-added it (92 lines,
+    and already stale on arrival — it said "Version: 0.94.1"). `git rm
+    --cached` again, the file left on disk, and `/report.md` added to
+    `.gitignore` under "Local development" so `git add -A` cannot bring
+    it back a third time.
+
+  **Test accounting: 1 new, 1 changed, 0 removed** (1,646 → 1,647;
+  `aurora-render` 137 → 138, `aurora-app` unchanged at 387).
+
+  The rewritten test needed two helpers extracted to stay under
+  `clippy::too_many_lines`' 100 (it measured 123 inline):
+  `half_transparent_texels()` for the fixture, and
+  `assert_whole_tile_matches()` for the `read_rgba8` comparison it now
+  performs twice. **No new lint exception was added** — the alternative
+  was an `#[allow]` this file currently has none of.
+
+  **Mutation-tested twice, both run for real and reverted**, on
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_lighten`
+  (NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu):
+
+  1. **`max` → `min` in `fs_composite_lighten`** — 0.95.0's own mutation
+     2, re-run against the corrected fixture. **6 of 6 failed** (0.95.0:
+     4 of 5, the transparent-backdrop test surviving). The survivor is
+     measurably gone, not assumed gone.
+  2. **`let a = s.a * opacity.value;` → `let a = min(s.a *
+     opacity.value, 1.0);`**, in `fs_composite_lighten` only — the exact
+     copy-paste bug the restored test exists for. **Exactly 1 of 6
+     failed, and it was the restored test.** So the coverage hole
+     0.95.0's justification opened was real: without this test the whole
+     suite would have gone green on a clamped source alpha. Both
+     mutations reverted and the clean state re-verified (`git diff` on
+     the shader empty, 6 of 6 green).
+
+  **Verified (0.95.1), on this box's real discrete GPU**:
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_lighten
+  --nocapture` (**6 passed**, every one printing `GPU adapter: NVIDIA
+  GeForce RTX 3090 (Vulkan, DiscreteGpu)`). Then the full gate: `cargo
+  fmt --all --check`, `python3 scripts/check_layering.py` (20 crates),
+  `python3 scripts/check_no_hardcoded_style.py` (28 files), `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+  --workspace` (**1,647 passed, 0 failed**), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features` — all clean.
+
+  **Scope, stated plainly**: still one backend on one vendor. Metal and
+  DX12 remain unverified for `fs_composite_lighten`, including the newly
+  half-transparent fixture's `ab > 0.0` branch. Nothing here was
+  measured for performance, and nothing here changes any composited
+  pixel — the blend math 0.95.0 shipped is untouched.
 
 ### M1.10 — Phase 1 gate
 

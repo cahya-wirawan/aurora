@@ -8223,9 +8223,13 @@ impl RecompositeTileCosts {
 // `too_many_lines`: 143, against a 100 limit, measured at 0.95.0 (it was
 // 124 at 0.86.1). It
 // first crossed on the second ported blend mode (0.85.0, at 107) -- the
-// body is one loop whose `match` gains a fixed ~13-line arm per mode, so
+// body is one loop whose `match` gains a fixed ~19-line arm per mode
+// (including its dispatch counter), so
 // it will keep drifting as more land, and `Lighten` (0.95.0) is the
-// third to prove that -- and 0.86.0's single-encoder
+// third to prove that. The ~13 this comment predicted through 0.95.0
+// was the pre-counter arm; the `Lighten` arm measures 19 non-comment
+// lines, and every mode from here on is expected to carry a counter
+// from its first round, per this round's own precedent -- and 0.86.0's single-encoder
 // batching added the rest. Splitting the arms out would
 // mean handing each a `&mut` borrow of both accumulator `Option`s plus
 // `device`/`queue`/`tile_extent`, which is exactly the shape the swap
@@ -28341,8 +28345,12 @@ mod tests {
     /// source (`0.75` over `0.25`) — so neither layer's own colour, and
     /// no other wired arm, can produce this texel.
     ///
-    /// Three independent guards, the same set the `Darken` five-layer
-    /// test carries:
+    /// **Four** independent guards — one more than the `Darken`
+    /// five-layer test above, whose own doc comment names *two* and
+    /// deliberately declines a hand-computed golden (hand-computing five
+    /// chained composites would restate the arithmetic under test).
+    /// Three layers fold to exact binary fractions, so this one can
+    /// carry that absolute golden as well:
     ///
     /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
     /// - the absolute golden, which a wrong-arm dispatch fails outright;

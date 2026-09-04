@@ -1828,6 +1828,13 @@ impl TileCompositor {
     /// field what `composite_multiply_over_with_opacity` and
     /// `composite_darken_over_with_opacity` each built inline at 0.85.0,
     /// with the six values that differed lifted into [`BlendPass`] —
+    /// six as of that extraction; **five now**, since 0.86.0 deleted the
+    /// per-mode encoder label along with the encoders those methods used
+    /// to create (see [`BlendPass`]'s own doc comment, which states the
+    /// live count). The "six" here is deliberately left as the
+    /// historical number this extraction actually moved, so a reader
+    /// comparing it against the struct's five fields is not left
+    /// guessing which one is wrong —
     /// and it took `composite_lighten_over_with_opacity` (0.95.0, the
     /// third caller) without a line of change, which is the bet that
     /// extraction was making — the
@@ -5602,21 +5609,40 @@ mod tests {
     // `TileCompositor::composite_lighten_over_with_opacity` and the
     // `fs_composite_lighten` entry point (0.95.0).
     //
-    // **Five tests, not the `Darken` suite's seven, and that is
-    // deliberate.** The two the `Darken` suite has and this one does not
-    // are its unclamped-source-alpha and clamped-out-of-range-opacity
-    // cases. Since 0.85.1's merge both of those properties live in a
-    // *single* shared line -- `composite_blend_over_with_opacity`'s own
-    // `let opacity = opacity.clamp(0.0, 1.0)`, which every mode's wrapper
-    // reaches through -- and the `Multiply` and `Darken` suites already
-    // pin it on real hardware. Re-asserting one shared line once per
-    // ported mode would grow linearly in the number of modes while
-    // covering nothing new; the five kept below each exercise something
-    // that really is per-entry-point (this mode's own arithmetic, its own
-    // un-premultiply branch, its own spatial addressing, its own
-    // opacity-scaled fold, and its own separately-compiled `ab > 0.0`
-    // guard). That is a disclosed reduction in coverage, not an
+    // **Six tests, not the `Darken` suite's seven** (corrected in
+    // 0.95.1 -- it was five, on a justification that only covered one of
+    // the two dropped tests; see below).
+    //
+    // The one the `Darken` suite has and this one legitimately does not
+    // is its clamped-out-of-range-opacity case. Since 0.85.1's merge
+    // that property lives in a *single* shared line --
+    // `composite_blend_over_with_opacity`'s own `let opacity =
+    // opacity.clamp(0.0, 1.0)`, which every mode's wrapper reaches
+    // through -- and the `Multiply` and `Darken` suites already pin it on
+    // real hardware. Re-asserting one shared Rust line once per ported
+    // mode would grow linearly in the number of modes while covering
+    // nothing new. That is a disclosed reduction in coverage, not an
     // equivalence claim.
+    //
+    // **0.95.0 dropped a second test on that same justification, and
+    // was wrong to.** `composite_darken_over_with_opacity_does_not_
+    // clamp_a_source_alpha_above_one` does not test the shared clamp at
+    // all: it tests that the *shader's* own `let a = s.a * opacity.value`
+    // deliberately does **not** clamp its product, only the Rust-side
+    // `opacity` factor having been clamped before it arrives. Each WGSL
+    // fragment function is separately compiled, so that is a
+    // per-entry-point property -- exactly the argument this same section
+    // makes to justify *keeping* the transparent-backdrop test. A
+    // copy-pasted `min(s.a * opacity.value, 1.0)` in
+    // `fs_composite_lighten` alone would have passed the whole 0.95.0
+    // suite. `composite_lighten_over_with_opacity_does_not_clamp_a_
+    // source_alpha_above_one` below closes that, so the count is six.
+    //
+    // The six kept each exercise something that really is
+    // per-entry-point: this mode's own arithmetic, its own un-premultiply
+    // branch, its own spatial addressing, its own opacity-scaled fold,
+    // its own unclamped `s.a * opacity` product, and its own
+    // separately-compiled `ab > 0.0` guard.
     //
     // Fixture values are again *not* copied from the `Darken` siblings.
     // `Lighten` collapses to a no-op whenever the source is darker than
@@ -6066,36 +6092,54 @@ mod tests {
     }
 
     #[test]
-    /// The `if (ab > 0.0)` guard's **untaken** branch in
-    /// `fs_composite_lighten`, on real hardware — the mirror of
-    /// `composite_darken_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`.
+    /// **`fs_composite_lighten` deliberately does not clamp
+    /// `s.a * opacity.value`** — only `opacity` itself is clamped, and it
+    /// is clamped Rust-side in `composite_blend_over_with_opacity`,
+    /// mirroring `composite_layer_into`'s own `let opacity =
+    /// opacity.clamp(0.0, 1.0)` followed by an unclamped `sa * opacity`.
+    /// `f16` can legally hold a source alpha above `1.0` (invariant
+    /// §7.3.1b), so this is a real input, not a synthetic one. The mirror
+    /// of
+    /// `composite_darken_over_with_opacity_does_not_clamp_a_source_alpha_above_one`.
     ///
-    /// Whether a shader compiler flattens that branch and evaluates the
-    /// `0.0 / 0.0` on both sides is a property of the *backend*, not of
-    /// the entry point, so proving it for `fs_composite_darken` does not
-    /// prove it here: this is a third, separately-compiled function, and
-    /// `max(NaN, x)` is exactly the kind of expression whose NaN handling
-    /// differs between backends — and it is a *different* expression from
-    /// `min(NaN, x)`, which the `Darken` sibling covers.
+    /// **Restored in 0.95.1.** 0.95.0 dropped this test on the grounds
+    /// that opacity clamping is one shared line since 0.85.1's merge.
+    /// That is true of the *out-of-range-opacity* test and not of this
+    /// one: the property here is the `let a = s.a * opacity.value;` line
+    /// inside this entry point, and each WGSL fragment function is
+    /// separately compiled — the same per-entry-point argument that keeps
+    /// the transparent-backdrop test below. See this section's header
+    /// comment.
     ///
-    /// With `ab == 0.0` the whole composite reduces to the source alone,
-    /// so the result is asserted to be exactly that -- a `NaN` leaking
-    /// out of the untaken divide would fail both the finiteness check
-    /// and the value check, and (`NaN != NaN`) could not be mistaken for
-    /// a pass.
+    /// **Why the fixture is shaped this way.** With a source alpha of
+    /// `2.0` the fold's `inv = 1.0 - a` goes *negative*, so the clamped
+    /// and unclamped answers differ by exactly `b - cb` per channel —
+    /// which for `Lighten` is zero in every channel the backdrop already
+    /// won. The backdrop is therefore chosen to win only *one* channel
+    /// (red, per this section's own two-sided-maximum rule), leaving
+    /// green and blue to separate the two answers:
     ///
-    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader
-    /// compilers are unverified for this specific branch.
-    fn composite_lighten_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone() {
+    /// - `cb = (0.5, 0.25, 0.375)`, `Cs = (0.25, 0.75, 0.5)`, so
+    ///   `b = max(cb, Cs) = (0.5, 0.75, 0.5)`;
+    /// - unclamped (`a = 2.0`, `inv = -1.0`):
+    ///   `-cb + 2b = (0.5, 1.25, 0.625)` at alpha `2.0 - 1.0 = 1.0`;
+    /// - clamped (`a = 1.0`, `inv = 0.0`): `b = (0.5, 0.75, 0.5)`, at the
+    ///   same alpha `1.0` — so **alpha alone cannot catch this**, and the
+    ///   colour channels are what the assertion rests on.
+    ///
+    /// Every value is an exact binary fraction, and the absolute golden
+    /// is asserted alongside the [`composite_tile_cpu`] differential so a
+    /// clamp added to *both* implementations could not pass either.
+    fn composite_lighten_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
         let Some(context) = real_context() else {
             return;
         };
         let device = context.device();
         let queue = context.queue();
 
-        // Deliberately non-symmetric across channels, so a contaminated
-        // channel cannot hide behind an equal one.
-        let top_rgba = [0.25, 0.5, 0.75, 1.0];
+        let bottom_rgba = [0.5, 0.25, 0.375, 1.0];
+        let top_rgba = [0.25, 0.75, 0.5, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
 
         let backdrop = solid_tile(
             device,
@@ -6103,16 +6147,7 @@ mod tests {
             [0.0, 0.0, 0.0, 0.0],
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
-        // A real render pass that leaves the accumulator empty: an
-        // opaque white layer at zero opacity contributes nothing, so the
-        // backdrop stays fully transparent while still having been
-        // produced by the mechanism under test.
-        let bottom = solid_tile(
-            device,
-            queue,
-            [1.0, 1.0, 1.0, 1.0],
-            wgpu::TextureUsages::empty(),
-        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
         let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
         let dst = solid_tile(
             device,
@@ -6132,7 +6167,201 @@ mod tests {
                 encoder,
                 &backdrop_view,
                 &bottom_view,
-                0.0,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_lighten_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::Lighten),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's \
+                 own formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). \
+                 Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        // The absolute golden, hand-derived in the doc comment above.
+        // A `min(s.a * opacity.value, 1.0)` in `fs_composite_lighten`
+        // yields (0.5, 0.75, 0.5, 1.0) instead -- red and alpha agree,
+        // which is why this is asserted per channel rather than as a
+        // single texel comparison whose message would not say where.
+        for (gpu, expected, channel) in [
+            (gr, 0.5, "r"),
+            (gg, 1.25, "g"),
+            (gb, 0.625, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold; got {gpu}. \
+                 (0.5, 0.75, 0.5, 1.0) would mean fs_composite_lighten clamped the \
+                 s.a * opacity product. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    /// A `SAMPLES`-length tile that is fully transparent in its left half
+    /// and opaque `(0.75, 0.25, 0.5)` in its right — the fixture
+    /// `composite_lighten_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
+    /// needs to exercise the `ab > 0.0` guard's untaken branch *and* stay
+    /// sensitive to the blend intrinsic in the same tile.
+    ///
+    /// The opaque colour is chosen so `Lighten` takes red from the
+    /// backdrop and green and blue from the source (this section's
+    /// two-sided-maximum rule), and so that `min` and `max` disagree in
+    /// every channel there.
+    fn half_transparent_texels() -> Vec<f16> {
+        let mut out = Vec::with_capacity(SAMPLES);
+        for _y in 0..TILE {
+            for x in 0..TILE {
+                let texel = if x >= TILE / 2 {
+                    [0.75, 0.25, 0.5, 1.0]
+                } else {
+                    [0.0, 0.0, 0.0, 0.0]
+                };
+                for channel in texel {
+                    out.push(f16::from_f32(channel));
+                }
+            }
+        }
+        out
+    }
+
+    /// Asserts two [`read_rgba8`]-shaped buffers agree everywhere within
+    /// `1` of 255, naming the first disagreeing `(x, y, channel)` rather
+    /// than dumping two 256 KiB vectors. The same comparison the
+    /// spatially-varying tests above spell out inline; factored out here
+    /// because the half-transparent test needs it twice (once on the
+    /// accumulator as a setup check, once on the result).
+    fn assert_whole_tile_matches(actual: &[u8], expected: &[u8], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context} -- readback and CPU reference must describe the same tile"
+        );
+        let first_mismatch = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find(|(_, (gpu, cpu))| u16::from(**gpu).abs_diff(u16::from(**cpu)) > 1)
+            .map(|(index, (gpu, cpu))| {
+                let texel = index / CHANNELS;
+                let tile = TILE as usize;
+                (texel % tile, texel / tile, index % CHANNELS, *gpu, *cpu)
+            });
+        assert!(
+            first_mismatch.is_none(),
+            "{context} -- first mismatch (x, y, channel, gpu, cpu): {first_mismatch:?}"
+        );
+    }
+
+    #[test]
+    /// The `if (ab > 0.0)` guard's **untaken** branch in
+    /// `fs_composite_lighten`, on real hardware — the mirror of
+    /// `composite_darken_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`.
+    ///
+    /// Whether a shader compiler flattens that branch and evaluates the
+    /// `0.0 / 0.0` on both sides is a property of the *backend*, not of
+    /// the entry point, so proving it for `fs_composite_darken` does not
+    /// prove it here: this is a third, separately-compiled function, and
+    /// `max(NaN, x)` is exactly the kind of expression whose NaN handling
+    /// differs between backends — and it is a *different* expression from
+    /// `min(NaN, x)`, which the `Darken` sibling covers.
+    ///
+    /// Where `ab == 0.0` the whole composite reduces to the source alone,
+    /// so that half of the tile is asserted to be exactly that -- a `NaN`
+    /// leaking out of the untaken divide would fail both the finiteness
+    /// check and the value check, and (`NaN != NaN`) could not be
+    /// mistaken for a pass.
+    ///
+    /// **The backdrop is deliberately half transparent, not uniformly so
+    /// (0.95.1).** The `Darken`/`Multiply` siblings both use a uniformly
+    /// zero-alpha accumulator, and red-team proved by execution that this
+    /// makes them the one test in each suite that a `min`/`max` swap
+    /// survives: with `ab == 0` everywhere, the mode-dependent term `b`
+    /// is multiplied by zero in every texel, so no such fixture can
+    /// distinguish the two intrinsics. That is inherent to a *uniform*
+    /// fixture and not to the property under test — the untaken
+    /// `ab > 0.0` branch only needs *some* texels at zero alpha. So the
+    /// bottom layer here is transparent in its left half and opaque
+    /// `(0.75, 0.25, 0.5)` in its right, and the whole tile is compared:
+    ///
+    /// - left half (`ab == 0`): `blended = Cs`, `out = Cs` — the untaken
+    ///   branch, `(0.25, 0.5, 0.75, 1.0)`;
+    /// - right half (`ab == 1`): `out = max(cb, Cs) = (0.75, 0.5, 0.75)`,
+    ///   where `min` would give `(0.25, 0.25, 0.5)` — all three channels
+    ///   differ, so the swap now fails here too.
+    ///
+    /// A `NaN` in the left half is still caught by the whole-tile
+    /// comparison as well as by the explicit finiteness check on texel 0:
+    /// [`read_rgba8`]'s `clamp` maps `NaN` to `0`, which cannot match the
+    /// CPU reference's real value there.
+    ///
+    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader
+    /// compilers are unverified for this specific branch.
+    fn composite_lighten_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Deliberately non-symmetric across channels, so a contaminated
+        // channel cannot hide behind an equal one.
+        let top_rgba = [0.25, 0.5, 0.75, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        // A real render pass builds the accumulator, rather than seeding
+        // it: the zero-alpha half is produced by the same mechanism under
+        // test, not written directly.
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
             );
         });
         submit_one(&context, |encoder| {
@@ -6146,11 +6375,26 @@ mod tests {
             );
         });
 
+        // Texel 0 is in the transparent half, and `f16` equality pins its
+        // alpha at exactly zero -- something the 8-bit whole-tile
+        // comparison below cannot do, since a tiny non-zero alpha would
+        // quantise to 0 there.
         let gpu_accumulator = read_first_texel(device, queue, &backdrop);
         assert_eq!(
             gpu_accumulator,
             (0.0, 0.0, 0.0, 0.0),
-            "setup: this test is only meaningful against a genuinely zero-alpha accumulator"
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        // ... and the whole accumulator must reproduce the bottom layer,
+        // so the opaque half is genuinely opaque and the halves are where
+        // this test believes they are.
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
         );
 
         let gpu_result = read_first_texel(device, queue, &dst);
@@ -6160,17 +6404,23 @@ mod tests {
             "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. That is a \
              real finding about this backend's shader compiler, not a reason to relax this test."
         );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.5, 0.75, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
 
         let top_texels = solid_texels(top_rgba);
-        let cpu_result = first_texel(&composite_tile_cpu(&[(
-            &top_texels,
-            1.0,
-            BlendMode::Lighten,
-        )]));
-        assert_eq!(
-            gpu_result, cpu_result,
-            "over a fully transparent accumulator the composite is the source alone, exactly as \
-             composite_tile_cpu computes it"
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Lighten),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader Lighten path and composite_tile_cpu disagree across a half-transparent \
+             backdrop. In the opaque half a min/max swap shows up here; in the transparent half a \
+             NaN out of the untaken `ab > 0.0` branch does.",
         );
     }
 
