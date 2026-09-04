@@ -52,7 +52,7 @@ cargo run -p aurora-app                 # the application
 cargo run -p aurora-cli                 # headless binary
 ```
 
-**Before a full-workspace build or gate run, check free disk space** — `df -h /home` (or wherever this checkout lives). Three separate rounds (0.102.1, 0.103.0, 0.103.1) hit `/home` at or near 100% full mid-gate, each recovered the same way: `rm -rf target/debug/incremental` (a pure build cache, regenerates automatically; nothing else under `target/` needs touching). If free space is under ~20G, run that first rather than discovering the failure mid-`cargo test`.
+**Hard precondition, not a suggestion: before a full-workspace build, gate run, or real-GPU verification pass, confirm `df -h /home` (or wherever this checkout lives) shows at least 25G free.** Five separate rounds now (0.102.1, 0.103.0, 0.103.1, 0.104.0, 0.104.1) hit `/home` running tight mid-gate, each recovered the same way: `rm -rf target/debug/incremental` (a pure build cache, regenerates automatically; nothing else under `target/` needs touching). This is no longer noise — it is a structural property of this workspace's size against real-hardware GPU test runs, and the one failure mode it risks (an `ENOSPC` mid-run against real GPU hardware) is exactly the evidence a round cannot substitute for. Run the cleanup *before* the gate, not after discovering the failure mid-`cargo test`.
 
 The spikes are separate crates, deliberately outside the workspace (root `Cargo.toml` `exclude`s them) so they can never become dependencies of real code:
 
