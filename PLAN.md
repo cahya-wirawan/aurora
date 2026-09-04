@@ -21685,6 +21685,128 @@ severity choice.
   read the GPU-path row above as "0.98.x has no effect"**; read it as
   "this fixture was never going to show one."
 
+  **0.100.0 (2026-09-04) — the fixture 0.99.0 said was missing, built for
+  real, and the cross-version verdict it could not give: 0.98.x's
+  vectorization is a REAL, separable whole-frame win once
+  `fold_onto_opaque` is actually reached — ~4.7 ms/frame, ~10% of the
+  frame.** Diagnostic/measurement round; one new test, one test-only
+  return value, no shipping-code change of any kind.
+
+  New test:
+  `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+  (`aurora-app`). Two root-level pixel layers at **identical** bounds
+  (`0, 0, 300_000, 300_000` — identical origins matter: `resolve_tile`'s
+  cheap arm is gated on `origin == reference_origin`, and any other origin
+  routes through `read_layer_window`, a different cost mixed into the same
+  number). The lower layer ("backdrop", `Normal`) is **pre-seeded
+  full-tile opaque by a direct tile fill**, not a brush dab — the two arms
+  of `composite_layer_into` are chosen *per texel* on
+  `backdrop_alpha > 0.0`, so a dab-sized backdrop would put a few thousand
+  of a tile's 65,536 texels on the dividing arm and measure nothing. The
+  upper layer ("canvas", `Screen`, translucent, also pre-seeded) is the
+  active layer the timed loop dabs into each frame. `Screen`
+  disqualifies the document from GPU compositing (asserted directly), so
+  every visible tile goes through `composite_roots_into_tile`. The timed
+  loop is `measure_pan_and_paint_frames`, **reused byte for byte**.
+
+  **Fold-census proof, not inference** (0.97.1's counter, now *returned*
+  by `report_frame_stages` rather than only printed, so the test asserts on
+  it):
+
+  | arm | folds | first (cheap, transparent backdrop) | later (`fold_onto_opaque`, 3 divisions/texel) |
+  |---|---|---|---|
+  | two roots, backdrop visible | **216** | 108 | **108** |
+  | control, backdrop hidden | 108 | 108 | 0 |
+
+  108 = 9 tiles × 12 frames, exactly, on every one of 12 runs. So the main
+  arm reaches the dividing arm on *every texel of every visible tile of
+  every frame*, and the control — the same fixture with one
+  `set_visible(false)` — reaches it never. The test asserts
+  `later >= frames`; the control's `later == 0` is **reported, not
+  asserted**, because `RECOMPOSITE_FOLD_COUNTS` is process-global and a
+  concurrent CPU-only test can add to it (pollution can only add, which is
+  what makes the main arm's lower bound sound and an equality assertion on
+  the control a latent flake).
+
+  **The cross-version A/B — obtained, not skipped.** `composite.rs` keeps
+  a verbatim copy of the pre-0.98.0 scalar body as
+  `composite_layer_into_scalar` under `#[cfg(test)]`. A throwaway
+  `git worktree` at this same commit had `composite_layer_into`'s real body
+  replaced with that text verbatim (uncommitted, worktree since removed;
+  nothing from it is in the tree). Same hardware, same session, same
+  release profile, runs interleaved between the two trees.
+  Adapter, printed by every run: **`NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`**, `AURORA_REQUIRE_GPU=1`, `--release`, machine otherwise
+  idle. 6 runs each, whole-frame **mean** (ms):
+
+  | arm | vectorized (this tree) | scalar (pre-0.98.0 body) | separable? |
+  |---|---|---|---|
+  | two roots, `later=108` | 42.51 / 40.59 / 40.48 / 40.65 / 40.48 / 40.30 | 45.60 / 44.58 / 44.87 / 45.53 / 44.99 / 47.25 | **yes** — ranges do not overlap (worst vectorized 42.51 < best scalar 44.58) |
+  | control, `later=0` | 26.17 / 24.72 / 24.87 / 24.90 / 24.84 / 25.18 | 30.35 / 26.56 / 25.81 / 30.43 / 25.77 / 25.80 | **no** — ranges overlap (25.77–30.43 vs 24.72–26.17) |
+
+  Same shape in p50 on the two-root arm (vectorized 40.42–42.89, scalar
+  44.60–45.55, also non-overlapping). Run-median difference on that arm:
+  **40.53 → 45.26 ms, i.e. ~4.7 ms/frame, ~10.5% of the scalar frame.**
+
+  **Verdict, stated plainly: a win.** On a fixture that genuinely reaches
+  `composite_layer_into`'s `fold_onto_opaque` arm, 0.98.x's vectorization
+  is worth ~4.7 ms of a ~45 ms frame, and the two trees' 6-run ranges do
+  not overlap — this is not noise. On the *same* fixture with the backdrop
+  hidden, so that every fold is a first fold, the ranges do overlap and no
+  difference is separable. That is 0.99.0's structural explanation
+  confirmed by direct measurement rather than by reasoning: the win lives
+  in later folds, 0.99.0's two fixtures had none, and this one has one per
+  tile per frame.
+
+  Derived, and flagged as derived: isolating the later-fold cost as
+  (main − control) run-medians gives 15.66 ms/frame vectorized vs
+  19.07 ms/frame scalar for 9 later folds, i.e. ~1.74 vs ~2.12 ms per
+  whole-tile later fold, ~18% cheaper. That lands inside the 10–32% band
+  `benches/composite.rs`'s own `fold_onto_opaque` column reported at
+  0.98.0–0.98.3, which is a consistency check and **not** a second
+  independent measurement — it is a difference of two noisy means and
+  should not be quoted as a per-call figure.
+
+  **Caveats, all real:**
+
+  - **These absolute numbers are not comparable to 0.99.0's rows above.**
+    Different fixture: two root layers instead of one, both with content
+    at every visited tile, and a 256-tile `TileStore` budget instead of
+    16 — deliberately above the fixture's whole working set, so this one
+    measures compositing arithmetic and *not* tile paging. It is
+    ~4.4× 0.99.0's CPU-fallback row for those reasons, not because
+    anything regressed. The pan itself (512×512 viewport, 12 frames,
+    `(50_000, 50_000)` start, `(200, 120)` px/frame) is identical to that
+    row's on purpose.
+  - **`p99` here is the maximum.** `ms_stats` takes the
+    `round((n-1) × 0.99)`-th order statistic, which at `n = 12` (and at
+    `n = 40`) is the last element. Mean and p50 are the primary figures;
+    `p99` and `max` are one sample under two names. Same caveat as 0.94.1.
+  - **Idle only.** CLAUDE.md requires a contended figure beside an idle
+    one for a whole-frame *performance claim*. The claim made here is a
+    **relative** one between two builds measured back to back under the
+    same conditions, and no contended figure was gathered — so do not read
+    ~40 ms or ~45 ms as this fixture's cost on a busy desktop.
+  - **One adapter, one OS.** Vulkan/NVIDIA on Linux. `half`'s SIMD
+    conversion path is x86-64 F16C here; Metal/aarch64 and DX12 are
+    unmeasured for this.
+  - **The two older whole-frame tests are unchanged in outcome** (checked
+    directly, 3 runs before and 3 after): GPU path mean 8.34/8.27/8.94 →
+    8.19/8.21/8.47, CPU fallback 9.44/9.05/9.56 → 9.04/8.90/8.94, and both
+    fold censuses bit-identical (0/0/0 and 31/31/0). The after-runs sit at
+    the low end of the before-range rather than dead centre; the only code
+    change on their path is `report_frame_stages` and friends *returning* a
+    pair they already computed, after every timing is taken, so read that
+    as run-to-run drift, not an effect. Neither test's text changed, and
+    neither needs the return value.
+
+  **The `rayon` multi-root parallelization named as future work above is
+  NOT started by this round** — not begun, not prototyped, not partially
+  landed. This round is diagnostic only, exactly as 0.99.0 was. What it
+  does add is the fixture that work would need to prove itself against:
+  a `later`-fold-dominated frame whose cost is now a known number on known
+  hardware.
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

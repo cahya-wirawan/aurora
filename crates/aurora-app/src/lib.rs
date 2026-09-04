@@ -29816,11 +29816,24 @@ mod tests {
     ///    checkable figure, and it is how the fixed, content-independent
     ///    upload floor in these fixtures was found: min equals max, so
     ///    the volume does not depend on what was painted at all.
-    fn report_frame_stages(label: &str, stages: &mut FrameStages) {
+    ///
+    /// **Returns** the fold census pair
+    /// `[folds, real_fold_tiles]` — [`take_recomposite_fold_counts`]'s own
+    /// value, relayed up unchanged from
+    /// [`report_recomposite_fold_census`] (0.100.0) so a caller can assert
+    /// on which `composite_layer_into` arm its fixture actually reached
+    /// instead of reading the printed line by eye. Not `#[must_use]`, on
+    /// purpose: the two older whole-frame tests call this as a bare
+    /// statement and nothing about their behaviour changed.
+    fn report_frame_stages(label: &str, stages: &mut FrameStages) -> [u64; 2] {
         let frames = stages.total.len();
         if frames == 0 {
             println!("{label}: no frames measured");
-            return;
+            // Nothing was measured, so there is no census to relay. The
+            // zero pair is deliberately *not* a "no folds happened"
+            // claim -- a caller reaching this arm has a zero-frame
+            // `FrameStages`, which is its own, louder problem.
+            return [0, 0];
         }
 
         // Before `ms_stats` sorts anything: which frame was worst overall?
@@ -29879,7 +29892,7 @@ mod tests {
             );
         }
 
-        report_frame_counters(label, stages, frames);
+        report_frame_counters(label, stages, frames)
     }
 
     /// The per-frame *counter* half of [`report_frame_stages`]'s output:
@@ -29898,7 +29911,12 @@ mod tests {
     /// it is still called unconditionally at the end of that function.
     /// `frames` is passed rather than recomputed so both halves divide by
     /// the same denominator.
-    fn report_frame_counters(label: &str, stages: &FrameStages, frames: usize) {
+    ///
+    /// Relays [`report_recomposite_tile_costs`]'s
+    /// `[folds, real_fold_tiles]` pair back to
+    /// [`report_frame_stages`] (0.100.0). Nothing about what is printed,
+    /// or in what order, changed with it.
+    fn report_frame_counters(label: &str, stages: &FrameStages, frames: usize) -> [u64; 2] {
         #[allow(clippy::cast_precision_loss)]
         let gpu_tiles_mean = stages.gpu_tiles.iter().copied().sum::<u64>() as f64 / frames as f64;
         // min/max as well as the mean (0.88.1). 0.88.0 printed the mean
@@ -29931,7 +29949,7 @@ mod tests {
              -- no timestamp queries)"
         );
 
-        report_recomposite_tile_costs(label, stages, frames);
+        let fold_counts = report_recomposite_tile_costs(label, stages, frames);
 
         // What `upload_sync` actually moved, from the `SyncStats` `sync`
         // already returns. Reported next to `gpu_tiles` because the two
@@ -29968,6 +29986,8 @@ mod tests {
         );
 
         report_composite_write_outcomes(label, stages, frames);
+
+        fold_counts
     }
 
     /// The 0.90.0 `write_composited` bucket line, split out of
@@ -30038,7 +30058,11 @@ mod tests {
     /// ([`RECOMPOSITE_MARK_IMBALANCE`]) is the one that detects that, and it
     /// must print `0`. Neither is asserted on here — the trip-wire test
     /// asserts the imbalance; this function only reports.
-    fn report_recomposite_tile_costs(label: &str, stages: &FrameStages, frames: usize) {
+    ///
+    /// Returns [`report_recomposite_fold_census`]'s own
+    /// `[folds, real_fold_tiles]` pair verbatim (0.100.0) — see that
+    /// function for why the pair travels back to the caller at all.
+    fn report_recomposite_tile_costs(label: &str, stages: &FrameStages, frames: usize) -> [u64; 2] {
         let mut means = [0.0_f64; 5];
         for costs in &stages.recomposite_tile_costs {
             for (src, dest) in costs.iter().zip(means.iter_mut()) {
@@ -30090,7 +30114,7 @@ mod tests {
              composite_roots_into_tile returns, never by inspecting the resulting texels"
         );
 
-        report_recomposite_fold_census(label, frames);
+        report_recomposite_fold_census(label, frames)
     }
 
     /// The 0.97.1 fold census line, printed right after the `phase1 split`
@@ -30111,9 +30135,24 @@ mod tests {
     /// [`composite_roots_into_tile`] always starts from
     /// [`aurora_render::transparent_tile`].
     ///
-    /// Diagnostic only; nothing asserts on it.
-    fn report_recomposite_fold_census(label: &str, frames: usize) {
-        let [folds, real_fold_tiles] = take_recomposite_fold_counts();
+    /// Diagnostic only as far as *printing* goes; nothing here asserts on
+    /// it. **It does return the raw pair now** (0.100.0), unchanged from
+    /// [`take_recomposite_fold_counts`], relayed up through
+    /// [`report_recomposite_tile_costs`] →
+    /// [`report_frame_counters`] → [`report_frame_stages`] so a caller can
+    /// *assert* on the census rather than eyeballing the printed line.
+    /// `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+    /// is the reason: that fixture exists specifically to reach the
+    /// `later`-fold arm, and a fixture that silently stopped reaching it
+    /// would keep passing while measuring the wrong thing.
+    ///
+    /// Deliberately **not** `#[must_use]`: the two older whole-frame tests
+    /// call `report_frame_stages` as a bare statement and have no use for
+    /// the pair, and making them opt out of a lint would be a change to
+    /// their text for no gain.
+    fn report_recomposite_fold_census(label: &str, frames: usize) -> [u64; 2] {
+        let counts = take_recomposite_fold_counts();
+        let [folds, real_fold_tiles] = counts;
         let later = folds.saturating_sub(real_fold_tiles);
         #[allow(clippy::cast_precision_loss)]
         let per_frame = folds as f64 / frames as f64;
@@ -30128,6 +30167,7 @@ mod tests {
              composite_roots_into_tile always seeds its accumulator with transparent_tile, so \
              every root's first fold takes the backdrop_alpha == 0.0 arm"
         );
+        counts
     }
 
     /// Real, headless, GPU-gated end-to-end frame-timing measurement of
@@ -30627,6 +30667,509 @@ mod tests {
             p99 < BUDGET_MS,
             "p99 frame time {p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms CI-safety budget \
              (mean {mean:.2}ms, p50 {p50:.2}ms, max {max:.2}ms)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 0.100.0: the two-root CPU-fallback whole-frame fixture — the thing
+    // PLAN.md's 0.99.0 entry named as missing ("a fixture with two or more
+    // real root layers per tile, so at least one fold per tile reaches
+    // `fold_onto_opaque`. No such fixture exists in this benchmark suite
+    // today"). Everything from here to
+    // `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+    // exists to build exactly that and nothing else; the timed loop itself
+    // is `measure_pan_and_paint_frames`, reused byte for byte, so this
+    // fixture cannot move either older whole-frame test's numbers.
+    // ------------------------------------------------------------------
+
+    /// The pan this fixture measures, held in constants because the
+    /// pre-seeding step below has to know *exactly* which tiles the timed
+    /// loop will visit and there must be one definition of that.
+    ///
+    /// Deliberately identical to
+    /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]'s
+    /// own arguments — same 512x512 viewport, same 12 frames, same
+    /// `(50_000, 50_000)` start, same `(200, 120)` px/frame step — so the
+    /// only differences between the two fixtures are the ones this round is
+    /// about: **two** root layers instead of one, both with real stored
+    /// content at every visited tile, and a bigger `TileStore` budget
+    /// (below). That is a deliberate choice over a "nicer" pan: the whole
+    /// value of the comparison is that the shape is held fixed.
+    ///
+    /// **Not comparable to the 40-frame GPU-path sibling**, which uses a
+    /// larger viewport on purpose. And note `ms_stats`' own p99 is the
+    /// `round((n-1) * 0.99)`-th order statistic, which for any `n` in this
+    /// file's range *is* the maximum — see PLAN.md's 0.94.1 entry. Read
+    /// mean and p50 as the primary figures here; `p99` and `max` are the
+    /// same single sample under two names.
+    const TWO_ROOT_VIEWPORT: (u32, u32) = (512, 512);
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_FRAMES: u32 = 12;
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_START: (u32, u32) = (50_000, 50_000);
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_PAN_STEP: (u32, u32) = (200, 120);
+
+    /// This fixture's own `TileStore` budget, in tiles.
+    ///
+    /// **Deliberately not the shared `real_tile_store()` helper (16
+    /// tiles), and deliberately larger than the 32 the GPU-path sibling
+    /// uses.** Three live surfaces are in play here, not two — the
+    /// backdrop layer, the active canvas layer, and the composite surface
+    /// — so one frame's own working set is `3 * 9 = 27` tiles for a 3x3
+    /// visible grid, and the pre-seeding step below writes real content
+    /// into every tile the whole 12-frame pan will visit on *both* layer
+    /// surfaces (measured: 64 tiles per surface, so 128 pre-seeded).
+    ///
+    /// The GPU-path sibling's own doc comment sets the precedent this
+    /// follows: a budget below one frame's working set produces an
+    /// *intra*-frame self-evict-and-reload pathology rather than the
+    /// realistic cross-frame paging pressure a pan is supposed to
+    /// exercise. Here that would be worse than merely unrealistic — it
+    /// would confound the measurement this fixture exists to take, since
+    /// the extra paging is proportional to exactly the thing being added
+    /// (a second surface with content everywhere). 256 holds the whole
+    /// fixture (128 layer tiles + at most ~64 composite tiles) with room
+    /// to spare, i.e. this fixture measures compositing arithmetic and
+    /// deliberately **not** tile paging. Peak resident cost is bounded by
+    /// `256 * 512 KiB = 128 MiB`, allocated only after
+    /// `real_gpu_context()` has already confirmed a real adapter, so a
+    /// no-GPU CI runner never pays it.
+    const TWO_ROOT_STORE_BUDGET: usize = 256;
+
+    /// Every tile [`measure_pan_and_paint_frames`] can ask
+    /// `TileResidency::visible_tiles` for over the pan described by
+    /// [`TWO_ROOT_VIEWPORT`] and friends, as a **generous superset**: one
+    /// extra tile of margin on each axis beyond
+    /// `aurora_gpu::residency`'s own `grid_for`
+    /// (`viewport.div_ceil(TILE) + 1` per axis).
+    ///
+    /// The margin is the point. `grid_for` is private to `aurora-gpu`, so
+    /// this is a *replica* of its arithmetic and replicas drift; a
+    /// superset makes drift in the safe direction (a few pre-seeded tiles
+    /// nothing ever reads) instead of the unsafe one (a visited tile with
+    /// no backdrop content, which would silently drop that tile's second
+    /// fold and weaken the very measurement this fixture takes). The test
+    /// still asserts on the fold census rather than trusting this
+    /// function, so a drift big enough to matter fails loudly anyway.
+    ///
+    /// Returns the union across frames, deduplicated, in first-visited
+    /// order. `Vec::contains` is a linear scan, which is fine on the ~64
+    /// tiles this produces and keeps the order deterministic for the
+    /// pre-seed walk.
+    fn panned_tile_superset(
+        viewport: (u32, u32),
+        frames: u32,
+        start: (u32, u32),
+        step: (u32, u32),
+    ) -> Vec<aurora_tile::TileId> {
+        let grid = (
+            viewport.0.div_ceil(aurora_tile::TILE).saturating_add(2),
+            viewport.1.div_ceil(aurora_tile::TILE).saturating_add(2),
+        );
+        let mut tiles: Vec<aurora_tile::TileId> = Vec::new();
+        for frame in 0..frames {
+            let x = start.0.saturating_add(frame.saturating_mul(step.0));
+            let y = start.1.saturating_add(frame.saturating_mul(step.1));
+            let origin = aurora_tile::TileId {
+                x: x / aurora_tile::TILE,
+                y: y / aurora_tile::TILE,
+            };
+            for gy in 0..grid.1 {
+                for gx in 0..grid.0 {
+                    let id = aurora_tile::TileId {
+                        x: origin.x.saturating_add(gx),
+                        y: origin.y.saturating_add(gy),
+                    };
+                    if !tiles.contains(&id) {
+                        tiles.push(id);
+                    }
+                }
+            }
+        }
+        tiles
+    }
+
+    /// Fills every one of `tiles` on `surface` with `premultiplied`,
+    /// whole-tile, and marks it fully dirty — a **direct tile fill, not a
+    /// brush dab**, and that distinction is the whole reason this function
+    /// exists.
+    ///
+    /// `aurora_render::composite_layer_into`'s two arms are chosen
+    /// **per texel**, on `backdrop_alpha > 0.0`. A brush-dab-sized second
+    /// layer would put a few thousand of a tile's 65,536 texels on the
+    /// dividing (`fold_onto_opaque`) arm and leave the rest on the cheap
+    /// one — reaching the arm technically, measuring it barely. Seeding the
+    /// first-folded layer opaque across the *whole* tile is what makes the
+    /// second fold take the dividing arm at every texel of every visited
+    /// tile, which is the condition
+    /// `aurora-render/benches/composite.rs`'s own `fold_onto_opaque`
+    /// column measures per call.
+    ///
+    /// Values are **premultiplied**, matching what the tile store holds
+    /// everywhere else (`un_premultiply_in_place` runs on the finished
+    /// composite, not on layer content), so callers must pass
+    /// `rgb <= a`.
+    ///
+    /// Runs entirely *before* the timed loop, so its own cost — and the
+    /// evictions it causes if it ever outgrows
+    /// [`TWO_ROOT_STORE_BUDGET`] — is not in any reported number.
+    fn preseed_full_tiles(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tiles: &[aurora_tile::TileId],
+        premultiplied: [f32; aurora_tile::CHANNELS],
+    ) {
+        let full_tile = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+        };
+        let [sr, sg, sb, sa] = premultiplied.map(half::f16::from_f32);
+        for &tile_id in tiles {
+            let tile = match store.get_mut(surface, tile_id) {
+                Ok(tile) => tile,
+                Err(err) => {
+                    unreachable!("a scratch store this test just created must be writable: {err:?}")
+                }
+            };
+            // Destructured rather than `copy_from_slice`d: this crate
+            // holds a professional's unsaved work and `copy_from_slice`
+            // panics on a length mismatch, so the whole file avoids it
+            // without a length guard in front. `chunks_exact_mut` cannot
+            // yield a short chunk, so the `else` arm is unreachable —
+            // it exists only because the pattern is refutable.
+            for texel in tile.texels_mut().chunks_exact_mut(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = texel else { continue };
+                *r = sr;
+                *g = sg;
+                *b = sb;
+                *a = sa;
+            }
+            tile.mark_dirty(full_tile);
+        }
+    }
+
+    /// Everything
+    /// [`recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`]
+    /// needs to run one arm of its measurement. The `TempDir` is held
+    /// (not `_`-bound at the call site and dropped) because dropping it
+    /// deletes the scratch directory out from under the still-live
+    /// `TileStore`.
+    struct TwoRootFixture {
+        _dir: tempfile::TempDir,
+        store: aurora_tile::TileStore,
+        layers: aurora_doc::LayerTree,
+        /// Folds **first**, onto the transparent accumulator. Pre-seeded
+        /// full-tile opaque, which is what puts the *second* fold on the
+        /// `fold_onto_opaque` arm.
+        backdrop: aurora_doc::LayerId,
+        /// Folds **second**, onto the now-opaque accumulator, and is the
+        /// active layer the timed loop stamps its per-frame dab into.
+        canvas: aurora_doc::LayerId,
+        canvas_surface: aurora_tile::SurfaceId,
+    }
+
+    /// Builds the two-root fixture: two root-level pixel layers at
+    /// **identical** bounds (`0, 0, 300_000, 300_000`, the Phase 0
+    /// ceiling), both with real stored content at every tile the pan will
+    /// visit, on a document that cannot take the GPU compositing path.
+    ///
+    /// Four things here are load-bearing, and each one is a way the
+    /// fixture could silently measure something else:
+    ///
+    /// 1. **Identical bounds.** `resolve_tile`'s cheap arm is gated on
+    ///    `origin == reference_origin`, and `reference_origin` is the
+    ///    *active* layer's own origin (`composite_reference_origin`). A
+    ///    backdrop at any other origin would route through
+    ///    `read_layer_window` instead — a different, slower path whose
+    ///    cost would be confounded with the fold arithmetic being
+    ///    measured.
+    /// 2. **Insertion order.** `LayerTree::add_pixel_layer` inserts each
+    ///    new layer as the *topmost* sibling (`siblings.insert(0, id)`),
+    ///    and `composite_roots_into_tile` folds `roots().iter().rev()` —
+    ///    so the layer added *first* folds first. The backdrop is
+    ///    therefore added first. The test asserts this via
+    ///    `roots().last()` rather than trusting the comment.
+    /// 3. **`Screen` on the active layer.** One of the 22 blend modes the
+    ///    GPU path still cannot express, so
+    ///    `document_qualifies_for_gpu_compositing` is `false` and every
+    ///    tile goes through `composite_roots_into_tile` — the same lever,
+    ///    and for the same reason, as the single-root CPU-fallback
+    ///    sibling. The backdrop stays `Normal`: it is the accumulator's
+    ///    first fold and its mode is not what this measures.
+    /// 4. **Both layers pre-seeded, both arms.** `backdrop_visible`
+    ///    controls *only* `set_visible`. The control arm has byte-identical
+    ///    store contents and differs from the main arm in exactly one
+    ///    document flag, so the two arms' difference is folds-per-tile and
+    ///    nothing else. (The canvas layer is pre-seeded too, not left to
+    ///    the per-frame dab: a dab covers a handful of tiles, and a tile
+    ///    where the *second* layer resolves nothing folds once and
+    ///    contributes no `later` fold at all.)
+    fn two_root_cpu_fallback_fixture(backdrop_visible: bool) -> TwoRootFixture {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(TWO_ROOT_STORE_BUDGET) else {
+            unreachable!("TWO_ROOT_STORE_BUDGET is a non-zero literal");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300_000,
+            height: 300_000,
+        };
+        // Added first => topmost-inserted last => `roots().last()` =>
+        // folded first. See this function's own point 2.
+        let backdrop = match layers.add_pixel_layer("backdrop", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let canvas = match layers.add_pixel_layer("canvas", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(canvas, aurora_doc::BlendMode::Screen) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_visible(backdrop, backdrop_visible) {
+            unreachable!("{err:?}");
+        }
+        let Some(backdrop_surface) = layers.surface_id(backdrop) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let Some(canvas_surface) = layers.surface_id(canvas) else {
+            unreachable!("just created as a pixel layer");
+        };
+
+        let tiles = panned_tile_superset(
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        // Fully opaque (`a = 1.0`), so the accumulator's alpha after the
+        // first fold is `1.0` at every texel and the second fold takes
+        // `fold_onto_opaque` everywhere.
+        preseed_full_tiles(
+            &mut store,
+            backdrop_surface,
+            &tiles,
+            [0.20, 0.35, 0.55, 1.0],
+        );
+        // Translucent, premultiplied (`rgb = straight * 0.75`): a real
+        // paint layer over a real backdrop, and it keeps the second fold
+        // off any degenerate all-opaque shortcut a future implementation
+        // might add.
+        preseed_full_tiles(
+            &mut store,
+            canvas_surface,
+            &tiles,
+            [0.675, 0.45, 0.1875, 0.75],
+        );
+
+        TwoRootFixture {
+            _dir: dir,
+            store,
+            layers,
+            backdrop,
+            canvas,
+            canvas_surface,
+        }
+    }
+
+    /// The whole-frame measurement PLAN.md's 0.99.0 entry said this suite
+    /// could not take: **two real, overlapping root pixel layers on the
+    /// CPU-fallback compositing path, with `composite_layer_into`'s
+    /// `fold_onto_opaque` arm genuinely reached** — proven by the 0.97.1
+    /// fold census, not inferred from the fixture's shape.
+    ///
+    /// Two arms, same store budget, same pan, same blend modes, same
+    /// pre-seeded store contents, differing in exactly one document flag:
+    ///
+    /// - **main**: backdrop visible. Two roots fold at every visited tile,
+    ///   so every tile contributes one `first` fold (cheap
+    ///   `backdrop_alpha == 0.0` arm) *and* one `later` fold (the arm that
+    ///   pays three divisions per texel).
+    /// - **control**: backdrop hidden. `resolve_tile` declines it on
+    ///   visibility, one root folds per tile, and `later` folds are zero
+    ///   *by construction*.
+    ///
+    /// **The control's `later == 0` is reported, not asserted**, and the
+    /// reason is worth stating: `RECOMPOSITE_FOLD_COUNTS` is
+    /// process-global, and while this test holds `GPU_TEST_LOCK` (so no
+    /// other *GPU* test is inside the counter), a CPU-only test in the
+    /// same binary can composite a multi-root document concurrently and
+    /// add to it. Pollution can only *add*, which is why the main arm's
+    /// lower-bound assertion is sound and an equality assertion on the
+    /// control arm would be a flake waiting to happen. For the same
+    /// reason, read the printed census as "at least this much happened".
+    ///
+    /// **What is asserted**: that the document really does fail
+    /// `document_qualifies_for_gpu_compositing` (AC: CPU fallback, not the
+    /// GPU path), that the backdrop really is the root that folds first
+    /// (`roots().last()`, since `composite_roots_into_tile` walks
+    /// `.rev()`), that the main arm's `later` fold count clears a floor of
+    /// one per frame, and the same generous CI-safety frame budget the two
+    /// older whole-frame tests use. Nothing asserts a *magnitude* on any
+    /// timing — this is a diagnostic, exactly as its two siblings are.
+    ///
+    /// **Measured, real hardware (`NVIDIA GeForce RTX 3090, Vulkan,
+    /// DiscreteGpu`), `AURORA_REQUIRE_GPU=1`, `--release`, idle machine.**
+    /// Whole-frame mean over 6 runs: **40.30–42.51 ms** for the two-root
+    /// arm (`later = 108`) and **24.72–26.17 ms** for the single-fold
+    /// control — both far over the 16.7 ms budget, and both much larger
+    /// than the single-root CPU-fallback sibling's own ~9 ms because this
+    /// fixture composites two full-content layers per tile on a store big
+    /// enough not to page. `p99` at `n = 12` *is* the maximum (see
+    /// [`TWO_ROOT_VIEWPORT`]); read mean and p50.
+    ///
+    /// **And the cross-version answer 0.99.0 could not give**: with
+    /// `composite_layer_into`'s body swapped for its verbatim pre-0.98.0
+    /// scalar text in a throwaway worktree, the same two-root arm measured
+    /// **44.58–47.25 ms** — non-overlapping with this tree's range, i.e.
+    /// 0.98.x's vectorization is worth ~4.7 ms of a ~45 ms frame *here*,
+    /// a real and separable whole-frame win. On the control arm, where
+    /// every fold is a first fold, the two trees' ranges overlap and
+    /// nothing is separable. PLAN.md's 0.100.0 entry has the full tables,
+    /// the derived-and-flagged per-fold figures, and every caveat
+    /// (one adapter, idle only, absolute numbers not comparable to
+    /// 0.99.0's rows).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path() {
+        // Same generous CI-safety budget, and the same reasoning, as
+        // `recomposite_and_present_loop_exercises_the_cpu_fallback_path`:
+        // it exists so a real regression fails rather than to assert 60
+        // FPS, which this path does not meet. See that test's own comment.
+        const BUDGET_MS: f64 = 1500.0;
+        const MAIN_LABEL: &str = "recomposite_and_present_loop (CPU fallback, TWO overlapping \
+                                  roots, fold_onto_opaque reached, 300,000px ceiling, pan+paint)";
+        const CONTROL_LABEL: &str = "recomposite_and_present_loop (CPU fallback, control: same \
+                                     fixture, backdrop hidden, single fold, 300,000px ceiling, \
+                                     pan+paint)";
+
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+
+        let mut fixture = two_root_cpu_fallback_fixture(true);
+        assert!(
+            !document_qualifies_for_gpu_compositing(&fixture.layers),
+            "a Screen-blend root must disqualify the document from the GPU path, so that every \
+             visible tile goes through composite_roots_into_tile"
+        );
+        assert_eq!(
+            fixture.layers.roots().last().copied(),
+            Some(fixture.backdrop),
+            "composite_roots_into_tile folds roots().iter().rev(), so the LAST root folds FIRST, \
+             onto the transparent accumulator. The pre-seeded full-tile-opaque backdrop must be \
+             that layer, or the opaque tile ends up on top and the fold that pays three \
+             divisions never happens"
+        );
+        assert_eq!(
+            fixture.layers.roots().first().copied(),
+            Some(fixture.canvas),
+            "and the active, Screen-blend canvas layer must be the one that folds second, onto \
+             the now-opaque accumulator: that fold is the fold_onto_opaque arm this fixture \
+             exists to reach"
+        );
+
+        let mut stages = measure_pan_and_paint_frames(
+            &context,
+            &fixture.layers,
+            fixture.canvas,
+            fixture.canvas_surface,
+            &mut fixture.store,
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        // `report_frame_stages` returns the census it prints (0.100.0)
+        // precisely so this assertion can exist. `first_folds` is slot 1
+        // (`real_fold_tiles`) and `later = folds - first_folds`; see
+        // `RECOMPOSITE_FOLD_COUNTS`' own doc comment for why that
+        // subtraction is exact rather than an estimate.
+        let [folds, first_folds] = report_frame_stages(MAIN_LABEL, &mut stages);
+        let later_folds = folds.saturating_sub(first_folds);
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
+        println!(
+            "{MAIN_LABEL}: n={} mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms \
+             (nominal budget 16.7ms) | fold census: folds={folds} first={first_folds} \
+             later={later_folds} -- `later` is the count that took \
+             composite_layer_into's dividing arm, and a run with later=0 measured the wrong \
+             thing however good its timings look",
+            timings.len()
+        );
+
+        assert!(
+            later_folds >= u64::from(TWO_ROOT_FRAMES),
+            "this fixture exists to reach composite_layer_into's fold_onto_opaque arm, and the \
+             fold census says it barely did or did not: folds={folds} first={first_folds} \
+             later={later_folds}, floor {} (one per frame). Check, in this order: both layers' \
+             bounds/origins still identical (resolve_tile's cheap arm is gated on \
+             origin == reference_origin); the backdrop still the LAST root; the pre-seeded tile \
+             superset still covering what visible_tiles actually walks; the store budget still \
+             above the fixture's working set",
+            u64::from(TWO_ROOT_FRAMES)
+        );
+        assert!(
+            p99 < BUDGET_MS,
+            "p99 frame time {p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms CI-safety budget \
+             (mean {mean:.2}ms, p50 {p50:.2}ms, max {max:.2}ms)"
+        );
+
+        // The control arm. Identical in every respect except that the
+        // backdrop is hidden, which is what makes the pair a same-fixture
+        // double-fold-vs-single-fold comparison rather than two
+        // differently-shaped benchmarks.
+        let mut control = two_root_cpu_fallback_fixture(false);
+        assert!(
+            !document_qualifies_for_gpu_compositing(&control.layers),
+            "hiding the backdrop must not accidentally re-qualify the document for the GPU \
+             path -- the active layer is still Screen-blended"
+        );
+        let mut control_stages = measure_pan_and_paint_frames(
+            &context,
+            &control.layers,
+            control.canvas,
+            control.canvas_surface,
+            &mut control.store,
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        let [control_folds, control_first] =
+            report_frame_stages(CONTROL_LABEL, &mut control_stages);
+        let control_later = control_folds.saturating_sub(control_first);
+        let control_timings = &mut control_stages.total;
+        let (c_mean, c_p50, c_p99, c_max) = ms_stats(control_timings);
+        println!(
+            "{CONTROL_LABEL}: n={} mean={c_mean:.2}ms p50={c_p50:.2}ms p99={c_p99:.2}ms \
+             max={c_max:.2}ms (nominal budget 16.7ms) | fold census: folds={control_folds} \
+             first={control_first} later={control_later} -- later is 0 by construction here \
+             (one visible root, and composite_roots_into_tile always seeds a transparent \
+             accumulator); reported, NOT asserted, because RECOMPOSITE_FOLD_COUNTS is \
+             process-global and a concurrent CPU-only test can add to it",
+            control_timings.len()
+        );
+        assert!(
+            c_p99 < BUDGET_MS,
+            "control p99 frame time {c_p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms \
+             CI-safety budget (mean {c_mean:.2}ms, p50 {c_p50:.2}ms, max {c_max:.2}ms)"
         );
     }
 
