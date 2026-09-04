@@ -19717,19 +19717,26 @@ severity choice.
   **Two non-vacuity mutations, run by hand rather than assumed** — the
   check that the skip is actually tested in the direction that matters:
 
-  - `if folded > 0` → `if false` (always skip): **5 tests FAIL**
-    (`379 passed; 5 failed`), reported here as 2 and re-run by hand in
-    0.94.1 — coverage is stronger than this entry claimed, but the claim
-    should still be accurate. The full list:
+  - `if folded > 0` → `if false` (always skip): **6 tests FAIL**
+    (`379 passed; 6 failed`) against the tree as actually committed here,
+    reported originally as 2, corrected to 5 earlier in this same 0.94.1
+    pass, and corrected again to 6 by independent re-verification — the
+    5-count above was itself captured before this entry's own regression
+    guard (below) existed in the tree and was never re-run against the
+    final code, the exact "stale claim" failure mode this correction pass
+    exists to fix. The full list:
     `composite_document_un_premultiplies_a_translucent_root_level_layer`,
     `recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer`,
     `composite_document_straightens_a_fractional_group_and_a_fractional_root_fold_exactly_once`,
     `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`,
-    and `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_opacity_document`.
-    The first two each report the premultiplied `(0.5, 0.5, 0.5, 0.5)`
-    where straight `(1.0, 1.0, 1.0, 0.5)` is required. So the pass is
-    genuinely load-bearing for a folded tile and the suite notices its
-    removal from several independent directions.
+    `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_opacity_document`,
+    and `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`
+    (the new regression-guard test itself, added below in this same
+    0.94.1 pass — failing here is exactly its job). The first two each
+    report the premultiplied `(0.5, 0.5, 0.5, 0.5)` where straight
+    `(1.0, 1.0, 1.0, 0.5)` is required. So the pass is genuinely
+    load-bearing for a folded tile and the suite notices its removal from
+    several independent directions.
   - `if folded > 0` → `if true` (the exact pre-change behaviour):
     **384 passed, 0 failed** in `aurora-app`, including the three new
     tests. Then restored to `if folded > 0`: **384 passed, 0 failed**.
