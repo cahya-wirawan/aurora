@@ -21311,7 +21311,11 @@ severity choice.
   **0.98.0 (2026-09-04) — Round C: the cheaper fix 0.97.1 said to measure
   first. Batching `composite_layer_into`'s `f16` <-> `f32` conversions is a
   real, measured win — every mode faster in the multi-root condition, and
-  the three decision modes faster in the single-root one too.** 0.97.1's
+  the two decision modes faster in the single-root one too.** (Corrected
+  0.98.1 from "the three decision modes": `benches/composite.rs`'s own
+  module doc fixes the go/no-go read to exactly **two** modes, `Normal`
+  and `Multiply`, and no third was ever named as a decision mode here.)
+  0.97.1's
   "Alternatives considered" named this explicitly and ranked it ahead of
   `rayon`: the per-texel cost is dominated by `f16` <-> `f32` conversions
   rather than by the blend formula, and 0.92.0 had already removed exactly
@@ -21322,7 +21326,22 @@ severity choice.
 
   **The measurement, and read the methodology note before the table.**
   Same box, same `benches/composite.rs`, same two conditions, all 26
-  modes, criterion medians with the 95 % change interval. A **first
+  modes. **Correction (0.98.1): the before/after columns are not
+  medians.** They are criterion's own reported point estimate — its
+  `slope` where it has one, else its `mean` — i.e. the number criterion
+  prints as the middle value of `time: [low mid high]`, read back out of
+  `target/criterion/*/estimates.json`. The `change` column is criterion's
+  *separately computed* change estimate, not `(after - before) / before`
+  over the two quoted numbers, so on low-effect-size rows the two will not
+  exactly ratio-match (e.g. Multiply's `fold_onto_transparent`
+  1.765 -> 1.704 ms is a -3.5 % ratio against a reported -5.2 % change;
+  that row's medians are 1.740 -> 1.673 ms, -3.9 %). **That is expected,
+  not an error** — they are two statistics from the same run — but it does
+  mean a reader cannot cross-check one column against the other, and the
+  original "criterion medians" label wrongly implied they could. The
+  `fold_onto_opaque` rows happen to reconcile closely; the
+  `fold_onto_transparent` rows are where the gap shows. T1's own bar was
+  registered in medians, and reads the same either way (below). A **first
   after-run was discarded**: it was launched in the background while
   `cargo check --workspace`, `cargo clippy --workspace` and `cargo test
   --workspace` were running on the same 4-core box (load average 6.08),
@@ -21355,10 +21374,63 @@ severity choice.
   `fold_onto_opaque`, **26 of 26 improved**, from -10.4 % (ColorBurn) to
   -32.3 % (HardLight), every interval entirely below zero. In
   `fold_onto_transparent`, **23 of 26 improved** (-1.7 % to -26.2 %) and
-  **three got slightly worse**: ColorBurn +1.8 %, LinearLight +1.9 %,
-  Color +1.4 %, each `p = 0.00` with the whole interval above zero, so
-  they are real and not noise — small, real losses, disclosed rather than
-  averaged away. The asymmetry has an obvious shape: the opaque arm pays
+  **three came back slightly slower**: ColorBurn +1.8 %, LinearLight
+  +1.9 %, Color +1.4 %.
+
+  **Correction (0.98.1) — those three are a disclosed *possible* small
+  cost, not a confirmed regression. The original entry overstated the
+  statistical confidence.** It said "each `p = 0.00` with the whole
+  interval above zero, so they are real and not noise". Two independent
+  re-measurements say that does not hold. The `p` values are quoted
+  correctly, but **`p < 0.05` was not criterion's verdict on these rows** —
+  criterion's own decision rule combines the `p` value with its default
+  2 % noise threshold, and on every one of these rows it printed
+  **"Change within noise threshold."**, which is precisely *not* "real and
+  not noise". Quoting the `p` value while omitting the verdict line
+  directly beneath it inverted what the tool actually reported.
+
+  Re-measured at 0.98.1, on this same idle box, by rebuilding a clean
+  baseline from the parent commit `5a0f179`
+  (`git checkout 5a0f179 -- crates/aurora-render/src/composite.rs`,
+  `cargo bench -p aurora-render --bench composite -- --save-baseline
+  b5a0f179 'fold_onto_transparent/(ColorBurn|LinearLight|Color)$'`), then
+  restoring HEAD and re-running the same three benchmarks against that
+  saved baseline **twice**:
+
+  | mode | baseline | run 1 | run 2 | criterion's verdict |
+  |---|---|---|---|---|
+  | ColorBurn | 1.9284 ms | +1.72 % `[+0.65, +2.74]`, p = 0.00 | +1.51 % `[+0.48, +2.59]`, p = 0.01 | *Change within noise threshold* (both) |
+  | LinearLight | 1.7911 ms | +1.51 % `[+0.30, +2.63]`, p = 0.01 | +1.16 % `[-0.07, +2.31]`, p = 0.05 | *within noise* / **No change in performance detected** |
+  | Color | 2.6283 ms | +1.44 % `[+0.45, +2.31]`, p = 0.00 | +1.51 % `[+0.58, +2.40]`, p = 0.00 | *Change within noise threshold* (both) |
+
+  The baseline reproduced 0.98.0's own "before" column closely (1.9284 vs.
+  1.923, 1.7911 vs. 1.783, 2.6283 vs. 2.622), so this is the same
+  measurement, not a different one. But note what moved: **LinearLight's
+  interval crossed zero on the second run** and criterion reported *No
+  change in performance detected* — the same benchmark, the same binaries,
+  minutes apart. An independent reviewer rebuilding the baseline the same
+  way got all three at **p = 0.08–0.16 with intervals straddling zero and
+  roughly half the magnitude (~+0.8 %)**, i.e. criterion's *No change*
+  verdict on all three.
+
+  **So the honest statement is:** the *direction* is consistent across
+  every run and every reviewer — these three modes are slightly slower —
+  and the magnitude is somewhere around **+0.5 % to +2 %**, but the effect
+  is **inside this benchmark's own noise floor at this sample size** and is
+  **not** established as a real regression by any run of it. It is
+  disclosed as a plausible small cost of the two new `f32` scratch arrays'
+  memory traffic, in the cheapest modes on the arm with the least
+  conversion work to amortize — which is the mechanism the round predicted
+  up front, and is why it is worth recording at all rather than deleting.
+  Establishing it as real would need a larger sample count or a lowered
+  `--noise-threshold`, neither of which was run. **Do not quote these
+  three as measured regressions.** The 23 improvements in this condition
+  and all 26 in `fold_onto_opaque` are unaffected: those are 5–32 %
+  effects, an order of magnitude clear of the same 2 % noise floor these
+  three sit inside, so nothing about this correction touches the round's
+  headline result.
+
+  The asymmetry has an obvious shape: the opaque arm pays
   three extra `f16` widenings for the straightening divisions, so it has
   more conversion overhead to remove, and it is where the batching pays
   best.
@@ -21367,10 +21439,14 @@ severity choice.
   that the win might be zero — `blend_rgb`'s 26-mode dispatch might
   dominate, LLVM might already CSE the conversions, and the two new `f32`
   scratch arrays add memory traffic the old code did not have. That third
-  effect is visible: it is almost certainly what the three
-  `fold_onto_transparent` regressions are, in the cheapest modes on the
-  arm with the least conversion work to amortize. The first two did not
-  hold — the win is real and, for the expensive non-separable modes, large.
+  effect is the best available explanation for the three
+  `fold_onto_transparent` modes that came back slower, in the cheapest
+  modes on the arm with the least conversion work to amortize — but per
+  the 0.98.1 correction above, that slowdown is itself inside the
+  benchmark's noise floor, so this is a plausible mechanism for a possible
+  small cost, **not** a measured effect with a confirmed cause. The first
+  two did not hold — the win is real and, for the expensive non-separable
+  modes, large.
 
   **What this does *not* do: move T1, or the 60 FPS gate.** 0.97.1's T1
   bar was "median >= 2.0 ms for both `Normal` and `Multiply` in the
@@ -21433,7 +21509,11 @@ severity choice.
 
   - rewrite the body in the naive independent-remainder shape ->
     `mismatched_length_folds_match_the_scalar_reference` FAILS, and it is
-    the **only** test that fails (116 pass).
+    the **only** test that fails (**143 pass** — corrected 0.98.1 from a
+    stale "116 pass"; `aurora-render`'s lib has 144 tests after this
+    round, and `cargo test -p aurora-render --lib` under this mutation
+    reports 143 passed, 1 failed. The substance of the claim — that
+    exactly one test catches it — is unchanged and was re-confirmed).
   - round-trip the full `out` slice instead of just the vectorized head ->
     `an_over_long_accumulator_keeps_its_tail_bits_untouched` FAILS, and
     only it.
@@ -21679,6 +21759,48 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.98.1) — 0.97.1's directive is DISCHARGED, and
+0.98.0's three "real, not noise" regressions are downgraded to a
+disclosed possible cost.** (1) **The directive is done.** 0.97.1 ended
+"Measure vectorization against this same benchmark before committing to
+`rayon` here." 0.98.0 did exactly that: batching `composite_layer_into`'s
+`f16` ↔ `f32` conversions through `half::slice::HalfFloatSliceExt`, no
+`rayon`, no new dependency. **26 of 26 modes faster in
+`fold_onto_opaque`** (-10.4 % to -32.3 %) and **23 of 26 in
+`fold_onto_transparent`** (-1.7 % to -26.2 %). (2) **The single-root T1
+verdict is still FAIL and now further below the bar.** T1's 2.0 ms bar,
+read in `fold_onto_transparent` — the only arm a single-root document ever
+takes — was `Normal` 1.7983 / `Multiply` 1.7876 ms at 0.97.1; it is now
+**`Normal` 1.681 / `Multiply` 1.704 ms**, so the work parallelization
+would have to amortize is ~6 % *smaller* than when 0.97.1 called it
+NO-GO. **That hardens the single-root NO-GO rather than reopening it** —
+parallelizing the common case is now less attractive, not more. (3) **The
+conditional, multi-root-only GO is unchanged and still open**, and
+composes with this round rather than being replaced by it: any future
+round must still gate a parallel path on a document genuinely folding
+multiple roots, never parallelize every call. (4) **The 60 FPS gate is
+untouched by this round, explicitly.** This was a per-call, CPU-only
+constant-factor reduction on the compositing *fallback* path, measured on
+one tile per call; it was never re-measured end-to-end on a frame, and the
+M1.10 pan-while-painting tables remain the standing 60 FPS numbers.
+(5) **What 0.98.1 itself corrected**, all reporting accuracy on 0.98.0's
+already-verified code (no implementation change): the three slightly
+slower `fold_onto_transparent` modes (ColorBurn, LinearLight, Color) were
+claimed "real and not noise" on their `p` values alone, but criterion's
+own verdict line on every one of those rows is *Change within noise
+threshold* — re-measured twice at 0.98.1 against a clean `5a0f179`
+baseline (+1.2 % to +1.7 %, one row flipping to *No change in performance
+detected*), and independently at ~+0.8 % with p = 0.08–0.16, so they are
+now recorded as a **disclosed possible small cost, not a measured
+regression**; the before/after table was mislabelled "criterion medians"
+when it quotes criterion's `slope`-else-`mean` point estimate, with a
+`change` column that is a separate estimate and deliberately does not
+ratio-match; mutation A's "116 pass" was stale (**143 pass**, of 144); and
+four doc-comment claims in `composite.rs` were overstated. **Next actual
+decision is unchanged and still Cahya's**: the multi-root-only
+parallelization GO is open but low-value, and nothing here advances the
+60 FPS gate.
 
 **Addendum 2026-09-04 (0.97.1) — 0.97.0's GO verdict is WITHDRAWN: T1 was
 read from a condition the round's own corroborating fixture never

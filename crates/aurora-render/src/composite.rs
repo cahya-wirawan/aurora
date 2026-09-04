@@ -790,10 +790,24 @@ fn fold_texel(
 /// per-texel from `out`, `texels`, `opacity`, and `mode`. That is what
 /// makes folding N layers via N calls identical to one
 /// [`composite_tile_cpu`] call over the same N layers in the same
-/// order — **by construction**, not by test: the loop below reads no
-/// state at all beyond `dst`, `src`, `opacity` and `mode`, so there is
-/// nothing a batch call could carry across layers that N separate calls
-/// could not. What pins the math itself is
+/// order — **by construction**, not by test: no state carries from one
+/// *call* to the next, so there is nothing a batch call could carry
+/// across layers that N separate calls could not. (Corrected in 0.98.1:
+/// this paragraph used to say "the loop below reads no state at all
+/// beyond `dst`, `src`, `opacity` and `mode`", which 0.98.0's
+/// vectorization made literally false. The loop *does* now carry two
+/// call-local `[f32; CHUNK_SAMPLES]` scratch arrays, `dst_wide` and
+/// `src_wide`, across chunk iterations. They are declared inside this
+/// function, so nothing crosses a call boundary; what makes reusing them
+/// across chunks correct is that `convert_to_f32_slice` overwrites
+/// *every* lane of its destination on every chunk — a `half`-crate
+/// guarantee this code relies on rather than one it establishes locally
+/// — so no lane of a previous chunk can survive into the next. A
+/// violation would show up as a bit mismatch in
+/// `vectorized_fold_is_bit_identical_to_the_scalar_reference`, whose
+/// fixture varies per texel *and* per channel across the chunk boundary
+/// precisely so a stale lane cannot hide behind uniform data; see
+/// `varied_samples_from`'s own comment.) What pins the math itself is
 /// `composite_layer_into_folded_matches_hand_computed_golden_values`,
 /// which fixes a three-layer fold to values derived by hand from the
 /// formula above rather than from any call this module makes.
@@ -929,7 +943,7 @@ fn fold_texel(
 ///
 /// **Bit-exactness.** `convert_to_f32_slice`/`convert_from_f32_slice`
 /// are the same `half` conversions `to_f32`/`from_f32` perform, batched;
-/// the private `fold_texel` below holds the arithmetic verbatim, in the same operand
+/// the private `fold_texel` above holds the arithmetic verbatim, in the same operand
 /// order; and no sample is ever round-tripped `f16` → `f32` → `f16`
 /// without being computed, because all four of a processed texel's
 /// channels are computed values. (That last point is where the 0.92.0
@@ -986,6 +1000,17 @@ pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode:
     // `aurora_gpu::residency`'s single-input serializer can use -- would
     // misalign the tail whenever the two chunk counts differ.
     let vectorized = (out.len().min(texels.len()) / CHUNK_SAMPLES) * CHUNK_SAMPLES;
+    // Both `else` arms below are unreachable by construction: `vectorized`
+    // is `min(out.len(), texels.len())` rounded *down*, so it is <= both
+    // lengths and every split point is in bounds (the proof is in this
+    // function's "Panics: none, by construction" section). `return` --
+    // fold nothing -- is chosen over attempting a partial fold precisely
+    // because a case that cannot occur has no principled partial answer:
+    // if the split point were somehow out of bounds, the length
+    // relationship the whole lockstep argument rests on would already be
+    // broken, and folding *some* prefix would be guessing. Do not
+    // "handle" these arms; they exist only because the workspace denies
+    // `unwrap` and the panicking `split_at`/`split_at_mut`.
     let Some((head_src, tail_src)) = texels.split_at_checked(vectorized) else {
         return;
     };
@@ -7595,6 +7620,20 @@ mod tests {
     /// | dev (`opt-level = 1`) | 96 | 96 | **0** |
     /// | `--release` | 5,808 | 5,808 | **0** |
     ///
+    /// **Read those two counts as a one-time manual measurement, not as
+    /// something this tree re-derives** (disclosed 0.98.1). They were
+    /// produced by temporarily instrumenting this test's loop to count and
+    /// classify every mismatch, in each profile, and that instrumentation
+    /// was not kept: nothing committed here counts or prints them, so
+    /// re-running the suite confirms the *property* below without
+    /// reproducing the numbers. What the committed test does enforce
+    /// permanently is the load-bearing half — the "anything else" column
+    /// being **0** — because it still asserts full `to_bits()` equality
+    /// everywhere the scalar reference did not produce a NaN. The exact
+    /// counts are profile-, LLVM-version- and target-dependent and would
+    /// drift with any of the three, which is why they are recorded as a
+    /// dated observation rather than pinned by an assertion.
+    ///
     /// So the divergence is *entirely* NaN-payload selection and never a
     /// value: not one sample differed where either side was a number.
     /// The dev-profile cases are all `Luminosity`, all on the red
@@ -7708,10 +7747,12 @@ mod tests {
     }
 
     /// The mirror: a source longer than the accumulator composites only
-    /// the accumulator's own worth of texels, and reads nothing past it.
-    /// `out` is the shorter slice here, so there is no tail to check on
-    /// the output side — what this pins is that the extra *source*
-    /// samples cannot change the result.
+    /// the accumulator's own worth of texels. `out` is the shorter slice
+    /// here, so there is no tail to check on the output side — what this
+    /// pins is that the extra *source* samples cannot change the result.
+    /// (Deliberately *not* "and reads nothing past it": safe Rust gives
+    /// this test no way to observe a read, so that is not something it
+    /// proves. Corrected in 0.98.1.)
     #[test]
     fn an_over_long_source_composites_only_the_shorter_prefix() {
         let accumulator = boundary_fixture(0);
