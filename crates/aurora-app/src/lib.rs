@@ -28545,11 +28545,30 @@ mod tests {
     /// chained composites would restate that arithmetic rather than test
     /// it. The `assert_ne!` against transparent black is the setup guard
     /// that keeps the differential from passing on two empty results.
-    // `too_many_lines`: 101, against a 100 limit — the four-layer
-    // fixture table plus two full `recomposite_visible_tiles` runs. The
-    // same allow several sibling tests in this module already carry.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing for something this test
+    /// never mentions** (recorded 0.105.3): it is the only reason the
+    /// `Multiply` *dispatch arm*'s `src`/`backdrop` argument order is
+    /// observable anywhere in the workspace. `Cb * Cs` is commutative, so
+    /// only the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, can ever see the two operands
+    /// swapped, and it cannot at `a = 1` — the dedicated
+    /// `..._agree_on_a_multiply_blend_document` sibling is all-opacity-`1.0`
+    /// and provably blind to that mutation. This fixture and the
+    /// `..._reads_back_the_right_member_after_an_odd_swap_count` one below
+    /// are the *two* tests PLAN.md's 0.105.2 kill matrix measured a
+    /// transposed `Multiply` arm dying on, and nothing else in the suite
+    /// caught it. Normalising this layer's opacity to `1.0` during some
+    /// later cleanup would silently reopen that gap: this test is
+    /// differential-only, so unlike its `Lighten`/`Screen`/`Difference`/
+    /// `LinearDodge` siblings it has no absolute golden that such an edit
+    /// would break. The fixture table therefore lives in
+    /// [`MIXED_NORMAL_AND_MULTIPLY_STACK`], which
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+    /// re-checks headlessly. (Moving it there also took the body from 101
+    /// lines to well under the 100-line `clippy::too_many_lines` limit,
+    /// which is why that allow and its note are gone.)
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack() {
         let Some(context) = real_gpu_context() else {
             return;
@@ -28564,32 +28583,7 @@ mod tests {
         };
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
-        for (name, mode, opacity, rgba) in [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0_f32,
-                [0.5_f32, 0.75, 1.0, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::Normal,
-                0.5,
-                [0.0, 0.0, 1.0, 1.0],
-            ),
-            (
-                "l4",
-                aurora_doc::BlendMode::Multiply,
-                0.5,
-                [0.25, 1.0, 0.5, 1.0],
-            ),
-        ] {
+        for (name, mode, opacity, rgba) in MIXED_NORMAL_AND_MULTIPLY_STACK {
             let id = match layers.add_pixel_layer(name, bounds, None) {
                 Ok(id) => id,
                 Err(err) => unreachable!("{err:?}"),
@@ -28722,6 +28716,432 @@ mod tests {
             fill_solid(store, surface, aurora_tile::TileId { x: 0, y: 0 }, rgba);
         }
         layers
+    }
+
+    /// One [`solid_root_stack`] entry — `(layer name, blend mode,
+    /// opacity, solid RGBA)` — named once (0.105.3) so the fixture
+    /// constants below, the roster that walks them and the tests that
+    /// composite them all share a single spelling of the tuple.
+    type StackEntry = (&'static str, aurora_doc::BlendMode, f32, [f32; 4]);
+
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_
+    /// multiply_stack`'s own four-layer fixture, and one of exactly two
+    /// places a transposed `Multiply` dispatch arm is visible (via `l4`'s
+    /// opacity `0.5`). Hoisted out of that test in 0.105.3 so
+    /// [`TRANSPOSE_COVERAGE`]'s guard can read the same data the test
+    /// composites, rather than a copy of it that could drift. Read that
+    /// test's doc comment for the swap-direction table these values were
+    /// chosen for.
+    const MIXED_NORMAL_AND_MULTIPLY_STACK: [StackEntry; 4] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.5,
+            [0.0, 0.0, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Multiply,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+    ];
+
+    /// `recomposite_visible_tiles_gpu_path_reads_back_the_right_member_
+    /// after_an_odd_swap_count`'s five-layer fixture — three `Multiply`
+    /// layers, so three swaps — and the second of the two places a
+    /// transposed `Multiply` dispatch arm is visible (again `l4`'s
+    /// opacity `0.5`; `l2` and `l5` sit at `1.0`, where the swap cannot
+    /// be seen). Hoisted in 0.105.3, same reason as above.
+    const FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK: [StackEntry; 5] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.75,
+            [0.0, 0.25, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Multiply,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+        (
+            "l5",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.5, 0.25, 1.0],
+        ),
+    ];
+
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_
+    /// multiply_and_darken_stack`'s five-layer fixture, and the *only*
+    /// place a transposed `Darken` dispatch arm is visible (`l4`'s
+    /// opacity `0.5`). Hoisted in 0.105.3, same reason as above.
+    const MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK: [StackEntry; 5] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.75,
+            [0.0, 0.25, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Darken,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+        (
+            "l5",
+            aurora_doc::BlendMode::Darken,
+            1.0,
+            [0.75, 0.5, 0.25, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_lighten_blend_document`'s three-layer fixture
+    /// (0.95.0), with the `Lighten` layer at opacity `0.5` as of 0.105.2 —
+    /// deliberately, and the golden `(0.1875, 0.375, 0.5, 1.0)` is derived
+    /// from that value.
+    const NORMAL_MULTIPLY_LIGHTEN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Lighten,
+            0.5,
+            [0.25, 0.25, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_screen_blend_document`'s three-layer fixture
+    /// (0.102.0), `Screen` layer at opacity `0.5` as of 0.105.2; golden
+    /// `(0.234375, 0.453125, 0.53125, 1.0)`.
+    const NORMAL_MULTIPLY_SCREEN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Screen,
+            0.5,
+            [0.25, 0.25, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_difference_blend_document`'s three-layer fixture
+    /// (0.104.0), `Difference` layer at opacity `0.5` as of 0.105.2;
+    /// golden `(0.25, 0.3125, 0.375, 1.0)`. Its source colour is chosen so
+    /// `|Cb - Cs|` has three distinct magnitudes — see that test.
+    const NORMAL_MULTIPLY_DIFFERENCE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Difference,
+            0.5,
+            [0.5, 0.125, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_linear_dodge_blend_document`'s three-layer fixture
+    /// (0.105.0), `LinearDodge` layer at opacity `0.5` as of 0.105.1 — the
+    /// round that discovered this whole class of gap, on this arm.
+    const NORMAL_MULTIPLY_LINEAR_DODGE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::LinearDodge,
+            0.5,
+            [0.25, 0.875, 0.5, 1.0],
+        ),
+    ];
+
+    /// **Which fixture makes which GPU blend-math dispatch arm's argument
+    /// order observable** (0.105.3) — `(mode, the test that composites
+    /// this fixture, the fixture itself)`, and the input to
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`].
+    ///
+    /// Every entry is a fixture some existing test already composites; no
+    /// row here adds coverage of its own. What the roster adds is a single
+    /// place that *names* the property, and a headless assertion that it
+    /// still holds, because it is invisible in the fixtures themselves: an
+    /// opacity of `0.5` on one layer reads like an arbitrary choice.
+    ///
+    /// Both `Multiply` rows are real and neither is redundant — PLAN.md's
+    /// 0.105.2 kill matrix measured a transposed `Multiply` arm killing
+    /// exactly those two tests.
+    const TRANSPOSE_COVERAGE: &[(aurora_doc::BlendMode, &str, &[StackEntry])] = &[
+        (
+            aurora_doc::BlendMode::Multiply,
+            "recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack",
+            &MIXED_NORMAL_AND_MULTIPLY_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Multiply,
+            "recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count",
+            &FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Darken,
+            "recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack",
+            &MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Lighten,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document",
+            &NORMAL_MULTIPLY_LIGHTEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Screen,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document",
+            &NORMAL_MULTIPLY_SCREEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Difference,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document",
+            &NORMAL_MULTIPLY_DIFFERENCE_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::LinearDodge,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document",
+            &NORMAL_MULTIPLY_LINEAR_DODGE_STACK,
+        ),
+    ];
+
+    /// The `aurora_doc` blend mode each [`GpuBlendDispatch`] counter is
+    /// counting. Written as an exhaustive `match` on purpose: a counter
+    /// variant added for a newly ported mode is a compile error here, which
+    /// is what forces the author past the guard below.
+    fn dispatch_arm_blend_mode(which: GpuBlendDispatch) -> aurora_doc::BlendMode {
+        match which {
+            GpuBlendDispatch::Multiply => aurora_doc::BlendMode::Multiply,
+            GpuBlendDispatch::Darken => aurora_doc::BlendMode::Darken,
+            GpuBlendDispatch::Lighten => aurora_doc::BlendMode::Lighten,
+            GpuBlendDispatch::Screen => aurora_doc::BlendMode::Screen,
+            GpuBlendDispatch::Difference => aurora_doc::BlendMode::Difference,
+            GpuBlendDispatch::LinearDodge => aurora_doc::BlendMode::LinearDodge,
+            GpuBlendDispatch::Dissolve => aurora_doc::BlendMode::Dissolve,
+        }
+    }
+
+    /// The layer *tree* one of the fixture constants above describes, with
+    /// no tile store and no pixels — enough for
+    /// [`document_qualifies_for_gpu_compositing`], which reads a root
+    /// layer's kind, visibility and blend mode and nothing else. Keeps the
+    /// guard below headless: no temp directory, no GPU adapter, no
+    /// compositing.
+    fn root_stack_tree(entries: &[StackEntry]) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for &(name, mode, opacity, _) in entries {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_visible(id, true) {
+                unreachable!("{err:?}");
+            }
+        }
+        layers
+    }
+
+    /// **The systemic guard against the gap 0.105.1 and 0.105.2 each had
+    /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
+    /// dispatch arm's `src`/`backdrop` arguments survived the entire test
+    /// suite, and both times the only thing that found it was a human
+    /// performing the mutation and re-running everything. Nineteen modes
+    /// are still to be ported on the same template, so the class needs a
+    /// standing check rather than a third discovery.
+    ///
+    /// The property, in one line: every blend-math formula the GPU path
+    /// implements so far (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
+    /// `|Cb - Cs|`, `min(Cb+Cs, 1)`) is **commutative**, so the only thing
+    /// that can ever notice a swapped pair of operands is the asymmetric
+    /// fold around it, `out = (1 - a) * bd + a * blended`, and it notices
+    /// nothing at `a = 1`. A fixture whose layer at the mode under test is
+    /// fully opaque therefore cannot see a transposed dispatch arm, no
+    /// matter how many assertions it carries.
+    ///
+    /// So, for every mode with a dispatch counter (`GpuBlendDispatch::ALL`,
+    /// itself pinned to the enum by an exhaustive `match` and by
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter`), except
+    /// `Dissolve`, which resolves to `Normal` before any blend math runs,
+    /// this asserts that [`TRANSPOSE_COVERAGE`] names at least one fixture
+    /// with a layer at that mode whose effective alpha (`opacity * the
+    /// layer's own alpha`) is strictly between `0` and `1`, and that the
+    /// fixture still qualifies for the GPU path at all.
+    ///
+    /// **What it does not do, stated plainly.**
+    ///
+    /// - It does not prove a transpose *is* detected. That takes running
+    ///   the mutation, which is what PLAN.md's 0.105.1/0.105.2 kill
+    ///   matrices record; non-unit opacity is necessary, not sufficient
+    ///   (`Cb == Cs` in every channel would hide a swap at any opacity, as
+    ///   would assertions too loose to see the difference). This guard's
+    ///   real job is to keep the *necessary* condition from being
+    ///   optimised away by a later, unrelated cleanup.
+    /// - It does not check the fixture's assertions at all, only its layer
+    ///   table.
+    /// - Its roster is hand-maintained. A new mode ported *without* an
+    ///   entry fails here (that is the point), but a fixture added and
+    ///   never registered is invisible to it.
+    /// - It anchors on the counter enum, not directly on
+    ///   [`document_qualifies_for_gpu_compositing`]'s `matches!` set: a
+    ///   mode admitted at the predicate with no counter variant would slip
+    ///   past. Nothing enumerates `aurora_doc::BlendMode`'s 27 variants at
+    ///   runtime, so closing that would mean adding a second
+    ///   hand-maintained list — the very thing this exists to reduce.
+    ///   `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_
+    ///   across_every_expressible_mode`'s own mode loop is the other place
+    ///   that drift shows up, and it has caught it once already.
+    ///
+    /// Headless and cheap: no GPU adapter, no tile store, no compositing —
+    /// it reads layer tables and builds throwaway trees.
+    #[test]
+    fn every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument() {
+        for which in GpuBlendDispatch::ALL {
+            let mode = dispatch_arm_blend_mode(which);
+            if mode == aurora_doc::BlendMode::Dissolve {
+                continue;
+            }
+            let mut fixtures = 0_usize;
+            for &(roster_mode, test_name, stack) in TRANSPOSE_COVERAGE {
+                if roster_mode != mode {
+                    continue;
+                }
+                fixtures += 1;
+                let observable = stack.iter().any(|&(_, entry_mode, opacity, rgba)| {
+                    let [_, _, _, alpha] = rgba;
+                    entry_mode == mode && opacity * alpha > 0.0 && opacity * alpha < 1.0
+                });
+                assert!(
+                    observable,
+                    "{test_name}'s fixture has no {mode:?} layer at an effective alpha strictly \
+                     between 0 and 1, so a dispatch arm that transposed src and backdrop for \
+                     {mode:?} would be invisible to it: every formula on the GPU path is \
+                     commutative, and the fold (1 - a) * bd + a * blended around it collapses to \
+                     `blended` at a = 1. Restore the non-unit opacity (and its derived golden) \
+                     rather than deleting this row -- PLAN.md's 0.105.1 and 0.105.2 entries \
+                     record the measured mutations this property is what kills."
+                );
+                assert!(
+                    document_qualifies_for_gpu_compositing(&root_stack_tree(stack)),
+                    "{test_name}'s fixture must still qualify for the GPU path, or the arm it is \
+                     credited with covering never runs and the transpose is unobservable for a \
+                     second, different reason"
+                );
+            }
+            assert!(
+                fixtures > 0,
+                "{mode:?} has a GPU dispatch counter, so it has a dispatch arm, so some fixture \
+                 must be able to see that arm's src/backdrop order transposed -- and none is \
+                 registered in TRANSPOSE_COVERAGE. If this fired because a mode was just ported: \
+                 give its fixture a non-unit opacity on its own layer, derive the golden from \
+                 that, and add the row. Read this test's doc comment first; the two rounds that \
+                 found this gap by hand are PLAN.md's 0.105.1 and 0.105.2."
+            );
+        }
+
+        for &(mode, test_name, _) in TRANSPOSE_COVERAGE {
+            assert!(
+                GpuBlendDispatch::ALL
+                    .iter()
+                    .any(|&which| dispatch_arm_blend_mode(which) == mode),
+                "TRANSPOSE_COVERAGE credits {test_name} with covering {mode:?}, which has no \
+                 GpuBlendDispatch counter -- so either the mode is not on the GPU path at all \
+                 (drop the row) or it was ported without a counter (add one, and see \
+                 GpuBlendDispatches for why a counter is what tells a real dispatch apart from a \
+                 silent CPU fallback computing the same pixels)"
+            );
+        }
     }
 
     /// One texel's own `(r, g, b, a)` channels — the shape
@@ -28952,47 +29372,27 @@ mod tests {
     /// reference the CPU path runs — deliberately not a hand-derived
     /// golden, which for five chained composites would restate the
     /// arithmetic under test rather than check it.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing beyond the swap table
+    /// above** (recorded 0.105.3): it is the second of only two places in
+    /// the workspace where a transposed `src`/`backdrop` in the
+    /// `Multiply` *dispatch arm* is observable at all — PLAN.md's 0.105.2
+    /// kill matrix measured that mutation killing exactly this test and
+    /// `..._composites_a_mixed_normal_and_multiply_stack`. Layers 2 and 5
+    /// sit at opacity `1.0`, where the commutative `Cb * Cs` and the
+    /// collapsed fold `out = blended` make the swap provably invisible.
+    /// The fixture therefore lives in
+    /// [`FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK`], where
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+    /// can re-check that property headlessly rather than trusting a later
+    /// round not to normalise it away.
     #[test]
     fn recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count() {
         let Some(context) = real_gpu_context() else {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let layers = solid_root_stack(
-            &mut store,
-            &[
-                (
-                    "l1",
-                    aurora_doc::BlendMode::Normal,
-                    1.0,
-                    [0.5, 0.75, 1.0, 1.0],
-                ),
-                (
-                    "l2",
-                    aurora_doc::BlendMode::Multiply,
-                    1.0,
-                    [0.5, 0.5, 0.5, 1.0],
-                ),
-                (
-                    "l3",
-                    aurora_doc::BlendMode::Normal,
-                    0.75,
-                    [0.0, 0.25, 1.0, 1.0],
-                ),
-                (
-                    "l4",
-                    aurora_doc::BlendMode::Multiply,
-                    0.5,
-                    [0.25, 1.0, 0.5, 1.0],
-                ),
-                (
-                    "l5",
-                    aurora_doc::BlendMode::Multiply,
-                    1.0,
-                    [0.75, 0.5, 0.25, 1.0],
-                ),
-            ],
-        );
+        let layers = solid_root_stack(&mut store, &FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
             "a five-layer Normal/Multiply root stack must qualify for the GPU path -- otherwise \
@@ -29232,26 +29632,7 @@ mod tests {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0,
-                [0.25, 0.75, 0.5, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::Lighten,
-                0.5,
-                [0.25, 0.25, 0.75, 1.0],
-            ),
-        ];
+        let stack = NORMAL_MULTIPLY_LIGHTEN_STACK;
         let layers = solid_root_stack(&mut store, &stack);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
@@ -29439,26 +29820,7 @@ mod tests {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0,
-                [0.25, 0.75, 0.5, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::Screen,
-                0.5,
-                [0.25, 0.25, 0.75, 1.0],
-            ),
-        ];
+        let stack = NORMAL_MULTIPLY_SCREEN_STACK;
         let layers = solid_root_stack(&mut store, &stack);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
@@ -29672,26 +30034,7 @@ mod tests {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0,
-                [0.25, 0.75, 0.5, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::Difference,
-                0.5,
-                [0.5, 0.125, 0.75, 1.0],
-            ),
-        ];
+        let stack = NORMAL_MULTIPLY_DIFFERENCE_STACK;
         let layers = solid_root_stack(&mut store, &stack);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
@@ -29883,10 +30226,24 @@ mod tests {
     ///   `|Cb - Cs|` and `min(Cb + Cs, 1)` are all commutative, so the
     ///   surrounding "over" is the only thing that can ever notice the
     ///   swap, and it only does so where some layer is not fully opaque.
-    ///   `Multiply` and `Darken` are covered **incidentally**: each of
-    ///   those two modes' own app-level fixture already carries a
-    ///   non-`1.0` opacity on an unrelated layer (`l4`), for reasons that
-    ///   predate this gap being noticed. `LinearDodge` (0.105.1, above)
+    ///   `Multiply` and `Darken` are covered **incidentally**, and not by
+    ///   either mode's own dedicated `..._agree_on_a_<mode>_blend_document`
+    ///   test — both of those build all-opacity-`1.0` fixtures, where the
+    ///   swap is provably invisible. The coverage comes from three
+    ///   *other*, mixed-stack fixtures, each of which happens to carry a
+    ///   layer at that mode (`l4`) at opacity `0.5` for reasons that
+    ///   predate this gap being noticed:
+    ///   `..._composites_a_mixed_normal_and_multiply_stack` and
+    ///   `..._reads_back_the_right_member_after_an_odd_swap_count` for
+    ///   `Multiply`, and `..._composites_a_mixed_normal_multiply_and_
+    ///   darken_stack` for `Darken` — exactly the three tests 0.105.2's
+    ///   kill matrix measured those two arms' transposes dying on, and
+    ///   nothing else. (Until 0.105.3 this bullet said "each of those two
+    ///   modes' own app-level fixture … on an unrelated layer", which was
+    ///   wrong twice: not their own fixtures, and `l4` is the
+    ///   mode-bearing layer rather than an unrelated one — it is *because*
+    ///   `l4` carries the mode under test that its non-unit opacity makes
+    ///   the swap observable at all.) `LinearDodge` (0.105.1, above)
     ///   and then `Lighten`, `Screen` and `Difference` (0.105.2) are
     ///   covered **deliberately**, all four by the same mechanism: set
     ///   that mode's own layer to opacity `0.5` and re-derive the golden.
@@ -29910,26 +30267,7 @@ mod tests {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0,
-                [0.25, 0.75, 0.5, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::LinearDodge,
-                0.5,
-                [0.25, 0.875, 0.5, 1.0],
-            ),
-        ];
+        let stack = NORMAL_MULTIPLY_LINEAR_DODGE_STACK;
         let layers = solid_root_stack(&mut store, &stack);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
@@ -30096,44 +30434,29 @@ mod tests {
     /// `get_or_insert_with` on one `spare` binding, plus that
     /// function's own doc comment; making it *checkable* would need an
     /// allocation counter, not a fixture.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing for a fourth property**
+    /// (recorded 0.105.3): it is the *only* reason a transposed
+    /// `src`/`backdrop` in the `Darken` dispatch arm is observable
+    /// anywhere in the workspace — `min(Cb, Cs)` is commutative, so only
+    /// the asymmetric fold `out = (1 - a) * bd + a * blended` can see the
+    /// swap, and at layer 5's opacity `1.0` it collapses to
+    /// `out = blended` and cannot. PLAN.md's 0.105.2 kill matrix measured
+    /// that mutation killing exactly this one test out of the whole
+    /// `aurora-app` binary; the dedicated
+    /// `..._agree_on_a_darken_blend_document` sibling is all-opacity-`1.0`
+    /// and blind to it. This test is differential-only, so normalising
+    /// that opacity would reopen the gap with nothing going red — hence
+    /// the table lives in [`MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK`],
+    /// re-checked by
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`.
     #[test]
     fn recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack() {
         let Some(context) = real_gpu_context() else {
             return;
         };
         let (_dir, mut store) = real_tile_store();
-        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 5] = [
-            (
-                "l1",
-                aurora_doc::BlendMode::Normal,
-                1.0,
-                [0.5, 0.75, 1.0, 1.0],
-            ),
-            (
-                "l2",
-                aurora_doc::BlendMode::Multiply,
-                1.0,
-                [0.5, 0.5, 0.5, 1.0],
-            ),
-            (
-                "l3",
-                aurora_doc::BlendMode::Normal,
-                0.75,
-                [0.0, 0.25, 1.0, 1.0],
-            ),
-            (
-                "l4",
-                aurora_doc::BlendMode::Darken,
-                0.5,
-                [0.25, 1.0, 0.5, 1.0],
-            ),
-            (
-                "l5",
-                aurora_doc::BlendMode::Darken,
-                1.0,
-                [0.75, 0.5, 0.25, 1.0],
-            ),
-        ];
+        let stack = MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK;
         let layers = solid_root_stack(&mut store, &stack);
         assert!(
             document_qualifies_for_gpu_compositing(&layers),

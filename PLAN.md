@@ -17653,9 +17653,14 @@ severity choice.
   created. It carries four independent guards: the GPU-vs-CPU
   differential, an absolute golden `(0.25, 0.375, 0.75, 1.0)` (whose
   maximum is genuinely two-sided — red and blue from the source, green
-  from the backdrop), the `LIGHTEN_GPU_DISPATCHES == 1` assertion, and
-  an `assert_ne!` vacuity guard substituting `Darken` for `Lighten` on a
-  CPU-only re-run (`(0.125, 0.25, 0.25)` — all three channels differ).
+  from the backdrop) — **superseded in 0.105.2 (below)**, which moved that
+  fixture's `Lighten` layer to opacity `0.5` to make a transposed dispatch
+  arm observable and re-derived the golden as
+  `(0.1875, 0.375, 0.5, 1.0)` —, the `LIGHTEN_GPU_DISPATCHES == 1`
+  assertion, and an `assert_ne!` vacuity guard substituting `Darken` for
+  `Lighten` on a CPU-only re-run (`(0.125, 0.25, 0.25)` — all three
+  channels differ; **also superseded in 0.105.2**, now
+  `(0.125, 0.3125, 0.25)`, still differing in all three).
   The existing `recomposite_visible_tiles_gpu_path_ignores_a_never_
   painted_layer_across_every_expressible_mode` loop gained `Lighten`
   too, since leaving it out would have made that test's own name a
@@ -18059,7 +18064,10 @@ severity choice.
      pixel comparison **with the dispatch counter still reading 1** —
      the dispatch happened, the wrong shader ran — and the observed
      wrong texel was `(0.25, 0.375, 0.75, 1.0)`, exactly the `Lighten`
-     value derived by hand for that fixture. Counter and pixels are
+     value derived by hand for that fixture. (**Both goldens moved in
+     0.105.2, below**, when the two fixtures' mode-bearing layers went to
+     opacity `0.5`; the equality was real on the opaque fixtures this
+     mutation was measured against.) Counter and pixels are
      genuinely independent observables.
   4. **Removed `Screen` from
      `document_qualifies_for_gpu_compositing`'s matched set.** Killed by
@@ -18611,7 +18619,13 @@ severity choice.
   that test's own doc comment to the bit. The app test's GPU texel came
   back `(-0.375, 0.25, -0.5, 1.0)` against golden `(0.375, 0.25, 0.5, 1.0)`,
   again exactly the documented prediction, with green agreeing (`0.25`)
-  because that is the one channel where `Cb > Cs` in that fixture. (f)
+  because that is the one channel where `Cb > Cs` in that fixture.
+  (**That golden is superseded in 0.105.2, below**: the fixture's
+  `Difference` layer moved to opacity `0.5`, making the golden
+  `(0.25, 0.3125, 0.375, 1.0)` and the `abs()`-less value
+  `(-0.125, 0.3125, -0.125)`. The measurement here was real at the time,
+  against the opaque fixture; green is still the only channel where
+  `Cb > Cs`.) (f)
   kills the same set, which is what separates these fixtures from
   "anything missing an `abs()`" — they discriminate `Difference` from
   `Subtract` specifically.
@@ -19301,6 +19315,18 @@ severity choice.
   | `Screen` | `(0.25, 0.25, 0.75)` | `Cb+Cs-Cb·Cs` → `(0.34375, 0.53125, 0.8125)` | **`(0.234375, 0.453125, 0.53125, 1.0)`** | `(0.296875, 0.390625, 0.78125, 1.0)` |
   | `Difference` | `(0.5, 0.125, 0.75)` | `abs` → `(0.375, 0.25, 0.5)` | **`(0.25, 0.3125, 0.375, 1.0)`** | `(0.4375, 0.1875, 0.625, 1.0)` |
 
+  **Why `0.5`, and the rule for the next mode ported on this template**
+  (added 0.105.3, from this round's own red-team review). The
+  transpose-detection margin is `(1 - p) * |Cb - Cs|` per channel, so it
+  *grows* as `p` falls: `0.5` gives half the margin `p → 0` would. It was
+  never close — the observed separations are 32× to 64× the
+  `2 * f16::EPSILON` tolerance, and every golden stays an exact binary
+  fraction, which matters more than the ratio. So the rule for the
+  remaining 19 modes is: pick the smallest exactly-`f16`-representable
+  opacity that keeps every derived golden exact (`0.5` and `0.25` both
+  qualify for these fixtures), and record the margin-to-tolerance ratio
+  alongside the golden so a later fixture edit cannot quietly shrink it.
+
   Every wrong-arm alternative named in each assertion message was
   recomputed the same way and rewritten, not carried over — the previous
   literals were the *blend terms*, which are no longer the output. So, at
@@ -19446,6 +19472,131 @@ severity choice.
   That is a pre-existing `aurora-render` documentation error, unrelated to
   this app-level round, and touching it would put a shader file in a diff
   that is otherwise fixture-and-comment-only in `aurora-app`.
+
+- [x] **0.105.2's review follow-ups: the transpose-coverage property is
+  written down where it lives, and given a standing automated guard —
+  done 2026-09-05 (0.105.3).** A hardening round on top of two rounds of
+  already-verified-correct work. **Scope first, because it bounds
+  everything below: no shader, wrapper, dispatch-arm or predicate line
+  changed, and no fixture value, opacity or golden changed either.** The
+  mode counts are therefore unchanged again: still **19 of 27** blend
+  modes CPU-only at the app's GPU predicate, **20 of 26** with no
+  dedicated blend-math WGSL entry point. One test was added (1,688 →
+  **1,689**; `aurora-app` 396 → **397**); none was removed or weakened.
+
+  **Six items, five of them documentation.**
+
+  1. **A version mirror this round's own predecessor missed.** CLAUDE.md's
+     "Versioning" section still said `0.105.1` while its status line and
+     `Cargo.toml` said `0.105.2`. Both mirrors now say `0.105.3`.
+  2. **The three fixtures that carry `Multiply`'s and `Darken`'s transpose
+     coverage now say so.** `..._composites_a_mixed_normal_and_multiply_
+     stack`, `..._reads_back_the_right_member_after_an_odd_swap_count`
+     and `..._composites_a_mixed_normal_multiply_and_darken_stack` each
+     hold a layer (`l4`) at opacity `0.5`, and that non-unit opacity is
+     the *only* reason those two dispatch arms' argument order is
+     observable anywhere in the workspace. None of the three said so;
+     each now does, cross-referencing this round's predecessor's kill
+     matrix. This matters more for these three than for the `Lighten`/
+     `Screen`/`Difference`/`LinearDodge` four: those four assert an
+     absolute golden *derived from* their opacity, so normalising it
+     fails loudly, while all three of these are differential-only and
+     would stay green (measured — see the mutation evidence below).
+  3. **A wrong claim in `LinearDodge`'s own doc comment, introduced by
+     0.105.2's corrections.** It said `Multiply` and `Darken` are covered
+     incidentally by "each of those two modes' own app-level fixture …
+     [carrying] a non-`1.0` opacity on an unrelated layer (`l4`)". Wrong
+     twice: both modes' *own* dedicated `..._agree_on_a_<mode>_blend_
+     document` tests are all-opacity-`1.0` and provably blind to the
+     mutation, and `l4` is the layer carrying the mode under test rather
+     than an unrelated one. It now names the three fixtures that really
+     supply the coverage, and says why `l4` being the mode-bearing layer
+     is the point.
+  4. **Four stale historical PLAN.md values back-annotated** rather than
+     rewritten, following the convention 0.105.1's entry already
+     established: the `Lighten` round's golden and its `assert_ne!`
+     substitute value, the `Screen` round's observation that a shader
+     mis-wire produced exactly `Lighten`'s golden, and the `Difference`
+     round's golden are each marked superseded, with the current value
+     and a note that the original measurement was real against the
+     fixture of its day.
+  5. **A margin rule for the next mode ported on this template**, from
+     this round's red-team review: the detection margin is
+     `(1 - p) * |Cb - Cs|`, so it grows as the opacity falls, and `0.5`
+     takes half of what `p → 0` would. Not worth re-deriving four
+     goldens for at 32×–64× the tolerance, but worth writing down — see
+     the "Why `0.5`" paragraph in the 0.105.2 entry above.
+  6. **The one behavioural addition: a standing guard for the whole
+     class**, described next.
+
+  **`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+  transposed_argument`** (`aurora-app`, headless — no GPU adapter, no tile
+  store, no compositing). Twice in a row a transposed dispatch arm
+  survived the entire suite and was found only by a human running the
+  mutation by hand; 19 modes remain to be ported on the same template, so
+  the class needed a standing check rather than a third discovery. The
+  test walks `GpuBlendDispatch::ALL` (skipping `Dissolve`, which resolves
+  to `Normal` before any blend math) and asserts, for each mode, that a
+  new `TRANSPOSE_COVERAGE` roster names at least one fixture with a layer
+  at that mode whose effective alpha (`opacity × the layer's own alpha`)
+  is strictly between 0 and 1, and that the fixture still qualifies for
+  the GPU path. The roster points at the real fixture data: the seven
+  fixture tables were hoisted out of their test bodies into named
+  constants, so the guard reads exactly what those tests composite rather
+  than a copy that could drift. (Hoisting also took
+  `..._composites_a_mixed_normal_and_multiply_stack`'s body from 101 lines
+  to well under 100, so its `clippy::too_many_lines` allow and the note
+  explaining it are gone.)
+
+  **What the guard does not do, stated in its own doc comment too**: it
+  does not prove a transpose *is* detected — non-unit opacity is
+  necessary, not sufficient (`Cb == Cs` in every channel, or assertions
+  too loose to see the difference, would still hide one), and proving
+  detection means running the mutation, which is what the kill matrices
+  record. It checks layer tables, not assertions. Its roster is
+  hand-maintained: a mode ported without a row fails here, by design, but
+  a fixture added and never registered is invisible to it. And it anchors
+  on the dispatch-counter enum rather than directly on
+  `document_qualifies_for_gpu_compositing`'s `matches!` set, so a mode
+  admitted at the predicate with *no* counter variant would slip past —
+  closing that would need a second hand-maintained list of
+  `aurora_doc::BlendMode`'s 27 variants, since nothing enumerates them at
+  runtime, which is the very thing this reduces.
+
+  **Mutation-tested, three mutations, each really run and reverted**
+  (RTX 3090, Vulkan, `AURORA_REQUIRE_GPU=1`, whole `aurora-app` binary
+  each time):
+
+  | mutation | result |
+  |---|---|
+  | `MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK`'s `l4` opacity `0.5` → `1.0` | killed — **1** test (the new guard), 396 passed |
+  | `MIXED_NORMAL_AND_MULTIPLY_STACK`'s `l4` opacity `0.5` → `1.0` | killed — **1** test (the new guard), 396 passed |
+  | `Lighten`'s row deleted from `TRANSPOSE_COVERAGE` | killed — **1** test (the new guard), 396 passed |
+
+  The first two are the important ones, and their "396 passed" column is
+  the finding: **normalising either opacity is otherwise a total
+  survivor**, exactly as 0.105.1/0.105.2 measured for the transposes
+  themselves. The guard is now the only thing in the workspace that
+  notices, and it reports with the reason rather than a bare inequality.
+  The third confirms the completeness half fires for a mode ported without
+  a registered fixture.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` (**1,689 passed, 0 failed, 10 ignored**;
+  `aurora-app` alone **397 passed, 0 failed**), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`, `cargo deny check all`. `/home` at 79% used, **82G
+  free**, checked before starting per 0.104.1's precondition.
+
+  **Still not fixed, still deliberate.** `fs_composite_difference`'s and
+  `fs_composite_linear_dodge`'s WGSL comments cross-reference a symmetry
+  disclosure that `fs_composite_screen`'s comment does not contain. It
+  stays open for the same reason 0.105.2 gave: it is a pre-existing
+  `aurora-render` error, and fixing it would put a shader file into a diff
+  that is otherwise comment-and-test-only in `aurora-app`.
 
 ### M1.10 — Phase 1 gate
 
@@ -24289,6 +24440,40 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.105.3) — 0.105.2's review follow-ups: the
+transpose-coverage property is documented where it lives, and now has a
+standing automated guard.** A hardening round. **No shader, wrapper,
+dispatch-arm or predicate line changed, and no fixture opacity or golden
+changed**, so every count below is unchanged from 0.105.0–0.105.2: no mode
+was ported and none was admitted to the GPU predicate.
+
+Five of the six items are documentation: CLAUDE.md's "Versioning" mirror
+(it still said `0.105.1`); an explicit "this opacity is load-bearing for
+transpose detection" note on each of the three *other* fixtures that carry
+`Multiply`'s and `Darken`'s coverage — they are differential-only, so
+unlike their four `Lighten`/`Screen`/`Difference`/`LinearDodge` siblings no
+golden would break if a later cleanup normalised them; a correction to
+`LinearDodge`'s doc comment, which wrongly credited those two modes' *own*
+dedicated fixtures (both all-opacity-`1.0`, and provably blind to the
+mutation) instead of the three mixed-stack tests that really supply the
+coverage; four superseded historical PLAN.md goldens back-annotated; and a
+margin rule for future ports (the detection margin is `(1 - p) * |Cb - Cs|`,
+so it grows as opacity falls).
+
+The sixth is one new headless test,
+`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+(1,688 → **1,689**). It walks every mode with a GPU dispatch counter and
+asserts a named fixture exists whose layer at that mode has an effective
+alpha strictly between 0 and 1 — the necessary condition for the
+commutative blend formulas' surrounding "over" fold to notice a transposed
+`src`/`backdrop` at all. The seven fixture tables moved into constants so
+the guard reads the same data the tests composite. **Mutation-tested:
+normalising either `Multiply`/`Darken` fixture's `l4` opacity to `1.0`
+kills exactly the new guard and nothing else (396 of 397 still pass), which
+is the finding — that edit was otherwise a total survivor.** It proves a
+necessary condition, not detection itself; see the 0.105.3 M1.10 entry for
+the full limitations list and the mutation table.
 
 **Addendum 2026-09-04 (0.105.2) — 0.105.1's named follow-on discharged:
 the `Lighten`, `Screen` and `Difference` dispatch-arm transpose gap is
