@@ -31,9 +31,10 @@
 //! second-root-onward folds, i.e. only on multi-root documents.~~ Do not
 //! quote a T1 pass without naming which condition it came from.
 //!
-//! **Closed (0.101.0): T1 now fails in *both* conditions, so there is no
-//! document shape left in which it passes and the `rayon` question this
-//! file exists to answer is settled NO-GO.** 0.98.0's batched `f16` ↔
+//! **Closed (0.101.0): T1 now fails in *both* conditions, so ~~there is no
+//! document shape left in which it passes and~~ the `rayon` question this
+//! file exists to answer is settled NO-GO** ~~.~~ **for `Normal` and
+//! `Multiply`, the two modes it was ever registered against.** 0.98.0's batched `f16` ↔
 //! `f32` conversions cut `fold_onto_opaque` by ~16–17%, which took the
 //! very column the conditional pass depended on below the bar. Re-measured
 //! on this box at 0.101.0: `fold_onto_transparent` `Normal` **1.6826 ms**
@@ -45,6 +46,27 @@
 //! has the verdict, the two separate soundness blockers on the *other*
 //! two framings (fold-across-roots, fold-across-tiles), and the one sound
 //! restructuring left unbuilt.
+//!
+//! **Three scope corrections, 0.101.1 — read these before quoting the
+//! NO-GO above.** (1) **The bar is a risk-adjusted proxy, not a proof.**
+//! PLAN.md's 0.101.0 entry discloses that 2.0 ms is a
+//! *contention-survival* threshold set at ~8× a measured-insufficient
+//! 0.25 ms unit from a *bandwidth-bound* upload serializer, so failing it
+//! does not show that splitting a 1.70 ms call would not win on an idle
+//! box, and the multiplier's transfer to this compute-bound kernel is
+//! assumed rather than measured. (2) **The scope is two modes, not all
+//! 27.** Re-measured at 0.101.1 on this same box, `fold_onto_opaque`
+//! clears 2.0 ms with confidence intervals wholly *above* the bar for
+//! `Hue` **3.1129**, `Saturation` **2.9638**, `Color` **2.4488**,
+//! `Luminosity` **2.3877**, `Overlay` **2.3257** and `SoftLight`
+//! **2.2192** ms (`HardLight`, **1.8038** ms, fails). Whether documents
+//! dominated by those modes are common enough to build for is a separate,
+//! unanswered question. (3) **"fold-across-tiles" is only half closed.**
+//! The `!Sync`/`&mut self` blockers bind the framing that shares a
+//! `TileStore` across workers; the framing that resolves every tile's
+//! roots sequentially into *owned* buffers first and then folds
+//! independent tiles in parallel is sound and unmeasured. See PLAN.md's
+//! 0.101.1 correction.
 //!
 //! **Read the decision off `Normal` and `Multiply` only.** Those two
 //! dominate real documents — the app's own default startup document uses

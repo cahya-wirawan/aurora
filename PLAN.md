@@ -20860,7 +20860,10 @@ severity choice.
     fix" was taken (0.98.0's vectorization) and it dropped
     `fold_onto_opaque` from 2.0758 / 2.0485 ms to 1.7051 / 1.7335 ms, i.e.
     below this round's own 2.0 ms T1 bar — so the one condition under which
-    T1 passed no longer exists. See the 0.101.0 entry.**
+    T1 passed no longer exists **for `Normal` and `Multiply`, the two modes
+    T1 was ever read off (scoped 0.101.1, Red-team RT-02: six costlier
+    `fold_onto_opaque` modes do still clear 2.0 ms).** See the 0.101.0
+    entry and the 0.101.1 correction at the end of it.**
 
   Round A (0.96.0–0.96.2 above) parallelized `TileResidency::sync`'s
   serialize loop, shipped a `panic = "abort"` crash path, shipped a ~2x
@@ -22007,7 +22010,25 @@ severity choice.
   Written BEFORE any measurement for this round was taken: the commit that
   adds this paragraph contains no measurement, no table and no verdict, so
   `git log` shows the bar predating the result rather than a threshold
-  reverse-fitted to a number already in hand.** The question is narrow, and
+  reverse-fitted to a number already in hand.**
+  **Scoped down 0.101.1 (Red-team RT-04, Critic G-06) — claim only what
+  commit ordering actually proves.** What is true: the threshold text
+  lives in its own commit (`62790b1`), contains no number from this round,
+  and precedes the write-up commit (`f595ce9`). What that does *not*
+  prove is that the measurements were gathered afterwards. The two commit
+  timestamps are 16:06:27 and 16:18:34 — a **727-second (12 m 07 s)**
+  window — and the criterion bench alone takes ~83 s warm, before the
+  three `AURORA_REQUIRE_GPU` fixture runs and the eight-step gate the
+  second commit reports. That workload does not fit in 727 s, so the
+  honest reading is "the bar was fixed, in writing, in its own commit
+  before the write-up", not "no number existed anywhere in the working
+  tree when the bar was written". Separately (G-06), P2b's outcome was
+  already inferable from 0.98.0's own previously-recorded −16 %/−17 %
+  table, and P1's `!Sync`/`&mut self` facts were already recorded at
+  0.96.0 — so the value of the discipline here is that it pinned the
+  threshold's *wording* where it could not be softened after the fact, not
+  that it protected against a surprising result.
+  The question is narrow, and
   narrower than 0.97.1's own "conditional, multi-root-only GO" wording
   suggests: now that 0.100.0's two-root fixture exists, is parallelizing
   `aurora_app::composite_roots_into_tile`'s **fold loop** with `rayon` — as
@@ -22051,6 +22072,19 @@ severity choice.
   dependency, no `rayon` anywhere. Two doc comments corrected in place and
   this entry are the whole diff besides the version bump.
 
+  > **Read the 0.101.1 correction at the end of this entry before quoting
+  > anything here.** The NO-GO on the two framings this round actually
+  > measured stands. Three of the claims around it do not: the
+  > across-tiles verdict was generalized from a framing that shares
+  > `TileStore` to one that does not (so a sound candidate was declared
+  > permanently closed when it is merely unmeasured), the across-roots
+  > limb was argued from non-commutativity while calling it
+  > non-associativity, and "there is no document shape left in which
+  > T1/P2b passes" is false as a universal — it holds for the two modes
+  > P2b was registered against and not for six others that were never
+  > measured here. Several percentages below are also arithmetically off
+  > by a point or two.
+
   **P1 (soundness) — FAIL for both of the framings this round set out to
   test, and this is a code-reading result, not a measurement.**
 
@@ -22060,18 +22094,39 @@ severity choice.
      accumulator chain: `let mut composited = transparent_tile();` at
      `:6728`, then `for &id in layers.roots().iter().rev()` at `:6730`
      calling `composite_layer_into(&mut composited, ..)` at `:6741`. Fold
-     *n+1* reads fold *n*'s output through that `&mut`. Any tree reduction
-     or fold-order change requires blend-mode composition to be
+     *n+1* reads fold *n*'s output through that `&mut`. ~~Any tree
+     reduction or fold-order change requires blend-mode composition to be
      **associative**, which it is not — 0.97.0's own worked counterexample
      above (two opaque layers, bottom `Normal` 0.5 grey, top `Multiply` 0.4:
      0.2 in the real order, 0.5 swapped) is the general refutation, and it
-     applies to *reassociation* just as it does to *reordering*.
+     applies to *reassociation* just as it does to *reordering*.~~
+     **Corrected 0.101.1 (Critic G-01) — the conclusion stands, the
+     argument was on the wrong property. That counterexample refutes
+     *commutativity*, not *associativity*: it swaps two layers, which is a
+     reordering, and 0.97.0's own original wording said so ("Blend modes
+     do not commute"). Non-commutativity does not imply
+     non-associativity — matrix multiplication and function composition
+     are both non-commutative *and* associative — so that example rules
+     out reordering the roots and nothing more. The two arguments that do
+     hold are (a) and (b) in 0.101.1's item 1 below; the short form is
+     that the loop body takes `&mut TileStore` and `&mut CompositeBudget`
+     via `resolve_tile`, so it cannot run concurrently at all whatever the
+     algebra says, and that a tree reduction would additionally need a
+     cheaply-representable *composed* blend function that does not exist
+     for non-`Normal` modes.**
      **This limb was never open.** 0.97.0's entry already says "Cross-layer
      is impossible"; what was open was a *different* candidate (see P2b
      below), and only 0.100.0's shorthand — corrected in place below — made
      it read as though parallelizing across roots was the named future work.
-  2. **Parallelizing across the ~9 independent tiles a frame touches is
-     blocked at the type level, twice over.**
+  2. **Parallelizing across the ~9 independent tiles a frame touches**
+     ~~is blocked at the type level, twice over.~~ **— corrected 0.101.1
+     (Critic G-03 = Red-team RT-03, found independently). What follows is
+     correct *only* for the framing that shares a `TileStore` across
+     workers, which is the only one this round considered. It does not
+     bind the framing that hoists all store access out of the parallel
+     region, and declaring "across tiles" closed on P1 was over-broad. See
+     0.101.1 item 2 below; that candidate is open, not closed.** For the
+     shared-store framing:
      `aurora_tile::TileStore::get` (`crates/aurora-tile/src/store.rs:568`)
      and `::get_mut` (`:581`) both take `&mut self`, so the API shape alone
      forbids a shared read — but the stronger blocker is that **`TileStore`
@@ -22140,14 +22195,39 @@ severity choice.
   bar is ≥ 2.0 ms per synchronous dispatch unit. At 0.97.1 the
   `fold_onto_opaque` column read `Normal` **2.0758** / `Multiply`
   **2.0485** ms — a thin *pass*, and the sole basis for the conditional
-  multi-root-only GO. It now reads **1.7051 / 1.7335 ms**: a **15 % / 15 %
-  FAIL**, with both confidence intervals entirely below the bar.
-  `fold_onto_transparent` fails by 16 % (1.6826 / 1.6911), as it already
-  did. **0.98.0's sequential vectorization did not merely fail to help the
+  multi-root-only GO. It now reads **1.7051 / 1.7335 ms**: a
+  ~~**15 % / 15 %**~~ **14.7 % / 13.3 %** **FAIL**, with both confidence
+  intervals entirely below the bar.
+  `fold_onto_transparent` fails by ~~16 %~~ **15.9 % / 15.4 %**
+  (1.6826 / 1.6911), as it already
+  did. (Percentages corrected 0.101.1, Critic G-04: `(2.0 − x) / 2.0`
+  gives 14.7 / 13.3 / 15.9 / 15.4, not the flat "15 %" and "16 %" written
+  here. The round's own "Next action" addendum already carried the correct
+  **13–16 %** band, so this paragraph was the inconsistent one.)
+  **0.98.0's sequential vectorization did not merely fail to help the
   parallelization case — it removed the only condition under which that
-  case cleared its own pre-registered bar.** Every one of the six cells
+  case cleared its own pre-registered bar.** ~~Every one of the six cells
   measured is now below 2.0 ms, so there is no document shape left in which
-  T1/P2b passes.
+  T1/P2b passes.~~ **Corrected 0.101.1 (Red-team RT-02): every one of the
+  six cells measured is below 2.0 ms, and P2b therefore fails for `Normal`
+  and `Multiply` — the two modes it was registered against, per 0.97.1's
+  own "read the decision off those two" rule. Generalizing that to "no
+  document shape left" was not licensed by the measurement and is false:
+  six of the seven further `fold_onto_opaque` modes re-measured at 0.101.1
+  clear 2.0 ms with confidence intervals wholly above it. See 0.101.1
+  item 3 for the table.**
+
+  **A note on estimators, added 0.101.1 (Critic G-08).** The
+  1.7051 / 1.7335 figures above are **0.101.1's/0.101.0's own
+  re-measurement on this tree**, quoted as criterion's
+  `[lower median upper]`. 0.98.0's table quotes criterion's
+  `slope`-else-`mean` point estimate instead (per 0.98.1's own correction
+  of that table's label). Both are real; they are different estimators of
+  different runs and are not expected to coincide numerically. Wherever
+  this entry says "0.98.0's vectorization dropped `fold_onto_opaque` to
+  1.7051 / 1.7335 ms", read it as *0.98.0 caused the drop; these specific
+  figures are 0.101.0's re-measurement of the result*, not as figures
+  0.98.0 itself published.
 
   **P2 — PASS for the texel-loop candidate, and reported rather than
   suppressed because a partial pass is more useful to a future reader than
@@ -22190,12 +22270,23 @@ severity choice.
   **Verdict: NO-GO**, and specifically:
   - Parallelizing the fold loop across roots: **NO-GO on P1**, permanently
     — this cannot be reopened by a faster machine or a bigger document.
-  - Parallelizing across tiles: **NO-GO on P1** while `TileStore` stays
+  - Parallelizing across tiles ~~: **NO-GO on P1** while `TileStore` stays
     `!Sync`; reopening it means reopening `writer.rs`'s FIFO correctness
-    argument first.
+    argument first.~~ **— corrected 0.101.1: NO-GO on P1 only for the
+    *shared-store* framing (a `&TileStore` inside the parallel region),
+    where the `!Sync`/`&mut self` blockers are real and reopening does
+    mean reopening `writer.rs`'s FIFO correctness argument first. The
+    *hoisted-store* framing — resolve every tile's roots sequentially into
+    owned buffers, then fold the independent tiles in parallel over those
+    buffers — passes P1 and was never measured. It is OPEN, not closed;
+    see 0.101.1 item 2.**
   - Parallelizing the texel loop inside one fold (0.97.x's real candidate):
-    **NO-GO on P2b**, and the conditional multi-root-only GO 0.97.1
-    registered is hereby **closed, not carried forward**.
+    **NO-GO on P2b** ~~, and~~ **for `Normal` and `Multiply`, the modes
+    P2b was registered against (corrected 0.101.1: six other
+    `fold_onto_opaque` modes do clear the bar — item 3). And**
+    the conditional multi-root-only GO 0.97.1
+    registered is hereby **closed, not carried forward** for those two
+    modes.
 
   **Disclosed weakness in that last limb, stated plainly.** P2b failing is
   not a measurement that no idle win exists. The 2.0 ms bar is a
@@ -22204,7 +22295,16 @@ severity choice.
   says is "this unit is too small to be worth the pool-init and contention
   risk 0.96.1 already paid for once", not "splitting it would not go
   faster on an idle box". A 1.70 ms unit split over four physical cores
-  plausibly *would* win idle. The bar was fixed in advance precisely so
+  plausibly *would* win idle. **And a second gap in that derivation,
+  disclosed 0.101.1 (Red-team RT-05): Round A's 0.25 ms/tile unit came out
+  of 0.96.x's *tile-upload serializer* — a bandwidth-bound, PCIe/staging-
+  buffer workload — whereas this bar is being applied to a compute-bound,
+  F16C-vectorized CPU kernel. Nothing in this round or in 0.97.0 argues
+  that the ~8× multiplier transfers between those two workload classes; it
+  is assumed, not measured. Treat the 2.0 ms figure as a deliberately
+  conservative risk budget carried across from a different kind of work,
+  which is another reason a future round is entitled to argue it
+  down — in advance, with a reason.** The bar was fixed in advance precisely so
   that argument could not be made after the fact, and it is being honoured.
   If a future round wants to reopen this, the honest way is to argue the
   bar down **before** measuring, with a reason, not to quote an idle
@@ -22224,10 +22324,20 @@ severity choice.
   needs `resolve_tile`'s output to be block-addressable, which it is not
   today. **Its own bar, pre-registered here:** it must clear the same
   P2b ≥ 2.0 ms per synchronous dispatch unit measured on the *aggregated*
-  unit it would actually dispatch (all roots of one block, i.e. roughly the
-  sum of a tile's folds — 3.40 ms on this fixture, which *would* clear the
-  bar), and it must clear P3 contended before any of it reaches the frame
-  path. Nobody should start it before the 60 FPS gate has a better reason
+  unit it would actually dispatch ~~(all roots of one block, i.e. roughly
+  the sum of a tile's folds — 3.40 ms on this fixture, which *would* clear
+  the bar)~~ **— unit clarified 0.101.1 (Critic G-07), because "per block"
+  and "per tile" were used interchangeably here and they are not the same
+  thing. The dispatch unit P2b is measured against is the whole
+  synchronous parallel region, *joined once per tile*: all blocks × all
+  roots of that one tile — not a per-block chunk and not a per-worker
+  chunk. On this fixture that unit is roughly the sum of one tile's folds,
+  `1.6826 + 1.7172 =` **3.40 ms**, which *would* clear the 2.0 ms bar.
+  Measured per *block* it would trivially fail, which is exactly why the
+  unit has to be named rather than left to the reader; it is the same
+  unit-of-dispatch definition 0.101.1 item 2 applies to the hoisted-store
+  tile-level candidate.**, and it must clear P3 contended before any of it
+  reaches the frame path. Nobody should start it before the 60 FPS gate has a better reason
   to need it than this.
 
   **Gate at this commit**, all green: `cargo fmt --all --check`,
@@ -22244,6 +22354,199 @@ severity choice.
   the GPU-path figure at the high end of its own, which is drift on an n=40
   single-order-statistic benchmark and not an effect of a round that
   changed no shipping code.
+
+  **0.101.1 (2026-09-04) — correction round on the entry above.
+  Independent Critic and Red-team review, run in parallel against
+  `f595ce9`, found the same over-broad verdict from two directions and
+  three further overstatements; the Red-team half reproduced its findings
+  with real compiler probes, a real criterion run and hand arithmetic on
+  this same box. The two framings 0.101.0 actually measured are still
+  NO-GO and the numbers all stand. What does not stand is the scope
+  0.101.0 claimed for them.** Documentation-only: this entry, tagged
+  corrections in place above, and two doc comments. No shipping-code
+  change, no test change, no new dependency, still no `rayon` anywhere.
+
+  1. **The across-roots limb was argued from the wrong algebraic property
+     (Critic G-01).** 0.101.0 wrote that a tree reduction "requires
+     blend-mode composition to be **associative**, which it is not", and
+     cited 0.97.0's two-layer counterexample as "the general refutation".
+     That counterexample — bottom `Normal` 0.5 grey, top `Multiply` 0.4,
+     giving 0.2 in the real order and 0.5 swapped — *swaps* two layers.
+     It refutes **commutativity**, which is what 0.97.0's own original
+     sentence said ("Blend modes do not commute"), and commutativity is a
+     different property: matrix multiplication and function composition
+     are both non-commutative *and* associative. So that example closes
+     **reordering** the roots and says nothing about **reassociating**
+     them. The conclusion (no safe tree reduction) survives on two other
+     grounds, and these are the ones to quote:
+
+     **(a) The loop body cannot run concurrently at all — this is
+     sufficient on its own and needs no algebra.** The body calls
+     `resolve_tile` (`crates/aurora-app/src/lib.rs:6295`), whose signature
+     takes `store: &mut aurora_tile::TileStore` and `budget: &mut
+     CompositeBudget`. Two iterations cannot hold either `&mut`
+     simultaneously. The across-roots limb is closed by exactly the same
+     `&mut`/`!Sync` facts as the shared-store framing in item 2, before
+     any question about blend algebra is reached.
+
+     **(b) There is no cheaply-representable *composed* blend function.**
+     A tree reduction has to fold roots *n* and *n+1* into one
+     intermediate that can then be folded onto the accumulator as though
+     it were a single layer — i.e. it needs `fₙ₊₁ ∘ fₙ` expressed as
+     another `(texels, opacity, mode)` triple of the kind
+     `composite_layer_into` accepts. For `Normal` at full opacity such a
+     triple exists; for the non-`Normal` modes it does not, because each
+     mode is applied against whatever backdrop is actually present and the
+     composition of two of them is not itself a member of the mode set.
+     Red-team's three-root probe makes the divergence concrete, on one
+     opaque channel: bottom `Normal` 0.5, middle `Multiply` 0.4, top
+     `Screen` 0.8. Sequential is
+     `screen(multiply(0.5, 0.4), 0.8) = screen(0.2, 0.8) = 0.84`, i.e.
+     **0.83984375** in `f16`; grouping the top two first and refolding the
+     partial gives `screen(0.4, 0.8) = 0.88`, i.e. **0.8798828125**.
+     Different pixel, identical inputs. Both `f16` values check by hand —
+     the ulp at that magnitude is 2⁻¹¹, and `0.84 / 2⁻¹¹ = 1720.32 → 1720`
+     (`= 0.83984375`), `0.88 / 2⁻¹¹ = 1802.24 → 1802` (`= 0.8798828125`).
+     So reassociation *does* diverge; 0.101.0 simply had no argument for
+     that and asserted it from an example about ordering.
+
+  2. **"Parallelizing across tiles is blocked at the type level" is
+     over-broad, and it closed a candidate that is sound (Critic G-03 =
+     Red-team RT-03, found independently).** Two framings have to be told
+     apart, and 0.101.0 only ever considered the first:
+
+     **(a) Share one `&TileStore` across worker threads inside the
+     parallel region — genuinely blocked, conclusion unchanged.**
+     `get`/`get_mut` take `&mut self` (`store.rs:568`/`:581`), and
+     `TileStore` is `!Sync` because `BackgroundWriter` holds an
+     `std::sync::mpsc::Receiver` (`writer.rs:119`–`123`, reached via
+     `store.rs:260`). Both compiler-checked. Reopening this means
+     reopening `writer.rs`'s single-thread FIFO *correctness* argument.
+     Everything 0.101.0 wrote about this framing stands.
+
+     **(b) Hoist all store access out of the parallel region — NOT blocked
+     by anything P1 found, and therefore NOT closed by this round.**
+     `resolve_tile`'s return type is
+     `Option<(Vec<half::f16>, f32, aurora_render::BlendMode)>`
+     (`lib.rs:6304`) — **fully owned buffers**. It hands out no borrow of
+     the store. And `composite_layer_into(&mut composited, &texels,
+     opacity, blend_mode)` (`lib.rs:6741`) touches no store at all. So a
+     design that (i) resolves every root of every tile **sequentially**
+     first, on one thread, into owned `Vec<half::f16>`s — no concurrency,
+     no shared store, `&mut TileStore` held by exactly one thread
+     throughout — and then (ii) folds the ~9 **independent** tiles in
+     parallel over those owned buffers, never has a `TileStore` inside its
+     parallel region. `!Sync` and `&mut self` do not bind it. Each tile's
+     own fold order is preserved exactly within its worker, so item 1's
+     algebra does not bind it either. (Red-team separately confirmed by
+     compiler probe that `TileStore` *is* `Send` and `Arc<Mutex<TileStore>>`
+     *is* `Sync`; that is a secondary route and this design needs neither.)
+
+     **This is the round's real reporting failure**, and it is
+     self-inflicted rather than subtle: the "Follow-on, named and not
+     built" paragraph above uses *this very argument* ("touches no
+     `TileStore` inside the parallel region") to justify a **different**
+     candidate, and supplies the aggregated per-tile fold figure —
+     **3.40 ms** — that clears P2b's 2.0 ms bar for the hoisted-store
+     tile-level design too, since its dispatch unit is the same one (all
+     roots of one tile, joined once per tile; see the unit clarification
+     in item G-07 above). So 0.101.0 ruled out on *soundness* (P1) a
+     candidate that its own arithmetic shows clearing the *measurement*
+     gate (P2b). That is backwards.
+
+     **Status of that candidate, stated plainly: OPEN.** It was not
+     measured for P2 (whole-frame magnitude at scale), not measured for P3
+     (contention), and the 3.40 ms figure is a *model* of the dispatch
+     unit read off the per-call bench, not a measurement of the design.
+     Real open questions remain — the hoist means holding every root's
+     resolved buffer for every in-flight tile live at once rather than one
+     tile's at a time, which is a memory-shape claim against invariant
+     §7.3.1's 300,000² ceiling and needs its own bound — and it may still
+     die on any of them. But it dies on evidence in a future round, not
+     on this one's P1. **Deliberately not built here**: 0.101.1 is a
+     correction round on what was written, not new implementation and not
+     new measurement.
+
+  3. **"There is no document shape left in which T1/P2b passes" is false
+     as stated (Red-team RT-02), and re-measured here.** P2b was
+     pre-registered against `Normal` and `Multiply` only, following
+     0.97.1's own rule that the decision is read off those two rather than
+     off an exotic mode no real document uses. That scoping was
+     legitimate. Universalizing the result to all 27 modes was not.
+     Re-run on this box at 0.101.1 (`cargo bench -p aurora-render --bench
+     composite -- '^fold_onto_opaque/(Overlay|SoftLight|Hue|Saturation|Luminosity|Color|HardLight)$'`),
+     criterion `[lower median upper]`:
+
+     | mode | `fold_onto_opaque` | vs. 2.0 ms bar |
+     |---|---|---|
+     | `Hue` | [3.0984 **3.1129** 3.1287] ms | **PASS**, CI wholly above |
+     | `Saturation` | [2.9493 **2.9638** 2.9800] ms | **PASS**, CI wholly above |
+     | `Color` | [2.4367 **2.4488** 2.4619] ms | **PASS**, CI wholly above |
+     | `Luminosity` | [2.3773 **2.3877** 2.3993] ms | **PASS**, CI wholly above |
+     | `Overlay` | [2.3110 **2.3257** 2.3420] ms | **PASS**, CI wholly above |
+     | `SoftLight` | [2.2053 **2.2192** 2.2355] ms | **PASS**, CI wholly above |
+     | `HardLight` | [1.7822 **1.8038** 1.8307] ms | FAIL, CI wholly below |
+
+     Six of seven clear the bar, with confidence intervals entirely above
+     it — reproducing Red-team's independent run within run-to-run drift.
+     **Corrected claim: P2b fails for `Normal` and `Multiply`, the two
+     modes it was registered against. It does not rule out a document
+     dominated by `Overlay`/`SoftLight`/`Color`/`Luminosity`/`Saturation`/
+     `Hue`-blended layers, which measurably clear it.** Whether such
+     documents are common enough in practice to be worth building for is a
+     **separate and unanswered** question that this round did not address
+     and no measurement here speaks to — do not read a frequency argument
+     into either direction. 0.97.1's "read the decision off `Normal` and
+     `Multiply`" rule is a reasonable default and stays; what changes is
+     that a scoped verdict must be *reported* as scoped.
+
+  4. **Percentage arithmetic (Critic G-04)** — fixed in place above.
+     `(2.0 − 1.7051) / 2.0 = 14.7 %` and `(2.0 − 1.7335) / 2.0 = 13.3 %`,
+     not "15 % / 15 %"; `fold_onto_transparent` is 15.9 % / 15.4 %, not a
+     flat "16 %". The round's own "Next action" addendum already had the
+     correct **13–16 %** band, so the M1.10 entry was the inconsistent
+     one.
+
+  5. **Pre-registration claim scoped down (Red-team RT-04, Critic
+     G-06)** — see the correction appended to the pre-registration
+     paragraph above. Short form: commit ordering proves the bar was
+     fixed in writing before the write-up; it does not prove the numbers
+     were gathered afterwards, and the 727 s gap between the two commits
+     is too short to contain the measurement-plus-gate workload the second
+     one reports.
+
+  6. **Criterion estimator mismatch disclosed (Critic G-08)** — see the
+     note appended after the P2b paragraph above. 0.98.0's table and
+     0.101.0's re-measurement use different criterion point estimates, so
+     they are not expected to coincide numerically, and 0.101.0's phrasing
+     attributed its own freshly-measured figures to 0.98.0.
+
+  7. **Bar-derivation transferability disclosed (Red-team RT-05)** — see
+     the addition to the "Disclosed weakness" paragraph above. The 2.0 ms
+     bar's "~8× Round A's dispatch unit" derivation came from a
+     bandwidth-bound upload-serialization workload; applying that
+     multiplier to a compute-bound SIMD kernel is an assumption this
+     project has never measured.
+
+  8. **Follow-on's dispatch unit disambiguated (Critic G-07)** — see the
+     clarification in the follow-on paragraph above. The unit is the whole
+     synchronous parallel region joined once per tile, not per block and
+     not per worker.
+
+  **What 0.101.1 does not change.** The across-roots NO-GO (item 1), the
+  shared-store across-tiles NO-GO (item 2a), the P2b FAIL for `Normal` and
+  `Multiply` (item 3), P2's PASS for the texel-loop candidate, and P3's
+  correct non-run are all unchanged. No number measured at 0.101.0 was
+  found wrong; the corrections are all about what those numbers were said
+  to establish.
+
+  **Gate at this commit**, all green: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo check --workspace
+  --locked`, `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo test --workspace`, `cargo test --workspace --doc`,
+  `cargo deny check all`. Test count unchanged at **1,662** (this round
+  adds none and changes none).
 
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
@@ -22397,39 +22700,74 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Addendum 2026-09-04 (0.101.0) — the `rayon`-in-`composite_layer_into`
-question is CLOSED, NO-GO, and the conditional multi-root-only GO 0.97.1
-registered is closed with it. Nothing about `rayon` and CPU compositing is
-open any more.** Three independent grounds, against bars pre-registered in
-their own commit (`62790b1`) before any number for this round existed:
+**Addendum 2026-09-04 (0.101.0, scope-corrected 0.101.1) — the
+`rayon`-in-`composite_layer_into` question is CLOSED, NO-GO, for the two
+framings this round measured, and the conditional multi-root-only GO 0.97.1
+registered is closed with it for the two blend modes it was registered
+against.** ~~Nothing about `rayon` and CPU compositing is open any
+more.~~ **Withdrawn 0.101.1 (Critic G-03 = Red-team RT-03, and Red-team
+RT-02): two things remain genuinely open — see the two "STILL OPEN" bullets
+below.** Three independent grounds, against bars pre-registered in
+their own commit (`62790b1`) ~~before any number for this round
+existed~~ **— which proves the bar was fixed in writing before the
+write-up, and not that the numbers came later; the two commits are 727 s
+apart, too short to hold the measurement-and-gate workload the second one
+reports (RT-04, and see the pre-registration paragraph in M1.10)**:
 
 - **P1, soundness.** Parallelizing `composite_roots_into_tile`'s fold loop
   *across roots* is unsound — it is a sequential accumulator chain
-  (`crates/aurora-app/src/lib.rs:6728`–`6744`) and reassociating it assumes
-  blend-mode associativity, which 0.97.0's own counterexample refutes.
-  Parallelizing *across tiles* is blocked because `aurora_tile::TileStore`
+  (`crates/aurora-app/src/lib.rs:6728`–`6744`) whose body takes
+  `&mut TileStore` and `&mut CompositeBudget` through `resolve_tile`, so it
+  cannot run concurrently at all; and a tree reduction would additionally
+  need a composed blend function that does not exist for non-`Normal`
+  modes (0.101.1 item 1 has the arithmetic — and corrects 0.101.0's own
+  wording, which called 0.97.0's *commutativity* counterexample an
+  associativity refutation).
+  Parallelizing *across tiles* is blocked **in the framing that shares a
+  `TileStore` across workers** because `aurora_tile::TileStore`
   is `!Sync` (compiler-checked: `BackgroundWriter`'s
   `std::sync::mpsc::Receiver`) and its accessors take `&mut self`.
 - **P2b, dispatch unit.** The one framing that *is* sound — the texel loop
   inside one `composite_layer_into` call, which is what 0.97.0 actually
   registered — now measures **1.6826–1.7335 ms** per whole-tile call across
   all six `{transparent, opaque} × {Normal, Multiply, Screen}` cells,
-  against a 2.0 ms bar. **FAIL by 13–16 %, everywhere.** 0.98.0's
+  against a 2.0 ms bar. **FAIL by 13–16 % for `Normal` and `Multiply`**,
+  the two modes P2b was registered against. 0.98.0's
   sequential vectorization is what did this: it dropped `fold_onto_opaque`
   by ~16–17 % and thereby removed the only condition under which T1 had
-  ever passed.
+  ever passed **for those two modes**.
 - **P3, contention.** Not run, correctly: it is gated on P1 + P2b passing.
+
+- **STILL OPEN (1) — the hoisted-store tile-level parallel fold.** Resolve
+  every tile's roots **sequentially** into owned buffers (`resolve_tile`
+  returns `Option<(Vec<half::f16>, f32, BlendMode)>` — owned, no store
+  borrow), then fold the ~9 independent tiles in parallel over those
+  buffers. No `TileStore` inside the parallel region, so neither `!Sync`
+  nor `&mut self` binds it, and each tile's fold order is preserved
+  exactly. It passes P1. Its dispatch unit is one tile's whole joined fold
+  region, ~**3.40 ms** on the two-root fixture, which clears P2b. It was
+  never measured for P2 or P3 and has an unbounded memory-shape question
+  against §7.3.1 — a real open candidate, not a closed one.
+- **STILL OPEN (2) — documents dominated by the costlier blend modes.**
+  P2b's FAIL is scoped to `Normal`/`Multiply`. Re-measured at 0.101.1,
+  `fold_onto_opaque` clears 2.0 ms with confidence intervals wholly above
+  the bar for `Hue` 3.11, `Saturation` 2.96, `Color` 2.45, `Luminosity`
+  2.39, `Overlay` 2.33 and `SoftLight` 2.22 ms (only `HardLight`, 1.80,
+  fails). Whether such documents are common enough to build for is a
+  separate, unanswered question.
 
 P2 (magnitude) did pass for the sound framing — the blend math models at
 ~30.6 ms of the two-root fixture's ~39.2 ms phase-1 CPU compositing — so
 this is a *dispatch-granularity* NO-GO, not a "the blend loop is not where
 the time goes" NO-GO. **Disclosed:** the 2.0 ms bar is a
-contention-survival proxy (~8× Round A's insufficient 0.25 ms unit), so
-failing it does not prove no idle win exists; reopening it honestly means
-arguing the bar down *before* measuring. The one sound restructuring left
+contention-survival proxy (~8× Round A's insufficient 0.25 ms unit, which
+came out of a *bandwidth-bound* upload serializer, so the multiplier's
+transfer to this compute-bound kernel is assumed and not measured — RT-05),
+so failing it does not prove no idle win exists; reopening it honestly means
+arguing the bar down *before* measuring. The other sound restructuring left
 — inverting the loops so texel *blocks* are outside and roots inside — is
 named, given its own bar, and deliberately not built; see the 0.101.0 M1.10
-entry.
+entry and the 0.101.1 correction at the end of it.
 
 **Addendum 2026-09-04 (0.98.2) — 0.97.1's directive is DISCHARGED, and
 0.98.0's three "real, not noise" regressions are corrected: two downgrade
@@ -22529,8 +22867,15 @@ parallel path on a document genuinely having multiple roots being folded,
 never parallelize every call.~~ **Closed 0.101.0 as a NO-GO: 0.98.0's
 vectorization — the "cheaper fix" the next paragraph recommends taking
 first — dropped `fold_onto_opaque` to `Normal` 1.7051 / `Multiply`
-1.7335 ms, under this round's own 2.0 ms T1 bar, so no document shape
-clears T1 any more. Note also, since the phrase "multi-root" has since
+1.7335 ms, under this round's own 2.0 ms T1 bar, so ~~no document shape
+clears T1 any more~~ **no `Normal`- or `Multiply`-dominated document
+clears T1 any more — scoped 0.101.1 (Red-team RT-02), which re-measured six
+costlier `fold_onto_opaque` modes (`Hue` 3.11, `Saturation` 2.96, `Color`
+2.45, `Luminosity` 2.39, `Overlay` 2.33, `SoftLight` 2.22 ms) all clearing
+2.0 ms with confidence intervals wholly above the bar. `Normal` and
+`Multiply` are the two modes 0.97.1's own rule says to read the decision
+off, so the NO-GO stands as the default; it is just not universal**. Note
+also, since the phrase "multi-root" has since
 been misread that way: this conditional GO was always about the texel loop
 *inside* one fold, gated on a multi-root document — never about
 parallelizing across roots, which the "Cross-layer is impossible"

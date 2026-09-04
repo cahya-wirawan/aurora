@@ -924,9 +924,27 @@ fn fold_texel(
 /// 0.101.0: it did not compose with that question, it *closed* it.
 /// 0.97.1's conditional GO rested on the `fold_onto_opaque` column
 /// clearing a pre-registered 2.0 ms-per-call bar; this batching dropped
-/// that column ~16–17 %, to 1.71–1.73 ms, so no document shape clears the
-/// bar any longer and the `rayon` question for this function is closed
-/// NO-GO. See PLAN.md's 0.101.0 entry.** Read the real
+/// that column ~16–17 %, to 1.71–1.73 ms, so ~~no document shape clears
+/// the bar any longer and~~ the `rayon` question for this function is
+/// closed NO-GO. See PLAN.md's 0.101.0 entry.**
+///
+/// **Two scope corrections, 0.101.1 — read them before quoting that
+/// NO-GO.** (1) The "no document shape" half is withdrawn: the bar was
+/// read off `Normal` and `Multiply` only, and six costlier
+/// `fold_onto_opaque` modes (`Hue`, `Saturation`, `Color`, `Luminosity`,
+/// `Overlay`, `SoftLight`) still clear 2.0 ms with confidence intervals
+/// wholly above it. The NO-GO holds for the two modes it was registered
+/// against, which is the right default, but it is not universal.
+/// (2) The 2.0 ms bar is a *risk-adjusted contention-survival proxy*, not
+/// a measurement that no idle win exists — PLAN.md's 0.101.0 entry
+/// discloses this in full, including that the bar's ~8× multiplier was
+/// derived from a bandwidth-bound workload and its transfer to this
+/// compute-bound kernel is assumed, not measured. Also note that
+/// parallelizing *across whole tiles* is not closed: only the framing that
+/// shares a `TileStore` across workers is, and PLAN.md's 0.101.1
+/// correction names the hoisted-store framing that is not.
+///
+/// Read the real
 /// before/after numbers off PLAN.md's own 0.98.0 entry, not off this
 /// comment.
 ///
