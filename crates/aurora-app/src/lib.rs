@@ -29420,14 +29420,19 @@ mod tests {
         /// breakdown of this interval:
         ///
         /// - **87.1%** `aurora_gpu::residency`'s
-        ///   `extend_premultiplied_le_bytes` -- an
+        ///   `serialize_premultiplied_le_bytes` -- an
         ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
         ///   every texel of every dirty tile. That loop was
         ///   single-threaded with no `rayon` when this was probed;
-        ///   **since 0.96.0 it is `rayon`-parallel across fixed-size
-        ///   blocks of one tile** (64 tasks for a whole tile), so the
-        ///   share below is stale in that direction too. See PLAN.md's
-        ///   0.96.0 entry for what that actually bought, measured.
+        ///   **since 0.96.0 it is driven in parallel across fixed-size
+        ///   blocks of one tile** (64 work items for a whole tile), so the
+        ///   share below is stale in that direction too. (The probe named
+        ///   `extend_premultiplied_le_bytes`, which *was* this path's entry
+        ///   point at the time; 0.96.0 moved `sync` off it and 0.96.1
+        ///   corrected the name here, since that wrapper is no longer what
+        ///   runs in the measured interval.) See PLAN.md's 0.96.0 entry for
+        ///   what the parallelism bought on an idle machine and its 0.96.1
+        ///   entry for what it costs on a contended one.
         /// - **12.7%** `queue.write_texture`'s own CPU-side staging
         ///   `memcpy`.
         /// - **~0%** `TileStore::get` (the tile-store read).
@@ -30202,8 +30207,10 @@ mod tests {
     ///
     /// - `upload_sync` is **not** GPU upload bandwidth. It is ~87%
     ///   `aurora_gpu::residency`'s
-    ///   `extend_premultiplied_le_bytes` serialize loop -- single-threaded
-    ///   when probed, `rayon`-parallel across blocks of one tile since
+    ///   `serialize_premultiplied_le_bytes` loop (the probe named its
+    ///   then-entry-point `extend_premultiplied_le_bytes`; renamed here in
+    ///   0.96.1 to the function that actually runs) -- single-threaded
+    ///   when probed, driven in parallel across blocks of one tile since
     ///   0.96.0 -- and ~13%
     ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
     ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s

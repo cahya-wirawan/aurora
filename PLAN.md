@@ -20263,9 +20263,21 @@ severity choice.
   it still does not close the 60 FPS gate.**
 
   **The success threshold was written down before any "after" run existed**
-  (`scratchpad/bench/threshold.md`, recorded at HEAD `0321d66`/0.95.1 with
-  the three baseline runs already in hand and no changed source on disk):
-  a win requires the GPU-path `upload_sync` **mean** and **p50** to each
+  — stated in full immediately below, recorded at HEAD `0321d66`/0.95.1 with
+  the three baseline runs already in hand and no changed source on disk.
+  **Correction (0.96.1):** through 0.96.0 this sentence cited a file at
+  `scratchpad/bench/threshold.md`. **That file does not exist in this
+  repository and never did** — it was written into an ephemeral agent
+  session directory, was never committed, and `scratchpad/` is not even in
+  `.gitignore`. The citation was therefore a dangling reference in the one
+  file CLAUDE.md designates as the source of truth ("every `[x]` backed by
+  linked evidence"), backing this round's single strongest honesty claim.
+  It could not be reconstructed after the fact, and fabricating a file
+  dated to a past HEAD would be worse than having none, so the path is
+  removed rather than repaired: the threshold's own statement below — which
+  is complete, and appears before any result in this entry — stands as the
+  evidence, and the ordering of this entry's own text is what it rests on.
+  A win requires the GPU-path `upload_sync` **mean** and **p50** to each
   fall with a 3-run min–max range that does **not overlap** the baseline's
   range, *and* the `upload_sync moved ...` control line to stay
   byte-identical, proving a pure CPU-time change rather than a change in
@@ -20482,6 +20494,222 @@ severity choice.
   budget enforcement, `take_dirty`/`get` ordering, `slots` mutation and
   row-major iteration order are all untouched. 6 tests added, 0 changed, 0
   removed.
+
+  **0.96.1 (2026-09-04) — a `rayon` pool-init panic path that `panic =
+  "abort"` turned into `SIGABRT` on the every-frame upload path, fixed; and
+  the contended re-measurement 0.96.0 should have done, which found a real
+  4-5x regression that bounding the pool reduces but does NOT remove.**
+
+  Two independent reviews confirmed 0.96.0's arithmetic (bit-identical
+  output across 8,201 tested input lengths, both hand-run mutations
+  reproduced, the budget-ordering test genuinely non-vacuous, the ~1.4x idle
+  win causal and reproducible). Neither finding below is an arithmetic bug.
+
+  ### 1. The panic path 0.96.0's own panic-freedom analysis missed
+
+  0.96.0 wrote out "exactly four places a panic could come from" inside the
+  sequential serializer core and discharged all four correctly. The fifth
+  place was not in that function at all: it was the **new parallel splitter's
+  own use of `rayon`'s implicit *global* thread pool**. That pool is built
+  lazily on first use, and `rayon_core::registry::global_registry`
+  `.expect()`s the `Result` — `is_unsupported()` (wasm) is the only kind it
+  tolerates, not `IOError`. So a machine that cannot spawn workers panics
+  *inside `rayon`*, and the release profile's `panic = "abort"` makes that
+  `SIGABRT`: no unwind, no save of the professional's unsaved work, no crash
+  dialog. On `TileResidency::sync`, which runs every frame, for every user,
+  including on the app's own default startup document.
+
+  **Reproduced, and the fix verified against the reproduction** — the single
+  most important check in this round. A subshell `ulimit -u` stands in for
+  `RLIMIT_NPROC` / a cgroup `pids.max` / systemd `TasksMax` / memory
+  pressure, all realistic on a real desktop and more so on a sandboxed one.
+  Both spellings of the same 262,144-sample split, same binary, same limit:
+
+  | `ulimit -u` | 0.96.0 (global pool) | 0.96.1 (owned, bounded pool) |
+  |---|---|---|
+  | unconstrained | ok | ok |
+  | 140 | **panic, exit 101** (3/3 runs) | ok, exit 0 (3/3) |
+  | 138 | **panic, exit 101** | ok, exit 0 (pool still built) |
+  | **137** | **panic, exit 101** | **fallback warning logged, exit 0, bytes identical** |
+  | 136 / 135 / 134 / 132 | **panic, exit 101** | fallback, exit 0, bytes identical |
+
+  The panic is verbatim what the review reported:
+
+  ```text
+  thread 'main' panicked at rayon-core-1.13.0/src/registry.rs:171:10:
+  The global thread pool has not been initialized.: ThreadPoolBuildError {
+      kind: IOError(Os { code: 11, kind: WouldBlock,
+      message: "Resource temporarily unavailable" }) }
+  ```
+
+  `ulimit -u 137` is the decisive row: it is the first limit at which the
+  bounded pool *also* fails to build, so it exercises the fallback rather
+  than merely a smaller pool succeeding. There the fix logs one warning and
+  produces byte-identical output at exit 0.
+
+  **The fix.** An **owned** `rayon::ThreadPoolBuilder` pool, built once
+  behind a `OnceLock`, whose `build()` `Result` is captured; on `Err` the
+  stored value is `None` and every call falls through to
+  `serialize_premultiplied_le_bytes` — *the exact code that ran before
+  0.96.0*, so the fallback is a known-good path, not an untried one. Warned
+  once, not per frame, because the `OnceLock` initializer runs once. Owning
+  the pool also means the parallel iterators never touch the global registry
+  at all: `ThreadPool::install` runs the closure on the owned pool's own
+  worker, so `rayon`'s `in_worker` finds a current worker thread and never
+  calls `global_registry()`.
+
+  A test drives the real failure rather than mocking around it: a
+  `spawn_handler` refusing with `ErrorKind::WouldBlock` (errno 11, the same
+  error the `ulimit` reproduction produced) makes `build()` return the
+  genuine `ThreadPoolBuildError`, `.ok()` collapses it to the `None` the
+  production code stores, and the *same single dispatch point a real frame
+  uses* is then called with it — asserting both that nothing panics and that
+  the fallback's bytes equal the scalar oracle. The panic-freedom doc comment
+  now enumerates **six** places, not four: the two additions are pool
+  construction (this) and a zero chunk size (unreachable — every chunk size
+  on the path is a compile-time constant derived from `CHANNELS`).
+
+  ### 2. The contended measurement, and the regression it found
+
+  0.96.0 disclosed qualitatively that "the benchmark's caller thread is
+  otherwise idle, which flatters the change". Quantified, that
+  understatement is the round's real problem. Same machine as 0.96.0
+  (RTX 3090 / Vulkan / DiscreteGpu; i3-10100, 4 physical / 8 logical cores),
+  same command, 3 runs per cell; "load" = 8 competing CPU-bound processes,
+  started 1 s before the run and killed after it. GPU path, n=40,
+  `upload_sync`:
+
+  | config | idle mean (3 runs) | idle p50 | **8-thread-load mean** | load p50 | load p99 |
+  |---|---|---|---|---|---|
+  | sequential (pre-0.96.0) | 1.90 / 1.90 / 2.00 | 1.62 / 1.63 / 1.74 | **3.45 / 3.91 / 4.22** | 3.35 / 3.56 / 4.79 | 10.17 / 9.56 / 9.64 |
+  | **0.96.0, unbounded (8 logical cores)** | 1.37–1.44 | 1.23–1.33 | **~28.50** (independent review) | — | ~60.94 |
+  | **0.96.1, bounded to 4 workers** | 1.47 / 1.56 / 1.41 | 1.41 / 1.41 / 1.29 | **19.88 / 20.26 / 22.12** | 18.82 / 19.15 / 19.42 | 65.30 / 56.57 / 71.18 |
+
+  Whole-frame mean over the same runs: sequential 8.16 / 8.07 / 8.63 idle →
+  14.59 / 17.95 / 17.59 loaded; bounded-4 7.89 / 7.69 / 7.46 idle → 34.34 /
+  34.57 / 36.70 loaded. Control line byte-identical across every cell
+  (`mean=6.8 tiles/frame (min=2 max=20), mean=3.41 MB/frame`), so all of
+  this is CPU time, not upload volume.
+
+  **Read plainly, and not spun:**
+
+  - **The idle win survives the bound.** 1.41–1.56 ms mean against the
+    sequential baseline's 1.90–2.00 — still non-overlapping ranges, still
+    ~1.3-1.4x, marginally worse than unbounded's 1.37–1.44 as expected from
+    4 workers instead of 8. Re-measured, not assumed.
+  - **Bounding the pool reduces the contended regression by roughly a
+    quarter and does not come close to removing it.** 28.5 ms unbounded →
+    ~20.8 ms at 4 workers → 3.9 ms sequential. **Against the sequential code
+    it replaced, 0.96.1 is still ~5.3x slower under load**, and
+    `upload_sync` *alone* still costs more than the entire 16.7 ms frame
+    budget (mean ~20.8 ms, p99 up to 71 ms). The stage that used to cost
+    under 2 ms does not belong there.
+  - **So Issue 2 is *mitigated*, not fixed, and calling it fixed would be
+    false.** The three data points are monotonic and steep in worker count,
+    which says the cost is dominated by per-work-item scheduler wakeups on
+    an oversubscribed machine — the frame thread blocks on `install` until
+    the *slowest* of up to 64 blocks is scheduled, while the sequential path
+    only ever needed one core's time slice. Fewer workers is the right
+    direction and is not a cure; 2 workers would very likely still regress.
+  - **The next round owes a decision, not another tuning knob**, and this
+    entry is the input to it: either make the split conditional on evidence
+    that the machine is not contended, or make it opt-in, or revert
+    `TileResidency::sync` to the sequential serializer and keep the
+    parallel splitter for non-frame-path callers only. A ~0.5 ms idle gain
+    bought with a ~17 ms loaded loss is not obviously a good trade for an
+    editor that must stay responsive while a background tile writer, `tokio`
+    I/O and the user's other applications are running — which is the normal
+    case, not the adversarial one.
+  - **A load-sensing heuristic was considered and deliberately not built**
+    inside a patch release. There is no cheap, portable per-frame read of
+    "is this machine busy": `getloadavg` is a 1-minute average and not in
+    `std`, and a timing feedback loop is a design. Documented at the
+    dispatch site rather than left as an unexplained absence.
+  - **One configuration.** Linux, Vulkan, NVIDIA, `x86_64`+F16C, 4 physical
+    / 8 logical cores. The contended figures in particular are a property of
+    *this* core count and *this* competing load; neither Metal nor DX12 nor
+    any other core count is measured. `yes > /dev/null` × 8 is a crude
+    stand-in for real application load.
+  - **The CPU-fallback fixture's loaded numbers are noisy** (`upload_sync`
+    mean 14.59 / 15.24 / **2.54** — the third loaded run reads as though the
+    competing load had already ended). n=12 and one anomalous run; reported,
+    not used to argue anything.
+
+  **What was built for it:** an explicit `SERIALIZER_MAX_THREADS = 4` cap,
+  and a worker count of `available_parallelism() - 1` clamped to it, where a
+  result below 2 means "no pool, serialize inline" (a one-worker pool is pure
+  handoff cost — `install` blocks the caller rather than letting it join the
+  work). One pool per process, not per `TileResidency`. Plus a size guard: an
+  input of one `BLOCK_SAMPLES` or less has no parallel width to win and is
+  taken inline, which is where `upload_mip`'s mip level 3 lands.
+
+  ### 3-5. Documentation and evidence corrections
+
+  - **The "why" doc moved to the function that is actually hot.** 0.96.0's
+    split left ~220 lines of rationale (the 0.68.0 one-buffer history, the
+    0.88.1 "87% of the stage" measurement, the `wide`-vs-`half` evaluation,
+    the bit-exactness/NaN analysis) on `extend_premultiplied_le_bytes`,
+    which `sync` no longer calls at all and whose only remaining caller is
+    `upload_mip`. It is now on `serialize_premultiplied_le_bytes`, which
+    produces every real upload byte; the wrapper keeps a pointer and says
+    plainly that it used to carry it. The "both real upload paths call
+    `extend_premultiplied_le_bytes`" claim on `premultiply_rgba` was false
+    after 0.96.0 and now names both chains explicitly (`sync` →
+    `write_premultiplied_le_bytes` → `serialize…`; `upload_mip` →
+    `extend…` → `write…` → `serialize…`). `aurora-app`'s two
+    frame-diagnostic comments no longer attribute the measured 87.1% share
+    to a function that does not run in the measured interval.
+  - **The dangling threshold-file citation is removed**, with the reason
+    stated in the 0.96.0 entry itself rather than quietly deleted: the file
+    was never in the repository, could not be reconstructed, and
+    fabricating one dated to a past HEAD would be worse than having none.
+    The inline statement of the threshold — complete, and ordered before
+    every result — is the evidence now.
+  - **The `texels().len() != SAMPLES` guard's untested-ness is disclosed,
+    and verified to be unreachable rather than merely assumed so.** Checked
+    against `aurora-tile` directly: `Tile::from_texels` is the only
+    non-blank constructor and is `pub(crate)`, so nothing outside
+    `aurora-tile` (this crate and its tests included) can build a
+    wrong-length tile; `Tile::blank()` is `SAMPLES` by construction and
+    `texels_mut()` returns a `&mut [f16]`, which cannot resize; and both
+    internal `from_texels` call sites are fed by `codec::decode`, whose
+    exact-length check `a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`
+    already pins. Kept as cheap insurance (one length compare per
+    half-megabyte memcpy) against a future `aurora-tile` change, and **no
+    test-only escape hatch was added to a lower crate to exercise it** —
+    disproportionate for a guard confirmed unreachable.
+  - Smaller corrections from the same reviews: "two samples of output per
+    input sample" → "two bytes"; "exactly 64 independent tasks" → "64
+    independent work items" (`rayon`'s task granularity is adaptive, so 64
+    is the granularity the split can reach, not a spawn count); the
+    across-tile blocker's "there is nothing for a `par_iter` to iterate
+    over" → "not without reintroducing the per-tile copy 0.68.0 removed" (a
+    caller *could* build the collection, just not for free); "continues
+    instead of panicking" → "continues or returns", one arm being a return.
+  - **Two test gaps closed.** The mis-sized-output-buffer test now runs at
+    two fixture sizes — one single block (taken inline) and one spanning
+    three blocks, which is the only one that actually exercises a short
+    trailing `par_chunks_mut` chunk sitting after two correctly-offset full
+    ones; through 0.96.0 it had only the first. And the budget/ordering test
+    now asserts `remaining == 2`, without which a `sync` that uploaded two
+    tiles and forgot the rest would have passed it.
+
+  **Verified:** `cargo fmt --all --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo test --workspace` (1,655 passed, 0 failed), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`, `cargo deny check all` (`advisories ok, bans ok, licenses
+  ok, sources ok`) — all clean. **No new dependencies** (`rayon` was already
+  added in 0.96.0), no new `unsafe`, no new lint exception, no
+  `unwrap`/`expect`/`panic`/`indexing_slicing` — the last one mattering
+  particularly here, since Issue 1 was an `expect` inside a dependency.
+  `aurora-tile` untouched. `TileResidency::sync`'s budget enforcement,
+  `take_dirty`/`get` ordering, `slots` mutation and row-major iteration order
+  are all still untouched, and the serialized bytes are unchanged on every
+  path. 2 tests added, 2 changed, 0 removed (1,653 → 1,655 workspace-wide;
+  `aurora-gpu` 74 → 76).
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

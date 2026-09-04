@@ -4,6 +4,7 @@
 //! instead of the whole texture (`spike/FINDINGS.md` finding #4).
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use aurora_core::MAX_DOCUMENT_EXTENT;
 use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId, TileStore};
@@ -82,14 +83,24 @@ const MIP_LEVELS: u32 = 4;
 ///
 /// **Test-only since 0.92.1**, and `#[cfg(test)]` so that stays true:
 /// this is the scalar *reference* implementation the equivalence tests
-/// below pin `extend_premultiplied_le_bytes` against, not a path any
-/// upload takes. Both real upload paths ([`TileResidency::sync`] and
-/// [`TileResidency::upload_mip`]) call `extend_premultiplied_le_bytes`.
-/// They did not between 0.92.0 and 0.92.1 — `upload_mip` still ran this
-/// function — and that split is exactly what made the two paths disagree
-/// on a double-NaN texel while writing the same atlas texture. Keeping
-/// the reference compiled only under `cfg(test)` is what stops that
-/// regression from being reintroduced by accident.
+/// below pin the real serializer against, not a path any upload takes.
+///
+/// **Both real upload paths still bottom out in the same one function**,
+/// which is what matters here, but as of 0.96.0 neither reaches it the way
+/// it used to and the chains differ by one hop:
+/// [`TileResidency::sync`] calls [`write_premultiplied_le_bytes`] →
+/// [`serialize_premultiplied_le_bytes`], and
+/// [`TileResidency::upload_mip`] calls
+/// [`extend_premultiplied_le_bytes`] → `write_premultiplied_le_bytes` →
+/// `serialize_premultiplied_le_bytes`. (Through 0.96.0 this paragraph said
+/// both paths call `extend_premultiplied_le_bytes`; that stopped being true
+/// when 0.96.0 moved `sync` off it, and is corrected in 0.96.1.)
+/// The two paths did not share an implementation at all between 0.92.0 and
+/// 0.92.1 — `upload_mip` still ran this function — and that split is
+/// exactly what made them disagree on a double-NaN texel while writing the
+/// same atlas texture. Keeping the reference compiled only under
+/// `cfg(test)` is what stops that regression from being reintroduced by
+/// accident.
 ///
 /// The rest of this comment is the canonical write-up of *why* the atlas
 /// holds premultiplied alpha at all. It is still accurate and still the
@@ -164,20 +175,212 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// `wgpu::Queue::write_texture` wants, premultiplied on the way, writing
 /// them into `out` **in place** rather than appending.
 ///
-/// The arithmetic here — the two `half::slice` vectorized conversions, the
-/// `rgb * alpha` operand order, why alpha is copied from the source chunk
-/// and never from the narrowed scratch buffer, and exactly which
-/// bit-exactness guarantees hold against [`premultiply_rgba`] — is
-/// unchanged from 0.92.0/0.92.1 and is documented in full on
-/// [`extend_premultiplied_le_bytes`] below. This function is where it
-/// lives as of 0.96.0; read that comment for the *why* and this one for
-/// the panic-freedom and slice-length argument.
+/// **This is the hot function**, and as of 0.96.0 it is the *only* place
+/// real upload bytes are produced — reached either in parallel, through
+/// [`write_premultiplied_le_bytes`]'s `rayon` splitter, or sequentially
+/// through that same function's fallback. The substantive *why* below (the
+/// 0.68.0 buffer history, the 0.88.1 measurement that named this loop
+/// rather than the bus, the 0.89.0 append batching, the `wide`-vs-`half`
+/// crate evaluation, and exactly which bit-exactness guarantees hold
+/// against [`premultiply_rgba`]) was moved here in 0.96.1 from
+/// [`extend_premultiplied_le_bytes`], which carried it while it was
+/// [`TileResidency::sync`]'s entry point and no longer is — `sync` calls
+/// [`write_premultiplied_le_bytes`], and `extend_premultiplied_le_bytes`
+/// is now a `Vec`-sizing wrapper whose only caller is
+/// [`TileResidency::upload_mip`].
 ///
-/// **Panic-freedom, argued rather than asserted.** The release profile
+/// # Why one buffer, written in place (0.68.0)
+///
+/// The premultiply happens *here*, as the bytes are written, rather than
+/// as a separate pass over a separate buffer, so that
+/// [`TileResidency::sync`] needs one reusable buffer for the whole call
+/// instead of two per tile. 0.68.0 spelled the same work as *copy the tile
+/// into a staging `Vec<f16>`, premultiply that in place, then allocate a
+/// fresh `Vec<u8>` and serialize into it* — a half-megabyte copy plus an
+/// allocation per tile, on an upload path `spike/FINDINGS.md` finding #3
+/// already names as bandwidth-bound. The comment justifying the staging
+/// buffer said it "avoids allocating a fresh half-megabyte buffer per
+/// tile", which the very next line then did anyway.
+///
+/// # This loop is the real cost, not the bus (measured, 0.88.1)
+///
+/// On the real pan-while-painting benchmark (`aurora-app`'s M1.10
+/// per-stage frame breakdown, PLAN.md), this conversion loop dominated the
+/// `upload_sync` stage's time — a single-threaded scalar
+/// `f16 -> f32 -> premultiply -> f16` conversion, not GPU bandwidth. The
+/// actual GPU DMA of the bytes this produces happens later, at the next
+/// `queue.submit`, and measures near line-rate there. Before optimizing
+/// this as a *bandwidth* problem (fewer bytes, mip streaming), check
+/// whether it's cheaper to fix as a *throughput* problem first — see the
+/// PLAN.md entry for the measured numbers. (0.88.1 quoted "~87% of the
+/// stage" from a probe of the pre-0.89.0 four-append loop. Do not quote
+/// that figure forward: 0.90.0's unchanged-tile skip cut how many tiles
+/// reach this function at all, so the share is stale. PLAN.md's 0.92.0
+/// entry states what a fresh baseline actually measured instead.)
+///
+/// **Batching the four channel writes is done (0.89.0)**: the loop body
+/// concatenates the four `to_le_bytes()` pairs into one 8-byte write
+/// ([`write_texel_le_bytes`]) instead of four separate 2-byte appends.
+/// Each append re-checked the `Vec`'s capacity and performed its own small
+/// `memcpy`, so this cut a 256×256 tile from 262,144 append calls to
+/// 65,536. The arithmetic, the `to_le_bytes()` calls and the R/G/B/A order
+/// were unchanged, so the output was bit-for-bit what the four-append
+/// version produced.
+///
+/// **What that actually bought, measured: almost nothing, and it
+/// disproved the rationale in the paragraph above.** Roughly 1-5% off
+/// the `upload_sync` stage's p50, no improvement at p99 (noise-dominated
+/// in both directions), and the GPU-path stage *mean* stayed inside
+/// run-to-run noise; the 60 FPS verdict did not move. Removing 3-of-4
+/// append calls per texel from a stage this loop dominates should have
+/// been dramatic if capacity checks and small `memcpy`s were where the
+/// time went — so they are not. **The per-texel
+/// `f16 -> f32 -> multiply -> f16` arithmetic is**, which redirected the
+/// next attempt here to vectorizing that conversion rather than any
+/// further append bookkeeping. PLAN.md's 0.89.0 addendum under M1.10 has
+/// the full before/after tables, the sample sizes, and the caveats.
+///
+/// # Vectorizing the conversion (0.92.0): the crate evaluation
+///
+/// **Why "just call `from_f32` in a loop, but faster" is not the fix.**
+/// `half`'s scalar `f16::from_f32` / `f32::from(f16)` already use the
+/// hardware F16C instructions (`vcvtps2ph` / `vcvtph2ps`) on `x86_64` —
+/// they are not slow *arithmetic*. What is slow is the per-call
+/// overhead around them: each one runs its own
+/// `is_x86_feature_detected!("f16c")` check and then calls a
+/// `#[target_feature(enable = "f16c")]` function, which cannot be
+/// inlined into a caller that was not compiled with that feature. At
+/// the pre-0.92.0 per-texel granularity a 256×256 tile paid that overhead
+/// **seven times per texel**: one `f32::from` to widen alpha, three more
+/// to widen R/G/B, and three `f16::from_f32` calls to narrow the three
+/// products back down. That is `7 × 65,536 = 458,752` non-inlinable
+/// calls, each preceded by a feature-detection check, per tile. (This
+/// paragraph said "three times per texel for RGB plus once for the
+/// widening of alpha — on the order of 393,000" through 0.92.0. Both
+/// halves were wrong and they were wrong inconsistently: the prose named
+/// four operations, which would be 262,144, while the figure implied six.
+/// Counted against the pre-0.92.0 body itself — `git show HEAD^` at the
+/// 0.92.1 commit — it is seven and 458,752.) That bookkeeping, not the
+/// conversion, is the cost.
+///
+/// **`wide` was evaluated and rejected.** The user's starting
+/// suggestion was the `wide` crate. It is the wrong tool here, for two
+/// independent reasons. First and decisively: **`wide` has no `f16` lane
+/// type at all.** Its lane vocabulary is `i8`/`i16`/`i32`/`i64`,
+/// `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
+/// `f16` ↔ `f32` conversion, which is the part that costs. It would
+/// vectorize only the alpha multiply, leaving all 458,752 scalar
+/// conversion calls exactly where they are. Second: without a
+/// target-feature bump 0.92.0 was not making (no `RUSTFLAGS`, no
+/// `.cargo/config.toml`), `wide`'s widest guaranteed lane width on
+/// baseline `x86_64` is SSE2's 128 bits — four `f32` lanes for the one
+/// operation that was never the bottleneck. It would also be a new
+/// runtime dependency, with the licence review that implies.
+///
+/// **`half`'s own slice API was chosen instead.** `half` is already a
+/// dependency (`half = "2"`, resolving to 2.7.1), and it ships
+/// [`half::slice::HalfFloatSliceExt`] — `convert_to_f32_slice` and
+/// `convert_from_f32_slice` — which reach the *same* F16C instructions
+/// through `_mm256_cvtph_ps` / `_mm256_cvtps_ph`, eight lanes per
+/// instruction, behind **one** feature-detection check for the whole
+/// slice rather than one per sample. That is genuine SIMD
+/// vectorization of the expensive half of the work, with **zero new
+/// dependencies** and no `unsafe` in this crate — strictly better than
+/// what adding `wide` could have given. On a CPU without F16C, `half`
+/// falls back to its own software conversion and this code stays
+/// correct, just not faster; on `aarch64` it takes `half`'s own `fp16`
+/// NEON path. Neither non-F16C `x86_64` nor `aarch64` is verified here.
+///
+/// # Bit-exactness with the scalar path: what is guaranteed, and the one
+/// case that is not
+///
+/// `half`'s scalar and 8-wide x86 paths issue the same
+/// conversion instructions with the same rounding immediate
+/// (`_MM_FROUND_TO_NEAREST_INT`), and the multiply keeps the scalar
+/// path's `rgb * alpha` operand order. So for **any input where at most
+/// one of a texel's RGB channel and its alpha is NaN**, this function is
+/// bit-for-bit identical to `premultiply_rgba` followed by a plain
+/// little-endian serialize — every finite value, both infinities, both
+/// signed zeros, every subnormal, and every single-NaN combination. That
+/// half was established exhaustively over all 65,536 × 65,536 (RGB bits ×
+/// alpha bits) texels by an independent review pass and holds **in every
+/// build profile tested** (`opt-level = 1`, the workspace's default, and
+/// `opt-level = 3` / `--release`) — unlike the double-NaN case below,
+/// which is profile-dependent, this one follows from IEEE 754's own
+/// single-NaN propagation rule, not from what a particular optimizer
+/// happens to emit, so there is no reason to expect a third profile to
+/// behave differently.
+///
+/// **When a texel's RGB channel and its alpha are *both* NaN, the two
+/// spellings can disagree on the result's NaN payload.** 0.92.0's doc
+/// comment claimed bit-exactness without qualification; that claim was
+/// false for exactly this case, which is why it is spelled out here
+/// instead of hedged. What is still guaranteed is that the result is *a*
+/// NaN carrying one of the two NaN operands' payloads, quieted — the pixel
+/// was already meaningless before and after, so this turns garbage into
+/// different garbage rather than corrupting a good pixel. What is *not*
+/// guaranteed is *which* operand's payload survives: `NaN × NaN` returns
+/// the quieted **first source operand** on x86, and which of `rgb` and
+/// `alpha` ends up "first" is an operand-order detail of whatever code
+/// LLVM emits. Neither IEEE 754 nor this source pins it down.
+///
+/// **Measured, because the shape of it is not what it looks like.** Per
+/// channel position, "which operand's payload survives" on `x86_64`
+/// (0.92.1, this sandbox, all 30 ordered pairs of six distinct NaN
+/// payloads, every texel of a full chunk):
+///
+/// | profile | this function | `premultiply_rgba` | agree? |
+/// |---|---|---|---|
+/// | `opt-level = 1` (the default test profile) | rgb, rgb, **alpha** | rgb, rgb, **alpha** | yes, bit-exact |
+/// | `opt-level = 3` (`--release`) | **alpha**, rgb, **alpha** | rgb, rgb, **alpha** | no — R diverges |
+///
+/// Three things worth reading off that table, none of them obvious. The
+/// divergence between the two paths is **release-only**: at the profile
+/// `cargo test` and `cargo nextest` actually use, they agree bit-for-bit
+/// even here. `premultiply_rgba` is **not** a scalar baseline that IEEE
+/// 754 pins — LLVM auto-vectorizes its loop too, and it already sources
+/// B's payload from `alpha` at every profile measured, so the divergence
+/// is between two *different* auto-vectorizations of the same arithmetic
+/// rather than between a vector path and a scalar one. And the choice
+/// varies by *channel position*, not by texel or by payload: LLVM
+/// vectorizes some of the three multiplies and leaves others alone, and
+/// which ones move with the optimizer.
+///
+/// `the_fused_serializer_agrees_on_a_double_nan_texel_up_to_the_payload_operand`
+/// below pins what survives all of that — the payload comes from one of
+/// the two operands and never from anywhere else, each channel position
+/// chooses consistently across every texel and every payload pair, and
+/// alpha passes through untouched — so a toolchain change that moved this
+/// somewhere else fails a test instead of passing silently. It
+/// deliberately does not assert *which* operand, since that is the part
+/// the table shows to be profile-dependent.
+///
+/// Reachability, stated rather than hand-waved: `aurora-io`'s 16-bit-float
+/// TIFF reader takes raw `f16` samples verbatim with no NaN filtering, so
+/// a malformed or adversarial file can construct this input directly. The
+/// consequence is bounded to the above.
+///
+/// The equivalence tests below pin all of this against
+/// [`premultiply_rgba`], which is deliberately left in the obvious scalar
+/// spelling as the reference implementation, and which is `#[cfg(test)]`
+/// since 0.92.1 because that is now its only role.
+///
+/// **Why alpha is read from the source chunk, never from the narrowed
+/// buffer.** `premultiply_rgba` does not touch alpha at all, so its
+/// bits pass through untouched — and `f16 -> f32 -> f16` is *not* the
+/// identity for a signalling NaN, which the F16C widening quiets
+/// (`0x7c01` becomes `0x7e01`). Taking alpha from the round-tripped
+/// buffer would therefore silently change one class of input. It is
+/// copied straight from `chunk` instead.
+///
+/// # Panic-freedom, argued rather than asserted
+///
+/// The release profile
 /// sets `panic = "abort"`, and as of 0.96.0 this function also runs inside
 /// a `rayon` worker closure, so a panic here is a process abort rather
-/// than a recoverable error. There are exactly four places a panic could
-/// come from, and none of them can fire:
+/// than a recoverable error. There are six places a panic could
+/// come from — 0.96.0's own version of this list named four, and both
+/// omissions are called out below — and none of them can fire:
 ///
 /// 1. `chunk.convert_to_f32_slice(&mut wide)` — `half`'s only failure mode
 ///    is an `assert_eq!` that source and destination lengths match.
@@ -191,8 +394,10 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// 3. Slice indexing — there is none. Every read walks an iterator
 ///    (`chunks_exact`, `chunks_exact_mut`, `zip`), and every write goes
 ///    through an irrefutable-on-success slice pattern whose failure arm
-///    `continue`s instead of panicking. No `[i]`, no `copy_from_slice`
-///    (which *does* panic on a length mismatch), no `unwrap`, no `expect`.
+///    `continue`s or returns instead of panicking (the two arms in this
+///    function `continue`; [`write_texel_le_bytes`]'s returns). No `[i]`,
+///    no `copy_from_slice` (which *does* panic on a length mismatch), no
+///    `unwrap`, no `expect`.
 /// 4. Running out of `out` — impossible to panic on, because `out` is
 ///    consumed through `chunks_exact_mut(CHANNELS * 2)` zipped against the
 ///    texel iterators. A `zip` stops at whichever side ends first, so an
@@ -200,6 +405,29 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 ///    leaves its tail untouched. That is what makes the reused
 ///    [`Self::sync`] buffer and the parallel splitter's short trailing
 ///    block both safe without a length assertion.
+/// 5. **A zero chunk size** — `chunks_exact`, `chunks_exact_mut` and
+///    `par_chunks*` all panic on a chunk size of 0, which 0.96.0's list
+///    did not mention at all. Every chunk size on this path is a
+///    compile-time constant computed from [`CHANNELS`] (4): `CHUNK_SAMPLES`
+///    is 256, `CHANNELS * 2` is 8, `CHANNELS` is 4, `BLOCK_SAMPLES` is
+///    4,096. None can be zero without `CHANNELS` being zero, which would
+///    break the `[r, g, b, a]` slice patterns at compile time — so this is
+///    unreachable by construction rather than by check.
+/// 6. **`rayon`'s thread-pool construction** — the one 0.96.0 missed that
+///    could actually fire, and it is not in this function: it is in
+///    [`write_premultiplied_le_bytes`], which used to reach `rayon`'s
+///    *implicit global* pool. That pool is initialized lazily on first use,
+///    and `rayon_core::registry::global_registry` `.expect()`s the
+///    `Result` of building it — so a machine that cannot spawn worker
+///    threads (`RLIMIT_NPROC`, a cgroup `pids.max`, systemd `TasksMax`, or
+///    plain memory pressure; reproduced here with `ulimit -u`) panicked
+///    inside `rayon`, i.e. `SIGABRT` under `panic = "abort"`, on a path
+///    that runs on every frame including the default startup document's.
+///    0.96.1 replaced the global pool with an **owned, explicitly bounded**
+///    one whose `build()` `Result` is captured, falling back to calling
+///    *this* function directly when it fails. See
+///    [`write_premultiplied_le_bytes`] and [`serializer_pool`] for the
+///    mechanism and the test that exercises the fallback.
 ///
 /// **Trailing partial texel**: a `texels` length that is not a multiple of
 /// [`CHANNELS`] contributes nothing for its final incomplete texel, the
@@ -208,7 +436,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
     // buffers. `wide` is deliberately *not* a reference to the rejected
-    // crate of the same name -- see `extend_premultiplied_le_bytes`.
+    // crate of the same name -- see this function's own doc comment.
     let mut wide = [0f32; CHUNK_SAMPLES];
     let mut narrow = [f16::ZERO; CHUNK_SAMPLES];
     // One texel of output is `CHANNELS` little-endian `f16` samples.
@@ -225,9 +453,9 @@ fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
             let alpha = *a;
             // Operand order (rgb * alpha) matches the scalar path's, so
             // single-NaN products keep the same payload. A *double*-NaN
-            // product does not necessarily -- see
-            // `extend_premultiplied_le_bytes`'s "Bit-exactness" section;
-            // it is disclosed, tested and deliberately not chased.
+            // product does not necessarily -- see this function's own
+            // "Bit-exactness" section; it is disclosed, tested and
+            // deliberately not chased.
             *r *= alpha;
             *g *= alpha;
             *b *= alpha;
@@ -300,31 +528,143 @@ fn write_texel_le_bytes(r: f16, g: f16, b: f16, a: f16, dest: &mut [u8]) {
     *d7 = a_hi;
 }
 
-/// [`serialize_premultiplied_le_bytes`], split across `rayon` worker
-/// threads at [`BLOCK_SAMPLES`]-sample granularity. **This is 0.96.0's
-/// actual change**; everything it calls is 0.92.x code.
+/// Hard ceiling on the tile-upload serializer pool's worker count (0.96.1).
+///
+/// **Why a ceiling at all, and why this one.** 0.96.0 used `rayon`'s
+/// implicit global pool, which sizes itself to
+/// `std::thread::available_parallelism()` — every logical core — with no
+/// bound. On an otherwise idle machine that is the fastest choice and it
+/// measured as one (PLAN.md's 0.96.0 table). Under **CPU contention** it is
+/// the opposite: [`TileResidency::sync`] calls this synchronously on the frame
+/// thread and blocks until the *slowest* of up to 64 blocks finishes, so
+/// every worker that has to wait for a scheduler time-slice adds to the
+/// frame's critical path, while the sequential code it replaced only ever
+/// needed one core's slice. An independent review measured that as a **4-5×
+/// regression** with 8 competing CPU-bound threads on a 4-physical/8-logical
+/// core box: `upload_sync` mean 28.5 ms against the sequential path's
+/// 5.2 ms, i.e. one stage alone exceeding the whole 16.7 ms frame budget.
+///
+/// Four is chosen as "a small number that is still real parallel width":
+/// it is the physical core count of the machine both the win and the
+/// regression were measured on, it cannot oversubscribe a machine with
+/// hyper-threading, and it keeps `SERIALIZER_MAX_THREADS` well below the
+/// core count of the larger machines this code will meet. **This bounds the
+/// worst case; it does not eliminate it** — PLAN.md's 0.96.1 entry carries
+/// the re-measured contended numbers, including the residual regression.
+const SERIALIZER_MAX_THREADS: usize = 4;
+
+/// Workers [`serializer_pool`] asks for: one fewer than the machine's
+/// logical core count, capped at [`SERIALIZER_MAX_THREADS`], and 0 (meaning
+/// "don't build a pool, run inline") on a machine too small for the split
+/// to buy anything.
+///
+/// The `- 1` leaves headroom for the rest of a running Aurora — the
+/// background tile writer, `tokio`'s I/O threads, the compositor — rather
+/// than claiming every core for a stage that is a fraction of the frame.
+/// A result below 2 returns 0: a one-worker pool is pure handoff cost,
+/// because `ThreadPool::install` blocks the calling thread on a latch and
+/// does *not* let it join the work, so a single worker would serialize the
+/// same bytes on a different thread while the frame thread idled.
+fn serializer_pool_threads() -> usize {
+    let usable = std::thread::available_parallelism()
+        .map_or(0, |n| n.get().saturating_sub(1))
+        .min(SERIALIZER_MAX_THREADS);
+    if usable < 2 { 0 } else { usable }
+}
+
+/// Builds the serializer's pool, or returns `None` — **never panics, and
+/// that is the entire point of this function** (0.96.1).
+///
+/// `rayon`'s implicit global pool, which 0.96.0 used, is initialized lazily
+/// and `rayon_core::registry::global_registry` `.expect()`s the `Result` of
+/// building it. Anything but `is_unsupported()` (which covers wasm, not a
+/// spawn failure) therefore panics *inside `rayon`* — and the release
+/// profile sets `panic = "abort"`, so that is `SIGABRT` with no unwind, no
+/// save and no crash dialog, on a path [`TileResidency::sync`] runs every frame
+/// including for the app's own default startup document. Reproduced under
+/// `ulimit -u`, and equally reachable from a cgroup `pids.max`, systemd
+/// `TasksMax`, or memory pressure:
+///
+/// ```text
+/// thread '...' panicked at rayon-core-1.13.0/src/registry.rs:171:10:
+/// The global thread pool has not been initialized.: ThreadPoolBuildError {
+///     kind: IOError(Os { code: 11, kind: WouldBlock, ... }) }
+/// ```
+///
+/// Owning the pool is what makes the failure a value instead of a panic:
+/// [`rayon::ThreadPoolBuilder::build`] returns a `Result`, this captures
+/// it, and a failure degrades to the sequential serializer — which is
+/// exactly the code that ran before 0.96.0, so the fallback is a known-good
+/// path rather than an untried one. Warned once, not per frame, because
+/// [`serializer_pool`]'s `OnceLock` initializer runs once.
+fn build_serializer_pool(threads: usize) -> Option<rayon::ThreadPool> {
+    if threads == 0 {
+        return None;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("aurora-tile-serialize-{i}"))
+        .build()
+    {
+        Ok(pool) => Some(pool),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                threads,
+                "tile uploads will serialize on the calling thread: rayon could not \
+                 build a thread pool"
+            );
+            None
+        }
+    }
+}
+
+/// The process-wide, lazily built serializer pool, or `None` when this
+/// machine could not or should not have one — see [`build_serializer_pool`]
+/// for why it is owned rather than `rayon`'s global, and
+/// [`serializer_pool_threads`] for its size.
+///
+/// One pool for the process, not one per [`TileResidency`]: worker threads
+/// are the scarce resource being bounded, and two atlases (a future second
+/// viewport) must share the bound rather than double it.
+fn serializer_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| build_serializer_pool(serializer_pool_threads()))
+        .as_ref()
+}
+
+/// [`serialize_premultiplied_le_bytes`], split across the
+/// [`serializer_pool`]'s worker threads at [`BLOCK_SAMPLES`]-sample
+/// granularity. **This is 0.96.0's actual change**; everything it calls is
+/// 0.92.x code.
 ///
 /// `texels` is split by `par_chunks(BLOCK_SAMPLES)` and `out` by
-/// `par_chunks_mut(BLOCK_SAMPLES * 2)` — two samples of output per input
+/// `par_chunks_mut(BLOCK_SAMPLES * 2)` — two output *bytes* per input
 /// sample — and the two are `zip`ped so block *k* of the input always
 /// meets block *k* of the output. A whole [`TILE`]×[`TILE`] tile
-/// ([`SAMPLES`] samples) therefore becomes exactly 64 independent tasks.
+/// ([`SAMPLES`] samples) therefore becomes exactly 64 independent work
+/// items. (Work *items*, not tasks: `rayon` splits a parallel iterator
+/// adaptively by work-stealing, so how many actual jobs those 64 blocks
+/// become depends on how many workers are free. 64 is the granularity the
+/// split can reach, not a count of spawns.)
 ///
 /// **Why the output is bit-identical to the sequential version, regardless
 /// of thread count or scheduling.** There is no shared mutable state: no
-/// accumulator, no reduction, no cross-block carry. Each task owns a
+/// accumulator, no reduction, no cross-block carry. Each work item owns a
 /// disjoint `&mut [u8]` sub-slice (that disjointness is what
 /// `par_chunks_mut` guarantees and what the borrow checker enforces), and
-/// each task's output depends only on its own input block. Because
+/// each one's output depends only on its own input block. Because
 /// `BLOCK_SAMPLES % CHANNELS == 0`, a texel never straddles a block
-/// boundary, so no task can see a partial texel that the sequential walk
+/// boundary, so no worker can see a partial texel that the sequential walk
 /// would have seen whole; and because `BLOCK_SAMPLES % CHUNK_SAMPLES ==
 /// 0`, every block but possibly the last is a whole number of vectorized
 /// chunks, so no block is pushed onto the scalar remainder path that the
 /// sequential walk would have vectorized. There is consequently **no
 /// run-to-run non-determinism to disclose**: the bytes are a pure function
 /// of the input, and `the_parallel_serializer_matches_the_scalar_reference_across_block_boundaries`
-/// pins that against the scalar oracle.
+/// pins that against the scalar oracle. It is also what makes 0.96.1's
+/// sequential *fallback* a drop-in rather than a second implementation to
+/// keep in step: both spellings produce the same bytes by construction.
 ///
 /// `par_chunks`, not `par_chunks_exact`: a short trailing block then goes
 /// through the *same* code path as every other block, with
@@ -336,204 +676,8 @@ fn write_texel_le_bytes(r: f16, g: f16, b: f16, a: f16, dest: &mut [u8]) {
 /// would silently write correct bytes at wrong offsets, which is why
 /// `the_block_and_chunk_constants_divide_a_whole_tile_evenly` pins the
 /// arithmetic and the boundary sweep below checks every length class.
-fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
-    texels
-        .par_chunks(BLOCK_SAMPLES)
-        .zip(out.par_chunks_mut(BLOCK_SAMPLES * 2))
-        .for_each(|(block, bytes)| serialize_premultiplied_le_bytes(block, bytes));
-}
-
-/// Appends `texels` to `out` as the little-endian `f16` bytes
-/// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
-/// (`premultiply_rgba`'s arithmetic, applied per texel as the bytes are
-/// written rather than in a separate pass over a separate buffer).
 ///
-/// This exists so [`TileResidency::sync`] needs one reusable buffer for
-/// the whole call instead of two per tile. 0.68.0 spelled the same work
-/// as *copy the tile into a staging `Vec<f16>`, premultiply that in
-/// place, then allocate a fresh `Vec<u8>` and serialize into it* — a
-/// half-megabyte copy plus an allocation per tile, on an upload path
-/// `spike/FINDINGS.md` finding #3 already names as bandwidth-bound. The
-/// comment justifying the staging buffer said it "avoids allocating a
-/// fresh half-megabyte buffer per tile", which the very next line then
-/// did anyway.
-///
-/// **This function itself is the real cost, not the bus** (measured,
-/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1): on
-/// the real pan-while-painting benchmark, this loop dominated the
-/// `upload_sync` stage's time — a single-threaded scalar
-/// `f16 -> f32 -> premultiply -> f16` conversion, not GPU bandwidth. The
-/// actual GPU DMA of the bytes this produces happens later, at the next
-/// `queue.submit`, and measures near line-rate there. Before optimizing
-/// this as a *bandwidth* problem (fewer bytes, mip streaming), check
-/// whether it's cheaper to fix as a *throughput* problem first — see the
-/// PLAN.md entry for the measured numbers. (0.88.1 quoted "~87% of the
-/// stage" from a probe of the pre-0.89.0 four-append loop. Do not quote
-/// that figure forward: 0.90.0's unchanged-tile skip cut how many tiles
-/// reach this function at all, so the share is stale. PLAN.md's 0.92.0
-/// entry states what a fresh baseline actually measured instead.)
-///
-/// **Batching the four channel writes is done (0.89.0)**: the loop body
-/// concatenates the four `to_le_bytes()` pairs into one 8-byte array and
-/// appends that with a single `extend_from_slice`, instead of four
-/// separate 2-byte appends. Each append re-checks the `Vec`'s capacity
-/// and performs its own small `memcpy`, so this cuts a 256×256 tile from
-/// 262,144 append calls to 65,536. The arithmetic, the `to_le_bytes()`
-/// calls and the R/G/B/A order are unchanged, so the output is
-/// bit-for-bit what the four-append version produced.
-///
-/// **What that actually bought, measured: almost nothing, and it
-/// disproved the rationale in the paragraph above.** Roughly 1-5% off
-/// the `upload_sync` stage's p50, no improvement at p99 (noise-dominated
-/// in both directions), and the GPU-path stage *mean* stayed inside
-/// run-to-run noise; the 60 FPS verdict did not move. Removing 3-of-4
-/// append calls per texel from a stage this loop dominates should have
-/// been dramatic if capacity checks and small `memcpy`s were where the
-/// time went — so they are not. **The per-texel
-/// `f16 -> f32 -> multiply -> f16` arithmetic is**, which redirected the
-/// next attempt here to vectorizing that conversion rather than any
-/// further append bookkeeping. PLAN.md's 0.89.0 addendum under M1.10 has
-/// the full before/after tables, the sample sizes, and the caveats.
-///
-/// # Vectorizing the conversion (0.92.0): the crate evaluation
-///
-/// **Why "just call `from_f32` in a loop, but faster" is not the fix.**
-/// `half`'s scalar `f16::from_f32` / `f32::from(f16)` already use the
-/// hardware F16C instructions (`vcvtps2ph` / `vcvtph2ps`) on `x86_64` —
-/// they are not slow *arithmetic*. What is slow is the per-call
-/// overhead around them: each one runs its own
-/// `is_x86_feature_detected!("f16c")` check and then calls a
-/// `#[target_feature(enable = "f16c")]` function, which cannot be
-/// inlined into a caller that was not compiled with that feature. At
-/// today's per-texel granularity a 256×256 tile pays that overhead
-/// **seven times per texel**: one `f32::from` to widen alpha, three more
-/// to widen R/G/B, and three `f16::from_f32` calls to narrow the three
-/// products back down. That is `7 × 65,536 = 458,752` non-inlinable
-/// calls, each preceded by a feature-detection check, per tile. (This
-/// paragraph said "three times per texel for RGB plus once for the
-/// widening of alpha — on the order of 393,000" through 0.92.0. Both
-/// halves were wrong and they were wrong inconsistently: the prose named
-/// four operations, which would be 262,144, while the figure implied six.
-/// Counted against the pre-0.92.0 body itself — `git show HEAD^` at the
-/// 0.92.1 commit — it is seven and 458,752.) That bookkeeping, not the
-/// conversion, is the cost.
-///
-/// **`wide` was evaluated and rejected.** The user's starting
-/// suggestion was the `wide` crate. It is the wrong tool here, for two
-/// independent reasons. First and decisively: **`wide` has no `f16` lane
-/// type at all.** Its lane vocabulary is `i8`/`i16`/`i32`/`i64`,
-/// `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
-/// `f16` ↔ `f32` conversion, which is the part that costs. It would
-/// vectorize only the alpha multiply, leaving all 458,752 scalar
-/// conversion calls exactly where they are. Second: without a
-/// target-feature bump this round is not making (no `RUSTFLAGS`, no
-/// `.cargo/config.toml`), `wide`'s widest guaranteed lane width on
-/// baseline `x86_64` is SSE2's 128 bits — four `f32` lanes for the one
-/// operation that was never the bottleneck. It would also be a new
-/// runtime dependency, with the licence review that implies.
-///
-/// **`half`'s own slice API was chosen instead.** `half` is already a
-/// dependency (`half = "2"`, resolving to 2.7.1), and it ships
-/// [`half::slice::HalfFloatSliceExt`] — `convert_to_f32_slice` and
-/// `convert_from_f32_slice` — which reach the *same* F16C instructions
-/// through `_mm256_cvtph_ps` / `_mm256_cvtps_ph`, eight lanes per
-/// instruction, behind **one** feature-detection check for the whole
-/// slice rather than one per sample. That is genuine SIMD
-/// vectorization of the expensive half of the work, with **zero new
-/// dependencies** and no `unsafe` in this crate — strictly better than
-/// what adding `wide` could have given. On a CPU without F16C, `half`
-/// falls back to its own software conversion and this code stays
-/// correct, just not faster; on `aarch64` it takes `half`'s own `fp16`
-/// NEON path. Neither non-F16C `x86_64` nor `aarch64` is verified here.
-///
-/// **Bit-exactness with the scalar path: what is guaranteed, and the one
-/// case that is not.** `half`'s scalar and 8-wide x86 paths issue the same
-/// conversion instructions with the same rounding immediate
-/// (`_MM_FROUND_TO_NEAREST_INT`), and the multiply keeps the scalar
-/// path's `rgb * alpha` operand order. So for **any input where at most
-/// one of a texel's RGB channel and its alpha is NaN**, this function is
-/// bit-for-bit identical to `premultiply_rgba` followed by a plain
-/// little-endian serialize — every finite value, both infinities, both
-/// signed zeros, every subnormal, and every single-NaN combination. That
-/// half was established exhaustively over all 65,536 × 65,536 (RGB bits ×
-/// alpha bits) texels by an independent review pass and holds **in every
-/// build profile tested** (`opt-level = 1`, the workspace's default, and
-/// `opt-level = 3` / `--release`) — unlike the double-NaN case below,
-/// which is profile-dependent, this one follows from IEEE 754's own
-/// single-NaN propagation rule, not from what a particular optimizer
-/// happens to emit, so there is no reason to expect a third profile to
-/// behave differently.
-///
-/// **When a texel's RGB channel and its alpha are *both* NaN, the two
-/// spellings can disagree on the result's NaN payload.** 0.92.0's doc
-/// comment claimed bit-exactness without qualification; that claim was
-/// false for exactly this case, which is why it is spelled out here
-/// instead of hedged. What is still guaranteed is that the result is *a*
-/// NaN carrying one of the two NaN operands' payloads, quieted — the pixel
-/// was already meaningless before and after, so this turns garbage into
-/// different garbage rather than corrupting a good pixel. What is *not*
-/// guaranteed is *which* operand's payload survives: `NaN × NaN` returns
-/// the quieted **first source operand** on x86, and which of `rgb` and
-/// `alpha` ends up "first" is an operand-order detail of whatever code
-/// LLVM emits. Neither IEEE 754 nor this source pins it down.
-///
-/// **Measured, because the shape of it is not what it looks like.** Per
-/// channel position, "which operand's payload survives" on `x86_64`
-/// (0.92.1, this sandbox, all 30 ordered pairs of six distinct NaN
-/// payloads, every texel of a full chunk):
-///
-/// | profile | this function | `premultiply_rgba` | agree? |
-/// |---|---|---|---|
-/// | `opt-level = 1` (the default test profile) | rgb, rgb, **alpha** | rgb, rgb, **alpha** | yes, bit-exact |
-/// | `opt-level = 3` (`--release`) | **alpha**, rgb, **alpha** | rgb, rgb, **alpha** | no — R diverges |
-///
-/// Three things worth reading off that table, none of them obvious. The
-/// divergence between the two paths is **release-only**: at the profile
-/// `cargo test` and `cargo nextest` actually use, they agree bit-for-bit
-/// even here. `premultiply_rgba` is **not** a scalar baseline that IEEE
-/// 754 pins — LLVM auto-vectorizes its loop too, and it already sources
-/// B's payload from `alpha` at every profile measured, so the divergence
-/// is between two *different* auto-vectorizations of the same arithmetic
-/// rather than between a vector path and a scalar one. And the choice
-/// varies by *channel position*, not by texel or by payload: LLVM
-/// vectorizes some of the three multiplies and leaves others alone, and
-/// which ones move with the optimizer.
-///
-/// `the_fused_serializer_agrees_on_a_double_nan_texel_up_to_the_payload_operand`
-/// below pins what survives all of that — the payload comes from one of
-/// the two operands and never from anywhere else, each channel position
-/// chooses consistently across every texel and every payload pair, and
-/// alpha passes through untouched — so a toolchain change that moved this
-/// somewhere else fails a test instead of passing silently. It
-/// deliberately does not assert *which* operand, since that is the part
-/// the table shows to be profile-dependent.
-///
-/// Reachability, stated rather than hand-waved: `aurora-io`'s 16-bit-float
-/// TIFF reader takes raw `f16` samples verbatim with no NaN filtering, so
-/// a malformed or adversarial file can construct this input directly. The
-/// consequence is bounded to the above.
-///
-/// The equivalence tests below pin all of this against
-/// `premultiply_rgba`, which is deliberately left in the obvious scalar
-/// spelling as the reference implementation, and which is `#[cfg(test)]`
-/// since 0.92.1 because that is now its only role.
-///
-/// **Why alpha is read from the source chunk, never from the narrowed
-/// buffer.** `premultiply_rgba` does not touch alpha at all, so its
-/// bits pass through untouched — and `f16 -> f32 -> f16` is *not* the
-/// identity for a signalling NaN, which the F16C widening quiets
-/// (`0x7c01` becomes `0x7e01`). Taking alpha from the round-tripped
-/// buffer would therefore silently change one class of input. It is
-/// copied straight from `chunk` instead.
-///
-/// **Parallelism, as of 0.96.0: done *within* a tile, still not done
-/// *across* tiles.** This function is now a thin wrapper — it sizes `out`
-/// and hands the work to [`write_premultiplied_le_bytes`], which splits one
-/// tile's texels into [`BLOCK_SAMPLES`]-sample blocks (64 of them for a
-/// whole tile) and converts them on `rayon` worker threads. `rayon` became
-/// a genuine runtime dependency of this crate in that round, PRD §8's own
-/// pre-decided choice for CPU tile parallelism. [`TileResidency::upload_mip`]
-/// inherits the parallelism for free, since it calls this function too.
+/// # Within a tile, still not across tiles
 ///
 /// Text before 0.96.0 said parallelizing "is NOT done" and gave two
 /// reasons: the new dependency, and [`TileResidency::sync`]'s reused
@@ -544,25 +688,104 @@ fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
 ///
 /// 1. `aurora_tile::TileStore::get` takes `&mut self`, and the type exposes
 ///    no `&self` tile accessor at all. A caller therefore cannot hold two
-///    tiles' texels at once, so there is nothing for a `par_iter` across
-///    tiles to iterate over.
+///    tiles' texels at once — not without first copying each tile out
+///    sequentially, which is exactly the per-tile half-megabyte copy 0.68.0
+///    removed, so the parallel gain would be paid for with the cost the
+///    whole path was restructured to avoid. (Through 0.96.0 this said
+///    "there is nothing for a `par_iter` across tiles to iterate over",
+///    which overstated it: a caller *could* build such a collection, just
+///    not for free.)
 /// 2. `TileStore` is `Send` but **not** `Sync` — its `BackgroundWriter`
 ///    holds an `mpsc::Receiver` — so the store cannot be shared with a
 ///    worker thread either.
 /// 3. [`TileResidency::sync`]'s `bytes_left` budget must decide *which*
 ///    tiles upload, in a fixed row-major order, before any of them is
-///    touched (two tests pin the resulting retry-on-a-later-call
-///    behaviour). Any across-tile scheme has to reproduce that ordering
-///    exactly, which is a redesign of the budget, not a `par_iter`.
+///    touched (three tests pin the resulting retry-on-a-later-call
+///    behaviour and its tile identities). Any across-tile scheme has to
+///    reproduce that ordering exactly, which is a redesign of the budget,
+///    not a `par_iter`.
 ///
 /// Block-level parallelism has none of those problems, touches no store
 /// bookkeeping and no budget logic, and gives *more* parallel width than
 /// the across-tile design would have: 64 blocks per tile against a measured
 /// mean of ~6.8 tiles per frame. PLAN.md's 0.96.0 entry carries the costed
-/// across-tile alternative that was considered and not taken this round,
-/// together with the round's own measured result.
+/// across-tile alternative that was considered and not taken, together with
+/// that round's measured result; its 0.96.1 entry carries the contended
+/// re-measurement and the pool bound that came out of it.
+fn split_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+    texels
+        .par_chunks(BLOCK_SAMPLES)
+        .zip(out.par_chunks_mut(BLOCK_SAMPLES * 2))
+        .for_each(|(block, bytes)| serialize_premultiplied_le_bytes(block, bytes));
+}
+
+/// Serializes `texels` into `out`, in parallel on `pool` when that is worth
+/// doing and sequentially inline otherwise. The whole parallel/sequential
+/// decision lives here, in one `match`, so both arms are reachable from one
+/// test.
 ///
-/// Same trailing-partial-chunk contract as `premultiply_rgba`: a slice
+/// `pool` is a parameter rather than a call to [`serializer_pool`] purely so
+/// that `the_serializer_falls_back_to_the_sequential_core_without_a_pool`
+/// can drive the `None` arm — the arm a machine that cannot spawn threads
+/// takes — with the identical dispatch a real frame uses.
+///
+/// **The size guard.** A `texels` no longer than one [`BLOCK_SAMPLES`]
+/// yields a single `par_chunks` block, so there is no parallel width to
+/// win; taking it inline skips `install`'s job injection and latch wait
+/// entirely. Real traffic: `sync` always passes a whole tile (64 blocks,
+/// parallel), and [`TileResidency::upload_mip`] passes 16 blocks at mip level 1,
+/// 4 at level 2 and exactly 1 at level 3 (which lands here). A *load*-
+/// sensing heuristic was considered for 0.96.1 and deliberately not built:
+/// there is no cheap, portable way to read "is this machine busy right now"
+/// from inside a frame — `getloadavg` is a 1-minute average and Linux-only
+/// in `std`'s absence, and a per-frame timing feedback loop is a design,
+/// not a patch. Bounding the pool ([`SERIALIZER_MAX_THREADS`]) plus honest
+/// disclosure of the residual contended regression was the accepted
+/// outcome; PLAN.md's 0.96.1 entry states it.
+fn write_premultiplied_le_bytes_on(
+    pool: Option<&rayon::ThreadPool>,
+    texels: &[f16],
+    out: &mut [u8],
+) {
+    match pool {
+        Some(pool) if texels.len() > BLOCK_SAMPLES => {
+            pool.install(|| split_premultiplied_le_bytes(texels, out));
+        }
+        _ => serialize_premultiplied_le_bytes(texels, out),
+    }
+}
+
+/// What every real upload path calls: [`write_premultiplied_le_bytes_on`]
+/// against the process's own [`serializer_pool`].
+fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+    write_premultiplied_le_bytes_on(serializer_pool(), texels, out);
+}
+
+/// Appends `texels` to `out` as the little-endian `f16` bytes
+/// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
+/// ([`premultiply_rgba`]'s arithmetic, applied per texel as the bytes are
+/// written rather than in a separate pass over a separate buffer).
+///
+/// **A thin `Vec`-sizing wrapper as of 0.96.0, and no longer on the frame
+/// path.** It resizes `out` to hold the whole-texel prefix and hands the
+/// actual work to [`write_premultiplied_le_bytes`]. Its only remaining
+/// caller is [`TileResidency::upload_mip`] (which has no call site in
+/// `aurora-app` yet — see that method's own doc for why what it writes is
+/// not currently visible); [`TileResidency::sync`] calls
+/// `write_premultiplied_le_bytes` directly, against a buffer it has already
+/// sized to exactly one tile and reuses.
+///
+/// **The substantive *why* is not here any more.** Through 0.96.0 this doc
+/// comment carried the 0.68.0 one-buffer history, the 0.88.1 measurement
+/// naming this loop rather than the bus, the 0.89.0 append batching, the
+/// `wide`-vs-`half` crate evaluation and the bit-exactness/NaN analysis —
+/// correct while this function *was* `sync`'s entry point and the hot loop,
+/// and stale the moment 0.96.0's split moved both elsewhere. 0.96.1 moved
+/// all of it onto [`serialize_premultiplied_le_bytes`], the function that
+/// now actually produces every upload byte. Read it there; this function
+/// contributes only the sizing below.
+///
+/// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.
 fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
@@ -1361,6 +1584,26 @@ impl TileResidency {
                 // failure above, and for the same reason: drop the slot
                 // mapping so the tile is retried instead of silently
                 // sticking as resident-but-never-uploaded.
+                //
+                // **This guard is defensive and, as of 0.96.1, provably
+                // unreachable through any current API, which is why it has
+                // no test** -- disclosed rather than left as a silent
+                // coverage gap. `aurora_tile::Tile`'s only non-blank
+                // constructor, `Tile::from_texels`, is `pub(crate)`, so no
+                // code outside `aurora-tile` (this crate and its tests
+                // included) can build a wrong-length tile at all;
+                // `Tile::blank()` is `SAMPLES` by construction and
+                // `texels_mut()` hands out a `&mut [f16]`, which cannot
+                // resize. Inside `aurora-tile`, both `from_texels` call
+                // sites are fed by `codec::decode`, whose own exact-length
+                // check `a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`
+                // pins. Kept anyway, because it is a length compare per
+                // tile against a half-megabyte memcpy: cheap insurance
+                // against a future `aurora-tile` change (a public
+                // `from_texels`, a variable tile size) reintroducing the
+                // possibility, and the cost of being wrong here is a
+                // corrupted upload of another tile's pixels rather than an
+                // error.
                 if tile.texels().len() != SAMPLES {
                     self.slots.remove(&slot);
                     tracing::warn!(
@@ -1539,8 +1782,10 @@ impl std::fmt::Debug for TileResidency {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SAMPLES, CHUNK_SAMPLES, CHUNK_TEXELS, TILE_BYTES, TileResidency,
-        extend_premultiplied_le_bytes, premultiply_rgba, write_premultiplied_le_bytes,
+        BLOCK_SAMPLES, CHUNK_SAMPLES, CHUNK_TEXELS, SERIALIZER_MAX_THREADS, TILE_BYTES,
+        TileResidency, build_serializer_pool, extend_premultiplied_le_bytes, premultiply_rgba,
+        serializer_pool, serializer_pool_threads, write_premultiplied_le_bytes,
+        write_premultiplied_le_bytes_on,
     };
     use crate::test_support::{real_context, real_tile_store};
     use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId};
@@ -3435,47 +3680,176 @@ mod tests {
     /// short trailing block safe without a length assertion, so it is
     /// checked rather than asserted in prose.
     ///
-    /// The fixture is deliberately shorter than one [`BLOCK_SAMPLES`] so
-    /// there is exactly one block and the arithmetic below is easy to read;
-    /// the property does not depend on that (earlier blocks stay aligned
-    /// either way).
+    /// Checked at **two** fixture sizes (0.96.1): one shorter than a single
+    /// [`BLOCK_SAMPLES`], which
+    /// [`write_premultiplied_le_bytes_on`]'s size guard runs inline with no
+    /// pool at all, and one spanning three blocks, which really does go
+    /// through the parallel splitter. Only the second exercises what the
+    /// mis-sizing actually threatens — a *short trailing* `par_chunks_mut`
+    /// chunk sitting after two full, correctly-offset ones — and through
+    /// 0.96.0 this test had only the first.
     #[test]
     fn the_parallel_serializer_tolerates_a_mis_sized_output_buffer() {
         const SENTINEL: u8 = 0xab;
-        let source = varied_fixture(CHUNK_SAMPLES * 2 + 12);
-        let expected = scalar_reference(&source);
-        let texels = source.len() / CHANNELS;
-        assert_eq!(expected.len(), texels * CHANNELS * 2);
+        let single = CHUNK_SAMPLES * 2 + 12;
+        let multi = BLOCK_SAMPLES * 2 + CHUNK_SAMPLES + 12;
+        assert!(single < BLOCK_SAMPLES, "the first fixture is one block");
         assert!(
-            source.len() < BLOCK_SAMPLES,
-            "this fixture is meant to be a single block"
+            multi > BLOCK_SAMPLES * 2,
+            "the second fixture spans more than two blocks, so the last \
+             par_chunks_mut chunk is the short one"
         );
 
-        // One byte short: the last texel has nowhere to go, so exactly
-        // `texels - 1` texels are written and nothing panics.
-        let mut short = vec![0u8; expected.len() - 1];
-        write_premultiplied_le_bytes(&source, &mut short);
-        let prefix = (texels - 1) * CHANNELS * 2;
-        assert_eq!(
-            short.get(..prefix),
-            expected.get(..prefix),
-            "a one-byte-short buffer must still receive every texel that fits"
-        );
+        for samples in [single, multi] {
+            let source = varied_fixture(samples);
+            let expected = scalar_reference(&source);
+            let texels = source.len() / CHANNELS;
+            assert_eq!(expected.len(), texels * CHANNELS * 2);
 
-        // One byte long: the extra byte falls in `chunks_exact_mut`'s
-        // remainder and must be left exactly as it was.
-        let mut long = vec![SENTINEL; expected.len() + 1];
-        write_premultiplied_le_bytes(&source, &mut long);
-        assert_eq!(
-            long.get(..expected.len()),
-            expected.get(..),
-            "a one-byte-long buffer must receive every texel"
+            // One byte short: the last texel has nowhere to go, so exactly
+            // `texels - 1` texels are written and nothing panics.
+            let mut short = vec![0u8; expected.len() - 1];
+            write_premultiplied_le_bytes(&source, &mut short);
+            let prefix = (texels - 1) * CHANNELS * 2;
+            assert_eq!(
+                short.get(..prefix),
+                expected.get(..prefix),
+                "a one-byte-short buffer must still receive every texel that \
+                 fits ({samples} samples)"
+            );
+
+            // One byte long: the extra byte falls in `chunks_exact_mut`'s
+            // remainder and must be left exactly as it was.
+            let mut long = vec![SENTINEL; expected.len() + 1];
+            write_premultiplied_le_bytes(&source, &mut long);
+            assert_eq!(
+                long.get(..expected.len()),
+                expected.get(..),
+                "a one-byte-long buffer must receive every texel ({samples} \
+                 samples)"
+            );
+            assert_eq!(
+                long.last(),
+                Some(&SENTINEL),
+                "the byte past the last whole texel must be untouched \
+                 ({samples} samples)"
+            );
+        }
+    }
+
+    /// **Issue 1's regression guard (0.96.1): the sequential fallback a
+    /// machine that cannot spawn threads takes is real, reachable, and
+    /// produces the same bytes.**
+    ///
+    /// 0.96.0 reached `rayon`'s *implicit global* pool, whose lazy
+    /// initializer `.expect()`s its own `ThreadPoolBuildError` — so under a
+    /// process/thread limit (`RLIMIT_NPROC`, a cgroup `pids.max`, systemd
+    /// `TasksMax`, memory pressure; reproduced with `ulimit -u`) the tile
+    /// upload path panicked inside `rayon`, which `panic = "abort"` turns
+    /// into `SIGABRT` on every frame including the default startup
+    /// document's.
+    ///
+    /// This drives that exact failure rather than mocking around it: a
+    /// `spawn_handler` that refuses with `ErrorKind::WouldBlock` — `errno`
+    /// 11, the same error the `ulimit -u` reproduction produced — makes
+    /// [`rayon::ThreadPoolBuilder::build`] return the real
+    /// `ThreadPoolBuildError`, `.ok()` collapses it to the `None` the
+    /// production code stores, and
+    /// [`write_premultiplied_le_bytes_on`] is then called with it: the same
+    /// single dispatch point a real frame goes through. The fixture is
+    /// deliberately longer than one `BLOCK_SAMPLES`, so a pool *would* have
+    /// been used had one built.
+    ///
+    /// Two things are asserted: it does not panic (reaching the final
+    /// assertion is that), and the fallback's bytes are byte-identical to
+    /// the scalar oracle — i.e. degrading to it costs correctness nothing.
+    #[test]
+    fn the_serializer_falls_back_to_the_sequential_core_without_a_pool() {
+        let failed = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .spawn_handler(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "simulated RLIMIT_NPROC exhaustion",
+                ))
+            })
+            .build();
+        let Err(err) = failed else {
+            // Not a failure of the code under test, so not an assertion:
+            // if some future rayon builds a pool despite a refusing spawn
+            // handler, there is nothing here to check.
+            return;
+        };
+        // Formatted rather than ignored so a failing run's log shows what
+        // rayon actually reported -- and so the test records that this is a
+        // *value* on the `Err` path, which is the whole fix, rather than the
+        // panic 0.96.0's global pool would have produced from the same
+        // condition.
+        let reported = format!("{err}");
+        assert!(
+            !reported.is_empty(),
+            "rayon must report a real ThreadPoolBuildError, not panic"
         );
-        assert_eq!(
-            long.last(),
-            Some(&SENTINEL),
-            "the byte past the last whole texel must be untouched"
+        let unavailable: Option<rayon::ThreadPool> = None;
+
+        let source = varied_fixture(BLOCK_SAMPLES * 3 + CHUNK_SAMPLES + 12);
+        assert!(
+            source.len() > BLOCK_SAMPLES,
+            "a pool would have been used if one had built"
         );
+        let mut fallback = vec![0u8; source.len() * 2];
+        write_premultiplied_le_bytes_on(unavailable.as_ref(), &source, &mut fallback);
+        assert_eq!(
+            fallback,
+            scalar_reference(&source),
+            "with no thread pool the serializer must still produce the \
+             sequential bytes rather than panicking or writing nothing"
+        );
+    }
+
+    /// The pool is **bounded** (0.96.1, Issue 2): `rayon`'s global default
+    /// takes every logical core, which measured as a 4-5× `upload_sync`
+    /// regression under 8 competing CPU-bound threads because
+    /// [`TileResidency::sync`] blocks the frame thread until the slowest
+    /// block finishes.
+    ///
+    /// Pinned here rather than argued: the worker count never exceeds
+    /// [`SERIALIZER_MAX_THREADS`], never exceeds the machine's own logical
+    /// core count, and is never 1 (a one-worker pool is pure handoff cost —
+    /// `install` blocks the caller instead of letting it join in). A
+    /// deliberate change to any of those should re-measure and edit this
+    /// test, which is the point of it.
+    #[test]
+    fn the_serializer_pool_is_bounded_well_below_a_machines_core_count() {
+        let threads = serializer_pool_threads();
+        assert!(
+            threads <= SERIALIZER_MAX_THREADS,
+            "{threads} workers exceeds the {SERIALIZER_MAX_THREADS}-worker cap"
+        );
+        assert_ne!(threads, 1, "a one-worker pool is pure overhead");
+        if let Ok(cores) = std::thread::available_parallelism() {
+            assert!(
+                threads < cores.get(),
+                "{threads} workers must leave headroom on a {cores}-core machine"
+            );
+        }
+        // 0 means "no pool, serialize inline" and must not build one.
+        assert!(
+            build_serializer_pool(0).is_none(),
+            "a zero-worker request must not produce a pool"
+        );
+        // And the real pool agrees with the size decision either way.
+        match serializer_pool() {
+            Some(pool) => assert_eq!(
+                pool.current_num_threads(),
+                threads,
+                "the built pool must have exactly the bounded worker count"
+            ),
+            None => assert_eq!(
+                threads, 0,
+                "no pool is only correct when no pool was asked for"
+            ),
+        }
     }
 
     /// **The budget/ordering characterization guard.** `sync`'s
@@ -3490,7 +3864,7 @@ mod tests {
     /// Added in 0.96.0 alongside the block-level parallelism, which
     /// deliberately does not touch this logic. Its real purpose is the
     /// *next* round: an across-tile parallelization (see
-    /// [`extend_premultiplied_le_bytes`]'s doc for why it is blocked today)
+    /// [`split_premultiplied_le_bytes`]'s doc for why it is blocked today)
     /// would have to reproduce this ordering exactly, and this test is what
     /// makes an accidental reordering a test failure instead of a silent
     /// behaviour change a user would see as tiles filling in from the wrong
@@ -3526,6 +3900,14 @@ mod tests {
         );
         assert_eq!(first.uploaded, 2);
         assert_eq!(first.errors, 0);
+        // The other half of "a two-tile budget uploaded the first two":
+        // the remaining two must be *reported* as still owed, not silently
+        // dropped. Added in 0.96.1 -- without it a `sync` that uploaded two
+        // tiles and forgot the rest would pass this test.
+        assert_eq!(
+            first.remaining, 2,
+            "the two tiles the budget skipped must be reported as remaining"
+        );
 
         let mut mapped: Vec<((u32, u32), TileId)> =
             residency.slots.iter().map(|(&s, &id)| (s, id)).collect();
