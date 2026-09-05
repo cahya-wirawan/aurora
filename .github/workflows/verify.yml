@@ -113,10 +113,21 @@ jobs:
       # units at the first failure and reports only the crates already in
       # flight, which reads exactly like a complete list and is not one.
       #
-      # This job is Linux-only, so doc comments *on* items gated to another OS
-      # (`App::handle_menu_event` is `#[cfg(target_os = "macos")]`) are still
-      # never checked anywhere. Extending this job to the same 3-OS matrix the
-      # `test` job uses is the named follow-on; see PLAN.md, 0.106.2.
+      # Two blind spots this step still has, both disclosed rather than fixed:
+      #
+      # 1. This job is Linux-only, so doc comments *on* items gated to another
+      #    OS (`App::handle_menu_event` is `#[cfg(target_os = "macos")]`) are
+      #    never checked anywhere. That is not hypothetical — 0.106.3 found and
+      #    fixed a real broken link inside macOS-gated
+      #    `detect_accessibility_preferences`, which this step cannot see.
+      #    Extending this job to the same 3-OS matrix the `test` job uses is the
+      #    named follow-on; see PLAN.md, 0.106.2/0.106.3.
+      # 2. Links *inside* `#[cfg(test)]` items are unchecked on every OS, so the
+      #    3-OS follow-on would not close this one. rustdoc runs without
+      #    `--cfg test`, so it never documents those items and never reads their
+      #    doc comments; `GpuBlendDispatch::ALL`'s `TRANSPOSE_COVERAGE` link is a
+      #    live instance. Adding `--cfg test` here would document the whole test
+      #    suite, so this is a known limit, not a pending fix.
       - name: rustdoc
         run: cargo doc --workspace --no-deps --all-features --document-private-items --keep-going
         env:

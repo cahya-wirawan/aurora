@@ -76,6 +76,23 @@ pub struct Stats {
     pub superseded_writes: u64,
 }
 
+/// One entry of [`TileStore::pending`]: the `write_generation` the bytes
+/// were submitted under, and the bytes themselves, shared with the
+/// queued [`WriteJob`] rather than copied into it.
+type PendingWrite = (u64, Arc<Vec<u8>>);
+
+/// The dirty rectangle [`TileStore::take_dirty`] reports for a tile that
+/// was dirty when an eviction took it out of `resident`: an eviction
+/// preserves only the *fact* that something was dirty (see
+/// `TileStore::evicted_dirty`), never which rectangle, so the whole tile
+/// is the only honest answer available.
+const WHOLE_TILE: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: TILE,
+    height: TILE,
+};
+
 /// A sparse, paging, LRU-bounded store of [`Tile`]s, addressed by
 /// `(SurfaceId, TileId)`.
 ///
@@ -135,23 +152,6 @@ pub struct Stats {
 /// result whose generation is not the one `pending` holds — before they
 /// look at whether it succeeded, so a superseded *failure* cannot enter
 /// the failed-write queue either. Counted in [`Stats::superseded_writes`].
-/// One entry of [`TileStore::pending`]: the `write_generation` the bytes
-/// were submitted under, and the bytes themselves, shared with the
-/// queued [`WriteJob`] rather than copied into it.
-type PendingWrite = (u64, Arc<Vec<u8>>);
-
-/// The dirty rectangle [`TileStore::take_dirty`] reports for a tile that
-/// was dirty when an eviction took it out of `resident`: an eviction
-/// preserves only the *fact* that something was dirty (see
-/// `TileStore::evicted_dirty`), never which rectangle, so the whole tile
-/// is the only honest answer available.
-const WHOLE_TILE: Rect = Rect {
-    x: 0,
-    y: 0,
-    width: TILE,
-    height: TILE,
-};
-
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -167,7 +167,7 @@ pub struct TileStore {
     /// allowed to act on this entry if it carries the same number: an
     /// older job for the same key, superseded by a later eviction, must
     /// not clear (or record a failure against) bytes that are not its
-    /// own — see this type's own "Stale-write race, closed" note.
+    /// own — see [`TileStore`]'s own "Stale-write race, closed" note.
     ///
     /// The bytes are an `Arc<Vec<u8>>` shared with the queued
     /// [`WriteJob`], not a copy of it: both holders are read-only, and

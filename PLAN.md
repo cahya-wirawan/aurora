@@ -25170,16 +25170,30 @@ before and after; the diff is doc-comment lines only, with no
 `#![allow(rustdoc::broken_intra_doc_links)]` and no per-item `allow`
 anywhere in it.
 
-*A methodological trap worth recording, since it is what hid the other 12
-links from two separate scouting passes:* **`cargo doc` stops spawning new
-units after the first failure**, so a plain workspace run reports only the
-crates already in flight — here `aurora-io`, `aurora-widgets` and
-`aurora-app`, which reads exactly like a complete list. Adding
-`--keep-going` turned those 3 crates into 6 and the 11 links into 21.
-Worse, a *second* run looks like confirmation while proving nothing: the
-crates that succeeded are cached and never re-documented, so their doc
-comments are not re-checked at all. Any future claim about this command
-needs `--keep-going` **and** cleared doc fingerprints
+*A methodological trap worth recording — and its own numbers were wrong as
+first written, corrected here in 0.106.3 after re-measuring against the
+parent commit in a clean worktree:* **`cargo doc` stops spawning new units
+after the first failure**, so a plain workspace run reports only the crates
+already in flight. Measured on 5a1b29b with doc fingerprints cleared, that
+run reports **3 links in `aurora-tile` alone** and stops — which reads
+exactly like a complete list and understates the workspace by 18.
+`--keep-going` on the same commit reports the real **21 links across 6
+crates** (`aurora-app` 9, `aurora-gpu` 6, `aurora-tile` 3, and one each in
+`aurora-io`, `aurora-render`, `aurora-widgets`). This paragraph originally
+claimed the flagless run named `aurora-io`/`aurora-widgets`/`aurora-app`
+and 11 links, and that `--keep-going` was what hid "the other 12"; both
+are wrong. **These are two distinct mechanisms that overlap rather than
+compose**, and neither alone explains the gap: the `-p aurora-app` scoping
+above hid the 12 links outside `aurora-app` (that is where "9 in one crate"
+came from), while a missing `--keep-going` on a *workspace* run hides 18 of
+21 — a different, larger, differently-composed set. Worse, the crate set a
+flagless run names is not even stable, which is how the wrong list got
+recorded in the first place: a *second* run looks like confirmation while
+proving nothing, because the crates that succeeded are cached and never
+re-documented, so their doc comments are not re-checked at all — leaving
+only the crates that *failed*, and so were never cached, to report. Any
+future claim about this command needs `--keep-going` **and** cleared doc
+fingerprints
 (`target/debug/.fingerprint/aurora-*` dirs containing a `doc-*` file —
 deleting only those forces re-documentation without invalidating any
 compile artifact).
@@ -25249,6 +25263,35 @@ its own doc comment would go uncaught on all three legs. Extending `docs`
 to the same 3-OS matrix `test` uses is the named follow-on, and that one
 genuinely does need a run on hardware this round did not have. **Not
 verified: macOS, Windows.**
+
+**0.106.3 found that gap was not hypothetical, and adds a second one the
+3-OS follow-on will not close either.** The macOS-gated
+`detect_accessibility_preferences` carried exactly the predicted defect —
+`[`AccessibilityPreferences::default`]`, a type aurora-app never imports —
+twelve lines below a line in the *same* doc comment that already spelled it
+`aurora_theme::AccessibilityPreferences` correctly. So 0.106.2's "all 21,
+every site got a real fix" was true of what Linux rustdoc can see and false
+of the workspace: a 22nd site existed, invisible to the job that round
+adopted, and it would have turned the 3-OS follow-on red on its first run.
+Confirmed broken by relocating the link verbatim into a Linux-visible
+overload (`error: no item named `AccessibilityPreferences` in scope`),
+fixed, and the other 7 macOS-gated sites in `aurora-app/src/lib.rs`
+re-checked by hand — their links all target non-gated crate-root items
+(`activate_command`, `logical_point`, `RailResize`, `open_dialog`,
+`handle_key`, `App::about_to_wait`), so they resolve on every OS. Every
+other platform gate in the workspace is `#[cfg(unix)]`, which Linux already
+covers, so macOS is the only blind platform.
+
+*The second blind spot: links **inside** `#[cfg(test)]` items.* Rustdoc
+without `--cfg test` never documents such an item, so it never reads its
+doc comment either — and no OS matrix changes that. `aurora-app/src/lib.rs`
+has a live instance at `GpuBlendDispatch::ALL`'s doc comment, whose
+`[`TRANSPOSE_COVERAGE`]` names a `mod tests` item from crate-root scope and
+therefore cannot resolve in *any* configuration that checks it. It is left
+alone deliberately: it sits inside the `GpuBlendDispatch` family this
+correction round was scoped out of touching. Note this is the mirror image
+of the `#[cfg(test)]` demotions above — those were links *to* test-only
+items *from* documented ones, which is why rustdoc caught them.
 
 **Addendum 2026-09-04 (0.103.0) — the five GPU-admitted non-`Normal`
 blend modes now all have genuine dispatch proof, through one shared
