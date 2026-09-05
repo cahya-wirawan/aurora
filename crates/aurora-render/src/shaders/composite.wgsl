@@ -244,13 +244,13 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 //      written once and shared by all ten entry points. (A backend is
 //      still free to inline it per call site, so per-entry-point *machine
 //      code* is not ruled out -- but the source-level independence the
-//      comments leaned on is gone, and the measured 3-of-9 kill above is
+//      comments leaned on is gone, and the measured 4-of-10 kill above is
 //      the direct evidence.)
 //
 // Those suite-header comments in `composite.rs` were corrected in 0.109.1
 // and carry the specific sites; the per-test doc comments there carry a
-// one-line back-reference to here rather than repeating this. Only 3 of
-// the 9 kept transparent-backdrop tests can currently detect the guard's
+// one-line back-reference to here rather than repeating this. Only 4 of
+// the 10 kept transparent-backdrop tests can currently detect the guard's
 // removal at all -- see the `straight_backdrop()` comment above, and
 // PLAN.md's 0.109.0 entry for why.
 //

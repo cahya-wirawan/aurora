@@ -7072,12 +7072,15 @@ fn composite_roots_into_tile(
 ///   **Two degeneracies, both verified algebraically:**
 ///   `Overlay(0.5, Cs) = Cs` (a backdrop channel at exactly `0.5` is
 ///   `Normal`), and `Overlay(Cb, 0.5) = Cb` for **every** `Cb` (a *source*
-///   channel at exactly `0.5` makes this mode a total no-op). The second is
-///   why `NORMAL_MULTIPLY_OVERLAY_STACK` is the first sibling fixture in
-///   this crate not built on a `Multiply` layer at opacity `0.5`: that
-///   value would have driven every backdrop channel to or below `0.5` *and*
-///   landed on the `Normal`-degenerate case, leaving the high arm
-///   unreachable.
+///   channel at exactly `0.5` makes this mode a total no-op). Together with
+///   the branch on `Cb <= 0.5` they are why
+///   `NORMAL_MULTIPLY_OVERLAY_STACK` is the first sibling fixture in this
+///   crate not built on a `Multiply` layer of `0.5` grey — its `l2` colour is
+///   `0.75` grey instead, its *opacity* being `1.0` exactly as every
+///   sibling's is. A `0.5`-grey `Multiply` would have halved the accumulator,
+///   driving every backdrop channel to or below `0.5`, leaving the high arm
+///   unreachable and every channel crowding the `Normal`-degenerate
+///   boundary.
 ///
 ///   **The `HardLight` collision rule**, which every fixture here is chosen
 ///   against: `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two agree
@@ -7550,7 +7553,7 @@ fn accumulator_or_create<'slot>(
 /// lets one call site serve both builds without a `#[cfg]` at the call
 /// site itself.
 ///
-/// The variants are exactly the ten modes
+/// The variants are exactly the eleven modes
 /// [`document_qualifies_for_gpu_compositing`] admits *other than*
 /// `Normal`, which is deliberately absent: the `Normal` arm is shared by
 /// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
@@ -7559,7 +7562,7 @@ fn accumulator_or_create<'slot>(
 /// call site and why it is where it is.
 ///
 /// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
-/// consequence of 0.103.1 rather than an inconsistency.** The other nine
+/// consequence of 0.103.1 rather than an inconsistency.** The other ten
 /// are named by real dispatch arms that exist in both builds, so they are
 /// constructed in both. `Dissolve` has no arm; the only thing that ever
 /// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
@@ -7719,9 +7722,11 @@ impl GpuBlendDispatch {
 ///   `NORMAL_MULTIPLY_OVERLAY_STACK`, is the first in this list chosen for a
 ///   property of its *operand pairs* rather than only its opacity: all three
 ///   channels straddle. That fixture is also the first here **not** built on
-///   a `Multiply` layer at opacity `0.5`, because `0.5` is exactly this
-///   mode's own no-op value on the source side and drives every backdrop
-///   channel to or below `0.5` on the other. Its round also confirmed the
+///   a `Multiply` layer of `0.5` grey — its `l2` colour is `0.75` grey, its
+///   opacity `1.0` like every sibling's — because `0.5` is exactly this
+///   mode's own no-op value on the source side, and a `0.5`-grey `Multiply`
+///   drives every backdrop channel to or below `0.5` on the other. Its round
+///   also confirmed the
 ///   `<=` → `<` mutation is unkillable in principle (the two arms are
 ///   bit-identical at `Cb == 0.5`), which is disclosed rather than tested
 ///   around.
@@ -29850,11 +29855,12 @@ mod tests {
     /// `..._agree_on_an_overlay_blend_document`'s three-layer fixture
     /// (0.110.0). Golden `(0.5703125, 0.46875, 0.2578125, 1.0)`.
     ///
-    /// **`l2` is a `Multiply` layer at opacity `1.0`, not `0.5`, and that
-    /// breaks the pattern every sibling fixture above follows — on purpose,
-    /// and it is the one thing about this const not to "normalise".** A
-    /// `Multiply` at `0.5` halves the accumulator, which for this mode is
-    /// not a cosmetic change but a *structural* one, twice over:
+    /// **`l2` is a `Multiply` layer of `0.75` grey, not the `0.5` grey every
+    /// sibling fixture above uses, and that colour is the one thing about this
+    /// const not to "normalise".** (Its *opacity* is `1.0`, exactly as every
+    /// sibling's `l2` opacity is — the departure here is the colour, not the
+    /// opacity.) A `0.5`-grey `Multiply` halves the accumulator, which for
+    /// this mode is not a cosmetic change but a *structural* one, twice over:
     ///
     ///   1. `Overlay` branches on `Cb <= 0.5`, so a halved backdrop puts
     ///      every channel on or below the boundary and the high
@@ -30037,8 +30043,11 @@ mod tests {
     /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
     /// dispatch arm's `src`/`backdrop` arguments survived the entire test
     /// suite, and both times the only thing that found it was a human
-    /// performing the mutation and re-running everything. Sixteen modes
-    /// are still to be ported on the same template, so the class needs a
+    /// performing the mutation and re-running everything. Fifteen modes
+    /// are still to be ported on the same template — sixteen
+    /// `aurora_render::BlendMode` variants lack a blend-math WGSL entry
+    /// point, but `Normal` is among them and needs none, compositing through
+    /// a separate fixed-function path — so the class needs a
     /// standing check rather than a third discovery. (It earned its keep
     /// immediately: `LinearBurn`, 0.106.0, was the first mode ported
     /// since, and this guard is what made its fixture's non-unit opacity a
@@ -32151,8 +32160,9 @@ mod tests {
     /// `(0.5703125, 0.46875, 0.2578125, 1.0)`.
     ///
     /// **Both arms fire in this one draw**, which is what
-    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s unusual `l2` opacity of `1.0` (not
-    /// the `0.5` every sibling fixture uses) is *for* — see that const. No
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s unusual `l2` *colour* of `0.75`
+    /// grey (not the `0.5` grey every sibling fixture uses; its opacity is
+    /// `1.0`, the same as every sibling's) is *for* — see that const. No
     /// channel of either operand is `0.5`, this mode's own no-op value on the
     /// source side and its `Normal`-degenerate value on the backdrop side;
     /// no channel has `Cb == Cs`; and **all three channels straddle `0.5`**,

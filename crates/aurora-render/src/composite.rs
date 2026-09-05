@@ -2956,11 +2956,19 @@ impl TileCompositor {
     /// `Cb` (a *source* channel at exactly `0.5` makes this mode a total
     /// no-op — both arms give it: `0.5 * 2*Cb = Cb`, and
     /// `0.5 + t - 0.5*t = 0.5 + 0.5*(2*Cb - 1) = Cb`). The second is why no
-    /// solid-colour fixture in this crate's `composite_overlay_*` tests, and
-    /// no layer of `aurora-app`'s `NORMAL_MULTIPLY_OVERLAY_STACK`, uses `0.5`
-    /// in any channel — a `Multiply` layer at opacity `0.5`, which every
-    /// prior sibling fixture in that crate uses, would have produced exactly
-    /// that.
+    /// solid-colour fixture in this crate's `composite_overlay_*` tests uses
+    /// `0.5` in any channel, and why in `aurora-app`'s
+    /// `NORMAL_MULTIPLY_OVERLAY_STACK` **neither operand of the actual blend**
+    /// has a channel at exactly `0.5`: `Cb = (0.65625, 0.375, 0.1875)` after
+    /// the `Multiply` fold, against `Cs = (0.25, 0.75, 0.875)`. That — not "no
+    /// raw fixture literal is `0.5`" — is the invariant: `l1`'s green literal
+    /// *is* `0.5`, and is harmless only because the fold carries it to
+    /// `0.75 * 0.5 = 0.375`. What that fixture departs from is the sibling
+    /// `Multiply` layer's *colour*, using `0.75` grey where every prior
+    /// sibling in that crate uses `0.5` grey (the opacity is `1.0` either
+    /// way). A `0.5`-grey `Multiply` would have halved the accumulator
+    /// instead, putting every backdrop channel on or below the branch
+    /// boundary and leaving the high arm unreachable.
     ///
     /// **The `HardLight` collision rule.**
     /// `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two modes agree exactly
@@ -14329,10 +14337,14 @@ mod tests {
     //      `0.5 + t - 0.5*t = 0.5 + 0.5*(2*Cb - 1) = Cb`. This is the
     //      easiest degeneracy here to hit by accident and it erases the
     //      source outright, so **no solid-colour fixture below uses `0.5` in
-    //      any channel of either operand** -- and it is why `aurora-app`'s
-    //      `NORMAL_MULTIPLY_OVERLAY_STACK` is the first sibling fixture in
-    //      that crate not built on a `Multiply` layer at opacity `0.5`,
-    //      which would have produced exactly that.
+    //      any channel of either operand** -- and it is part of why
+    //      `aurora-app`'s `NORMAL_MULTIPLY_OVERLAY_STACK` is the first
+    //      sibling fixture in that crate whose `Multiply` layer is `0.75`
+    //      grey rather than the sibling-standard `0.5` grey (its *opacity* is
+    //      `1.0` there, exactly as every sibling's is -- the departure is the
+    //      colour, not the opacity). A `0.5`-grey `Multiply` halves the
+    //      accumulator, which for that fixture's `l1` leaves every backdrop
+    //      channel at or below the branch boundary.
     //   3. `Overlay(0, Cs) = 0` and `Overlay(1, Cs) = 1` -- a black or white
     //      backdrop channel erases the source, exactly as `Multiply` and
     //      `Screen` do at those points. The solid-colour fixtures keep every

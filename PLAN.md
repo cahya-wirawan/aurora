@@ -19602,6 +19602,103 @@ severity choice.
   `aurora-render` error, and fixing it would put a shader file into a diff
   that is otherwise comment-and-test-only in `aurora-app`.
 
+- [x] **0.110.0's own prose corrected — five review findings, zero logic
+  changed — done 2026-09-05 (0.110.1).** Independent Critic and Red-team
+  passes both re-derived every formula, golden, mutation result and plumbing
+  detail of 0.110.0 and found the **shipped code fully correct** (the Red-team
+  swept all 15,361 `f16`-representable values to confirm mutation (j) really is
+  unkillable, and cross-checked all six NaN-laundering modes individually). All
+  five confirmed findings were in the round's *prose*. This commit touches only
+  doc comments, WGSL comments and this file — no WGSL logic, no Rust logic, no
+  assertion values, no fixture field values, no helper bodies. Test counts are
+  unchanged by construction (`aurora-render` **191**, `aurora-app` **404**, 0
+  failed, zero `SKIPPED` under `AURORA_REQUIRE_GPU=1`).
+
+  1. **A self-contradicting detector count inside one file.** 0.110.0 updated
+     `shaders/composite.wgsl` to say `Overlay` joins the un-premultiply
+     guard's detectors — "four tests, not ten … fails exactly four of the ten
+     per-mode transparent-backdrop tests" — but **two sites in that same file**
+     kept the pre-`Overlay` figure: "the measured 3-of-9 kill **above**", whose
+     "above" points at the paragraph that now says 4-of-10, and "Only 3 of the
+     9 kept transparent-backdrop tests can currently detect the guard's
+     removal at all". Both now read 4-of-10 / 4 of the 10. (PLAN.md's own
+     0.109.0 addendum still says 3-of-9 / 6-of-9 and is left alone: that is a
+     correctly-scoped historical statement about a round in which `Overlay` did
+     not exist.)
+  2. **Six sites misidentified `NORMAL_MULTIPLY_OVERLAY_STACK`'s load-bearing
+     property, and this was the substantive finding.** All six said its `l2` is
+     unusual for sitting at *opacity* `1.0` "as against the `0.5` every sibling
+     uses". **That is false, and was checked against every sibling rather than
+     assumed:** `MIXED_NORMAL_AND_MULTIPLY_STACK` and
+     `NORMAL_MULTIPLY_{LIGHTEN,SCREEN,DIFFERENCE,LINEAR_DODGE,LINEAR_BURN,
+     COLOR_BURN,COLOR_DODGE}_STACK` all have `l2` at opacity `1.0` too. What is
+     actually unusual is its **colour**: `[0.75, 0.75, 0.75, 1.0]` where every
+     sibling uses `[0.5, 0.5, 0.5, 1.0]`. The physics was re-derived rather
+     than taken on trust: at the sibling colour, red is `0.875 * 0.5 = 0.4375
+     <= 0.5`, so `Overlay`'s high (`Screen`-form) arm is **unreachable** — the
+     exact coverage loss this fixture exists to avoid; at `0.75` it is
+     `0.875 * 0.75 = 0.65625 > 0.5` and the arm fires. Corrected at all six
+     `.rs` sites (`aurora-app`'s fixture const, app integration test doc,
+     predicate bullet and `GpuBlendDispatch` history bullet; `aurora-render`'s
+     wrapper doc and `composite_overlay_*` suite header) **plus a seventh in
+     this file's own 0.110.0 entry**, which had the same error and which the
+     review brief had not counted.
+  3. **A related invariant that was checking the wrong thing.**
+     `aurora-render`'s wrapper doc claimed "no layer of `aurora-app`'s
+     `NORMAL_MULTIPLY_OVERLAY_STACK` uses `0.5` in any channel". False on its
+     face — `l1`'s green literal **is** `0.5` (`[0.875, 0.5, 0.25, 1.0]`). It
+     is harmless only because the `Multiply` fold carries it to
+     `0.75 * 0.5 = 0.375`, which is the point: the invariant that matters is
+     about the *blend's operands*, not the fixture's raw literals. Restated as
+     "neither operand of the actual blend has a channel at exactly `0.5`:
+     `Cb = (0.65625, 0.375, 0.1875)` after the fold, against
+     `Cs = (0.25, 0.75, 0.875)`", with the `l1`-green case named explicitly so
+     the weaker claim cannot come back.
+  4. **Two stale counts in `GpuBlendDispatch`'s doc, recounted from the source
+     rather than incremented.** `document_qualifies_for_gpu_compositing` admits
+     **twelve** modes (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`,
+     `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
+     `Overlay`, `Dissolve`), so "the variants are exactly the **ten** modes it
+     admits other than `Normal`" → **eleven**, matching the enum's eleven
+     variants; and "the other **nine** are named by real dispatch arms that
+     exist in both builds" → **ten**, `Dissolve` still being the one
+     `cfg(test)` variant.
+  5. **One stale count that silently conflated two denominators.** The standing
+     transpose guard's doc said "**Sixteen** modes are still to be ported on
+     the same template". Sixteen is the `aurora-render`-side figure (26
+     `BlendMode` variants − 10 with a blend-math WGSL entry point) and it
+     includes `Normal`, which needs no blend-math port at all — it composites
+     through a separate fixed-function path, a distinction `composite.rs`
+     already explains at length. The number actually awaiting a port is
+     **fifteen**, now stated with the sixteen-vs-fifteen difference spelled out
+     inline so the two figures stop being confusable.
+
+  **The h″ control run is no longer describable as green, and that is the one
+  finding that changes what a reader should conclude.** 0.110.0's mutation
+  matrix used h″ (fixture opacity `1.0`, *no* transpose) to isolate h′'s
+  failure to the transpose rather than to the opacity change. The Red-team
+  reproduced it and it does **not** come back clean: it has exactly **two**
+  failures, both expected and both unrelated to the transpose — the standing
+  guard
+  `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`,
+  which demands non-unit fixture opacity and so
+  *correctly* rejects `1.0` (the guard working, not a defect), and the app
+  integration test's hardcoded absolute golden, which is pinned to opacity
+  `0.5` and cannot match at `1.0`. The row already named both, but its framing
+  invited "the control was green"; it now says outright that the control is
+  **not** a green run, and that what isolates causation is the **GPU-vs-CPU
+  differential assertion** and not the golden — the differential passed in the
+  control and fails only once the transpose is also applied. The isolation
+  logic survives intact; only its wording was load-bearing.
+
+  **Not fixed, and named rather than left silent.** `CLAUDE.md`'s status
+  paragraph still carries the pre-`Overlay` figures ("16 of 27 … 17 of 26",
+  "3 of the 9 modes' tests") and a `0.106.1` version string, so it is stale for
+  0.107.0 through 0.110.1 as a whole rather than for this round specifically.
+  That is a separate sync commit of the kind `1c62bed` already is, not a
+  0.110.1 prose fix, and folding it in would have put an unrelated rewrite into
+  an otherwise strictly-scoped diff.
+
 - [x] **`Overlay` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.110.0).** The tenth
   real blend-math mode on the GPU, and a **third shader shape**: not one
@@ -19726,10 +19823,14 @@ severity choice.
 
   **One fixture broke the pattern every sibling follows, and that is the
   round's most consequential single decision.**
-  `NORMAL_MULTIPLY_OVERLAY_STACK`'s `l2` is a `Multiply` layer at opacity
-  **`1.0`**, where `NORMAL_MULTIPLY_{LIGHTEN,SCREEN,DIFFERENCE,LINEAR_*,
-  COLOR_*}_STACK` all use `0.5`. Copying the sibling would have been wrong
-  twice over: halving the accumulator drives every backdrop channel to or
+  `NORMAL_MULTIPLY_OVERLAY_STACK`'s `l2` is a `Multiply` layer of **`0.75`
+  grey**, where `NORMAL_MULTIPLY_{LIGHTEN,SCREEN,DIFFERENCE,LINEAR_*,
+  COLOR_*}_STACK` all use `0.5` grey. **The departure is the colour, not the
+  opacity** — that `l2` sits at opacity `1.0`, exactly as every one of those
+  siblings' `l2` does; 0.110.0's own prose misattributed this to opacity at
+  seven sites and 0.110.1 corrected all of them. Copying the sibling colour
+  would have been wrong twice over: halving the accumulator drives every
+  backdrop channel to or
   below `0.5`, which (a) makes the high (`Screen`-form) arm **unreachable**,
   so the fixture would exercise one arm and silently pass a shader that got
   the other wrong, and (b) lands on degeneracy 1, the `Normal`-degenerate
@@ -19818,7 +19919,7 @@ severity choice.
   | g | `fragment_entry` points at `fs_composite_screen` | all `composite_overlay` tests | **killed, 8 tests** — all 7 render + the app differential |
   | h | transpose `src`/`backdrop` in the dispatch arm, at the fixture's real opacity `0.5` | killed | **killed, 1 test** — measured `(0.2890625, 0.71875, 0.8359375, 1.0)` against the golden `(0.5703125, 0.46875, 0.2578125, 1.0)`, **exactly** the independent exact-rational prediction, all three channels |
   | h′ | the same transpose at opacity `1.0` | killed anyway (conditional asymmetry, all channels straddle) | **killed** — measured `(0.328125, 0.6875, 0.796875, 1.0)` against the correct-at-`1.0` `(0.484375, 0.5625, 0.328125, 1.0)`, again exactly as derived, all three channels, with the fold contributing nothing at all |
-  | h″ | opacity `1.0` **without** the transpose — the control for h′ | GPU/CPU differential green, absolute golden fails | **exactly that**: the differential passed (both paths reached `(0.484375, 0.5625, 0.328125, 1.0)`) and only the golden and the standing guard failed. Without this control, h′ could not be attributed to the transpose rather than to the opacity change |
+  | h″ | opacity `1.0` **without** the transpose — the control for h′ | GPU/CPU differential green; the absolute golden and the standing transpose guard both fail | **exactly that. This control is deliberately *not* a green run, and must not be quoted as one**: it has exactly **two** failures, both expected and both unrelated to the transpose — (1) `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, which demands non-unit fixture opacity and so *correctly* rejects `1.0` (the guard doing its job, not a defect), and (2) the app integration test's hardcoded absolute golden, which is pinned to opacity `0.5` and cannot match at `1.0`. What isolates causation is the **GPU-vs-CPU differential assertion**, not the golden: the differential stayed green here (both paths reached `(0.484375, 0.5625, 0.328125, 1.0)`) and fails **only** once the transpose is also applied (h′). Without that split, h′ could not be attributed to the transpose rather than to the opacity change |
   | i | delete `straight_backdrop`'s `ab > 0.0` guard entirely | **killed** by render 6 — `Overlay` has no `min`/`max` to launder the `NaN`, unlike the six laundering modes | **killed, exactly 1 test** — render 6, whose readback was literally `(NaN, NaN, NaN, 1.0)`. The other six render tests and the app golden stayed green (their backdrops are all opaque, so no `ab == 0` texel exists). **`Overlay` is a fourth detector of this guard's removal**, joining `Multiply`, `Screen` and `Difference`, and the first of the four whose detection was predicted from the formula rather than found by running the sweep |
   | j | flip `<=` to `<` in the `select()` condition | **survives** (unkillable in principle) | **survived all 191 render + 404 app tests**, as predicted and as disclosed at six sites |
   | k | omit the `TRANSPOSE_COVERAGE` row | killed by the standing guard | **killed, 1 test** — `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` |
