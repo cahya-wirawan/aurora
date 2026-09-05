@@ -16217,6 +16217,86 @@ severity choice.
     reverting the arm to `continue`, which fails it on the residue
     assertion.
 
+  **Addendum 2026-09-05 (0.115.2) — `forget_tile`'s own doc comment
+  described an orphaned scratch file as an accepted trade-off; CI found
+  it was worse than that, and it is now closed.** `forget_tile`
+  deletes a tile's scratch file *if one already exists*, but a real
+  eviction's background write can still be genuinely in flight at the
+  moment a tile is forgotten — `forget_tile` never waits for it, by
+  design (that is what keeps eviction non-blocking) — and until this
+  round, that write's eventual completion drained into
+  `reconcile_pending`/`TileStore::flush` as an ordinary, unremarkable
+  success: `pending`'s entry for the key was already gone (`forget_tile`
+  cleared it), so `is_superseded` saw an absent key rather than a
+  mismatched generation and correctly did *not* treat it as superseded
+  — it isn't, in that check's sense — and the write's file was left
+  sitting on disk with no key in any map able to name it. `github
+  actions` caught this for real:
+  `aurora-tile::store::tests::forget_surface_drops_every_tile_of_that_surface_from_every_place_it_can_live`
+  failed on a CI runner slow (or differently scheduled) enough for the
+  write to land *after* the test's own `!path.exists()` assertion ran,
+  something this session's own local hardware never reproduced in many
+  runs — timing-dependent in exactly the way the doc comment predicted,
+  which is a real defect and not the flaky-test-shrug it can look like.
+
+  **Fixed by giving `forget_tile` a tombstone, not by making it wait.**
+  A new `TileStore::forgotten_while_pending` set records a key
+  `forget_tile` discarded while it was still genuinely in `pending`
+  (checked before `forget_pending` clears that entry). A new shared
+  prologue, `discard_if_forgotten_while_pending` — placed immediately
+  after `drop_if_superseded` at both drain sites, `reconcile_pending`
+  and `flush`, the same placement for the same reason that method's own
+  doc comment already argues for — removes the tombstone when that
+  write's result finally arrives and, on an `Ok` outcome only, deletes
+  the file it just produced instead of letting `reconcile_pending`
+  treat it as an ordinary success. An `Err` outcome removes the
+  tombstone and stops there: nothing landed, so there is nothing to
+  delete, and `retain_failed_write` keeping that failure's bytes alive
+  would be a real memory cost paid for a tile nothing reads any more.
+
+  **Deliberately a second, disjoint set rather than a weakened
+  `is_superseded`.** Folding "absent from `pending`" into
+  "superseded" was tried in an earlier round and rejected for a
+  different, real reason still on record —
+  `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`'s
+  own doc comment — and that reason still applies: `ensure_resident`'s
+  revisit branch also clears `pending` for an absent-afterward key, and
+  a write that then fails for *that* key must still be reported, not
+  silently treated as moot. `forgotten_while_pending` only ever gains
+  an entry from `forget_tile`, never from `ensure_resident`, so the two
+  "key not in `pending`" cases stay distinguishable by which set (if
+  any) claims the key, not by weakening one shared check to mean both.
+
+  **The flaky test is now fixed two ways, not one, and the two prove
+  different things.** A `store.flush()` was added right after
+  `forget_surface` in the pre-existing test (previously present only in
+  the `evict_and_flush == true` branch, before the sweep) — this forces
+  any write still in flight for a doomed key to complete and drain
+  through the new tombstone path before the assertions run, so the
+  test is deterministic rather than merely usually passing. Separately,
+  a new test,
+  `forget_tile_deletes_the_file_a_write_still_in_flight_at_forget_time_later_produces`,
+  reproduces the exact race with no eviction, no background thread and
+  no timing at all: it hand-inserts a `pending` entry, calls
+  `forget_tile`, and only *then* submits the `WriteJob` that write would
+  have been — proving the fix by construction rather than by hoping a
+  scheduler cooperates. **Mutation-tested for real**: removing both
+  `discard_if_forgotten_while_pending` call sites left the new
+  deterministic test failing on exactly the assertion this round's
+  finding predicted ("a write that lands after its tile was forgotten
+  must not leave the file behind"), while the pre-existing timing-
+  dependent test stayed green throughout on this hardware — the same
+  asymmetry that let the original bug ship for five rounds (0.80.0
+  through this one) without a local run ever catching it.
+
+  Full local gate green: `cargo test -p aurora-tile` (74/74, including
+  both tests above), `cargo clippy -p aurora-tile --all-targets
+  --all-features -- -D warnings` (clean), `cargo check --workspace
+  --locked`, `cargo fmt --all --check`. No shader, dispatch, predicate,
+  or blend-mode code touched — this crate sits two layers below
+  `aurora-render`/`aurora-app` in the layering graph and the fix does
+  not cross it.
+
   **0.82.2 — the Judge's one substantive finding: deferring the clear
   removes a failure-path cost 0.82.1 accepted rather than needed to.**
   0.82.1's arm called `forget_tile` inline, in the same loop iteration

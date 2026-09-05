@@ -186,6 +186,47 @@ pub struct TileStore {
     /// only surviving copy) and nothing else would ever drop it, which is
     /// exactly why this queue and its cap exist.
     failed_writes: VecDeque<(SurfaceId, TileId)>,
+    /// Keys [`Self::forget_tile`] discarded while their eviction's
+    /// background write was still genuinely in flight — a real race,
+    /// not a hypothetical one, since `forget_tile` never waits for it.
+    /// Without this set, that write lands on disk *after* `forget_tile`
+    /// already tried (and, finding nothing there yet, failed) to delete
+    /// it, and nothing else ever notices: `reconcile_pending`/[`Self::flush`]
+    /// see an ordinary, non-superseded result for a key `pending` no
+    /// longer holds and reconcile it as a normal success, leaving the
+    /// file behind forever (or until the whole scratch directory is
+    /// swept at session end) with no key in any map able to name it.
+    ///
+    /// `forget_tile` inserts here in place of leaving the write to
+    /// orphan its file, and only when the key is genuinely still in
+    /// `pending` at that moment — a key already `paged_out` with a real
+    /// file on disk is handled synchronously by
+    /// [`Self::discard_stale_scratch_file`] and never reaches here.
+    /// [`Self::discard_if_forgotten_while_pending`] is the shared
+    /// prologue both drain sites run *before* their ordinary `Ok`/`Err`
+    /// handling — same placement, same reason, as
+    /// [`Self::drop_if_superseded`] just above it: removes the entry and
+    /// deletes whatever the write actually produced, so the file this
+    /// set exists to catch is deleted once, not aliased back into
+    /// `paged_out` as if the tile were still alive.
+    ///
+    /// **Not the same problem [`Self::is_superseded`] already solves.**
+    /// That check is keyed on a *newer* generation replacing an older
+    /// one for a key that is still alive; this set is for a key with no
+    /// newer generation at all, because nothing will ever write for it
+    /// again. Folding the two together (treating an absent `pending`
+    /// entry as "superseded") was tried and rejected — see
+    /// `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`'s
+    /// own doc comment for the real failure that revives — so this is a
+    /// second, disjoint set rather than a weakened first one.
+    ///
+    /// **Bounded by `pending`.** An insert here always removes a `pending`
+    /// entry in the same call ([`Self::forget_tile`]'s `forget_pending`),
+    /// and every path that later drains this set removes exactly what it
+    /// found — so it can never hold more keys than `pending` could have,
+    /// and `pending` is itself bounded the way [`Self::failed_writes`]'s
+    /// own doc explains.
+    forgotten_while_pending: HashSet<(SurfaceId, TileId)>,
     /// Keys that were **dirty when `make_room` took them out of
     /// `resident`** — the one piece of a `Tile`'s state `codec::encode`
     /// does not carry to the scratch disk, and which `Tile::from_texels`
@@ -549,6 +590,7 @@ impl TileStore {
             paged_out: HashMap::new(),
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
+            forgotten_while_pending: HashSet::new(),
             evicted_dirty: HashSet::new(),
             write_generation: 0,
             budget,
@@ -760,14 +802,20 @@ impl TileStore {
     /// back from it.
     ///
     /// Nothing is flushed and nothing is awaited. A background write
-    /// already in flight for this key is left to complete and land on a
-    /// file this call has just deleted (or is about to be deleted by
-    /// it); its result then drains into `reconcile_pending`/[`Self::flush`]
-    /// against a `pending` entry that is gone, which those already
-    /// handle as an ordinary "no longer in pending" outcome. The
-    /// scratch file it recreates is orphaned rather than aliased — the
-    /// key is in neither map any more, so no read can reach it, and the
-    /// scratch directory is deleted with the session.
+    /// already in flight for this key is left to complete in its own
+    /// time — but its eventual result is not left to reconcile as an
+    /// ordinary success. **A key still in `pending` at this moment is
+    /// recorded in [`Self::forgotten_while_pending`] before its `pending`
+    /// entry is dropped**, so when that write's result later drains into
+    /// `reconcile_pending`/[`Self::flush`], [`Self::discard_if_forgotten_while_pending`]
+    /// deletes the file it just produced instead of letting it sit
+    /// unreferenced. (Before 0.116.1 that file was genuinely orphaned —
+    /// no key in any map could name it, so no read could reach it, but
+    /// nothing deleted it either until the whole scratch directory was
+    /// swept at session end. See
+    /// `forget_surface_drops_every_tile_of_that_surface_from_every_place_it_can_live`'s
+    /// own history for the real, timing-dependent CI failure that
+    /// disclosed it.)
     pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
         let key = (surface, id);
         let held = self.contains_tile(surface, id);
@@ -776,6 +824,15 @@ impl TileStore {
         // of `paged_out`, so the other order would leak the file.
         self.discard_stale_scratch_file(key);
         self.paged_out.remove(&key);
+        // Tombstone *before* `forget_pending` clears the entry this
+        // check reads -- the other order would always see it already
+        // gone. Only a key genuinely still in `pending` has a write left
+        // in flight for `discard_if_forgotten_while_pending` to catch;
+        // a key already `paged_out` was just handled synchronously
+        // above, and a key in neither has nothing coming.
+        if self.pending.contains_key(&key) {
+            self.forgotten_while_pending.insert(key);
+        }
         self.forget_pending(key);
         self.resident.pop(&key);
         // Swept with the rest of what this key owns (0.91.0): the record
@@ -917,11 +974,26 @@ impl TileStore {
     ///
     /// Returns the first [`TileError::Io`] encountered among pending
     /// writes, if any failed.
+    ///
+    /// **A forgotten tile's result is handled the same way
+    /// `reconcile_pending` does** (0.116.1): dropped from this loop by
+    /// [`Self::discard_if_forgotten_while_pending`], which deletes the
+    /// file it produced rather than treating it as an ordinary success
+    /// or a reportable failure. This is in fact the only place that
+    /// path is exercised deterministically — `flush` blocks until the
+    /// writer thread has actually processed every job already in its
+    /// channel, `forget_tile`'s among them, so a caller that forgets a
+    /// tile mid-eviction and then flushes is guaranteed to see the file
+    /// gone by the time this call returns, with no dependence on how
+    /// the background thread happened to be scheduled.
     pub fn flush(&mut self) -> Result<(), TileError> {
         self.writer.flush();
         let mut first_err = None;
         for result in self.writer.drain_results() {
             if self.drop_if_superseded(&result) {
+                continue;
+            }
+            if self.discard_if_forgotten_while_pending(&result) {
                 continue;
             }
             match result.outcome {
@@ -1129,9 +1201,17 @@ impl TileStore {
     /// content. See [`Self::drop_if_superseded`] (the shared prologue
     /// [`Self::flush`] runs too) and [`Self::is_superseded`], and
     /// [`Stats::superseded_writes`] for the counter.
+    ///
+    /// **A forgotten tile's result is dropped too, but deletes rather
+    /// than ignores** (0.116.1) — see
+    /// [`Self::discard_if_forgotten_while_pending`], the second shared
+    /// prologue, run immediately after the one above.
     fn reconcile_pending(&mut self) {
         for result in self.writer.drain_results() {
             if self.drop_if_superseded(&result) {
+                continue;
+            }
+            if self.discard_if_forgotten_while_pending(&result) {
                 continue;
             }
             match result.outcome {
@@ -1195,6 +1275,62 @@ impl TileStore {
             ok = result.outcome.is_ok(),
             "dropping a superseded write result"
         );
+        true
+    }
+
+    /// The second shared prologue both drain sites run, immediately
+    /// after [`Self::drop_if_superseded`] and for the same reason: a
+    /// result this method claims must not fall through to the ordinary
+    /// `Ok`/`Err` match either. Returns `true` — having deleted whatever
+    /// the write actually produced on an `Ok` outcome, and done nothing
+    /// on an `Err` one — when `key` was in
+    /// [`Self::forgotten_while_pending`], which [`Self::forget_tile`] is
+    /// the only inserter of.
+    ///
+    /// **Order matters**: this runs *after* the supersession check, not
+    /// before or merged with it. A key can only ever be in one of
+    /// `is_superseded`'s "different generation still in `pending`" state
+    /// or this set's "no generation in `pending` at all, because the key
+    /// was discarded" state — `forget_tile` clears `pending` for exactly
+    /// the key it tombstones here — so the two checks are looking at
+    /// disjoint keys in practice, but keeping them as two small,
+    /// separately-named methods (rather than one that tries to explain
+    /// both reasons a result might be moot) is what let 0.116.1 add this
+    /// one without touching `is_superseded`'s own, already-tested
+    /// contract for the *other* absent-key case: see
+    /// `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`,
+    /// which this method does not affect because
+    /// `ensure_resident`'s revisit branch never inserts into
+    /// `forgotten_while_pending` — only `forget_tile` does.
+    ///
+    /// An `Err` outcome removes the tombstone and stops there: the write
+    /// that would have produced the orphan never landed, so there is
+    /// nothing to delete, and reporting the failure (as the ordinary
+    /// `Err` arm would) would be about a tile nothing holds any more —
+    /// [`Self::retain_failed_write`] keeping its bytes alive is not a
+    /// trade worth paying for a tile with no reader left.
+    fn discard_if_forgotten_while_pending(&mut self, result: &WriteResult) -> bool {
+        let key = (result.surface, result.id);
+        if !self.forgotten_while_pending.remove(&key) {
+            return false;
+        }
+        if result.outcome.is_ok() {
+            let path = self.tile_path(key.0, key.1);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::error!(
+                        surface = ?key.0,
+                        tile = ?key.1,
+                        path = %path.display(),
+                        %err,
+                        "could not delete the scratch file a forgotten tile's in-flight write \
+                         produced after the fact; it is unreferenced but not removed"
+                    );
+                }
+            }
+        }
         true
     }
 
@@ -1790,6 +1926,22 @@ mod tests {
                 "every tile of the swept surface must be reported forgotten"
             );
 
+            // Without this, the `evict_and_flush == false` pass's
+            // `!path.exists()` assertions below raced a background write
+            // still in flight for a doomed tile at the moment of the
+            // sweep — CI caught the race 0.116.1 closed
+            // (`forget_surface_drops_every_tile_of_that_surface_from_
+            // every_place_it_can_live` failing on a runner slow enough
+            // for the write to land *after* `forget_surface` returned).
+            // Flushing here forces that write to complete and drain
+            // through `discard_if_forgotten_while_pending`, so the file
+            // is deterministically gone rather than merely usually gone.
+            // A no-op for `evict_and_flush == true`, whose writes are
+            // already confirmed above.
+            if let Err(err) = store.flush() {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+
             for (id, path) in targets.iter().zip(paths.iter()) {
                 assert!(
                     !store.contains_tile(doomed, *id),
@@ -1816,6 +1968,63 @@ mod tests {
                 "the spared surface must keep its own pixels, not come back blank"
             );
         }
+    }
+
+    #[test]
+    // The deterministic version of the race the test above closes with a
+    // `flush()`: forces a tile's write to still be genuinely in flight —
+    // no eviction, no background thread, no timing — at the exact moment
+    // it is forgotten, so this cannot pass by accident the way the timing-
+    // dependent version above could before 0.116.1.
+    fn forget_tile_deletes_the_file_a_write_still_in_flight_at_forget_time_later_produces() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 3, y: 1 };
+        let path = store.tile_path(s, id);
+
+        // What `make_room` does at the instant of eviction, without a
+        // real eviction: a `pending` entry for a real generation, and
+        // -- the whole point -- no `WriteJob` submitted yet, so the
+        // write really is still to come.
+        store.write_generation = store.write_generation.wrapping_add(1);
+        let generation = store.write_generation;
+        let bytes: Arc<Vec<u8>> = Arc::new(vec![9, 9, 9, 9]);
+        store
+            .pending
+            .insert((s, id), (generation, Arc::clone(&bytes)));
+
+        assert!(
+            store.forget_tile(s, id),
+            "a key only in `pending` is still held"
+        );
+        assert!(
+            !path.exists(),
+            "nothing has been written yet -- there is nothing to have deleted"
+        );
+
+        // The write that was "in flight" lands only now, exactly as the
+        // background writer thread would complete it well after
+        // `forget_tile` already moved on.
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation,
+            path: path.clone(),
+            bytes,
+        });
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        assert!(
+            !path.exists(),
+            "a write that lands after its tile was forgotten must not leave the file behind -- \
+             this is what `discard_if_forgotten_while_pending` exists to catch"
+        );
+        assert!(
+            !store.contains_tile(s, id),
+            "forgetting must still be permanent even though a write for this key landed after it"
+        );
     }
 
     #[test]
