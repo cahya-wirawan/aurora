@@ -31102,8 +31102,9 @@ mod tests {
     /// **symmetric** rule — with exactly one exception: at
     /// `(Cb, Cs) = (0, 1)` it is `0`, because `color_dodge_channel` tests
     /// `cb == 0.0` before `cs == 1.0` and the first guard wins. Verified
-    /// exhaustively over a `1/256` grid plus an edge refinement: one exception,
-    /// and exactly two asymmetric pairs, `(0, 1)` and `(1, 0)`.
+    /// exhaustively over the entire `f16`-representable domain in `[0, 1]`
+    /// (0.115.1; a `1/256` grid plus edge refinement first, 0.115.0): one
+    /// exception, and exactly two asymmetric pairs, `(0, 1)` and `(1, 0)`.
     ///
     /// So there is **no interior operand pair for which
     /// `H(Cb, Cs) != H(Cs, Cb)`**. That corner is the only channel shape whose
