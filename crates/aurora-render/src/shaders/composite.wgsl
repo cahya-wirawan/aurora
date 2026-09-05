@@ -105,16 +105,21 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // The two halves of the blend-math "over" that every blend-math entry
 // point below shares verbatim, extracted in 0.109.0. Each statement in
 // both bodies is byte-identical to the line it replaced in those entry
-// points -- moved, not retyped -- which is what makes "bit-for-bit
-// identical output" a property provable by text diff rather than by
-// trusting arithmetic reasoning about equivalent rewrites. Do not
-// "clean up" either body: `a + bd.a * inv` is deliberately not
-// `a + ab * inv` (numerically identical, textually not), the `if`
-// guard is deliberately not a `select()` (which would evaluate both
-// arms and make the `0.0 / 0.0` divide unconditional, defeating the
-// nine `..._is_the_source_alone_where_the_backdrop_is_transparent`
-// tests), and no expression may be reordered, since float addition is
-// not associative and the CPU differential tests assert exact equality.
+// points -- moved, not retyped -- with exactly one exception:
+// `straight_backdrop`'s own `return cb;` is new text and replaced
+// nothing, because the entry points left the recovered colour in a local
+// and carried straight on rather than returning it. Every *other*
+// statement is a moved line, which is what makes "bit-for-bit identical
+// output" a property provable by text diff rather than by trusting
+// arithmetic reasoning about equivalent rewrites. Do not "clean up"
+// either body: `a + bd.a * inv` is deliberately not `a + ab * inv`
+// (numerically identical, textually not), the `if` guard is deliberately
+// not a `select()` (which would evaluate both arms and make the
+// `0.0 / 0.0` divide unconditional -- see the guard's own comment below
+// for how much of that is actually caught by a test, which is less than
+// 0.109.0 first claimed), and no expression may be reordered, since
+// float addition is not associative and the CPU differential tests
+// assert exact equality.
 
 // `composite_layer_into`'s `straight_backdrop = d.rgb / backdrop_alpha,
 // or [0,0,0] if da == 0` -- the premultiplied accumulator's straight
@@ -122,6 +127,25 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `backdrop_alpha > 0.0` guard and the zero fallback is its
 // `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
 // once per entry point.
+//
+// **What actually protects this guard is three tests, not nine
+// (measured, 0.109.0; explained, 0.109.1).** Deleting the guard -- or
+// replacing it with a `select()`, which evaluates both arms -- fails
+// exactly three of the nine per-mode transparent-backdrop tests:
+// `multiply`'s, `screen`'s and `difference`'s. (Two naming shapes are in
+// play: `multiply`'s and `darken`'s are
+// `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
+// the other seven are
+// `composite_<mode>_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.)
+// The other six -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
+// `color_burn`, `color_dodge` -- pass with the guard gone, and not
+// because their fixtures are weak: on this backend `min()`/`max()`
+// *launder* a NaN operand into the finite one, so those six formulas
+// never let the NaN reach `fold_over`, where `ab == 0.0` would erase it
+// anyway. That makes the guard's removal genuinely **output-equivalent**
+// for those six here, not merely undetected. See PLAN.md's 0.109.0 entry
+// for the two isolating experiments and for why no fixture change can
+// close it.
 fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
     let ab = bd.a;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
@@ -190,11 +214,30 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 //
 // As of 0.109.0 that guard belongs to `straight_backdrop()`, not to each
 // entry point. The guard's existence and behaviour are unchanged, but the
-// several test comments in `composite.rs` that quote
-// `if (ab > 0.0) { cb = bd.rgb / ab; }` and attribute it to a *specific*
-// entry point are now stale about its **location** only -- disclosed here,
-// in one place, rather than by editing nine test comments to say the same
-// thing.
+// test comments in `composite.rs` that describe a kept per-mode test's
+// rationale are stale in **two** ways, not one -- 0.109.0 disclosed only
+// the first, and 0.109.1 corrects that:
+//
+//   1. **Location.** Comments quoting
+//      `if (ab > 0.0) { cb = bd.rgb / ab; }` and attributing it to a
+//      *specific* entry point now name the wrong function; the line lives
+//      in `straight_backdrop()` above.
+//   2. **Independence, which matters more.** Several suite-header comments
+//      justify keeping a per-mode transparent-backdrop test by listing
+//      "its own separately-compiled `ab > 0.0` guard" among the things
+//      that test uniquely exercises. That is no longer true: the guard is
+//      written once and shared by all nine entry points. (A backend is
+//      still free to inline it per call site, so per-entry-point *machine
+//      code* is not ruled out -- but the source-level independence the
+//      comments leaned on is gone, and the measured 3-of-9 kill above is
+//      the direct evidence.)
+//
+// Those suite-header comments in `composite.rs` were corrected in 0.109.1
+// and carry the specific sites; the per-test doc comments there carry a
+// one-line back-reference to here rather than repeating this. Only 3 of
+// the 9 kept transparent-backdrop tests can currently detect the guard's
+// removal at all -- see the `straight_backdrop()` comment above, and
+// PLAN.md's 0.109.0 entry for why.
 //
 // `opacity.value` is not re-clamped here because the Rust caller
 // (`TileCompositor::composite_multiply_over_with_opacity`) already
@@ -564,7 +607,10 @@ fn fs_composite_linear_burn(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `blend_channel`'s own `BlendMode::ColorBurn` arm (src/composite.rs), one
-// channel at a time -- this file's first non-entry-point function, and the
+// channel at a time -- one of this file's per-channel blend helpers (it was
+// the first non-entry-point function here when 0.107.0 added it; 0.109.0's
+// `straight_backdrop()`/`fold_over()` now precede it, so the ordinal is
+// dropped rather than re-counted), and the
 // first ported mode whose formula cannot be one componentwise expression
 // on `vec3<f32>`: two of its three branches are per-channel *conditions*,
 // not arithmetic, so a `vec3` form would need per-lane selects over a
@@ -662,8 +708,10 @@ fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `blend_channel`'s own `BlendMode::ColorDodge` arm (src/composite.rs), one
-// channel at a time -- this file's shaders' second non-entry-point
-// function, and the exact structural sibling of `color_burn_channel`
+// channel at a time -- the other of this file's per-channel blend helpers
+// (second of them, and no longer this file's second non-entry-point
+// function: 0.109.0's `straight_backdrop()`/`fold_over()` precede both),
+// and the exact structural sibling of `color_burn_channel`
 // above: two of its three branches are per-channel *conditions* rather
 // than arithmetic, so a componentwise `vec3` form would need per-lane
 // selects over a division that is undefined in the very lanes the

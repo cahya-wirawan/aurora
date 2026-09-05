@@ -6946,8 +6946,11 @@ fn composite_roots_into_tile(
 ///   `Cs == 0` yields `0`, else `1 - min(1, (1 - Cb) / Cs)` — and two of
 ///   those three are per-channel *conditions* rather than arithmetic, so
 ///   `fs_composite_color_burn` factors them into a
-///   `color_burn_channel(cb, cs)` helper (that file's shaders' first
-///   non-entry-point function) called once per channel. **Branch order is
+///   `color_burn_channel(cb, cs)` helper (one of that file's two
+///   per-channel blend helpers; it was that file's first non-entry-point
+///   function when 0.107.0 added it, but 0.109.0's shared
+///   `straight_backdrop()`/`fold_over()` now precede it, so the ordinal is
+///   dropped rather than re-counted) called once per channel. **Branch order is
 ///   load-bearing**: `Cb == 1` is tested first, so a white backdrop under
 ///   a black source — both conditions true at once, and an ordinary pixel
 ///   rather than a contrived one — yields `1.0`, not `0.0`. Both guards
@@ -6991,8 +6994,11 @@ fn composite_roots_into_tile(
 ///   per channel — `Cb == 0` yields `0`, else `Cs == 1` yields `1`, else
 ///   `min(1, Cb / (1 - Cs))` — and two of those three are per-channel
 ///   *conditions* rather than arithmetic, so `fs_composite_color_dodge`
-///   factors them into a `color_dodge_channel(cb, cs)` helper (that file's
-///   shaders' second non-entry-point function) called once per channel.
+///   factors them into a `color_dodge_channel(cb, cs)` helper (the other of
+///   that file's two per-channel blend helpers -- second of them, though no
+///   longer that file's second non-entry-point function, since 0.109.0's
+///   shared `straight_backdrop()`/`fold_over()` precede both) called once
+///   per channel.
 ///   **Branch order is load-bearing, and it is the mirror of `ColorBurn`'s
 ///   rather than the same**: `Cb == 0` is tested first, so a black backdrop
 ///   under a white source — both conditions true at once, and an ordinary

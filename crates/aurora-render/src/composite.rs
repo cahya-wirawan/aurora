@@ -2622,9 +2622,12 @@ impl TileCompositor {
     /// Two of those three branches are per-channel *conditions* rather
     /// than arithmetic, so — unlike every mode ported before it — this one
     /// cannot be one componentwise expression on `vec3<f32>`. The shader
-    /// factors the arm into a `color_burn_channel(cb, cs)` helper (this
-    /// file's shaders' first non-entry-point function) and calls it three
-    /// times to build `b`.
+    /// factors the arm into a `color_burn_channel(cb, cs)` helper (one of
+    /// that file's two per-channel blend helpers -- it was its first
+    /// non-entry-point function when 0.107.0 added it, but 0.109.0's
+    /// `straight_backdrop()`/`fold_over()` now precede it, so the ordinal
+    /// is dropped rather than re-counted) and calls it three times to
+    /// build `b`.
     ///
     /// **Both guards are arithmetically redundant under IEEE-754 and both
     /// are still required.** Drop the `Cb == 1` guard and
@@ -2749,8 +2752,11 @@ impl TileCompositor {
     /// than arithmetic, so — as with `ColorBurn`, and unlike the seven
     /// modes ported before that one — this cannot be one componentwise
     /// expression on `vec3<f32>`. The shader factors the arm into a
-    /// `color_dodge_channel(cb, cs)` helper (that file's shaders' second
-    /// non-entry-point function) and calls it three times to build `b`.
+    /// `color_dodge_channel(cb, cs)` helper (the other of that file's two
+    /// per-channel blend helpers -- second of them, though no longer that
+    /// file's second non-entry-point function, since 0.109.0's
+    /// `straight_backdrop()`/`fold_over()` precede both) and calls it
+    /// three times to build `b`.
     ///
     /// **Both guards are arithmetically redundant under IEEE-754, both are
     /// still required, and — unlike `ColorBurn`'s — they are redundant for
@@ -5592,6 +5598,14 @@ mod tests {
     /// finding, so a future backend or `naga` change cannot regress it
     /// silently.
     ///
+    /// **Since 0.109.0 the guard is shared, not per entry point, and this
+    /// is one of only three of the nine per-mode versions of this test
+    /// that still detect its removal** — with `screen`'s and
+    /// `difference`'s. `Multiply`'s `cb * s.rgb` propagates a `NaN`
+    /// instead of laundering it through a `min`/`max`, which is exactly
+    /// why. See `composite.wgsl`'s disclosure beside `straight_backdrop()`
+    /// and PLAN.md's 0.109.0 entry.
+    ///
     /// With `ab == 0.0` the whole composite reduces to the source alone,
     /// so the result is also asserted to be exactly that -- a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -6433,6 +6447,16 @@ mod tests {
     /// function, and `min(NaN, x)` is exactly the kind of expression
     /// whose NaN handling differs between backends.
     ///
+    /// **0.109.0/0.109.1 turned that last clause from a caution into a
+    /// measurement, and it cuts against this test.** The guard now lives
+    /// once in `composite.wgsl`'s shared `straight_backdrop()`, and on
+    /// Vulkan/NVIDIA `min(NaN, x)` returns `x` — so with the guard deleted
+    /// this test still *passes*: `Darken` is one of the six modes for which
+    /// removing it is output-equivalent rather than merely undetected. What
+    /// this test still pins per entry point is that this mode's own `b`
+    /// line and fold reduce to the source alone at `ab == 0.0`. See
+    /// `composite.wgsl`'s disclosure beside `straight_backdrop()`.
+    ///
     /// With `ab == 0.0` the whole composite reduces to the source alone,
     /// so the result is asserted to be exactly that -- a `NaN` leaking
     /// out of the untaken divide would fail both the finiteness check
@@ -6697,8 +6721,28 @@ mod tests {
     // The six kept each exercise something that really is
     // per-entry-point: this mode's own arithmetic, its own un-premultiply
     // branch, its own spatial addressing, its own opacity-scaled fold,
-    // its own unclamped `s.a * opacity` product, and its own
-    // separately-compiled `ab > 0.0` guard.
+    // its own unclamped `s.a * opacity` product, and this mode's own
+    // collapse to the source alone where the accumulator alpha is zero.
+    //
+    // **That last one used to read "its own separately-compiled
+    // `ab > 0.0` guard", and 0.109.1 corrected it here and at the six
+    // sibling section headers below.** Since 0.109.0 the guard is written
+    // *once*, in `composite.wgsl`'s `straight_backdrop()`, and shared by
+    // all nine blend-math entry points, so guard independence is not a
+    // per-entry-point property any more. It is worse than that for this
+    // mode specifically: with the guard deleted, `composite_lighten_over_
+    // with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
+    // still *passes*, because `max()` launders the resulting NaN into the
+    // finite operand before it reaches the fold. Only `multiply`,
+    // `screen` and `difference` can detect the guard's removal at all;
+    // for the other six modes -- this one included -- removing it is
+    // output-equivalent on Vulkan/NVIDIA, not merely undetected, so no
+    // fixture change of the 0.105.1/0.105.2 kind could close it. What the
+    // test does still pin per entry point is that *this* mode's `b` line
+    // and its `fold_over` call reduce to the source alone at `ab == 0.0`.
+    // `composite.wgsl`'s disclosure beside `straight_backdrop()` has the
+    // full account, and PLAN.md's 0.109.0 entry has the two isolating
+    // experiments behind it; neither is repeated at the sibling headers.
     //
     // Fixture values are again *not* copied from the `Darken` siblings.
     // `Lighten` collapses to a no-op whenever the source is darker than
@@ -7351,6 +7395,16 @@ mod tests {
     /// differs between backends — and it is a *different* expression from
     /// `min(NaN, x)`, which the `Darken` sibling covers.
     ///
+    /// **Measured since (0.109.0/0.109.1), and it cuts against this test.**
+    /// The guard now lives once in `composite.wgsl`'s shared
+    /// `straight_backdrop()`, and on Vulkan/NVIDIA `max(NaN, x)` returns
+    /// `x` — so with the guard deleted this test still *passes*: `Lighten`
+    /// is one of the six modes for which removing it is output-equivalent
+    /// rather than merely undetected. What this test still pins per entry
+    /// point is that this mode's own `b` line and fold reduce to the source
+    /// alone where `ab == 0.0`. See `composite.wgsl`'s disclosure beside
+    /// `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that -- a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -7512,8 +7566,15 @@ mod tests {
     // The six each exercise something genuinely per-entry-point: this
     // mode's own arithmetic, its own un-premultiply branch, its own
     // spatial addressing, its own opacity-scaled fold, its own unclamped
-    // `s.a * opacity` product, and its own separately-compiled
-    // `ab > 0.0` guard.
+    // `s.a * opacity` product, and this mode's own collapse to the source
+    // alone at a zero accumulator alpha -- **not** "its own
+    // separately-compiled `ab > 0.0` guard", which 0.109.0's shared
+    // `straight_backdrop()` made false and 0.109.1 corrected here.
+    // `Screen` is, however, one of only three modes whose
+    // transparent-backdrop test still detects that guard's removal: its
+    // formula is arithmetic on `cb`, so a NaN propagates instead of being
+    // laundered by a `min`/`max`. See the `Lighten` section header above
+    // and `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     //
     // **Fixture values are chosen against `Screen`'s own two degeneracies,
     // which are different from every prior mode's.** `Screen(0, Cs) = Cs`
@@ -8099,6 +8160,15 @@ mod tests {
     /// selected away, which if anything makes this the most likely of the
     /// four entry points to leak a `NaN` if the branch is flattened.
     ///
+    /// **That reasoning was confirmed by measurement in 0.109.0.** The
+    /// guard now lives once in `composite.wgsl`'s shared
+    /// `straight_backdrop()`, and deleting it fails exactly three of the
+    /// nine per-mode versions of this test — `multiply`'s, this one, and
+    /// `difference`'s — precisely because those three propagate the `NaN`
+    /// while the other six launder it through a `min`/`max`. So this test
+    /// is one of the three that genuinely protects the shared guard. See
+    /// `composite.wgsl`'s disclosure beside `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that — a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -8256,8 +8326,15 @@ mod tests {
     // The six each exercise something genuinely per-entry-point: this
     // mode's own arithmetic, its own un-premultiply branch, its own
     // spatial addressing, its own opacity-scaled fold, its own unclamped
-    // `s.a * opacity` product, and its own separately-compiled
-    // `ab > 0.0` guard.
+    // `s.a * opacity` product, and this mode's own collapse to the source
+    // alone at a zero accumulator alpha -- **not** "its own
+    // separately-compiled `ab > 0.0` guard", which 0.109.0's shared
+    // `straight_backdrop()` made false and 0.109.1 corrected here.
+    // `Difference` is, with `Multiply` and `Screen`, one of only three
+    // modes whose transparent-backdrop test still detects that guard's
+    // removal -- `abs(NaN - x)` propagates rather than laundering. See the
+    // `Lighten` section header above and `composite.wgsl`'s disclosure
+    // beside `straight_backdrop()`.
     //
     // **Fixture values are chosen against `Difference`'s own degeneracies,
     // which are different again from every prior mode's.** There are three
@@ -8990,6 +9067,14 @@ mod tests {
     /// *arithmetic* on `cb` rather than a `min`/`max` intrinsic —
     /// `abs(NaN - x)` is `NaN`, propagated rather than selected away.
     ///
+    /// **Confirmed by measurement in 0.109.0.** The guard now lives once in
+    /// `composite.wgsl`'s shared `straight_backdrop()`, and deleting it
+    /// fails exactly three of the nine per-mode versions of this test —
+    /// `multiply`'s, `screen`'s and this one — for exactly that reason,
+    /// while the other six launder the `NaN` through a `min`/`max`. So this
+    /// test is one of the three that genuinely protects the shared guard.
+    /// See `composite.wgsl`'s disclosure beside `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that — a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -9168,8 +9253,14 @@ mod tests {
     // The six each exercise something genuinely per-entry-point: this
     // mode's own arithmetic *and its clamp*, its own un-premultiply
     // branch, its own spatial addressing, its own opacity-scaled fold,
-    // its own unclamped `s.a * opacity` product, and its own
-    // separately-compiled `ab > 0.0` guard.
+    // its own unclamped `s.a * opacity` product, and this mode's own
+    // collapse to the source alone at a zero accumulator alpha -- **not**
+    // "its own separately-compiled `ab > 0.0` guard", which 0.109.0's
+    // shared `straight_backdrop()` made false and 0.109.1 corrected here.
+    // `LinearDodge` is one of the six modes whose transparent-backdrop
+    // test does *not* detect that guard's removal, because its `min(...,
+    // 1.0)` clamp launders the NaN. See the `Lighten` section header above
+    // and `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     //
     // **Fixture values are chosen against `LinearDodge`'s own
     // degeneracies, which are different again from every prior mode's.**
@@ -9940,6 +10031,18 @@ mod tests {
     /// implementation-defined at best and `NaN` in practice, propagated
     /// rather than selected away.
     ///
+    /// **"`NaN` in practice" was wrong, and 0.109.0/0.109.1 measured it.**
+    /// The guard now lives once in `composite.wgsl`'s shared
+    /// `straight_backdrop()`, and on Vulkan/NVIDIA `min(NaN, 1.0)` returns
+    /// `1.0` — the clamp launders it. So with the guard deleted this test
+    /// still *passes*: `LinearDodge` is one of the six modes for which
+    /// removing it is output-equivalent rather than merely undetected,
+    /// grouped with `Darken`/`Lighten` here and not with `Screen`'s or
+    /// `Difference`'s clamp-free arithmetic. What this test still pins per
+    /// entry point is that this mode's own `b` line and fold reduce to the
+    /// source alone where `ab == 0.0`. See `composite.wgsl`'s disclosure
+    /// beside `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that — a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -10135,8 +10238,14 @@ mod tests {
     // The six each exercise something genuinely per-entry-point: this
     // mode's own arithmetic *and its clamp*, its own un-premultiply
     // branch, its own spatial addressing, its own opacity-scaled fold,
-    // its own unclamped `s.a * opacity` product, and its own
-    // separately-compiled `ab > 0.0` guard.
+    // its own unclamped `s.a * opacity` product, and this mode's own
+    // collapse to the source alone at a zero accumulator alpha -- **not**
+    // "its own separately-compiled `ab > 0.0` guard", which 0.109.0's
+    // shared `straight_backdrop()` made false and 0.109.1 corrected here.
+    // `LinearBurn` is one of the six modes whose transparent-backdrop test
+    // does *not* detect that guard's removal, because its `max(..., 0.0)`
+    // clamp launders the NaN. See the `Lighten` section header above and
+    // `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     //
     // **Fixture values are chosen against `LinearBurn`'s own
     // degeneracies, and there are six of them -- one more than any prior
@@ -10965,6 +11074,17 @@ mod tests {
     /// `max(NaN + x - 1, 0)` is implementation-defined at best and `NaN`
     /// in practice, propagated rather than selected away.
     ///
+    /// **"`NaN` in practice" was wrong, and 0.109.0/0.109.1 measured it.**
+    /// The guard now lives once in `composite.wgsl`'s shared
+    /// `straight_backdrop()`, and on Vulkan/NVIDIA `max(NaN, 0.0)` returns
+    /// `0.0` — the clamp launders it, exactly as `LinearDodge`'s `min` does.
+    /// So with the guard deleted this test still *passes*: `LinearBurn` is
+    /// one of the six modes for which removing it is output-equivalent
+    /// rather than merely undetected. What this test still pins per entry
+    /// point is that this mode's own `b` line and fold reduce to the source
+    /// alone where `ab == 0.0`. See `composite.wgsl`'s disclosure beside
+    /// `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that — a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -11150,9 +11270,16 @@ mod tests {
     // the `LinearBurn` suite directly above cover this mode's own
     // arithmetic and its `min` clamp, its own un-premultiply branch, its
     // own spatial addressing, its own opacity-scaled fold, its own
-    // unclamped `s.a * opacity` product, and its own separately-compiled
-    // `ab > 0.0` guard. Tests 7 and 8 cover the `Cb == 1` and `Cs == 0`
-    // branches respectively, which nothing else here reaches.
+    // unclamped `s.a * opacity` product, and this mode's own collapse to
+    // the source alone at a zero accumulator alpha -- **not** "its own
+    // separately-compiled `ab > 0.0` guard", which 0.109.0's shared
+    // `straight_backdrop()` made false and 0.109.1 corrected here.
+    // `ColorBurn` is one of the six modes whose transparent-backdrop test
+    // does *not* detect that guard's removal, because its guarded branches
+    // end in `min(1.0, ...)`, which launders the NaN. See the `Lighten`
+    // section header above and `composite.wgsl`'s disclosure beside
+    // `straight_backdrop()`. Tests 7 and 8 cover the `Cb == 1` and
+    // `Cs == 0` branches respectively, which nothing else here reaches.
     //
     // The same one every suite since `Darken` omits is omitted again: an
     // out-of-range-*opacity* case, which since 0.85.1's merge lives in a
@@ -12023,6 +12150,18 @@ mod tests {
     /// strictly more load-bearing than its siblings', not a formality
     /// copied across.
     ///
+    /// **That last claim is the one 0.109.0/0.109.1 overturned.** The guard
+    /// now lives once in `composite.wgsl`'s shared `straight_backdrop()`,
+    /// and on Vulkan/NVIDIA `min(1.0, NaN)` returns `1.0` — so the second
+    /// division's `min` is precisely what *launders* the `NaN` away, and
+    /// with the guard deleted this test still *passes*. `ColorBurn` is one
+    /// of the six modes for which removing it is output-equivalent rather
+    /// than merely undetected; only `multiply`'s, `screen`'s and
+    /// `difference`'s versions detect it. What this test still pins per
+    /// entry point is that this mode's own three-call `b` and fold reduce to
+    /// the source alone where `ab == 0.0`. See `composite.wgsl`'s disclosure
+    /// beside `straight_backdrop()`.
+    ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
     /// so that half of the tile is asserted to be exactly that — a `NaN`
     /// leaking out of the untaken divide would fail both the finiteness
@@ -12516,9 +12655,16 @@ mod tests {
     // reaches. Six cover this mode's own arithmetic and its `min` clamp,
     // its own un-premultiply branch, its own spatial addressing, its own
     // opacity-scaled fold, its own unclamped `s.a * opacity` product, and
-    // its own separately-compiled `ab > 0.0` guard. Tests 7 and 8 cover the
-    // `Cb == 0` and `Cs == 1` branches respectively, which nothing else
-    // here reaches.
+    // this mode's own collapse to the source alone at a zero accumulator
+    // alpha -- **not** "its own separately-compiled `ab > 0.0` guard",
+    // which 0.109.0's shared `straight_backdrop()` made false and 0.109.1
+    // corrected here. `ColorDodge` is one of the six modes whose
+    // transparent-backdrop test does *not* detect that guard's removal,
+    // because its guarded branches end in `min(1.0, ...)`, which launders
+    // the NaN. See the `Lighten` section header above and
+    // `composite.wgsl`'s disclosure beside `straight_backdrop()`. Tests 7
+    // and 8 cover the `Cb == 0` and `Cs == 1` branches respectively, which
+    // nothing else here reaches.
     //
     // The same one every suite since `Darken` omits is omitted again: an
     // out-of-range-*opacity* case, which since 0.85.1's merge lives in a
@@ -13429,6 +13575,17 @@ mod tests {
     /// implementation-defined. That makes this mode's version of this test
     /// strictly more load-bearing than its commutative siblings', not a
     /// formality copied across.
+    ///
+    /// **That last claim is the one 0.109.0/0.109.1 overturned**, exactly as
+    /// for the `ColorBurn` sibling. The guard now lives once in
+    /// `composite.wgsl`'s shared `straight_backdrop()`, and on
+    /// Vulkan/NVIDIA `min(1.0, NaN)` returns `1.0`, so the second division's
+    /// `min` *launders* the `NaN` and this test still passes with the guard
+    /// deleted. `ColorDodge` is one of the six modes for which removing it
+    /// is output-equivalent rather than merely undetected. What this test
+    /// still pins per entry point is that this mode's own three-call `b` and
+    /// fold reduce to the source alone where `ab == 0.0`. See
+    /// `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone, so
     /// that half of the tile is asserted to be exactly that — a `NaN`

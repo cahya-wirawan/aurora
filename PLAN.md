@@ -25097,6 +25097,51 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.109.1) — 0.109.0's prose corrected, and its one
+open question closed by measurement. Prose only: no WGSL logic, no Rust
+logic, no test changed.** Independent review of 0.109.0 found no defect in
+the shipped code — the refactor is correct, the byte-identity claim holds,
+`aurora-app/src/lib.rs` was genuinely untouched — but four wrong or
+overstated claims in its *comments and this entry*, plus one accounting nit.
+All five are fixed below and in the 0.109.0 entry that follows; test counts
+are unchanged (`aurora-render` 184 passed, `aurora-app` 403 passed, 0
+failed, `AURORA_REQUIRE_GPU=1`, same adapter).
+
+1. **The open mechanism question is now answered** — item 3 of the 0.109.0
+   entry below was rewritten in place. It is NaN laundering through
+   `min`/`max`, proved by a `bd`-independent NaN injection plus a direct
+   `min(NaN, x)`/`max(NaN, x)` probe on real hardware; 0.109.0's contrary
+   "refutation" was a confounded experiment. The honest characterisation of
+   the six survivors is **output-equivalent on this backend**, not "an open
+   coverage gap", and no fixture retargeting of the 0.105.1/0.105.2 kind can
+   close it.
+2. **"Stale about location only" was wrong twice over.** 0.109.0 disclosed,
+   in `composite.wgsl`, that `composite.rs`'s test comments were stale about
+   the guard's *location*. They are also stale about **independence**: seven
+   suite-header comments listed "its own separately-compiled `ab > 0.0`
+   guard" among the things a kept per-mode test uniquely exercises, and the
+   guard is now written once and shared by all nine entry points. Those
+   seven headers and the nine per-test doc comments now say what each test
+   actually still exercises — and, per mode, whether it can detect the
+   guard's removal at all — with one full account in `composite.wgsl` and
+   short cross-references elsewhere rather than the explanation repeated
+   sixteen times.
+3. **The `select()` rejection was justified by nine tests; three is the
+   measured number.** Corrected in `composite.wgsl` and in item 1 below. The
+   `if` still stays, for definedness across backends.
+4. **Two stale ordinals.** `color_burn_channel` and `color_dodge_channel`
+   were documented as `composite.wgsl`'s "first" and "second"
+   non-entry-point functions at six sites (two in `composite.wgsl`, two in
+   `aurora-render/src/composite.rs`, two in `aurora-app/src/lib.rs` — that
+   last file untouched by 0.109.0 and stale because of it). 0.109.0 inserted
+   two functions ahead of them. Retitled to "per-channel blend helpers"
+   rather than re-counted, so the next insertion cannot stale them again.
+   The 0.107.0 and 0.108.0 addenda below keep their original wording as
+   dated records — true when written, and now superseded by this note.
+5. **Byte-identity accounting.** "Every statement is byte-identical to the
+   line it replaced" has exactly one exception: `straight_backdrop`'s own
+   `return cb;` is new text. Noted in item 1 below and in the shader.
+
 **Addendum 2026-09-05 (0.109.0) — the WGSL fold duplication, extracted: a
 pure refactor with no mode port in it.** The deferral recorded in 0.106.1
 (item 4 of the 0.106.1-era list below) is now discharged. Two new
@@ -25123,20 +25168,25 @@ modes and 17 → 9 for `fs_composite_color_burn` and
 
 1. **"Bit-for-bit identical" was proved by text diff, not by trusting
    arithmetic reasoning.** Every statement inside both helper bodies is
-   *byte-identical* to the line it replaced — moved, not retyped. The check
-   was mechanical: extract the distinct removed lines from `git diff`
+   *byte-identical* to the line it replaced — moved, not retyped — with
+   exactly one exception, corrected here in 0.109.1: `straight_backdrop`'s
+   own `return cb;` is **new text and replaced nothing**, because the entry
+   points left the recovered colour in a local and carried straight on
+   rather than returning it. Every *other* statement is a moved line. The
+   check was mechanical: extract the distinct removed lines from `git diff`
    (exactly **10**) and confirm each is `grep -qxF`-present in the two
    helper bodies. **All 10 matched, zero unmatched.** This is what makes the
    no-behaviour-change claim checkable rather than argued, and it is why
    three tempting cleanups were deliberately *not* made: `a + bd.a * inv`
    stays instead of `a + ab * inv` (numerically identical, textually not);
    the `if (ab > 0.0)` guard stays instead of a `select()` (which evaluates
-   both arms, making the `0.0 / 0.0` divide unconditional and defeating the
-   nine transparent-backdrop tests); and no expression was reordered, since
-   float addition is not associative and these tests assert *exact*
-   equality against the CPU reference. The 10 absorbed lines become 11
-   helper statement lines, because `let ab = bd.a;` is needed by both halves
-   and so appears once in each helper.
+   both arms, making the `0.0 / 0.0` divide unconditional — which **three**
+   of the nine transparent-backdrop tests would catch, not nine, see items 2
+   and 3); and no expression was reordered, since float addition is not
+   associative and these tests assert *exact* equality against the CPU
+   reference. The 10 absorbed lines become 11 helper statement lines,
+   because `let ab = bd.a;` is needed by both halves and so appears once in
+   each helper — plus the 12th, that new `return cb;`.
 2. **Mutation 1 (delete the guard) was killed, but by 3 tests, not the
    predicted 9 — and the shortfall is pre-existing, not introduced.**
    Replacing `straight_backdrop`'s body with an unguarded
@@ -25150,21 +25200,69 @@ modes and 17 → 9 for `fs_composite_color_burn` and
    applied to the *pre-refactor* file (all nine copies removed) fails the
    **identical three tests**. So the extraction did not widen the
    undetectable-bug class — the six-mode gap is a property those nine tests
-   already had. Carried forward as a real, open coverage gap: for
-   `darken`, `lighten`, `linear_dodge`, `linear_burn`, `color_burn` and
-   `color_dodge`, the transparent-backdrop test does **not** detect a
-   missing divide-by-zero guard on this backend.
-3. **The mechanism behind that survival is *not* settled, and a first guess
-   was refuted by measurement.** The initial hypothesis was NaN
-   "laundering" by each survivor's `min`/`max`/branch. A diagnostic run
-   (guard removed *and* `fs_composite_darken`'s `min(cb, s.rgb)` reduced to
-   plain `cb`, so a NaN would reach the fold unlaundered) left darken's
-   transparent-backdrop test **still passing** — refuting laundering as the
-   whole explanation. The remaining candidate is backend-level algebraic
-   simplification of `ab * (bd.rgb / ab)` → `bd.rgb`, which would apply to
-   the reduced darken case but not through `multiply`'s extra factor. Both
-   mechanisms are plausible and neither was isolated; recorded as an
-   unresolved backend-compiler question, not a finding.
+   already had. **And it is not a "coverage gap" in the usual sense** — see
+   item 3, which 0.109.1 rewrote once the mechanism was actually isolated.
+   For `darken`, `lighten`, `linear_dodge`, `linear_burn`, `color_burn` and
+   `color_dodge`, the transparent-backdrop test does not merely *fail to
+   notice* a missing divide-by-zero guard on this backend: the guard's
+   removal produces **genuinely identical output** for those six modes here,
+   so there is nothing for a test to notice.
+3. **Resolved in 0.109.1: the mechanism is NaN laundering through
+   `min`/`max`, and 0.109.0's own "refutation" of that was a confounded
+   experiment.** The diagnostic 0.109.0 ran — guard removed *and*
+   `fs_composite_darken`'s `min(cb, s.rgb)` reduced to plain `cb` — changed
+   two things at once. It removed the laundering operation, but it also
+   removed `cb`'s only *use* as an operand of `min`, replacing the formula
+   with a different masking pattern (`b = cb = bd.rgb / ab`, so the term the
+   fold multiplies by `ab == 0` is now the bare quotient rather than a
+   function of it). It therefore could not isolate laundering from algebraic
+   simplification, and its conclusion — that simplification of
+   `ab * (bd.rgb / ab)` → `bd.rgb` was the remaining candidate — does not
+   survive the follow-up.
+
+   **Two decisive experiments, both on real hardware (NVIDIA GeForce RTX
+   3090, Vulkan, DiscreteGpu):**
+
+   - **A `bd`-independent NaN.** `cb`'s fallback was forced to
+     `vec3<f32>(sqrt(-1.0 - opacity.value))` — a NaN that never touches
+     `bd`, and not constant-foldable, since it reads a uniform — while
+     `if (ab > 0.0) { cb = bd.rgb / ab; }` was left structurally intact.
+     The same **3-of-9 / 6-of-9** split appeared. Because the injected NaN
+     is not derived from `bd` at all, `ab * (bd.rgb / ab) → bd.rgb` cannot
+     explain it: algebraic simplification is **ruled out**, not merely
+     unfavoured.
+   - **A direct probe of the intrinsics.** `min(NaN, x)` and `max(NaN, x)`
+     were evaluated on this adapter and both return **`x`**, the non-NaN
+     operand. NaN is *laundered*, not propagated.
+
+   Together those exactly account for the split. `Multiply` (`cb * cs`),
+   `Screen` (`cb + cs - cb * cs`) and `Difference` (`abs(cb - cs)`) contain
+   no `min`/`max`, so the NaN reaches the output and trips the existing
+   `is_finite()` assertion. `Darken` (`min`), `Lighten` (`max`),
+   `LinearDodge` (`min(cb + cs, 1)`), `LinearBurn` (`max(cb + cs - 1, 0)`)
+   and `ColorBurn`/`ColorDodge` (guarded branches ending in
+   `min(1.0, ...)`) all launder the NaN into a finite value *before* it
+   reaches `fold_over`, where `ab == 0.0` multiplies it away regardless.
+
+   **This is backend-specific and must not be read as portable.** WGSL, and
+   SPIR-V's `FMin`/`FMax` beneath it, leave the result **undefined** when an
+   operand is NaN. This adapter happens to return the non-NaN operand; Metal
+   and DX12 are unverified, and a backend that propagated instead would make
+   all nine tests catch the guard's removal. The guard therefore stays
+   required — its justification is definedness across backends, not
+   observed behaviour on this one.
+
+   **What this means for the test suite, stated as strongly as the evidence
+   allows.** Three of the nine modes have guard-loss provably caught by an
+   existing test. For the other six, guard-loss is **output-equivalent on
+   this backend** — not undetected. No fixture change can close that: the
+   historical pattern this project has used before (retargeting a fixture's
+   opacity or channel values, as in 0.105.1 and 0.105.2) works when a
+   mutant produces *different* pixels that no fixture happens to look at,
+   and here the mutant produces the *correct* pixels. Closing it would take
+   a different kind of test — one asserting on an intermediate value inside
+   the shader rather than on its output — which is a real test-suite change
+   and deliberately **not** part of 0.109.1's prose-only correction.
 4. **Mutation 2 (transpose `src`/`backdrop` in the fold) was killed far
    harder than predicted: 55 tests, not ~9.** Swapping the roles in
    `fold_over`'s last two lines (`ab_inv * bd.rgb` and `inv * s.rgb`) failed
