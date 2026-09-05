@@ -84,7 +84,7 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // opacity` blend-math method (as of 0.110.0
 // `composite_multiply_over_with_opacity` and its
 // `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-// `color_burn`/`color_dodge`/`overlay`
+// `color_burn`/`color_dodge`/`overlay`/`hard_light`
 // siblings, named
 // as a family rather than relisted, since one more joins them every time
 // a mode is ported) --
@@ -97,8 +97,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // written against this file. That "25" is the 0.83.1 count and is not
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
 // (0.102.0), `Difference` (0.104.0), `LinearDodge` (0.105.0),
-// `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge` (0.108.0)
-// and `Overlay` (0.110.0) have
+// `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge` (0.108.0),
+// `Overlay` (0.110.0) and `HardLight` (0.111.0) have
 // since landed, and the live numbers live in `TileCompositor`'s own doc
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
@@ -129,12 +129,13 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
 // once per entry point.
 //
-// **What actually protects this guard is four tests, not ten (measured,
-// 0.109.0 for the first three and 0.110.0 for the fourth; explained,
-// 0.109.1).** Deleting the guard -- or replacing it with a `select()`,
-// which evaluates both arms -- fails
-// exactly four of the ten per-mode transparent-backdrop tests:
-// `multiply`'s, `screen`'s, `difference`'s and `overlay`'s. (Two naming
+// **What actually protects this guard is five tests, not eleven (measured,
+// 0.109.0 for the first three, 0.110.0 for the fourth and 0.111.0 for the
+// fifth; explained, 0.109.1).** Deleting the guard -- or replacing it with a
+// `select()`, which evaluates both arms -- fails
+// exactly five of the eleven per-mode transparent-backdrop tests:
+// `multiply`'s, `screen`'s, `difference`'s, `overlay`'s and
+// `hard_light`'s. (Two naming
 // shapes are in play: `multiply`'s and `darken`'s are
 // `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
 // the other eight are
@@ -161,6 +162,19 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // blend term has no NaN-laundering intrinsic on the path from `cb` to
 // `b`, which is a property to check when porting the next mode rather
 // than a fact about these four.
+//
+// **`HardLight` (0.111.0) is the fifth detector, and the rule above is what
+// predicted it — correctly, and measured before being written down here.**
+// Like its transposed twin `Overlay` it has neither a `min` nor a `max`, so
+// nothing launders the `NaN`. One detail differs from the sibling and is
+// worth stating because it does *not* change the outcome: this mode's
+// `select()` condition tests `s.rgb`, which the guard's removal does not
+// touch, so a well-defined arm is still chosen — but `cb` appears in **both**
+// arms (`cb * 2*Cs` and `cb + t - cb*t`), so `b` is `NaN` either way, and
+// `fold_over`'s `ab * b` is `0.0 * NaN`, which is `NaN`, not `0.0`.
+// Measured: with the guard deleted, `fs_composite_hard_light`'s texel 0 reads
+// back literally `(NaN, NaN, NaN, 1.0)`, failing both that test's finiteness
+// check and its value check. See PLAN.md's 0.111.0 entry.
 fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
     let ab = bd.a;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
@@ -925,13 +939,18 @@ fn fs_composite_color_dodge(in: VsOut) -> @location(0) vec4<f32> {
 //     reached by different expression sequences, so agreement there is
 //     algebraic and only *usually* bit-exact.
 //
-// They differ only where the two operands **straddle** `0.5`. `HardLight`
-// has no entry point in this file and is still CPU-only, so it is not a
-// wrong-arm hazard the way `LinearDodge`/`LinearBurn` are -- but it *is*
-// exactly what a transposed `src`/`backdrop` binding computes here, which
-// is why every fixture in this crate's `composite_overlay_*` tests, and
-// `aurora-app`'s `NORMAL_MULTIPLY_OVERLAY_STACK`, straddles `0.5` in all
-// three channels.
+// They differ only where the two operands **straddle** `0.5`. **As of
+// 0.111.0 `HardLight` has its own entry point below
+// (`fs_composite_hard_light`) and its own `aurora-app` dispatch arm, so it
+// is now a wrong-arm hazard in the fullest sense the burn and dodge pairs
+// are, and in one they are not: the hazard here is *bidirectional*, each of
+// the two modes being the other's transpose.** (Until 0.111.0 this comment
+// said `HardLight` was CPU-only with no entry point, which was true then and
+// is exactly the claim that port had to come back and correct.) It remains
+// what a transposed `src`/`backdrop` binding computes here — and now also
+// what a `fragment_entry` naming the sibling computes — which is why every
+// fixture in this crate's `composite_overlay_*` tests, and `aurora-app`'s
+// `NORMAL_MULTIPLY_OVERLAY_STACK`, straddles `0.5` in all three channels.
 //
 // **Asymmetry, and it is *conditional* -- the first of that kind.**
 // `ColorBurn` (0.107.0) and `ColorDodge` (0.108.0) are asymmetric
@@ -957,5 +976,156 @@ fn fs_composite_overlay(in: VsOut) -> @location(0) vec4<f32> {
     let t = 2.0 * cb - 1.0;
     let hi = s.rgb + t - s.rgb * t;
     let b = select(hi, lo, cb <= vec3<f32>(0.5));
+    return fold_over(s, bd, b);
+}
+
+// Mirrors `blend_channel(BlendMode::HardLight, cb, cs)` (src/composite.rs)
+// exactly. `HardLight` in the shader (0.111.0) — the eleventh blend mode on
+// the GPU path, and `fs_composite_overlay` directly above is its **exact
+// transposed twin**: `HardLight(Cb, Cs) = Overlay(Cs, Cb)` and
+// `Overlay(Cb, Cs) = HardLight(Cs, Cb)`. This is the first entry point in
+// this file whose transposed twin is *also* a live entry point here, so the
+// wrong-arm hazard is now **bidirectional between two real, shipped GPU
+// modes** rather than "computed by mistake but unreachable by dispatch",
+// which is what `fs_composite_overlay`'s own comment above could still say
+// about `HardLight` at 0.110.0 and can no longer.
+//
+// **Derived from `blend_channel`'s own `HardLight` arm, not from
+// `fs_composite_overlay`.** That discipline is not stylistic here, it is the
+// whole defence: the two entry points differ in exactly one *semantic*
+// place — which operand the branch tests — and copying the sibling and
+// "fixing it up" is precisely how that one place gets left alone.
+// `blend_channel`'s arm is:
+//
+//     BlendMode::HardLight => if cs <= 0.5 {
+//         blend_channel(BlendMode::Multiply, cb, 2.0 * cs)
+//     } else {
+//         blend_channel(BlendMode::Screen, cb, 2.0 * cs - 1.0)
+//     }
+//
+// Substituting `Multiply`'s `cb * cs` and `Screen`'s `cb + cs - cb * cs`
+// with **`cb` as the first operand of each delegate** (the opposite of
+// `Overlay`'s substitution, where the *source* is first) gives:
+//
+//     Cs <= 0.5:  B = Multiply(Cb, 2*Cs)   = Cb * 2*Cs
+//     Cs >  0.5:  B = Screen(Cb, 2*Cs - 1) = Cb + t - Cb*t,  t = 2*Cs - 1
+//
+// The branch tests the **source**. Both statements below keep
+// `blend_channel`'s own operand order and expression sequence verbatim
+// (`cb * (2.0 * s.rgb)`, not `(2.0 * s.rgb) * cb`; `cb + t - cb * t`, not an
+// algebraic rearrangement) because the CPU differential tests in
+// composite.rs assert **exact** equality and float addition is not
+// associative.
+//
+// **Measured, and it corrects what this comment first claimed.** The round
+// that wrote this asserted that `cb * (2.0 * s.rgb)` here, against the
+// sibling's `s.rgb * (2.0 * cb)`, "is the evidence this was not copy-pasted".
+// It is evidence for a *human reader* and nothing more: mutation (m) of the
+// round's matrix rewrote this `lo` arm into the sibling's exact shape and
+// **the entire suite stayed green**, on real hardware. That is not a coverage
+// gap, it is the collision rule's own "both operands `<= 0.5`" clause applied
+// to one arm -- `Cs * 2*Cb` and `Cb * 2*Cs` are both `2*Cb*Cs`, and
+// bit-identically so, `2*x` being exact and each form one rounding of the
+// same product. **The `lo` arm's operand order is therefore unobservable in
+// principle, and no test can or should claim to pin it.** What *is*
+// observable, and was confirmed by running it, is the `hi` arm's base operand
+// (writing `s.rgb + t - s.rgb * t` there kills all seven of this mode's
+// render tests and the app golden) and the `select()` condition (mutation
+// (c), which computes `Overlay` outright). So the derivation-from-the-Rust-arm
+// discipline earns its keep on the branch and the `hi` arm; on the `lo` arm it
+// buys readability, not correctness.
+//
+// **Written with `select()`, for the same reason the sibling above is** —
+// both arms are pure finite multiply/add on operands already in `[0, 1]`, so
+// evaluating the discarded one is harmless, unlike `color_burn_channel`'s
+// and `color_dodge_channel`'s, whose discarded arm divides by zero in
+// exactly the lanes their branch excludes. The condition is
+// `s.rgb <= vec3<f32>(0.5)`, **not** `cb <= vec3<f32>(0.5)`: the latter is
+// literally `fs_composite_overlay`, so that one token is the difference
+// between this mode and a second, redundant copy of its neighbour. The splat
+// is required for the same reason the sibling's is — WGSL's comparison
+// operators have no scalar/vector mixed overload, even though `*` and `-`
+// broadcast a scalar.
+//
+// **The two branches agree bit-exactly at `Cs == 0.5`.** The `lo` arm gives
+// `Cb * 1.0 = Cb`; the `hi` arm gives `t = 0.0` exactly, so
+// `Cb + 0.0 - Cb * 0.0 = Cb` — the same bits. So `HardLight` is continuous
+// there, **and a mutation flipping `<=` to `<` is unkillable in principle**,
+// exactly as for `Overlay`: the two arms compute identical bits on the only
+// input that distinguishes the two conditions.
+// `composite_hard_light_over_with_opacity_agrees_across_its_own_branch_
+// boundary` in composite.rs pins the continuity; nothing can pin the
+// comparison, and no test there claims to.
+//
+// **Four degeneracies, each verified algebraically against the two arms
+// above and each the *transpose* of the sibling's correspondingly-numbered
+// one — read them carefully rather than by analogy:**
+//
+//   1. `HardLight(0.5, Cs) = Cs` for **every** `Cs` — a *backdrop* channel
+//      at exactly `0.5` is indistinguishable from `Normal`. Both arms give
+//      it: `lo` is `0.5 * 2*Cs = Cs`, and `hi` is
+//      `0.5 + t - 0.5*t = 0.5 + 0.5*(2*Cs - 1) = Cs`. Note this is **not**
+//      the branch boundary here (the branch is on `Cs`), which is where it
+//      differs structurally from the sibling's degeneracy 1.
+//   2. `HardLight(Cb, 0.5) = Cb` for **every** `Cb` — a *source* channel at
+//      exactly `0.5` makes this mode a total no-op, **and this one *is* the
+//      branch boundary**: `lo` gives `Cb * (2*0.5) = Cb` and `hi` gives
+//      `t = 0.0`, so `Cb + 0.0 - Cb*0.0 = Cb`. That coincidence is what
+//      makes the `<=`/`<` mutation unkillable.
+//   3. `HardLight(Cb, 0) = 0` and `HardLight(Cb, 1) = 1` — a black or white
+//      *source* channel erases the backdrop (`lo` at `Cs = 0` is `Cb * 0`;
+//      `hi` at `Cs = 1` has `t = 1`, so `Cb + 1 - Cb`). The sibling's
+//      degeneracy 3 is on the *backdrop* side; do not carry it over.
+//      Deliberately **not** true of a `0` or `1` backdrop here:
+//      `HardLight(0, Cs)` is `0` on the low arm but `2*Cs - 1` on the high
+//      one, and `HardLight(1, Cs)` is `2*Cs` then `1`.
+//   4. `Cb == Cs` in a channel lets a transposed operand pair hide behind an
+//      accidental equality — and here that is stronger than "a transpose
+//      survives": by the collision rule below, `Cb == Cs` makes this mode
+//      and `Overlay` produce the *same* value, so such a channel cannot see
+//      a branch-on-the-wrong-operand mutation either.
+//
+// **The two-way collision rule, worked out rather than asserted.** The modes
+// agree exactly wherever `Cb` and `Cs` fall on the **same side** of `0.5`:
+//
+//   - both `<= 0.5`: `HardLight = Cb * 2*Cs` and `Overlay = Cs * 2*Cb`, both
+//     `2*Cb*Cs` — and bit-identically, since `2*x` is exact and each form is
+//     one rounding of the same product.
+//   - both `> 0.5`: `HardLight = 2*Cs + 2*Cb - 1 - 2*Cb*Cs` and
+//     `Overlay = 2*Cb + 2*Cs - 1 - 2*Cb*Cs` — the same value, reached by
+//     different expression sequences, so agreement there is algebraic and
+//     only *usually* bit-exact.
+//
+// They differ only where the two operands **straddle** `0.5`. Since both
+// modes are now live entry points here, that is simultaneously (a) what a
+// transposed `src`/`backdrop` binding on *this* pass computes, (b) what a
+// branch on `cb` instead of `s.rgb` computes, and (c) what a `fragment_entry`
+// naming the sibling computes — three distinct mutations that all land on the
+// same wrong answer. Every fixture in this crate's `composite_hard_light_*`
+// tests, and `aurora-app`'s `NORMAL_MULTIPLY_HARD_LIGHT_STACK`, therefore
+// straddles `0.5` in all three channels.
+//
+// **Asymmetry: conditional, the second of that kind.** `Overlay` (0.110.0)
+// was the first; `ColorBurn`/`ColorDodge` are asymmetric everywhere and the
+// other seven ported modes commutative everywhere. `B(Cb, Cs) = B(Cs, Cb)`
+// here in every channel whose two operands share a side of `0.5` (that is
+// the collision rule with `HardLight` on both sides), and differs only in a
+// straddling channel.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the ten entry points above;
+// no new binding, no new layout.
+@fragment
+fn fs_composite_hard_light(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    // blend_channel(HardLight, cb, cs): Multiply(cb, 2*cs) where cs <= 0.5,
+    // else Screen(cb, 2*cs - 1). The branch tests the SOURCE -- branching on
+    // `cb` here is `fs_composite_overlay`, one token away and directly above.
+    let lo = cb * (2.0 * s.rgb);
+    let t = 2.0 * s.rgb - 1.0;
+    let hi = cb + t - cb * t;
+    let b = select(hi, lo, s.rgb <= vec3<f32>(0.5));
     return fold_over(s, bd, b);
 }

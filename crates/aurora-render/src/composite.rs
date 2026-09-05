@@ -164,8 +164,12 @@ const LABEL_COLOR_DODGE_PASS: &str = "composite.color_dodge.pass";
 /// say which blend mode is at fault. Unlike the burn and dodge pairs
 /// above there is no near-name to disambiguate from here — `"overlay"`
 /// is unique in this file — but the *formula* has a twin: `HardLight`,
-/// which is `Overlay` with its two channel arguments swapped and is
-/// still CPU-only, so it has no label of its own to be confused with.
+/// which is `Overlay` with its two channel arguments swapped. That twin got
+/// its own four labels in 0.111.0 (`LABEL_HARD_LIGHT` and siblings below),
+/// so this comment's original "and is still CPU-only, so it has no label of
+/// its own to be confused with" is now false and is corrected rather than
+/// deleted: there *is* now a label to confuse this one with, and the two name
+/// formulas that differ in exactly one operand position.
 const LABEL_OVERLAY: &str = "composite.overlay";
 /// That method's own per-call uniform buffer.
 const LABEL_OVERLAY_UNIFORM: &str = "composite.overlay.opacity";
@@ -174,6 +178,27 @@ const LABEL_OVERLAY_BIND_GROUP: &str = "composite.overlay.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_OVERLAY_PASS: &str = "composite.overlay.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_hard_light_over_with_opacity`] (0.111.0)
+/// — the same four-label set the ten modes above each carry, for the
+/// same reason: eleven blend-math pipelines sharing one `"composite"` label
+/// would leave a `wgpu` validation message or a frame capture unable to
+/// say which blend mode is at fault. **This is the first label pair in this
+/// file whose two members name *mutually* transposed formulas**: `"overlay"`
+/// directly above is `HardLight` with its two channel arguments swapped, and
+/// `"hard_light"` is `Overlay` with its two swapped. Unlike the burn pair
+/// and the guarded-division pair the confusion risk is not a shared word at
+/// all — the two names look nothing alike — which is exactly why the
+/// labels are the *safe* part of this port and the shader's own branch
+/// operand is the dangerous part.
+const LABEL_HARD_LIGHT: &str = "composite.hard_light";
+/// That method's own per-call uniform buffer.
+const LABEL_HARD_LIGHT_UNIFORM: &str = "composite.hard_light.opacity";
+/// That method's own per-call bind group.
+const LABEL_HARD_LIGHT_BIND_GROUP: &str = "composite.hard_light.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_HARD_LIGHT_PASS: &str = "composite.hard_light.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -184,7 +209,7 @@ const LABEL_OVERLAY_PASS: &str = "composite.overlay.pass";
 /// [`TileCompositor`]'s blend-math `composite_*_over_with_opacity`
 /// methods — `composite_multiply_over_with_opacity` and its
 /// `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-/// `color_burn`/`color_dodge`/`overlay`
+/// `color_burn`/`color_dodge`/`overlay`/`hard_light`
 /// siblings,
 /// deliberately named as a family rather than relisted here, since the
 /// list grows by one every time a mode is ported — five
@@ -208,7 +233,12 @@ const LABEL_OVERLAY_PASS: &str = "composite.overlay.pass";
 /// `Overlay` is a third shape again — a *branch* written as one
 /// componentwise `select()`, four shader lines rather than one or five —
 /// and cost the Rust side the same one const, one wrapper and four labels
-/// as every mode before it.)
+/// as every mode before it. `HardLight`, the eleventh, in 0.111.0, is the
+/// same shape as `Overlay` and cost the same; what was new in its round was
+/// not the plumbing but that its transposed twin was already *live* here, so
+/// a mistyped `fragment_entry` could for the first time silently name the one
+/// wrong formula that a transposed binding and a wrong branch operand also
+/// produce.)
 ///
 /// There is deliberately **no encoder label here any more** (0.86.0).
 /// These methods no longer create a `wgpu::CommandEncoder` at all — the
@@ -345,17 +375,40 @@ const BLEND_PASS_COLOR_DODGE: BlendPass = BlendPass {
 /// [`BlendMode::Overlay`]'s, likewise (0.110.0). Every field differs from
 /// every const above, `fragment_entry` included — the hazard here is not a
 /// near-name (there is none) but the *formula's* twin: `HardLight` is this
-/// mode with its two channel arguments swapped, and it has no entry point
-/// in `shaders/composite.wgsl` at all, so a mistyped `fragment_entry` here
-/// cannot silently name it. What it can name is any of the nine other
-/// modes, which is mutation (g) of this round's set, killed by every
-/// `composite_overlay_*` test.
+/// mode with its two channel arguments swapped.
+///
+/// **Corrected in 0.111.0.** This comment used to continue "and it has no
+/// entry point in `shaders/composite.wgsl` at all, so a mistyped
+/// `fragment_entry` here cannot silently name it". That was true at 0.110.0
+/// and is now false: `fs_composite_hard_light` exists, so a mistyped
+/// `fragment_entry` here *can* silently name this mode's own transposed twin
+/// — the single worst wrong value to produce, since it is also what a
+/// transposed binding and a branch on the wrong operand produce. It stays
+/// killed by every `composite_overlay_*` test, whose fixtures all straddle
+/// `0.5` in all three channels precisely so that the two modes disagree
+/// there.
 const BLEND_PASS_OVERLAY: BlendPass = BlendPass {
     fragment_entry: "fs_composite_overlay",
     pipeline: LABEL_OVERLAY,
     uniform: LABEL_OVERLAY_UNIFORM,
     bind_group: LABEL_OVERLAY_BIND_GROUP,
     pass: LABEL_OVERLAY_PASS,
+};
+
+/// [`BlendMode::HardLight`]'s, likewise (0.111.0). Every field differs from
+/// every const above, and this is the first const here whose `fragment_entry`
+/// has a **mutually** transposed partner already in the file: naming
+/// `"fs_composite_overlay"` instead of `"fs_composite_hard_light"` computes
+/// this mode with its two channel arguments swapped, which is mutation (g) of
+/// this round's set and is killed by every `composite_hard_light_*` test —
+/// every one of whose fixtures straddles `0.5` in all three channels, since
+/// that is the only region where the two modes disagree at all.
+const BLEND_PASS_HARD_LIGHT: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_hard_light",
+    pipeline: LABEL_HARD_LIGHT,
+    uniform: LABEL_HARD_LIGHT_UNIFORM,
+    bind_group: LABEL_HARD_LIGHT_BIND_GROUP,
+    pass: LABEL_HARD_LIGHT_PASS,
 };
 
 /// The byte size of `composite_over_with_opacity`'s own uniform buffer —
@@ -1568,32 +1621,34 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// the seventh,
 /// [`Self::composite_color_burn_over_with_opacity`] (0.107.0) the eighth,
 /// [`Self::composite_color_dodge_over_with_opacity`] (0.108.0) the
-/// ninth, and [`Self::composite_overlay_over_with_opacity`] (0.110.0) the
+/// ninth, [`Self::composite_overlay_over_with_opacity`] (0.110.0) the
+/// tenth, and [`Self::composite_hard_light_over_with_opacity`] (0.111.0)
+/// the eleventh — that last one being the exact transposed twin of the
 /// tenth,
 /// each built to exactly the same shape.
-/// The remaining 16 modes have no dedicated blend-math WGSL entry point
+/// The remaining 15 modes have no dedicated blend-math WGSL entry point
 /// of their own, and wait on one — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
-/// 16 is "26 minus the ten, `Multiply`, `Darken`, `Lighten`, `Screen`,
-/// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`
-/// and `Overlay`, done so
+/// 15 is "26 minus the eleven, `Multiply`, `Darken`, `Lighten`, `Screen`,
+/// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
+/// `Overlay` and `HardLight`, done so
 /// far."
 ///
-/// **`Normal` is one of those 16 and is *not* CPU-only**, so read the
+/// **`Normal` is one of those 15 and is *not* CPU-only**, so read the
 /// figure as "no blend-math shader", never as "no GPU path":
 /// [`Self::composite_over_with_opacity`]'s fixed-function
 /// `Blend::AlphaBlending` unit already expresses `Normal` on the GPU,
 /// which is exactly why it needs no formula in
 /// `shaders/composite.wgsl`. The modes genuinely left to
-/// `composite_tile_cpu` are therefore the other **15**, and that is
+/// `composite_tile_cpu` are therefore the other **14**, and that is
 /// precisely `aurora-app`'s own count of what its GPU predicate
-/// rejects: 27 real `aurora_doc::BlendMode` variants minus the twelve it
+/// rejects: 27 real `aurora_doc::BlendMode` variants minus the thirteen it
 /// admits (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`,
 /// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
-/// `Overlay` and `Dissolve`). The two
-/// figures — 16
-/// here, 15 there —
+/// `Overlay`, `HardLight` and `Dissolve`). The two
+/// figures — 15
+/// here, 14 there —
 /// count different
 /// things, and the one mode between them is `Normal`. `Dissolve` is in
 /// neither set: absent from this crate's enum altogether, and *admitted*
@@ -1643,9 +1698,17 @@ pub struct TileCompositor {
 /// `shaders/composite.wgsl`: `fs_composite_multiply` (0.83.0),
 /// `fs_composite_darken` (0.85.0), `fs_composite_lighten` (0.95.0),
 /// `fs_composite_screen` (0.102.0), `fs_composite_difference`
-/// (0.104.0) and `fs_composite_linear_dodge` (0.105.0) so
+/// (0.104.0), `fs_composite_linear_dodge` (0.105.0),
+/// `fs_composite_linear_burn` (0.106.0), `fs_composite_color_burn`
+/// (0.107.0), `fs_composite_color_dodge` (0.108.0),
+/// `fs_composite_overlay` (0.110.0) and `fs_composite_hard_light`
+/// (0.111.0) so
 /// far. A newly ported mode needs its
-/// own entry point and its own `PipelineKey`, but no new layout.
+/// own entry point and its own `PipelineKey`, but no new layout. (This list
+/// had gone un-updated since 0.105.0 and was four entry points stale before
+/// 0.111.0 brought it current; it is a roster, not a count, so nothing
+/// depended on it — but "every such entry point" is a claim, so it is
+/// corrected rather than left to drift further.)
 ///
 /// A free function rather than more lines inside
 /// [`TileCompositor::new`] purely to keep that constructor under
@@ -2862,8 +2925,8 @@ impl TileCompositor {
     /// `aurora-app`'s standing `every_gpu_blend_math_dispatch_arm_has_a_
     /// fixture_that_could_see_a_transposed_argument` guard is deliberately
     /// *not* special-cased for either mode: non-unit opacity is now
-    /// sufficient-but-not-necessary for three of the ten (`Overlay`, 0.110.0,
-    /// joined them, conditionally), and a conservative
+    /// sufficient-but-not-necessary for four of the eleven (`Overlay`, 0.110.0,
+    /// and `HardLight`, 0.111.0, joined them, both conditionally), and a conservative
     /// guard that still demands it costs nothing and keeps the rule
     /// uniform.
     ///
@@ -2925,8 +2988,12 @@ impl TileCompositor {
     /// - `Cb > 0.5`: `B = Screen(Cs, 2*Cb - 1) = Cs + t - Cs*t`, `t = 2*Cb - 1`.
     ///
     /// The branch tests the **backdrop**, not the source. Branching on the
-    /// source instead computes `HardLight`, a different, still-CPU-only
-    /// mode — mutation (c) of this round's set.
+    /// source instead computes `HardLight` — mutation (c) of this round's set.
+    /// (This sentence said "a different, still-CPU-only mode" at 0.110.0;
+    /// 0.111.0 ported `HardLight` to
+    /// [`Self::composite_hard_light_over_with_opacity`], so it is now a
+    /// different mode that is *also* on the GPU path, and the two are each
+    /// other's transpose in both directions.)
     ///
     /// **`fs_composite_overlay` is the first entry point in
     /// `shaders/composite.wgsl` to use `select()`, and that is a real
@@ -2970,12 +3037,15 @@ impl TileCompositor {
     /// instead, putting every backdrop channel on or below the branch
     /// boundary and leaving the high arm unreachable.
     ///
-    /// **The `HardLight` collision rule.**
-    /// `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two modes agree exactly
-    /// wherever `Cb` and `Cs` sit on the **same side** of `0.5`: both `<=`
-    /// gives `2*Cb*Cs` either way, and both `>` gives
+    /// **The `HardLight` collision rule, and as of 0.111.0 it runs both
+    /// ways.** `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two modes agree
+    /// exactly wherever `Cb` and `Cs` sit on the **same side** of `0.5`: both
+    /// `<=` gives `2*Cb*Cs` either way, and both `>` gives
     /// `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way. They differ only where the
-    /// operands **straddle** `0.5`.
+    /// operands **straddle** `0.5`. Since
+    /// [`Self::composite_hard_light_over_with_opacity`] now exists, that twin
+    /// is also reachable from *this* pass by a mistyped `fragment_entry`, not
+    /// only computable by getting the operand order wrong.
     ///
     /// **Asymmetry, and it is *conditional* — the first of that kind.**
     /// `ColorBurn` (0.107.0) and `ColorDodge` (0.108.0) are asymmetric
@@ -3026,6 +3096,157 @@ impl TileCompositor {
         );
     }
 
+    /// `HardLight` in the shader (0.111.0) — the eleventh blend mode on the
+    /// GPU path, and **the exact transposed twin of
+    /// [`Self::composite_overlay_over_with_opacity`] directly above**:
+    /// `HardLight(Cb, Cs) = Overlay(Cs, Cb)` and
+    /// `Overlay(Cb, Cs) = HardLight(Cs, Cb)`. This is the first round in
+    /// which the transposed twin of the mode being ported was **already a
+    /// live entry point and dispatch arm**, so the wrong-arm hazard here is
+    /// bidirectional between two real, shipped GPU modes rather than
+    /// "computable by mistake but unreachable by dispatch", which is all
+    /// 0.110.0 could say about it.
+    ///
+    /// **Every "why" about the surrounding "over" lives on
+    /// [`Self::composite_multiply_over_with_opacity`]**: the aliasing rule
+    /// (`dst` must not be `backdrop`), the `Blend::None` replace, the
+    /// parameter order, the deliberately unclamped `sa * opacity` product,
+    /// and the `wgpu` validation-panic gap. None of that is mode-specific.
+    ///
+    /// **The formula, derived from `blend_channel`'s own arm and deliberately
+    /// *not* from the sibling's shader.** That arm is a real two-branch body
+    /// (unlike `Overlay`'s, which is one line delegating here with its
+    /// arguments swapped): `Cs <= 0.5` is
+    /// `blend_channel(Multiply, Cb, 2*Cs)`, else
+    /// `blend_channel(Screen, Cb, 2*Cs - 1)`. Substituting those two
+    /// delegates with **`Cb` as the first operand of each** — the opposite of
+    /// the sibling's substitution, where the source is first — gives:
+    ///
+    /// - `Cs <= 0.5`: `B = Cb * 2*Cs`;
+    /// - `Cs > 0.5`: `B = Cb + t - Cb*t`, `t = 2*Cs - 1`.
+    ///
+    /// The branch tests the **source**, not the backdrop. Branching on the
+    /// backdrop instead computes `Overlay` — mutation (c) of this round's
+    /// set, and the reason `fs_composite_hard_light` was written from the
+    /// Rust arm rather than copied from `fs_composite_overlay` and adjusted:
+    /// the two shaders differ in exactly one semantic place, and copy-and-fix
+    /// is precisely how that place gets left alone.
+    ///
+    /// **How much of that discipline is *testable*, measured rather than
+    /// assumed.** The visible textual difference is `cb * (2.0 * s.rgb)` here
+    /// against the sibling's `s.rgb * (2.0 * cb)` — and 0.111.0's mutation
+    /// (m) rewrote this mode's low arm into the sibling's exact shape and
+    /// watched the whole suite stay green on real hardware. That is correct
+    /// rather than a coverage gap: both forms are `2*Cb*Cs`, bit-identically,
+    /// by the collision rule's own "both operands `<= 0.5`" clause. **The low
+    /// arm's operand order is unobservable in principle.** The *high* arm's
+    /// base operand is not — writing `Cs + t - Cs*t` there kills all seven
+    /// `composite_hard_light_*` tests and the app-level golden, run for real
+    /// — and neither is the branch condition (mutation (c), which computes
+    /// `Overlay` outright). So the derivation discipline is load-bearing on
+    /// the branch and the high arm, and cosmetic on the low one; stated
+    /// because the opposite is the natural thing to assume.
+    ///
+    /// **Written with `select()`, for the sibling's reason and not a new
+    /// one**: both arms are finite multiply/add on operands already in
+    /// `[0, 1]`, so evaluating the discarded one is harmless, unlike
+    /// [`Self::composite_color_burn_over_with_opacity`]'s and
+    /// [`Self::composite_color_dodge_over_with_opacity`]'s, whose discarded
+    /// arm divides by zero in exactly the lanes their branch excludes.
+    ///
+    /// **The two branches agree bit-exactly at `Cs == 0.5`**: the low arm
+    /// gives `Cb * 1.0 = Cb`, the high arm gives `t == 0.0` exactly and so
+    /// `Cb + 0.0 - Cb * 0.0 = Cb`. So the mode is continuous there — pinned
+    /// by `composite_hard_light_over_with_opacity_agrees_across_its_own_branch_boundary`
+    /// — **and a mutation flipping `<=` to `<` is unkillable in principle**,
+    /// exactly as for `Overlay`, since the two arms compute identical bits on
+    /// the only input that distinguishes the two conditions. Disclosed, not
+    /// tested around; run for real in this round and it survived, as
+    /// predicted.
+    ///
+    /// **Three degeneracies that constrain every fixture, all verified
+    /// algebraically, and each the *transpose* of the sibling's
+    /// correspondingly-numbered one rather than a copy of it:**
+    ///
+    /// 1. `HardLight(0.5, Cs) = Cs` for every `Cs` — a *backdrop* channel at
+    ///    exactly `0.5` is `Normal`. Both arms give it
+    ///    (`0.5 * 2*Cs = Cs`, and `0.5 + 0.5*(2*Cs - 1) = Cs`). Note this is
+    ///    **not** the branch boundary here, which is the structural
+    ///    difference from the sibling.
+    /// 2. `HardLight(Cb, 0.5) = Cb` for every `Cb` — a *source* channel at
+    ///    exactly `0.5` makes this mode a total no-op, **and it is** the
+    ///    branch boundary, which is why the `<=`/`<` mutation is unkillable.
+    /// 3. `HardLight(Cb, 0) = 0` and `HardLight(Cb, 1) = 1` — a black or
+    ///    white *source* channel erases the backdrop. The sibling's
+    ///    equivalent is on the backdrop side; a `0` or `1` *backdrop* is
+    ///    **not** degenerate here (`HardLight(0, Cs)` is `0` on the low arm
+    ///    but `2*Cs - 1` on the high one).
+    ///
+    /// No solid-colour fixture in this crate's `composite_hard_light_*` tests
+    /// uses `0.5`, `0.0` or `1.0` in any channel of either operand, except
+    /// the branch-boundary test, whose red source channel is `0.5` on
+    /// purpose. In `aurora-app`'s `NORMAL_MULTIPLY_HARD_LIGHT_STACK`
+    /// **neither operand of the actual blend** has a channel at exactly
+    /// `0.5`: `Cb = (0.65625, 0.375, 0.1875)` after the `Multiply` fold,
+    /// against `Cs = (0.25, 0.75, 0.875)`.
+    ///
+    /// **The two-way collision rule.** The two modes agree exactly wherever
+    /// `Cb` and `Cs` sit on the **same side** of `0.5`: both `<=` gives
+    /// `2*Cb*Cs` either way, and both `>` gives
+    /// `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way. They differ only where the
+    /// operands **straddle** `0.5` — so three separate mutations (a
+    /// transposed `src`/`backdrop` binding, a branch on `cb`, and a
+    /// `fragment_entry` naming `fs_composite_overlay`) all land on the same
+    /// wrong answer, and all three are invisible in a non-straddling channel.
+    /// Every fixture here straddles in all three.
+    ///
+    /// **Asymmetry, *conditional* — the second of that kind.** `ColorBurn`
+    /// (0.107.0) and `ColorDodge` (0.108.0) are asymmetric everywhere; the
+    /// seven modes before them are commutative everywhere; `Overlay`
+    /// (0.110.0) was the first conditional case and this is the second. By
+    /// the collision rule with `HardLight` on both sides,
+    /// `B(Cb, Cs) == B(Cs, Cb)` in every channel whose operands share a side
+    /// of `0.5`. `aurora-app`'s standing
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument` guard is deliberately not special-cased for this
+    /// mode either: non-unit opacity stays a conservative,
+    /// sufficient-but-not-necessary requirement.
+    ///
+    /// **The application calls this** (0.111.0): `aurora-app`'s
+    /// `document_qualifies_for_gpu_compositing` admits `HardLight` and
+    /// `begin_gpu_composite_tile` dispatches here for every `HardLight` root
+    /// layer, through the same single ping-pong spare accumulator any other
+    /// blend-math layer uses. Its dispatch arm was instrumented from day one
+    /// (`GpuBlendDispatch::HardLight` in that crate), so no test here can be
+    /// satisfied by a silent CPU fallback.
+    ///
+    /// All three views must be `Rgba16Float` and the same size; `dst`'s
+    /// owning texture must include `RENDER_ATTACHMENT` usage, and both
+    /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
+    /// `opacity` is clamped to `0.0..=1.0`.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — see
+    /// [`Self::composite_over_with_opacity`] for the full account.
+    pub fn composite_hard_light_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_HARD_LIGHT,
+        );
+    }
+
     /// The one body behind every shader-computed blend mode: build (or
     /// reuse) `pass.fragment_entry`'s pipeline, upload the clamped
     /// opacity, bind `src`/backdrop/uniform, and draw one fullscreen
@@ -3058,8 +3279,9 @@ impl TileCompositor {
     /// the sixth), `composite_linear_burn_over_with_opacity` (0.106.0,
     /// the seventh), `composite_color_burn_over_with_opacity` (0.107.0,
     /// the eighth), `composite_color_dodge_over_with_opacity` (0.108.0,
-    /// the ninth) and `composite_overlay_over_with_opacity` (0.110.0, the
-    /// tenth) without a line of change, which is the bet that
+    /// the ninth), `composite_overlay_over_with_opacity` (0.110.0, the
+    /// tenth) and `composite_hard_light_over_with_opacity` (0.111.0, the
+    /// eleventh) without a line of change, which is the bet that
     /// extraction was making — the
     /// same discipline, and the same "no existing test needed to change"
     /// bar, 0.83.1 used when it extracted [`composite_pipeline`] and
@@ -3068,7 +3290,8 @@ impl TileCompositor {
     /// `composite_lighten_*`, `composite_screen_*`,
     /// `composite_difference_*`, `composite_linear_dodge_*`,
     /// `composite_linear_burn_*`, `composite_color_burn_*`,
-    /// `composite_color_dodge_*` and `composite_overlay_*`
+    /// `composite_color_dodge_*`, `composite_overlay_*` and
+    /// `composite_hard_light_*`
     /// differentials in
     /// this module's tests, each checking the shader's output against
     /// [`composite_tile_cpu`]'s own on real hardware, are what makes that
@@ -5764,9 +5987,10 @@ mod tests {
     /// silently.
     ///
     /// **Since 0.109.0 the guard is shared, not per entry point, and this
-    /// is one of only four of the ten per-mode versions of this test
-    /// that still detect its removal** — with `screen`'s, `difference`'s
-    /// and, as of 0.110.0, `overlay`'s. `Multiply`'s `cb * s.rgb`
+    /// is one of only five of the eleven per-mode versions of this test
+    /// that still detect its removal** — with `screen`'s, `difference`'s,
+    /// `overlay`'s (0.110.0) and `hard_light`'s (0.111.0). `Multiply`'s
+    /// `cb * s.rgb`
     /// propagates a `NaN`
     /// instead of laundering it through a `min`/`max`, which is exactly
     /// why. See `composite.wgsl`'s disclosure beside `straight_backdrop()`
@@ -6894,13 +7118,14 @@ mod tests {
     // `ab > 0.0` guard", and 0.109.1 corrected it here and at the six
     // sibling section headers below.** Since 0.109.0 the guard is written
     // *once*, in `composite.wgsl`'s `straight_backdrop()`, and shared by
-    // all ten blend-math entry points, so guard independence is not a
+    // all eleven blend-math entry points, so guard independence is not a
     // per-entry-point property any more. It is worse than that for this
     // mode specifically: with the guard deleted, `composite_lighten_over_
     // with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
     // still *passes*, because `max()` launders the resulting NaN into the
     // finite operand before it reaches the fold. Only `multiply`,
-    // `screen`, `difference` and (as of 0.110.0) `overlay` can detect the
+    // `screen`, `difference`, `overlay` (0.110.0) and `hard_light`
+    // (0.111.0) can detect the
     // guard's removal at all;
     // for the other six modes -- this one included -- removing it is
     // output-equivalent on Vulkan/NVIDIA, not merely undetected, so no
@@ -9237,11 +9462,12 @@ mod tests {
     ///
     /// **Confirmed by measurement in 0.109.0.** The guard now lives once in
     /// `composite.wgsl`'s shared `straight_backdrop()`, and deleting it
-    /// fails exactly four of the ten per-mode versions of this test —
-    /// `multiply`'s, `screen`'s, this one and (as of 0.110.0) `overlay`'s —
+    /// fails exactly five of the eleven per-mode versions of this test —
+    /// `multiply`'s, `screen`'s, this one, `overlay`'s (0.110.0) and
+    /// `hard_light`'s (0.111.0) —
     /// for exactly that reason,
     /// while the other six launder the `NaN` through a `min`/`max`. So this
-    /// test is one of the four that genuinely protects the shared guard.
+    /// test is one of the five that genuinely protects the shared guard.
     /// See `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
@@ -15446,6 +15672,1209 @@ mod tests {
              (0.0, 0.0), Exclusion (0.625, 0.5625), ColorBurn (0.0, 0.0) and ColorDodge \
              (1.0, 0.6667) -- while red agrees with Normal, Lighten and HardLight by \
              construction, which is what degeneracy 1 means."
+        );
+    }
+
+    // -- Real in-shader blend-mode math on the GPU, slice 11 of the
+    // blend-mode port: `HardLight`, via
+    // `TileCompositor::composite_hard_light_over_with_opacity` and the
+    // `fs_composite_hard_light` entry point (0.111.0).
+    //
+    // **Seven tests, mirroring the `Overlay` suite directly above** -- the
+    // standard six (this mode's own arithmetic in both arms, its own
+    // un-premultiply branch, its own spatial addressing, its own
+    // opacity-scaled fold, its own unclamped `s.a * opacity` product, and its
+    // own collapse to the source alone at a zero accumulator alpha) plus a
+    // seventh pinning the two arms' agreement at this mode's own branch
+    // boundary. No eighth: like `Overlay` and unlike `ColorBurn`/`ColorDodge`
+    // there is no guard, no undefined operation and no edge-case semantics
+    // that only fire at `0` or `1` -- only the boundary, which test 7 is.
+    // The out-of-range-*opacity* case every suite since `Darken` omits is
+    // omitted again, for the same disclosed reason (it lives in one shared
+    // Rust line that the `Multiply` and `Darken` suites already pin).
+    //
+    // **The formula, and where it comes from -- this is the load-bearing
+    // sentence of the whole round.** `blend_channel`'s own `HardLight` arm is
+    // a real two-branch body:
+    //
+    //     Cs <= 0.5:  B = Multiply(Cb, 2*Cs)   = Cb * 2*Cs
+    //     Cs >  0.5:  B = Screen(Cb, 2*Cs - 1) = Cb + t - Cb*t,  t = 2*Cs - 1
+    //
+    // with **`Cb` as the first operand of each delegate**. The branch tests
+    // the **source**, which is the one and only place this mode differs from
+    // `Overlay` directly above -- so `fs_composite_hard_light` was derived
+    // from that Rust arm rather than by copying `fs_composite_overlay` and
+    // transposing it, since copy-and-fix is exactly how a single semantic
+    // difference gets left alone. The textual evidence survives in the
+    // shader: `cb * (2.0 * s.rgb)` here, `s.rgb * (2.0 * cb)` there --
+    // **though only the *reader* can use that, not a test.** Mutation (m) of
+    // this round's matrix rewrote the low arm into the sibling's exact shape
+    // and every test here stayed green, correctly: both forms are `2*Cb*Cs`
+    // bit-identically, by the collision rule's own "both `<= 0.5`" clause. The
+    // *high* arm's base operand and the `select()` condition are the parts
+    // that are observable, and both were confirmed killed by running them.
+    //
+    // **This is the first round in which the mode being ported has a
+    // transposed twin that is *already* a live entry point and dispatch
+    // arm.** `HardLight(Cb, Cs) = Overlay(Cs, Cb)` *and*
+    // `Overlay(Cb, Cs) = HardLight(Cs, Cb)`, so three different mutations --
+    // a transposed `src`/`backdrop` binding, a branch on `cb` instead of
+    // `s.rgb`, and a `fragment_entry` naming `fs_composite_overlay` -- all
+    // produce the same wrong answer, and all three are invisible in any
+    // channel whose operands do not straddle `0.5`. At 0.110.0 the sibling
+    // suite could still say its twin was "CPU-only, so not a wrong-arm
+    // hazard"; that is no longer true in either direction.
+    //
+    // **The two arms agree bit-exactly at `Cs == 0.5`, so one mutation is
+    // unkillable in principle.** The low arm gives `Cb * 1.0`; the high arm
+    // gives `t == 0.0` exactly and so `Cb + 0.0 - Cb * 0.0`. Both are `Cb`,
+    // to the bit. Test 7 pins that continuity. **Nothing can pin the
+    // comparison itself**: flipping `<=` to `<` changes the arm taken only at
+    // `Cs == 0.5`, where the two arms produce identical bits. That mutation
+    // was run for real in this round and survived, as predicted; it is
+    // disclosed here rather than papered over with a test that would not mean
+    // what it claimed.
+    //
+    // **Four degeneracies, each verified algebraically against the two arms
+    // above, and each the *transpose* of the sibling suite's
+    // correspondingly-numbered one -- read them, do not carry the sibling's
+    // over by analogy:**
+    //
+    //   1. `HardLight(0.5, Cs) = Cs` -- a *backdrop* channel at exactly `0.5`
+    //      is indistinguishable from `Normal` (and from `Lighten` wherever
+    //      `Cs >= Cb`). Both arms give it. **This is not the branch boundary
+    //      here**, which is the structural difference from `Overlay`, where
+    //      the same-numbered degeneracy is.
+    //   2. `HardLight(Cb, 0.5) = Cb` for **every** `Cb` -- a *source* channel
+    //      at exactly `0.5` makes this mode a total no-op, **and it is** the
+    //      branch boundary. Both arms give it: `Cb * (2*0.5) = Cb`, and
+    //      `t = 0.0` so `Cb + 0.0 - Cb*0.0 = Cb`. That coincidence is
+    //      precisely why the `<=` -> `<` mutation cannot be killed. No
+    //      solid-colour fixture below uses `0.5` in any channel of either
+    //      operand except test 7, whose red *source* is `0.5` on purpose.
+    //   3. `HardLight(Cb, 0) = 0` and `HardLight(Cb, 1) = 1` -- a black or
+    //      white *source* channel erases the backdrop. Note the side: the
+    //      sibling's degeneracy 3 is a black/white *backdrop*, and a
+    //      black/white backdrop is **not** degenerate here
+    //      (`HardLight(0, Cs)` is `0` on the low arm but `2*Cs - 1` on the
+    //      high one; `HardLight(1, Cs)` is `2*Cs` then `1`). The
+    //      solid-colour fixtures keep every operand strictly inside `(0, 1)`;
+    //      tests 3 and 6 cannot.
+    //   4. `Cb == Cs` in a channel hides a transposed operand pair -- and
+    //      here it hides more than that: by the collision rule such a channel
+    //      makes this mode and `Overlay` produce the *same* value, so it
+    //      cannot see a wrong-branch-operand mutation either. No solid-colour
+    //      fixture has one.
+    //
+    // **The two-way collision rule, worked out rather than asserted, and the
+    // single most important thing about this suite's fixtures.** The two
+    // modes agree exactly wherever `Cb` and `Cs` fall on the **same side** of
+    // `0.5`: both `<=` gives `2*Cb*Cs` either way (bit-identically, `2*x`
+    // being exact and each form one rounding of the same product), and both
+    // `>` gives `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way (the same value by
+    // different expression sequences, so only usually bit-identical). They
+    // differ **only** where the operands straddle `0.5`. **So all three
+    // channels of every solid-colour fixture below straddle `0.5`**, chosen
+    // for that reason and not incidentally.
+    //
+    // **Asymmetry, *conditional* -- the second of that kind on the GPU
+    // path.** `ColorBurn` (0.107.0) and `ColorDodge` (0.108.0) are asymmetric
+    // everywhere; the seven modes before them are commutative everywhere;
+    // `Overlay` (0.110.0) was the first conditional case and this is the
+    // second. `B(Cb, Cs) == B(Cs, Cb)` in every channel whose operands share
+    // a side of `0.5`.
+    //
+    // **What is not confused with what.** `Overlay` is this mode's
+    // transposed twin and is *live*, above. `Multiply` and `Screen` are its
+    // two arms seen in isolation -- each arm is one of them with a doubled
+    // **source** (the sibling doubles the backdrop), so a fixture that only
+    // ever took one arm could not distinguish `HardLight` from a plain
+    // `Multiply`/`Screen` with the wrong operand scale. Every solid-colour
+    // fixture below therefore takes **both** arms across its three channels.
+    // `SoftLight`, `VividLight`, `PinLight`, `LinearLight` and `HardMix` are
+    // the rest of the overlay-and-light family and all remain CPU-only, so
+    // none is reachable by a wrong `fragment_entry`. Note in particular that
+    // none of `VividLight`, `PinLight` or `HardMix` delegates to `HardLight`
+    // in `blend_channel` (they go to `ColorBurn`/`ColorDodge`,
+    // `Darken`/`Lighten`, and `VividLight` respectively) -- the only CPU arm
+    // that delegates here is `Overlay`'s, and this round left it untouched.
+    //
+    // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
+    // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
+    // benchmarks stay comparable across it, unlike `Screen`'s round.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`,
+    // NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu). That is one backend on
+    // one vendor: Metal and DX12 remain unverified for
+    // `fs_composite_hard_light`, and the sibling's specific caveat applies
+    // verbatim -- `select()` on a `vec3<bool>` is a construct only these two
+    // entry points use, so no round before 0.110.0 supplies cross-backend
+    // evidence for it.
+
+    #[test]
+    /// The plain-arithmetic case, and the one test here that proves **both**
+    /// arms fire in the same draw.
+    ///
+    /// An opaque `(0.65625, 0.375, 0.1875)` accumulator under a
+    /// `(0.25, 0.75, 0.875)` source at its own `0.5` alpha — **deliberately
+    /// the same two colours as the `Overlay` suite's test 1**, so the only
+    /// thing that differs between the two tests is which operand the branch
+    /// reads, and the two goldens are therefore a direct read-out of the
+    /// collision rule. Red's *source* is below `0.5` and takes the `Multiply`
+    /// arm; green's and blue's are above it and take the `Screen` arm:
+    ///
+    /// - red: `B = 0.65625 * 2*0.25 = 0.65625 * 0.5 = 0.328125`;
+    /// - green: `t = 2*0.75 - 1 = 0.5`, so
+    ///   `B = 0.375 + 0.5 - 0.375*0.5 = 0.6875`;
+    /// - blue: `t = 2*0.875 - 1 = 0.75`, so
+    ///   `B = 0.1875 + 0.75 - 0.1875*0.75 = 0.796875`.
+    ///
+    /// The "over" then folds that in at the source's effective alpha
+    /// (`0.5 * Cb + 0.5 * B`, the accumulator being opaque), giving
+    /// `(0.4921875, 0.53125, 0.4921875)` at alpha `1.0`.
+    ///
+    /// **All three channels straddle `0.5`** (red `Cb > 0.5 >= Cs`, green and
+    /// blue `Cb <= 0.5 < Cs`), which by the suite header's collision rule is
+    /// what makes a transposed binding, a branch on `cb`, and a
+    /// `fragment_entry` naming the sibling all visible here; **none of the six
+    /// operands is `0.5`** (degeneracies 1 and 2), none is `0.0` or `1.0`
+    /// (degeneracy 3), and no channel has `Cb == Cs` (degeneracy 4).
+    ///
+    /// **REQUIRED DISCLOSURE: red and blue coincide in the golden**
+    /// (`0.4921875` both), which is an arithmetic accident of this fixture and
+    /// not a property of the mode. It costs nothing against any rival arm
+    /// below — every one of them differs from the golden in all three
+    /// channels — but it does mean a mutation that swapped this test's red and
+    /// blue *channels* would be invisible here. Test 4's golden has three
+    /// distinct channels and covers that.
+    ///
+    /// Rival arms, re-derived in exact rationals for this fixture — every one
+    /// a real mutation target, since each is either a live dispatch arm or the
+    /// transposed twin (which is now both):
+    ///
+    /// - `Overlay`, this mode's transposed twin and what a branch on `cb`, a
+    ///   transposed binding, or a `fragment_entry` of
+    ///   `"fs_composite_overlay"` computes: `(0.5703125, 0.46875, 0.2578125)`
+    ///   — differs in **all three** channels, precisely because all three
+    ///   straddle;
+    /// - `Normal` `(0.453125, 0.5625, 0.53125)`;
+    /// - `Multiply` `(0.41015625, 0.328125, 0.17578125)`;
+    /// - `Screen` `(0.69921875, 0.609375, 0.54296875)`;
+    /// - `Darken` `(0.453125, 0.375, 0.1875)`, `Lighten`
+    ///   `(0.65625, 0.5625, 0.53125)`;
+    /// - `Difference` `(0.53125, 0.375, 0.4375)`, `LinearDodge`
+    ///   `(0.78125, 0.6875, 0.59375)`, `LinearBurn`
+    ///   `(0.328125, 0.25, 0.125)`;
+    /// - `ColorBurn` roughly `(0.328125, 0.2708.., 0.1294..)`, `ColorDodge`
+    ///   `(0.765625, 0.6875, 0.59375)`;
+    /// - `Exclusion` `(0.6171875, 0.46875, 0.4609375)` — which coincided with
+    ///   the sibling suite's green golden and does **not** coincide with this
+    ///   one anywhere.
+    ///
+    /// Every one of those differs from the golden in all three channels, which
+    /// is strictly better separation than the `Overlay` suite's test 1
+    /// achieves on the identical fixture.
+    ///
+    /// The golden is asserted *and* cross-checked against the real
+    /// [`composite_tile_cpu`] for the same two layers, so a stale literal
+    /// cannot outlive a change to either implementation. Every value is an
+    /// exact binary fraction — this mode's arithmetic is multiply/add only —
+    /// so both are bit-exact `assert_eq!`s.
+    ///
+    /// `dst` is seeded opaque red first, so a pass that silently wrote
+    /// nothing would fail rather than accidentally read as a pass.
+    fn composite_hard_light_over_with_opacity_multiplies_or_screens_per_channel_on_the_source() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.65625, 0.375, 0.1875, 1.0];
+        let top_rgba = [0.25, 0.75, 0.875, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.65625, 0.375, 0.1875, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass \
+             then samples -- and it must straddle 0.5 against the source in all three channels, \
+             or this test stops distinguishing HardLight from Overlay at all"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            // `0.492_187_5` is `0.4921875` -- `clippy::unreadable_literal`
+            // requires separators at seven significant digits, the same
+            // convention the `Overlay` and `ColorBurn` goldens already carry a
+            // note for. The doc comment above and the message below both spell
+            // it without separators, which is how a reader will see it.
+            (0.492_187_5, 0.53125, 0.492_187_5, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself \
+             computes for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.492_187_5, 0.53125, 0.492_187_5, 1.0),
+            "HardLight branches on the *source*: Multiply(Cb, 2*Cs) where Cs <= 0.5, else \
+             Screen(Cb, 2*Cs - 1). Red takes the Multiply arm and green and blue the Screen arm \
+             here. Overlay -- the transposed twin, now itself a live GPU entry point, and what a \
+             branch on cb, a transposed binding or a fragment_entry of fs_composite_overlay all \
+             compute -- gives (0.5703125, 0.46875, 0.2578125), differing in all three channels \
+             because all three straddle 0.5. The Normal arm gives (0.453125, 0.5625, 0.53125), \
+             Multiply (0.41015625, 0.328125, 0.17578125), Screen \
+             (0.69921875, 0.609375, 0.54296875), Darken (0.453125, 0.375, 0.1875), Lighten \
+             (0.65625, 0.5625, 0.53125), Difference (0.53125, 0.375, 0.4375), LinearDodge \
+             (0.78125, 0.6875, 0.59375), LinearBurn (0.328125, 0.25, 0.125), ColorBurn roughly \
+             (0.328125, 0.2708, 0.1294), ColorDodge (0.765625, 0.6875, 0.59375) and Exclusion \
+             (0.6171875, 0.46875, 0.4609375) -- every one of them differing in all three \
+             channels. Red and blue coincide in the golden itself, which is an accident of this \
+             fixture; test 4 has three distinct channels."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case, exercising the shared
+    /// `straight_backdrop()`'s recovery
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`) as this entry point reaches it.
+    ///
+    /// The backdrop is `(0.65625, 0.375, 0.1875)` at half opacity and the
+    /// source `(0.25, 0.75, 0.875)` at its own alpha `1.0` — the same two
+    /// colours as test 1, deliberately, so the *only* thing that differs
+    /// between the two tests is which of the shader's own lines is exercised.
+    ///
+    /// **REQUIRED DISCLOSURE, and here it is a *weaker* claim than the
+    /// `Overlay` sibling's, not a stronger one — stated plainly because the
+    /// obvious move is to copy that suite's wording.** For `Overlay`, halving
+    /// `cb` can move a channel across the branch boundary, so a missing
+    /// un-premultiply changes a channel's *formula*. It cannot do that here:
+    /// this mode's branch reads the **source**, which premultiplication of the
+    /// accumulator does not touch, so every channel stays on the arm it was
+    /// already on and the mutation only changes magnitudes. It is still caught
+    /// — `B` becomes `(0.1640625, 0.59375, 0.7734375)` against the correct
+    /// `(0.328125, 0.6875, 0.796875)`, folding to
+    /// `(0.20703125, 0.671875, 0.82421875)` against
+    /// `(0.2890625, 0.71875, 0.8359375)` — but the margins differ sharply by
+    /// channel: red is off by `0.08203125`, green by `0.046875`, and **blue by
+    /// only `0.01171875`**, which is about six times the `2 * f16::EPSILON`
+    /// tolerance and so the narrowest of the three. Red is the real
+    /// discriminator here.
+    ///
+    /// The expected value is **not hand-derived**: it comes from calling the
+    /// real [`composite_tile_cpu`] with the same two layers. Compared within
+    /// `2 * f16::EPSILON`, the same tolerance and reasoning every sibling
+    /// suite documents. (For the record it is
+    /// `(0.2890625, 0.71875, 0.8359375, 1.0)` — `ab_inv * Cs + ab * B` at
+    /// `ab = 0.5` with the source's own `a = 1.0` making `inv = 0.0`. That is
+    /// also, by the collision rule, exactly the value 0.110.0 measured when it
+    /// transposed the *`Overlay`* app dispatch arm at opacity `0.5`, which is
+    /// a coincidence worth noticing rather than relying on.)
+    fn composite_hard_light_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.65625, 0.375, 0.1875, 1.0];
+        let top_rgba = [0.25, 0.75, 0.875, 1.0];
+        let bottom_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        // A half-opacity bottom layer leaves a *premultiplied* accumulator
+        // whose alpha is 0.5 -- the state whose raw colour is not its straight
+        // colour. Unlike the Overlay sibling, no channel changes *arm* here:
+        // this mode's branch reads the source, not the backdrop.
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_accumulator = first_texel(&composite_tile_cpu(&[(
+            &bottom_texels,
+            bottom_opacity,
+            BlendMode::Normal,
+        )]));
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, bottom_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardLight),
+        ]));
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator, cpu_accumulator,
+            "setup: the accumulator the second pass samples must be the premultiplied, \
+             fractional-alpha state the CPU path also reaches"
+        );
+        assert!(
+            gpu_accumulator.3 > 0.0 && gpu_accumulator.3 < 1.0,
+            "setup: this test is only meaningful with a fractional accumulator alpha, got \
+             {gpu_accumulator:?}"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader HardLight path and composite_tile_cpu diverged \
+                 by more than {tolerance} against a translucent accumulator ({gpu} vs {cpu}) -- \
+                 that is a real finding to report, not a reason to loosen this assertion. A \
+                 missing un-premultiply gives (0.20703125, 0.671875, 0.82421875) here: wrong in \
+                 all three channels but, unlike the Overlay sibling, wrong only in magnitude, \
+                 since this mode's branch reads the source. Red carries the widest margin and \
+                 blue only 0.01171875. Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **The spatial-addressing test for the `HardLight` entry point**, and
+    /// the only `HardLight` test here that can catch a V-flip, a transposed
+    /// axis or a half-texel UV offset: every other one composites uniform
+    /// tiles and reads back texel 0.
+    ///
+    /// Both layers are [`patterned_texels`] with *different* seeds, the
+    /// accumulator is built by a real `composite_over_with_opacity` render
+    /// pass rather than seeded, and the **whole** `TILE`x`TILE` result is
+    /// compared against [`composite_tile_cpu`]'s own output via
+    /// [`read_rgba8`] and its CPU twin [`rgba8_of`]. The top layer's alpha is
+    /// `0.75`, so `a = 0.75` and `inv = 0.25`: both terms of
+    /// `out = inv * d.rgb + a * blended` are live.
+    ///
+    /// **REQUIRED DISCLOSURE, and for this mode it is a *larger* one than the
+    /// `Overlay` sibling's — do not reuse that suite's account.**
+    /// [`patterned_texels`] draws every channel from `{0.0, 0.25, 0.5, 0.75}`,
+    /// and because this mode branches on the *source* the degeneracies land
+    /// differently. Worked out per channel from the real pattern:
+    ///
+    /// - **red** (`Cb, Cs`) by `x % 4` is `(0, 0.25)`, `(0.25, 0.5)`,
+    ///   `(0.5, 0.75)`, `(0.75, 0)`. `x % 4 == 1` is degeneracy 2
+    ///   (`Cs == 0.5`, a total no-op, `B = Cb = 0.25`); `x % 4 == 2` is
+    ///   degeneracy 1 (`Cb == 0.5`, so `B = Cs = 0.75`, indistinguishable from
+    ///   `Normal`); `x % 4 == 3` is degeneracy 3 (`Cs == 0`, so `B = 0`); and
+    ///   `x % 4 == 0` has `Cb == 0`, which on the low arm also gives `B = 0`.
+    ///   **So no red column separates this mode from `Multiply`/`Darken`** —
+    ///   two columns give `0`, which those modes give too — where the sibling
+    ///   suite's `x % 4 == 3` gave a distinctive `0.5`. What red *does* do is
+    ///   separate `HardLight` from `Overlay`, in exactly one column: at
+    ///   `x % 4 == 3` a branch on `cb` gives `Overlay(0.75, 0) = 0.5` against
+    ///   the correct `0`;
+    /// - **green** does the same in `y`;
+    /// - **blue is seed-independent** (a pure function of the quadrant), so
+    ///   `Cb == Cs` at every texel — degeneracy 4 — and blue can therefore see
+    ///   neither a transpose nor a wrong branch operand (by the collision rule
+    ///   the two modes agree exactly where the operands are equal). Its four
+    ///   quadrant values give `B = 0` (top-left, `Cb == Cs == 0`), `B = 0.5`
+    ///   (top-right, `Cb == Cs == 0.5`, degeneracies 1 and 2 at once),
+    ///   `B = 0.125` (bottom-left, `0.25 * 2*0.25`) and `B = 0.875`
+    ///   (bottom-right, `0.75 + 0.5 - 0.375`). **Those last two are the only
+    ///   texels in this whole fixture that separate `HardLight` from
+    ///   `Multiply` and `Darken`** (`0.0625`/`0.25` and `0.5625`/`0.75`
+    ///   respectively).
+    ///
+    /// So this test earns its place as the **spatial** guard — a wrong-texel
+    /// bug shows up in three quarters of the columns and rows regardless — and
+    /// it must not be credited with more formula discrimination than the
+    /// paragraph above grants: one red column and one green row in four
+    /// separate this mode from its twin, two blue quadrants separate it from
+    /// the multiply family, and every other texel is pinned to the right
+    /// answer by a degeneracy, which is a real assertion but not a
+    /// mode-distinguishing one. The surrounding asymmetric "over" still
+    /// catches a transposed binding everywhere.
+    ///
+    /// Tolerance is `1` out of 255, the same reasoning
+    /// `composite_over_matches_the_golden_image` documents.
+    fn composite_hard_light_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // The accumulator itself must have survived its render pass
+        // texel-for-texel first, or a spatial failure downstream would be
+        // ambiguous between the two passes.
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the HardLight comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader HardLight path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel bug \
+             (V-flip, transpose, UV offset, transposed binding), not precision -- but note this \
+             fixture's degenerate texels, enumerated in the doc comment, which pin the right \
+             answer without discriminating the formula, and note that only one red column and \
+             one green row in four separate this mode from Overlay at all.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `HardLight` path, exercising the
+    /// `s.a * opacity.value` scale the shader relies on the Rust caller to
+    /// have clamped.
+    ///
+    /// **A second arithmetic fixture, with a different *arm pattern* from
+    /// test 1's rather than merely different operands** — and that is the
+    /// stronger property: test 1 is (`Multiply`, `Screen`, `Screen`) across
+    /// its channels, this one is (`Screen`, `Multiply`, `Screen`), so no
+    /// mutation that mishandles one arm can satisfy both tests by luck of
+    /// channel order. `Cb = (0.3125, 0.75, 0.4375)`,
+    /// `Cs = (0.625, 0.25, 0.875)`, opacity `0.5` against a source alpha of
+    /// `1.0`:
+    ///
+    /// - red: `Cs = 0.625 > 0.5`, so `t = 0.25` and
+    ///   `B = 0.3125 + 0.25 - 0.3125*0.25 = 0.484375`;
+    /// - green: `Cs = 0.25 <= 0.5`, so `B = 0.75 * 0.5 = 0.375`;
+    /// - blue: `Cs = 0.875 > 0.5`, so `t = 0.75` and
+    ///   `B = 0.4375 + 0.75 - 0.4375*0.75 = 0.859375`.
+    ///
+    /// The fold at `a = 0.5` over an opaque accumulator gives
+    /// `0.5 * Cb + 0.5 * B = (0.3984375, 0.5625, 0.6484375)` at alpha `1.0`.
+    /// The `t` values in play here are `0.25` and `0.75` against test 1's
+    /// `0.5` and `0.75`, so a shader that hard-coded either `t` passes at most
+    /// one of the two. **All three golden channels are distinct**, which is
+    /// what test 1's red/blue coincidence needed covering.
+    ///
+    /// All three channels straddle `0.5`, no operand is `0.5`, `0.0` or `1.0`,
+    /// and no channel has `Cb == Cs`.
+    ///
+    /// Rival arms, re-derived in exact rationals for this fixture:
+    /// `Overlay` — the transposed twin, and what a branch on `cb`, a
+    /// transposed binding or the sibling's `fragment_entry` computes —
+    /// `(0.421875, 0.6875, 0.6015625)`, `Normal` `(0.5, 0.5, 0.65625)`,
+    /// `Multiply` `(0.3046875, 0.46875, 0.41015625)`, `Screen`
+    /// `(0.5703125, 0.78125, 0.68359375)`, `Darken` `(0.375, 0.5, 0.4375)`,
+    /// `Lighten` `(0.5, 0.75, 0.65625)`, `Difference`
+    /// `(0.3125, 0.625, 0.4375)`, `LinearDodge` `(0.625, 0.875, 0.71875)`,
+    /// `LinearBurn` `(0.15625, 0.375, 0.375)`, `Exclusion`
+    /// `(0.4453125, 0.6875, 0.4921875)`, `ColorBurn`
+    /// `(0.15625, 0.375, 0.3973..)` and `ColorDodge` roughly
+    /// `(0.5729.., 0.875, 0.71875)`. **Every one differs from the golden in
+    /// all three channels.**
+    ///
+    /// The golden is asserted alongside the [`composite_tile_cpu`]
+    /// differential. Every value is an exact binary fraction except
+    /// `ColorBurn`'s and `ColorDodge`'s, which are only listed as rivals.
+    fn composite_hard_light_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.3125, 0.75, 0.4375, 1.0];
+        let top_rgba = [0.625, 0.25, 0.875, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::HardLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            // `0.398_437_5`/`0.648_437_5` are `0.3984375`/`0.6484375`; see
+            // test 1's own note on `clippy::unreadable_literal`.
+            (0.398_437_5, 0.5625, 0.648_437_5, 1.0),
+            "setup: the golden named in this test's doc comment must be what composite_tile_cpu \
+             itself computes -- if this fails, the literal is stale, not the GPU"
+        );
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.398_437_5, 0.5625, 0.648_437_5, 1.0),
+            "HardLight at opacity 0.5, with a different *arm pattern* from test 1's (Screen, \
+             Multiply, Screen against Multiply, Screen, Screen) so no single mutation satisfies \
+             both: Overlay (the transposed twin) gives (0.421875, 0.6875, 0.6015625), Normal \
+             (0.5, 0.5, 0.65625), Multiply (0.3046875, 0.46875, 0.41015625), Screen \
+             (0.5703125, 0.78125, 0.68359375), Darken (0.375, 0.5, 0.4375), Lighten \
+             (0.5, 0.75, 0.65625), Difference (0.3125, 0.625, 0.4375), LinearDodge \
+             (0.625, 0.875, 0.71875), LinearBurn (0.15625, 0.375, 0.375), Exclusion \
+             (0.4453125, 0.6875, 0.4921875), ColorBurn (0.15625, 0.375, 0.3973) and ColorDodge \
+             roughly (0.5729, 0.875, 0.71875) -- every one of them differing in all three \
+             channels here."
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader HardLight path and composite_tile_cpu diverged \
+                 by more than {tolerance} at opacity {opacity} ({gpu} vs {cpu}). Full texels: \
+                 {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **`fs_composite_hard_light` deliberately does not clamp
+    /// `s.a * opacity.value`** — only `opacity` itself is clamped, and it is
+    /// clamped Rust-side in `composite_blend_over_with_opacity`, mirroring
+    /// `composite_layer_into`'s own `let opacity = opacity.clamp(0.0, 1.0)`
+    /// followed by an unclamped `sa * opacity`. `f16` can legally hold a
+    /// source alpha above `1.0` (invariant §7.3.1b), so this is a real input.
+    /// Kept per mode for the reason 0.95.1 had to restore the `Lighten` one:
+    /// this asserts a line reached *through this entry point*, and each WGSL
+    /// fragment function is separately compiled.
+    ///
+    /// **The source alpha is `2.0` and the `opacity` argument is `1.0`, not
+    /// the other way round.** Passing `opacity = 2.0` would prove nothing:
+    /// `composite_blend_over_with_opacity` clamps that argument before it
+    /// reaches the uniform, so `a` would come out `1.0` and this test would
+    /// assert the *clamped* answer.
+    ///
+    /// **A fresh fixture rather than test 1's colours.** With `a = 2.0` the
+    /// fold's `inv` is `-1.0`, so `out = -Cb + 2B` and the clamped and
+    /// unclamped answers differ by exactly `B - Cb` per channel. This fixture
+    /// is chosen so the unclamped fold leaves the unit interval **in both
+    /// directions at once**: `Cb = (0.5625, 0.4375, 0.75)`,
+    /// `Cs = (0.125, 0.875, 0.375)`, all three straddling `0.5`, none of the
+    /// six operands `0.5`, `0.0` or `1.0`, and no channel with `Cb == Cs`:
+    ///
+    /// - red: `Cs <= 0.5`, `B = 0.5625 * 0.25 = 0.140625`;
+    /// - green: `Cs > 0.5`, `t = 0.75`,
+    ///   `B = 0.4375 + 0.75 - 0.328125 = 0.859375`;
+    /// - blue: `Cs <= 0.5`, `B = 0.75 * 0.75 = 0.5625`.
+    ///
+    /// So `-Cb + 2B` is `(-0.28125, 1.28125, 0.375)` at alpha
+    /// `2.0 - 1.0 = 1.0`. **Red undershoots `0.0` and green overshoots
+    /// `1.0`** — this mode's `B` is bounded to `[0, 1]` by construction (both
+    /// arms are convex combinations of operands in `[0, 1]`), but the *fold*
+    /// around it is not. Neither `composite_layer_into` nor
+    /// `fs_composite_hard_light` clamps its output, `Rgba16Float` stores both
+    /// values exactly, and [`read_first_texel`] does not clamp on the way
+    /// back — so the GPU and CPU are expected to agree on them. A
+    /// disagreement would be a real finding about one of those three, not a
+    /// reason to move the fixture.
+    ///
+    /// **Blue's source is `0.375`, not the `0.25` the `Overlay` sibling's
+    /// equivalent fixture uses, and that one digit is load-bearing.** At
+    /// `Cs = 0.25` this mode's blue `B` is `0.75 * 0.5 = 0.375`, and
+    /// `-0.75 + 2*0.375` is **exactly `0.0`** — the same value an output clamp
+    /// would produce, which would have made blue silently unable to
+    /// distinguish "no clamp" from "clamped at zero".
+    ///
+    /// - clamped-alpha counterfactual (`a = 1.0`, `inv = 0.0`):
+    ///   `out = B = (0.140625, 0.859375, 0.5625)` at the same alpha `1.0` — so
+    ///   **alpha alone cannot catch this**, and the colour channels are what
+    ///   the assertion rests on. All three differ.
+    ///
+    /// The absolute golden is asserted alongside the [`composite_tile_cpu`]
+    /// differential, so a clamp added to *both* implementations could not pass
+    /// either.
+    fn composite_hard_light_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5625, 0.4375, 0.75, 1.0];
+        let top_rgba = [0.125, 0.875, 0.375, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::HardLight),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's own \
+                 formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        // The absolute golden, hand-derived in the doc comment above.
+        // A `min(s.a * opacity.value, 1.0)` in `fs_composite_hard_light`
+        // yields (0.140625, 0.859375, 0.5625, 1.0) instead -- alpha agrees,
+        // which is why this is asserted per channel rather than as a single
+        // texel comparison whose message would not say where. Red is
+        // deliberately below 0.0 and green above 1.0; blue's 0.375 is
+        // deliberately not 0.0, which the sibling fixture's own blue would
+        // have been (see the doc comment).
+        for (gpu, expected, channel) in [
+            (gr, -0.28125, "r"),
+            (gg, 1.28125, "g"),
+            (gb, 0.375, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold; got {gpu}. \
+                 (0.140625, 0.859375, 0.5625, 1.0) would mean fs_composite_hard_light clamped \
+                 the s.a * opacity product, a 0.0 in red or a 1.0 in green would mean something \
+                 clamped the *output* to [0, 1]. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The shared `straight_backdrop()` guard's **untaken** branch as
+    /// `fs_composite_hard_light` reaches it, on real hardware — and this mode
+    /// was *predicted* to be the fifth of eleven whose equivalent test has
+    /// teeth, then measured.
+    ///
+    /// **Why, from the rule `composite.wgsl` states rather than by analogy.**
+    /// 0.109.0 found that deleting the guard fails only three of the then-nine
+    /// per-mode transparent-backdrop tests (`Multiply`'s, `Screen`'s and
+    /// `Difference`'s), because the other six run the `NaN` through `min()` or
+    /// `max()`, which on this backend *launders* it into the finite operand;
+    /// 0.110.0 added `Overlay` as a fourth on the same reasoning. **`HardLight`
+    /// has no `min` and no `max` either**, so there is nothing to launder
+    /// with. One detail differs from the sibling and does *not* change the
+    /// outcome: this mode's `select()` condition reads `s.rgb`, which the
+    /// guard's removal does not touch, so a well-defined arm is still chosen —
+    /// but `cb` appears in **both** arms, so `b` is `NaN` regardless, and
+    /// `fold_over`'s `ab * b` is `0.0 * NaN`, which is `NaN`, not `0.0`.
+    ///
+    /// **That mutation was run for real in this round ((i) of its matrix) and
+    /// the prediction held exactly**: with the guard deleted, texel 0 reads
+    /// back literally `(NaN, NaN, NaN, 1.0)`, this test fails, and the other
+    /// six `composite_hard_light_*` tests stay green (their backdrops are all
+    /// opaque, so no `ab == 0` texel exists in them) — as does the app-level
+    /// `HardLight` golden. So this is a **fifth** detector, joining
+    /// `Multiply`, `Screen`, `Difference` and `Overlay`. See PLAN.md's 0.111.0
+    /// entry.
+    ///
+    /// **The backdrop is deliberately half transparent, not uniformly so** —
+    /// the reason 0.95.1 gives for the `Lighten` sibling applies verbatim.
+    /// With [`half_transparent_texels`]'s opaque half at `(0.75, 0.25, 0.5)`
+    /// and a `(0.25, 0.625, 0.875)` source at alpha `1.0` and opacity `1.0`
+    /// (so `a = 1.0`, `inv = 0.0`, and the opaque half's output is `B`
+    /// exactly):
+    ///
+    /// - left half (`ab == 0`): `blended = Cs`, `out = Cs` — the untaken
+    ///   branch, `(0.25, 0.625, 0.875, 1.0)`;
+    /// - right half (`ab == 1`): red `Cs = 0.25 <= 0.5` gives
+    ///   `B = 0.75 * 0.5 = 0.375`; green `Cs = 0.625 > 0.5` gives `t = 0.25`
+    ///   and `B = 0.25 + 0.25 - 0.0625 = 0.4375`; blue's `Cb` is exactly
+    ///   `0.5`, which is **degeneracy 1**, so `B = Cs = 0.875` —
+    ///   `(0.375, 0.4375, 0.875)`.
+    ///
+    /// **REQUIRED DISCLOSURE: blue is degenerate here and cannot
+    /// discriminate.** [`half_transparent_texels`]'s opaque colour is fixed
+    /// and its blue channel is exactly `0.5`, this suite's degeneracy 1 — so
+    /// blue's answer is `Cs`, identical to `Normal`'s and (since `Cs > Cb`
+    /// there) to `Lighten`'s and `Overlay`'s. That is the *same* blue
+    /// degeneracy the `Overlay` sibling test discloses, but reached by a
+    /// different route: there `Cb == 0.5` is the branch boundary, here it is
+    /// not. Red and green are the real discriminators, and both were chosen to
+    /// straddle `0.5`: `Overlay` — the transposed twin — gives
+    /// `(0.625, 0.3125, 0.875)`, differing in red and green; `Normal`
+    /// `(0.25, 0.625, 0.875)`, `Multiply` `(0.1875, 0.15625, 0.4375)`,
+    /// `Screen` `(0.8125, 0.71875, 0.9375)`, `Darken` `(0.25, 0.25, 0.5)`,
+    /// `Lighten` `(0.75, 0.625, 0.875)`, `Difference` `(0.5, 0.375, 0.375)`,
+    /// `LinearDodge` `(1.0, 0.875, 1.0)`, `LinearBurn` `(0.0, 0.0, 0.375)`,
+    /// `Exclusion` `(0.625, 0.5625, 0.375)`, `ColorBurn` roughly
+    /// `(0.0, 0.0, 0.4286..)` and `ColorDodge` roughly
+    /// `(1.0, 0.6667.., 1.0)`.
+    ///
+    /// **Every value in both halves is an exact binary fraction** — this mode
+    /// has no division — so the right half is genuinely pinned by the
+    /// whole-tile comparison at full 8-bit precision and texel 0 is asserted
+    /// with `assert_eq!`.
+    ///
+    /// A `NaN` in the left half is caught by the whole-tile comparison as well
+    /// as by the explicit finiteness check on texel 0: [`read_rgba8`]'s
+    /// `clamp` maps `NaN` to `0`, which cannot match the CPU reference's real
+    /// value there.
+    ///
+    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader compilers
+    /// are unverified for this branch — and for this mode, as for its twin,
+    /// whether `select()`'s discarded arm is evaluated and what `0.0 / 0.0`
+    /// yields are both per-backend properties.
+    fn composite_hard_light_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
+     {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Straddles 0.5 in red (Cb 0.75 against Cs 0.25) and green (Cb 0.25
+        // against Cs 0.625) so both are real discriminators; blue is
+        // degenerate because half_transparent_texels' own blue is exactly 0.5,
+        // this mode's Normal-degenerate *backdrop* value -- see the doc
+        // comment.
+        let top_rgba = [0.25, 0.625, 0.875, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        // A real render pass builds the accumulator, rather than seeding it:
+        // the zero-alpha half is produced by the same mechanism under test,
+        // not written directly.
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // Texel 0 is in the transparent half, and `f16` equality pins its
+        // alpha at exactly zero -- something the 8-bit whole-tile comparison
+        // below cannot do, since a tiny non-zero alpha would quantise to 0.
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. Like its \
+             transposed twin Overlay and unlike the six modes whose min()/max() launders a NaN, \
+             HardLight has neither, so deleting that guard is expected to surface *here* -- \
+             measured in 0.111.0 -- which is a real finding about this backend's shader compiler \
+             if it happens unexpectedly, not a reason to relax this test."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.625, 0.875, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader HardLight path and composite_tile_cpu disagree across a \
+             half-transparent backdrop. In the opaque half a wrong blend formula shows up in red \
+             and green -- Overlay would give (0.625, 0.3125) there against the correct \
+             (0.375, 0.4375) -- while blue's Cb is exactly 0.5, this mode's Normal-degenerate \
+             backdrop value (see the doc comment); in the transparent half a NaN out of the \
+             untaken `ab > 0.0` branch does.",
+        );
+    }
+
+    #[test]
+    /// **This mode's own branch boundary, `Cs == 0.5`** — the one test in this
+    /// suite whose fixture deliberately *is* degenerate, and the reason this
+    /// suite has seven tests rather than six. Note the side: the `Overlay`
+    /// sibling's boundary is `Cb == 0.5`, on the *backdrop*.
+    ///
+    /// The two arms agree there bit-exactly: the low arm gives `Cb * 1.0`, and
+    /// the high arm gives `t = 2*0.5 - 1 = 0.0` exactly, so
+    /// `Cb + 0.0 - Cb * 0.0` — the same bits. This test pins that continuity:
+    /// a shader whose high arm was written wrongly (a dropped `- 1.0` in `t`,
+    /// a `+` where the `Screen` form needs a `-`) no longer reduces to `Cb` at
+    /// the boundary and fails **red** here even though red is on the boundary
+    /// rather than past it.
+    ///
+    /// **REQUIRED DISCLOSURE: this test cannot catch a `<=` → `<` mutation,
+    /// and no test can.** That mutation changes which arm runs *only* at
+    /// `Cs == 0.5`, and there the two arms compute identical bits. It is
+    /// unkillable in principle, was run for real in this round, and survived —
+    /// as predicted. What this test proves is continuity, not
+    /// branch-*selection* correctness.
+    ///
+    /// Backdrop `(0.875, 0.75, 0.25)` opaque under a `(0.5, 0.25, 0.625)`
+    /// source at opacity `1.0`, so `a = 1.0`, `inv = 0.0` and the whole result
+    /// is `B`:
+    ///
+    /// - red: `Cs == 0.5` exactly — **either arm** gives `B = Cb = 0.875`.
+    ///   This is degeneracy 2, deliberately, and it is what makes red the
+    ///   boundary probe;
+    /// - green: `Cs = 0.25 <= 0.5`, `B = 0.75 * 0.5 = 0.375`;
+    /// - blue: `Cs = 0.625 > 0.5`, `t = 0.25`,
+    ///   `B = 0.25 + 0.25 - 0.0625 = 0.4375`.
+    ///
+    /// Golden `(0.875, 0.375, 0.4375, 1.0)`, every value an exact binary
+    /// fraction. Green and blue keep this test from being *only* a boundary
+    /// probe: they take opposite arms off the boundary, and no operand in them
+    /// is `0.5`, `0.0`, `1.0` or equal to its partner.
+    ///
+    /// **Red agrees with a family of other modes, by construction, and — the
+    /// point worth stating — that family includes the transposed twin.**
+    /// `Lighten` gives `0.875` there (`max(0.875, 0.5)`), and so does
+    /// `Overlay`, because `Overlay(Cb, 0.5) = Cb` holds for it too (its own
+    /// degeneracy 2, on the source side, at the same value). So **red cannot
+    /// discriminate `HardLight` from `Overlay` at all**; green and blue carry
+    /// that entirely. Against `Overlay`'s `(0.625, 0.3125)`, `Normal`'s
+    /// `(0.25, 0.625)`, `Multiply`'s `(0.1875, 0.15625)`, `Screen`'s
+    /// `(0.8125, 0.71875)`, `Darken`'s `(0.25, 0.25)`, `Lighten`'s
+    /// `(0.75, 0.625)`, `Difference`'s `(0.5, 0.375)`, `LinearDodge`'s
+    /// `(1.0, 0.875)`, `LinearBurn`'s `(0.0, 0.0)`, `Exclusion`'s
+    /// `(0.625, 0.5625)`, `ColorBurn`'s `(0.0, 0.0)` and `ColorDodge`'s
+    /// `(1.0, 0.6667..)`.
+    ///
+    /// The golden is cross-checked against the real [`composite_tile_cpu`],
+    /// whose own arm this boundary behaviour is inherited from, and a
+    /// finiteness check runs first.
+    fn composite_hard_light_over_with_opacity_agrees_across_its_own_branch_boundary() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Red's *source* is exactly 0.5, this mode's branch boundary and its
+        // total-no-op value. Green and blue take opposite arms off the
+        // boundary so this test is not only a boundary probe.
+        let bottom_rgba = [0.875, 0.75, 0.25, 1.0];
+        let top_rgba = [0.5, 0.25, 0.625, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.875, 0.75, 0.25, 1.0),
+            "setup: the accumulator must be fully opaque and carry these exact channels, or the \
+             boundary probe below stops meaning what it claims"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.875, 0.375, 0.4375, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own HardLight arm \
+             computes -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the HardLight select(): {gpu_result:?}"
+        );
+        assert_eq!(
+            gpu_result,
+            (0.875, 0.375, 0.4375, 1.0),
+            "at Cs == 0.5 both arms must give exactly Cb (0.875 in red): the low arm is \
+             Cb * 2*0.5, the high arm is Cb + 0.0 - Cb*0.0, and the two agree to the bit. A \
+             dropped - 1.0 in t, or a + where Screen needs a -, breaks that and shows up in red. \
+             This assertion cannot see a <= turned into a < -- the two arms are bit-identical \
+             there, so that mutation is unkillable in principle. Red also cannot separate this \
+             mode from Overlay, whose own source-side degeneracy gives Cb at Cs == 0.5 too; \
+             green and blue carry that, taking opposite arms off the boundary: Overlay gives \
+             (0.625, 0.3125) there, Normal (0.25, 0.625), Multiply (0.1875, 0.15625), Screen \
+             (0.8125, 0.71875), Darken (0.25, 0.25), Lighten (0.75, 0.625), Difference \
+             (0.5, 0.375), LinearDodge (1.0, 0.875), LinearBurn (0.0, 0.0), Exclusion \
+             (0.625, 0.5625), ColorBurn (0.0, 0.0) and ColorDodge (1.0, 0.6667)."
         );
     }
 
