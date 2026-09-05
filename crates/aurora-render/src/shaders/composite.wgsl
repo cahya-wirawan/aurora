@@ -150,7 +150,7 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // turn the NaN into a finite `b` before `fold_over` ever sees it -- and
 // `fold_over`'s own `ab == 0.0` would have erased that finite `b` anyway.
 // That makes the guard's removal genuinely **output-equivalent**
-// for those six here, not merely undetected. See PLAN.md's 0.109.0 entry
+// for those eight here, not merely undetected. See PLAN.md's 0.109.0 entry
 // for the two isolating experiments and for why no fixture change can
 // close it.
 //
@@ -182,7 +182,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // **Neither `LinearLight` (0.113.0) nor `VividLight` (0.114.0) is a sixth
 // detector, and the same rule is
 // what predicted that too — the first time the rule predicted a *non*-detection
-// for a newly ported mode, and it was then measured rather than assumed.** Its
+// for a newly ported mode, and it was then measured rather than assumed.**
+// `LinearLight`'s own
 // blend term is a single `clamp()`, and WGSL specifies float `clamp(e1, e2, e3)`
 // as `min(max(e1, e2), e3)`; so despite containing no literal `min`/`max` token
 // it has *two* of them, and it launders the `NaN` into the finite bound exactly
@@ -1470,9 +1471,6 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
 //     named mode's own answer; see the suite header for which fixture covers
 //     which.
 //
-// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
-// `TileCompositor::bind_group_layout_blend` with the twelve entry points
-// above; no new binding, no new layout.
 fn vivid_light_channel(cb: f32, cs: f32) -> f32 {
     if (cs <= 0.5) {
         return color_burn_channel(cb, 2.0 * cs);
@@ -1490,7 +1488,12 @@ fn vivid_light_channel(cb: f32, cs: f32) -> f32 {
 // blend-mode-independent, so only the `b = ...` block below differs. Read
 // `vivid_light_channel` directly above for this mode's own formula, its four
 // inherited guard-reachability results, its asymmetry class, its five
-// degeneracies, its unkillable boundary mutation and its near-miss table.
+// degeneracies, its boundary mutation (unkillable at this suite's tolerance,
+// not in principle -- see the derivation above) and its near-miss table.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the twelve entry points
+// above; no new binding, no new layout.
 @fragment
 fn fs_composite_vivid_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
