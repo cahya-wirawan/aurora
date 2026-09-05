@@ -699,7 +699,7 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
 
 /// Builds a fresh, single-layer document from a decoded
 /// `aurora_io::Image` — the real "open a file" document construction
-/// [`Self::open_file`] needs, mirroring [`demo_document`]'s own shape
+/// [`App::open_file`] needs, mirroring [`demo_document`]'s own shape
 /// (built through `History`, not `LayerTree` directly, so the journal
 /// stays a meaningful record for the History panel and autosave) but
 /// with exactly the one real layer the opened file actually has, sized
@@ -2624,7 +2624,7 @@ impl FileDialogAccess for SystemFileDialog {
 /// [`App::save_file`] still need to read/decode or encode/write it),
 /// or because it needs live document state `activate_command` is
 /// deliberately kept free of (`Undo`/`Redo` — [`App::handle_key_event`]/
-/// [`App::handle_menu_event`] run them via the same [`run_command`]
+/// `App::handle_menu_event` run them via the same [`run_command`]
 /// path `Ctrl+Z`/`Ctrl+Shift+Z` already use, so there is exactly one
 /// place either command's own logic lives, not a second copy here).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2763,7 +2763,7 @@ fn command_close_target(
 /// this function is deliberately kept free of `layers`/`history`/
 /// `pixel_history`/`aurora_tile::TileStore`, so it stays exactly as
 /// pure and unit-testable as it already was; the caller
-/// ([`App::handle_key_event`]/[`App::handle_menu_event`], both of
+/// ([`App::handle_key_event`]/`App::handle_menu_event`, both of
 /// which already own that state) runs the real undo/redo via
 /// [`run_command`], the same path `Ctrl+Z`/`Ctrl+Shift+Z` themselves
 /// use. Logs and returns `None` for any other id.
@@ -3504,8 +3504,9 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
 /// populate_properties_panel`] shows for `tool` — this crate's own
 /// per-tool parameters, not `aurora-ui`'s (that crate carries no
 /// Brush/Eraser-specific knowledge at all, see
-/// `aurora_ui::properties_panel`'s own doc comment). Only [`Tool::Brush`]
-/// and [`Tool::Eraser`] have a real parameter today ([`BRUSH_RADIUS`]/
+/// `aurora_ui::properties_panel`'s own doc comment). Only
+/// [`aurora_ui::Tool::Brush`] and [`aurora_ui::Tool::Eraser`] have a real
+/// parameter today ([`BRUSH_RADIUS`]/
 /// [`ERASER_RADIUS`]); every other tool (`Move`, `MarqueeSelect`, `Zoom`,
 /// `Pan`, `Eyedropper`) has no real backing data anywhere in this crate
 /// yet, so it gets an honest empty list rather than an invented option —
@@ -9891,7 +9892,7 @@ impl CompositeCache {
         self.invalidate_doc_rects(std::slice::from_ref(&rect), reference_origin);
     }
 
-    /// [`Self::invalidate_doc_rect`] for a whole set of regions at once,
+    /// `Self::invalidate_doc_rect` for a whole set of regions at once,
     /// in **one** pass over the cache — every rule that method documents
     /// applies unchanged, `reference_origin` requirement included.
     ///
@@ -11901,7 +11902,7 @@ struct App {
     ///
     /// **One slot, deliberately.** A modal alert blocks everything else
     /// ([`handle_key`]'s own routing order, and — since 0.68.2 —
-    /// [`App::handle_menu_event`]'s), so a second one could never be
+    /// `App::handle_menu_event`'s), so a second one could never be
     /// interacted with anyway; [`open_dialog`]'s own "already open is a
     /// no-op" guard is what makes that concrete. **Three callers open
     /// one today**: crash recovery at construction, if
@@ -11966,8 +11967,8 @@ struct App {
     /// The live document's own layer structure — built once in
     /// [`App::new`] (from [`demo_document`] or a recovered autosave) and
     /// kept alive from then on. This is what [`Self::active_layer`]/
-    /// [`LayerTree::surface_id`] read to find somewhere for the Brush
-    /// tool to actually paint.
+    /// [`aurora_doc::LayerTree::surface_id`] read to find somewhere for
+    /// the Brush tool to actually paint.
     layers: aurora_doc::LayerTree,
     /// The document's own real, independent canvas size — `(width,
     /// height)`, in document-space pixels. **Not** derived from any
@@ -12057,7 +12058,7 @@ struct App {
     ///
     /// **This can hold a group's `LayerId`, not just a pixel layer's.**
     /// `layer_rows` maps every row `populate_layers_panel` inserts,
-    /// group rows included ([`aurora_ui::layers_panel::insert_layer_row`]
+    /// group rows included (`aurora_ui::layers_panel::insert_layer_row`
     /// inserts unconditionally), and [`select_layer`] sets `*active_layer`
     /// from whichever row was clicked with no `LayerKind` check. A caller
     /// reading this field for anything pixel-specific (paint/erase

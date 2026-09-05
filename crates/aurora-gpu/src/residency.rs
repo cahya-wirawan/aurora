@@ -187,7 +187,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// 0.68.0 buffer history, the 0.88.1 measurement that named this loop
 /// rather than the bus, the 0.89.0 append batching, the `wide`-vs-`half`
 /// crate evaluation, and exactly which bit-exactness guarantees hold
-/// against [`premultiply_rgba`]) was moved here in 0.96.1 from
+/// against `premultiply_rgba`) was moved here in 0.96.1 from
 /// [`extend_premultiplied_le_bytes`], which carried it while it was
 /// [`TileResidency::sync`]'s entry point and no longer is —
 /// `extend_premultiplied_le_bytes` is now a `Vec`-sizing wrapper whose only
@@ -365,7 +365,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// consequence is bounded to the above.
 ///
 /// The equivalence tests below pin all of this against
-/// [`premultiply_rgba`], which is deliberately left in the obvious scalar
+/// `premultiply_rgba`, which is deliberately left in the obvious scalar
 /// spelling as the reference implementation, and which is `#[cfg(test)]`
 /// since 0.92.1 because that is now its only role.
 ///
@@ -408,7 +408,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 ///    texel iterators. A `zip` stops at whichever side ends first, so an
 ///    `out` too short simply writes fewer texels and an `out` too long
 ///    leaves its tail untouched. That is what makes the reused
-///    [`Self::sync`] buffer and the parallel splitter's short trailing
+///    [`TileResidency::sync`] buffer and the parallel splitter's short trailing
 ///    block both safe without a length assertion.
 /// 5. **A zero chunk size** — `chunks_exact`, `chunks_exact_mut` and
 ///    `par_chunks*` all panic on a chunk size of 0, which 0.96.0's list
@@ -439,7 +439,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 ///
 /// **Trailing partial texel**: a `texels` length that is not a multiple of
 /// [`CHANNELS`] contributes nothing for its final incomplete texel, the
-/// same contract [`premultiply_rgba`] and the pre-0.96.0 spelling of
+/// same contract `premultiply_rgba` and the pre-0.96.0 spelling of
 /// [`extend_premultiplied_le_bytes`] both have.
 fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
@@ -804,7 +804,7 @@ fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
 
 /// Appends `texels` to `out` as the little-endian `f16` bytes
 /// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
-/// ([`premultiply_rgba`]'s arithmetic, applied per texel as the bytes are
+/// (`premultiply_rgba`'s arithmetic, applied per texel as the bytes are
 /// written rather than in a separate pass over a separate buffer).
 ///
 /// **A thin `Vec`-sizing wrapper as of 0.96.0, and no longer on the frame
@@ -826,7 +826,7 @@ fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
 /// now actually produces every upload byte. Read it there; this function
 /// contributes only the sizing below.
 ///
-/// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
+/// Same trailing-partial-chunk contract as `premultiply_rgba`: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.
 fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {

@@ -75,8 +75,8 @@
 //! (`accent.primary`/`accent.primary_active`, `surface.sunken`,
 //! `state.disabled_opacity`) — invariant §7.3.10, never a literal. The
 //! returned `[f32; 4]` is straight (unpremultiplied) sRGB-gamma-encoded
-//! RGBA, [`Color::to_srgb_f32`]'s own convention — matching what
-//! [`crate::render::PathPipeline::bind_group`]'s own doc comment
+//! RGBA, [`aurora_theme::Color::to_srgb_f32`]'s own convention —
+//! matching what [`crate::render::PathPipeline::bind_group`]'s own doc comment
 //! expects. This function itself never linearizes for an sRGB-aware
 //! render target; that's a real caller's own job once it actually owns
 //! one (`aurora-app::linearize_paint_color` does it for the real

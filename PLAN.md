@@ -25153,6 +25153,103 @@ wrong** — worth stating plainly rather than quietly reporting a partial
 pass. Making `--document-private-items` a green, CI-adoptable check is a
 named, cheap follow-on: 9 doc links in one crate.
 
+**Addendum 2026-09-05 (0.106.2) — that follow-on is done, and its own
+sizing was wrong: 21 links across 6 crates, not 9 in one.** The paragraph
+above stands as written about `aurora-app` (it did report 9, and all 9 are
+fixed here), but "9 doc links in one crate" undercounted the workspace by
+12, because it was measured with `cargo doc -p aurora-app` — one crate —
+and never re-measured across the workspace. `RUSTDOCFLAGS="-D warnings"
+cargo doc --workspace --no-deps --all-features --document-private-items`
+now exits 0 with zero warnings, all 20 crates documented in one forced
+run (doc fingerprints cleared first, so nothing was served from cache),
+and the same command **without** `--document-private-items` still exits 0
+— measured both before and after, so "no public-link regression" is a
+reading rather than an assumption. `cargo test --workspace` is 1697
+passed / 0 failed / 10 ignored before and after, and clippy is clean
+before and after; the diff is doc-comment lines only, with no
+`#![allow(rustdoc::broken_intra_doc_links)]` and no per-item `allow`
+anywhere in it.
+
+*A methodological trap worth recording, since it is what hid the other 12
+links from two separate scouting passes:* **`cargo doc` stops spawning new
+units after the first failure**, so a plain workspace run reports only the
+crates already in flight — here `aurora-io`, `aurora-widgets` and
+`aurora-app`, which reads exactly like a complete list. Adding
+`--keep-going` turned those 3 crates into 6 and the 11 links into 21.
+Worse, a *second* run looks like confirmation while proving nothing: the
+crates that succeeded are cached and never re-documented, so their doc
+comments are not re-checked at all. Any future claim about this command
+needs `--keep-going` **and** cleared doc fingerprints
+(`target/debug/.fingerprint/aurora-*` dirs containing a `doc-*` file —
+deleting only those forces re-documentation without invalidating any
+compile artifact).
+
+The 21 sites and why each got the disposition it did:
+
+- **Fully-qualified path (9)** — the target is real, public and genuinely
+  linkable, just not in scope at the doc's own position.
+  `aurora-app/src/lib.rs`: `Self::open_file` → `App::open_file` (the doc
+  is on the free fn `document_from_image`, so `Self` was never `App`);
+  `Tool::Brush`/`Tool::Eraser` → `aurora_ui::Tool::*`;
+  `LayerTree::surface_id` → `aurora_doc::LayerTree::surface_id`.
+  `aurora-tile/src/store.rs`: `Self::is_dirty`/`Self::take_dirty`/
+  `Self::flush` → `TileStore::*` (the doc block is on the `PendingWrite`
+  type alias, and one line of it already spelled `TileStore::pending`
+  correctly). `aurora-gpu/src/residency.rs`: `Self::sync` →
+  `TileResidency::sync` (doc on the free fn
+  `serialize_premultiplied_le_bytes`; that file already spells this link
+  `TileResidency::sync` in three other places).
+  `aurora-widgets/src/paint.rs`: `Color::to_srgb_f32` →
+  `aurora_theme::Color::to_srgb_f32` — and deliberately **not** by adding
+  a `use aurora_theme::Color;`, which would have been a non-doc source
+  change for a doc-comment problem.
+- **Disambiguator (2)** — `aurora-io/src/aur.rs`'s `[`write`]` (both a fn
+  and `std`'s `write!` macro) and `aurora-render/src/lib.rs`'s
+  `[`schedule`]` (both the `pub use`d fn and the private `mod schedule`
+  it comes from) → `write()`/`schedule()`, the paren form this file
+  already uses at 19 other sites. Note `schedule` is *only* ambiguous
+  under `--document-private-items`, because that is the only
+  configuration in which the private module is a documented candidate.
+- **Backtick demotion (10)** — the target exists only in a configuration
+  rustdoc is not building, so no path or disambiguator can reach it and
+  demotion is the honest fix rather than a workaround.
+  `#[cfg(target_os = "macos")]`-only: `App::handle_menu_event` ×3.
+  `#[cfg(test)]`-only: `Self::invalidate_doc_rect`, and
+  `premultiply_rgba` ×5 in `aurora-gpu/src/residency.rs` (whose own prose
+  already says it is `#[cfg(test)]` since 0.92.1, so the link had been
+  self-contradicting). Private in another crate:
+  `aurora_ui::layers_panel::insert_layer_row` — the one site with no
+  linkable spelling at all, and making it `pub` to satisfy a doc link
+  would be a real API change for a comment's benefit.
+
+**Decision: `verify.yml`'s doc step adopts `--document-private-items` now
+(plus `--keep-going`), rather than deferring it.** This round was planned
+the other way — defer, on the grounds that `verify.yml` runs a 3-OS matrix
+whose macOS and Windows legs cannot be pre-verified here — and **that
+premise turned out to be false, which is why the plan was not followed.**
+`verify.yml` has two separate jobs: `test` is the
+`[ubuntu, macos, windows]` matrix, and `docs` (the job holding the rustdoc
+step) is a single `runs-on: ubuntu-latest` leg. So the step being changed
+runs on Linux only, `rust-toolchain.toml` pins the toolchain to 1.97 and
+rustup honours that in-repo regardless of what `dtolnay/rust-toolchain@stable`
+installed, and the local run that exits 0 here is 1.97.1 on Linux against
+the same lockfile and the same command — configuration-identical to the
+job, not merely similar. Deferring a check that is already fully verified
+against its own runner, in order to wait for legs that step never touches,
+would have been caution about the wrong thing; the 12 links that sat
+unnoticed in five crates while the paragraph above tracked 9 in one are
+what that caution costs.
+
+**The genuine coverage gap the flag does *not* close, disclosed rather
+than glossed:** because `docs` is Linux-only, a doc comment *on* an item
+gated to another OS is still never read by any CI run. `App::handle_menu_event`
+is exactly that case — `#[cfg(target_os = "macos")]`, so a link *to* it
+must be plain backticks (as it now is, ×3) while a broken link *inside*
+its own doc comment would go uncaught on all three legs. Extending `docs`
+to the same 3-OS matrix `test` uses is the named follow-on, and that one
+genuinely does need a run on hardware this round did not have. **Not
+verified: macOS, Windows.**
+
 **Addendum 2026-09-04 (0.103.0) — the five GPU-admitted non-`Normal`
 blend modes now all have genuine dispatch proof, through one shared
 mode-indexed counter instead of three copies.** Pure instrumentation: no

@@ -1640,7 +1640,7 @@ fn read_entry<R: Read + Seek>(
 }
 
 /// Every surface this format persists, paired with the rectangle its
-/// own tile grid is derived from — [`write`]/[`read`]'s **one** shared
+/// own tile grid is derived from — [`write()`]/[`read`]'s **one** shared
 /// answer to "what goes in the archive", so the writer and the reader
 /// cannot disagree about it.
 ///

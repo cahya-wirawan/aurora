@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.106.1`: roughly 122,000 lines across 20 crates, 1,697 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.106.2`: roughly 122,000 lines across 20 crates, 1,697 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
 Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
@@ -91,7 +91,15 @@ original scaffold through 0.48.0, because the generator crashed on the scalar
 `cargo nextest` is not always installed locally — `cargo test --workspace` is an
 acceptable stand-in, and CI additionally runs `cargo test --workspace --doc`
 (nextest does not run doctests) plus `cargo doc --workspace --no-deps
---all-features`, so a broken intra-doc link fails CI even when every test passes.
+--all-features --document-private-items --keep-going`, so a broken intra-doc
+link fails CI even when every test passes. `--document-private-items` is
+load-bearing, not decoration (0.106.2): these crates are almost entirely
+private, so without it rustdoc never reads most of this workspace's doc
+comments — 21 broken links across 6 crates had accumulated behind that gap.
+`--keep-going` is too: `cargo doc` otherwise stops spawning units at the first
+failure and prints only the crates already in flight, which reads exactly like
+a complete list and is not one. That job runs on Linux only, so a doc comment
+*on* an item gated to another OS is still read by no CI run at all.
 
 GPU-backed tests self-skip when no adapter is present, and print `SKIPPED` rather
 than failing. A dev box with only Mesa llvmpipe still runs them, but in software
@@ -132,7 +140,7 @@ The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.106.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.106.2`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.

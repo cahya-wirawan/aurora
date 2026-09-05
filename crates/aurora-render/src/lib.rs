@@ -3,7 +3,7 @@
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
 //! `docs/adr/` for the decisions that shape it.
 //!
-//! [`schedule`] translates an `aurora_graph::RenderGraph`'s node-granular
+//! [`schedule()`] translates an `aurora_graph::RenderGraph`'s node-granular
 //! dirty regions into tile-granular work lists (PLAN.md M1.3).
 //! [`TileCompositor`] executes the GPU half of that work: blending one
 //! tile over another via the GPU's fixed-function alpha blend unit,

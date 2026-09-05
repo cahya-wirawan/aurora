@@ -92,8 +92,8 @@ pub struct Stats {
 ///
 /// **Dirtiness survives eviction** (0.91.0). A tile that is evicted while
 /// still dirty (its pending changes never consumed, e.g. via GPU upload)
-/// is recorded in `evicted_dirty`, so [`Self::is_dirty`] keeps answering
-/// `true` for it while it is paged out, [`Self::take_dirty`] can consume
+/// is recorded in `evicted_dirty`, so [`TileStore::is_dirty`] keeps answering
+/// `true` for it while it is paged out, [`TileStore::take_dirty`] can consume
 /// that record without a page-in first, and paging the tile back in
 /// re-marks it dirty. Before 0.91.0 the fact was simply lost:
 /// `Tile::from_texels` starts clean, so dirty -> evicted -> paged back in
@@ -131,7 +131,7 @@ pub struct Stats {
 /// silently, with no error raised. Every job now carries a generation
 /// minted by `make_room` (`write_generation`) and stored
 /// alongside the bytes in `pending`; both drain sites
-/// (`reconcile_pending` and [`Self::flush`]) drop, whole, any
+/// (`reconcile_pending` and [`TileStore::flush`]) drop, whole, any
 /// result whose generation is not the one `pending` holds — before they
 /// look at whether it succeeded, so a superseded *failure* cannot enter
 /// the failed-write queue either. Counted in [`Stats::superseded_writes`].

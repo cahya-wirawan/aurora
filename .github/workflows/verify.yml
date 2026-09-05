@@ -105,8 +105,20 @@ jobs:
       - name: Install fontconfig
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
 
+      # `--document-private-items` since 0.106.2. Aurora's crates are almost
+      # entirely private (`aurora-app` especially), so without it rustdoc never
+      # reads most of this workspace's doc comments and a broken intra-doc link
+      # in one is invisible to CI — 21 had accumulated across 6 crates by
+      # 0.106.2. `--keep-going` because `cargo doc` otherwise stops spawning
+      # units at the first failure and reports only the crates already in
+      # flight, which reads exactly like a complete list and is not one.
+      #
+      # This job is Linux-only, so doc comments *on* items gated to another OS
+      # (`App::handle_menu_event` is `#[cfg(target_os = "macos")]`) are still
+      # never checked anywhere. Extending this job to the same 3-OS matrix the
+      # `test` job uses is the named follow-on; see PLAN.md, 0.106.2.
       - name: rustdoc
-        run: cargo doc --workspace --no-deps --all-features
+        run: cargo doc --workspace --no-deps --all-features --document-private-items --keep-going
         env:
           RUSTDOCFLAGS: -D warnings
 
