@@ -141,8 +141,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `color_burn`, `color_dodge` -- pass with the guard gone, and not
 // because their fixtures are weak: on this backend `min()`/`max()`
 // *launder* a NaN operand into the finite one, so those six formulas
-// never let the NaN reach `fold_over`, where `ab == 0.0` would erase it
-// anyway. That makes the guard's removal genuinely **output-equivalent**
+// turn the NaN into a finite `b` before `fold_over` ever sees it -- and
+// `fold_over`'s own `ab == 0.0` would have erased that finite `b` anyway.
+// That makes the guard's removal genuinely **output-equivalent**
 // for those six here, not merely undetected. See PLAN.md's 0.109.0 entry
 // for the two isolating experiments and for why no fixture change can
 // close it.
