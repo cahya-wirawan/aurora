@@ -5214,11 +5214,11 @@ fn perform_undo_redo(
     // undoable structural steps flip it: `SetBlendMode` on a root-level
     // pixel layer across the GPU-expressible boundary (`Normal`/
     // `Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/`LinearDodge`/
-    // `LinearBurn`/`ColorBurn`/`ColorDodge`/`Dissolve` on one
-    // side, the other 16 modes on the other), and
+    // `LinearBurn`/`ColorBurn`/`ColorDodge`/`Overlay`/`Dissolve` on one
+    // side, the other 15 modes on the other), and
     // `SetVisible`, `Reparent`, `RemoveById` or `Restore` of a
     // root-level layer that is itself disqualifying (a group, or a
-    // pixel layer at one of those other 16 modes). When it flips, every
+    // pixel layer at one of those other 15 modes). When it flips, every
     // visible tile's compositing *path*
     // changes while a per-layer `Rect` names only one layer's own
     // region -- a quantity no `Rect` can express.
@@ -17885,9 +17885,10 @@ mod tests {
     /// every visible tile at once. Undoing a `SetBlendMode` on a
     /// root-level pixel layer across the GPU-expressible boundary
     /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/
-    /// `LinearDodge`/`LinearBurn`/`ColorBurn`/`ColorDodge`/`Dissolve` on
+    /// `LinearDodge`/`LinearBurn`/`ColorBurn`/`ColorDodge`/`Overlay`/
+    /// `Dissolve` on
     /// one
-    /// side, the other 16 modes on the
+    /// side, the other 15 modes on the
     /// other) flips it, so
     /// the whole document's compositing path changes while the step's own
     /// reported rect names one layer's region. This pins both halves:
@@ -27976,11 +27977,11 @@ mod tests {
         );
     }
 
-    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 16 modes the GPU
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 15 modes the GPU
     /// path still cannot express" (27 `aurora_doc::BlendMode` variants
-    /// minus the eleven admitted as of 0.108.0: `Normal`, `Multiply`,
+    /// minus the twelve admitted as of 0.110.0: `Normal`, `Multiply`,
     /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
-    /// `LinearBurn`, `ColorBurn`, `ColorDodge` and
+    /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay` and
     /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
@@ -34466,7 +34467,7 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// [`CPU_ONLY_BLEND_MODE`], one of the 16 modes the GPU path still
+    /// [`CPU_ONLY_BLEND_MODE`], one of the 15 modes the GPU path still
     /// cannot express; it was `Multiply` until 0.84.0 wired that mode onto
     /// the GPU path, then `Screen` until 0.102.0 did the same, either of
     /// which would have quietly turned this into a second GPU-path
