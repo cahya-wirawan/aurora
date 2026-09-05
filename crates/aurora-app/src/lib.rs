@@ -1066,8 +1066,8 @@ fn verify_aur(path: &Path) -> bool {
 /// `tool` reseeds the Properties panel with `tool`'s own current
 /// options ([`tool_options`]) — opening a different document doesn't
 /// change which tool is selected, so the caller's own current
-/// `self.tool` is what this should show, not [`aurora_ui::Tool::
-/// default`].
+/// `self.tool` is what this should show, not
+/// [`aurora_ui::Tool::default`].
 ///
 /// # Errors
 ///
