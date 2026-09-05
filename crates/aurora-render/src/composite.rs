@@ -265,6 +265,30 @@ const LABEL_HARD_MIX_BIND_GROUP: &str = "composite.hard_mix.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_HARD_MIX_PASS: &str = "composite.hard_mix.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_pin_light_over_with_opacity`] (0.116.0)
+/// — the same four-label set the fourteen modes above each carry, for the
+/// same reason: fifteen blend-math pipelines sharing one `"composite"` label
+/// would leave a `wgpu` validation message or a frame capture unable to
+/// say which blend mode is at fault. **The near-name risk here is a
+/// *prefix* one and the file's densest**: `"composite.hard_light"`,
+/// `"composite.linear_light"`, `"composite.vivid_light"` and this one all end
+/// in `_light`, and four `*_light` pipelines in one capture is exactly the
+/// situation a truncated label ruins. The *formula* risk is different again and
+/// points at two labels that share no word with this one at all:
+/// `"composite.darken"` and `"composite.lighten"`, whose arms this mode's two
+/// branches are literally built from, and which it provably agrees with in any
+/// backdrop-wins channel (see `fs_composite_pin_light`'s own comment). Spelled
+/// in full (`pin_light`, never `pin` or `p_light`) for the reason every pair
+/// above is.
+const LABEL_PIN_LIGHT: &str = "composite.pin_light";
+/// That method's own per-call uniform buffer.
+const LABEL_PIN_LIGHT_UNIFORM: &str = "composite.pin_light.opacity";
+/// That method's own per-call bind group.
+const LABEL_PIN_LIGHT_BIND_GROUP: &str = "composite.pin_light.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_PIN_LIGHT_PASS: &str = "composite.pin_light.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -550,6 +574,26 @@ const BLEND_PASS_HARD_MIX: BlendPass = BlendPass {
     pass: LABEL_HARD_MIX_PASS,
 };
 
+/// [`BlendMode::PinLight`]'s, likewise (0.116.0). Every field differs from
+/// every const above. Its `fragment_entry` mis-typing hazard has two shapes and
+/// they point in different directions. The *lexical* one is
+/// `"fs_composite_hard_light"`, `"fs_composite_linear_light"` and
+/// `"fs_composite_vivid_light"`, three live entry points sharing this one's
+/// `_light` suffix. The *formula* one is `"fs_composite_darken"` and
+/// `"fs_composite_lighten"`, which share no word with this name but are exactly
+/// what this mode's two branches reduce to — and which it provably agrees with
+/// in every backdrop-wins channel, so separating them needs a *source-derived*
+/// channel in each branch. Those are mutations (i) and (j) of this round's set,
+/// and every `composite_pin_light_*` fixture carries at least one
+/// source-derived channel per branch it reaches for exactly that reason.
+const BLEND_PASS_PIN_LIGHT: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_pin_light",
+    pipeline: LABEL_PIN_LIGHT,
+    uniform: LABEL_PIN_LIGHT_UNIFORM,
+    bind_group: LABEL_PIN_LIGHT_BIND_GROUP,
+    pass: LABEL_PIN_LIGHT_PASS,
+};
+
 /// Every [`BlendPass`] const above, once — this crate's own registry of
 /// the blend-math entry points it can dispatch (0.112.0).
 ///
@@ -577,7 +621,7 @@ const BLEND_PASS_HARD_MIX: BlendPass = BlendPass {
 /// one, which merged the two comments and left this array documented by
 /// nothing — one doc block per const, immediately above it, is the pattern
 /// every other mode here follows.)
-const ALL_BLEND_PASSES: [&BlendPass; 14] = [
+const ALL_BLEND_PASSES: [&BlendPass; 15] = [
     &BLEND_PASS_MULTIPLY,
     &BLEND_PASS_DARKEN,
     &BLEND_PASS_LIGHTEN,
@@ -592,6 +636,7 @@ const ALL_BLEND_PASSES: [&BlendPass; 14] = [
     &BLEND_PASS_LINEAR_LIGHT,
     &BLEND_PASS_VIVID_LIGHT,
     &BLEND_PASS_HARD_MIX,
+    &BLEND_PASS_PIN_LIGHT,
 ];
 
 /// How many blend-math `@fragment` entry points this crate dispatches —
@@ -1827,35 +1872,40 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// ninth's own per-channel helpers, and
 /// [`Self::composite_hard_mix_over_with_opacity`] (0.115.0) the
 /// fourteenth, whose blend term is the thirteenth's own helper plus one
-/// comparison,
+/// comparison, and
+/// [`Self::composite_pin_light_over_with_opacity`] (0.116.0) the
+/// fifteenth, whose blend term is the second's and third's own arms behind
+/// a `select()`,
 /// each built to exactly the same shape.
-/// The remaining 12 modes have no dedicated blend-math WGSL entry point
+/// The remaining 11 modes have no dedicated blend-math WGSL entry point
 /// of their own, and wait on one — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
-/// 12 is "26 minus the fourteen, `Multiply`, `Darken`, `Lighten`, `Screen`,
+/// 11 is "26 minus the fifteen, `Multiply`, `Darken`, `Lighten`, `Screen`,
 /// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
-/// `Overlay`, `HardLight`, `LinearLight`, `VividLight` and `HardMix`, done so
+/// `Overlay`, `HardLight`, `LinearLight`, `VividLight`, `HardMix` and
+/// `PinLight`, done so
 /// far." (Both halves of that arithmetic are derivable rather than typed:
 /// `BLEND_MATH_PASS_COUNT` is `ALL_BLEND_PASSES`'s own length, and
 /// `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`
 /// ties it to `shaders/composite.wgsl` by set equality.)
 ///
-/// **`Normal` is one of those 12 and is *not* CPU-only**, so read the
+/// **`Normal` is one of those 11 and is *not* CPU-only**, so read the
 /// figure as "no blend-math shader", never as "no GPU path":
 /// [`Self::composite_over_with_opacity`]'s fixed-function
 /// `Blend::AlphaBlending` unit already expresses `Normal` on the GPU,
 /// which is exactly why it needs no formula in
 /// `shaders/composite.wgsl`. The modes genuinely left to
-/// `composite_tile_cpu` are therefore the other **11**, and that is
+/// `composite_tile_cpu` are therefore the other **10**, and that is
 /// precisely `aurora-app`'s own count of what its GPU predicate
-/// rejects: 27 real `aurora_doc::BlendMode` variants minus the sixteen it
+/// rejects: 27 real `aurora_doc::BlendMode` variants minus the seventeen it
 /// admits (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`,
 /// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
-/// `Overlay`, `HardLight`, `LinearLight`, `VividLight`, `HardMix` and
+/// `Overlay`, `HardLight`, `LinearLight`, `VividLight`, `HardMix`,
+/// `PinLight` and
 /// `Dissolve`). The two
-/// figures — 12
-/// here, 11 there —
+/// figures — 11
+/// here, 10 there —
 /// count different
 /// things, and the one mode between them is `Normal`. `Dissolve` is in
 /// neither set: absent from this crate's enum altogether, and *admitted*
@@ -3854,6 +3904,97 @@ impl TileCompositor {
             dst,
             opacity,
             &BLEND_PASS_HARD_MIX,
+        );
+    }
+
+    /// [`BlendMode::PinLight`]'s in-shader composite (0.116.0) —
+    /// `fs_composite_pin_light`, the **fifteenth** mode ported and the last
+    /// branch-on-the-source overlay-family mode except `SoftLight`.
+    ///
+    /// Same signature, same aliasing rule (`dst` must not be `backdrop`), same
+    /// `(src, backdrop, dst)` order and same clamped-`opacity`/unclamped-`sa *
+    /// opacity` contract as
+    /// [`Self::composite_multiply_over_with_opacity`], whose doc comment
+    /// carries the full derivation of the surrounding "over".
+    ///
+    /// **The formula.** `blend_channel`'s own arm is
+    ///
+    /// ```text
+    /// BlendMode::PinLight => if cs <= 0.5 { Darken(cb, 2*cs) }
+    ///                        else         { Lighten(cb, 2*cs - 1) }
+    /// ```
+    ///
+    /// with `Darken => min` and `Lighten => max`, so the shader is one
+    /// componentwise `select()` over a `min` and a `max` and needs no per-channel
+    /// helper. A `select()` is legitimate here for `Overlay`'s and `HardLight`'s
+    /// reason and not `VividLight`'s: neither arm divides, so evaluating the
+    /// discarded one reinstates no hazard.
+    ///
+    /// **The blind set, which is what shapes every fixture — four classes,
+    /// exhaustively verified over a 129×129 rational grid with zero members
+    /// outside them.** Writing `D0 = Cb - Cs` and
+    /// `D1 = B(Cb, Cs) - B(Cs, Cb)`, the blend term is symmetric (`D1 == 0`,
+    /// hence blind to a transpose at effective alpha `1.0`) exactly on:
+    /// `Cb == Cs`; **`|Cb - Cs| == 0.5`**; one operand `0` with the other
+    /// `<= 0.5`; one operand `1` with the other `> 0.5`. The second is a hazard
+    /// class **no previously ported mode has** and is the finding of this round
+    /// worth carrying forward — `(0.25, 0.75)` and `(0.5, 1.0)` are both in it,
+    /// and both are values a fixture reaches for by habit. Blindness at
+    /// `a = 0.5` needs `D0 + D1 == 0` with `D0 != 0`, which over that grid
+    /// happens at **exactly two pairs, `(0, 1)` and `(1, 0)`** — the same corner
+    /// `HardMix` found, for an unrelated reason. Only a channel straddling `0.5`
+    /// can have any interior blind alpha at all.
+    ///
+    /// **Its `<=` boundary mutation is killable, measured — the second ported
+    /// mode for which that is true, and the first whose kill needs an
+    /// out-of-gamut backdrop.** At `Cs == 0.5` the arms are `min(Cb, 1)` and
+    /// `max(Cb, 0)`, identical for every `Cb` in `[0, 1]`; but
+    /// `straight_backdrop` does not clamp, so an accumulator with
+    /// `rgb > a` gives `Cb > 1`, where they diverge (`Cb = 1.5` → `1.0` against
+    /// `1.5`). `composite_pin_light_over_with_opacity_agrees_across_its_own_
+    /// branch_boundary` carries one such channel and two in-gamut ones, and the
+    /// `<` mutant was measured failing it on real hardware.
+    ///
+    /// **Not a sixth detector of `straight_backdrop`'s guard removal** —
+    /// predicted from 0.110.0's rule, then measured. Both arms are a bare
+    /// `min`/`max` with `cb` as an operand, and this adapter's `min`/`max`
+    /// launder a `NaN` into the finite operand, so this mode sits in
+    /// `Darken`/`Lighten`'s class — which is unsurprising, since it *is* those
+    /// two behind a branch. The detector count stays at five. Unlike `HardMix`'s
+    /// argument this one rests wholly on that measured `FMin`/`FMax` behaviour,
+    /// which WGSL leaves undefined, so it is not a portability guarantee.
+    ///
+    /// **Degeneracy that governs the fixtures: every backdrop-wins channel
+    /// (`B == Cb`) agrees with `Darken` in the low branch and `Lighten` in the
+    /// high branch**, both live GPU arms — so separating them needs a
+    /// *source-derived* channel in each branch, which every
+    /// `composite_pin_light_*` fixture carries. A `0.5` **source** channel is a
+    /// no-op and is also this mode's one `LinearLight` collision
+    /// (`LinearLight(Cb, 0.5) = clamp(Cb, 0, 1)`); a `0.5` **backdrop** channel
+    /// is not degenerate.
+    ///
+    /// `aurora-app` is the only caller: `document_qualifies_for_gpu_compositing`
+    /// admits `PinLight` and `begin_gpu_composite_tile` dispatches here for every
+    /// `PinLight` root layer, counting each dispatch
+    /// (`GpuBlendDispatch::PinLight` in that crate), so no test here can be
+    /// silently satisfied by a CPU fallback.
+    pub fn composite_pin_light_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_PIN_LIGHT,
         );
     }
 
@@ -6922,7 +7063,7 @@ mod tests {
     /// silently.
     ///
     /// **Since 0.109.0 the guard is shared, not per entry point, and this
-    /// is one of only five of the fourteen per-mode versions of this test
+    /// is one of only five of the fifteen per-mode versions of this test
     /// that still detect its removal** — with `screen`'s, `difference`'s,
     /// `overlay`'s (0.110.0) and `hard_light`'s (0.111.0). `Multiply`'s
     /// `cb * s.rgb`
@@ -8053,7 +8194,7 @@ mod tests {
     // `ab > 0.0` guard", and 0.109.1 corrected it here and at the six
     // sibling section headers below.** Since 0.109.0 the guard is written
     // *once*, in `composite.wgsl`'s `straight_backdrop()`, and shared by
-    // all fourteen blend-math entry points, so guard independence is not a
+    // all fifteen blend-math entry points, so guard independence is not a
     // per-entry-point property any more. It is worse than that for this
     // mode specifically: with the guard deleted, `composite_lighten_over_
     // with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
@@ -10407,7 +10548,7 @@ mod tests {
     ///
     /// **Confirmed by measurement in 0.109.0.** The guard now lives once in
     /// `composite.wgsl`'s shared `straight_backdrop()`, and deleting it
-    /// fails exactly five of the fourteen per-mode versions of this test —
+    /// fails exactly five of the fifteen per-mode versions of this test —
     /// `multiply`'s, `screen`'s, this one, `overlay`'s (0.110.0) and
     /// `hard_light`'s (0.111.0) —
     /// for exactly that reason,
@@ -19811,7 +19952,7 @@ mod tests {
     /// burn arm (`1 - min(1, NaN)` is `1 - 1`) or a finite `1.0` in the dodge
     /// arm, and `fold_over`'s `ab == 0.0` erases it anyway. Measured in
     /// 0.114.0: with the guard deleted, **this test stays green**. The detector
-    /// count stays at **five of fourteen**.
+    /// count stays at **five of fifteen**.
     ///
     /// The finiteness check below is kept regardless: a backend whose `min()`
     /// does *not* launder would surface exactly there rather than as a silent
@@ -20164,7 +20305,7 @@ mod tests {
     // `NaN < 0.5` is `false`, so `hard_mix_channel` takes its `else` branch and
     // returns a finite `1.0`. Predicted in this round, then measured: test 6
     // stays green with the guard deleted. The detector count stays at **five of
-    // fourteen** (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`).
+    // fifteen** (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`).
     //
     // **Two portability guards inherited unchanged**, `color_burn_channel`'s
     // `cs == 0.0` and `color_dodge_channel`'s `cs == 1.0`, each redundant only
@@ -20869,7 +21010,7 @@ mod tests {
     ///   exactly `1.0`. It cannot return a non-finite value for any input.
     ///
     /// Measured in 0.115.0: with the guard deleted, **this test stays green**.
-    /// The detector count stays at **five of fourteen**. Note the two
+    /// The detector count stays at **five of fifteen**. Note the two
     /// mechanisms are *not* distinguishable from the output — `fold_over`'s
     /// `ab == 0.0` multiplies `b` away regardless — so this test cannot say
     /// which one saved it, only that the result is finite and correct.
@@ -21328,6 +21469,1036 @@ mod tests {
              one remaining channel can rail only one way. ColorDodge is separated \
              ((0, 1, 0.6667)), and ColorBurn is separated by six of the seven other fixtures in \
              this suite."
+        );
+    }
+
+    // -- `BlendMode::PinLight` on the GPU (0.116.0), the **fifteenth** mode
+    // ported. `fs_composite_pin_light` in `shaders/composite.wgsl`, dispatched
+    // through `BLEND_PASS_PIN_LIGHT` and
+    // `TileCompositor::composite_pin_light_over_with_opacity`. Read that entry
+    // point's own comment first; this header records only what constrains the
+    // seven fixtures below.
+    //
+    // **The formula.** `Cs <= 0.5 -> min(Cb, 2*Cs)`, else
+    // `max(Cb, 2*Cs - 1)` -- `Darken` and `Lighten` behind a branch on the
+    // **source**, which is what `blend_channel`'s own arm delegates to. One
+    // componentwise `select()`, no per-channel helper, no division.
+    //
+    // **Four regimes, and every fixture is described by which it reaches**:
+    // low/high branch crossed with *source-derived* (`B != Cb`) and
+    // *backdrop-wins* (`B == Cb`). That cross is not cosmetic -- see degeneracy
+    // 1.
+    //
+    // **Degeneracies, and what each fixture must therefore carry.**
+    //
+    //   1. **Every backdrop-wins channel provably agrees with `Darken` in the
+    //      low branch and with `Lighten` in the high branch.** Both are live
+    //      entry points and live dispatch arms, so a `fragment_entry` naming
+    //      either is separated only by a *source-derived* channel in the
+    //      matching branch. Every fixture here carries at least one
+    //      source-derived channel per branch it reaches.
+    //   2. `PinLight(Cb, 0) = 0` and `PinLight(Cb, 1) = 1` -- a black or white
+    //      **source** channel erases the backdrop.
+    //   3. `PinLight(Cb, 0.5) = Cb` for in-gamut `Cb` -- a **source** channel at
+    //      exactly `0.5` is a no-op, is this mode's branch boundary, and is its
+    //      one total `LinearLight` collision
+    //      (`LinearLight(Cb, 0.5) = clamp(Cb, 0, 1)`). Only test 7 uses it, and
+    //      deliberately.
+    //   4. A `0.5` **backdrop** channel is *not* degenerate here, unlike
+    //      `HardLight`'s -- so backdrop `0.5`s are usable and are used.
+    //   5. `Cb == Cs` hides a transposed operand pair, as for every mode.
+    //
+    // **The blind set is this round's finding, and one class of it is new to
+    // this file.** With `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, the
+    // blend term is symmetric (`D1 == 0`) exactly on four classes -- verified
+    // exhaustively over a 129x129 rational grid on `[0, 1]^2`, 511 pairs found
+    // and **zero of them outside these four**:
+    //
+    //   1. `Cb == Cs`;
+    //   2. **`|Cb - Cs| == 0.5`** -- a hazard class **no previously ported mode
+    //      has**. `(0.25, 0.75)` and `(0.5, 1.0)` are both in it, because the
+    //      low `min` and the high `max` land on the same value from either
+    //      operand order (`max(0.25, 0.5) = 0.5 = min(0.75, 0.5)`). Those are
+    //      values a fixture reaches for by habit, which is why this is stated
+    //      here rather than only in the shader;
+    //   3. one operand `0` with the other `<= 0.5`;
+    //   4. one operand `1` with the other `> 0.5`.
+    //
+    // Blindness at `a = 0.5` needs `D0 + D1 == 0` with `D0 != 0`, which over
+    // that grid holds at **exactly two pairs, `(0, 1)` and `(1, 0)`** -- the
+    // same corner `HardMix`'s round found, reached here for an unrelated reason.
+    // Only a channel straddling `0.5` can have an interior blind alpha at all.
+    // No fixture below sits on any of those five sets.
+    //
+    // **The `<= 0.5` boundary mutation IS killable, and this round resolved it
+    // by measurement rather than disclosing it unresolved** -- the second ported
+    // mode for which that is true after `HardMix` (0.115.0), and the **first
+    // whose kill needs an out-of-gamut backdrop to exist at all**. For every
+    // `Cb` in `[0, 1]` the two arms agree at `Cs == 0.5` (`min(Cb, 1) = Cb =
+    // max(Cb, 0)`), exactly as `Overlay`'s, `HardLight`'s and `VividLight`'s do
+    // -- so in gamut the mutation computes the same function. But
+    // `straight_backdrop` does not clamp, and an accumulator whose premultiplied
+    // `rgb` exceeds its own `a` (an unclamped float-TIFF import under invariant
+    // §7.3.1b, not off-nominal input) gives `Cb > 1`, where they diverge. Test 7
+    // carries one such channel and two in-gamut ones, and the `<` mutant was
+    // measured failing it.
+    //
+    // **Not a sixth detector of `straight_backdrop`'s guard removal** --
+    // predicted from 0.110.0's rule, then measured. Both arms are a bare
+    // `min`/`max` with `cb` as an operand, and on this adapter those launder a
+    // `NaN` into the finite operand, so `b` is finite before `fold_over` sees
+    // it; the branch condition reads `s.rgb` and is unaffected. This mode sits
+    // in `Darken`/`Lighten`'s class, which is unsurprising since it *is* those
+    // two behind a branch. Measured in 0.116.0: test 6 stays green with the
+    // guard deleted. The detector count stays at **five of fifteen**
+    // (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`). Unlike
+    // `HardMix`'s, this argument rests wholly on a measured `FMin`/`FMax`
+    // property WGSL leaves undefined, so it is this adapter's result and not a
+    // portability guarantee.
+    //
+    // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
+    // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
+    // benchmarks stay comparable across it.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`, NVIDIA GeForce
+    // RTX 3090, Vulkan, DiscreteGpu). One backend on one vendor: Metal and DX12
+    // remain unverified for `fs_composite_pin_light`.
+
+    #[test]
+    /// The plain case, and the fixture that carries **three of the four
+    /// branch/outcome regimes in one draw**: an opaque
+    /// `(0.65625, 0.375, 0.1875)` accumulator under a
+    /// `(0.25, 0.8125, 0.5625)` source at its own `0.5` alpha. These are
+    /// exactly `aurora-app`'s `NORMAL_MULTIPLY_PIN_LIGHT_STACK` composited
+    /// operands, so the two crates' goldens are the same number derived twice.
+    ///
+    /// Per channel, with `B = PinLight(Cb, Cs)`:
+    ///
+    /// - red: `Cs = 0.25 <= 0.5`, **low branch**,
+    ///   `min(0.65625, 0.5) = 0.5` — **source-derived**, so this is the channel
+    ///   that separates `Darken` (`min(0.65625, 0.25) = 0.25`) in the low
+    ///   branch, per degeneracy 1;
+    /// - green: `Cs = 0.8125 > 0.5`, **high branch**,
+    ///   `max(0.375, 0.625) = 0.625` — **source-derived**, the channel that
+    ///   separates `Lighten` (`max(0.375, 0.8125) = 0.8125`) in the high
+    ///   branch;
+    /// - blue: `Cs = 0.5625 > 0.5`, **high branch**,
+    ///   `max(0.1875, 0.125) = 0.1875` — **backdrop-wins**, a no-op channel.
+    ///
+    /// `B = (0.5, 0.625, 0.1875)` and the fold at `a = 0.5` over an opaque
+    /// accumulator is `0.5 * Cb + 0.5 * B`, giving
+    /// `(0.578125, 0.5, 0.1875)` at alpha `1.0`. **All three golden channels
+    /// are distinct.**
+    ///
+    /// Off every blind class: no `Cb == Cs`, no `|Cb - Cs| == 0.5`
+    /// (`0.40625`, `0.4375`, `0.375`), no operand at `0` or `1`, and neither
+    /// `(0, 1)` corner. So an in-shader operand transpose is visible here, in
+    /// all three channels: `(0.484375, 0.5625, 0.28125)`.
+    ///
+    /// Rival arms, re-derived in exact rationals (`0.5 * Cb + 0.5 * B` for each
+    /// mode's own `B`):
+    ///
+    /// - **`Darken` `(0.453125, 0.375, 0.1875)`** — a live GPU arm, and what a
+    ///   dropped `2.0 *` in the low arm computes there. **REQUIRED DISCLOSURE:
+    ///   blue coincides**, which is not a fixture weakness but degeneracy 1 —
+    ///   blue is a backdrop-wins high channel and
+    ///   `Darken(0.1875, 0.5625) = 0.1875 = B`. Red and green carry the claim.
+    /// - **`Lighten` `(0.65625, 0.59375, 0.375)`** — also live; all three
+    ///   channels separate it.
+    /// - `Normal` `(0.453125, 0.59375, 0.375)`, `Multiply`
+    ///   `(0.41015625, 0.33984375, 0.14648438)`, `Screen`
+    ///   `(0.69921875, 0.62890625, 0.41601562)`, `Overlay`
+    ///   `(0.5703125, 0.4921875, 0.19921875)`, `HardLight`
+    ///   `(0.4921875, 0.5703125, 0.23828125)`, `ColorBurn`
+    ///   `(0.328125, 0.30288.., 0.09375)`, `ColorDodge`
+    ///   `(0.765625, 0.6875, 0.30803..)`, `Difference`
+    ///   `(0.53125, 0.40625, 0.28125)`, `Exclusion`
+    ///   `(0.6171875, 0.4765625, 0.36328125)`, `LinearBurn`
+    ///   `(0.328125, 0.28125, 0.09375)`, `LinearDodge`
+    ///   `(0.78125, 0.6875, 0.46875)`, `LinearLight`
+    ///   `(0.40625, 0.6875, 0.25)`, `VividLight`
+    ///   `(0.484375, 0.6875, 0.20089..)` and `HardMix`
+    ///   `(0.328125, 0.6875, 0.09375)` — **none coinciding in any channel**.
+    ///
+    /// The golden is cross-checked against the real [`composite_tile_cpu`]
+    /// first, so a stale literal fails as a setup error rather than as a GPU
+    /// disagreement.
+    fn composite_pin_light_over_with_opacity_takes_both_branches_per_channel() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.65625, 0.375, 0.1875, 1.0];
+        let top_rgba = [0.25, 0.8125, 0.5625, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.65625, 0.375, 0.1875, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass then \
+             samples"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.578_125, 0.5, 0.1875, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself computes \
+             for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.578_125, 0.5, 0.1875, 1.0),
+            "PinLight branches on the SOURCE: red takes the low branch (min(0.65625, 0.5) = 0.5, \
+             source-derived), green the high branch (max(0.375, 0.625) = 0.625, source-derived) \
+             and blue the high branch backdrop-wins (max(0.1875, 0.125) = 0.1875), so B is \
+             (0.5, 0.625, 0.1875) and 0.5*Cb + 0.5*B is (0.578125, 0.5, 0.1875). Darken gives \
+             (0.453125, 0.375, 0.1875) -- a live arm, and what a dropped 2.0* in the low arm \
+             computes; red and green see it, blue cannot, being a backdrop-wins high channel that \
+             provably agrees with Darken (degeneracy 1). Lighten gives (0.65625, 0.59375, 0.375), \
+             separated in all three. An in-shader operand transpose gives \
+             (0.484375, 0.5625, 0.28125) -- all three, this fixture sitting off every blind class. \
+             The Normal arm gives (0.453125, 0.59375, 0.375), Multiply \
+             (0.41015625, 0.33984375, 0.14648438), Screen \
+             (0.69921875, 0.62890625, 0.41601562), Overlay (0.5703125, 0.4921875, 0.19921875), \
+             HardLight (0.4921875, 0.5703125, 0.23828125), ColorBurn \
+             (0.328125, 0.30288, 0.09375), ColorDodge (0.765625, 0.6875, 0.30804), Difference \
+             (0.53125, 0.40625, 0.28125), Exclusion (0.6171875, 0.4765625, 0.36328125), \
+             LinearBurn (0.328125, 0.28125, 0.09375), LinearDodge (0.78125, 0.6875, 0.46875), \
+             LinearLight (0.40625, 0.6875, 0.25), VividLight (0.484375, 0.6875, 0.20089) and \
+             HardMix (0.328125, 0.6875, 0.09375) -- none coinciding in any channel."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case, exercising the shared
+    /// `straight_backdrop()`'s recovery
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`) as this entry point reaches it.
+    ///
+    /// The backdrop is `(0.75, 0.4375, 0.625)` at half opacity — so the
+    /// accumulator arrives premultiplied as `(0.375, 0.21875, 0.3125)` at alpha
+    /// `0.5` and the shader has a real division to do — under a
+    /// `(0.3125, 0.6875, 0.25)` source at alpha `1.0`.
+    ///
+    /// Correct `B`: red **low** branch, `min(0.75, 0.625) = 0.625`
+    /// (source-derived); green **high** branch,
+    /// `max(0.4375, 0.375) = 0.4375` (backdrop-wins); blue **low** branch,
+    /// `min(0.625, 0.5) = 0.5` (source-derived). Both branches, and a
+    /// source-derived channel in each. The fold at `ab = 0.5` with `a = 1.0` is
+    /// `0.5 * Cs + 0.5 * B`, giving `(0.46875, 0.5625, 0.375)` at alpha `1.0`.
+    ///
+    /// **All three channels see a missing un-premultiply**, and none of them by
+    /// a rounding: with `Cb` left halved at `(0.375, 0.21875, 0.3125)` the
+    /// branches are unchanged (they read `Cs`) but every `min`/`max` moves —
+    /// `min(0.375, 0.625) = 0.375`, `max(0.21875, 0.375) = 0.375`,
+    /// `min(0.3125, 0.5) = 0.3125` — and the mutant reads
+    /// `(0.34375, 0.53125, 0.28125)`, off by `0.125`, `0.03125` and `0.09375`
+    /// against a `2 * f16::EPSILON` tolerance.
+    ///
+    /// Off every blind class (`|Cb - Cs|` is `0.4375`, `0.25`, `0.375`).
+    ///
+    /// The expected value is asserted both ways: against the real
+    /// [`composite_tile_cpu`] within `2 * f16::EPSILON`, and as the absolute
+    /// literal `(0.46875, 0.5625, 0.375, 1.0)`.
+    fn composite_pin_light_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.75, 0.4375, 0.625, 1.0];
+        let top_rgba = [0.3125, 0.6875, 0.25, 1.0];
+        let backdrop_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                backdrop_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.375, 0.21875, 0.3125, 0.5),
+            "setup: the accumulator must be premultiplied at alpha 0.5, so the entry point under \
+             test has a real un-premultiply to do"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, backdrop_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        assert_eq!(
+            gpu_result,
+            (0.46875, 0.5625, 0.375, 1.0),
+            "0.5*Cs + 0.5*B against a half-alpha accumulator, with Cb recovered as \
+             (0.75, 0.4375, 0.625) and B = (0.625, 0.4375, 0.5). Without the un-premultiply Cb \
+             would be (0.375, 0.21875, 0.3125) and every min/max would move, reading \
+             (0.34375, 0.53125, 0.28125, 1.0) -- all three channels see that. Full texel: \
+             {gpu_result:?}"
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader PinLight path and composite_tile_cpu disagree \
+                 against a half-alpha accumulator ({gpu} vs {cpu}). Full texels: {gpu_result:?} \
+                 vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The spatial-addressing test for the `fs_composite_pin_light` entry point,
+    /// and the only `PinLight` test here that can catch a V-flip, a transposed
+    /// axis or a UV offset: two [`patterned_texels`] layers, one whole-tile
+    /// differential against [`composite_tile_cpu`].
+    ///
+    /// **What this fixture cannot do, disclosed rather than implied.**
+    /// `patterned_texels` varies over multiples of `0.25`, which puts a large
+    /// fraction of the tile on this mode's dead ends: a source channel of `0.0`,
+    /// `0.5` or `1.0` is degeneracy 2 or 3, and `|Cb - Cs| == 0.5` — this mode's
+    /// own new blind class — is hit by every pair two steps apart on that grid,
+    /// so a great many texels are blind to an operand transpose.
+    ///
+    /// So this is deliberately a *spatial* check rather than a formula check.
+    /// The formula checks are tests 1, 2, 4, 5, 6 and 7, whose solid fixtures
+    /// are chosen against the degeneracies and the blind set above. What is only
+    /// reachable here is a wrong *texel*: the accumulator is verified
+    /// texel-for-texel first, so a disagreement below is attributable to the
+    /// `PinLight` pass alone.
+    fn composite_pin_light_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the PinLight comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader PinLight path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel bug \
+             (V-flip, transpose, UV offset, transposed binding), not precision -- but note this \
+             fixture's degenerate texels, enumerated in the doc comment: on a 0.25 grid a source \
+             channel of 0.0, 0.5 or 1.0 is a dead end and |Cb - Cs| == 0.5 (this mode's own blind \
+             class) is common, so many texels say nothing about the formula.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `PinLight` path, exercising the
+    /// `s.a * opacity` scale, and the fixture that supplies the **fourth**
+    /// branch/outcome regime — *low-branch backdrop-wins* — which tests 1 and 2
+    /// between them do not reach.
+    ///
+    /// `Cb = (0.375, 0.8125, 0.5625)`, `Cs = (0.4375, 0.9375, 0.25)`, opacity
+    /// `0.5` against a source alpha of `1.0`:
+    ///
+    /// - red: **low**, `min(0.375, 0.875) = 0.375` — **backdrop-wins**, the
+    ///   regime this fixture exists for; it provably agrees with `Darken` here
+    ///   (degeneracy 1) and says nothing about that rival;
+    /// - green: **high**, `max(0.8125, 0.875) = 0.875` — source-derived;
+    /// - blue: **low**, `min(0.5625, 0.5) = 0.5` — source-derived, so the low
+    ///   branch still has a `Darken`-separating channel.
+    ///
+    /// `B = (0.375, 0.875, 0.5)` and `0.5 * Cb + 0.5 * B` gives
+    /// `(0.375, 0.84375, 0.53125)` at alpha `1.0`. **All three golden channels
+    /// are distinct.**
+    ///
+    /// This is also the suite's only fixture with **same-side** channels: red
+    /// (`0.375`, `0.4375`) and green (`0.8125`, `0.9375`) both have their two
+    /// operands on one side of `0.5`, which by the blind-set analysis means
+    /// `D0` and `D1` are same-signed there and neither channel has any interior
+    /// blind alpha. Blue straddles. None of the three is on a blind class
+    /// (`|Cb - Cs|` is `0.0625`, `0.125`, `0.3125`).
+    ///
+    /// Rival arms, re-derived in exact rationals: **`Darken`
+    /// `(0.375, 0.8125, 0.40625)`** — red coincides, by degeneracy 1; green and
+    /// blue separate it. **`Lighten` `(0.40625, 0.875, 0.5625)`** — green
+    /// coincides (a source-derived high channel whose `max` happens to pick the
+    /// same operand `Lighten` would, `0.875 > 0.8125`), red and blue separate
+    /// it. Then `Normal` `(0.40625, 0.875, 0.40625)`, `Multiply`
+    /// `(0.26953125, 0.78710938, 0.3515625)`, `Screen`
+    /// `(0.51171875, 0.90039062, 0.6171875)`, `Overlay`
+    /// `(0.3515625, 0.89453125, 0.453125)`, `HardLight`
+    /// `(0.3515625, 0.89453125, 0.421875)`, `ColorBurn`
+    /// `(0.1875, 0.80625, 0.28125)`, `ColorDodge`
+    /// `(0.52083.., 0.90625, 0.65625)`, `Difference`
+    /// `(0.21875, 0.46875, 0.4375)`, `Exclusion`
+    /// `(0.4296875, 0.51953125, 0.546875)`, `LinearBurn`
+    /// `(0.1875, 0.78125, 0.28125)`, `LinearDodge`
+    /// `(0.59375, 0.90625, 0.6875)`, `LinearLight`
+    /// `(0.3125, 0.90625, 0.3125)`, `VividLight`
+    /// `(0.33036.., 0.90625, 0.34375)` and `HardMix`
+    /// `(0.1875, 0.90625, 0.28125)` — none coinciding in any channel.
+    fn composite_pin_light_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.375, 0.8125, 0.5625, 1.0];
+        let top_rgba = [0.4375, 0.9375, 0.25, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::PinLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.375, 0.84375, 0.53125, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself computes \
+             -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.375, 0.84375, 0.53125, 1.0),
+            "the opacity uniform must scale the source alpha before the fold: B is \
+             (0.375, 0.875, 0.5) -- red low-branch backdrop-wins, green high-branch \
+             source-derived, blue low-branch source-derived -- so 0.5*Cb + 0.5*B is \
+             (0.375, 0.84375, 0.53125). Darken gives (0.375, 0.8125, 0.40625), coinciding in red \
+             alone by degeneracy 1, and Lighten (0.40625, 0.875, 0.5625), coinciding in green \
+             alone. The Normal arm gives (0.40625, 0.875, 0.40625), Multiply \
+             (0.26953125, 0.78710938, 0.3515625), Screen (0.51171875, 0.90039062, 0.6171875), \
+             Overlay (0.3515625, 0.89453125, 0.453125), HardLight \
+             (0.3515625, 0.89453125, 0.421875), ColorBurn (0.1875, 0.80625, 0.28125), ColorDodge \
+             (0.52083, 0.90625, 0.65625), Difference (0.21875, 0.46875, 0.4375), Exclusion \
+             (0.4296875, 0.51953125, 0.546875), LinearBurn (0.1875, 0.78125, 0.28125), \
+             LinearDodge (0.59375, 0.90625, 0.6875), LinearLight (0.3125, 0.90625, 0.3125), \
+             VividLight (0.33036, 0.90625, 0.34375) and HardMix (0.1875, 0.90625, 0.28125)."
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader PinLight path and composite_tile_cpu disagree at \
+                 opacity 0.5 ({gpu} vs {cpu}). Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// A source alpha above `1.0` — legal in `f16` and deliberately *not*
+    /// clamped, matching [`composite_layer_into`], which clamps the *opacity*
+    /// and not the `sa * opacity` product.
+    ///
+    /// `Cb = (0.25, 0.5625, 0.875)`, `Cs = (0.875, 0.4375, 0.1875)` at alpha
+    /// `2.0` and opacity `1.0`, so `a = 2.0`, `inv = -1.0`, and over an opaque
+    /// accumulator the fold is `out = 2*B - Cb`:
+    ///
+    /// - red: **high**, `max(0.25, 0.75) = 0.75` (source-derived);
+    ///   `out = 1.25`, deliberately above `1.0`;
+    /// - green: **low**, `min(0.5625, 0.875) = 0.5625` (backdrop-wins);
+    ///   `out = 0.5625`, in range;
+    /// - blue: **low**, `min(0.875, 0.375) = 0.375` (source-derived);
+    ///   `out = -0.125`, deliberately below `0.0`.
+    ///
+    /// So this fixture goes out of range in **both** directions in one draw,
+    /// which is what it exists for. A clamped `s.a * opacity` product would read
+    /// `(0.75, 0.5625, 0.375, 1.0)` — `out = B` — and an output clamp to
+    /// `[0, 1]` would read `(1.0, 0.5625, 0.0, 1.0)`; unlike `HardMix`'s
+    /// sibling test those two are **distinguishable here**, because this mode's
+    /// `B` is not two-valued.
+    ///
+    /// **The backdrop here is deliberately in gamut**, so this test says
+    /// nothing about the `<=`-vs-`<` boundary mutation — that needs `Cb > 1`
+    /// *and* a source channel at exactly `0.5`, and test 7 is where both live.
+    ///
+    /// `Lighten` `(1.5, 0.5625, 0.875)` coincides in green, by degeneracy 1
+    /// (green is a backdrop-wins **low** channel, and `Lighten` agreeing there
+    /// is coincidence rather than the provable rail — `max(0.5625, 0.4375)` is
+    /// `Cb` too). `Darken` `(0.25, 0.3125, -0.5)` coincides nowhere.
+    fn composite_pin_light_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.25, 0.5625, 0.875, 1.0];
+        let top_rgba = [0.875, 0.4375, 0.1875, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::PinLight),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's own \
+                 formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        for (gpu, expected, channel) in [
+            (gr, 1.25, "r"),
+            (gg, 0.5625, "g"),
+            (gb, -0.125, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold (out = 2*B - Cb \
+                 with B = (0.75, 0.5625, 0.375), out of range in both directions in one draw); got \
+                 {gpu}. (0.75, 0.5625, 0.375, 1.0) would mean fs_composite_pin_light clamped the \
+                 s.a * opacity product, and (1.0, 0.5625, 0.0, 1.0) that something clamped the \
+                 output to [0, 1] -- unlike HardMix's sibling test those two are distinguishable \
+                 here, this mode's B not being two-valued. This fixture's backdrop is in gamut, so \
+                 it says nothing about the <=-vs-< boundary mutation; test 7 is where that lives. \
+                 Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The shared `straight_backdrop()` guard's **untaken** branch as
+    /// `fs_composite_pin_light` reaches it, on real hardware — and this mode was
+    /// **predicted not to detect the guard's removal**, then measured. That is
+    /// the fourth such prediction (after `LinearLight`, 0.113.0, `VividLight`,
+    /// 0.114.0, and `HardMix`, 0.115.0).
+    ///
+    /// **Why.** A mode detects the guard's removal exactly when its blend term
+    /// has no `NaN`-laundering step on the path from `cb` to `b`. Both of this
+    /// mode's arms are a bare `min`/`max` with `cb` as an operand, and on this
+    /// adapter `min(NaN, x)`/`max(NaN, x)` return the finite operand (probed
+    /// directly in 0.109.1), so `b` is finite before `fold_over` sees it. The
+    /// `select()` condition reads `s.rgb`, which the guard's removal does not
+    /// touch, so a well-defined arm is still chosen — and it launders either
+    /// way. This mode is in `Darken`/`Lighten`'s class exactly, which is
+    /// unsurprising since it *is* those two behind a branch.
+    ///
+    /// Measured in 0.116.0: with the guard deleted, **this test stays green**.
+    /// The detector count stays at **five of fifteen**. **Unlike `HardMix`'s,
+    /// this argument rests wholly on a measured property of this vendor's
+    /// `FMin`/`FMax`, which WGSL leaves undefined on a `NaN` operand** — so it
+    /// is this adapter's result and not a portability claim. The finiteness
+    /// check below is kept regardless, as the siblings' are.
+    ///
+    /// **The opaque half is a real formula check.**
+    /// [`half_transparent_texels`]'s opaque `(0.75, 0.25, 0.5)` has no channel
+    /// at `0.0` or `1.0`, and its `0.5` blue is fine here — a `0.5` *backdrop*
+    /// is not degenerate for this mode (degeneracy 4). Against
+    /// `Cs = (0.3125, 0.6875, 0.5625)` at effective alpha `1.0`, so `out = B`:
+    ///
+    /// - red: **low**, `min(0.75, 0.625) = 0.625` (source-derived);
+    /// - green: **high**, `max(0.25, 0.375) = 0.375` (source-derived);
+    /// - blue: **high**, `max(0.5, 0.125) = 0.5` (backdrop-wins).
+    ///
+    /// Both branches, a source-derived channel in each, and all three golden
+    /// channels distinct. `Darken` gives `(0.3125, 0.25, 0.5)` — blue coincides,
+    /// by degeneracy 1; `Lighten` `(0.75, 0.6875, 0.5625)` — nothing coincides.
+    /// **REQUIRED DISCLOSURE: `Exclusion` also coincides in blue**
+    /// (`(0.59375, 0.59375, 0.5)`), which is arithmetic coincidence rather than
+    /// a provable agreement, and `Exclusion` is `CPU_ONLY_BLEND_MODE` and not a
+    /// live GPU arm. Red and green separate both.
+    /// Off every blind class (`|Cb - Cs|` is `0.4375`, `0.4375`, `0.0625`).
+    fn composite_pin_light_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
+    {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let top_rgba = [0.3125, 0.6875, 0.5625, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. Note this \
+             mode is *not* expected to catch the guard's deletion: both of its arms are a bare \
+             min/max with cb as an operand, and this adapter's min/max launder a NaN into the \
+             finite operand. That is a measured property WGSL leaves undefined, not a portability \
+             guarantee, which is exactly why this assertion is kept."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.3125, 0.6875, 0.5625, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader PinLight path and composite_tile_cpu disagree across a \
+             half-transparent backdrop. In the opaque half the correct answer is \
+             B = (0.625, 0.375, 0.5) -- red low-branch source-derived, green high-branch \
+             source-derived, blue high-branch backdrop-wins. Darken would give \
+             (0.3125, 0.25, 0.5) and Lighten (0.75, 0.6875, 0.5625). In the transparent half a \
+             NaN out of the untaken `ab > 0.0` branch would show up -- though this mode launders \
+             it on this adapter.",
+        );
+    }
+
+    #[test]
+    /// **The branch boundary, and the mutation it *can* kill — resolved by
+    /// measurement in this round rather than disclosed unresolved.** `Overlay`
+    /// (0.110.0), `HardLight` (0.111.0) and `VividLight` (0.114.0) each had to
+    /// disclose an unkillable `<=`-vs-`<`; `HardMix` (0.115.0) was the first
+    /// with a killable one. This is the **second**, and the first whose kill
+    /// needs an operand no in-gamut fixture can supply.
+    ///
+    /// **The in-gamut half of the story, which is the part that *looks* like the
+    /// earlier modes'.** At `Cs == 0.5` the low arm is
+    /// `min(Cb, 2*0.5) = min(Cb, 1)` and the high arm is
+    /// `max(Cb, 2*0.5 - 1) = max(Cb, 0)`. For every `Cb` in `[0, 1]` both are
+    /// `Cb` exactly — no rounding is involved, `2*Cs` and `2*Cs - 1` being exact
+    /// for `Cs = 0.5` — so `<=` against `<` computes the same function there and
+    /// no in-gamut fixture can distinguish them.
+    ///
+    /// **The half that changes the verdict.** `straight_backdrop` does not
+    /// clamp: it returns `bd.rgb / bd.a`, and an accumulator whose premultiplied
+    /// `rgb` exceeds its own `a` yields `Cb > 1`. That is not off-nominal input
+    /// — an unclamped float-TIFF import is explicitly legal under invariant
+    /// §7.3.1b, and this fixture's bottom layer is exactly one, a straight
+    /// `1.5` at alpha `1.0`. There the two arms **diverge**: `min(1.5, 1) = 1.0`
+    /// against `max(1.5, 0) = 1.5`.
+    ///
+    /// `Cb = (1.5, 0.875, 0.3125)`, `Cs = (0.5, 0.5, 0.75)`, both alphas and
+    /// the opacity `1.0`, so `out = B`:
+    ///
+    /// - red sits **on** the boundary with `Cb = 1.5` **out of gamut**: shipped
+    ///   `min(1.5, 1) = 1.0`, and the `<` mutant `max(1.5, 0) = 1.5`. **This is
+    ///   the channel that kills the mutation**, by a full `0.5`;
+    /// - green sits **on** the boundary with `Cb = 0.875` in gamut: both arms
+    ///   give `0.875`, which is what makes the in-gamut agreement a measured
+    ///   claim in this same test rather than an argument beside it;
+    /// - blue is off the boundary (`Cs = 0.75`, **high** branch),
+    ///   `max(0.3125, 0.5) = 0.5` — source-derived, and the only channel here
+    ///   that separates the rivals the two boundary channels cannot.
+    ///
+    /// Golden `(1.0, 0.875, 0.5, 1.0)`; the `<` mutant reads
+    /// `(1.5, 0.875, 0.5, 1.0)`.
+    ///
+    /// **REQUIRED DISCLOSURE: a source channel at exactly `0.5` is this mode's
+    /// own no-op and its total `LinearLight` collision**
+    /// (`LinearLight(Cb, 0.5) = clamp(Cb, 0, 1)`), so red and green coincide
+    /// with `LinearLight` `(1.0, 0.875, 0.8125)` — two of three channels, the
+    /// most any rival reaches in this suite. Blue is the only separator, which
+    /// is why blue is deliberately off the boundary. `Overlay`
+    /// `(1.5, 0.875, 0.46875)`, `Lighten` `(1.5, 0.875, 0.75)`, `HardLight`
+    /// `(1.5, 0.875, 0.65625)`, `SoftLight` `(1.5, 0.875, 0.43576..)` and
+    /// `VividLight` `(1.5, 0.875, 0.625)` each coincide in green alone;
+    /// `ColorDodge`, `LinearDodge` and `HardMix` all `(1, 1, 1)`, `Difference`
+    /// `(1, 0.375, 0.4375)`, `Subtract` `(1, 0.375, 0)`, `LinearBurn`
+    /// `(1, 0.375, 0.0625)` and `Divide` `(1, 1, 0.41667..)` in red alone;
+    /// `Darken` `(0.5, 0.5, 0.3125)`, `Multiply` `(0.75, 0.4375, 0.234375)`,
+    /// `Screen` `(1.25, 0.9375, 0.828125)`, `Exclusion`
+    /// `(0.5, 0.5, 0.59375)`, `ColorBurn` `(2, 0.75, 0.08333..)` and `Normal`
+    /// `(0.5, 0.5, 0.75)` nowhere.
+    ///
+    /// The claim about `<` is *this adapter's*, like every kill here — but
+    /// unlike `HardMix`'s boundary test it does not rest on WGSL's division
+    /// slack, since nothing in `min`/`max` rounds. What it does rest on is that
+    /// the backend computes `bd.rgb / bd.a` without clamping, which
+    /// `composite_tile_cpu` also does.
+    fn composite_pin_light_over_with_opacity_agrees_across_its_own_branch_boundary() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Red's `1.5` is deliberately out of `[0, 1]` -- an unclamped
+        // float-TIFF import is legal under invariant §7.3.1b, and it is the
+        // only kind of operand at which this mode's two branch arms differ.
+        let bottom_rgba = [1.5, 0.875, 0.3125, 1.0];
+        let top_rgba = [0.5, 0.5, 0.75, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (1.5, 0.875, 0.3125, 1.0),
+            "setup: red's accumulator channel must really arrive above 1.0, or this test loses the \
+             only channel that can kill the <=-vs-< boundary mutation and silently degenerates \
+             into an in-gamut agreement check -- which every other fixture in this suite already \
+             is. straight_backdrop divides without clamping, so bd.rgb/bd.a is 1.5 here"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (1.0, 0.875, 0.5, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own PinLight arm computes \
+             on and around its branch boundary, out-of-gamut backdrop included"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (1.0, 0.875, 0.5, 1.0),
+            "red and green both sit on the branch boundary (Cs == 0.5 exactly), where the low arm \
+             is min(Cb, 1) and the high arm max(Cb, 0). Green's Cb = 0.875 is in gamut and the two \
+             arms agree there, as they do for every Cb in [0, 1] -- which is why Overlay's, \
+             HardLight's and VividLight's own boundary mutations are unkillable. Red's Cb = 1.5 is \
+             NOT in gamut (straight_backdrop divides without clamping), and there they diverge: \
+             (1.5, 0.875, 0.5, 1.0) is what a `< 0.5` computes, so THIS mutation is killable and \
+             red is what kills it. Blue is off the boundary (high branch, max(0.3125, 0.5) = 0.5) \
+             and is the only channel here that separates the rivals: LinearLight coincides in red \
+             AND green ((1.0, 0.875, 0.8125)), a source channel at 0.5 being this mode's own no-op \
+             and its total LinearLight collision. Overlay (1.5, 0.875, 0.46875), Lighten \
+             (1.5, 0.875, 0.75), HardLight (1.5, 0.875, 0.65625), SoftLight \
+             (1.5, 0.875, 0.43576) and VividLight (1.5, 0.875, 0.625) coincide in green alone; \
+             ColorDodge, LinearDodge and HardMix all give (1, 1, 1), Difference \
+             (1, 0.375, 0.4375), Subtract (1, 0.375, 0), LinearBurn (1, 0.375, 0.0625) and Divide \
+             (1, 1, 0.41667) -- red alone; Darken (0.5, 0.5, 0.3125), Multiply \
+             (0.75, 0.4375, 0.234375), Screen (1.25, 0.9375, 0.828125), Exclusion \
+             (0.5, 0.5, 0.59375), ColorBurn (2, 0.75, 0.08333) and Normal (0.5, 0.5, 0.75) \
+             coincide nowhere."
         );
     }
 

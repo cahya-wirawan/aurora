@@ -20001,6 +20001,133 @@ severity choice.
   that gap so far: two inherited division-by-zero guards, each redundant only
   under this adapter's `+inf` behaviour.
 
+- [x] **`PinLight` ported to WGSL, admitted at the predicate, and wired through
+  the real dispatch arm — done 2026-09-05 (0.116.0).** The **fifteenth** real
+  blend-math mode on the GPU, the last branch-on-the-source overlay-family mode
+  except `SoftLight`, and the **cheapest port since `Overlay`**: three shader
+  lines (`min`, `max`, `select`) and no per-channel helper, because
+  `blend_channel`'s own arm delegates to `Darken` and `Lighten`, whose arms are
+  a `min` and a `max`. One WGSL entry point, one `BlendPass` const, four labels,
+  one one-line wrapper, one predicate arm, one dispatch arm, one counter
+  variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+  `TRANSPOSE_COVERAGE` row, one fixture const, **seven** render-level GPU tests,
+  one headless predicate test and one app-level integration test.
+  `composite_blend_over_with_opacity` was not touched — a **thirteenth**
+  consecutive caller added with no line of change to it. `CPU_ONLY_BLEND_MODE`
+  stays `Exclusion`; no fixture anywhere was retargeted, so both PLAN.md-tracked
+  CPU-fallback benchmarks stay comparable across this round. `blend_channel`'s
+  own `PinLight` arm and its two existing CPU tests were left untouched.
+
+  **Counts, recomputed against source rather than incremented.**
+  `ALL_BLEND_PASSES` is `[&BlendPass; 15]`, so `BLEND_MATH_PASS_COUNT` is 15;
+  `GpuBlendDispatch::ALL` is `[Self; 16]` (15 + `Dissolve`);
+  `GpuBlendDispatches` has 16 fields; the predicate admits **17 of 27** (15
+  blend-math + `Normal` + `Dissolve`), leaving **10 of 27** CPU-only there; 11 of
+  `aurora_render::BlendMode`'s 26 variants still lack a blend-math entry point,
+  `Normal` among them and needing none. Tests: `aurora-render` 222 → **229**,
+  `aurora-app` 413 → **415**; workspace 1767 → **1776** (the baseline is 1767,
+  not 1766: 0.115.2 landed one new `aurora-tile` test between the two rounds).
+
+  **The blind set, which is the round's real content — four classes, and one of
+  them is new to this file.** Writing `D0 = Cb - Cs` and
+  `D1 = B(Cb, Cs) - B(Cs, Cb)`, the fold gives
+  `out - out_transposed = (1 - a)*D0 + a*D1`, so a channel is blind at `a = 1`
+  exactly when `D1 == 0`. Brute-forced over a 129×129 rational grid on `[0,1]²`:
+  **511 pairs have `D1 == 0`, and they partition exactly into four classes with
+  zero members outside them** — `Cb == Cs` (129), **`|Cb - Cs| == 0.5`** (130),
+  one operand `0` with the other `<= 0.5` (126), one operand `1` with the other
+  `> 0.5` (126). The second is a hazard class **no previously ported mode has**:
+  at `|Cb - Cs| == 0.5` the low `min` and the high `max` land on the same value
+  from either operand order (`max(0.25, 0.5) = 0.5 = min(0.75, 0.5)`), and
+  `(0.25, 0.75)` and `(0.5, 1.0)` are both in it — exactly the operands a fixture
+  reaches for by habit. Blindness at `a = 0.5` specifically (`D0 + D1 == 0`,
+  `D0 != 0`) holds at **exactly two pairs over that grid, `(0, 1)` and
+  `(1, 0)`**: the same corner `HardMix` found, reached here for an unrelated
+  reason (`Lighten(0, 1)` against `Darken(1, 0)`, no guard ordering involved).
+  Every pair with an interior blind alpha straddles `0.5`; a same-side channel
+  has `D0` and `D1` same-signed and has none.
+
+  **A plan-level discrepancy caught and corrected by that computation, worth
+  recording because the wrong version reads as reassuring.** The round's plan
+  presented those four classes as "the blind set" without qualifying the alpha,
+  which reads as *universally* blind. It is not: `Cb == Cs` is the only class
+  with `D0 == 0` as well, so the other three are blind at `a = 1` and **visible
+  at `a = 0.5`**. The classes themselves are exactly right — the grid found no
+  members outside them — but the framing has to be per-alpha or a future fixture
+  will be judged safe on the wrong criterion.
+
+  **The `<= 0.5` boundary mutation is KILLABLE, and this round resolved it by
+  measurement rather than disclosing it unresolved.** `Overlay` (0.110.0),
+  `HardLight` (0.111.0) and `VividLight` (0.114.0) each had to disclose an
+  unkillable `<=`-vs-`<`; `HardMix` (0.115.0) was the first with a killable one.
+  This is the **second, and the first whose kill needs an operand no in-gamut
+  fixture can supply.** At `Cs == 0.5` the low arm is `min(Cb, 1)` and the high
+  arm `max(Cb, 0)`, identical for every `Cb` in `[0, 1]` with no rounding
+  involved — so in gamut the mutation computes the same function. But
+  `straight_backdrop` returns `bd.rgb / bd.a` **without clamping**, and an
+  accumulator whose premultiplied `rgb` exceeds its own `a` yields `Cb > 1`,
+  where the arms diverge (`min(1.5, 1) = 1.0` against `max(1.5, 0) = 1.5`). That
+  is not off-nominal input: an unclamped float-TIFF import is explicitly legal
+  under invariant §7.3.1b. `composite_pin_light_over_with_opacity_agrees_across_
+  its_own_branch_boundary` carries `Cb = (1.5, 0.875, 0.3125)` against
+  `Cs = (0.5, 0.5, 0.75)` — one out-of-gamut boundary channel, one in-gamut
+  boundary channel and one off-boundary channel — and mutation (h) was measured
+  killed by **that test alone**, out of 644 in the two crates.
+
+  **Not a sixth `NaN`-guard detector — predicted from 0.110.0's rule, then
+  measured.** Both arms are a bare `min`/`max` with `cb` as an operand, and this
+  adapter's `min`/`max` launder a `NaN` into the finite operand (probed in
+  0.109.1), so `b` is finite before `fold_over` sees it; the `select()` condition
+  reads `s.rgb` and is unaffected, and it launders either way. Measured: with the
+  guard deleted, `composite_pin_light_over_with_opacity_is_the_source_alone_
+  where_the_backdrop_is_transparent` stays **green**, and the failures are
+  exactly the same five as every prior round. Detector count stays at **five of
+  fifteen**. Honest limit, and it is weaker than `HardMix`'s: this argument rests
+  **wholly** on a measured property of this vendor's `FMin`/`FMax`, which WGSL
+  leaves undefined on a `NaN` operand — it is this adapter's result, not a
+  portability claim. Unsurprising, since the mode *is* `Darken` and `Lighten`
+  behind a branch, and both of those are in the same class.
+
+  **A degeneracy that is provable rather than incidental**: every backdrop-wins
+  channel (`B == Cb`) agrees with `Darken` in the low branch and `Lighten` in the
+  high branch, both **live GPU arms**. So separating them needs a *source-derived*
+  channel in each branch, which every fixture in the suite carries.
+
+  **A real, measured coverage hole in the spatial fixture, disclosed rather than
+  papered over.** `patterned_texels` puts red at `quarters(x + seed)`, green at
+  `quarters(y + seed)` and blue at a *seed-independent* quadrant value, and the
+  two layers use seeds `0` and `1` — so blue has `Cb == Cs` in **every** texel
+  and red/green are always one quarter-step apart: `(0, 0.25)`, `(0.25, 0.5)`,
+  `(0.5, 0.75)`, `(0.75, 0)`. `PinLight` equals `Darken` in all four
+  (`(0.5, 0.75)` being the only high-branch pair, where
+  `max(0.5, 0.5) = 0.5 = min(0.5, 0.75)`), so the fixture is **systematically
+  blind to a `Darken` substitution** — confirmed by mutations (c), (d) and (i)
+  each leaving it green while killing six or seven other tests. The test's own doc
+  comment now says so, and says it must not be counted as coverage of that family
+  of near-misses.
+
+  **Mutation matrix: sixteen mutations, every one really run** on
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`,
+  reverted from an out-of-repo `cp` backup between rows (never `git checkout`).
+  Full table in the 0.116.0 addendum under "Next action". The load-bearing rows:
+  **(h)** the boundary mutation, killed by the out-of-gamut boundary test alone —
+  the round's headline; **(k)** a transposed `src`/`backdrop` dispatch arm, killed
+  by the app differential **alone**, reading exactly the hand-derived
+  `(0.28125, 0.78125, 0.46875, 1.0)` against the golden's
+  `(0.578125, 0.5, 0.1875, 1.0)`; **(l)** deleting the dispatch arm, killed by
+  the counter assertion **alone** (`left: 0, right: 1`, read from the panic);
+  **(n)** deleting `straight_backdrop`'s guard, leaving this mode's own test
+  green as predicted; and **(p)** deleting the new
+  `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_
+  expressible_mode` entry, which **nothing** catches — the same hand-maintained
+  gap 0.104.0 and 0.115.1 each had to fix, now measured rather than argued.
+
+  **Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+  for `fs_composite_pin_light`. This mode divides nowhere and has no guarded arm,
+  so it inherits none of the guarded-division modes' portability gaps and none of
+  `HardMix`'s 2.5-ULP divide exposure; the one thing it does rest on is this
+  adapter's `min`/`max` `NaN` behaviour, above.
+
 - [x] **`HardMix` ported to WGSL, admitted at the predicate, and wired through
   the real dispatch arm — done 2026-09-05 (0.115.0).** The **fourteenth** real
   blend-math mode on the GPU, and the first whose blend term is one *whole other
@@ -26412,6 +26539,165 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.116.0) — `PinLight` ported to the GPU compositing
+path.** The **fifteenth** real blend-math mode, the last branch-on-the-source
+overlay-family mode except `SoftLight`, and the cheapest port since `Overlay`:
+its `blend_channel` arm delegates to `Darken` and `Lighten`, whose arms are a
+`min` and a `max`, so the shader is three lines and no per-channel helper. A
+`select()` is legitimate here for `Overlay`/`HardLight`'s reason and not
+`VividLight`'s — neither arm divides, so evaluating the discarded one reinstates
+no hazard. Rust-side cost was the usual one `BlendPass` const, four labels, one
+one-line wrapper, one predicate arm, one dispatch arm, one counter
+variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+`TRANSPOSE_COVERAGE` row and one fixture const — a **thirteenth** consecutive
+caller of `composite_blend_over_with_opacity` added with no line of change to
+it. `CPU_ONLY_BLEND_MODE` stays `Exclusion` and **no fixture anywhere was
+retargeted**, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable.
+`blend_channel`'s own `PinLight` arm and its two existing CPU tests were not
+touched.
+
+**Counts after the round, each verified against source.** `ALL_BLEND_PASSES` is
+`[&BlendPass; 15]`, so `BLEND_MATH_PASS_COUNT` is 15; `GpuBlendDispatch::ALL` is
+`[Self; 16]` (15 + `Dissolve`); `GpuBlendDispatches` has 16 fields; the app
+predicate admits **17 of 27** (15 blend-math + `Normal` + `Dissolve`), leaving
+**10 of 27** CPU-only at the predicate; and 11 of `aurora_render::BlendMode`'s 26
+variants still have no blend-math WGSL entry point, `Normal` among them and
+needing none.
+
+**Tests: 222 -> 229 in `aurora-render` (+7) and 413 -> 415 in `aurora-app`
+(+2); workspace 1767 -> 1776.** The baseline is 1767 rather than 1766 because
+0.115.2 landed one new `aurora-tile` test in between; this round added nothing
+outside those two crates. The seven are all GPU tests
+(`composite_pin_light_over_with_opacity_*`: both-branches per-channel golden,
+translucent accumulator, spatially-varying tile, half opacity, source alpha above
+one, transparent-backdrop-is-source-alone, and **branch-boundary agreement**);
+the two are the headless predicate test and the app-level differential.
+
+**The blind set, and the plan-level discrepancy the computation caught.** The
+fold gives `out - out_transposed = (1 - a)*D0 + a*D1` with `D0 = Cb - Cs` and
+`D1 = B(Cb, Cs) - B(Cs, Cb)`, so a channel is blind at `a = 1` exactly when
+`D1 == 0`. Brute-forced over a 129x129 rational grid on `[0,1]^2`: **511 pairs
+have `D1 == 0` and they partition exactly into four classes with zero members
+outside them** — `Cb == Cs` (129), **`|Cb - Cs| == 0.5`** (130), one operand `0`
+with the other `<= 0.5` (126), one operand `1` with the other `> 0.5` (126).
+Blindness at `a = 0.5` specifically (`D0 + D1 == 0`, `D0 != 0`) holds at
+**exactly two pairs, `(0, 1)` and `(1, 0)`** — the corner `HardMix` also has,
+reached here without any guard ordering (`Lighten(0, 1) = 1` against
+`Darken(1, 0) = 0`). Every pair with an interior blind alpha straddles `0.5`.
+
+`|Cb - Cs| == 0.5` is a hazard class **no previously ported mode has**, and it is
+the finding of this round worth carrying forward: at that separation the low
+`min` and the high `max` land on the same value from either operand order, and
+`(0.25, 0.75)` and `(0.5, 1.0)` are both in it — exactly the operands a fixture
+reaches for by habit.
+
+**The discrepancy, recorded because the wrong version reads as reassuring.** The
+round's plan presented those four classes as "the blind set" with no alpha
+qualifier, which reads as *universally* blind. Only `Cb == Cs` is
+(it alone has `D0 == 0` too); the other three are blind at `a = 1` and
+**visible at `a = 0.5`**. The classes are exactly right, the framing was not, and
+a future fixture judged on the unqualified version would be judged on the wrong
+criterion.
+
+**`NORMAL_MULTIPLY_PIN_LIGHT_STACK`, chosen against that set per channel.**
+`l1 = (0.875, 0.5, 0.25)` `Normal` 1.0 and `l2 = (0.75)³` `Multiply` 1.0 give
+`Cb = (0.65625, 0.375, 0.1875)`; `l3` is `PinLight` at opacity `0.5` with
+`Cs = (0.25, 0.8125, 0.5625)`.
+
+| ch | `Cs` vs `0.5` | branch | `B` | outcome | `|Cb - Cs|` | blind `a*` |
+|---|---|---|---|---|---|---|
+| red | `0.25 <= 0.5` | low, `min(Cb, 2Cs)` | `min(0.65625, 0.5) = 0.5` | source-derived | `0.40625` | `~1.857` |
+| green | `0.8125 > 0.5` | high, `max(Cb, 2Cs-1)` | `max(0.375, 0.625) = 0.625` | source-derived | `0.4375` | `1.4` |
+| blue | `0.5625 > 0.5` | high | `max(0.1875, 0.125) = 0.1875` | backdrop-wins | `0.375` | `2.0` |
+
+No channel is on any of the four classes or on the corner, and **every blind
+`a*` falls outside `(0, 1)` altogether** — the first roster fixture with no
+interior blind opacity at all. Golden at `a = 0.5` over an opaque accumulator is
+`0.5*Cb + 0.5*B = (0.578125, 0.5, 0.1875, 1.0)`, hand-derived in exact rationals
+and then confirmed by `composite_tile_cpu` and by the GPU. Transposed it folds to
+`(0.28125, 0.78125, 0.46875, 1.0)` — largest channel gap `0.296875` in red — and
+mutation (k) **measured exactly that texel** with the real arm transposed. One
+disclosed coincidence: blue is the backdrop-wins channel, so `Darken` agrees
+there; red and green separate it by `0.125` and `0.21875`.
+
+**The `<= 0.5` boundary mutation is KILLABLE — resolved by measurement, not
+disclosed unresolved.** In gamut the two arms agree at `Cs == 0.5`
+(`min(Cb, 1) = Cb = max(Cb, 0)`, exactly, for every `Cb` in `[0, 1]`), which is
+why `Overlay`'s, `HardLight`'s and `VividLight`'s equivalents are unkillable. But
+`straight_backdrop` divides **without clamping**, so an accumulator with
+`rgb > a` yields `Cb > 1` — an unclamped float-TIFF import, legal under invariant
+§7.3.1b — and there they diverge: `min(1.5, 1) = 1.0` against
+`max(1.5, 0) = 1.5`. `composite_pin_light_over_with_opacity_agrees_across_its_
+own_branch_boundary` carries `Cb = (1.5, 0.875, 0.3125)` against
+`Cs = (0.5, 0.5, 0.75)`: red out-of-gamut on the boundary (the killer), green
+in-gamut on the boundary (the agreement, measured in the same test), blue off the
+boundary (the only rival separator — a `0.5` source channel is this mode's own
+no-op **and** its total `LinearLight` collision, since
+`LinearLight(Cb, 0.5) = clamp(Cb, 0, 1)`, so `LinearLight` coincides in red and
+green). So `PinLight` is the **second** ported mode with a killable branch
+comparison and the **first** whose kill needs an out-of-gamut operand to exist at
+all.
+
+**Not a sixth `NaN`-guard detector — predicted, then measured, and the argument
+is *weaker* than `HardMix`'s.** Both arms are a bare `min`/`max` with `cb` as an
+operand, and this adapter's `min`/`max` return the finite operand (probed
+0.109.1), so `b` is finite before `fold_over` sees it. Measured: with the guard
+deleted this mode's own transparent-backdrop test stays green and the failures
+are exactly the same five as every prior round. Detector count stays at **five of
+fifteen** (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`). Honest
+limit: unlike `HardMix`, whose `NaN < 0.5` argument holds on every backend, this
+rests **wholly** on a measured `FMin`/`FMax` property WGSL leaves undefined.
+Unsurprising — the mode *is* `Darken` and `Lighten` behind a branch, and both are
+in that same class.
+
+**A real, measured coverage hole in the spatial fixture, disclosed rather than
+papered over.** `patterned_texels` sets red to `quarters(x + seed)`, green to
+`quarters(y + seed)` and blue to a *seed-independent* quadrant value; the two
+layers use seeds `0` and `1`. So blue has `Cb == Cs` in **every** texel and
+red/green are always one quarter-step apart — `(0, 0.25)`, `(0.25, 0.5)`,
+`(0.5, 0.75)`, `(0.75, 0)` — and `PinLight` equals `Darken` in all four
+(`(0.5, 0.75)` is the only high-branch pair, and
+`max(0.5, 0.5) = 0.5 = min(0.5, 0.75)`). The fixture is therefore
+**systematically blind to a `Darken` substitution**, which mutations (c), (d) and
+(i) each confirmed by leaving it green while killing six or seven other tests. It
+does catch `Lighten` (mutation (j)). The test's doc comment now records this and
+says the fixture must not be counted as coverage of that family of near-misses.
+
+**Mutation matrix — sixteen mutations, every one really run** on
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` under `AURORA_REQUIRE_GPU=1`,
+`cargo test -p aurora-render -p aurora-app --no-fail-fast` (644 tests), reverted
+from an out-of-repo `cp` backup between rows, never `git checkout`. "render N"
+counts distinct `composite_pin_light_over_with_opacity_*` tests; "app" is
+`recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_pin_light_blend_document`.
+
+| # | mutation | killed by | count | vs prediction |
+|---|---|---|---|---|
+| (a) | `min` -> `max` in the low arm | all 7 render + app | 8 | as predicted (broad) |
+| (b) | `max` -> `min` in the high arm | all 7 render + app | 8 | as predicted (broad) |
+| (c) | drop `2.0 *` in the low arm (= `Darken` there) | 6 render + app; **spatial survives** | 7 | predicted red-only *within test 1*, which held; the spatial survival was **not** predicted and is a real finding |
+| (d) | drop `2.0 *` in the high arm (= `B = Cb`) | 5 render + app; **spatial and translucent-accumulator survive** | 6 | predicted green-only within test 1, which held; the translucent survival is explained — its high channel is backdrop-wins, so `max(cb, cs-1) = cb` is already correct there |
+| (e) | drop `- 1.0` in the high arm | all 7 render + app | 8 | as predicted (broad) |
+| (f) | `select()` arms swapped | all 7 render + app | 8 | as predicted |
+| (g) | branch on `cb` instead of `s.rgb` | all 7 render + app | 8 | predicted red+green within test 1, which held; broad across the suite |
+| **(h)** | **`<=` -> `<`** | **`composite_pin_light_over_with_opacity_agrees_across_its_own_branch_boundary` ALONE** | **1** | **the round's open question, resolved: KILLABLE, via the out-of-gamut `Cb = 1.5` channel. Nothing else in 644 tests sees it** |
+| (i) | `fragment_entry` -> `"fs_composite_darken"` | 6 render + `all_blend_passes_matches_the_shaders_own_blend_math_entry_points` + app; **spatial survives** | 8 | the entry-point-set test was expected; the spatial survival was not |
+| (j) | `fragment_entry` -> `"fs_composite_lighten"` | all 7 render + entry-point-set test + app | 9 | as predicted |
+| **(k)** | dispatch arm `src`/`backdrop` transposed | **app ALONE**, reading `(0.28125, 0.78125, 0.46875, 1.0)` against the golden's `(0.578125, 0.5, 0.1875, 1.0)` | **1** | as predicted, in all three channels; and the measured texel is bit-identical to the hand-derived one. `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` stays green, being static — the same non-detection 0.115.0 measured |
+| **(l)** | dispatch arm deleted | **app ALONE**, and specifically its counter assertion (`left: 0, right: 1`, read from the panic) | **1** | as predicted — the counter is the sole detector, a sixteenth consecutive confirmation |
+| (m) | predicate arm deleted | `document_qualifies_for_gpu_compositing_admits_a_pin_light_blend_mode`, `..._admits_exactly_the_modes_with_a_dispatch_counter`, `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, app, `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode` | 5 | as predicted |
+| **(n)** | `straight_backdrop`'s guard deleted | the same **five** detectors (`multiply`, `screen`, `difference`, `overlay`, `hard_light` transparent-backdrop tests) + `recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack`; **`PinLight`'s own test GREEN** | 6 | **as predicted** — detector count stays five, now of fifteen |
+| (o) | `TRANSPOSE_COVERAGE` row deleted | `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` alone | 1 | as predicted |
+| **(p)** | new `..._across_every_expressible_mode` loop entry deleted | **nothing** | **0** | as predicted, and now **measured** rather than argued: the array's header comment is the only guard, exactly as 0.104.0 and 0.115.1 each discovered the hard way. Disclosed as a standing gap, not fixed — closing it would need a second derived list |
+
+**Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+for `fs_composite_pin_light`. This mode divides nowhere and has no guarded arm,
+so it inherits none of `ColorBurn`/`ColorDodge`/`VividLight`/`HardMix`'s
+division-by-zero or 2.5-ULP portability exposure. The one thing it does rest on
+is this adapter's `min`/`max` `NaN` behaviour, above — and that affects only a
+disclosure, not a shipped value.
+
+---
 
 **Addendum 2026-09-05 (0.115.1) — one real coverage regression and six
 disclosure defects from the `HardMix` round, all found by independent review.**
