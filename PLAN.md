@@ -19850,8 +19850,11 @@ severity choice.
   and every fixture was checked against the real `Multiply` fold.
 
   **Three findings carried forward.** (1) The `<=` at the branch boundary is
-  **unkillable in principle** — both arms give `Cb` at `Cs == 0.5`, guard points
-  included — the third such case after `Overlay` and `HardLight`; the new
+  **unkillable at these suites' tolerance** (0.114.1 scoped this from "in
+  principle") — both arms give `Cb` at `Cs == 0.5`, guard points
+  included, for every `f16`-representable `Cb` in `[0, 1]`; they differ by up to
+  `2^-25` for a general `f32` `Cb` and outright for an unclamped `Cb > 1`, see
+  the detailed entry — the third such case after `Overlay` and `HardLight`; the new
   `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
   proves the arm-equality over all **15,362** `f16` values in `[0, 1]` rather
   than at three points. (2) This mode is **not** a sixth detector of
@@ -19864,13 +19867,24 @@ severity choice.
 
   **Asymmetry: unconditional and *structural*, the fourth of that kind**, and
   the reverse of `LinearLight`'s case. `B(Cb, Cs)` branches on `Cs`,
-  `B(Cs, Cb)` on `Cb`; the mode is **not affine**, so there is no blind opacity
-  and the only launderer is rail agreement in both operand orders. No channel of
-  the fixture does that, so its transpose is caught in all three channels at
-  `0.5` **and** all three at `1.0` — the first roster row true at both. The
-  standing transpose guard's non-unit-opacity demand is therefore merely
-  redundant here, where for `LinearLight` it was insufficient; left
-  un-special-cased either way.
+  `B(Cs, Cb)` on `Cb`; the mode is **not affine in its operands**, so
+  `LinearLight`'s `(Cb - Cs)*(1 - 2a)` form has no analogue. **Corrected in
+  0.114.1: that is *not* the same as having no blind opacity, which is what this
+  round first wrote.** The fold's own gap `(1 - a)*D0 + a*D1`, with
+  `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, is affine in `a` for *every*
+  mode, so a channel is blind at `a* = D0/(D0 - D1)` whenever the two have
+  opposite signs — clamp-interior in both operand orders or not (in the burn
+  branch, blind at exactly `a = 0.5` is `2*Cb*Cs + Cb + Cs == 1`; `Cb = 0.3`,
+  `Cs = 0.4375` is such a pair, interior in both orders). Two mechanisms launder
+  a transpose here, then: rail agreement in both operand orders, and that blind
+  `a*`. The fixture escapes both — no channel rails in both orders, and its
+  three blind alphas are `≈0.8882`, `0.75` and `≈0.9310` — so its transpose is
+  caught in all three channels at `0.5` **and** all three at `1.0`, the first
+  roster row true at both. What establishes that is the standing guard's
+  *arithmetic* assertion (0.113.1), which is **necessary** for this mode exactly
+  as it is for `LinearLight`; the non-unit-opacity demand is neither sufficient
+  on its own nor the reason the fixture works. Left un-special-cased either
+  way.
 
   **Mutation matrix — all twelve run for real** on
   `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`,
@@ -26240,13 +26254,28 @@ checked against the real `Multiply` fold, not against `l1`'s values.
 
 **Two disclosures carried forward, both predicted and then measured.**
 
-1. **The `<=` at the branch boundary is unkillable in principle** — the third
-   such case, after `Overlay` (0.110.0) and `HardLight` (0.111.0). At
-   `Cs == 0.5` the burn arm is `ColorBurn(Cb, 1) = Cb` and the dodge arm is
+1. **The `<=` at the branch boundary is unkillable at these suites' tolerance**
+   — the third such case, after `Overlay` (0.110.0) and `HardLight` (0.111.0).
+   At `Cs == 0.5` the burn arm is `ColorBurn(Cb, 1) = Cb` and the dodge arm is
    `ColorDodge(Cb, 0) = Cb`, guard points included, so `<=` and `<` compute the
    same function. Mutation (d) below confirms it survives every test in both
    crates, and the new exhaustive CPU sweep turns the argument into a
    measurement over all 15,362 `f16` values rather than three sample points.
+   **Scoped in 0.114.1, which found the unqualified "in principle" false in two
+   ways.** (i) The burn arm's value is `1 - (1 - Cb)`, bit-exact only for an
+   `f16`-representable `Cb` — precisely the sweep's domain, where it holds for
+   all 15,362 — and *not* for a general `f32` `Cb`, which `straight_backdrop`'s
+   own division produces from a non-opaque premultiplied backdrop (measured:
+   `3.57627869e-07 / 0.999511719` is `3.5780258e-07`; burn gives
+   `3.5762787e-07`, dodge `3.5780258e-07`). Two roundings at `1.0` bound that
+   gap by `2^-25`, measured maximum `2.98e-8` — `1/65536` of the suites' own
+   `2 * f16::EPSILON` tolerance, so the mutation stays unkillable *here*.
+   (ii) `straight_backdrop` does not clamp, so an accumulator whose
+   premultiplied `rgb` exceeds its own `a` gives `cb > 1`, where the two arms
+   diverge outright: at `Cs == 0.5`, `Cb = 1.5` is `1.5` from burn (neither
+   `color_burn_channel` guard is an inequality) and `1.0` from dodge. That is
+   off-nominal input no fixture reaches, but it is why the claim is now written
+   as a tolerance statement rather than an identity.
 2. **This mode is *not* a sixth detector of `straight_backdrop`'s `ab > 0.0`
    guard**, predicted from the rule 0.110.0 wrote down and then measured — the
    second time that rule has correctly predicted a *non*-detection, after
@@ -26272,16 +26301,55 @@ a *value* twice over rather than once.
 kind** after `ColorBurn`, `ColorDodge` and `LinearLight`. `B(Cb, Cs)` branches
 on `Cs` while `B(Cs, Cb)` branches on `Cb`, so a straddling pair takes two
 different families under transposition rather than the same formula with swapped
-arguments. Being a pair of guarded divisions it is **not affine**, so
-`LinearLight`'s `(Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5` has no analogue
-and there is **no blind opacity at all**: the only launderer is *rail agreement*
+arguments. Being a pair of guarded divisions it is **not affine in its
+operands**, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)` form has no analogue.
+
+**Corrected in 0.114.1, and this is the substantive correction of that round.**
+This entry originally continued "and there is **no blind opacity at all**",
+concluding that a channel clamp-interior in both operand orders is observable at
+every alpha. That is false. Writing `D0 = Cb - Cs` and
+`D1 = B(Cb, Cs) - B(Cs, Cb)`, the fold's transpose gap over an opaque backdrop
+at effective alpha `a` is
+
+```text
+out - out_transposed = (1 - a) * D0 + a * D1
+```
+
+which is **affine in `a` for every blend mode**, `VividLight` included: a blend
+term that is not affine in its *operands* says nothing about an expression that
+never varies them. A channel is therefore blind at `a* = D0 / (D0 - D1)`, which
+lands in `(0, 1)` whenever `D0` and `D1` have opposite signs, whether or not the
+channel is clamp-interior in both orders. Inside the burn branch the algebra
+closes: for `Cb != Cs`, `D0 + D1 == 0` — blind at exactly the `0.5` the standing
+guard demands — reduces to `2*Cb*Cs + Cb + Cs == 1`, derived and then confirmed
+by exhaustive rational search over the `k/128` and `k/512` grids. `Cb = 0.3`,
+`Cs = 0.4375` sits on that locus with **both** orders burn-*interior*
+(`B = ColorBurn(0.3, 0.875) = 0.2` against
+`B^T = ColorBurn(0.4375, 0.6) = 0.0625`, and `0.5*(0.3 - 0.4375) + 0.5*(0.2 -
+0.0625) = 0` exactly). The dodge branch carries the mirror locus in `1 - Cb`,
+`1 - Cs`.
+
+So two mechanisms launder a transpose here, not one: *rail agreement*
 (`Cb + 2*Cs <= 1` **and** `Cs + 2*Cb <= 1` in the burn branch, or
-`Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2` in the dodge branch). No channel of
-the app fixture rails in both orders, so its transpose is observable in all
-three channels at `0.5` *and* all three at `1.0` — the first roster row for
-which that holds at both opacities. For this mode the standing guard's non-unit
-opacity demand is therefore simply redundant, the reverse of `LinearLight`,
-where it was *insufficient*. The guard is left un-special-cased either way.
+`Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2` in the dodge branch) and that blind
+`a*`. `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` escapes both, and the second only by
+measurement rather than by construction. No channel rails in both orders — red
+and blue are clamp-interior in both, green is upper-railed in the shipped order
+alone (`ColorDodge(0.375, 0.75)` raw `1.5`), so the round's "every channel
+clamp-interior in both orders" was also wrong and is corrected to "interior in
+at least one order, railing in both nowhere". And each channel has a real blind
+alpha in `(0, 1)` that simply is not `0.5` or `1.0`: red `≈0.8882`
+(`D0 = 0.40625`, `D1 = -0.051136`), green `0.75` (`-0.5`, `+0.166667`), blue
+`≈0.9310` (`-0.5625`, `+0.0416667`). Its transpose is observable in all three
+channels at `0.5` *and* all three at `1.0` — the first roster row for which that
+holds at both opacities — with a largest channel gap of `0.2602539` in blue
+against a `2 * f16::EPSILON` tolerance.
+
+**The consequence for the guard.** For this mode the non-unit-opacity demand is
+neither sufficient on its own nor the reason the fixture works; the third,
+computational assertion 0.113.1 added is **necessary** here, exactly as it is for
+`LinearLight`, and not merely redundant defence in depth as this round claimed.
+The guard is left un-special-cased either way.
 
 ### Mutation matrix — every one run for real, RTX 3090 / Vulkan / DiscreteGpu, `AURORA_REQUIRE_GPU=1`
 

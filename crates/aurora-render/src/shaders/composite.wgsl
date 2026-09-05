@@ -1326,22 +1326,53 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
 // `Cs` while `B(Cs, Cb)` branches on `Cb`, so a pair straddling `0.5` takes
 // two different *families* under transposition -- this is `ColorBurn`'s and
 // `ColorDodge`'s class, not `Overlay`'s and `HardLight`'s straddle-conditional
-// one. It is **not** affine, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)`
-// cancellation at `a = 0.5` has no analogue here. What launders a transpose
-// instead is *rail agreement*, in two regimes:
+// one. It is **not** affine in its operands, so `LinearLight`'s tidy
+// `(Cb - Cs)*(1 - 2a)` form has no analogue here.
 //
-//   - burn branch (`Cs <= 0.5`): `B` rails to `0` when `Cb + 2*Cs <= 1`. Both
-//     operand orders rail when `Cb + 2*Cs <= 1` **and** `Cs + 2*Cb <= 1`, and
-//     the blend term is blind to a transpose there.
-//   - dodge branch (`Cs > 0.5`): `B` rails to `1` when `Cb + 2*Cs >= 2`. Both
-//     orders rail when `Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2`.
+// **What that does *not* buy is freedom from a blind opacity, and 0.114.0's
+// first draft of this comment wrongly claimed it did** -- corrected here rather
+// than papered over, because the wrong version is the one that reads as
+// reassuring. The fold's own transpose gap,
+//
+//     out - out_transposed = (1 - a)*(Cb - Cs)
+//                            + a*(B(Cb, Cs) - B(Cs, Cb)),
+//
+// is affine in `a` for **every** blend mode, this one included: `B`'s
+// non-affinity is in its *operands*, which that expression never varies. So
+// writing `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, a channel is blind
+// at `a* = D0 / (D0 - D1)`, and `a*` lands in `(0, 1)` whenever `D0` and `D1`
+// have opposite signs -- clamp-interior in both operand orders or not.
+//
+// Two mechanisms therefore launder a transpose here, not one:
+//
+//   - *rail agreement* in the blend term, in two regimes:
+//       - burn branch (`Cs <= 0.5`): `B` rails to `0` when `Cb + 2*Cs <= 1`.
+//         Both operand orders rail when `Cb + 2*Cs <= 1` **and**
+//         `Cs + 2*Cb <= 1`, and the blend term is blind to a transpose there.
+//       - dodge branch (`Cs > 0.5`): `B` rails to `1` when `Cb + 2*Cs >= 2`.
+//         Both orders rail when `Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2`.
+//   - the per-channel blind `a*` above. Inside the burn branch the algebra
+//     closes exactly: for `Cb != Cs`, `D0 + D1 == 0` -- blind at precisely
+//     `a = 0.5` -- reduces to `2*Cb*Cs + Cb + Cs == 1`, derived and then
+//     confirmed by exhaustive rational search. `Cb = 0.3`, `Cs = 0.4375` sits
+//     on that locus with **both** orders burn-*interior* (`B = 0.2` against
+//     `B^T = 0.0625`), so such a channel is blind at exactly the `0.5` every
+//     roster fixture carries.
 //   - and universally, `Cb == Cs` hides one.
 //
-// So a fixture needs at least one channel that is clamp-*interior in both
-// operand orders*; such a channel then stays observable at **every** alpha,
-// including the `0.5` at which `LinearLight`'s interior channels go blind.
+// **So "clamp-interior in both operand orders" does not imply "observable at
+// every alpha".** What establishes observability is arithmetic, not that
+// heuristic: `aurora-app`'s
+// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_
+// argument` folds each roster fixture both ways on the CPU (0.113.1's third
+// assertion) and measures the gap. For this mode that assertion is
+// **necessary**, not defence in depth.
+//
 // Measured in 0.114.0 rather than argued: the app-level fixture's transpose is
-// caught in all three channels at `0.5` and all three at `1.0`.
+// caught in all three channels at `0.5` and all three at `1.0`. Every one of
+// its three channels does have a blind `a*` in `(0, 1)` -- red `~0.8882`,
+// green `0.75`, blue `~0.9310` -- and none of them is at `0.5` or `1.0`, which
+// is the whole reason both opacities work there.
 //
 // **Five degeneracies, all verified algebraically, and they constrain every
 // fixture in this crate's `composite_vivid_light_*` tests:**
@@ -1370,8 +1401,32 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
 // arm computes `ColorDodge(Cb, 0.0)`, which is `min(1, Cb/1) = Cb`. That
 // includes both arms' guard points (`Cb == 1` gives `1`, `Cb == 0` gives `0`,
 // from the guards and from the arithmetic alike). The two arms are therefore
-// identical on **every** input at the boundary, so `<=` against `<` computes
-// the same function and no test can distinguish them.
+// identical for **every `f16`-representable `Cb` in `[0, 1]`** -- exactly the
+// domain `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_
+// value` sweeps, and bit-exactly there, not merely within tolerance -- so `<=`
+// against `<` computes the same function and no test in this suite can
+// distinguish them.
+//
+// **Stated precisely, because the unqualified form of that claim is false in
+// two ways** (both disclosed in 0.114.1 rather than left implied):
+//
+//   - the burn arm's value is `1 - (1 - Cb)`, and that is bit-exactly `Cb` for
+//     every `f16`-representable `Cb`, but **not** for a general `f32` `Cb` --
+//     which is what `straight_backdrop`'s own division yields from a
+//     non-opaque premultiplied backdrop. Measured: `bd.rgb/bd.a` of
+//     `3.57627869e-07 / 0.999511719` is `3.5780258e-07`, where the burn arm
+//     gives `3.5762787e-07` and the dodge arm `3.5780258e-07`. The gap is
+//     bounded by two roundings at `1.0`, so at most `2^-25` (measured maximum
+//     `2.98e-8`) -- `1/65536` of the suites' own `2 * f16::EPSILON` tolerance.
+//     So the mutation is unkillable *at this suite's chosen tolerance*, not
+//     because the two arms compute the same function on all inputs.
+//   - `straight_backdrop` does not clamp, so an accumulator whose
+//     premultiplied `rgb` exceeds its own `a` yields `cb > 1`, where the two
+//     arms genuinely diverge: at `Cs == 0.5`, `Cb = 1.5` gives `1.5` from the
+//     burn arm (neither of `color_burn_channel`'s guards is an inequality) and
+//     `1.0` from the dodge arm. That is off-nominal input for a well-formed
+//     premultiplied accumulator, not a reachable path any fixture has.
+//
 // `composite_vivid_light_over_with_opacity_agrees_across_its_own_branch_boundary`
 // pins the *value* at the boundary and deliberately does not claim to test the
 // comparison's direction.

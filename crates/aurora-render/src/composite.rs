@@ -201,7 +201,7 @@ const LABEL_HARD_LIGHT_BIND_GROUP: &str = "composite.hard_light.bind_group";
 const LABEL_HARD_LIGHT_PASS: &str = "composite.hard_light.pass";
 /// The pipeline layout and render pipeline behind
 /// [`TileCompositor::composite_linear_light_over_with_opacity`] (0.113.0)
-/// — the same four-label set the twelve modes above each carry, for the
+/// — the same four-label set the eleven modes above each carry, for the
 /// same reason: twelve blend-math pipelines sharing one `"composite"` label
 /// would leave a `wgpu` validation message or a frame capture unable to
 /// say which blend mode is at fault. **This is the first label in this file
@@ -221,7 +221,7 @@ const LABEL_LINEAR_LIGHT_BIND_GROUP: &str = "composite.linear_light.bind_group";
 const LABEL_LINEAR_LIGHT_PASS: &str = "composite.linear_light.pass";
 /// The pipeline layout and render pipeline behind
 /// [`TileCompositor::composite_vivid_light_over_with_opacity`] (0.114.0)
-/// — the same four-label set the thirteen modes above each carry, for the
+/// — the same four-label set the twelve modes above each carry, for the
 /// same reason: thirteen blend-math pipelines sharing one `"composite"` label
 /// would leave a `wgpu` validation message or a frame capture unable to
 /// say which blend mode is at fault. **The near-name risk here is not a
@@ -250,8 +250,8 @@ const LABEL_VIVID_LIGHT_PASS: &str = "composite.vivid_light.pass";
 /// [`TileCompositor`]'s blend-math `composite_*_over_with_opacity`
 /// methods — `composite_multiply_over_with_opacity` and its
 /// `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-/// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`
-/// siblings,
+/// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`/
+/// `vivid_light` siblings,
 /// deliberately named as a family rather than relisted here, since the
 /// list grows by one every time a mode is ported — five
 /// `&'static str`s. Everything else those methods do is
@@ -283,10 +283,15 @@ const LABEL_VIVID_LIGHT_PASS: &str = "composite.vivid_light.pass";
 /// *simplest* shape — one componentwise `clamp()`, no branch and no
 /// `select()`, since its CPU arm is a single unconditional expression rather
 /// than a two-call delegation — and cost the Rust side the same one const, one
-/// wrapper and four labels as every mode before it. So the shape of a mode's
-/// shader and the cost of its Rust plumbing are now measured to be
-/// independent across three distinct shapes, which is the strongest form of
-/// the claim this extraction was making.)
+/// wrapper and four labels as every mode before it. `VividLight`, the
+/// thirteenth, in 0.114.0, is a **fourth** distinct shape: a branch, but one
+/// whose two arms delegate to two *other ported modes'* per-channel helpers, so
+/// it is called once per channel rather than written as a `select()` — those
+/// callees' guards are early returns, and a `select()` evaluates both arms. It
+/// cost the Rust side the same one const, one wrapper and four labels too. So
+/// the shape of a mode's shader and the cost of its Rust plumbing are now
+/// measured to be independent across four distinct shapes, which is the
+/// strongest form of the claim this extraction was making.)
 ///
 /// There is deliberately **no encoder label here any more** (0.86.0).
 /// These methods no longer create a `wgpu::CommandEncoder` at all — the
@@ -479,6 +484,25 @@ const BLEND_PASS_LINEAR_LIGHT: BlendPass = BlendPass {
     pass: LABEL_LINEAR_LIGHT_PASS,
 };
 
+/// [`BlendMode::VividLight`]'s, likewise (0.114.0). Every field differs from
+/// every const above. Its `fragment_entry` mis-typing hazard is the sharpest
+/// in this file so far, because the two names at risk are the two entry points
+/// this one genuinely *calls*: `"fs_composite_color_burn"` and
+/// `"fs_composite_color_dodge"` are each half of this mode's own formula, so
+/// naming either builds a pipeline that agrees with this one wherever the
+/// fixture's channel happens to take that half's branch. Those are mutations
+/// (f1) and (f2) of this round's set, and both are killed by every
+/// `composite_vivid_light_*` test whose fixture spans both branches — which is
+/// all of them, and is why the suite header enumerates each fixture's
+/// per-channel branch as well as its clamp regime.
+const BLEND_PASS_VIVID_LIGHT: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_vivid_light",
+    pipeline: LABEL_VIVID_LIGHT,
+    uniform: LABEL_VIVID_LIGHT_UNIFORM,
+    bind_group: LABEL_VIVID_LIGHT_BIND_GROUP,
+    pass: LABEL_VIVID_LIGHT_PASS,
+};
+
 /// Every [`BlendPass`] const above, once — this crate's own registry of
 /// the blend-math entry points it can dispatch (0.112.0).
 ///
@@ -500,25 +524,12 @@ const BLEND_PASS_LINEAR_LIGHT: BlendPass = BlendPass {
 /// Only these consts are listed. `fs_composite` and
 /// `fs_composite_opacity` are fixed-function paths with no blend math and
 /// no `BlendPass`, and the test names them separately.
-/// [`BlendMode::VividLight`]'s, likewise (0.114.0). Every field differs from
-/// every const above. Its `fragment_entry` mis-typing hazard is the sharpest
-/// in this file so far, because the two names at risk are the two entry points
-/// this one genuinely *calls*: `"fs_composite_color_burn"` and
-/// `"fs_composite_color_dodge"` are each half of this mode's own formula, so
-/// naming either builds a pipeline that agrees with this one wherever the
-/// fixture's channel happens to take that half's branch. Those are mutations
-/// (f1) and (f2) of this round's set, and both are killed by every
-/// `composite_vivid_light_*` test whose fixture spans both branches — which is
-/// all of them, and is why the suite header enumerates each fixture's
-/// per-channel branch as well as its clamp regime.
-const BLEND_PASS_VIVID_LIGHT: BlendPass = BlendPass {
-    fragment_entry: "fs_composite_vivid_light",
-    pipeline: LABEL_VIVID_LIGHT,
-    uniform: LABEL_VIVID_LIGHT_UNIFORM,
-    bind_group: LABEL_VIVID_LIGHT_BIND_GROUP,
-    pass: LABEL_VIVID_LIGHT_PASS,
-};
-
+///
+/// (Restored to this constant in 0.114.1. The `VividLight` round appended its
+/// own const's doc text to the bottom of this block instead of opening a new
+/// one, which merged the two comments and left this array documented by
+/// nothing — one doc block per const, immediately above it, is the pattern
+/// every other mode here follows.)
 const ALL_BLEND_PASSES: [&BlendPass; 13] = [
     &BLEND_PASS_MULTIPLY,
     &BLEND_PASS_DARKEN,
@@ -3582,11 +3593,22 @@ impl TileCompositor {
     /// constraint and not just the bottom layer's literal; a `0.5` backdrop
     /// channel is *not* degenerate; and `Cb == Cs` hides a transpose.
     ///
-    /// **The branch boundary is continuous and its `<=` is provably
-    /// unkillable** — the third such disclosure, after `Overlay` and
+    /// **The branch boundary is continuous and its `<=` is unkillable at this
+    /// suite's tolerance** — the third such disclosure, after `Overlay` and
     /// `HardLight`. At `Cs == 0.5` the burn arm is `ColorBurn(Cb, 1) = Cb` and
     /// the dodge arm is `ColorDodge(Cb, 0) = Cb`, guard points included, so the
-    /// two arms agree on every input there.
+    /// two arms agree for every `f16`-representable `Cb` in `[0, 1]` — bit-
+    /// exactly, and that is exactly the domain
+    /// `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
+    /// sweeps (plain backticks: that test is `cfg(test)`, so a link to it is a
+    /// broken intra-doc link under CI's `-D warnings`). Outside it they can
+    /// differ: the burn arm's `1 - (1 - Cb)` is not
+    /// bit-exact for a general `f32` `Cb` (which `straight_backdrop`'s own
+    /// division yields from a non-opaque premultiplied backdrop), though by at
+    /// most `2^-25` — `1/65536` of the `2 * f16::EPSILON` tolerance these
+    /// suites use — and for an unclamped `Cb > 1` they diverge outright
+    /// (`Cs == 0.5`, `Cb = 1.5` gives `1.5` from burn and `1.0` from dodge).
+    /// So the mutation is unkillable *here*, not in principle.
     /// `composite_vivid_light_over_with_opacity_agrees_across_its_own_branch_boundary`
     /// pins the value and does not claim to test the comparison direction.
     ///
@@ -3594,13 +3616,28 @@ impl TileCompositor {
     /// on the GPU path and the fourth of that kind, after `ColorBurn`,
     /// `ColorDodge` and `LinearLight`. `B(Cb, Cs)` branches on `Cs` and
     /// `B(Cs, Cb)` on `Cb`, so a straddling pair takes two different families
-    /// under transposition. Unlike `LinearLight` this mode is **not affine**,
-    /// so there is no `(Cb - Cs)*(1 - 2a)` cancellation and no blind spot at
-    /// `a = 0.5`; what launders a transpose is *rail agreement*
-    /// (`Cb + 2*Cs <= 1` and `Cs + 2*Cb <= 1` both railing to `0`, or
-    /// `Cb + 2*Cs >= 2` and `Cs + 2*Cb >= 2` both railing to `1`). A channel
-    /// that is clamp-interior in **both** operand orders is therefore
-    /// observable at every alpha, which is what every fixture here carries.
+    /// under transposition. Unlike `LinearLight` this mode is **not affine in
+    /// its operands**, so `LinearLight`'s tidy `(Cb - Cs)*(1 - 2a)` form has no
+    /// analogue.
+    ///
+    /// **That does not mean it has no blind opacity, and 0.114.0's first draft
+    /// of this comment wrongly said it did.** The fold's transpose gap,
+    /// `out - out_transposed = (1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`,
+    /// is affine in `a` for *every* mode — `B`'s non-affinity is in its
+    /// operands, which that expression never varies — so with `D0 = Cb - Cs`
+    /// and `D1 = B(Cb, Cs) - B(Cs, Cb)` a channel is blind at
+    /// `a* = D0 / (D0 - D1)`, which lands in `(0, 1)` whenever the two have
+    /// opposite signs. Two things launder a transpose here, then: *rail
+    /// agreement* (`Cb + 2*Cs <= 1` and `Cs + 2*Cb <= 1` both railing to `0`,
+    /// or `Cb + 2*Cs >= 2` and `Cs + 2*Cb >= 2` both railing to `1`) and that
+    /// blind `a*`. In the burn branch the latter closes exactly: for
+    /// `Cb != Cs`, blind at `a = 0.5` is `2*Cb*Cs + Cb + Cs == 1` — e.g.
+    /// `Cb = 0.3`, `Cs = 0.4375`, both orders burn-*interior*, `B = 0.2`
+    /// against `B^T = 0.0625`. **So a channel clamp-interior in both operand
+    /// orders is *not* thereby observable at every alpha**, and what actually
+    /// establishes observability is `aurora-app`'s standing guard folding each
+    /// roster fixture both ways and measuring the gap (0.113.1's third
+    /// assertion), which for this mode is necessary rather than redundant.
     ///
     /// **Near misses.** Dropping the `2.0 *` in the burn branch computes
     /// `ColorBurn(Cb, Cs)` there — a live GPU arm — and is caught only by a
@@ -18811,24 +18848,62 @@ mod tests {
     // `ColorBurn(Cb, 1.0) = 1 - min(1, (1 - Cb)/1) = Cb` and the dodge arm is
     // `ColorDodge(Cb, 0.0) = min(1, Cb/1) = Cb`, guard points included
     // (`Cb == 1` gives `1` either way, `Cb == 0` gives `0`). The two arms are
-    // identical on every input there, so `<=` against `<` is the same
-    // function. Test 7 pins the *value* and deliberately does not claim to test
-    // the comparison's direction;
+    // identical for every **`f16`-representable** `Cb` in `[0, 1]` -- bit-
+    // exactly, measured across all 15,362 of them -- so `<=` against `<` is the
+    // same function on every input this suite (or the app path, whose tiles are
+    // `f16`) can present. Test 7 pins the *value* and deliberately does not
+    // claim to test the comparison's direction;
     // `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
     // proves the identity exhaustively on the CPU rather than at three points.
+    //
+    // **Two ways the unqualified version of that claim is false**, disclosed
+    // rather than left implied. (i) The burn arm's value is `1 - (1 - Cb)`,
+    // which is bit-exact only for an `f16`-representable `Cb`; for a general
+    // `f32` `Cb` -- what `straight_backdrop`'s own division produces from a
+    // non-opaque premultiplied backdrop -- it is not. Measured:
+    // `3.57627869e-07 / 0.999511719` is `3.5780258e-07`, where the burn arm
+    // gives `3.5762787e-07` and the dodge arm `3.5780258e-07`. Two roundings at
+    // `1.0` bound that gap by `2^-25` (measured maximum `2.98e-8`), which is
+    // `1/65536` of this suite's own `2 * f16::EPSILON` tolerance. (ii)
+    // `straight_backdrop` does not clamp, so an accumulator whose premultiplied
+    // `rgb` exceeds its own `a` gives `cb > 1`, where the arms diverge
+    // outright: at `Cs == 0.5`, `Cb = 1.5` is `1.5` from burn (neither
+    // `color_burn_channel` guard is an inequality) and `1.0` from dodge. So the
+    // `<=`/`<` mutation is unkillable **at this suite's tolerance**, not
+    // because the two arms are the same function everywhere.
     //
     // **Asymmetry: UNCONDITIONAL and structural -- the sixth asymmetric mode on
     // the GPU path and the fourth of that kind**, after `ColorBurn`,
     // `ColorDodge` and `LinearLight`. `B(Cb, Cs)` branches on `Cs` while
     // `B(Cs, Cb)` branches on `Cb`, so a straddling pair takes two different
     // *families* under transposition. **Unlike `LinearLight` this mode is not
-    // affine**, so its `(Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5` has no
-    // analogue and there is no blind opacity. What launders a transpose is
-    // *rail agreement*: both orders railing to `0` (`Cb + 2*Cs <= 1` and
-    // `Cs + 2*Cb <= 1`) or both to `1` (`Cb + 2*Cs >= 2` and `Cs + 2*Cb >= 2`).
-    // Every fixture below therefore carries at least one channel that is
-    // clamp-interior in *both* operand orders, which is observable at every
-    // alpha.
+    // affine in its operands**, so its `(Cb - Cs)*(1 - 2a)` form has no
+    // analogue.
+    //
+    // **It does still have blind opacities, and 0.114.0's first draft of this
+    // header claimed otherwise.** The fold's own gap,
+    // `out - out_transposed = (1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`,
+    // is affine in `a` for *every* mode -- `B`'s non-affinity is in its
+    // operands, which that expression never varies -- so with `D0 = Cb - Cs`
+    // and `D1 = B(Cb, Cs) - B(Cs, Cb)` a channel goes blind at
+    // `a* = D0 / (D0 - D1)`, in `(0, 1)` whenever the two have opposite signs.
+    // Two mechanisms launder a transpose here:
+    //
+    //   - *rail agreement*: both orders railing to `0` (`Cb + 2*Cs <= 1` and
+    //     `Cs + 2*Cb <= 1`) or both to `1` (`Cb + 2*Cs >= 2` and
+    //     `Cs + 2*Cb >= 2`);
+    //   - that blind `a*`. In the burn branch it closes in closed form: for
+    //     `Cb != Cs`, blind at exactly `a = 0.5` is `2*Cb*Cs + Cb + Cs == 1`
+    //     (derived, then confirmed by exhaustive rational search) -- e.g.
+    //     `Cb = 0.3`, `Cs = 0.4375`, **both orders burn-interior**, `B = 0.2`
+    //     against `B^T = 0.0625`.
+    //
+    // So "clamp-interior in both operand orders" does **not** imply "observable
+    // at every alpha". Every fixture below does carry at least one channel
+    // interior in both orders, as 0.114.0 recorded -- but each one's transpose
+    // row is measured, and none of them rests on that property; `aurora-app`'s
+    // `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    // transposed_argument` is what asks the arithmetic for the roster fixture.
     //
     // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
     // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
@@ -19242,9 +19317,17 @@ mod tests {
     /// three golden channels are distinct**, and both near-misses are live
     /// here: green (the only burn channel) catches the dropped `2.0 *`, and
     /// red and blue (both dodge channels) catch the `2*cs`-for-`2*cs - 1`
-    /// substitution, which drives their divisor negative. Red, the railed
-    /// channel, is blind to the dropped `2.0 *` — a rail *does* gate that one —
-    /// which is the disclosure this fixture makes.
+    /// substitution, which drives their divisor negative. Red is blind to the
+    /// dropped `2.0 *` for the plain reason that it never enters the burn branch
+    /// where that mutation lives — **branch selection, not railing**, and blue
+    /// is blind to it for exactly the same reason despite being interior.
+    /// (Corrected in 0.114.1: this comment used to credit red's rail for that
+    /// blindness. What a rail genuinely gates for that mutation is a *lower*-
+    /// railed **burn** channel, `0.0` under both formulas since `Cb + 2*Cs <= 1`
+    /// implies `Cb + Cs <= 1`; this fixture has no such channel, its one burn
+    /// channel being interior. Red's rail is the dodge branch's *upper* one, and
+    /// what it does gate is `LinearDodge`/`LinearLight`/`HardMix` coinciding
+    /// there — listed below.)
     ///
     /// Rival arms, re-derived in exact rationals:
     ///

@@ -7109,15 +7109,19 @@ fn composite_roots_into_tile(
 ///   sufficient-but-not-necessary for six of the fourteen modes as of
 ///   0.114.0 (the sixth being `VividLight`, whose asymmetry is
 ///   unconditional *and* structural — it branches on the source, so a
-///   transposed pair branches on the backdrop — and which, not being affine,
-///   has no blind opacity at all; the fifth being `LinearLight`, whose
+///   transposed pair branches on the backdrop — and whose own fixture
+///   catches a transpose at `1.0` in all three channels, measured; note
+///   that this mode *does* have blind opacities, contrary to what 0.114.0
+///   first wrote here, so it is the fixture and not the formula that makes
+///   the `0.5` unnecessary — see `TRANSPOSE_COVERAGE`'s standing guard for
+///   the affine criterion; the fifth being `LinearLight`, whose
 ///   *unconditional*
 ///   asymmetry makes a transpose observable at alpha `1.0` even though its
 ///   own fixture's interior channels are blind to one at exactly `0.5` —
 ///   see `solid_stack_texel_cpu` for how the standing guard now catches
 ///   that case computationally instead), and
 ///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
-///   un-special-cased for all five (plain backticks: that const is
+///   un-special-cased for all six (plain backticks: that const is
 ///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
 ///   dispatch as its own arm and shares the *same single* `spare` ping-pong
 ///   accumulator.
@@ -7181,10 +7185,11 @@ fn composite_roots_into_tile(
 ///   `Cb`/`Cs`, and the second whose asymmetry is *conditional*** (`Overlay`
 ///   was the first; `ColorBurn` and `ColorDodge` are asymmetric everywhere).
 ///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
-///   un-special-cased for all four (plain backticks: that const is
-///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
-///   dispatch as its own arm and shares the *same single* `spare` ping-pong
-///   accumulator.
+///   un-special-cased for all six such modes (four when this paragraph was
+///   written in 0.111.0; count corrected in 0.114.1 — plain backticks: that
+///   const is `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s
+///   blend dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator.
 /// - [`aurora_doc::BlendMode::LinearLight`] (0.113.0), composited by
 ///   `aurora_render::TileCompositor::composite_linear_light_over_with_opacity`,
 ///   the twelfth mode ported to WGSL — and **structurally the simplest since
@@ -7270,17 +7275,29 @@ fn composite_roots_into_tile(
 ///   `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` is constrained by the real `Multiply`
 ///   fold and not just by `l1`'s literals. Its `<=` branch boundary is
 ///   continuous — both arms give `Cb` at `Cs == 0.5`, guard points included —
-///   so that comparison's direction is **unkillable in principle**, the third
-///   such case after `Overlay` and `HardLight`; `aurora-render`'s
+///   so that comparison's direction is **unkillable at these suites'
+///   tolerance**, the third such case after `Overlay` and `HardLight`;
+///   `aurora-render`'s
 ///   `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
-///   proves the arm-equality exhaustively rather than at a point. Its
-///   asymmetry is unconditional *and structural* (it branches on the source, so
-///   a transposed pair branches on the backdrop) and, unlike `LinearLight`, it
-///   is **not affine**, so there is no blind opacity: what launders a transpose
-///   is rail agreement in the blend term, and the fixture keeps every channel
-///   clamp-interior in both operand orders, catching a transpose in all three
-///   channels at `0.5` **and** at `1.0` — the first roster row for which that
-///   holds at both. `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   proves the arm-equality exhaustively over every `f16`-representable `Cb`
+///   in `[0, 1]`, which is the honest scope of the claim: outside that domain
+///   (a general `f32` `Cb` from a non-opaque backdrop's division, or an
+///   unclamped `Cb > 1`) the two arms can differ — see that mode's own shader
+///   comment. Its asymmetry is unconditional *and structural* (it branches on
+///   the source, so a transposed pair branches on the backdrop) and, unlike
+///   `LinearLight`, it is **not affine in its operands** — which, contrary to
+///   0.114.0's first draft here, does *not* mean it has no blind opacity: the
+///   fold's transpose gap is affine in `a` for every mode, so a channel goes
+///   blind wherever `Cb - Cs` and `B(Cb, Cs) - B(Cs, Cb)` have opposite signs,
+///   clamp-interior in both orders or not. Two things launder a transpose here
+///   (rail agreement in the blend term, and that blind alpha), and what
+///   establishes observability is `TRANSPOSE_COVERAGE`'s arithmetic assertion,
+///   not the interiority heuristic. Its fixture is interior in both orders in
+///   red and blue, upper-railed in green in the shipped order only, and rails
+///   in both orders nowhere — so no channel's blind alpha falls on `0.5` or
+///   `1.0`, and the transpose is caught in all three channels at `0.5` **and**
+///   at `1.0`, measured — the first roster row for which that holds at both.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
 ///   un-special-cased for this mode too (plain backticks: that const is
 ///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
 ///   its own arm and shares the *same single* `spare` ping-pong accumulator.
@@ -7322,7 +7339,9 @@ fn composite_roots_into_tile(
 /// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 13 blend modes) routes the *whole document*
+/// layer at any of the other 12 blend modes — 27 `aurora_doc::BlendMode`
+/// variants minus the fifteen admitted above; the figure was left at 13
+/// through 0.114.0 and corrected in 0.114.1) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -10000,15 +10019,27 @@ fn begin_gpu_composite_tile(
             // *structurally* asymmetric** -- `B(Cb, Cs)` branches on `Cs`
             // while `B(Cs, Cb)` branches on `Cb`, so a straddling pair takes
             // two different families under transposition. **Unlike
-            // `LinearLight` directly above it is not affine**, so its
-            // `(Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5` has no analogue
-            // here and there is no blind opacity: what launders a transpose is
-            // *rail agreement* in the blend term itself, and a channel that is
-            // clamp-interior in both operand orders is observable at every
-            // alpha. The fixture carries three such channels, so the transpose
-            // is caught in all three at both `0.5` and `1.0` -- measured, not
-            // reasoned about. That fixture still uses `0.5` on its
-            // `VividLight` layer, because `TRANSPOSE_COVERAGE`'s guard is
+            // `LinearLight` directly above it is not affine in its operands**,
+            // so that mode's `(Cb - Cs)*(1 - 2a)` form has no analogue here --
+            // which is *not* the same as having no blind opacity, and 0.114.0's
+            // first draft of this comment conflated the two. The fold's own
+            // transpose gap,
+            // `(1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`, is affine in `a`
+            // for every mode, so a channel goes blind at
+            // `a* = D0 / (D0 - D1)` whenever `D0 = Cb - Cs` and
+            // `D1 = B(Cb, Cs) - B(Cs, Cb)` have opposite signs -- interior in
+            // both operand orders or not (in the burn branch, blind at exactly
+            // `a = 0.5` is `2*Cb*Cs + Cb + Cs == 1`; `Cb = 0.3`, `Cs = 0.4375`
+            // is such a pair, interior in both orders). So two things launder a
+            // transpose here: *rail agreement* in the blend term, and that
+            // blind alpha. The fixture is interior in both orders in red and
+            // blue and upper-railed in green in the shipped order alone, rails
+            // in both orders nowhere, and has no channel whose blind alpha is
+            // `0.5` or `1.0` -- so the transpose is caught in all three at both
+            // opacities, measured, not reasoned about. What proves that is
+            // `TRANSPOSE_COVERAGE`'s arithmetic assertion (0.113.1), which for
+            // this mode is necessary rather than redundant; the fixture still
+            // uses `0.5` on its `VividLight` layer because that guard is
             // deliberately not special-cased for any asymmetric mode.
             aurora_render::BlendMode::VividLight => {
                 let spare_accumulator = accumulator_or_create(
@@ -30765,16 +30796,39 @@ mod tests {
     ///
     /// **Transpose observability.** This mode's blend term is unconditionally
     /// *and structurally* asymmetric (`B(Cb, Cs)` branches on `Cs`,
-    /// `B(Cs, Cb)` on `Cb`), and — unlike `LinearLight` — it is **not affine**,
-    /// so `LinearLight`'s `(Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5` has no
-    /// analogue and there is no blind opacity. What launders a transpose is
-    /// rail agreement in the blend term: both orders railing to `0`
-    /// (`Cb + 2*Cs <= 1` **and** `Cs + 2*Cb <= 1`) or both to `1`
-    /// (`Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2`). No channel here does:
-    /// `B^T = (0.3636.., 0.8333.., 0.3333..)`, all three interior, all three
-    /// different from `B`. Measured in 0.114.0, the transpose is caught in
-    /// **all three channels at `0.5` and all three at `1.0`** — the first
-    /// fixture in this roster for which that is true of both opacities.
+    /// `B(Cs, Cb)` on `Cb`), and — unlike `LinearLight` — it is **not affine in
+    /// its operands**, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)` form has no
+    /// analogue.
+    ///
+    /// **That is not the same as having no blind opacity, and 0.114.0 wrote it
+    /// here as though it were.** The fold's transpose gap,
+    /// `out - out_transposed = (1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`,
+    /// is affine in `a` for *every* mode — `B`'s non-affinity is in its
+    /// operands, which that expression never varies — so with `D0 = Cb - Cs`
+    /// and `D1 = B(Cb, Cs) - B(Cs, Cb)` a channel is blind at
+    /// `a* = D0 / (D0 - D1)`, in `(0, 1)` whenever the two have opposite signs.
+    /// Being clamp-interior in both operand orders does **not** exempt a
+    /// channel: in the burn branch, blind at exactly `a = 0.5` is
+    /// `2*Cb*Cs + Cb + Cs == 1` (derived, then confirmed by exhaustive rational
+    /// search), and `Cb = 0.3`, `Cs = 0.4375` sits on it with both orders
+    /// burn-*interior* (`B = 0.2`, `B^T = 0.0625`).
+    ///
+    /// So two mechanisms launder a transpose here: rail agreement in the blend
+    /// term (both orders railing to `0`, `Cb + 2*Cs <= 1` **and**
+    /// `Cs + 2*Cb <= 1`, or both to `1`, `Cb + 2*Cs >= 2` **and**
+    /// `Cs + 2*Cb >= 2`), and that blind `a*`. **This fixture escapes both, and
+    /// the second only by measurement.** `B^T = (0.3636.., 0.8333.., 0.3333..)`,
+    /// all three interior and all three different from `B`, so no channel rails
+    /// in both orders (red and blue are interior in both; green is
+    /// upper-railed in the shipped order alone, which is itself enough for `B`
+    /// to differ). And each channel's blind `a*` — red `≈ 0.8882`
+    /// (`D0 = 0.40625`, `D1 = -0.051136`), green `0.75` (`-0.5`, `+0.166667`),
+    /// blue `≈ 0.9310` (`-0.5625`, `+0.0416667`) — is a real blind opacity in
+    /// `(0, 1)` that simply is not `0.5` or `1.0`. Measured in 0.114.0, the
+    /// transpose is therefore caught in **all three channels at `0.5` and all
+    /// three at `1.0`** — the first fixture in this roster for which that is
+    /// true of both opacities — and the standing guard's largest channel gap
+    /// here is blue's `0.2602539`, against a `2 * f16::EPSILON` tolerance.
     ///
     /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
     /// source-side total no-op *and* its branch boundary), `0.0` or `1.0` (a
@@ -31036,8 +31090,8 @@ mod tests {
     /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
     /// dispatch arm's `src`/`backdrop` arguments survived the entire test
     /// suite, and both times the only thing that found it was a human
-    /// performing the mutation and re-running everything. Thirteen modes
-    /// are still to be ported on the same template — fourteen
+    /// performing the mutation and re-running everything. Twelve modes
+    /// are still to be ported on the same template — thirteen
     /// `aurora_render::BlendMode` variants lack a blend-math WGSL entry
     /// point, but `Normal` is among them and needs none, compositing through
     /// a separate fixed-function path — so the class needs a
@@ -31053,8 +31107,10 @@ mod tests {
     /// made this guard's demand actively *insufficient* — which is why 0.113.1
     /// added the computational third assertion below, and why the demand is
     /// now a diagnostic rather than the whole check. `VividLight`, the sixth
-    /// as of 0.114.0, is the reverse case: not affine, so it has no blind
-    /// opacity and the demand is merely redundant for it.)
+    /// as of 0.114.0, has blind opacities of its own — 0.114.0 claimed it did
+    /// not; see that mode's paragraph below — and its fixture escapes them by
+    /// measurement rather than by construction, which makes the computational
+    /// assertion necessary for it too.)
     ///
     /// The property, in one line: the first seven blend-math formulas the
     /// GPU path implemented (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
@@ -31146,17 +31202,45 @@ mod tests {
     /// branches on `Cs` while `B(Cs, Cb)` branches on `Cb`, so a straddling
     /// pair takes two different families under transposition rather than the
     /// same formula with swapped arguments. Being a pair of guarded divisions it
-    /// is **not affine**, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)` cancellation
-    /// has no analogue and there is **no blind opacity at all**. The only thing
-    /// that launders a transpose here is *rail agreement* — both orders driving
-    /// the callee's own `min(1, ..)` past its bound, i.e. `Cb + 2*Cs <= 1` and
-    /// `Cs + 2*Cb <= 1` in the burn branch, or `Cb + 2*Cs >= 2` and
-    /// `Cs + 2*Cb >= 2` in the dodge branch. `NORMAL_MULTIPLY_VIVID_LIGHT_STACK`
-    /// has no channel that rails in both orders, so its transpose is observable
-    /// in all three channels at `0.5` **and** all three at `1.0` (measured) —
-    /// the first roster row for which that holds at both opacities. For this
-    /// mode, then, the `0.5` this guard demands is simply redundant rather than
-    /// insufficient.
+    /// is **not affine in its operands**, so `LinearLight`'s
+    /// `(Cb - Cs)*(1 - 2a)` form has no analogue.
+    ///
+    /// **0.114.0 read that as "no blind opacity at all". It is not, and this is
+    /// the most load-bearing correction in this comment, because the wrong
+    /// version reads as a licence to skip assertion (3).** Write
+    /// `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`. Over an opaque backdrop
+    /// at effective alpha `a`,
+    ///
+    /// ```text
+    /// out - out_transposed = (1 - a) * D0 + a * D1
+    /// ```
+    ///
+    /// which is **affine in `a` for every blend mode**, this one included: a
+    /// blend term that is not affine in its *operands* says nothing about that
+    /// expression, which never varies them. So a channel is blind at
+    /// `a* = D0 / (D0 - D1)`, and `a*` lands in `(0, 1)` whenever `D0` and `D1`
+    /// have opposite signs. **Being clamp-interior in both operand orders does
+    /// not exempt a channel** — which is exactly the heuristic 0.114.0 leaned
+    /// on. Inside the burn branch the algebra closes: for `Cb != Cs`,
+    /// `D0 + D1 == 0` (blind at exactly the `0.5` this guard demands) reduces to
+    /// `2*Cb*Cs + Cb + Cs == 1`, derived and then confirmed by exhaustive
+    /// rational search — and `Cb = 0.3`, `Cs = 0.4375` sits on it with **both**
+    /// orders burn-*interior* (`B = 0.2` against `B^T = 0.0625`). The dodge
+    /// branch carries the mirror locus in `1 - Cb` and `1 - Cs`.
+    ///
+    /// Two mechanisms therefore launder a transpose here, not one: *rail
+    /// agreement* — both orders driving the callee's own `min(1, ..)` past its
+    /// bound, i.e. `Cb + 2*Cs <= 1` and `Cs + 2*Cb <= 1` in the burn branch, or
+    /// `Cb + 2*Cs >= 2` and `Cs + 2*Cb >= 2` in the dodge branch — and that
+    /// blind `a*`. `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` escapes both: no channel
+    /// rails in both orders, and its three blind alphas are `≈ 0.8882`, `0.75`
+    /// and `≈ 0.9310`, none of them `0.5` or `1.0`. So its transpose is
+    /// observable in all three channels at `0.5` **and** all three at `1.0`
+    /// (measured) — the first roster row for which that holds at both opacities.
+    /// **What establishes that is assertion (3) below, not this mode's
+    /// asymmetry**: for `VividLight` the computational check is *necessary*,
+    /// exactly as it is for `LinearLight`, and this guard's `0.5` is neither
+    /// sufficient on its own nor the reason the fixture works.
     ///
     /// **So as of 0.113.1 this guard no longer rests on the proxy alone: it
     /// asks the arithmetic.** A third assertion folds each roster fixture on
@@ -31177,10 +31261,16 @@ mod tests {
     /// PLAN.md's entry for that round): it reports a largest channel gap of
     /// exactly `0`, and assertions (1) and (2) pass it as they always did.
     ///
-    /// **All fourteen live rows clear it with room to spare**, measured in the
-    /// same round: the smallest gap in the roster is `LinearLight`'s own
-    /// `0.046875`, about 24× the tolerance, and the largest is `ColorDodge`'s
-    /// `0.61865`. So the check is not near a boundary for any current fixture.
+    /// **All fourteen live rows clear it with room to spare.** Thirteen of them
+    /// were measured in 0.113.1, the round that added the assertion; the
+    /// fourteenth is `VividLight`'s own row, which did not exist then and was
+    /// measured in 0.114.0 with the rest of that port (largest channel gap
+    /// `0.2602539`, in blue). The smallest gap in the roster is `LinearLight`'s
+    /// own `0.046875`, about 24× the tolerance, and the largest is
+    /// `ColorDodge`'s `0.61865`. So the check is not near a boundary for any
+    /// current fixture. (Provenance corrected in 0.114.1: 0.114.0 rewrote "all
+    /// thirteen" to "all fourteen" while leaving "measured in the same round",
+    /// which credited 0.113.1 with measuring a row that postdates it.)
     ///
     /// **Why not simply also exclude `a = 0.5`,** which is what the algebra
     /// above literally indicts? Because **all fourteen** roster rows carry
@@ -31196,12 +31286,12 @@ mod tests {
     /// its failure message — and the arithmetic is what actually decides.
     ///
     /// At
-    /// least five more asymmetric modes are still to
+    /// least four more asymmetric modes are still to
     /// be ported (`Subtract`, `Divide`,
-    /// `SoftLight`, `VividLight` and `PinLight`
+    /// `SoftLight` and `PinLight`
     /// among the separable ones — `Overlay` was on that list
-    /// until 0.110.0 ported it, `HardLight` until 0.111.0 did, and
-    /// `LinearLight` until 0.113.0 did);
+    /// until 0.110.0 ported it, `HardLight` until 0.111.0 did,
+    /// `LinearLight` until 0.113.0 did, and `VividLight` until 0.114.0 did);
     /// if a later round wants the exemption, it should be a deliberate,
     /// per-mode change to this test with its own measured justification,
     /// not a quiet loosening.
@@ -34233,11 +34323,19 @@ mod tests {
     /// at *both* opacities, and this mode is the first in the roster for which
     /// that is true.** Its blend term is unconditionally *and structurally*
     /// asymmetric — `B(Cb, Cs)` branches on `Cs`, `B(Cs, Cb)` on `Cb` — and
-    /// unlike `LinearLight` it is **not affine**, so `LinearLight`'s
-    /// `out - out_transposed = (Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5`
-    /// has no analogue here and there is no blind opacity. What launders a
-    /// transpose is rail agreement in the blend term, and no channel of this
-    /// fixture rails in *both* operand orders:
+    /// unlike `LinearLight` it is **not affine in its operands**, so that mode's
+    /// `out - out_transposed = (Cb - Cs)*(1 - 2a)` form has no analogue here.
+    /// **It does still have blind opacities, contrary to what 0.114.0 wrote
+    /// here**: the fold's gap `(1 - a)*D0 + a*D1`, with `D0 = Cb - Cs` and
+    /// `D1 = B(Cb, Cs) - B(Cs, Cb)`, is affine in `a` for every mode, so a
+    /// channel is blind at `a* = D0/(D0 - D1)` whenever the two have opposite
+    /// signs — and all three of this fixture's channels do (red `≈ 0.8882`,
+    /// green `0.75`, blue `≈ 0.9310`). None of those is `0.5` or `1.0`, which is
+    /// why both opacities work; being clamp-interior in both operand orders is
+    /// *not* what buys it. The other laundering mechanism, rail agreement in the
+    /// blend term, this fixture also escapes: no channel rails in *both* operand
+    /// orders — red and blue are interior in both, green is upper-railed in the
+    /// shipped order alone —
     /// `B^T = (0.3636.., 0.8333.., 0.3333..)`. Measured on real hardware in
     /// 0.114.0, not derived: the transposed arm read back
     /// `(0.30664063, 0.8540039, 0.5415039, 1.0)` against the golden
@@ -34329,8 +34427,8 @@ mod tests {
              (0.30664063, 0.8540039, 0.5415039, 1.0) on real hardware during 0.114.0's own \
              mutation \
              testing, with that mutation since reverted -- the shipped arm binds src first and \
-             the accumulator second -- caught in all three channels, this mode having no blind \
-             opacity because it is not affine."
+             the accumulator second -- caught in all three channels, none of whose own blind \
+             opacity (~0.8882, 0.75, ~0.9310) is 0.5 or 1.0."
         );
 
         // The vacuity guard: the same stack with its `VividLight` layer turned
