@@ -73,7 +73,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // fs_composite_screen, fs_composite_difference,
 // fs_composite_linear_dodge, fs_composite_linear_burn,
 // fs_composite_color_burn, fs_composite_color_dodge,
-// fs_composite_overlay and fs_composite_hard_light -- use it,
+// fs_composite_overlay, fs_composite_hard_light and
+// fs_composite_linear_light -- use it,
 // through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
@@ -81,10 +82,10 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // -- the `backdrop` of every `TileCompositor::composite_*_over_with_
-// opacity` blend-math method (as of 0.111.0
+// opacity` blend-math method (as of 0.113.0
 // `composite_multiply_over_with_opacity` and its
 // `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-// `color_burn`/`color_dodge`/`overlay`/`hard_light`
+// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`
 // siblings, named
 // as a family rather than relisted, since one more joins them every time
 // a mode is ported) --
@@ -129,19 +130,19 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
 // once per entry point.
 //
-// **What actually protects this guard is five tests, not eleven (measured,
+// **What actually protects this guard is five tests, not twelve (measured,
 // 0.109.0 for the first three, 0.110.0 for the fourth and 0.111.0 for the
 // fifth; explained, 0.109.1).** Deleting the guard -- or replacing it with a
 // `select()`, which evaluates both arms -- fails
-// exactly five of the eleven per-mode transparent-backdrop tests:
+// exactly five of the twelve per-mode transparent-backdrop tests:
 // `multiply`'s, `screen`'s, `difference`'s, `overlay`'s and
 // `hard_light`'s. (Two naming
 // shapes are in play: `multiply`'s and `darken`'s are
 // `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
-// the other nine are
+// the other ten are
 // `composite_<mode>_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.)
-// The other six -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
-// `color_burn`, `color_dodge` -- pass with the guard gone, and not
+// The other seven -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
+// `color_burn`, `color_dodge`, `linear_light` -- pass with the guard gone, and not
 // because their fixtures are weak: on this backend `min()`/`max()`
 // *launder* a NaN operand into the finite one, so those six formulas
 // turn the NaN into a finite `b` before `fold_over` ever sees it -- and
@@ -175,6 +176,19 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // Measured: with the guard deleted, `fs_composite_hard_light`'s texel 0 reads
 // back literally `(NaN, NaN, NaN, 1.0)`, failing both that test's finiteness
 // check and its value check. See PLAN.md's 0.111.0 entry.
+//
+// **`LinearLight` (0.113.0) is *not* a sixth detector, and the same rule is
+// what predicted that too — the first time the rule predicted a *non*-detection
+// for a newly ported mode, and it was then measured rather than assumed.** Its
+// blend term is a single `clamp()`, and WGSL specifies float `clamp(e1, e2, e3)`
+// as `min(max(e1, e2), e3)`; so despite containing no literal `min`/`max` token
+// it has *two* of them, and it launders the `NaN` into the finite bound exactly
+// as `darken` and the other five do. Measured in 0.113.0: with the guard
+// deleted, `composite_linear_light_over_with_opacity_is_the_source_alone_where_
+// the_backdrop_is_transparent` stays **green**. That is the same
+// output-equivalence the six min/max modes have, not a weak fixture — and it is
+// why the rule is worth stating as "no NaN-laundering intrinsic on the path from
+// `cb` to `b`" rather than as a list of tokens to grep for.
 fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
     let ab = bd.a;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
@@ -1131,5 +1145,110 @@ fn fs_composite_hard_light(in: VsOut) -> @location(0) vec4<f32> {
     let t = 2.0 * s.rgb - 1.0;
     let hi = cb + t - cb * t;
     let b = select(hi, lo, s.rgb <= vec3<f32>(0.5));
+    return fold_over(s, bd, b);
+}
+
+// `blend_channel`'s own `BlendMode::LinearLight` arm (src/composite.rs),
+// componentwise -- the **twelfth** blend mode ported to WGSL (0.113.0), and the
+// simplest-shaped one since `LinearBurn`. Derived from that Rust arm, which is
+// literally one expression:
+//
+//     BlendMode::LinearLight => (cb + 2.0 * cs - 1.0).clamp(0.0, 1.0),
+//
+// **No branch, no `select()`, and that is the structural news of this round.**
+// The two overlay-family modes ported before it (`Overlay`, `HardLight`) are
+// two-call delegations that had to become a componentwise `select()` here.
+// This mode's CPU arm delegates to nothing: `blend_channel` already carries a
+// proof (in its own comment, and in
+// `linear_light_simplified_form_matches_the_branch_form_for_several_inputs`)
+// that the *branch* form -- `Cs <= 0.5 -> LinearBurn(Cb, 2*Cs)`, else
+// `LinearDodge(Cb, 2*Cs - 1)` -- collapses to a single unconditional clamp,
+// because each branch only ever reaches the one bound it would have applied
+// anyway. So this entry point is shaped like `fs_composite_linear_burn`'s, not
+// like the two directly above it.
+//
+// **This is the first `clamp()` in this file** (every earlier mode reaches for
+// `min`, `max`, `abs` or plain arithmetic), which matters for one reason and
+// not for correctness: WGSL specifies float `clamp(e1, e2, e3)` as
+// `min(max(e1, e2), e3)`, so it **launders a NaN into a finite operand exactly
+// as the six min/max modes do** -- the opposite of `Overlay`'s and
+// `HardLight`'s behaviour. See `straight_backdrop`'s own comment for the
+// measured result of deleting its guard against this mode.
+//
+// **Near misses, in decreasing order of how easy the slip is:**
+//
+//   - **Dropping the `2.0 *` gives `LinearBurn` exactly**, not merely
+//     something close: `clamp(cb + cs - 1, 0, 1)` never reaches its upper
+//     bound (both operands are in `[0, 1]`, so the sum is at most `1`), so it
+//     *is* `max(cb + cs - 1, 0)`, which is `fs_composite_linear_burn` above.
+//     That is a live GPU entry point and a live dispatch arm, so this is the
+//     one slip in this round that silently computes another shipped mode.
+//   - **`min(cb + s.rgb, 1)` is `LinearDodge`** (also live, also above), the
+//     other half of the pair this mode's branch form is built from.
+//   - Dropping either bound of the clamp is a real mutation in its own right:
+//     `min(cb + 2*cs - 1, 1)` loses the lower rail and
+//     `max(cb + 2*cs - 1, 0)` the upper one. Both are killed, but only by a
+//     fixture that actually reaches the rail in question -- see the
+//     `composite_linear_light_*` suite header for which fixture covers which.
+//
+// **Two degeneracies, both verified algebraically:**
+//
+//   1. `LinearLight(Cb, 0.5) = Cb` for every `Cb` -- a **source** channel at
+//      exactly `0.5` makes this mode a total no-op (`Cb + 1 - 1`). No
+//      solid-colour fixture in this crate's `composite_linear_light_*` tests
+//      uses `0.5` in any *source* channel.
+//   2. `LinearLight(Cb, 0) = 0` and `LinearLight(Cb, 1) = 1` -- a black or
+//      white **source** channel erases the backdrop, both by clamping.
+//
+// A `0.5` **backdrop** channel is deliberately *not* degenerate here
+// (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)`, which still depends on
+// `Cs`), unlike `HardLight`, where it is `Normal`. Backdrop `0.5`s are
+// therefore usable and are used.
+//
+// **Asymmetry: UNCONDITIONAL, and this is the fifth asymmetric mode on the
+// GPU path -- the third unconditionally so**, after `ColorBurn` (0.107.0) and
+// `ColorDodge` (0.108.0). `Overlay` and `HardLight` are asymmetric only where
+// their operands straddle `0.5`. Here the algebra is direct:
+//
+//     B(Cb, Cs) - B(Cs, Cb) = (Cb + 2*Cs) - (Cs + 2*Cb) = Cs - Cb
+//
+// *before* the clamp -- so the **blend term** differs in every channel whose
+// operands differ at all, at any opacity.
+//
+// **Two separate things launder that, and they are exactly complementary --
+// worked out algebraically in this round and then measured, because the
+// obvious reading of "unconditional asymmetry" is wrong about both.** Over an
+// opaque backdrop at effective alpha `a`, `fold_over` gives
+// `out = (1-a)*Cb + a*B`, so:
+//
+//   - **A railed channel launders it.** If both operand orders drive the sum
+//     past the *same* bound, both `B`s are that bound and only the fold's own
+//     `(1-a)*Cb` vs `(1-a)*Cs` remains -- which vanishes at `a = 1`. So a
+//     saturated channel at full alpha sees nothing.
+//   - **A clamp-*interior* channel launders it at `a = 0.5` exactly.** With
+//     both orders interior, `out - out_transposed = (Cb - Cs) * (1 - 2a)`,
+//     which is **zero at `a = 0.5`** -- there `out = Cb + Cs - 0.5`, symmetric
+//     in its two operands. This is the surprising half: the very non-unit
+//     opacity `aurora-app`'s transpose guard demands is the one value at which
+//     an interior channel goes blind.
+//
+// So a fixture needs a *railed* channel to catch a transpose at `a = 0.5`, and
+// an *interior* channel to catch one at `a = 1`. The
+// `composite_linear_light_*` suite header names which of its fixtures supplies
+// which, and the app-level fixture carries both.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the eleven entry points
+// above; no new binding, no new layout.
+@fragment
+fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    // blend_channel(LinearLight, cb, cs): clamp(cb + 2*cs - 1, 0, 1), one
+    // expression and no branch -- see composite.rs's own arm for why the
+    // branch form collapses to this. Dropping the `2.0 *` here is
+    // fs_composite_linear_burn exactly.
+    let b = clamp(cb + 2.0 * s.rgb - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
     return fold_over(s, bd, b);
 }

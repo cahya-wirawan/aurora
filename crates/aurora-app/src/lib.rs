@@ -6813,9 +6813,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the thirteen
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the fourteen
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no fourteenth mode. The thirteen are (count corrected in
+/// no groups, no fifteenth mode. The fourteen are (count corrected in
 /// 0.107.1:
 /// this header said "eight" from 0.106.0 to 0.107.0 while the list below
 /// already had nine bullets, so it was stale by one before `ColorBurn`
@@ -6823,8 +6823,9 @@ fn composite_roots_into_tile(
 /// length and the predicate's `match` are the load-bearing lists, and
 /// this sentence is the hand-maintained one that drifted; 0.108.0 took it
 /// to eleven along with the `ColorDodge` bullet and arm it describes, and
-/// 0.110.0 to twelve along with the `Overlay` ones, and 0.111.0 to
-/// thirteen along with the `HardLight` ones):
+/// 0.110.0 to twelve along with the `Overlay` ones, 0.111.0 to
+/// thirteen along with the `HardLight` ones, and 0.113.0 to fourteen along
+/// with the `LinearLight` ones):
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -7104,7 +7105,7 @@ fn composite_roots_into_tile(
 ///   **all three** channels, and 0.110.0 confirmed by real measurement that
 ///   a transposed binding is observable there at effective alpha `1.0` as
 ///   well as at `0.5`. Non-unit fixture opacity is therefore
-///   sufficient-but-not-necessary for four of the eleven modes as of
+///   sufficient-but-not-necessary for four of the twelve modes as of
 ///   0.111.0, and
 ///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
 ///   un-special-cased for all four (plain backticks: that const is
@@ -7175,6 +7176,69 @@ fn composite_roots_into_tile(
 ///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
 ///   dispatch as its own arm and shares the *same single* `spare` ping-pong
 ///   accumulator.
+/// - [`aurora_doc::BlendMode::LinearLight`] (0.113.0), composited by
+///   `aurora_render::TileCompositor::composite_linear_light_over_with_opacity`,
+///   the twelfth mode ported to WGSL — and **structurally the simplest since
+///   `LinearBurn`, which is the news of its round**. The two overlay-family
+///   modes directly above it are two-call delegations that became a
+///   componentwise `select()`; this one's `aurora_render::blend_channel` arm is
+///   a *single unconditional expression*,
+///   `(cb + 2.0 * cs - 1.0).clamp(0.0, 1.0)`, so
+///   `fs_composite_linear_light` has **no branch and no `select()`** and is
+///   shaped like `fs_composite_linear_burn`'s instead. Its branch form
+///   (`Cs <= 0.5 -> LinearBurn(Cb, 2*Cs)`, else `LinearDodge(Cb, 2*Cs - 1)`)
+///   collapses to that clamp because each branch can only reach the one bound
+///   it would have applied anyway — proved numerically by
+///   `aurora_render`'s own `linear_light_simplified_form_matches_the_branch_
+///   form_for_several_inputs`, which predates the port. So this round had **no
+///   branch-boundary test to write and no unkillable `<=`/`<` mutation to
+///   disclose**, unlike each of the two before it.
+///
+///   **It is the first `clamp()` in `shaders/composite.wgsl`**, and WGSL
+///   specifies float `clamp(e1, e2, e3)` as `min(max(e1, e2), e3)` — so
+///   despite containing neither token it carries two NaN-laundering
+///   intrinsics, and deleting `straight_backdrop`'s guard is **not** caught by
+///   this mode's transparent-backdrop test. Predicted from the rule 0.110.0
+///   wrote down, then measured; the detector count stays at five, and this is
+///   the first time that rule predicted a *non*-detection.
+///
+///   **The near-miss set has a genuinely dangerous member.** Dropping the
+///   `2.0 *` gives `clamp(Cb + Cs - 1, 0, 1)`, whose upper bound is
+///   unreachable for operands in `[0, 1]` — so it **is** `max(Cb + Cs - 1, 0)`,
+///   which is `LinearBurn`, a live GPU entry point and dispatch arm.
+///   `min(Cb + Cs, 1)` is likewise exactly `LinearDodge`, also live. Both slips
+///   therefore degrade silently to another shipped mode. `Overlay` and
+///   `HardLight`, despite being the adjacent arms, are *not* plausible
+///   confusions in either direction: they branch and this does not.
+///
+///   **Two degeneracies, both on the source side:**
+///   `LinearLight(Cb, 0.5) = Cb` for every `Cb` (a source channel at exactly
+///   `0.5` is a total no-op), and `LinearLight(Cb, 0) = 0` /
+///   `LinearLight(Cb, 1) = 1` (a black or white source channel erases the
+///   backdrop). A `0.5` **backdrop** channel is deliberately *not* degenerate
+///   here — `LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)` still depends on
+///   `Cs` — which is the opposite of `HardLight` and is why several fixtures
+///   use one.
+///
+///   **It is the fifth admitted mode whose blend term is asymmetric in
+///   `Cb`/`Cs`, and the third whose asymmetry is *unconditional***
+///   (`ColorBurn` and `ColorDodge` are the other two; `Overlay` and
+///   `HardLight` are asymmetric only in straddling channels):
+///   `B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` before the clamp. **What that does
+///   *not* mean is that a transpose is always observable, and this round
+///   worked out why algebraically before measuring it**: over an opaque
+///   backdrop at effective alpha `a`, a *railed* channel's two orders share a
+///   `B` and only `(1-a)*Cb` vs `(1-a)*Cs` survives — nothing at `a = 1` —
+///   while an *interior* channel has
+///   `out - out_transposed = (Cb - Cs)*(1 - 2a)`, which is **zero at
+///   `a = 0.5`**. The two laundering mechanisms are exactly complementary, so
+///   `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` deliberately carries all three clamp
+///   regimes: its two railed channels catch a transpose at its own `0.5` and
+///   its one interior channel catches one at `1.0`, both measured.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for this mode too (plain backticks: that const is
+///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
+///   its own arm and shares the *same single* `spare` ping-pong accumulator.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -7194,13 +7258,13 @@ fn composite_roots_into_tile(
 ///   paths_agree_on_a_dissolve_blend_document` pins that on real
 ///   hardware.
 ///
-/// **All twelve non-`Normal` modes above carry a GPU dispatch counter**, as
+/// **All thirteen non-`Normal` modes above carry a GPU dispatch counter**, as
 /// of 0.103.0, which retrofitted one onto each of the five admitted then
 /// (and `Difference` has carried one from its own first round in 0.104.0,
 /// `LinearDodge` from its own in 0.105.0, `LinearBurn` from its own in
 /// 0.106.0, `ColorBurn` from its own in 0.107.0, `ColorDodge` from its own
 /// in 0.108.0, `Overlay` from its own in 0.110.0, `HardLight` from its own
-/// in 0.111.0 — deliberately stated
+/// in 0.111.0, `LinearLight` from its own in 0.113.0 — deliberately stated
 /// without
 /// ordinals, because "counter acquired Nth" and the bullets' own "Nth
 /// mode ported to WGSL" are two different orderings that disagree by
@@ -7213,7 +7277,7 @@ fn composite_roots_into_tile(
 /// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 14 blend modes) routes the *whole document*
+/// layer at any of the other 13 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -7249,6 +7313,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                             | aurora_doc::BlendMode::ColorDodge
                             | aurora_doc::BlendMode::Overlay
                             | aurora_doc::BlendMode::HardLight
+                            | aurora_doc::BlendMode::LinearLight
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -7626,7 +7691,7 @@ fn accumulator_or_create<'slot>(
 /// lets one call site serve both builds without a `#[cfg]` at the call
 /// site itself.
 ///
-/// The variants are exactly the twelve modes
+/// The variants are exactly the thirteen modes
 /// [`document_qualifies_for_gpu_compositing`] admits *other than*
 /// `Normal`, which is deliberately absent: the `Normal` arm is shared by
 /// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
@@ -7635,7 +7700,7 @@ fn accumulator_or_create<'slot>(
 /// call site and why it is where it is.
 ///
 /// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
-/// consequence of 0.103.1 rather than an inconsistency.** The other eleven
+/// consequence of 0.103.1 rather than an inconsistency.** The other twelve
 /// are named by real dispatch arms that exist in both builds, so they are
 /// constructed in both. `Dissolve` has no arm; the only thing that ever
 /// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
@@ -7657,6 +7722,7 @@ enum GpuBlendDispatch {
     ColorDodge,
     Overlay,
     HardLight,
+    LinearLight,
     #[cfg(test)]
     Dissolve,
 }
@@ -7678,9 +7744,9 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 12]` length is part of
-    /// that signal: a thirteenth variant cannot be appended here without the
-    /// author also editing the count, and the test asserts the same `12`
+    /// new variant is added to. The fixed `[Self; 13]` length is part of
+    /// that signal: a fourteenth variant cannot be appended here without the
+    /// author also editing the count, and the test asserts the same `13`
     /// as a literal so the expectation is stated in both places.
     ///
     /// **As of 0.112.0 this length is no longer the only check on it, and
@@ -7708,8 +7774,9 @@ impl GpuBlendDispatch {
     /// `LinearBurn` in 0.106.0 from `[Self; 7]` to `[Self; 8]`,
     /// `ColorBurn` in 0.107.0 from `[Self; 8]` to `[Self; 9]`,
     /// `ColorDodge` in 0.108.0 from `[Self; 9]` to `[Self; 10]`, and
-    /// `Overlay` in 0.110.0 from `[Self; 10]` to `[Self; 11]`, and
-    /// `HardLight` in 0.111.0 from `[Self; 11]` to `[Self; 12]`, with the
+    /// `Overlay` in 0.110.0 from `[Self; 10]` to `[Self; 11]`,
+    /// `HardLight` in 0.111.0 from `[Self; 11]` to `[Self; 12]`, and
+    /// `LinearLight` in 0.113.0 from `[Self; 12]` to `[Self; 13]`, with the
     /// test's own literal the only other place to touch each time. **Both
     /// halves of that belong in one edit**: 0.107.1 had to correct a round
     /// that left this prose quoting one length while the literal below read
@@ -7722,7 +7789,7 @@ impl GpuBlendDispatch {
     ///
     /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
     /// why that one variant is test-only.
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Multiply,
         Self::Darken,
         Self::Lighten,
@@ -7734,6 +7801,7 @@ impl GpuBlendDispatch {
         Self::ColorDodge,
         Self::Overlay,
         Self::HardLight,
+        Self::LinearLight,
         Self::Dissolve,
     ];
 }
@@ -7843,6 +7911,27 @@ impl GpuBlendDispatch {
 ///   this time, the source side), and found this mode to be the fifth
 ///   detector of the shared `straight_backdrop()` guard's removal — predicted
 ///   from the formula, then measured.
+/// - `LinearLight` (0.113.0): the same again, at the same cost — one variant,
+///   one field, one `counter` arm, one `ALL` entry and one
+///   `TRANSPOSE_COVERAGE` row — and the **fifth** asymmetric mode, joining
+///   `ColorBurn` and `ColorDodge` as the *third* whose asymmetry is
+///   unconditional rather than straddle-dependent. What earns it a bullet is
+///   neither the counter's cost nor the asymmetry class but a finding that
+///   changes how a fixture for this kind of mode must be chosen: its blend
+///   term is unconditionally asymmetric and yet **the two ways a transpose
+///   gets laundered here are exactly complementary**, so non-unit opacity is
+///   not merely sufficient-but-unnecessary — at effective alpha exactly `0.5`
+///   it makes a clamp-*interior* channel go **blind**
+///   (`out - out_transposed = (Cb - Cs)*(1 - 2a)`, zero at `a = 0.5`), while a
+///   *railed* channel is blind at `a = 1` instead. Its fixture,
+///   `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK`, therefore carries all three clamp
+///   regimes rather than being chosen for its opacity alone: measured, the
+///   transpose shows in its two railed channels at `0.5` and in its one
+///   interior channel at `1.0`. Its round also found this mode is **not** a
+///   sixth detector of `straight_backdrop`'s guard removal — the first time
+///   0.110.0's rule predicted a *non*-detection — because WGSL defines float
+///   `clamp` as `min(max(..))` and so launders a `NaN` despite the shader
+///   containing neither token.
 ///
 /// **Why a struct of named fields and an exhaustive `match`, not a
 /// `[AtomicU64; N]` indexed by discriminant.** This workspace denies
@@ -7886,12 +7975,13 @@ struct GpuBlendDispatches {
     color_dodge: std::sync::atomic::AtomicU64,
     overlay: std::sync::atomic::AtomicU64,
     hard_light: std::sync::atomic::AtomicU64,
+    linear_light: std::sync::atomic::AtomicU64,
     dissolve: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
 impl GpuBlendDispatches {
-    /// All twelve counters at zero. `const` so the static below is a
+    /// All thirteen counters at zero. `const` so the static below is a
     /// compile-time initializer rather than a lazily-initialized cell,
     /// exactly as the three separate `AtomicU64::new(0)` statics it
     /// replaces were.
@@ -7908,6 +7998,7 @@ impl GpuBlendDispatches {
             color_dodge: std::sync::atomic::AtomicU64::new(0),
             overlay: std::sync::atomic::AtomicU64::new(0),
             hard_light: std::sync::atomic::AtomicU64::new(0),
+            linear_light: std::sync::atomic::AtomicU64::new(0),
             dissolve: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -7917,7 +8008,7 @@ impl GpuBlendDispatches {
     /// The `match` is exhaustive and total by construction — no `_` arm,
     /// no fallible lookup, so there is no "which counter?" failure to
     /// either defend against or drop on the floor. See
-    /// [`GpuBlendDispatches`] for why that mattered enough to spend twelve
+    /// [`GpuBlendDispatches`] for why that mattered enough to spend thirteen
     /// named fields on.
     ///
     /// That every variant maps to a *distinct* counter is not something
@@ -7937,6 +8028,7 @@ impl GpuBlendDispatches {
             GpuBlendDispatch::ColorDodge => &self.color_dodge,
             GpuBlendDispatch::Overlay => &self.overlay,
             GpuBlendDispatch::HardLight => &self.hard_light,
+            GpuBlendDispatch::LinearLight => &self.linear_light,
             GpuBlendDispatch::Dissolve => &self.dissolve,
         }
     }
@@ -9593,7 +9685,7 @@ fn begin_gpu_composite_tile(
             // carries `0.5` on its `ColorDodge` layer, because
             // `TRANSPOSE_COVERAGE`'s guard is deliberately not
             // special-cased for either asymmetric mode: non-unit opacity
-            // is now sufficient-but-not-necessary for four of the eleven
+            // is now sufficient-but-not-necessary for four of the twelve
             // (`Overlay`, 0.110.0, and `HardLight`, 0.111.0, joined them,
             // both conditionally),
             // and a conservative guard that still demands it costs
@@ -9661,7 +9753,7 @@ fn begin_gpu_composite_tile(
             // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
             // guard is deliberately not special-cased for any of the four
             // asymmetric modes: non-unit opacity is now
-            // sufficient-but-not-necessary for four of the eleven, and a
+            // sufficient-but-not-necessary for four of the twelve, and a
             // conservative guard that still demands it costs nothing.
             aurora_render::BlendMode::Overlay => {
                 let spare_accumulator = accumulator_or_create(
@@ -9751,11 +9843,83 @@ fn begin_gpu_composite_tile(
                 note_gpu_blend_dispatch(GpuBlendDispatch::HardLight);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // `BlendMode::LinearLight` (0.113.0), the twelfth mode ported to
+            // WGSL: `clamp(Cb + 2*Cs - 1, 0, 1)`, one unconditional
+            // expression. **No branch and no `select()`, unlike the two arms
+            // directly above** -- `aurora_render`'s own `blend_channel` arm is
+            // a single clamped sum, its branch form having been proved
+            // (numerically, by a test predating this port) to collapse to
+            // exactly that. So this arm's shader is shaped like
+            // `fs_composite_linear_burn`'s, not like its two neighbours'.
+            //
+            // **The copy-paste hazard for this arm is NOT the arm directly
+            // above it, and that is a genuine structural difference from the
+            // last two rounds.** `Overlay` and `HardLight` are adjacent and
+            // are each other's transpose; nothing about them resembles this
+            // mode's arithmetic. The real hazards are the **two `linear_*`
+            // arms further up this `match`**:
+            //
+            //   - dropping the `2.0 *` in the shader computes `LinearBurn`
+            //     *exactly* (the upper clamp bound is unreachable for operands
+            //     in `[0, 1]`, so the expression reduces to
+            //     `max(Cb + Cs - 1, 0)`), and that is a live arm above;
+            //   - `min(Cb + Cs, 1)` is `LinearDodge`, also a live arm above.
+            //
+            // Both slips therefore degrade silently to another *shipped* mode
+            // rather than to nonsense, which is the hazard class `HardLight`'s
+            // round introduced, reached here by arithmetic instead of by a
+            // wrong branch operand. Calling
+            // `composite_linear_burn_over_with_opacity` or
+            // `composite_linear_dodge_over_with_opacity` here by mistake is
+            // the same hazard one level up. Instrumented from its first
+            // round -- see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real ((h) of its matrix). **This mode's blend term is
+            // *unconditionally* asymmetric** -- `B(Cb, Cs) - B(Cs, Cb) =
+            // Cs - Cb` before the clamp, unlike the two conditionally
+            // asymmetric arms above -- **but that does not make a transpose
+            // observable at every opacity, and this round worked out why
+            // before measuring it.** Over an opaque backdrop at effective
+            // alpha `a`, a *railed* channel's two orders share a `B` so only
+            // `(1-a)*Cb` vs `(1-a)*Cs` survives (nothing at `a = 1`), while an
+            // *interior* channel has `out - out_transposed =
+            // (Cb - Cs)*(1 - 2a)`, which is **zero at `a = 0.5`**. The two
+            // laundering mechanisms are exactly complementary, so
+            // `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` carries all three clamp
+            // regimes: measured, the transpose shows in its two railed
+            // channels at `0.5` and in its one interior channel at `1.0`. That
+            // fixture still uses `0.5` on its `LinearLight` layer, because
+            // `TRANSPOSE_COVERAGE`'s guard is deliberately not special-cased
+            // for any asymmetric mode -- and here, unusually, that
+            // conservative rule is what a naive reading would have called the
+            // *worse* choice.
+            aurora_render::BlendMode::LinearLight => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_linear_light_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::LinearLight);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
             // `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
             // `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`,
-            // `HardLight`
+            // `HardLight`, `LinearLight`
             // and `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
@@ -28684,6 +28848,85 @@ mod tests {
         );
     }
 
+    /// The twelfth blend-math mode's predicate arm (0.113.0).
+    ///
+    /// **Why this exists when neither `Overlay`'s (0.110.0) nor `HardLight`'s
+    /// (0.111.0) round added one.** That per-mode series stopped after
+    /// `ColorDodge`, and 0.112.0's
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` genuinely supersedes it for the failure this kind of
+    /// test was originally *meant* to catch: that derived test calls the real
+    /// predicate once per [`aurora_doc::BlendMode`] variant and pins the whole
+    /// admitted set, so a mode missing from the `matches!` fails there whether
+    /// or not it has a test of its own. This one is added anyway, for a reason
+    /// the derived test cannot serve: it names *this* mode and *this* round in
+    /// its failure message, so a bisect landing on a reverted predicate arm
+    /// reads "`LinearLight`, 0.113.0" rather than a set-difference dump. It is
+    /// twenty lines and headless. If a later round decides the series is dead
+    /// weight, deleting it is a defensible call — but delete it deliberately
+    /// rather than by omission, and say so.
+    ///
+    /// Deliberately `LinearLight`, and deliberately none of its neighbours,
+    /// each of which must still stay disqualified:
+    ///
+    /// - `VividLight` and `PinLight`, the two remaining branch-on-the-source
+    ///   overlay-family modes. `PinLight` is the one to watch: like this mode
+    ///   its branch form delegates to a pair of *admitted* modes
+    ///   (`Darken`/`Lighten`, where this mode's form uses
+    ///   `LinearBurn`/`LinearDodge`), so "both halves reach admitted arms" is
+    ///   now true of it too and is **not** what admits a mode. What admits one
+    ///   is having a WGSL entry point; `PinLight` has none, and unlike this
+    ///   mode its branch form does *not* collapse to a single expression —
+    ///   `min`/`max` do not telescope the way the two clamps do;
+    /// - `SoftLight` and `HardMix`, the rest of that family, both still
+    ///   CPU-only;
+    /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, which are near-misses for
+    ///   other modes rather than this one;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as every
+    ///   round since 0.104.0 except `Screen`'s has — so both PLAN.md-tracked
+    ///   CPU-fallback benchmarks stay comparable across it and no fixture
+    ///   needed retargeting.
+    ///
+    /// Note `LinearBurn` and `LinearDodge` — the two modes this one's formula
+    /// *degenerates to* under a dropped `2.0 *` or a dropped clamp bound — are
+    /// **not** in that list: both have been admitted since 0.106.0 and 0.105.0.
+    /// The hazard they pose is adjacent dispatch arms and near-miss arithmetic
+    /// being confused with each other, not one leaking onto the GPU path. That
+    /// is exactly why this mode's fixtures are chosen for their clamp regimes.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_
+    /// blend_document` is what checks the resulting composite is actually
+    /// right, and the counter assertion inside it is what checks the GPU arm
+    /// ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_linear_light_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::LinearLight) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level LinearLight pixel layer must qualify for the GPU path as of 0.113.0"
+        );
+    }
+
     /// `Dissolve` needs no GPU-side support to be admitted (0.84.1):
     /// `resolve_tile` intercepts it on the CPU, applies `dissolve_gate`,
     /// and hands back an already-gated buffer at `(opacity = 1.0,
@@ -30178,6 +30421,80 @@ mod tests {
         ),
     ];
 
+    /// `..._agree_on_a_linear_light_blend_document`'s three-layer fixture
+    /// (0.113.0). Golden `(0.828125, 0.5, 0.09375, 1.0)`.
+    ///
+    /// **This fixture reuses [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s `l1` and `l2`
+    /// verbatim and picks a fresh `l3`**, which is a deliberate half-step away
+    /// from [`NORMAL_MULTIPLY_HARD_LIGHT_STACK`]'s full reuse. The `Overlay`
+    /// and `HardLight` fixtures share all three colours because those two modes
+    /// are exact transposed twins, so one shared operand pair makes their
+    /// goldens a read-out of the collision rule. `LinearLight` is not a twin of
+    /// either, so there is nothing to read out; what its `l3` has to do instead
+    /// is put the three channels into **three different clamp regimes**, and
+    /// the sibling's `l3` does not. Keeping `l1`/`l2` unchanged still means the
+    /// backdrop this mode blends against is the exact same
+    /// `Cb = (0.65625, 0.375, 0.1875)` the two sibling tests use, so any
+    /// disagreement between the three tests is attributable to `l3` alone.
+    ///
+    /// **The regimes, which are the whole point.** Against
+    /// `Cs = (0.75, 0.625, 0.125)`:
+    ///
+    ///   - red: `0.65625 + 1.5 - 1 = 1.15625` → clamped down to `1.0`, the
+    ///     **upper rail**;
+    ///   - green: `0.375 + 1.25 - 1 = 0.625`, **interior**;
+    ///   - blue: `0.1875 + 0.25 - 1 = -0.5625` → clamped up to `0.0`, the
+    ///     **lower rail**.
+    ///
+    /// So one fixture exercises both clamp bounds and the unclamped path at
+    /// once, and each is reached by a real margin (`0.15625` over the top,
+    /// `0.5625` under the bottom) rather than marginally.
+    ///
+    /// **Why all three regimes, and not just non-unit opacity.** This mode's
+    /// blend term is *unconditionally* asymmetric, yet the two ways a transpose
+    /// gets laundered are exactly complementary (see
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// and the test below): a **railed** channel is blind at effective alpha
+    /// `1.0` and an **interior** channel is blind at exactly `0.5`. A fixture
+    /// with only interior channels would therefore be blind to a transposed
+    /// dispatch arm *at the very opacity the standing guard demands*. Carrying
+    /// both kinds is what makes this fixture see one at both opacities —
+    /// measured in 0.113.0, in its two railed channels at `0.5` and in its one
+    /// interior channel at `1.0`.
+    ///
+    /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
+    /// source-side total no-op), `0.0` or `1.0` (a black or white source
+    /// erases the backdrop), and no channel has `Cb == Cs`. `l1`'s green
+    /// literal is `0.5` and is harmless twice over: the `Multiply` fold carries
+    /// it to `0.375`, and a `0.5` *backdrop* is not degenerate for this mode
+    /// anyway (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)`), unlike for
+    /// `HardLight`.
+    ///
+    /// **The `LinearLight` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode either.
+    /// See the test's own doc comment for the per-channel derivation.
+    const NORMAL_MULTIPLY_LINEAR_LIGHT_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::LinearLight,
+            0.5,
+            [0.75, 0.625, 0.125, 1.0],
+        ),
+    ];
+
     /// **Which fixture makes which GPU blend-math dispatch arm's argument
     /// order observable** (0.105.3) — `(mode, the test that composites
     /// this fixture, the fixture itself)`, and the input to
@@ -30253,6 +30570,11 @@ mod tests {
             "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_light_blend_document",
             &NORMAL_MULTIPLY_HARD_LIGHT_STACK,
         ),
+        (
+            aurora_doc::BlendMode::LinearLight,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_blend_document",
+            &NORMAL_MULTIPLY_LINEAR_LIGHT_STACK,
+        ),
     ];
 
     /// The `aurora_doc` blend mode each [`GpuBlendDispatch`] counter is
@@ -30272,6 +30594,7 @@ mod tests {
             GpuBlendDispatch::ColorDodge => aurora_doc::BlendMode::ColorDodge,
             GpuBlendDispatch::Overlay => aurora_doc::BlendMode::Overlay,
             GpuBlendDispatch::HardLight => aurora_doc::BlendMode::HardLight,
+            GpuBlendDispatch::LinearLight => aurora_doc::BlendMode::LinearLight,
             GpuBlendDispatch::Dissolve => aurora_doc::BlendMode::Dissolve,
         }
     }
@@ -30312,8 +30635,8 @@ mod tests {
     /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
     /// dispatch arm's `src`/`backdrop` arguments survived the entire test
     /// suite, and both times the only thing that found it was a human
-    /// performing the mutation and re-running everything. Fourteen modes
-    /// are still to be ported on the same template — fifteen
+    /// performing the mutation and re-running everything. Thirteen modes
+    /// are still to be ported on the same template — fourteen
     /// `aurora_render::BlendMode` variants lack a blend-math WGSL entry
     /// point, but `Normal` is among them and needs none, compositing through
     /// a separate fixed-function path — so the class needs a
@@ -30322,18 +30645,21 @@ mod tests {
     /// since, and this guard is what made its fixture's non-unit opacity a
     /// precondition of the round instead of a third round of hand
     /// discovery. `ColorBurn`, 0.107.0, is the second, `ColorDodge`,
-    /// 0.108.0, the third, `Overlay`, 0.110.0, the fourth, and `HardLight`,
-    /// 0.111.0, the fifth — the latter
-    /// four being the modes for which the guard's stated premise does not
-    /// hold, the last two of them only *conditionally*; see below.)
+    /// 0.108.0, the third, `Overlay`, 0.110.0, the fourth, `HardLight`,
+    /// 0.111.0, the fifth, and `LinearLight`, 0.113.0, the sixth — the latter
+    /// five being the modes for which the guard's stated premise does not
+    /// hold, two of them only *conditionally* and the last one in a way that
+    /// makes this guard's demand actively *insufficient*; see below.)
     ///
     /// The property, in one line: the first seven blend-math formulas the
     /// GPU path implemented (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
     /// `|Cb - Cs|`, `min(Cb+Cs, 1)`, `max(Cb+Cs-1, 0)`) are all
     /// **commutative** — the eighth and ninth, the guarded-division pair,
-    /// are not, and the tenth and eleventh, `Overlay` and `HardLight`, are
+    /// are not, the tenth and eleventh, `Overlay` and `HardLight`, are
     /// commutative only in *some*
-    /// channels; see the paragraph below — so the only thing
+    /// channels, and the twelfth, `LinearLight`, is non-commutative
+    /// everywhere its clamp does not saturate;
+    /// see the paragraphs below — so the only thing
     /// that can ever notice a swapped pair of operands is the asymmetric
     /// fold around it, `out = (1 - a) * bd + a * blended`, and it notices
     /// nothing at `a = 1`. A fixture whose layer at the mode under test is
@@ -30341,8 +30667,8 @@ mod tests {
     /// matter how many assertions it carries.
     ///
     /// **`ColorBurn` (0.107.0) was the first exception, `ColorDodge`
-    /// (0.108.0) the second, `Overlay` (0.110.0) the third and `HardLight`
-    /// (0.111.0) the fourth, and this
+    /// (0.108.0) the second, `Overlay` (0.110.0) the third, `HardLight`
+    /// (0.111.0) the fourth and `LinearLight` (0.113.0) the fifth, and this
     /// guard is deliberately not special-cased for any of them.**
     /// `1 - min(1, (1 - Cb) / Cs)` and
     /// `min(1, Cb / (1 - Cs))` are each *not* symmetric in their two
@@ -30371,12 +30697,47 @@ mod tests {
     /// hand-maintained thing to keep in step with the enum, and the cost
     /// of the conservative rule is four fixtures carrying a `0.5` they do
     /// not strictly need. (`NORMAL_MULTIPLY_COLOR_DODGE_STACK` needs its
-    /// `0.5` for an unrelated second reason anyway — see that const.) At
-    /// least six more asymmetric modes are still to
+    /// `0.5` for an unrelated second reason anyway — see that const.)
+    ///
+    /// **`LinearLight` (0.113.0) is the fifth exception and a *different kind*
+    /// again — the first one for which this guard's demand is not merely
+    /// unnecessary but, on its own, **insufficient**. Read this before
+    /// extending the roster with another clamped mode.** Its blend term is
+    /// non-commutative *everywhere* (`B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` before
+    /// the clamp, so it is in `ColorBurn`'s and `ColorDodge`'s unconditional
+    /// class, not `Overlay`'s conditional one). But **two mechanisms launder a
+    /// transpose here and they are exactly complementary**, worked out
+    /// algebraically in that round and then measured:
+    ///
+    /// - a **railed** channel — one where both operand orders drive
+    ///   `Cb + 2*Cs - 1` past the *same* clamp bound — has an identical `B`
+    ///   either way, so only the fold's `(1-a)*Cb` vs `(1-a)*Cs` remains, and
+    ///   that vanishes at `a = 1`;
+    /// - a clamp-**interior** channel has
+    ///   `out - out_transposed = (Cb - Cs) * (1 - 2a)`, which is **zero at
+    ///   `a = 0.5`** — there `out = Cb + Cs - 0.5`, symmetric in its two
+    ///   operands outright.
+    ///
+    /// So for this mode the `0.5` this guard demands is precisely the value at
+    /// which an interior channel goes blind, and `a = 1.0` is precisely where a
+    /// railed one does. A fixture of only interior channels would satisfy this
+    /// guard and still be blind to a transposed dispatch arm.
+    /// `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` therefore carries **all three clamp
+    /// regimes** — upper rail, interior, lower rail — so the transpose is
+    /// observable at both opacities (measured: two channels at `0.5`, one at
+    /// `1.0`). That property is not something this guard can check, and it is
+    /// not claimed to; it is recorded on the fixture and in PLAN.md's 0.113.0
+    /// mutation matrix. **The lesson for the next clamped mode is that
+    /// "asymmetric blend term" does not imply "transpose observable", in either
+    /// direction.**
+    ///
+    /// At
+    /// least five more asymmetric modes are still to
     /// be ported (`Subtract`, `Divide`,
-    /// `SoftLight`, `VividLight`, `PinLight` and
-    /// `LinearLight` among the separable ones — `Overlay` was on that list
-    /// until 0.110.0 ported it, and `HardLight` until 0.111.0 did);
+    /// `SoftLight`, `VividLight` and `PinLight`
+    /// among the separable ones — `Overlay` was on that list
+    /// until 0.110.0 ported it, `HardLight` until 0.111.0 did, and
+    /// `LinearLight` until 0.113.0 did);
     /// if a later round wants the exemption, it should be a deliberate,
     /// per-mode change to this test with its own measured justification,
     /// not a quiet loosening.
@@ -30499,10 +30860,13 @@ mod tests {
                      between 0 and 1 that is also unoccluded from above, so a dispatch arm that \
                      transposed src and backdrop for {mode:?} would be invisible to it: every \
                      formula on the GPU path except the guarded-division pair (ColorBurn, \
-                     ColorDodge) is commutative -- Overlay and HardLight everywhere their two \
+                     ColorDodge) and LinearLight is commutative -- Overlay and HardLight \
+                     everywhere their two \
                      operands share a side of 0.5, which is most of a typical channel pair, and \
                      the two are each other's transpose so they also agree with each other \
-                     there -- and the fold \
+                     there; LinearLight is non-commutative wherever its clamp does not saturate, \
+                     but see this test's doc comment, because for that mode this very 0.5 is what \
+                     blinds a clamp-interior channel -- and the fold \
                      (1 - a) * bd + a * blended around it collapses to `blended` at a = 1 -- and \
                      a fully opaque Normal layer stacked above the mode-bearing one collapses it \
                      the same way, by replacing the accumulator outright. Restore the non-unit \
@@ -30783,8 +31147,8 @@ mod tests {
         // sources on both sides still has to acknowledge the change here.
         assert_eq!(
             modes.len(),
-            12,
-            "GpuBlendDispatch::ALL no longer has the twelve variants this test was written \
+            13,
+            "GpuBlendDispatch::ALL no longer has the thirteen variants this test was written \
              against \
              -- if a mode was added, that is expected: bump this literal. If a mode was added to \
              the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
@@ -33035,6 +33399,230 @@ mod tests {
              fs_composite_overlay computes -- or the differential above would pass with the wrong \
              arm running. This is a three-channel claim only because every channel of the fixture \
              straddles 0.5; where the two operands share a side, the two modes agree exactly."
+        );
+    }
+
+    /// **`LinearLight` end to end through the real caller** (0.113.0), the
+    /// twelfth mode ported: a three-layer `Normal`/`Multiply`/`LinearLight`
+    /// root stack ([`NORMAL_MULTIPLY_LINEAR_LIGHT_STACK`]) composited on real
+    /// hardware, with the `LinearLight` layer sampling a backdrop a `Multiply`
+    /// pass wrote into the accumulator and reusing the spare accumulator that
+    /// pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0` — the same backdrop the
+    /// `Overlay` and `HardLight` siblings blend against, so the three tests
+    /// differ in `l3` alone. Against `Cs = (0.75, 0.625, 0.125)`,
+    /// `LinearLight` is one unconditional `clamp(Cb + 2*Cs - 1, 0, 1)` with no
+    /// branch to take:
+    ///
+    /// - red: `0.65625 + 1.5 - 1 = 1.15625` → clamped down to `1.0`, the
+    ///   **upper rail**;
+    /// - green: `0.375 + 1.25 - 1 = 0.625`, **interior**;
+    /// - blue: `0.1875 + 0.25 - 1 = -0.5625` → clamped up to `0.0`, the
+    ///   **lower rail**.
+    ///
+    /// The `LinearLight` layer's own opacity `0.5` folds that in as
+    /// `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.828125, 0.5, 0.09375, 1.0)`. **All three clamp regimes fire in this
+    /// one draw**, which is what this fixture exists for and what neither
+    /// sibling's does. All three golden channels are distinct.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::LinearLight`] count, which is what
+    ///   distinguishes "the `LinearLight` arm ran on the GPU" from "it silently
+    ///   fell back to the CPU, which computes the same correct pixels" —
+    ///   historically the one mutation in a round like this that nothing else
+    ///   catches, and 0.113.0's mutation (a) confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `LinearLight` replaced by **`LinearBurn`** must composite to something
+    ///   *different*. That choice is not stylistic and not the sibling rounds'
+    ///   "transposed twin" logic either — there is no twin here. `LinearBurn`
+    ///   is what **dropping the `2.0 *`** computes, exactly: the clamp's upper
+    ///   bound is unreachable for operands in `[0, 1]`, so
+    ///   `clamp(Cb + Cs - 1, 0, 1)` *is* `max(Cb + Cs - 1, 0)`. It is also a
+    ///   live GPU dispatch arm, so the substituted run composites on the GPU
+    ///   path too. It gives `(0.53125, 0.1875, 0.09375)` against the golden's
+    ///   `(0.828125, 0.5, 0.09375)` — differing in red and green and
+    ///   **coinciding in blue**, which is not a fixture weakness but the
+    ///   provable rail identity: `Cb + 2*Cs < 1` implies `Cb + Cs < 1`, so a
+    ///   lower-railed channel is `0.0` for both modes and no fixture can
+    ///   separate them there. (The substituted run ticks
+    ///   `GpuBlendDispatch::LinearBurn`; nothing here reads that counter, and
+    ///   `real_gpu_context` zeroes every counter under its lock, so no sibling
+    ///   test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`):
+    /// `LinearBurn` `(0.53125, 0.1875, 0.09375)` and `LinearDodge`
+    /// `(0.828125, 0.6875, 0.25)` — **the two near-misses, and they are caught
+    /// by disjoint channel sets**: `LinearBurn` in red and green, `LinearDodge`
+    /// in green and blue, each coinciding in the channel whose rail it shares.
+    /// Green, the interior channel, is the only one that catches both, which is
+    /// the concrete reason this fixture needs an interior channel at all. Then
+    /// `Normal` `(0.703125, 0.5, 0.15625)` and `Lighten`
+    /// `(0.703125, 0.5, 0.1875)`, both coinciding in green;
+    /// `Multiply` `(0.57421875, 0.3046875, 0.10546875)`, `Screen`
+    /// `(0.78515625, 0.5703125, 0.23828125)`, `Darken`
+    /// `(0.65625, 0.375, 0.15625)`, `Difference` `(0.375, 0.3125, 0.125)`,
+    /// `Exclusion` `(0.5390625, 0.453125, 0.2265625)`, `Overlay`
+    /// `(0.7421875, 0.421875, 0.1171875)`, `HardLight`
+    /// `(0.7421875, 0.453125, 0.1171875)` — all three channels each — and
+    /// `ColorBurn` roughly `(0.5989.., 0.1875, 0.09375)` / `ColorDodge`
+    /// `(0.828125, 0.6875, 0.2008..)`, coinciding where their linear namesakes
+    /// do.
+    ///
+    /// **A transposed `src`/`backdrop` binding is caught here at *both*
+    /// opacities, but by *different channels* — and that is this round's real
+    /// finding, measured after being derived rather than assumed.** This mode's
+    /// blend term is unconditionally asymmetric
+    /// (`B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` pre-clamp), which makes it tempting
+    /// to say a transpose is always visible. It is not:
+    ///
+    /// - at opacity `0.5`, `out - out_transposed = (Cb - Cs) * (1 - 2a)` is
+    ///   **zero for a clamp-interior channel**, so green sees nothing; the two
+    ///   *railed* channels carry it. 0.113.0's mutation (h) measured
+    ///   `(0.875, 0.5, 0.0625, 1.0)` against the correct
+    ///   `(0.828125, 0.5, 0.09375, 1.0)` — red and blue caught, green
+    ///   identical;
+    /// - at opacity `1.0` the fold contributes nothing, so a *railed* channel's
+    ///   two orders agree outright and only the interior channel carries it.
+    ///   The same mutation measured `(1.0, 0.375, 0.0, 1.0)` against the
+    ///   correct `(1.0, 0.625, 0.0, 1.0)` — green alone.
+    ///
+    /// The two mechanisms are exactly complementary, which is why this fixture
+    /// carries all three regimes instead of only a non-unit opacity. Note that
+    /// **a fixture of purely interior channels would satisfy the standing
+    /// transpose guard and still be blind at `0.5`** — see
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`],
+    /// where this is now recorded as the first case in which that guard's
+    /// demand is insufficient on its own.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_linear_light`, and the construct at stake
+    /// is new to this round: it is the **first `clamp()` in
+    /// `shaders/composite.wgsl`**, and both this mode's arithmetic and its
+    /// (non-)detection of `straight_backdrop`'s guard rest on WGSL's specified
+    /// `clamp(e1, e2, e3) == min(max(e1, e2), e3)`. See PLAN.md's 0.113.0
+    /// entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_LINEAR_LIGHT_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/LinearLight root stack must qualify for the GPU path as of \
+             0.113.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearLight);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `LinearLight` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport
+        // marks four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.113.0
+        // mutation-testing record, where deleting the dispatch arm left every
+        // other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearLight),
+            1,
+            "the LinearLight layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/LinearLight document (the LinearLight layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.828_125` is `0.828125` -- `clippy::unreadable_literal`, the
+            // same convention the Overlay, HardLight and ColorBurn goldens
+            // above already carry a note for. The doc comment and the message
+            // both spell it without separators.
+            (0.828_125, 0.5, 0.09375, 1.0),
+            "0.5*Cb + 0.5*clamp(Cb + 2*Cs - 1, 0, 1) must come out of the GPU path itself, with \
+             no branch anywhere: Cb = (0.65625, 0.375, 0.1875) and Cs = (0.75, 0.625, 0.125) put \
+             red on the upper clamp rail (sum 1.15625 -> 1.0), green strictly inside it (0.625) \
+             and blue on the lower rail (sum -0.5625 -> 0.0), so B is (1.0, 0.625, 0.0) and all \
+             three clamp regimes fire in one draw. (0.53125, 0.1875, 0.09375, 1.0) would mean \
+             LinearBurn ran -- exactly what dropping the 2.0* computes, since the upper bound is \
+             unreachable for operands in [0, 1], and itself a live GPU arm -- and \
+             (0.828125, 0.6875, 0.25, 1.0) LinearDodge. Those two are caught by disjoint channels \
+             (red+green and green+blue), each coinciding on the rail it shares, so only green \
+             catches both. (0.703125, 0.5, 0.15625, 1.0) is the Normal arm, \
+             (0.57421875, 0.3046875, 0.10546875, 1.0) Multiply, \
+             (0.78515625, 0.5703125, 0.23828125, 1.0) Screen, \
+             (0.65625, 0.375, 0.15625, 1.0) Darken, (0.703125, 0.5, 0.1875, 1.0) Lighten, \
+             (0.375, 0.3125, 0.125, 1.0) Difference, (0.7421875, 0.421875, 0.1171875, 1.0) \
+             Overlay, (0.7421875, 0.453125, 0.1171875, 1.0) HardLight, roughly \
+             (0.5989, 0.1875, 0.09375, 1.0) ColorBurn and (0.828125, 0.6875, 0.2008, 1.0) \
+             ColorDodge. Exclusion gives (0.5390625, 0.453125, 0.2265625, 1.0). A dispatch arm \
+             that transposed src and backdrop measured (0.875, 0.5, 0.0625, 1.0) on real hardware \
+             in 0.113.0 -- caught in the two railed channels and blind in interior green, because \
+             out - out_transposed is (Cb - Cs)*(1 - 2a), which is zero at a = 0.5."
+        );
+
+        // The vacuity guard: the same stack with its `LinearLight` layer turned
+        // into a `LinearBurn` one. `LinearBurn` rather than the siblings'
+        // transposed twin, because this mode has no twin -- what it has is a
+        // near-miss reachable by deleting three characters, and `LinearBurn` is
+        // *exactly* what `clamp(Cb + Cs - 1, 0, 1)` computes. It is admitted at
+        // the predicate too, so the substituted stack also composites on the
+        // GPU path. Either way the guard only needs the texel to differ: if it
+        // did not, every assertion above would hold just as well with the wrong
+        // arm dispatched. Blue coincides between the two modes by the rail
+        // identity, so this is a two-channel claim and deliberately not
+        // described as a three-channel one.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::LinearLight {
+                entry.1 = aurora_doc::BlendMode::LinearBurn;
+            }
+        }
+        let with_linear_burn = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_linear_burn,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_linear_light_were_linear_burn = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_linear_light_were_linear_burn,
+            "setup: this fixture must distinguish its LinearLight layer from a LinearBurn one -- \
+             the same expression with its doubling dropped, and therefore exactly what a \
+             `2.0 * s.rgb -> s.rgb` slip in the shader or a fragment_entry naming \
+             fs_composite_linear_burn computes -- or the differential above would pass with the \
+             wrong arm running. Red and green carry this claim; blue cannot, since a lower-railed \
+             channel is provably 0.0 for both modes."
         );
     }
 
@@ -42281,7 +42869,7 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
-        // **All thirteen modes `document_qualifies_for_gpu_compositing`
+        // **All fourteen modes `document_qualifies_for_gpu_compositing`
         // admits, and this list has to keep pace with it** -- the test's
         // own name says "every expressible mode", so a mode ported to the
         // GPU path but not added here turns that name into a false claim
@@ -42302,9 +42890,10 @@ mod tests {
         // mode here in the same commit that admits it at the predicate.
         //
         // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge`
-        // (0.108.0), `Overlay` (0.110.0) and `HardLight` (0.111.0) were each
+        // (0.108.0), `Overlay` (0.110.0), `HardLight` (0.111.0) and
+        // `LinearLight` (0.113.0) were each
         // added in exactly that same commit, which is the convention
-        // working rather than five more data points
+        // working rather than six more data points
         // for the drift. Nothing in this crate makes the omission a
         // compile error -- `every_gpu_blend_math_dispatch_arm_has_a_
         // fixture_that_could_see_a_transposed_argument` anchors on the
@@ -42324,6 +42913,7 @@ mod tests {
             aurora_doc::BlendMode::ColorDodge,
             aurora_doc::BlendMode::Overlay,
             aurora_doc::BlendMode::HardLight,
+            aurora_doc::BlendMode::LinearLight,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(

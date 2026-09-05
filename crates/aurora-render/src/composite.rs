@@ -199,6 +199,26 @@ const LABEL_HARD_LIGHT_BIND_GROUP: &str = "composite.hard_light.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_HARD_LIGHT_PASS: &str = "composite.hard_light.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_linear_light_over_with_opacity`] (0.113.0)
+/// — the same four-label set the twelve modes above each carry, for the
+/// same reason: twelve blend-math pipelines sharing one `"composite"` label
+/// would leave a `wgpu` validation message or a frame capture unable to
+/// say which blend mode is at fault. **This is the first label in this file
+/// with *two* near-names already present**: `"composite.linear_dodge"` and
+/// `"composite.linear_burn"` both share its `linear_` prefix, and the burn
+/// one is the mode a dropped `2.0 *` in this mode's shader computes
+/// exactly. Spelled in full (`linear_light`, never `light` or `lin_light`)
+/// for the reason the burn and dodge pairs are: a truncated label would
+/// point at more than one pipeline.
+const LABEL_LINEAR_LIGHT: &str = "composite.linear_light";
+/// That method's own per-call uniform buffer.
+const LABEL_LINEAR_LIGHT_UNIFORM: &str = "composite.linear_light.opacity";
+/// That method's own per-call bind group.
+const LABEL_LINEAR_LIGHT_BIND_GROUP: &str = "composite.linear_light.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_LINEAR_LIGHT_PASS: &str = "composite.linear_light.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -209,7 +229,7 @@ const LABEL_HARD_LIGHT_PASS: &str = "composite.hard_light.pass";
 /// [`TileCompositor`]'s blend-math `composite_*_over_with_opacity`
 /// methods — `composite_multiply_over_with_opacity` and its
 /// `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-/// `color_burn`/`color_dodge`/`overlay`/`hard_light`
+/// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`
 /// siblings,
 /// deliberately named as a family rather than relisted here, since the
 /// list grows by one every time a mode is ported — five
@@ -238,7 +258,14 @@ const LABEL_HARD_LIGHT_PASS: &str = "composite.hard_light.pass";
 /// not the plumbing but that its transposed twin was already *live* here, so
 /// a mistyped `fragment_entry` could for the first time silently name the one
 /// wrong formula that a transposed binding and a wrong branch operand also
-/// produce.)
+/// produce. `LinearLight`, the twelfth, in 0.113.0, went back to the
+/// *simplest* shape — one componentwise `clamp()`, no branch and no
+/// `select()`, since its CPU arm is a single unconditional expression rather
+/// than a two-call delegation — and cost the Rust side the same one const, one
+/// wrapper and four labels as every mode before it. So the shape of a mode's
+/// shader and the cost of its Rust plumbing are now measured to be
+/// independent across three distinct shapes, which is the strongest form of
+/// the claim this extraction was making.)
 ///
 /// There is deliberately **no encoder label here any more** (0.86.0).
 /// These methods no longer create a `wgpu::CommandEncoder` at all — the
@@ -411,6 +438,26 @@ const BLEND_PASS_HARD_LIGHT: BlendPass = BlendPass {
     pass: LABEL_HARD_LIGHT_PASS,
 };
 
+/// [`BlendMode::LinearLight`]'s, likewise (0.113.0). Every field differs from
+/// every const above. The `fragment_entry` mis-typing hazard here is **not**
+/// the two consts directly above it, whose names look nothing like this one:
+/// it is `"fs_composite_linear_burn"` and `"fs_composite_linear_dodge"`, both
+/// live and both further up the file, because those two share this mode's
+/// `linear_` prefix *and* are what this mode's own formula degenerates to when
+/// its doubling or one of its clamp bounds is lost. Naming
+/// `"fs_composite_linear_burn"` here is mutation (i) of this round's set and is
+/// killed by every `composite_linear_light_*` test whose fixture has at least
+/// one clamp-interior channel — a fixture that only ever railed could not tell
+/// the two apart, which is why the suite header enumerates the regimes each
+/// fixture reaches.
+const BLEND_PASS_LINEAR_LIGHT: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_linear_light",
+    pipeline: LABEL_LINEAR_LIGHT,
+    uniform: LABEL_LINEAR_LIGHT_UNIFORM,
+    bind_group: LABEL_LINEAR_LIGHT_BIND_GROUP,
+    pass: LABEL_LINEAR_LIGHT_PASS,
+};
+
 /// Every [`BlendPass`] const above, once — this crate's own registry of
 /// the blend-math entry points it can dispatch (0.112.0).
 ///
@@ -432,7 +479,7 @@ const BLEND_PASS_HARD_LIGHT: BlendPass = BlendPass {
 /// Only these consts are listed. `fs_composite` and
 /// `fs_composite_opacity` are fixed-function paths with no blend math and
 /// no `BlendPass`, and the test names them separately.
-const ALL_BLEND_PASSES: [&BlendPass; 11] = [
+const ALL_BLEND_PASSES: [&BlendPass; 12] = [
     &BLEND_PASS_MULTIPLY,
     &BLEND_PASS_DARKEN,
     &BLEND_PASS_LIGHTEN,
@@ -444,6 +491,7 @@ const ALL_BLEND_PASSES: [&BlendPass; 11] = [
     &BLEND_PASS_COLOR_DODGE,
     &BLEND_PASS_OVERLAY,
     &BLEND_PASS_HARD_LIGHT,
+    &BLEND_PASS_LINEAR_LIGHT,
 ];
 
 /// How many blend-math `@fragment` entry points this crate dispatches —
@@ -2981,7 +3029,7 @@ impl TileCompositor {
     /// `aurora-app`'s standing `every_gpu_blend_math_dispatch_arm_has_a_
     /// fixture_that_could_see_a_transposed_argument` guard is deliberately
     /// *not* special-cased for either mode: non-unit opacity is now
-    /// sufficient-but-not-necessary for four of the eleven (`Overlay`, 0.110.0,
+    /// sufficient-but-not-necessary for four of the twelve (`Overlay`, 0.110.0,
     /// and `HardLight`, 0.111.0, joined them, both conditionally), and a conservative
     /// guard that still demands it costs nothing and keeps the rule
     /// uniform.
@@ -3303,6 +3351,136 @@ impl TileCompositor {
         );
     }
 
+    /// [`BlendMode::LinearLight`]'s in-shader composite (0.113.0) —
+    /// `fs_composite_linear_light`, the **twelfth** mode ported and the tenth
+    /// consecutive caller of `composite_blend_over_with_opacity` to
+    /// need no change to that shared body at all. (Plain backticks, not a
+    /// link: that method is private, and a public item linking to it is a
+    /// `rustdoc::private_intra_doc_links` error under CI's `-D warnings` —
+    /// the same reason `BLEND_MATH_PASS_COUNT`'s own doc gives.)
+    ///
+    /// **Structurally the simplest port since `LinearBurn`, and that is worth
+    /// stating because the two modes immediately before it were not.**
+    /// `Overlay` (0.110.0) and `HardLight` (0.111.0) are two-call delegations
+    /// in `blend_channel` (private, hence plain backticks) and became a
+    /// componentwise `select()` in WGSL.
+    /// This mode's arm delegates to nothing and branches on nothing:
+    ///
+    /// ```text
+    /// BlendMode::LinearLight => (cb + 2.0 * cs - 1.0).clamp(0.0, 1.0),
+    /// ```
+    ///
+    /// one unconditional expression. Its *branch* form
+    /// (`Cs <= 0.5 -> LinearBurn(Cb, 2*Cs)`, else `LinearDodge(Cb, 2*Cs - 1)`)
+    /// collapses to that clamp because each branch can only ever reach the one
+    /// bound it would have applied anyway — proved numerically, not just
+    /// argued, by `linear_light_simplified_form_matches_the_branch_form_for_
+    /// several_inputs`, which predates this port. **So there is no `select()`
+    /// here, no branch-boundary test, and no unkillable `<=`/`<` mutation** —
+    /// the disclosure every one of the two rounds before this one had to make.
+    ///
+    /// **The first `clamp()` in `shaders/composite.wgsl`.** WGSL specifies
+    /// float `clamp(e1, e2, e3)` as `min(max(e1, e2), e3)`, so this mode has
+    /// two NaN-laundering intrinsics despite containing neither token —
+    /// which is why deleting `straight_backdrop`'s guard is **not** caught by
+    /// this mode's own transparent-backdrop test. Predicted from the rule
+    /// 0.110.0 wrote down, then measured in this round; see that function's
+    /// comment in the shader, and note this is the opposite of `Overlay`'s and
+    /// `HardLight`'s result.
+    ///
+    /// **The near-miss set, and the one dangerous member of it.** Dropping the
+    /// `2.0 *` gives `clamp(Cb + Cs - 1, 0, 1)`, which **is** `LinearBurn`:
+    /// the upper bound is unreachable for operands in `[0, 1]`, so it reduces
+    /// to `max(Cb + Cs - 1, 0)` exactly, and that is
+    /// [`Self::composite_linear_burn_over_with_opacity`]'s live entry point.
+    /// `min(Cb + Cs, 1)` is likewise exactly
+    /// [`Self::composite_linear_dodge_over_with_opacity`]'s. Both are shipped
+    /// GPU arms, so a slip here degrades silently to a real mode rather than
+    /// to nonsense — the same hazard class `HardLight` introduced, reached by
+    /// arithmetic rather than by a wrong branch operand.
+    ///
+    /// **Two degeneracies that constrain every fixture, both verified
+    /// algebraically:**
+    ///
+    /// 1. `LinearLight(Cb, 0.5) = Cb` for every `Cb` — a **source** channel at
+    ///    exactly `0.5` makes this mode a total no-op. No solid-colour fixture
+    ///    in this crate's `composite_linear_light_*` tests has one.
+    /// 2. `LinearLight(Cb, 0) = 0` and `LinearLight(Cb, 1) = 1` — a black or
+    ///    white **source** channel erases the backdrop, both by clamping.
+    ///
+    /// A `0.5` **backdrop** channel is deliberately *not* degenerate
+    /// (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)` still depends on
+    /// `Cs`), which is the opposite of `HardLight`, where it is `Normal`. Two
+    /// fixtures here use one on purpose.
+    ///
+    /// **Asymmetry: UNCONDITIONAL — the fifth asymmetric mode on the GPU path
+    /// and the third of that kind**, after `ColorBurn` (0.107.0) and
+    /// `ColorDodge` (0.108.0); `Overlay` and `HardLight` are asymmetric only
+    /// where their operands straddle `0.5`. The algebra is one line:
+    /// `B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` *before* the clamp, so the two orders
+    /// differ in every channel whose operands differ at all, at any opacity.
+    ///
+    /// **But "unconditionally asymmetric blend term" does *not* mean
+    /// "a transpose is always observable", and this round worked out why
+    /// algebraically before measuring it.** Over an opaque backdrop at
+    /// effective alpha `a` the fold is `out = (1-a)*Cb + a*B`, and two things
+    /// launder a transpose — *complementarily*:
+    ///
+    /// - a **railed** channel (both orders past the same bound) has equal
+    ///   `B`s, leaving only the fold's `(1-a)*Cb` vs `(1-a)*Cs`, which
+    ///   vanishes at `a = 1`;
+    /// - a clamp-**interior** channel has
+    ///   `out - out_transposed = (Cb - Cs) * (1 - 2a)`, which is **zero at
+    ///   `a = 0.5`** — there `out = Cb + Cs - 0.5`, symmetric in its operands.
+    ///
+    /// So the *railed* channels catch a transpose at `a = 0.5` and the
+    /// *interior* ones catch it at `a = 1`. That is the opposite of the
+    /// intuition every prior round's fixture was built on, and it is why this
+    /// mode's fixtures are chosen for their clamp *regimes* rather than only
+    /// their opacity. Measured on `aurora-app`'s own fixture, which carries
+    /// all three regimes: the transpose shows in its two railed channels at
+    /// opacity `0.5` and in its one interior channel at `1.0`.
+    /// `aurora-app`'s standing
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument` guard is deliberately not special-cased for this
+    /// mode either: non-unit opacity stays a conservative,
+    /// sufficient-but-not-necessary requirement.
+    ///
+    /// **The application calls this** (0.113.0): `aurora-app`'s
+    /// `document_qualifies_for_gpu_compositing` admits `LinearLight` and
+    /// `begin_gpu_composite_tile` dispatches here for every `LinearLight` root
+    /// layer, through the same single ping-pong spare accumulator any other
+    /// blend-math layer uses. Its dispatch arm was instrumented from day one
+    /// (`GpuBlendDispatch::LinearLight` in that crate), so no test here can be
+    /// satisfied by a silent CPU fallback.
+    ///
+    /// All three views must be `Rgba16Float` and the same size; `dst`'s
+    /// owning texture must include `RENDER_ATTACHMENT` usage, and both
+    /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
+    /// `opacity` is clamped to `0.0..=1.0`.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — see
+    /// [`Self::composite_over_with_opacity`] for the full account.
+    pub fn composite_linear_light_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_LINEAR_LIGHT,
+        );
+    }
+
     /// The one body behind every shader-computed blend mode: build (or
     /// reuse) `pass.fragment_entry`'s pipeline, upload the clamped
     /// opacity, bind `src`/backdrop/uniform, and draw one fullscreen
@@ -3336,8 +3514,9 @@ impl TileCompositor {
     /// the seventh), `composite_color_burn_over_with_opacity` (0.107.0,
     /// the eighth), `composite_color_dodge_over_with_opacity` (0.108.0,
     /// the ninth), `composite_overlay_over_with_opacity` (0.110.0, the
-    /// tenth) and `composite_hard_light_over_with_opacity` (0.111.0, the
-    /// eleventh) without a line of change, which is the bet that
+    /// tenth), `composite_hard_light_over_with_opacity` (0.111.0, the
+    /// eleventh) and `composite_linear_light_over_with_opacity` (0.113.0,
+    /// the twelfth) without a line of change, which is the bet that
     /// extraction was making — the
     /// same discipline, and the same "no existing test needed to change"
     /// bar, 0.83.1 used when it extracted [`composite_pipeline`] and
@@ -3346,8 +3525,8 @@ impl TileCompositor {
     /// `composite_lighten_*`, `composite_screen_*`,
     /// `composite_difference_*`, `composite_linear_dodge_*`,
     /// `composite_linear_burn_*`, `composite_color_burn_*`,
-    /// `composite_color_dodge_*`, `composite_overlay_*` and
-    /// `composite_hard_light_*`
+    /// `composite_color_dodge_*`, `composite_overlay_*`,
+    /// `composite_hard_light_*` and `composite_linear_light_*`
     /// differentials in
     /// this module's tests, each checking the shader's output against
     /// [`composite_tile_cpu`]'s own on real hardware, are what makes that
@@ -4639,6 +4818,93 @@ mod tests {
                 "branch and simplified forms must agree exactly for cb={cb}, cs={cs}"
             );
         }
+    }
+
+    #[test]
+    // `LinearLight`'s **unconditional** asymmetry (0.113.0), pinned on
+    // `blend_channel` directly because the property is about the formula and
+    // needs no GPU. It is the load-bearing premise behind two separate things
+    // the GPU round rests on: that a transposed `src`/`backdrop` binding in
+    // `fs_composite_linear_light`'s dispatch arm is observable at all, and
+    // that this mode is the *fifth* asymmetric mode on the GPU path and the
+    // *third* unconditionally so (after `ColorBurn` and `ColorDodge`;
+    // `Overlay` and `HardLight` are asymmetric only where their operands
+    // straddle `0.5`).
+    //
+    // "Unconditional" is about the pre-clamp algebra --
+    // `B(Cb, Cs) - B(Cs, Cb) = (Cb + 2*Cs) - (Cs + 2*Cb) = Cs - Cb` -- so the
+    // two orders differ whenever the operands do *and* the clamp does not
+    // collapse them. Both cases are asserted:
+    //
+    //   - an **interior** pair, where neither order clamps and the raw
+    //     difference survives: `(0.25, 0.625)` gives `0.5` and its transpose
+    //     `(0.625, 0.25)` gives `0.125`;
+    //   - a **rail** pair, where both orders clamp but to *opposite* bounds:
+    //     `(0, 1)` gives `1.0` and `(1, 0)` gives `0.0`.
+    //
+    // The third case is deliberately *not* asserted as asymmetry, and is
+    // asserted as its opposite instead, because it is the honest limit of the
+    // claim: a pair both of whose orders saturate at the **same** bound comes
+    // back equal, so the clamp really can hide a transpose. `(0.9, 0.95)` and
+    // `(0.95, 0.9)` both give `1.0`. That is why this crate's
+    // `composite_linear_light_*` fixtures are chosen for their clamp regimes
+    // and not only for their operands' inequality -- see that suite's header
+    // for the complementary `(Cb - Cs) * (1 - 2a)` fold identity, which is the
+    // other half of the same story.
+    //
+    // Exact `f32` comparison: every value here is a dyadic rational except
+    // `0.9`/`0.95`, and that pair is only compared for *equality of two
+    // clamped results*, which is exact regardless (both are literally `1.0f`).
+    #[allow(clippy::float_cmp)]
+    fn linear_light_is_asymmetric_in_its_two_operands() {
+        // Interior: neither order reaches a clamp bound, so `Cs - Cb` survives
+        // into the result verbatim.
+        let interior = blend_channel(BlendMode::LinearLight, 0.25, 0.625);
+        let interior_transposed = blend_channel(BlendMode::LinearLight, 0.625, 0.25);
+        assert_eq!(
+            interior, 0.5,
+            "clamp(0.25 + 2*0.625 - 1) is 0.5, strictly inside the clamp"
+        );
+        assert_eq!(
+            interior_transposed, 0.125,
+            "clamp(0.625 + 2*0.25 - 1) is 0.125, also strictly inside it"
+        );
+        assert_ne!(
+            interior, interior_transposed,
+            "LinearLight must be asymmetric in its two operands: B(Cb, Cs) - B(Cs, Cb) is \
+             Cs - Cb before the clamp, so an interior pair differs by exactly that. If this ever \
+             holds, a transposed src/backdrop binding in the GPU dispatch arm stops being \
+             observable in interior channels and every fixture chosen for that property is \
+             vacuous."
+        );
+
+        // Rails, opposite bounds: both orders clamp, and the asymmetry is at
+        // its most extreme rather than hidden.
+        let low_rail = blend_channel(BlendMode::LinearLight, 0.0, 1.0);
+        let high_rail = blend_channel(BlendMode::LinearLight, 1.0, 0.0);
+        assert_eq!(low_rail, 1.0, "clamp(0 + 2 - 1) saturates at 1.0");
+        assert_eq!(high_rail, 0.0, "clamp(1 + 0 - 1) is 0.0 exactly");
+        assert_ne!(
+            low_rail, high_rail,
+            "a white source over a black backdrop and a black source over a white one must not \
+             agree: this mode's two degeneracies (LinearLight(Cb, 0) = 0 and \
+             LinearLight(Cb, 1) = 1) are on the *source* side, so swapping the operands swaps \
+             which one applies"
+        );
+
+        // The honest limit of the claim, asserted rather than merely disclosed:
+        // both orders past the *same* bound come back equal, so the clamp can
+        // hide a transpose. This is why the GPU fixtures need an interior
+        // channel and not merely unequal operands.
+        let same_rail = blend_channel(BlendMode::LinearLight, 0.9, 0.95);
+        let same_rail_transposed = blend_channel(BlendMode::LinearLight, 0.95, 0.9);
+        assert_eq!(same_rail, 1.0, "0.9 + 2*0.95 - 1 is 1.8, clamped to 1.0");
+        assert_eq!(
+            same_rail_transposed, 1.0,
+            "0.95 + 2*0.9 - 1 is 1.75, also clamped to 1.0 -- so this pair genuinely cannot see \
+             a transpose, which the composite_linear_light_* fixtures are built around rather \
+             than against"
+        );
     }
 
     #[test]
@@ -6224,7 +6490,7 @@ mod tests {
     /// silently.
     ///
     /// **Since 0.109.0 the guard is shared, not per entry point, and this
-    /// is one of only five of the eleven per-mode versions of this test
+    /// is one of only five of the twelve per-mode versions of this test
     /// that still detect its removal** — with `screen`'s, `difference`'s,
     /// `overlay`'s (0.110.0) and `hard_light`'s (0.111.0). `Multiply`'s
     /// `cb * s.rgb`
@@ -7355,7 +7621,7 @@ mod tests {
     // `ab > 0.0` guard", and 0.109.1 corrected it here and at the six
     // sibling section headers below.** Since 0.109.0 the guard is written
     // *once*, in `composite.wgsl`'s `straight_backdrop()`, and shared by
-    // all eleven blend-math entry points, so guard independence is not a
+    // all twelve blend-math entry points, so guard independence is not a
     // per-entry-point property any more. It is worse than that for this
     // mode specifically: with the guard deleted, `composite_lighten_over_
     // with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
@@ -7364,7 +7630,10 @@ mod tests {
     // `screen`, `difference`, `overlay` (0.110.0) and `hard_light`
     // (0.111.0) can detect the
     // guard's removal at all;
-    // for the other six modes -- this one included -- removing it is
+    // for the other seven modes -- this one included, and `linear_light`
+    // (0.113.0), whose single `clamp()` is `min(max(..))` by WGSL's own
+    // definition and so launders a NaN despite containing neither token --
+    // removing it is
     // output-equivalent on Vulkan/NVIDIA, not merely undetected, so no
     // fixture change of the 0.105.1/0.105.2 kind could close it. What the
     // test does still pin per entry point is that *this* mode's `b` line
@@ -8791,12 +9060,17 @@ mod tests {
     ///
     /// **That reasoning was confirmed by measurement in 0.109.0.** The
     /// guard now lives once in `composite.wgsl`'s shared
-    /// `straight_backdrop()`, and deleting it fails exactly four of the
-    /// ten per-mode versions of this test — `multiply`'s, this one,
-    /// `difference`'s and (as of 0.110.0) `overlay`'s — precisely because
-    /// those four propagate the `NaN`
-    /// while the other six launder it through a `min`/`max`. So this test
-    /// is one of the four that genuinely protects the shared guard. See
+    /// `straight_backdrop()`, and deleting it fails exactly **five of the
+    /// twelve** per-mode versions of this test — `multiply`'s, this one,
+    /// `difference`'s, `overlay`'s (0.110.0) and `hard_light`'s (0.111.0)
+    /// — precisely because those five propagate the `NaN`
+    /// while the other seven launder it through a `min`/`max`. (This
+    /// sentence read "four of the ten … the other six" from 0.110.0 until
+    /// 0.113.0, which was the live figure then; `hard_light` made it five,
+    /// and `linear_light` — whose single `clamp()` is `min(max(..))` by
+    /// WGSL's own definition, so it launders too — made the denominator
+    /// twelve.) So this test
+    /// is one of the five that genuinely protects the shared guard. See
     /// `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     ///
     /// Where `ab == 0.0` the whole composite reduces to the source alone,
@@ -9699,11 +9973,13 @@ mod tests {
     ///
     /// **Confirmed by measurement in 0.109.0.** The guard now lives once in
     /// `composite.wgsl`'s shared `straight_backdrop()`, and deleting it
-    /// fails exactly five of the eleven per-mode versions of this test —
+    /// fails exactly five of the twelve per-mode versions of this test —
     /// `multiply`'s, `screen`'s, this one, `overlay`'s (0.110.0) and
     /// `hard_light`'s (0.111.0) —
     /// for exactly that reason,
-    /// while the other six launder the `NaN` through a `min`/`max`. So this
+    /// while the other seven launder the `NaN` through a `min`/`max` —
+    /// `linear_light` (0.113.0) among them, its single `clamp()` being
+    /// `min(max(..))` by WGSL's own definition. So this
     /// test is one of the five that genuinely protects the shared guard.
     /// See `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     ///
@@ -14853,9 +15129,13 @@ mod tests {
     // distinguish `Overlay` from a plain `Multiply`/`Screen` with the wrong
     // operand scale. Every solid-colour fixture below therefore takes
     // **both** arms across its three channels. `SoftLight`, `VividLight`,
-    // `PinLight`, `LinearLight` and `HardMix` are the rest of the
-    // overlay-and-light family and all remain CPU-only, so none of them is
-    // reachable by a wrong `fragment_entry`.
+    // `PinLight` and `HardMix` are the rest of the overlay-and-light family
+    // and all remain CPU-only, so none of them is reachable by a wrong
+    // `fragment_entry`. **`LinearLight` was on that list until 0.113.0 ported
+    // it**, and it is now live -- but it is not a plausible confusion with
+    // this mode: it is a single clamped sum with no branch at all, so no
+    // `fragment_entry` slip between the two is a near-miss in either
+    // direction. Its own near-misses are `LinearDodge` and `LinearBurn`.
     //
     // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
     // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
@@ -16035,9 +16315,12 @@ mod tests {
     // ever took one arm could not distinguish `HardLight` from a plain
     // `Multiply`/`Screen` with the wrong operand scale. Every solid-colour
     // fixture below therefore takes **both** arms across its three channels.
-    // `SoftLight`, `VividLight`, `PinLight`, `LinearLight` and `HardMix` are
+    // `SoftLight`, `VividLight`, `PinLight` and `HardMix` are
     // the rest of the overlay-and-light family and all remain CPU-only, so
-    // none is reachable by a wrong `fragment_entry`. Note in particular that
+    // none is reachable by a wrong `fragment_entry`. **`LinearLight` was on
+    // that list until 0.113.0 ported it** and is now live below; it is not a
+    // near-miss for this mode either way, being one unconditional clamped sum
+    // with no branch to get the operand of wrong. Note in particular that
     // none of `VividLight`, `PinLight` or `HardMix` delegates to `HardLight`
     // in `blend_channel` (they go to `ColorBurn`/`ColorDodge`,
     // `Darken`/`Lighten`, and `VividLight` respectively) -- the only CPU arm
@@ -16789,7 +17072,7 @@ mod tests {
     #[test]
     /// The shared `straight_backdrop()` guard's **untaken** branch as
     /// `fs_composite_hard_light` reaches it, on real hardware — and this mode
-    /// was *predicted* to be the fifth of eleven whose equivalent test has
+    /// was *predicted* to be the fifth of twelve whose equivalent test has
     /// teeth, then measured.
     ///
     /// **Why, from the rule `composite.wgsl` states rather than by analogy.**
@@ -17119,6 +17402,1038 @@ mod tests {
              (0.8125, 0.71875), Darken (0.25, 0.25), Lighten (0.75, 0.625), Difference \
              (0.5, 0.375), LinearDodge (1.0, 0.875), LinearBurn (0.0, 0.0), Exclusion \
              (0.625, 0.5625), ColorBurn (0.0, 0.0) and ColorDodge (1.0, 0.6667)."
+        );
+    }
+
+    // -- `LinearLight` on the GPU (0.113.0), the twelfth mode ported:
+    // `TileCompositor::composite_linear_light_over_with_opacity` and the
+    // `fs_composite_linear_light` entry point behind it, checked against
+    // `composite_tile_cpu`'s own `BlendMode::LinearLight` arm.
+    //
+    // **The structural news, and it is the *absence* of something.**
+    // `blend_channel`'s arm is one unconditional expression --
+    // `(cb + 2.0 * cs - 1.0).clamp(0.0, 1.0)` -- not a two-call delegation
+    // like `Overlay`'s and `HardLight`'s. So there is no `select()` in the
+    // shader, no branch, **no branch-boundary test in this suite, and no
+    // unkillable `<=` -> `<` mutation to disclose**. This suite has six tests
+    // where the two before it had seven, and that missing seventh is the
+    // boundary probe neither of those two rounds could kill anyway. The
+    // asymmetry test this mode does need is a *CPU* one on `blend_channel`
+    // itself (`linear_light_is_asymmetric_in_its_two_operands`, up with the
+    // other `blend_channel` tests), because the property is about the formula
+    // and needs no GPU at all.
+    //
+    // **The three clamp regimes are this suite's real teeth**, in place of the
+    // "which arm fired" reasoning the branching modes use. Every fixture below
+    // is labelled with the regimes it reaches, and between them all three are
+    // covered several times over:
+    //
+    //   | test | red | green | blue |
+    //   |---|---|---|---|
+    //   | 1 | interior | interior | **lower rail** |
+    //   | 3 | mixed by column (all three) | same in rows | mixed by quadrant |
+    //   | 4 | **upper rail** | interior | **lower rail** |
+    //   | 5 | **lower rail** | **upper rail** | interior |
+    //   | 6 | interior | interior | **lower rail** |
+    //
+    // Tests 4 and 5 each reach all three in one draw, which is what makes
+    // "drop the lower bound" and "drop the upper bound" separately killable.
+    //
+    // **Near misses, and why the regime table above is load-bearing for them
+    // rather than decorative:**
+    //
+    //   - **Dropping the `2.0 *` computes `LinearBurn` exactly** (the upper
+    //     bound is unreachable for operands in `[0, 1]`, so the clamp reduces
+    //     to `max(cb + cs - 1, 0)`), and `LinearBurn` is a *live* GPU entry
+    //     point and dispatch arm. This is the single most dangerous slip in
+    //     this round.
+    //   - `min(cb + s.rgb, 1)` is `LinearDodge`, also live.
+    //   - **A railed channel cannot separate this mode from the near-miss its
+    //     rail belongs to.** Proved rather than observed: `cb + 2cs > 2`
+    //     implies `cb + cs > 1`, so an upper-railed channel gives `1.0` for
+    //     both `LinearLight` and `LinearDodge`; `cb + 2cs < 1` implies
+    //     `cb + cs < 1`, so a lower-railed channel gives `0.0` for both
+    //     `LinearLight` and `LinearBurn`. **Only an interior channel
+    //     discriminates**, and every fixture below has at least one.
+    //
+    // **Two degeneracies, verified algebraically:**
+    //
+    //   1. `LinearLight(Cb, 0.5) = Cb` for **every** `Cb` -- a *source*
+    //      channel at exactly `0.5` is a total no-op. No solid-colour fixture
+    //      below has one. (Test 3's patterned source cannot avoid it; that
+    //      test discloses which columns it costs.)
+    //   2. `LinearLight(Cb, 0) = 0` and `LinearLight(Cb, 1) = 1` -- a black or
+    //      white *source* channel erases the backdrop. The solid-colour
+    //      fixtures keep every source channel strictly inside `(0, 1)`; tests
+    //      3 and 6 cannot.
+    //
+    // A `0.5` **backdrop** channel is deliberately *not* degenerate here
+    // (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)`, still a function of
+    // `Cs`), unlike `HardLight`, where it is `Normal`. Tests 1, 2 and 6 use
+    // one on purpose, which is why their fixtures look like they violate the
+    // sibling suites' "no 0.5 anywhere" rule and do not.
+    //
+    // **Asymmetry: UNCONDITIONAL in the blend term -- the fifth asymmetric
+    // mode on the GPU path and the third of that kind**, after `ColorBurn`
+    // (0.107.0) and `ColorDodge` (0.108.0); `Overlay` and `HardLight` are
+    // asymmetric only in straddling channels. `B(Cb, Cs) - B(Cs, Cb) =
+    // Cs - Cb` before the clamp. **What is *not* unconditional is whether a
+    // transposed binding is observable, and this round found the two
+    // laundering mechanisms are exactly complementary** (algebra first, then
+    // measured): over an opaque backdrop at effective alpha `a`, a railed
+    // channel's two orders give the same `B` so only `(1-a)*Cb` vs `(1-a)*Cs`
+    // survives -- nothing at `a = 1`; while an interior channel gives
+    // `out - out_transposed = (Cb - Cs)*(1 - 2a)`, which is **zero at
+    // `a = 0.5`**, where `out = Cb + Cs - 0.5` outright. So test 1's and test
+    // 4's railed channels are what see a transpose at their `a = 0.5`, and
+    // test 6's interior channels are what see one at `a = 1`. Stated because
+    // the natural assumption -- that an unconditionally asymmetric formula is
+    // always caught -- is false here in both directions.
+    //
+    // **What is not confused with what.** `LinearDodge` and `LinearBurn` are
+    // the arithmetic near-misses above, both live. `Overlay` and `HardLight`
+    // are the overlay-and-light family's other live members and are *not*
+    // near-misses in either direction: they branch, this mode does not, and no
+    // `fragment_entry` slip between them is a plausible typo. `SoftLight`,
+    // `VividLight`, `PinLight` and `HardMix` remain CPU-only, so no wrong
+    // `fragment_entry` reaches them. Note also that **no CPU-only mode
+    // delegates to `LinearLight`** in `blend_channel` -- `VividLight` goes to
+    // `ColorBurn`/`ColorDodge`, `PinLight` to `Darken`/`Lighten`, `HardMix` to
+    // `VividLight` -- so this round changed no other mode's arm, and left
+    // `blend_channel`'s own `LinearLight` arm and its two existing CPU tests
+    // untouched.
+    //
+    // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
+    // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
+    // benchmarks stay comparable across it, unlike `Screen`'s round.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`,
+    // NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu). That is one backend on
+    // one vendor: Metal and DX12 remain unverified for
+    // `fs_composite_linear_light`. The specific new construct here is
+    // `clamp()` on a `vec3<f32>` -- the **first `clamp` in this shader file**
+    // -- whose NaN behaviour this round relies on being WGSL's specified
+    // `min(max(e1, e2), e3)`. That was measured on this backend only.
+
+    #[test]
+    /// The plain-arithmetic case: an opaque `(0.875, 0.5, 0.25)` accumulator
+    /// under a `(0.375, 0.625, 0.125)` source at its own `0.5` alpha.
+    ///
+    /// One expression, no branch, so unlike the two sibling suites there is no
+    /// "both arms fire" property to establish. What replaces it is the **clamp
+    /// regime** spread — red and green land strictly inside the clamp, blue
+    /// falls off the bottom:
+    ///
+    /// - red: `0.875 + 2*0.375 - 1 = 0.625`, interior;
+    /// - green: `0.5 + 2*0.625 - 1 = 0.75`, interior;
+    /// - blue: `0.25 + 2*0.125 - 1 = -0.5` → clamped up to `0.0`, the **lower
+    ///   rail**.
+    ///
+    /// So `B = (0.625, 0.75, 0.0)`, and the "over" folds it in at the source's
+    /// effective alpha (`0.5 * Cb + 0.5 * B`, the accumulator being opaque),
+    /// giving `(0.75, 0.625, 0.125)` at alpha `1.0`. **All three golden
+    /// channels are distinct** — the red backdrop is `0.875` rather than the
+    /// `0.75` that would have been the natural pick precisely so that red and
+    /// green do not coincide at `0.625`.
+    ///
+    /// **The green *backdrop* is exactly `0.5`, and that is deliberate, not an
+    /// oversight against the sibling suites' rules.** For `HardLight` a `0.5`
+    /// backdrop is `Normal`; here `LinearLight(0.5, Cs) = clamp(2*Cs - 0.5)`
+    /// still depends on `Cs` entirely. No *source* channel is `0.5` (that
+    /// would be the real no-op, degeneracy 1), none is `0.0` or `1.0`
+    /// (degeneracy 2), and no channel has `Cb == Cs`.
+    ///
+    /// Rival arms, re-derived in exact rationals for this fixture — each is
+    /// `0.5 * Cb + 0.5 * B` for that mode's own `B`:
+    ///
+    /// - **`LinearBurn` `(0.5625, 0.3125, 0.125)`** — what dropping the
+    ///   `2.0 *` computes, and a live GPU arm. **REQUIRED DISCLOSURE: it
+    ///   coincides with the golden in blue** (`0.125` both), because blue is
+    ///   lower-railed and a lower-railed channel is provably `0.0` for both
+    ///   modes. Red and green carry this one, with margins `0.1875` and
+    ///   `0.3125`;
+    /// - **`LinearDodge` `(0.9375, 0.75, 0.3125)`** — differs in all three;
+    /// - `Normal` `(0.625, 0.5625, 0.1875)`, `Multiply`
+    ///   `(0.6015625, 0.40625, 0.140625)`, `Screen`
+    ///   `(0.8984375, 0.65625, 0.296875)`, `Darken` `(0.625, 0.5, 0.1875)`,
+    ///   `Lighten` `(0.875, 0.5625, 0.25)`, `Difference`
+    ///   `(0.6875, 0.3125, 0.1875)`, `Exclusion` `(0.734375, 0.5, 0.28125)`,
+    ///   `Overlay` `(0.859375, 0.5625, 0.15625)`, `HardLight`
+    ///   `(0.765625, 0.5625, 0.15625)`, `ColorDodge` roughly
+    ///   `(0.9375, 0.75, 0.2678..)` — all differing in three channels;
+    /// - `ColorBurn` roughly `(0.7708.., 0.35, 0.125)`, which also coincides
+    ///   in blue, for the same reason `LinearBurn` does.
+    ///
+    /// **A transposed `src`/`backdrop` binding gives
+    /// `(0.6875, 0.625, 0.0625)` here — caught in red and blue, and *not* in
+    /// green.** Green is the interior channel at effective alpha exactly
+    /// `0.5`, which is where the suite header's `(Cb - Cs)*(1 - 2a)` identity
+    /// is zero. Red is caught because the transposed order rails upward where
+    /// the correct one is interior.
+    ///
+    /// The golden is asserted *and* cross-checked against the real
+    /// [`composite_tile_cpu`] for the same two layers, so a stale literal
+    /// cannot outlive a change to either implementation. Every value is an
+    /// exact binary fraction — this mode is add, double, subtract and clamp —
+    /// so both are bit-exact `assert_eq!`s.
+    ///
+    /// `dst` is seeded opaque red first, so a pass that silently wrote
+    /// nothing would fail rather than accidentally read as a pass.
+    fn composite_linear_light_over_with_opacity_doubles_the_source_and_clamps_per_channel() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.875, 0.5, 0.25, 1.0];
+        let top_rgba = [0.375, 0.625, 0.125, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.875, 0.5, 0.25, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass \
+             then samples -- and it must keep red and green inside the clamp against this source \
+             while driving blue off the bottom, or this test stops covering more than one regime"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::LinearLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.75, 0.625, 0.125, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself \
+             computes for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.75, 0.625, 0.125, 1.0),
+            "LinearLight is one unconditional expression, clamp(Cb + 2*Cs - 1, 0, 1): red and \
+             green land inside the clamp (0.625 and 0.75) and blue falls off the bottom to 0.0, \
+             so B is (0.625, 0.75, 0.0). LinearBurn -- what dropping the 2.0* computes, and a \
+             live GPU arm -- gives (0.5625, 0.3125, 0.125), differing in red and green only: it \
+             coincides in blue because a lower-railed channel is provably 0.0 for both modes. \
+             LinearDodge gives (0.9375, 0.75, 0.3125), the Normal arm \
+             (0.625, 0.5625, 0.1875), Multiply (0.6015625, 0.40625, 0.140625), Screen \
+             (0.8984375, 0.65625, 0.296875), Darken (0.625, 0.5, 0.1875), Lighten \
+             (0.875, 0.5625, 0.25), Difference (0.6875, 0.3125, 0.1875), Exclusion \
+             (0.734375, 0.5, 0.28125), Overlay (0.859375, 0.5625, 0.15625), HardLight \
+             (0.765625, 0.5625, 0.15625), ColorBurn roughly (0.7708, 0.35, 0.125) -- also \
+             coinciding in blue -- and ColorDodge roughly (0.9375, 0.75, 0.2678). A transposed \
+             src/backdrop binding gives (0.6875, 0.625, 0.0625): caught in red and blue, and \
+             blind in green, which is the interior channel at effective alpha exactly 0.5."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case, exercising the shared
+    /// `straight_backdrop()`'s recovery
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`) as this entry point reaches it.
+    ///
+    /// The backdrop is `(0.875, 0.5, 0.25)` at half opacity and the source
+    /// `(0.375, 0.625, 0.125)` at its own alpha `1.0` — the same two colours as
+    /// test 1, deliberately, so the *only* thing that differs between the two
+    /// tests is which of the shader's own lines is exercised.
+    ///
+    /// **A missing un-premultiply changes a channel's clamp *regime* here, not
+    /// just its magnitude** — which is the opposite of the `HardLight`
+    /// sibling's account and worth stating rather than copying. Halving `cb`
+    /// changes the sum `cb + 2*Cs - 1` directly, so `B` becomes
+    /// `(0.1875, 0.5, 0.0)` against the correct `(0.625, 0.75, 0.0)` and red
+    /// moves from `0.625` to `0.1875` while staying interior, green from
+    /// `0.75` to `0.5`, and blue stays railed at `0.0`. Folding at `ab = 0.5`
+    /// (`0.5 * Cs + 0.5 * B`, the source's own `a = 1.0` making `inv = 0.0`)
+    /// gives `(0.28125, 0.5625, 0.0625)` against the correct
+    /// `(0.5, 0.6875, 0.0625)`.
+    ///
+    /// **REQUIRED DISCLOSURE: blue cannot see that mutation at all** — it is
+    /// `0.0625` either way, because blue is lower-railed *both* times and the
+    /// rail erases the difference. Red is off by `0.21875` and green by
+    /// `0.125`, both about two orders of magnitude above the
+    /// `2 * f16::EPSILON` tolerance, so two live discriminators remain. This is
+    /// the cost of reusing test 1's colours, taken deliberately: the
+    /// alternative was a second unrelated fixture whose clamp regimes would
+    /// then need their own derivation.
+    ///
+    /// The expected value is **not hand-derived**: it comes from calling the
+    /// real [`composite_tile_cpu`] with the same two layers. Compared within
+    /// `2 * f16::EPSILON`, the same tolerance and reasoning every sibling
+    /// suite documents. (For the record it is `(0.5, 0.6875, 0.0625, 1.0)`.)
+    fn composite_linear_light_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator()
+    {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.875, 0.5, 0.25, 1.0];
+        let top_rgba = [0.375, 0.625, 0.125, 1.0];
+        let bottom_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        // A half-opacity bottom layer leaves a *premultiplied* accumulator
+        // whose alpha is 0.5 -- the state whose raw colour is not its straight
+        // colour. Unlike the HardLight sibling, the mutation this catches
+        // changes red's and green's arithmetic outright (there is no branch to
+        // stay on); blue is railed both ways and blind to it.
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_accumulator = first_texel(&composite_tile_cpu(&[(
+            &bottom_texels,
+            bottom_opacity,
+            BlendMode::Normal,
+        )]));
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, bottom_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::LinearLight),
+        ]));
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator, cpu_accumulator,
+            "setup: the accumulator the second pass samples must be the premultiplied, \
+             fractional-alpha state the CPU path also reaches"
+        );
+        assert!(
+            gpu_accumulator.3 > 0.0 && gpu_accumulator.3 < 1.0,
+            "setup: this test is only meaningful with a fractional accumulator alpha, got \
+             {gpu_accumulator:?}"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader LinearLight path and composite_tile_cpu \
+                 diverged by more than {tolerance} against a translucent accumulator \
+                 ({gpu} vs {cpu}) -- that is a real finding to report, not a reason to loosen \
+                 this assertion. A missing un-premultiply gives \
+                 (0.28125, 0.5625, 0.0625) here: red off by 0.21875 and green by 0.125, while \
+                 blue is 0.0625 either way, being lower-railed in both. Full texels: \
+                 {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **The spatial-addressing test for the `LinearLight` entry point**, and
+    /// the only `LinearLight` test here that can catch a V-flip, a transposed
+    /// axis or a half-texel UV offset: every other one composites uniform
+    /// tiles and reads back texel 0.
+    ///
+    /// Both layers are [`patterned_texels`] with *different* seeds, the
+    /// accumulator is built by a real `composite_over_with_opacity` render
+    /// pass rather than seeded, and the **whole** `TILE`x`TILE` result is
+    /// compared against [`composite_tile_cpu`]'s own output via
+    /// [`read_rgba8`] and its CPU twin [`rgba8_of`]. The top layer's alpha is
+    /// `0.75`, so `a = 0.75` and `inv = 0.25`: both terms of
+    /// `out = inv * d.rgb + a * blended` are live, and `0.75` is also *not*
+    /// the `0.5` at which this mode's interior channels go blind to a
+    /// transpose (see the suite header).
+    ///
+    /// **REQUIRED DISCLOSURE, worked out from the real pattern rather than by
+    /// analogy with either sibling suite.** [`patterned_texels`] draws every
+    /// channel from `{0.0, 0.25, 0.5, 0.75}`, so the fixture cannot avoid this
+    /// mode's degeneracies. Per channel:
+    ///
+    /// - **red** (`Cb, Cs`) by `x % 4` is `(0, 0.25)`, `(0.25, 0.5)`,
+    ///   `(0.5, 0.75)`, `(0.75, 0)`, giving `B` of `0.0` (lower rail), `0.25`
+    ///   (interior — and *also* degeneracy 1, `Cs == 0.5`, so `B = Cb`), `1.0`
+    ///   (the sum is exactly `1.0`, so this column sits on the upper bound
+    ///   without the clamp having to bite) and `0.0` (lower rail, *and*
+    ///   degeneracy 2, `Cs == 0`). **`x % 4 == 1` is the only red column that
+    ///   separates this mode from both `LinearDodge` (`0.75`) and `LinearBurn`
+    ///   (`0.0`)**; `x % 4 == 2` separates it from `LinearBurn` (`0.25`) only,
+    ///   since `LinearDodge` also gives `1.0` there; the two railed columns
+    ///   agree with `LinearBurn` outright;
+    /// - **green** does the same in `y`;
+    /// - **blue is seed-independent** (a pure function of the quadrant), so
+    ///   `Cb == Cs` at every texel and blue can see no transpose at all. Its
+    ///   four quadrant values give `B = 0.0` (top-left, `0`), `0.5`
+    ///   (top-right, `Cb = Cs = 0.5` — interior, and degeneracy 1 at the same
+    ///   time), `0.0` (bottom-left, `0.25`, lower rail) and `1.0`
+    ///   (bottom-right, `0.75`, upper rail). The top-right quadrant separates
+    ///   this mode from both near-misses (`1.0` and `0.0`); the
+    ///   bottom-right separates it from `LinearBurn` (`0.5`) only.
+    ///
+    /// So this test earns its place as the **spatial** guard — a wrong-texel
+    /// bug shows up across three quarters of the columns and rows regardless —
+    /// and it must not be credited with more formula discrimination than the
+    /// paragraph above grants: one red column, one green row and one blue
+    /// quadrant in four fully separate this mode from its two near-misses.
+    /// Tests 1, 4, 5 and 6 carry the formula.
+    ///
+    /// Tolerance is `1` out of 255, the same reasoning
+    /// `composite_over_matches_the_golden_image` documents.
+    fn composite_linear_light_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // The accumulator itself must have survived its render pass
+        // texel-for-texel first, or a spatial failure downstream would be
+        // ambiguous between the two passes.
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the LinearLight comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::LinearLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader LinearLight path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel bug \
+             (V-flip, transpose, UV offset, transposed binding), not precision -- but note this \
+             fixture's degenerate and railed texels, enumerated in the doc comment, which pin the \
+             right answer without discriminating the formula: only one red column, one green row \
+             and one blue quadrant in four separate this mode from both LinearDodge and \
+             LinearBurn.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `LinearLight` path, exercising the
+    /// `s.a * opacity.value` scale the shader relies on the Rust caller to
+    /// have clamped — **and the fixture that reaches all three clamp regimes
+    /// in one draw**, which is what makes "drop the lower bound" and "drop the
+    /// upper bound" separately killable rather than merely distinct edits.
+    ///
+    /// `Cb = (0.3125, 0.75, 0.4375)`, `Cs = (0.875, 0.375, 0.125)`, opacity
+    /// `0.5` against a source alpha of `1.0`:
+    ///
+    /// - red: `0.3125 + 1.75 - 1 = 1.0625` → clamped down to `1.0`, the
+    ///   **upper rail** — the regime test 1 has no example of;
+    /// - green: `0.75 + 0.75 - 1 = 0.5`, **interior**;
+    /// - blue: `0.4375 + 0.25 - 1 = -0.3125` → clamped up to `0.0`, the
+    ///   **lower rail**.
+    ///
+    /// `B = (1.0, 0.5, 0.0)`, and the fold at `a = 0.5` over an opaque
+    /// accumulator gives `0.5 * Cb + 0.5 * B = (0.65625, 0.625, 0.21875)` at
+    /// alpha `1.0`. **All three golden channels are distinct.** No operand is
+    /// `0.5`, `0.0` or `1.0` on the source side, and no channel has
+    /// `Cb == Cs`. Red overshoots by `0.0625` and blue undershoots by
+    /// `0.3125`, so neither rail is reached only marginally.
+    ///
+    /// **What each dropped bound costs, which is the point of this fixture:**
+    /// `min(cb + 2*cs - 1, 1)` (no lower bound) leaves blue at
+    /// `0.5*0.4375 + 0.5*(-0.3125) = 0.0625` against `0.21875`, and
+    /// `max(cb + 2*cs - 1, 0)` (no upper bound) leaves red at
+    /// `0.5*0.3125 + 0.5*1.0625 = 0.6875` against `0.65625`. Both are single
+    /// channels, both are far above tolerance, and **neither is caught by test
+    /// 1**, which has no upper-railed channel at all.
+    ///
+    /// Rival arms, re-derived in exact rationals:
+    ///
+    /// - **`LinearBurn` `(0.25, 0.4375, 0.21875)`** — the dropped-doubling
+    ///   slip. Differs in red and green; **coincides in blue**, blue being
+    ///   lower-railed;
+    /// - **`LinearDodge` `(0.65625, 0.875, 0.5)`** — differs in green and
+    ///   blue; **coincides in red**, red being upper-railed. So the two
+    ///   near-misses are caught by *disjoint* channel sets here, and each
+    ///   coincidence is the provable rail identity from the suite header
+    ///   rather than an accident;
+    /// - `Normal` `(0.59375, 0.5625, 0.28125)`, `Multiply`
+    ///   `(0.29296875, 0.515625, 0.24609375)`, `Screen`
+    ///   `(0.61328125, 0.796875, 0.47265625)`, `Darken`
+    ///   `(0.3125, 0.5625, 0.28125)`, `Lighten` `(0.59375, 0.75, 0.4375)`,
+    ///   `Difference` `(0.4375, 0.5625, 0.375)`, `Exclusion`
+    ///   `(0.4765625, 0.65625, 0.4453125)`, `Overlay`
+    ///   `(0.4296875, 0.71875, 0.2734375)`, `HardLight`
+    ///   `(0.5703125, 0.65625, 0.2734375)` — all three channels;
+    /// - `ColorBurn` roughly `(0.5989.., 0.5416.., 0.21875)` and `ColorDodge`
+    ///   `(0.65625, 0.875, 0.46875)`, each coinciding in one channel for the
+    ///   same rail reason as its linear namesake.
+    ///
+    /// The golden is asserted alongside the [`composite_tile_cpu`]
+    /// differential. Every value is an exact binary fraction except
+    /// `ColorBurn`'s and `ColorDodge`'s, which are only listed as rivals.
+    fn composite_linear_light_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.3125, 0.75, 0.4375, 1.0];
+        let top_rgba = [0.875, 0.375, 0.125, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::LinearLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.65625, 0.625, 0.21875, 1.0),
+            "setup: the golden named in this test's doc comment must be what composite_tile_cpu \
+             itself computes -- if this fails, the literal is stale, not the GPU"
+        );
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.65625, 0.625, 0.21875, 1.0),
+            "LinearLight at opacity 0.5, and the one fixture here that reaches all three clamp \
+             regimes in one draw: red's sum is 1.0625 and clamps down to 1.0, green's is 0.5 and \
+             is untouched, blue's is -0.3125 and clamps up to 0.0. Dropping the lower bound \
+             leaves blue at 0.0625; dropping the upper bound leaves red at 0.6875 -- neither is \
+             visible in test 1. LinearBurn (the dropped-doubling slip) gives \
+             (0.25, 0.4375, 0.21875), coinciding in lower-railed blue; LinearDodge gives \
+             (0.65625, 0.875, 0.5), coinciding in upper-railed red -- so the two near-misses are \
+             caught by disjoint channels. Normal gives (0.59375, 0.5625, 0.28125), Multiply \
+             (0.29296875, 0.515625, 0.24609375), Screen (0.61328125, 0.796875, 0.47265625), \
+             Darken (0.3125, 0.5625, 0.28125), Lighten (0.59375, 0.75, 0.4375), Difference \
+             (0.4375, 0.5625, 0.375), Exclusion (0.4765625, 0.65625, 0.4453125), Overlay \
+             (0.4296875, 0.71875, 0.2734375), HardLight (0.5703125, 0.65625, 0.2734375), \
+             ColorBurn roughly (0.5989, 0.5416, 0.21875) and ColorDodge \
+             (0.65625, 0.875, 0.46875)."
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader LinearLight path and composite_tile_cpu \
+                 diverged by more than {tolerance} at opacity {opacity} ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **`fs_composite_linear_light` deliberately does not clamp
+    /// `s.a * opacity.value`** — only `opacity` itself is clamped, and it is
+    /// clamped Rust-side in `composite_blend_over_with_opacity`, mirroring
+    /// `composite_layer_into`'s own `let opacity = opacity.clamp(0.0, 1.0)`
+    /// followed by an unclamped `sa * opacity`. `f16` can legally hold a
+    /// source alpha above `1.0` (invariant §7.3.1b), so this is a real input.
+    /// Kept per mode for the reason 0.95.1 had to restore the `Lighten` one:
+    /// this asserts a line reached *through this entry point*, and each WGSL
+    /// fragment function is separately compiled.
+    ///
+    /// **This mode makes the distinction sharper than any sibling, and that is
+    /// the reason to read this test carefully.** Its blend term is the *only*
+    /// one on the GPU path that clamps its own output to `[0, 1]` explicitly,
+    /// so "the shader contains a clamp" and "the shader clamps the composite"
+    /// are two different claims here, and only the first is true. `B` is
+    /// bounded; the fold around it is not.
+    ///
+    /// **The source alpha is `2.0` and the `opacity` argument is `1.0`, not
+    /// the other way round.** Passing `opacity = 2.0` would prove nothing:
+    /// `composite_blend_over_with_opacity` clamps that argument before it
+    /// reaches the uniform, so `a` would come out `1.0` and this test would
+    /// assert the *clamped* answer.
+    ///
+    /// With `a = 2.0` the fold's `inv` is `-1.0`, so `out = -Cb + 2B`. The
+    /// fixture is chosen so the unclamped fold leaves the unit interval **in
+    /// both directions at once** *and* reaches all three clamp regimes:
+    /// `Cb = (0.5625, 0.4375, 0.75)`, `Cs = (0.125, 0.875, 0.375)`, no source
+    /// channel `0.5`, `0.0` or `1.0`, and no channel with `Cb == Cs`:
+    ///
+    /// - red: `0.5625 + 0.25 - 1 = -0.1875` → `B = 0.0`, **lower rail**;
+    /// - green: `0.4375 + 1.75 - 1 = 1.1875` → `B = 1.0`, **upper rail**;
+    /// - blue: `0.75 + 0.75 - 1 = 0.5`, **interior**.
+    ///
+    /// So `-Cb + 2B` is `(-0.5625, 1.5625, 0.25)` at alpha `2.0 - 1.0 = 1.0`.
+    /// **Red undershoots `0.0` and green overshoots `1.0`.** `Rgba16Float`
+    /// stores both exactly, [`read_first_texel`] does not clamp on the way
+    /// back, and neither `composite_layer_into` nor
+    /// `fs_composite_linear_light` clamps its *output* — so the GPU and CPU
+    /// are expected to agree on them. A disagreement would be a real finding
+    /// about one of those three, not a reason to move the fixture.
+    ///
+    /// **Blue's `0.25` is load-bearing and was checked against the two values
+    /// it must not equal.** It is not `0.0` (which an output clamp at zero
+    /// would produce, and which is what red is deliberately below) and not
+    /// blue's own `B` of `0.5` (which the clamped-alpha counterfactual
+    /// produces), so blue distinguishes both mutations on its own:
+    ///
+    /// - clamped-alpha counterfactual (`a = 1.0`, `inv = 0.0`):
+    ///   `out = B = (0.0, 1.0, 0.5)` at the same alpha `1.0` — so **alpha
+    ///   alone cannot catch this** and all three colour channels differ;
+    /// - output-clamp counterfactual: `(0.0, 1.0, 0.25)`, differing from the
+    ///   golden in red and green.
+    ///
+    /// The absolute golden is asserted alongside the [`composite_tile_cpu`]
+    /// differential, so a clamp added to *both* implementations could not pass
+    /// either.
+    fn composite_linear_light_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5625, 0.4375, 0.75, 1.0];
+        let top_rgba = [0.125, 0.875, 0.375, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::LinearLight),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's own \
+                 formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        // The absolute golden, hand-derived in the doc comment above.
+        // A `min(s.a * opacity.value, 1.0)` in `fs_composite_linear_light`
+        // yields (0.0, 1.0, 0.5, 1.0) instead -- alpha agrees, which is why
+        // this is asserted per channel rather than as a single texel
+        // comparison whose message would not say where. Red is deliberately
+        // below 0.0 and green above 1.0; blue's 0.25 is deliberately neither
+        // 0.0 (an output clamp) nor its own B of 0.5 (a clamped alpha), so it
+        // separates both mutations by itself.
+        for (gpu, expected, channel) in [
+            (gr, -0.5625, "r"),
+            (gg, 1.5625, "g"),
+            (gb, 0.25, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold; got {gpu}. \
+                 (0.0, 1.0, 0.5, 1.0) would mean fs_composite_linear_light clamped the \
+                 s.a * opacity product, and (0.0, 1.0, 0.25, 1.0) that something clamped the \
+                 *output* to [0, 1] -- a distinction this mode makes sharper than any sibling, \
+                 since its blend term is the only one on the GPU path that clamps its own result \
+                 on purpose. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The shared `straight_backdrop()` guard's **untaken** branch as
+    /// `fs_composite_linear_light` reaches it, on real hardware — and this
+    /// mode was **predicted not to detect the guard's removal**, then
+    /// measured. That prediction held.
+    ///
+    /// **Why, from the rule `composite.wgsl` states rather than by analogy.**
+    /// 0.109.0 found that deleting the guard fails only those per-mode
+    /// transparent-backdrop tests whose blend term has no NaN-laundering
+    /// intrinsic on the path from `cb` to `b`: `Multiply`'s, `Screen`'s and
+    /// `Difference`'s then, plus `Overlay`'s (0.110.0) and `HardLight`'s
+    /// (0.111.0). The six min/max modes pass with the guard gone because
+    /// `min()`/`max()` launder a `NaN` into the finite operand on this
+    /// backend. **`LinearLight` looks like a seventh detector and is not**:
+    /// WGSL specifies float `clamp(e1, e2, e3)` as `min(max(e1, e2), e3)`, so
+    /// this mode's single `clamp` *is* two laundering intrinsics, and the
+    /// `NaN` never reaches `fold_over`. Measured in 0.113.0 as mutation (m) of
+    /// its matrix: with the guard deleted, **this test stays green**. That is
+    /// output-equivalence of the same kind the six min/max modes have, not a
+    /// weak fixture — `fold_over`'s `ab == 0.0` would have erased a finite `b`
+    /// anyway. So the detector count stays at **five of twelve**, and the
+    /// interesting thing about this round is that the rule predicted a
+    /// *non*-detection correctly for the first time. See PLAN.md's 0.113.0
+    /// entry.
+    ///
+    /// The finiteness check below is kept regardless: it costs nothing, and a
+    /// backend whose `clamp` does *not* launder (a legal implementation
+    /// difference, since the WGSL definition is what makes it launder here)
+    /// would surface exactly there rather than as a silent wrong pixel.
+    ///
+    /// **The backdrop is deliberately half transparent, not uniformly so** —
+    /// the reason 0.95.1 gives for the `Lighten` sibling applies verbatim.
+    /// With [`half_transparent_texels`]'s opaque half at `(0.75, 0.25, 0.5)`
+    /// and a `(0.375, 0.75, 0.125)` source at alpha `1.0` and opacity `1.0`
+    /// (so `a = 1.0`, `inv = 0.0`, and the opaque half's output is `B`
+    /// exactly):
+    ///
+    /// - left half (`ab == 0`): `blended = Cs`, `out = Cs` — the untaken
+    ///   branch, `(0.375, 0.75, 0.125, 1.0)`;
+    /// - right half (`ab == 1`): red `0.75 + 0.75 - 1 = 0.5` (interior), green
+    ///   `0.25 + 1.5 - 1 = 0.75` (interior), blue `0.5 + 0.25 - 1 = -0.25` →
+    ///   `0.0` (lower rail) — `(0.5, 0.75, 0.0)`.
+    ///
+    /// **No channel is degenerate here, which is a real improvement on both
+    /// sibling suites' equivalent tests.** [`half_transparent_texels`]'s
+    /// opaque blue is exactly `0.5`, which for `Overlay` and `HardLight` is a
+    /// `Normal`-degenerate *backdrop* and cost each of them its blue channel;
+    /// for this mode `LinearLight(0.5, Cs) = clamp(2*Cs - 0.5)` is a real
+    /// function of `Cs`, so blue discriminates normally. All three channels
+    /// are live.
+    ///
+    /// **This is also the one fixture here whose effective alpha is `1.0`, so
+    /// it is what catches a transposed binding in an *interior* channel** —
+    /// see the suite header: at `a = 0.5` an interior channel is blind to a
+    /// transpose, and at `a = 1.0` a railed one is. A transpose gives
+    /// `(0.875, 0.25, 0.125)` in the opaque half, differing in all three.
+    ///
+    /// Rival arms for the opaque half: `LinearDodge` `(1.0, 1.0, 0.625)`,
+    /// `LinearBurn` `(0.125, 0.0, 0.0)` — coinciding in lower-railed blue, as
+    /// the rail identity requires — `Normal` `(0.375, 0.75, 0.125)` and
+    /// `Lighten` `(0.75, 0.75, 0.5)`, both coinciding in green,
+    /// `Multiply` `(0.28125, 0.1875, 0.0625)`, `Screen`
+    /// `(0.84375, 0.8125, 0.5625)`, `Darken` `(0.375, 0.25, 0.125)`,
+    /// `Difference` `(0.375, 0.5, 0.375)`, `Exclusion` `(0.5625, 0.625, 0.5)`,
+    /// `Overlay` `(0.6875, 0.375, 0.125)`, `HardLight`
+    /// `(0.5625, 0.625, 0.125)`, `ColorBurn` roughly `(0.3333.., 0.0, 0.0)`
+    /// and `ColorDodge` roughly `(1.0, 1.0, 0.5714..)`.
+    ///
+    /// **Every value in both halves is an exact binary fraction** — this mode
+    /// has no division — so the right half is genuinely pinned by the
+    /// whole-tile comparison at full 8-bit precision and texel 0 is asserted
+    /// with `assert_eq!`.
+    ///
+    /// A `NaN` in the left half would be caught by the whole-tile comparison
+    /// as well as by the explicit finiteness check on texel 0:
+    /// [`read_rgba8`]'s `clamp` maps `NaN` to `0`, which cannot match the CPU
+    /// reference's real value there.
+    ///
+    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader compilers
+    /// are unverified for this branch — and for this mode specifically,
+    /// whether `clamp` really is `min(max(..))` in the compiled output is the
+    /// property the laundering result above rests on.
+    fn composite_linear_light_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
+     {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Every channel is a live discriminator here, unlike the Overlay and
+        // HardLight siblings: half_transparent_texels' opaque blue is exactly
+        // 0.5, which is Normal-degenerate for those two modes and is *not*
+        // degenerate for this one (LinearLight(0.5, Cs) = clamp(2*Cs - 0.5)).
+        // Red and green land inside the clamp and blue on the lower rail.
+        let top_rgba = [0.375, 0.75, 0.125, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        // A real render pass builds the accumulator, rather than seeding it:
+        // the zero-alpha half is produced by the same mechanism under test,
+        // not written directly.
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_linear_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // Texel 0 is in the transparent half, and `f16` equality pins its
+        // alpha at exactly zero -- something the 8-bit whole-tile comparison
+        // below cannot do, since a tiny non-zero alpha would quantise to 0.
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. Note this \
+             mode is *not* expected to catch the guard's deletion -- WGSL defines float clamp as \
+             min(max(e1, e2), e3), so its single clamp launders a NaN exactly as the six \
+             min()/max() modes do, and 0.113.0 measured this test staying green with the guard \
+             gone. This assertion is kept because a backend whose clamp does not launder would \
+             surface here rather than as a silent wrong pixel."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.375, 0.75, 0.125, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::LinearLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader LinearLight path and composite_tile_cpu disagree across a \
+             half-transparent backdrop. In the opaque half every channel is a live \
+             discriminator -- unlike the Overlay and HardLight siblings, whose blue is degenerate \
+             on this same fixture -- and the correct answer is (0.5, 0.75, 0.0): LinearDodge \
+             would give (1.0, 1.0, 0.625), LinearBurn (0.125, 0.0, 0.0), and a transposed \
+             binding (0.875, 0.25, 0.125). This is also the one LinearLight fixture at effective \
+             alpha 1.0, so it is what catches a transpose in an *interior* channel; at 0.5 those \
+             go blind. In the transparent half a NaN out of the untaken `ab > 0.0` branch would \
+             show up -- though this mode's clamp is expected to launder one.",
         );
     }
 
