@@ -72,8 +72,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // fs_composite_multiply, fs_composite_darken, fs_composite_lighten,
 // fs_composite_screen, fs_composite_difference,
 // fs_composite_linear_dodge, fs_composite_linear_burn,
-// fs_composite_color_burn, fs_composite_color_dodge and
-// fs_composite_overlay -- use it,
+// fs_composite_color_burn, fs_composite_color_dodge,
+// fs_composite_overlay and fs_composite_hard_light -- use it,
 // through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
@@ -81,7 +81,7 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // -- the `backdrop` of every `TileCompositor::composite_*_over_with_
-// opacity` blend-math method (as of 0.110.0
+// opacity` blend-math method (as of 0.111.0
 // `composite_multiply_over_with_opacity` and its
 // `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
 // `color_burn`/`color_dodge`/`overlay`/`hard_light`
@@ -255,16 +255,16 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 //      justify keeping a per-mode transparent-backdrop test by listing
 //      "its own separately-compiled `ab > 0.0` guard" among the things
 //      that test uniquely exercises. That is no longer true: the guard is
-//      written once and shared by all ten entry points. (A backend is
+//      written once and shared by all eleven entry points. (A backend is
 //      still free to inline it per call site, so per-entry-point *machine
 //      code* is not ruled out -- but the source-level independence the
-//      comments leaned on is gone, and the measured 4-of-10 kill above is
+//      comments leaned on is gone, and the measured 5-of-11 kill above is
 //      the direct evidence.)
 //
 // Those suite-header comments in `composite.rs` were corrected in 0.109.1
 // and carry the specific sites; the per-test doc comments there carry a
-// one-line back-reference to here rather than repeating this. Only 4 of
-// the 10 kept transparent-backdrop tests can currently detect the guard's
+// one-line back-reference to here rather than repeating this. Only 5 of
+// the 11 kept transparent-backdrop tests can currently detect the guard's
 // removal at all -- see the `straight_backdrop()` comment above, and
 // PLAN.md's 0.109.0 entry for why.
 //
@@ -1026,7 +1026,11 @@ fn fs_composite_overlay(in: VsOut) -> @location(0) vec4<f32> {
 // gap, it is the collision rule's own "both operands `<= 0.5`" clause applied
 // to one arm -- `Cs * 2*Cb` and `Cb * 2*Cs` are both `2*Cb*Cs`, and
 // bit-identically so, `2*x` being exact and each form one rounding of the
-// same product. **The `lo` arm's operand order is therefore unobservable in
+// same product. (`2*x` is exact for every `x` an `f16`-backed tile can
+// actually produce here, which is the claim that matters: it would fail only
+// on f32 overflow, and `straight_backdrop`'s divide bounds `cb` to roughly
+// `65504 / 5.96e-8` = 1.1e12 -- far below where `2*cb` could overflow.)
+// **The `lo` arm's operand order is therefore unobservable in
 // principle, and no test can or should claim to pin it.** What *is*
 // observable, and was confirmed by running it, is the `hi` arm's base operand
 // (writing `s.rgb + t - s.rgb * t` there kills all seven of this mode's

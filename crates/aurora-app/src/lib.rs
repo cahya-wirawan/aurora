@@ -7104,9 +7104,10 @@ fn composite_roots_into_tile(
 ///   **all three** channels, and 0.110.0 confirmed by real measurement that
 ///   a transposed binding is observable there at effective alpha `1.0` as
 ///   well as at `0.5`. Non-unit fixture opacity is therefore
-///   sufficient-but-not-necessary for a third mode now, and
+///   sufficient-but-not-necessary for four of the eleven modes as of
+///   0.111.0, and
 ///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
-///   un-special-cased for all three (plain backticks: that const is
+///   un-special-cased for all four (plain backticks: that const is
 ///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
 ///   dispatch as its own arm and shares the *same single* `spare` ping-pong
 ///   accumulator.
@@ -7677,7 +7678,7 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 11]` length is part of
+    /// new variant is added to. The fixed `[Self; 12]` length is part of
     /// that signal: a thirteenth variant cannot be appended here without the
     /// author also editing the count, and the test asserts the same `12`
     /// as a literal so the expectation is stated in both places. (The
@@ -9687,10 +9688,13 @@ fn begin_gpu_composite_tile(
             // derived from `aurora_render`'s own `blend_channel` arm rather
             // than copied from `fs_composite_overlay` and transposed: the
             // two differ in exactly one place, and copy-and-fix is how that
-            // one place gets left alone. Deliberately not `Cb * 2*Cb` or
-            // `Cs * 2*Cs` either: the two arms are `Multiply` and `Screen`
-            // with a doubled *source*, and both of those are themselves on
-            // the GPU. Instrumented from its first round -- see
+            // one place gets left alone. Deliberately not `Cb * 2*Cs` in the
+            // other branch either, and deliberately not `Cs * 2*Cb` in this
+            // one -- the latter being `Overlay`'s own low arm and so the
+            // realistic copy-paste slip here: the two arms are `Multiply` and
+            // `Screen` with a doubled *source*, so a wrong arm silently
+            // degrades to one of two modes that are themselves on the GPU.
+            // Instrumented from its first round -- see
             // `GpuBlendDispatches`.
             //
             // `&src_view` first, `&current_accumulator.1` second: the
@@ -9952,10 +9956,10 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// the other **15** blend modes and group isolation on the GPU. That 15
+/// the other **14** blend modes and group isolation on the GPU. That 14
 /// is the app-level count — 27 real `aurora_doc::BlendMode` variants
-/// minus the twelve the predicate admits — and closing it would need the
-/// remaining **16** blend formulas ported to WGSL, which is
+/// minus the thirteen the predicate admits — and closing it would need the
+/// remaining **15** blend formulas ported to WGSL, which is
 /// `aurora-render`'s own count over its own 26-variant enum; the one
 /// mode between the two figures is `Normal`, which needs no formula
 /// because the fixed-function unit already expresses it, and `Dissolve`
@@ -28142,11 +28146,11 @@ mod tests {
         );
     }
 
-    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 15 modes the GPU
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 14 modes the GPU
     /// path still cannot express" (27 `aurora_doc::BlendMode` variants
-    /// minus the twelve admitted as of 0.110.0: `Normal`, `Multiply`,
+    /// minus the thirteen admitted as of 0.111.0: `Normal`, `Multiply`,
     /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
-    /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay` and
+    /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`, `HardLight` and
     /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
@@ -28605,9 +28609,14 @@ mod tests {
     ///   `VividLight` too. **And as of this round `VividLight` is a mode
     ///   whose *both* halves delegate to admitted modes**, which makes the
     ///   confusion more available than it was, not less. It is still
-    ///   disqualified and must be: `VividLight` has no WGSL entry point of
-    ///   its own, and its branch is on `Cs`, which nothing on the GPU path
-    ///   expresses;
+    ///   disqualified and must be, on the one reason that survives:
+    ///   `VividLight` has no WGSL entry point of its own, so no
+    ///   `fragment_entry` and no dispatch arm can express it. **The reason
+    ///   this bullet used to give second — "its branch is on `Cs`, which
+    ///   nothing on the GPU path expresses" — stopped being true in
+    ///   0.111.0**, when `fs_composite_hard_light` landed branching on `Cs`;
+    ///   a branch on the source is no longer a disqualifier by itself, and
+    ///   the conclusion here never depended on it;
     /// - `Divide` (`Cs == 0 -> 1`, else `min(1, Cb / Cs)`), which is a
     ///   *third* guarded division and the one this mode is genuinely easy to
     ///   confuse with arithmetically rather than structurally — `Cb / Cs`
@@ -32494,14 +32503,15 @@ mod tests {
     /// caught at both, with the fold contributing nothing at all in the
     /// second. The fixture keeps its `0.5` regardless, because the standing
     /// transpose guard demands it and is deliberately not special-cased for
-    /// any of the three asymmetric modes. See
+    /// any of the four asymmetric modes. See
     /// [`NORMAL_MULTIPLY_OVERLAY_STACK`].
     ///
     /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
     /// unverified for `fs_composite_overlay` — and for this mode that gap has
-    /// its own specific edge: `select()` on a `vec3<bool>` is a construct no
-    /// other entry point in `composite.wgsl` uses, so no prior round's
-    /// cross-backend evidence covers it. See PLAN.md's 0.110.0 entry.
+    /// its own specific edge: `select()` on a `vec3<bool>` is a construct only
+    /// this entry point and its 0.111.0 transposed twin
+    /// `fs_composite_hard_light` use, so no round before 0.110.0 supplies
+    /// cross-backend evidence for it. See PLAN.md's 0.110.0 entry.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_overlay_blend_document() {
         let Some(context) = real_gpu_context() else {

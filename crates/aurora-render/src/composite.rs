@@ -14586,11 +14586,17 @@ mod tests {
     // each form one rounding of the same product), and both `>` gives
     // `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way (the same value, reached by
     // different expression sequences, so only usually bit-identical). They
-    // differ **only** where the two operands straddle `0.5`. `HardLight`
-    // has no entry point in `composite.wgsl` and is still CPU-only, so it
-    // is not a wrong-arm hazard the way `LinearDodge`/`LinearBurn` are --
-    // but it is exactly what a transposed `src`/`backdrop` binding computes
-    // here.
+    // differ **only** where the two operands straddle `0.5`. **As of
+    // 0.111.0 `HardLight` has its own entry point in `composite.wgsl`
+    // (`fs_composite_hard_light`) and its own `aurora-app` dispatch arm, so
+    // it is now a wrong-arm hazard in the fullest sense the burn and dodge
+    // pairs are, and in one they are not: the hazard here is
+    // *bidirectional*, each of the two modes being the other's transpose.**
+    // (Until 0.111.0 this comment said `HardLight` had no entry point and
+    // was still CPU-only, which was true then and is exactly the claim that
+    // port had to come back and correct.) It remains what a transposed
+    // `src`/`backdrop` binding computes here -- and now also what a
+    // `fragment_entry` naming the sibling computes.
     //
     // **Asymmetry, and it is *conditional* -- the first of that kind on the
     // GPU path.** `ColorBurn` (0.107.0) and `ColorDodge` (0.108.0) are
@@ -14623,8 +14629,9 @@ mod tests {
     // one vendor: Metal and DX12 remain unverified for
     // `fs_composite_overlay` -- and for this mode there is a specific reason
     // to care beyond the usual, namely that `select()` on a `vec3<bool>` is
-    // a construct no other entry point in this file uses, so no prior
-    // round's cross-backend evidence covers it.
+    // a construct only this entry point and its 0.111.0 transposed twin
+    // `fs_composite_hard_light` use, so no round before 0.110.0 supplies
+    // cross-backend evidence for it.
 
     #[test]
     /// The plain-arithmetic case, and the one test here that proves **both**
