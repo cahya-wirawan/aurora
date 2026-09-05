@@ -1302,11 +1302,24 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial
-    // read must not survive.
+    // read must not survive. `elided` is the same idea for the
+    // positions the scan would clear rather than write: applied only
+    // once the scan is known to have succeeded, so a rejected file
+    // clears nothing it merely elided (0.82.2).
     let mut committed: Vec<(SurfaceId, TileId)> = Vec::new();
-    if let Err(err) = read_persisted_tiles(&mut zip, &manifest.layers, store, &mut committed) {
+    let mut elided: Vec<(SurfaceId, TileId)> = Vec::new();
+    if let Err(err) = read_persisted_tiles(
+        &mut zip,
+        &manifest.layers,
+        store,
+        &mut committed,
+        &mut elided,
+    ) {
         roll_back_committed_tiles(store, &committed, &err);
         return Err(err);
+    }
+    for (surface, tile_id) in elided {
+        store.forget_tile(surface, tile_id);
     }
 
     Ok(AurDocument {
@@ -1431,6 +1444,46 @@ fn read_skipped_tiles<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Skipped
 /// independently, after its content surface has already been committed
 /// in full.
 ///
+/// # A grid position with no entry is *cleared*, not skipped (0.82.1)
+///
+/// The same "writes into the caller's live store" property has a second
+/// consequence, and until 0.82.1 this scan had it backwards. The writer
+/// elides a blank tile entirely, so a missing entry means "blank" — but
+/// leaving the key alone only produces a blank read on a store that
+/// holds nothing there. Against a live store already carrying a
+/// previous document under the very same (restart-from-zero) surface
+/// ids, it left that document's pixels showing through the new one, and
+/// `aurora_app::App::open_aur_file`'s own `write_autosave` then
+/// persisted them. Unlike the flat-image path's edge-tile version of
+/// this bug (fixed in 0.82.0), it reached whole *interior* tiles,
+/// because an interior tile that was blank at save time has no entry
+/// either. So the arm calls `TileStore::forget_tile` instead: the key
+/// is dropped, and the store's next `get` there hands back a genuine
+/// `Tile::blank()`.
+///
+/// This scan therefore leaves every grid position of every surface in
+/// `layers` holding exactly this file's content. It does **not** reach
+/// residue outside those grids — a surface the incoming document has no
+/// layer for, or a position beyond an incoming layer's own grid — which
+/// is the part still waiting on the architectural fix PLAN.md's 0.82.1
+/// addendum names.
+///
+/// **The clears are deferred, not applied inline (0.82.2).** This scan
+/// only *records* which positions it would clear, in `elided`; nothing
+/// is actually forgotten from `store` until [`read`] sees the whole scan
+/// succeed. A read that fails part-way therefore leaves every
+/// not-yet-cleared position exactly as it was, on top of `committed`'s
+/// existing guarantee for positions the file actually wrote — so a
+/// rejected container now destroys nothing beyond what its own entries
+/// overwrote, on either list. The first attempt at this (0.82.1) called
+/// `forget_tile` inline instead, which was strictly worse on the failure
+/// path than the bug it fixed: at a position the file simply elided, the
+/// live document's tile had not been touched by anything, and the
+/// inline clear destroyed it anyway, for a read that then failed.
+/// `elided` costs the same twelve bytes per entry `committed` already
+/// does, and the two lists are disjoint by construction (a position is
+/// never on both — it either got a real write or a missing one).
+///
 /// # Errors
 ///
 /// The tile-scan half of [`read`]'s own list: [`IoError::Zip`] /
@@ -1443,6 +1496,7 @@ fn read_persisted_tiles<R: Read + Seek>(
     layers: &LayerTree,
     store: &mut TileStore,
     committed: &mut Vec<(SurfaceId, TileId)>,
+    elided: &mut Vec<(SurfaceId, TileId)>,
 ) -> Result<(), IoError> {
     for (surface, bounds) in persisted_surfaces(layers) {
         // Range-checked and charged against the whole-document budget
@@ -1456,10 +1510,37 @@ fn read_persisted_tiles<R: Read + Seek>(
                 let bytes = match zip.by_name(&name) {
                     Ok(file) => read_capped(file, &name, MAX_TILE_ENTRY_BYTES)?,
                     // No entry for this tile -- it was blank when
-                    // written (see this module's own doc comment) and
-                    // stays at the store's own default. Nothing is
-                    // committed, so nothing is recorded for rollback.
-                    Err(zip::result::ZipError::FileNotFound) => continue,
+                    // written (see this module's own doc comment), so
+                    // the store must read blank here afterwards.
+                    //
+                    // `forget_tile` (deferred, see this function's own
+                    // doc comment), not `continue`: "stays at the
+                    // store's own default" was only true of a store
+                    // that held nothing at this key. This reader writes
+                    // into the *caller's live* store, and a fresh
+                    // `LayerTree` restarts surface ids from the bottom
+                    // of the space, so the key an elided blank tile
+                    // names is very likely one the previous document
+                    // already owns. Skipping it left that document's
+                    // pixels visible under the new one -- in the
+                    // *interior* of the new document, not just at its
+                    // edges, since a whole interior tile is elided when
+                    // it was blank at save time. See the 0.82.1/0.82.2
+                    // addenda in PLAN.md.
+                    //
+                    // Recorded here, cleared only once `read` sees the
+                    // whole scan succeed -- this commits no content, so
+                    // it does not belong on `committed`, but it must
+                    // not touch `store` before this read is known to
+                    // succeed either. Materializes nothing -- still
+                    // deliberately not "write an explicit blank tile",
+                    // which would materialize every blank grid position
+                    // of every persisted surface and is unbounded at the
+                    // §7.3.1 ceiling.
+                    Err(zip::result::ZipError::FileNotFound) => {
+                        elided.push((surface, tile_id));
+                        continue;
+                    }
                     Err(err) => return Err(err.into()),
                 };
                 let decoded = aurora_tile::codec::decode(&bytes)?;
@@ -1559,7 +1640,7 @@ fn read_entry<R: Read + Seek>(
 }
 
 /// Every surface this format persists, paired with the rectangle its
-/// own tile grid is derived from — [`write`]/[`read`]'s **one** shared
+/// own tile grid is derived from — [`write()`]/[`read`]'s **one** shared
 /// answer to "what goes in the archive", so the writer and the reader
 /// cannot disagree about it.
 ///
@@ -2055,6 +2136,128 @@ mod tests {
         assert!(
             restored_tile.texels().iter().all(|s| s.to_f32() == 0.0),
             "a layer with no persisted tile entries must read back blank"
+        );
+    }
+
+    /// The 0.82.1 fix, pinned: an *interior* grid position the writer
+    /// elided because it was blank must read back blank even when the
+    /// store already holds a previous document's pixels under exactly
+    /// that key — which is the normal case, since a fresh `LayerTree`
+    /// restarts surface ids from the bottom of the space.
+    ///
+    /// Deliberately a 2x2 tile grid with only the *far* tile painted,
+    /// so the stale key is genuinely interior to the document rather
+    /// than a partial edge tile: an edge tile is the weaker,
+    /// flat-image-path version of this bug that 0.82.0 already fixed.
+    #[test]
+    fn a_blank_tile_elided_from_the_file_reads_back_blank_over_a_stale_store() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let history = History::new();
+        // 300x300 spans a 2x2 grid at TILE = 256, so (0, 0) is a whole
+        // interior tile rather than a partial edge one.
+        let grid = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 300,
+        };
+        let id = match layers.add_pixel_layer("Two by two", grid, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("id was just created as a pixel layer");
+        };
+        let blank_tile = TileId { x: 0, y: 0 };
+        let painted_tile = TileId { x: 1, y: 1 };
+        {
+            let tile = match store.get_mut(surface, painted_tile) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let texels = tile.texels_mut();
+            if let Some(sample) = texels.get_mut(1) {
+                *sample = f16::from_f32(1.0); // green channel of texel (0, 0)
+            }
+            if let Some(sample) = texels.get_mut(3) {
+                *sample = f16::from_f32(1.0); // alpha channel of texel (0, 0)
+            }
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (300, 300),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        // Exactly one tile entry for a four-position grid: the other
+        // three were blank and were elided. Without this the test could
+        // pass on a file that carried an explicit all-zero (0, 0)
+        // entry, which is a different mechanism entirely.
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.get_ref().clone())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            archive
+                .file_names()
+                .filter(|name| name.starts_with("tiles/"))
+                .count(),
+            1,
+            "only the one painted tile may have an entry: {:?}",
+            archive.file_names().collect::<Vec<_>>()
+        );
+        drop(archive);
+
+        // The previous document's residue, written under the very key
+        // the file has no entry for. Distinctive red, so a stale read
+        // is unmistakable.
+        {
+            let tile = match store.get_mut(surface, blank_tile) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let texels = tile.texels_mut();
+            if let Some(sample) = texels.get_mut(0) {
+                *sample = f16::from_f32(1.0);
+            }
+            if let Some(sample) = texels.get_mut(3) {
+                *sample = f16::from_f32(1.0);
+            }
+        }
+
+        bytes.set_position(0);
+        if let Err(err) = read(bytes, &mut store) {
+            unreachable!("{err:?}");
+        }
+
+        let restored = match store.get(surface, blank_tile) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            restored.texels().iter().all(|s| s.to_f32() == 0.0),
+            "a tile the file elided as blank must not read back the previous document's pixels"
+        );
+
+        // Non-vacuity in the other direction: the read really did run
+        // and really did restore the one tile the file does carry.
+        let painted = match store.get(surface, painted_tile) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            painted.texels().get(1).map(|sample| sample.to_f32()),
+            Some(1.0),
+            "the one tile the file does carry must still round-trip"
         );
     }
 
@@ -4079,6 +4282,87 @@ mod tests {
         assert!(
             store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
             "a successful read must leave its mask tile in the store"
+        );
+    }
+
+    /// The 0.82.2 fix, pinned: a read that fails *after* eliding one
+    /// position must not have cleared that position on the way. 0.82.1
+    /// called `forget_tile` inline the moment it saw a missing entry —
+    /// correct on a successful read, but on a read that then fails
+    /// later (here, on the mask tile, which `persisted_surfaces` always
+    /// yields after a layer's own content), it destroyed a live tile
+    /// nothing else had touched, for an open that ultimately failed.
+    ///
+    /// Same shape as `a_read_that_fails_on_a_mask_tile_leaves_no_content_tile_behind_either`,
+    /// but with no content entry at all rather than a valid one: the
+    /// content position is *elided*, not *committed*, so it is
+    /// `elided`'s guarantee under test, not `committed`'s.
+    #[test]
+    fn a_failed_read_does_not_clear_a_position_it_only_elided() {
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // No entry at all for the content tile -- elided, not written --
+        // and a mask entry `codec::decode` genuinely rejects, so the
+        // scan fails strictly after recording the elision.
+        let mask_entry = super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 });
+        let container = container_with(
+            &manifest_bytes,
+            &[(mask_entry, b"this is not an encoded tile".to_vec())],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        // The live document's own tile, sitting under the exact key the
+        // file's content surface will elide. Distinctive, so a clear
+        // would be unmistakable.
+        {
+            let tile = match store.get_mut(content_surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for sample in tile.texels_mut() {
+                *sample = f16::from_f32(1.0);
+            }
+        }
+
+        match read(container, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+
+        let survived = match store.get(content_surface, TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            survived.texels().iter().all(|s| exactly(s.to_f32(), 1.0)),
+            "a position the read only elided must survive a read that failed later, \
+             untouched by the clear that never got to run"
+        );
+        assert!(
+            !store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "the mask tile itself must still not survive its own decode failure"
         );
     }
 

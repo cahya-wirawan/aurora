@@ -1192,7 +1192,8 @@ fn canvas_pipeline_min_filter_linear_still_applies_when_minified() {
 ///
 /// **The second half of the test covers the second half of the fix.**
 /// The A/B check above is a control for the *upload* step: it fails if
-/// `premultiply_rgba` stops running, and it passes either way for the
+/// the upload-time premultiply stops running, and it passes either way
+/// for the
 /// shader line, since a premultiplied atlas makes both fixtures
 /// identical before `fs_canvas` ever sees them. So the test also renders
 /// a **uniform 50%-alpha white** document at the same minified zoom,
@@ -1216,7 +1217,10 @@ fn canvas_pipeline_min_filter_linear_still_applies_when_minified() {
 ///   requires ~150–158. The single blended pixel on the hard edge above
 ///   moves from **186** to **129** in the same run — the 57-unit gap
 ///   this test's own scan records.
-/// - With `fs_canvas` correct and `premultiply_rgba` made a no-op, the
+/// - With `fs_canvas` correct and the upload-time premultiply made a
+///   no-op (`premultiply_rgba` when this was measured; since 0.92.1 the
+///   equivalent mutation target is `extend_premultiplied_le_bytes`, which
+///   both upload paths now share), the
 ///   A/B assertion fails at sample 24: the transparent-**black** frame
 ///   reads **46** (pure checkerboard) where the transparent-**white**
 ///   frame reads **255** (fully blown out) — a **209/255** gap, which is

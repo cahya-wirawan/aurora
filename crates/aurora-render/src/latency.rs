@@ -131,7 +131,19 @@ fn upload_and_composite_one_dirtied_tile_stays_within_a_generous_ci_budget() {
         let start = Instant::now();
         let _stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
         let src_view = residency.view();
-        compositor.composite_over(&context, &dst_view, src_view);
+        // `composite_over` only *records* into a caller-supplied encoder
+        // as of 0.86.0, so the encoder and the submit it used to do
+        // internally live here now -- deliberately *inside* the timed
+        // span, because what this module measures is upload + composite
+        // *submission* latency, and moving the submit out would silently
+        // shrink the very thing under test.
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composite-latency"),
+            });
+            compositor.composite_over(&context, &mut encoder, &dst_view, src_view);
+            queue.submit(std::iter::once(encoder.finish()));
+        }
         samples.push(start.elapsed());
     }
     // Flush before the test ends, tidy rather than load-bearing --

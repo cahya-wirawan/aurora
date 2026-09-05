@@ -149,6 +149,17 @@ impl FocusManager {
     /// Clears focus if the currently focused widget no longer exists in
     /// `tree` (see this type's own doc comment). Returns whether focus
     /// was actually cleared.
+    ///
+    /// This is the half of the stale-focus invariant this type owns.
+    /// The other half lives in [`WidgetTree::accessibility_update`],
+    /// which falls back to the tree's root if the id it's handed is
+    /// gone — that guard is what keeps a stale `self.focused` from ever
+    /// reaching `accesskit_consumer` as an invalid `TreeUpdate.focus`
+    /// and panicking there, but it doesn't repair `self.focused` itself.
+    /// A caller that removes widgets (a tree collapse, a dialog close,
+    /// a palette close) should still call `validate` afterward so this
+    /// type's own idea of focus doesn't go on pointing at a dead id even
+    /// though the next accessibility push would no longer crash on it.
     pub fn validate<W>(&mut self, tree: &WidgetTree<W>) -> bool {
         if let Some(id) = self.focused
             && !tree.contains(id)

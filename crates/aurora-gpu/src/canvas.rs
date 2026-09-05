@@ -8,13 +8,17 @@
 //!
 //! Self-contained (owns its own shader module, bind group layout, and
 //! pipeline cache), the same shape `aurora_render::TileCompositor`
-//! already uses — deliberately *not* a self-contained draw-and-submit
-//! method the way that type's `composite_over` is, though: the caller
-//! (`aurora-app`) needs to draw the canvas within one existing render
-//! pass alongside its own background clear (a viewport-restricted draw
-//! into the canvas dock area, not the whole window), so this exposes
+//! already uses. It goes one step further than that type's
+//! `composite_over`, though: `composite_over` opens its own render pass
+//! into a caller-supplied `wgpu::CommandEncoder` (it stopped submitting
+//! one of its own in 0.86.0, which batched a whole composite tile into
+//! one submit — this line said "draw-and-submit" until 0.86.1), whereas
+//! the caller here (`aurora-app`) needs to draw the canvas *within* one
+//! existing render pass alongside its own background clear (a
+//! viewport-restricted draw into the canvas dock area, not the whole
+//! window). So this exposes
 //! [`CanvasPipeline::pipeline`]/[`CanvasPipeline::bind_group`] for the
-//! caller's own pass instead.
+//! caller's own pass instead of opening a pass at all.
 
 use crate::pipeline::{Blend, PipelineCache, PipelineKey};
 use crate::residency::TileResidency;

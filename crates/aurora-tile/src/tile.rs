@@ -81,6 +81,14 @@ impl Tile {
     /// Reconstructs a tile from decoded samples (paging in from disk).
     /// Starts clean (`dirty: None`) — a tile just read back from the
     /// scratch disk matches what's stored there by definition.
+    ///
+    /// **That is not the same as "an upload is not owed"**, and since
+    /// 0.91.0 the *store* says so rather than the tile: if the key was
+    /// dirty when [`crate::TileStore`]'s own eviction took it out of
+    /// memory, the store records that and re-marks the reinstated tile
+    /// dirty over its whole area on the way back in (see
+    /// `TileStore::is_dirty`). So a caller must not read "clean here" as
+    /// "clean in the store" — a paged-in tile can and does arrive dirty.
     #[must_use]
     pub(crate) fn from_texels(texels: Vec<f16>) -> Self {
         Self {

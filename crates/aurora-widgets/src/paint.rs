@@ -6,7 +6,7 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, and `Panel` — solid rounded-rect shapes, the simplest of
+//! `ListRow`, `TreeItem`, `Panel`, and `Dialog` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -30,9 +30,36 @@
 //! thumb on top of it, but that is *all* it is: nothing in this crate
 //! scrolls any content, so the thumb's own position and length are a
 //! pure function of its state's numbers and never of a real viewport
-//! (`widgets::scrollbar`'s own module doc comment). Every other
-//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
-//! real, deliberate "nothing to paint," not an error.
+//! (`widgets::scrollbar`'s own module doc comment). `TreeItem` paints
+//! the same selection highlight `ListRow` does, from the same token,
+//! with one real difference: a row's own layout box grows to contain
+//! its children, so the fill is clamped to one row's height
+//! ([`paint_tree_item`]) — a selected group would otherwise paint over
+//! every descendant beneath it. It draws no disclosure triangle and no
+//! label (this crate draws no glyphs at all), so a collapsed row and an
+//! expanded one are pixel-identical apart from what their descendants
+//! do; `expanded` reaches the accessibility node only. `Dialog` paints
+//! a modal's own surface — a `surface.overlay` rounded rect with an
+//! unconditional `border.default` outline, the same fill-plus-border
+//! shape `Panel` already has and for the same measured reason (without
+//! it, a Light-theme dialog is byte-identical to the panel behind it;
+//! [`paint_dialog`] has the full account, the vocabulary citation for
+//! `surface.overlay` over `surface.raised`, and the honest
+//! Colour-Critical residual) — and **nothing else**: no title glyph, no
+//! message glyph (this crate draws no glyphs), and no scrim dimming the
+//! window behind it (out of scope, see `widgets::dialog`'s own module
+//! doc comment). Every other
+//! [`WidgetKind`] (`Container` on its own, a dialog's own message node
+//! included) returns `Ok(vec![])` too — a real, deliberate "nothing to
+//! paint," not an error.
+//!
+//! Every kind's own geometry is built from bounds that
+//! [`clip_to_clipping_ancestors`] has already intersected with any
+//! ancestor declaring a clipping `taffy::Overflow`, so no widget paints
+//! outside the panel that holds it and one entirely past its panel's
+//! edge paints nothing at all — see that function for the measured case
+//! (a 21 px row in a 13 px panel body) and for why no per-widget height
+//! clamp can stand in for it.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
@@ -48,8 +75,8 @@
 //! (`accent.primary`/`accent.primary_active`, `surface.sunken`,
 //! `state.disabled_opacity`) — invariant §7.3.10, never a literal. The
 //! returned `[f32; 4]` is straight (unpremultiplied) sRGB-gamma-encoded
-//! RGBA, [`Color::to_srgb_f32`]'s own convention — matching what
-//! [`crate::render::PathPipeline::bind_group`]'s own doc comment
+//! RGBA, [`aurora_theme::Color::to_srgb_f32`]'s own convention —
+//! matching what [`crate::render::PathPipeline::bind_group`]'s own doc comment
 //! expects. This function itself never linearizes for an sRGB-aware
 //! render target; that's a real caller's own job once it actually owns
 //! one (`aurora-app::linearize_paint_color` does it for the real
@@ -71,11 +98,13 @@ use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
 use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
 
+use taffy::Overflow;
+
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
-    TextFieldState, WidgetKind,
+    TextFieldState, TreeItemState, WidgetKind, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -150,6 +179,9 @@ pub fn paint_widget(
 ) -> Result<Vec<Paint>, WidgetError> {
     let bounds = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
+    let Some(bounds) = clip_to_clipping_ancestors(tree, id, bounds) else {
+        return Ok(vec![]);
+    };
     match kind {
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
         WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
@@ -163,9 +195,97 @@ pub fn paint_widget(
             paint_color_swatch(*state, bounds, theme, scales, scale_factor)
         }
         WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales, scale_factor),
+        // By reference, unlike `ListRow`/`ColorSwatch` above:
+        // `TreeItemState` owns a `String` label, so it is deliberately
+        // not `Copy` (see `list_row`'s own doc comment for why the two
+        // row types stayed separate).
+        WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
+        WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
+}
+
+/// `bounds`, intersected with the box of every ancestor that clips its
+/// own content — `taffy::Overflow` anything but `Visible`, tested per
+/// axis, since `taffy` carries `overflow.x` and `overflow.y`
+/// independently. `None` when nothing of the widget survives the
+/// intersection, which [`paint_widget`] turns into the same real,
+/// deliberate `Ok(vec![])` an unselected row already returns.
+///
+/// **This is what keeps a widget from painting outside the panel that
+/// contains it, and it is a real, measured gap, not a hypothetical.**
+/// A panel body (`aurora_ui::panel`'s own `body_style`, the only
+/// `Overflow::Hidden` in the workspace today) gets a content-independent
+/// share of the dock rail, while the rows inside it each carry a hard
+/// one-line `min_size.height` floor. Measured in a real
+/// `aurora_ui::build_workspace` at an 800×40 window: the History body
+/// resolves to 13 px tall and its first row to 21 px, so the row's own
+/// box extends 8 px past the body — and the Layers panel's tree rows do
+/// exactly the same thing, at exactly the same numbers. Painting a
+/// selected row's `accent.primary` fill from its own unclipped bounds
+/// would lay that overhang across whatever is docked below.
+///
+/// `paint_tree_item`'s own `row_height(scales).min(bounds.height)` does
+/// **not** cover this and never did: for a 21 px row it computes
+/// `min(21, 21) = 21`. That clamp exists for a different problem — a
+/// selected *group*'s box spanning its whole subtree — and this one is
+/// about the ancestor, which no per-widget height clamp can see.
+///
+/// The clip is applied to the *rect*, before tessellation, rather than
+/// as a real scissor: a partly-clipped rounded rect therefore keeps its
+/// `scales.radius.sm` corners at the cut instead of being sliced flat.
+/// That is a visible approximation only in the already-degenerate case
+/// this exists to contain, and a genuine scissor belongs to
+/// `crate::render`/the caller's own render pass, not here. Clipping to
+/// nothing also makes paint agree with `WidgetTree::hit_test`, which
+/// already refuses to descend into a parent whose bounds exclude the
+/// point: a row fully past the bottom of its panel is now both
+/// unreachable *and* invisible, rather than unreachable but drawn.
+fn clip_to_clipping_ancestors(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    bounds: Rect,
+) -> Option<Rect> {
+    let mut left = bounds.x;
+    let mut top = bounds.y;
+    let mut right = bounds.x.saturating_add(i64::from(bounds.width));
+    let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
+    let mut clipped = false;
+    let mut current = tree.parent(id);
+    while let Some(ancestor) = current {
+        if let (Some(style), Some(clip)) = (tree.style(ancestor), tree.bounds(ancestor)) {
+            if style.overflow.x != Overflow::Visible {
+                clipped = true;
+                left = left.max(clip.x);
+                right = right.min(clip.x.saturating_add(i64::from(clip.width)));
+            }
+            if style.overflow.y != Overflow::Visible {
+                clipped = true;
+                top = top.max(clip.y);
+                bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
+            }
+        }
+        current = tree.parent(ancestor);
+    }
+    // Returned untouched, not merely unchanged, when no ancestor clips
+    // at all: a widget whose bounds are still the default zero rect
+    // (every test in this module that paints without a
+    // `compute_layout`/`set_bounds` first) must keep painting the
+    // degenerate shape it always did, rather than being turned into an
+    // `Ok(vec![])` by an empty intersection with itself.
+    if !clipped {
+        return Some(bounds);
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
 }
 
 fn paint_button(
@@ -507,6 +627,131 @@ fn paint_command_palette(
     Ok(paints)
 }
 
+/// A modal dialog's own surface: a `scales.radius.md` rounded rect
+/// filled with `surface.overlay`, an **unconditional `border.default`
+/// outline over it**, and the conditional [`control_outline`] on top of
+/// that in a theme whose `border.control_opacity` is above zero. No
+/// title glyph, no message glyph, no scrim.
+///
+/// **`surface.overlay`, not `surface.raised`.**
+/// `design/tokens/vocabulary.md` defines `surface.overlay` as
+/// "Elevation 2: modals, dialogs" and `surface.raised` as "Elevation 1:
+/// dropdowns, popovers, context menus" — a modal alert
+/// (`widgets::dialog` builds nothing else: `Role::AlertDialog` plus
+/// `Node::set_modal`) is the former, a command palette the latter.
+///
+/// **The unconditional border is the load-bearing part, not decoration
+/// — a fill alone made this widget genuinely invisible.** In the Light
+/// theme `design/themes/light.toml` resolves `surface.overlay`,
+/// `surface.raised`, `surface.panel` *and* `surface.canvas` all to
+/// `neutral.900` `#f5f5f6`, and sets `border.control_opacity = 0.0`, so
+/// through `0.79.0` a dialog's entire paint was one `#f5f5f6` fill with
+/// [`control_outline`] returning `None` — byte-identical to the
+/// [`paint_panel`] surface behind it, at 1.000:1, with nothing else
+/// (this crate draws no shadows) to separate them. That is reachable in
+/// the shipping app: `aurora-app`'s enforced 640×480 minimum window
+/// still centres a real dialog over real `WidgetKind::Panel` chrome.
+/// [`paint_panel`] hit exactly this failure mode once already, on real
+/// hardware, and was fixed with an unconditional `border.default`
+/// stroke at a 1.0 logical-pixel width; this is that same fix, the same
+/// token, the same width, applied to the same class of bug rather than
+/// a new invention. In Light it buys a 2.47:1 edge against both the
+/// dialog's own fill and the panel behind it.
+///
+/// **The border is a chromatic no-op in Dark, the default theme.**
+/// `design/themes/dark.toml` resolves both `border.default` and
+/// `surface.overlay` to the same `neutral.300` — the stroke this
+/// function draws is there for every *other* theme, but in Dark it
+/// paints a shape in its own fill's exact colour, invisible on its own.
+/// Dark's dialog is still genuinely visible: its fill (`neutral.300`)
+/// differs from `surface.panel` (`neutral.150`) behind it, so
+/// visibility there rests entirely on fill-vs-panel contrast, the same
+/// mechanism [`paint_command_palette`] already relies on. Not a gap —
+/// just worth knowing before assuming this stroke is what separates a
+/// dialog from its backdrop in the theme most users run.
+///
+/// **The honest residual: Colour-Critical.** There, `border.default`
+/// (`cc.border_mid` `#6e6e6e`) clears `cc.overlay` `#5a5a5a` by only
+/// ≈1.35:1 and `cc.canvas` `#545454` by ≈1.49:1 — a real edge, but a
+/// faint one. That is **not a new gap and not specific to this
+/// function**: [`paint_panel`]'s own border is the same token against
+/// the same canvas at the same ≈1.49:1, so it is the existing, accepted
+/// tradeoff of a deliberately neutral, deliberately close-valued grey
+/// theme (`design/themes/color-critical.toml`'s own header: "not
+/// extreme contrast, just non-biasing chroma"). Raising it would mean
+/// changing that theme's `border.default`, a design-owner decision
+/// (PRD FR-027 *Ownership*), not this function's.
+///
+/// **Why the conditional [`control_outline`] is kept as well**, unlike
+/// [`paint_panel`], which has only the one border: the two High
+/// Contrast themes set `border.control_opacity = 1.0` with
+/// `border.control` at pure white/black, which is their brief's
+/// "mandatory strong borders on every control" taken literally. Dropping
+/// it to match `paint_panel` exactly would have *downgraded* those two
+/// themes from a 21:1 outline to `border.default`'s `hc.mid_gray`. So a
+/// dialog paints two shapes in Dark/Light/Colour-Critical and three in
+/// the two High Contrast themes, the third drawn last and therefore on
+/// top — coincident with the second, and deliberately so.
+///
+/// **These are two functions rather than one token-parameterized helper
+/// for a documentation reason, not a testing one.** An earlier version
+/// of this comment said "do not simplify," implying a shared helper
+/// would make some test vacuous; that was imprecise — nothing here
+/// depends on the duplication, and no drift between the two has
+/// occurred. The real reason is narrower: each function carries its own
+/// `vocabulary.md` elevation citation next to the token it actually
+/// resolves, which a shared helper would move away from both call
+/// sites. Worth knowing either way: the two tokens resolve
+/// *byte-identically* in three of the five built-in themes — Light
+/// (both `neutral.900`), High Contrast Dark (both `hc.black`) and High
+/// Contrast Light (both `hc.white`) — so in those three no
+/// rendered-pixel test can tell this function's token choice from
+/// [`paint_command_palette`]'s. Only Dark (`neutral.200` vs
+/// `neutral.300`) and Colour-Critical (`cc.raised` `#4c4c4c` vs
+/// `cc.overlay` `#5a5a5a`) distinguish them, which is why
+/// `a_dialog_paints_surface_overlay_not_the_command_palettes_surface_
+/// raised` is scoped to exactly those two and opens with an explicit
+/// `assert_ne!` on the tokens so it cannot quietly become a tautology.
+///
+/// Still a real, honest gap, the same one [`paint_command_palette`]
+/// has: neither the dialog's title nor its message is drawn (no text
+/// shaping in this crate at all), and nothing here paints a scrim
+/// behind the dialog — see `widgets::dialog`'s own module doc comment.
+fn paint_dialog(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px `paint_panel` strokes its own border at,
+    // and a plain engineering default for the same reason: no "border
+    // width" token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.md as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
+
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [br, bg, bb] = theme.border.default.to_srgb_f32();
+
+    let mut paints = vec![
+        (fill_mesh, [fr, fg, fb, 1.0]),
+        (border_mesh, [br, bg, bb, 1.0]),
+    ];
+    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
 /// A colour swatch's own fill: `state.color` itself — the one widget in
 /// this module whose fill colour is *not* a `Theme` token (see this
 /// module's own doc comment and `widgets::color_swatch`'s for why: the
@@ -556,6 +801,21 @@ fn paint_color_swatch(
 /// "primary buttons, active tool," so this isn't a new use invented
 /// here. `scales.radius.sm`, the same small-control radius every other
 /// non-panel shape in this module uses.
+///
+/// **The fill really is the row's whole box, and deliberately so** —
+/// unlike [`paint_tree_item`], which clamps to one row's height because
+/// a tree row's box grows to contain its children. A list row has no
+/// children to contain, and a command-palette row's box is *meant* to be
+/// its whole share of a sparse palette (`widgets::command_palette`'s own
+/// `row_style` sets `flex_grow: 1.0`), so clamping here would leave a
+/// palette row highlighted over only part of its own click target.
+/// Measured rather than argued: applying `row_height(scales).min(bounds.
+/// height)` here fails ten existing `tests/gallery.rs` cases, five of
+/// them golden-image comparisons.
+///
+/// Staying inside the *panel* is a different question, and it is
+/// [`clip_to_clipping_ancestors`]' job for every widget kind at once —
+/// including `TreeItem`, whose own height clamp never addressed it.
 fn paint_list_row(
     state: ListRowState,
     bounds: Rect,
@@ -571,6 +831,72 @@ fn paint_list_row(
         bounds.y as f32,
         bounds.width as f32,
         bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
+/// A tree row's own highlight — the same shape [`paint_list_row`]
+/// paints, for the same reason and from the same token: nothing at all
+/// when the row isn't selected (a real, deliberate `Ok(vec![])`),
+/// `accent.primary` at `scales.radius.sm` when it is,
+/// `state.disabled_opacity` folded into the alpha when it's disabled.
+///
+/// **The one real difference, and it is load-bearing: the fill is one
+/// row tall, not the whole box.** A tree row's own layout box grows to
+/// contain its children (`widgets::tree_view::style` — that is what
+/// makes a subtree's rows nest and indent in the first place), so a
+/// selected *group* has bounds spanning every descendant beneath it.
+/// Painting `bounds.height` would lay an opaque `accent.primary`
+/// rectangle over that whole subtree — every descendant's own highlight
+/// included, since `WidgetTree::paint_order` draws a parent before its
+/// children only for the fill order, and this fill is opaque. Clamping
+/// to `row_height(scales)` paints exactly the row itself. The
+/// `.min(bounds.height)` guard keeps a row that is somehow *shorter*
+/// than one line (a caller-supplied `set_bounds`, a squeezed layout)
+/// from painting outside its own bounds.
+///
+/// **What it does not do is keep the row inside its own *panel*.** For a
+/// 21 px row in a 13 px panel body it computes `min(21, 21) = 21` and
+/// overhangs by 8 px, exactly as an unclamped `ListRow` would; that
+/// class of overflow belongs to [`clip_to_clipping_ancestors`], which
+/// runs before this function and hands it already-clipped `bounds`.
+///
+/// **A latent interaction, not yet reachable**: `clip_to_clipping_ancestors`
+/// can move `bounds.y` down when a row is clipped at its *top* (a
+/// scrolled-past-the-start row, once a scrolling container exists — see
+/// `history_panel.rs`'s own disclosed damage-rect gap for the sibling case
+/// clipping already guards). This function always paints `row_height`
+/// starting from whatever `bounds.y` it receives, so a group row clipped
+/// at the top would have its one-row highlight anchored over its first
+/// visible *descendants* rather than its own (now-scrolled-off) row. No
+/// caller can produce a top-clipped row today — nothing in this crate
+/// scrolls, and every panel body only ever clips at the *bottom* — so this
+/// is recorded rather than fixed.
+fn paint_tree_item(
+    state: &TreeItemState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    if !state.selected {
+        return Ok(vec![]);
+    }
+    let height = row_height(scales).min(bounds.height as f32);
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        height,
         scales.radius.sm as f32,
     );
     let tolerance = tolerance_for_scale_factor(scale_factor);
@@ -661,12 +987,13 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, ListRowState, ScrollbarRange, ScrollbarState, WidgetKind,
-        command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_scrollbar, insert_slider, insert_text_field, new_tree,
+        CommandEntry, DialogAction, DialogHandle, ListRowState, ScrollbarRange, ScrollbarState,
+        WidgetKind, command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
+        insert_command_palette, insert_container, insert_dialog, insert_scrollbar, insert_slider,
+        insert_text_field, insert_tree_item, insert_tree_view, new_tree, row_height,
         set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
         set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
-        set_text_field_disabled, toggle_checkbox,
+        set_text_field_disabled, set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
     };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
@@ -674,6 +1001,9 @@ mod tests {
 
     const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
     const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+    const COLOR_CRITICAL_THEME_TOML: &str =
+        include_str!("../../../design/themes/color-critical.toml");
+    const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
     const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
     fn dark_theme() -> Theme {
@@ -730,6 +1060,56 @@ mod tests {
         match themes.resolve("TestHighContrast", &palette) {
             Ok(theme) => theme,
             Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The real, committed Colour-Critical theme -- the *second* of the
+    /// only two built-in themes that resolve `surface.overlay` and
+    /// `surface.raised` to different values (Dark is the first), which
+    /// is the only reason this module needs a third real theme fixture
+    /// at all. `extends = "Dark"`, so the parent has to be registered
+    /// first, and the name is the exact, case-sensitive
+    /// `"Color-Critical"` that file's own `name` field holds.
+    fn color_critical_theme() -> Theme {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("the committed Dark theme must register: {err:?}");
+        }
+        if let Err(err) = themes.register(COLOR_CRITICAL_THEME_TOML) {
+            unreachable!("the committed Color-Critical theme must register: {err:?}");
+        }
+        match themes.resolve("Color-Critical", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("the committed Color-Critical theme must resolve: {err:?}"),
+        }
+    }
+
+    /// The real, committed Light theme. One test needs it --
+    /// `a_light_theme_dialog_is_not_invisible_against_the_panel_behind_it`
+    /// -- because Light is the theme where every elevated surface token
+    /// collapses onto the same `neutral.900` value *and*
+    /// `border.control_opacity` is `0.0`. `extends = "Dark"`, so the
+    /// parent has to be registered first, same as `color_critical_theme`
+    /// above.
+    fn light_theme() -> Theme {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("the committed Dark theme must register: {err:?}");
+        }
+        if let Err(err) = themes.register(LIGHT_THEME_TOML) {
+            unreachable!("the committed Light theme must register: {err:?}");
+        }
+        match themes.resolve("Light", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("the committed Light theme must resolve: {err:?}"),
         }
     }
 
@@ -1820,6 +2200,367 @@ mod tests {
         );
     }
 
+    /// A selected tree row paints the same token a selected list row
+    /// does — `accent.primary`, `design/tokens/vocabulary.md`'s own
+    /// "selection highlight".
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_selected_tree_row_paints_accent_primary() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 21,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, row, &theme, &scales, 1.0);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 200x21 selected tree row must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(color, [r, g, b, 1.0]);
+    }
+
+    #[test]
+    fn an_unselected_tree_row_has_no_paint() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = dark_theme();
+        let paints = match paint_widget(&tree, row, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "an unselected row paints nothing at all, the same as an unselected list row"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_selected_tree_row_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_tree_item_disabled(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 21,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = single_paint(&tree, row, &theme, &scales, 1.0);
+        assert_eq!(color[3], theme.state.disabled_opacity);
+    }
+
+    /// The one real difference from `paint_list_row`, and the reason
+    /// `paint_tree_item` exists at all: a selected *group*'s own layout
+    /// box spans every descendant beneath it (that is what makes a
+    /// subtree nest), so painting `bounds.height` would lay an opaque
+    /// rectangle over all of them. Measured through a real
+    /// `compute_layout`, not a hand-set `set_bounds`, so the group's
+    /// bounds are the ones the layout engine actually produces.
+    #[test]
+    fn a_selected_groups_highlight_is_one_row_tall_not_its_whole_subtree() {
+        let root_style = taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(300.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        };
+        let (mut tree, root) = new_tree(root_style);
+        let scales = scales();
+        // Through a real `Role::Tree` container, not straight off the
+        // root: a `Row`-direction parent's own `align_items: Stretch`
+        // would inflate a row's `auto` height to the whole 200px, which
+        // is a property of the *parent*, not of `tree_view::style`.
+        let view = match insert_tree_view(&mut tree, root, Some("Layers")) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match insert_tree_item(&mut tree, view, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for label in ["Child A", "Child B"] {
+            if let Err(err) = insert_tree_item(&mut tree, group, &scales, label, false) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Err(err) = set_tree_item_selected(&mut tree, group, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(300.0, 200.0);
+
+        let Some(bounds) = tree.bounds(group) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            bounds.height, 63,
+            "the group's own box really does span its own row plus both children"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, group, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (bottom - top - 21.0).abs() < 0.5,
+            "the highlight must be one row tall (21px), not the whole 63px box: \
+             {top} -> {bottom}"
+        );
+    }
+
+    /// A panel body that hides its overflow, sized the way a real dock
+    /// rail sizes one: a content-independent share, here deliberately
+    /// shorter than the one-line `min_size.height` floor its rows carry.
+    /// `overflow: Hidden` needs `Overflow::Scroll`'s sibling semantics
+    /// only for clipping, not scrolling, which is all this exercises.
+    fn clipping_body(height: f32) -> taffy::Style {
+        taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::length(height),
+            },
+            overflow: taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// One row's own style, the same shape `aurora_ui::panel`'s shared
+    /// `row_style` builds: an `auto` height with a hard one-line floor,
+    /// which is exactly what lets a row out-grow an undersized body.
+    /// (It was `aurora_ui::history_panel`'s until `0.77.4` moved it up to
+    /// `panel` and gave it a second caller, the Properties panel.)
+    ///
+    /// **This is a deliberate replica, and it cannot be shared.**
+    /// `aurora-widgets` sits *below* `aurora-ui` in the layering rule
+    /// (`scripts/layering.json`, PRD §7.2), so importing the real
+    /// function here is not merely awkward, it is forbidden — which also
+    /// means nothing mechanical will notice if the two drift apart. The
+    /// tests below are then testing a shape production may no longer
+    /// have. Whoever changes `aurora_ui::panel::row_style` has to change
+    /// this by hand; that manual step is the cost of the layering rule,
+    /// not an oversight. What actually needs to match is the pair that
+    /// makes the clip observable — an `auto` main size with a
+    /// `length(row_height)` minimum under it — not the whole style.
+    fn floored_row_style(scales: &Scales) -> taffy::Style {
+        taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::percent(1.0_f32),
+                height: taffy::style_helpers::auto(),
+            },
+            min_size: taffy::Size {
+                width: taffy::style_helpers::length(row_height(scales)),
+                height: taffy::style_helpers::length(row_height(scales)),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A selected `ListRow` whose own one-line floor makes it taller
+    /// than the panel body holding it must still paint inside that body.
+    /// Measured, not hypothetical: a real `aurora_ui::build_workspace`
+    /// at an 800×40 window gives the History body 13 px and its rows
+    /// 21 px each. Before `0.77.3` the fill was built straight from the
+    /// row's own unclipped bounds and hung 8 px over whatever was docked
+    /// below.
+    #[test]
+    fn a_selected_list_rows_highlight_stays_inside_a_body_that_clips_its_overflow() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = match tree.insert(
+            body,
+            floored_row_style(&scales),
+            accesskit::Node::new(accesskit::Role::ListItem),
+            WidgetKind::ListRow(ListRowState {
+                selected: true,
+                disabled: false,
+            }),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(row_bounds) = tree.bounds(row) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            row_bounds.height, 21,
+            "the row really does out-grow its 13px body -- that is the precondition: \
+             {row_bounds:?}"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 13.0,
+            "a 21px row in a 13px clipping body must paint only inside it: {top} -> {bottom}"
+        );
+    }
+
+    /// The same clip, taken to its end: a row laid out entirely past the
+    /// bottom of its clipping body paints nothing at all. That makes
+    /// paint agree with `WidgetTree::hit_test`, which already refuses to
+    /// descend into a parent whose own bounds exclude the point.
+    #[test]
+    fn a_selected_list_row_past_the_bottom_of_its_body_paints_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            match tree.insert(
+                body,
+                floored_row_style(&scales),
+                accesskit::Node::new(accesskit::Role::ListItem),
+                WidgetKind::ListRow(ListRowState {
+                    selected: true,
+                    disabled: false,
+                }),
+            ) {
+                Ok(id) => rows.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(&last) = rows.last() else {
+            unreachable!("three rows were just inserted");
+        };
+        let Some(last_bounds) = tree.bounds(last) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            last_bounds.y >= 13,
+            "the third row must start past the 13px body -- the precondition: {last_bounds:?}"
+        );
+        let theme = dark_theme();
+        let paints = match paint_widget(&tree, last, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "a row wholly outside its clipping body must paint nothing, the same \
+             Ok(vec![]) an unselected row returns"
+        );
+    }
+
+    /// The same guard for `TreeItem`, whose own
+    /// `row_height(scales).min(bounds.height)` clamp never covered this:
+    /// for a 21px row in a 13px body it computes `min(21, 21) = 21` and
+    /// overhangs exactly as an unclamped `ListRow` would.
+    #[test]
+    fn a_selected_tree_rows_highlight_stays_inside_a_body_that_clips_its_overflow() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = match insert_tree_item(&mut tree, body, &scales, "Squeezed", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(row_bounds) = tree.bounds(row) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            row_bounds.height, 21,
+            "the tree row out-grows its 13px body too: {row_bounds:?}"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 13.0,
+            "a tree row must be clipped to its own body as well: {top} -> {bottom}"
+        );
+    }
+
+    /// A row squeezed shorter than one line must not paint outside its
+    /// own bounds — what `.min(bounds.height)` is for.
+    #[test]
+    fn a_tree_rows_highlight_never_exceeds_its_own_bounds() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Squeezed", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 8,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 8.0,
+            "an 8px-tall row's highlight must stay inside it: {top} -> {bottom}"
+        );
+    }
+
     #[test]
     #[allow(clippy::float_cmp)]
     fn a_laid_out_color_swatch_paints_its_own_arbitrary_color() {
@@ -1941,6 +2682,341 @@ mod tests {
             border_color,
             [r, g, b, 1.0],
             "a panel's own border must use border.default at full opacity"
+        );
+    }
+
+    /// The window a dialog test lays out against. Any definite size
+    /// works; this one matches `widgets::dialog`'s own layout tests so
+    /// the two read as the same fixture.
+    const DIALOG_WINDOW: (f32, f32) = (800.0, 600.0);
+
+    /// A real, laid-out one-action dialog in a **definitely sized**
+    /// root. The size is load-bearing, not incidental: `insert_dialog`'s
+    /// own root style is `Position::Absolute` with a `percent(0.5)`
+    /// width, so against `new_tree(Style::default())`'s auto-sized root
+    /// the percentage has nothing to resolve against and the dialog
+    /// silently collapses to its `min_size` floor -- a degenerate box
+    /// that still paints, and would make every assertion below a
+    /// statement about the wrong rectangle. Same idiom (and same
+    /// reason) as `widgets::dialog`'s own `sized_tree`.
+    fn laid_out_dialog(scales: &Scales) -> (WidgetTree<WidgetKind>, DialogHandle) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(DIALOG_WINDOW.0),
+                height: taffy::style_helpers::length(DIALOG_WINDOW.1),
+            },
+            ..Default::default()
+        });
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            scales,
+            "Aurora Didn't Close Properly",
+            "The previous session didn't shut down cleanly.",
+            vec![DialogAction::new("ok", "OK")],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(DIALOG_WINDOW.0, DIALOG_WINDOW.1);
+        (tree, handle)
+    }
+
+    /// Resolves a dialog's own paint and asserts it is exactly the two
+    /// shapes every non-High-Contrast theme produces -- a
+    /// `surface.overlay` fill and the unconditional `border.default`
+    /// outline over it -- returning both. The High Contrast case (a
+    /// third, `border.control` shape on top) has its own test.
+    fn dialog_fill_and_border(
+        tree: &WidgetTree<WidgetKind>,
+        handle: &DialogHandle,
+        theme: &Theme,
+        scales: &Scales,
+    ) -> (Paint, Paint) {
+        let mut paints = match paint_widget(tree, handle.root, theme, scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            paints.len(),
+            2,
+            "a dialog paints a fill and a border: {paints:?}"
+        );
+        let border = paints.remove(1);
+        let fill = paints.remove(0);
+        (fill, border)
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_dialog_paints_surface_overlay_with_a_real_border_over_it() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+
+        let ((fill_mesh, fill_color), (border_mesh, border_color)) =
+            dialog_fill_and_border(&tree, &handle, &theme, &scales);
+        assert!(
+            !fill_mesh.vertices.is_empty() && !fill_mesh.indices.is_empty(),
+            "a real, centred dialog box must tessellate to real geometry"
+        );
+        assert!(
+            !border_mesh.vertices.is_empty() && !border_mesh.indices.is_empty(),
+            "a dialog's own border must tessellate to real geometry too"
+        );
+        let [r, g, b] = theme.surface.overlay.to_srgb_f32();
+        assert_eq!(
+            fill_color,
+            [r, g, b, 1.0],
+            "a dialog's own surface must use surface.overlay at full opacity"
+        );
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(
+            border_color,
+            [r, g, b, 1.0],
+            "a dialog's own border must use border.default at full opacity, the same \
+             token paint_panel already strokes its own with"
+        );
+    }
+
+    /// **The regression test for the Light-theme invisibility bug**
+    /// found by review of `0.79.0` and fixed in `0.79.1`, stated against
+    /// the exact widget pair that collides in the real app: a
+    /// `WidgetKind::Dialog` over a `WidgetKind::Panel`.
+    ///
+    /// `design/themes/light.toml` resolves `surface.overlay`,
+    /// `surface.panel`, `surface.raised` and `surface.canvas` all to
+    /// `neutral.900` `#f5f5f6`, and sets `border.control_opacity = 0.0`
+    /// so `control_outline` returns `None`. Through `0.79.0` a dialog's
+    /// *entire* paint was therefore one `#f5f5f6` fill, byte-identical
+    /// to the fill of the panel behind it at 1.000:1 -- reachable in the
+    /// shipping app at `aurora-app`'s enforced 640x480 minimum window,
+    /// where a real dialog does centre over real panel chrome. Nothing
+    /// in this crate draws shadows, so there was nothing else to
+    /// separate them.
+    ///
+    /// The first two assertions pin the collision itself rather than
+    /// assuming it, so this test still says what it means if Light's
+    /// tokens are later changed (it fails loudly rather than passing for
+    /// a new reason). The claim is deliberately *not* "the dialog's
+    /// whole paint list differs from the panel's" -- that is vacuous
+    /// here, since the two lists differ in corner radius alone
+    /// (`radius.md` vs `radius.sm`) and both borders come from the same
+    /// `border.default` token. The real claim is that a dialog paints at
+    /// least one colour its own backdrop does not, i.e. that its edge
+    /// exists at all.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_dialog_is_not_invisible_against_the_panel_behind_it() {
+        let scales = scales();
+        let theme = light_theme();
+
+        assert_eq!(
+            theme.surface.overlay, theme.surface.panel,
+            "this test is only worth running while Light resolves a dialog's own fill \
+             token and a panel's to the same value -- if they ever separate, the \
+             invisibility this guards against is gone and this test needs rewriting"
+        );
+        assert_eq!(
+            theme.border.control_opacity, 0.0,
+            "... and while control_outline returns None in Light, which is what left \
+             a dialog with no second shape at all through 0.79.0"
+        );
+
+        let (tree, handle) = laid_out_dialog(&scales);
+        let paints = match paint_widget(&tree, handle.root, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let [pr, pg, pb] = theme.surface.panel.to_srgb_f32();
+        let backdrop = [pr, pg, pb, 1.0];
+        assert!(
+            paints.iter().any(|(_, color)| *color != backdrop),
+            "in Light a dialog must paint at least one shape that is NOT the panel \
+             colour behind it, or it is literally invisible over real panel chrome: \
+             {paints:?}"
+        );
+        let Some((_, fill_color)) = paints.first() else {
+            unreachable!("a dialog always paints at least its own fill");
+        };
+        assert_eq!(
+            *fill_color, backdrop,
+            "and the fill really is the colliding one -- it is the border, not the \
+             fill, that is doing the work here"
+        );
+    }
+
+    /// The one assertion that actually distinguishes this function's
+    /// token choice from `paint_command_palette`'s -- and it can only be
+    /// made in **two** of the five built-in themes.
+    ///
+    /// Light, High Contrast Dark and High Contrast Light each resolve
+    /// `surface.overlay` and `surface.raised` to the *same* value
+    /// (`neutral.900`, `hc.black`, `hc.white` respectively -- deliberate
+    /// elevation choices in those files, not oversights), so the same
+    /// assertion there would pass no matter which token `paint_dialog`
+    /// read, i.e. it would be vacuous. Only Dark (`neutral.200` vs
+    /// `neutral.300`) and Colour-Critical (`cc.raised` vs `cc.overlay`)
+    /// separate them, so only those two are checked here -- and each is
+    /// checked *starting* with an explicit `assert_ne!` on the two
+    /// tokens, so if a future theme edit ever collapsed them this test
+    /// fails loudly instead of quietly degrading into a tautology.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialog_paints_surface_overlay_not_the_command_palettes_surface_raised() {
+        let scales = scales();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            let overlay = theme.surface.overlay.to_srgb_f32();
+            let raised = theme.surface.raised.to_srgb_f32();
+            assert_ne!(
+                overlay, raised,
+                "{name} is only worth testing because these two tokens differ in it -- \
+                 if they ever collide here, this test has stopped proving anything and \
+                 needs a theme that still separates them"
+            );
+
+            let (tree, handle) = laid_out_dialog(&scales);
+            let ((_, color), _) = dialog_fill_and_border(&tree, &handle, &theme, &scales);
+            let [r, g, b] = overlay;
+            assert_eq!(
+                color,
+                [r, g, b, 1.0],
+                "{name}: a dialog paints surface.overlay (Elevation 2: modals, dialogs)"
+            );
+            let [r, g, b] = raised;
+            assert_ne!(
+                color,
+                [r, g, b, 1.0],
+                "{name}: ... and specifically not surface.raised, which is what \
+                 paint_command_palette reads (Elevation 1: popovers)"
+            );
+        }
+    }
+
+    /// A dialog carries the unconditional `border.default` outline
+    /// [`paint_panel`] does *and* keeps the conditional `border.control`
+    /// one, so a High Contrast theme gets three shapes, not two. That is
+    /// deliberate: those two themes set `border.control` to pure
+    /// white/black at full opacity ("mandatory strong borders on every
+    /// control"), and collapsing to `border.default` alone -- an exact
+    /// mirror of `paint_panel` -- would have downgraded them to
+    /// `hc.mid_gray`. The third shape draws last, so it is what a user
+    /// of those themes actually sees.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialog_gains_a_third_outline_shape_when_border_control_opacity_is_above_zero() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = high_contrast_theme();
+
+        let paints = match paint_widget(&tree, handle.root, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            paints.len(),
+            3,
+            "a dialog paints its own surface, its border.default outline, and the \
+             mandatory control outline over both: {paints:?}"
+        );
+        let Some((_, border_color)) = paints.get(1) else {
+            unreachable!("just asserted len() == 3");
+        };
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(
+            *border_color,
+            [r, g, b, 1.0],
+            "the unconditional border must still use border.default at full opacity"
+        );
+        let Some((_, outline_color)) = paints.get(2) else {
+            unreachable!("just asserted len() == 3");
+        };
+        let [r, g, b] = theme.border.control.to_srgb_f32();
+        assert_eq!(
+            *outline_color,
+            [r, g, b, theme.border.control_opacity],
+            "the control outline must use border.control at border.control_opacity, \
+             and must draw last so it lands on top of border.default"
+        );
+    }
+
+    /// **The corner radius is this widget's one real geometric decision,
+    /// and this is what pins it.** `paint_dialog` chooses
+    /// `scales.radius.md` (`4`); review of `0.79.0` found that mutating
+    /// it to every other value in the `radius` scale
+    /// (`none`/`sm`/`lg`/`pill`) left every dialog test in this crate
+    /// green, because none of them looked at the mesh's actual geometry
+    /// and this widget deliberately ships no golden image.
+    ///
+    /// Two assertions, read straight off the fill mesh.
+    /// `aurora_vector::rounded_rect` emits a real path anchor at
+    /// `(x, y + r)` -- where the top-left arc rejoins the left edge --
+    /// and `lyon`'s fill tessellator keeps every path endpoint as a
+    /// vertex, so:
+    ///
+    /// 1. that exact point must be present, which is false for `sm`
+    ///    (`2`), `lg` (`8`) and `pill` (clamped to half the box);
+    /// 2. the square corner `(x, y)` must be *absent*, which is what
+    ///    rules out `none` (`0`) -- the one mutation assertion 1 alone
+    ///    would miss.
+    ///
+    /// Verified by actually performing all four mutations, not assumed.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialogs_fill_mesh_has_the_radius_md_corner_and_not_a_square_one() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+        let Some(bounds) = tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+
+        let ((fill_mesh, _), _) = dialog_fill_and_border(&tree, &handle, &theme, &scales);
+        #[allow(clippy::cast_precision_loss)]
+        let (left, top, radius) = (bounds.x as f32, bounds.y as f32, scales.radius.md as f32);
+        assert!(
+            radius > 0.0,
+            "the committed radius.md must be a real, non-zero radius: {radius}"
+        );
+
+        let has = |x: f32, y: f32| fill_mesh.vertices.iter().any(|v| v.x == x && v.y == y);
+        assert!(
+            has(left, top + radius),
+            "the fill must carry rounded_rect's own (x, y + radius.md) anchor, which \
+             pins the radius to exactly {radius}: {:?}",
+            fill_mesh.vertices
+        );
+        assert!(
+            !has(left, top),
+            "... and must NOT carry the square top-left corner, which is what a \
+             radius of 0 would produce: {:?}",
+            fill_mesh.vertices
+        );
+    }
+
+    /// Pins the "no text rendering" half of a dialog's scope: the
+    /// message node holds the real message string for the
+    /// accessibility tree and draws nothing at all. If this ever starts
+    /// painting, either real text shaping landed (in which case this
+    /// test should be rewritten around it) or a `WidgetKind` was
+    /// changed by accident.
+    #[test]
+    fn a_dialogs_message_node_still_paints_nothing() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, handle.message, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "a dialog's message is a plain Container -- this crate draws no glyphs, so \
+             there is nothing to paint: {paints:?}"
         );
     }
 

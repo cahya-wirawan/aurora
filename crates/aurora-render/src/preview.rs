@@ -110,7 +110,7 @@ mod tests {
                 // Half-transparent green -- distinct from a blank tile,
                 // and *translucent* deliberately (0.68.4): with an opaque
                 // fixture, both `downsample`'s premultiplied-domain box
-                // filter and `upload_mip`'s own premultiply are the
+                // filter and `upload_mip`'s premultiply are the
                 // identity, so this whole store -> downsample -> atlas
                 // chain asserted nothing about either.
                 let channel = match i % 4 {

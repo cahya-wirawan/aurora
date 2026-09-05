@@ -9,7 +9,7 @@
 //! thread and one real LRU memory bound covering all of them combined —
 //! the property a naive one-store-per-surface design would not have.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use lru::LruCache;
 
 use crate::codec;
 use crate::error::TileError;
-use crate::tile::{SurfaceId, Tile, TileId};
+use crate::tile::{SurfaceId, TILE, Tile, TileId};
 use crate::writer::{BackgroundWriter, WriteJob, WriteResult};
 
 /// Counters mirroring `spike/vertical-slice`'s own `Stats` (paging
@@ -76,6 +76,23 @@ pub struct Stats {
     pub superseded_writes: u64,
 }
 
+/// One entry of [`TileStore::pending`]: the `write_generation` the bytes
+/// were submitted under, and the bytes themselves, shared with the
+/// queued [`WriteJob`] rather than copied into it.
+type PendingWrite = (u64, Arc<Vec<u8>>);
+
+/// The dirty rectangle [`TileStore::take_dirty`] reports for a tile that
+/// was dirty when an eviction took it out of `resident`: an eviction
+/// preserves only the *fact* that something was dirty (see
+/// `TileStore::evicted_dirty`), never which rectangle, so the whole tile
+/// is the only honest answer available.
+const WHOLE_TILE: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: TILE,
+    height: TILE,
+};
+
 /// A sparse, paging, LRU-bounded store of [`Tile`]s, addressed by
 /// `(SurfaceId, TileId)`.
 ///
@@ -90,17 +107,24 @@ pub struct Stats {
 /// behaviour for a memory bound meant to cover a whole document
 /// regardless of how many surfaces (layers) it has.
 ///
-/// **Known limitation, accepted rather than solved here**: a tile's dirty
-/// rectangle does not survive eviction. If a tile is evicted while still
-/// dirty (its pending changes never consumed, e.g. via GPU upload), that
-/// dirty state is lost — the pixel data itself is safely persisted, only
-/// the "what changed since last upload" bookkeeping is not. A freshly
-/// paged-in tile always starts clean, which is correct *relative to what
-/// is on disk*, but a consumer that was relying on an in-flight dirty
-/// rect across an eviction would need to re-derive it some other way.
-/// Solving this would mean persisting dirty state in the on-disk format,
-/// which is real, avoidable complexity for a corner case this milestone
-/// does not need to close.
+/// **Dirtiness survives eviction** (0.91.0). A tile that is evicted while
+/// still dirty (its pending changes never consumed, e.g. via GPU upload)
+/// is recorded in `evicted_dirty`, so [`TileStore::is_dirty`] keeps answering
+/// `true` for it while it is paged out, [`TileStore::take_dirty`] can consume
+/// that record without a page-in first, and paging the tile back in
+/// re-marks it dirty. Before 0.91.0 the fact was simply lost:
+/// `Tile::from_texels` starts clean, so dirty -> evicted -> paged back in
+/// read as clean, and `aurora_gpu::TileResidency::sync` declined an
+/// upload the GPU atlas genuinely still needed. That fired routinely
+/// rather than rarely — a store budget smaller than the visible working
+/// set is the *design assumption* at this project's 300,000 × 300,000 px
+/// document ceiling, not a fixture quirk.
+///
+/// **What is still not preserved: which rectangle.** A reinstated tile
+/// reads back dirty over its whole area, because the exact rect is the
+/// one part that would require changing the on-disk tile format to carry,
+/// and no consumer needs it — `sync` uploads whole tiles regardless. The
+/// error is toward uploading too much, never too little.
 ///
 /// **Eviction/revisit race, closed**: `make_room` evicts a tile by handing
 /// its encoded bytes to a background writer (`submit` never blocks — see
@@ -124,15 +148,10 @@ pub struct Stats {
 /// silently, with no error raised. Every job now carries a generation
 /// minted by `make_room` (`write_generation`) and stored
 /// alongside the bytes in `pending`; both drain sites
-/// (`reconcile_pending` and [`Self::flush`]) drop, whole, any
+/// (`reconcile_pending` and [`TileStore::flush`]) drop, whole, any
 /// result whose generation is not the one `pending` holds — before they
 /// look at whether it succeeded, so a superseded *failure* cannot enter
 /// the failed-write queue either. Counted in [`Stats::superseded_writes`].
-/// One entry of [`TileStore::pending`]: the `write_generation` the bytes
-/// were submitted under, and the bytes themselves, shared with the
-/// queued [`WriteJob`] rather than copied into it.
-type PendingWrite = (u64, Arc<Vec<u8>>);
-
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -148,7 +167,7 @@ pub struct TileStore {
     /// allowed to act on this entry if it carries the same number: an
     /// older job for the same key, superseded by a later eviction, must
     /// not clear (or record a failure against) bytes that are not its
-    /// own — see this type's own "Stale-write race, closed" note.
+    /// own — see [`TileStore`]'s own "Stale-write race, closed" note.
     ///
     /// The bytes are an `Arc<Vec<u8>>` shared with the queued
     /// [`WriteJob`], not a copy of it: both holders are read-only, and
@@ -167,6 +186,99 @@ pub struct TileStore {
     /// only surviving copy) and nothing else would ever drop it, which is
     /// exactly why this queue and its cap exist.
     failed_writes: VecDeque<(SurfaceId, TileId)>,
+    /// Keys [`Self::forget_tile`] discarded while their eviction's
+    /// background write was still genuinely in flight — a real race,
+    /// not a hypothetical one, since `forget_tile` never waits for it.
+    /// Without this set, that write lands on disk *after* `forget_tile`
+    /// already tried (and, finding nothing there yet, failed) to delete
+    /// it, and nothing else ever notices: `reconcile_pending`/[`Self::flush`]
+    /// see an ordinary, non-superseded result for a key `pending` no
+    /// longer holds and reconcile it as a normal success, leaving the
+    /// file behind forever (or until the whole scratch directory is
+    /// swept at session end) with no key in any map able to name it.
+    ///
+    /// `forget_tile` inserts here in place of leaving the write to
+    /// orphan its file, and only when the key is genuinely still in
+    /// `pending` at that moment — a key already `paged_out` with a real
+    /// file on disk is handled synchronously by
+    /// [`Self::discard_stale_scratch_file`] and never reaches here.
+    /// [`Self::discard_if_forgotten_while_pending`] is the shared
+    /// prologue both drain sites run *before* their ordinary `Ok`/`Err`
+    /// handling — same placement, same reason, as
+    /// [`Self::drop_if_superseded`] just above it: removes the entry and
+    /// deletes whatever the write actually produced, so the file this
+    /// set exists to catch is deleted once, not aliased back into
+    /// `paged_out` as if the tile were still alive.
+    ///
+    /// **Not the same problem [`Self::is_superseded`] already solves.**
+    /// That check is keyed on a *newer* generation replacing an older
+    /// one for a key that is still alive; this set is for a key with no
+    /// newer generation at all, because nothing will ever write for it
+    /// again. Folding the two together (treating an absent `pending`
+    /// entry as "superseded") was tried and rejected — see
+    /// `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`'s
+    /// own doc comment for the real failure that revives — so this is a
+    /// second, disjoint set rather than a weakened first one.
+    ///
+    /// **Bounded by `pending`.** An insert here always removes a `pending`
+    /// entry in the same call ([`Self::forget_tile`]'s `forget_pending`),
+    /// and every path that later drains this set removes exactly what it
+    /// found — so it can never hold more keys than `pending` could have,
+    /// and `pending` is itself bounded the way [`Self::failed_writes`]'s
+    /// own doc explains.
+    forgotten_while_pending: HashSet<(SurfaceId, TileId)>,
+    /// Keys that were **dirty when `make_room` took them out of
+    /// `resident`** — the one piece of a `Tile`'s state `codec::encode`
+    /// does not carry to the scratch disk, and which `Tile::from_texels`
+    /// therefore cannot reconstruct.
+    ///
+    /// Without this (every version before 0.91.0), dirty -> evicted ->
+    /// paged back in read as *clean*: `aurora_gpu::TileResidency::sync`'s
+    /// non-consuming [`Self::is_dirty`] peek then declined to re-upload a
+    /// tile whose atlas slot still nominally matched, and the GPU kept
+    /// showing pre-edit pixels.
+    ///
+    /// **A boolean, not the rectangle, deliberately.** No consumer needs
+    /// sub-rect precision — `sync` uploads whole tiles regardless of what
+    /// [`Self::take_dirty`] hands back — and persisting the exact rect
+    /// would mean changing the on-disk tile format. A reinstated tile
+    /// reads back dirty over its whole area (`WHOLE_TILE`), which errs
+    /// toward uploading too much, never too little.
+    ///
+    /// **Invariant: a key in here is never simultaneously resident.**
+    /// `make_room` is the only insert, for a key it has just popped *out*
+    /// of `resident`; `make_resident` — which every path that puts a tile
+    /// back goes through — removes the entry in the same call that
+    /// inserts into `resident`.
+    ///
+    /// **Bounded by `paged_out`, not by document size.** `make_room`
+    /// inserts here only alongside a `paged_out` entry for the same key,
+    /// and every path that drops a `paged_out` entry drops this one too
+    /// ([`Self::forget_tile`] sweeps both; [`Self::forget_surfaces`] chains
+    /// this set into its key collection; both of `ensure_resident`'s paging
+    /// branches and `page_in` clear it via `make_resident`). The converse
+    /// is deliberately *not* true — [`Self::take_dirty`] drops the entry
+    /// here alone and leaves `paged_out` untouched, which is exactly what a
+    /// consumed "upload owed" record should do — but only the first
+    /// direction is what bounds this set, so it stays a subset of
+    /// `paged_out`: a constant factor on a map this store already keeps,
+    /// not a new growth term.
+    ///
+    /// **Only ever consumed by a surface something actually calls
+    /// [`Self::take_dirty`] on.** Today that is
+    /// `aurora_gpu::TileResidency::sync`, and only for the composite
+    /// surface. Layer and mask surfaces are marked dirty by other code
+    /// paths and never `take_dirty`'d, so once one of their tiles is
+    /// evicted while dirty it is recorded here, re-marked dirty on every
+    /// page-in and re-recorded on every eviction — permanently dirty by
+    /// construction. That costs nothing today (the set is still bounded by
+    /// `paged_out` above, and nothing reads those flags), and it is the
+    /// right answer for the composite surface, the only real consumer. It
+    /// would matter to a *future* reader of [`Self::is_dirty`] on a layer
+    /// or mask surface, which would find an always-true flag rather than a
+    /// meaningful one — such a reader needs to start consuming what it
+    /// peeks at, not just peek.
+    evicted_dirty: HashSet<(SurfaceId, TileId)>,
     /// Mints the generation stamped on every [`WriteJob`] and stored in
     /// [`Self::pending`]. Store-wide and monotonic, not per key: a
     /// per-key counter would need a map that outlives its `pending`
@@ -478,6 +590,8 @@ impl TileStore {
             paged_out: HashMap::new(),
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
+            forgotten_while_pending: HashSet::new(),
+            evicted_dirty: HashSet::new(),
             write_generation: 0,
             budget,
             scratch_dir,
@@ -514,28 +628,114 @@ impl TileStore {
         }
     }
 
-    /// Takes and clears `(surface, id)`'s accumulated dirty rectangle, if
-    /// it is currently resident and dirty. Returns `None` for a tile that
-    /// is not resident, not dirty, or has never been touched.
+    /// Takes and clears `(surface, id)`'s accumulated dirty rectangle.
+    /// Returns `None` for a tile that is not dirty or has never been
+    /// touched.
+    ///
+    /// # A tile that was dirty when it was evicted (0.91.0)
+    ///
+    /// …reports the **whole tile** here, and does so *even while it is not
+    /// resident*: an eviction keeps only the fact that an upload was owed,
+    /// never which rectangle (see this type's own `evicted_dirty` field),
+    /// so a whole-tile answer is the only honest one available. It errs
+    /// toward uploading too much, never too little.
+    ///
+    /// Consuming that record **here**, rather than only when the tile is
+    /// paged back in, is deliberate and load-bearing:
+    /// `aurora_gpu::TileResidency::sync` calls this *before* its
+    /// [`Self::get`], so a record that survived until the page-in would
+    /// re-dirty the tile the same frame it was uploaded and buy a second,
+    /// redundant ~512 KB upload on the next one.
     pub fn take_dirty(&mut self, surface: SurfaceId, id: TileId) -> Option<Rect> {
-        self.resident
-            .get_mut(&(surface, id))
-            .and_then(Tile::take_dirty)
+        let key = (surface, id);
+        let resident = self.resident.get_mut(&key).and_then(Tile::take_dirty);
+        // Checked even when the resident lookup answered: the invariant
+        // says the two are mutually exclusive, and asking anyway is what
+        // keeps a violation of it from stranding a record forever.
+        if self.evicted_dirty.remove(&key) {
+            return Some(WHOLE_TILE);
+        }
+        resident
     }
 
-    /// Whether `(surface, id)` is resident and currently dirty, **without
-    /// clearing it** — [`Self::take_dirty`]'s non-consuming counterpart,
-    /// for a caller that must decide whether it can act on the dirtiness
-    /// before consuming it (see [`Tile::is_dirty`]).
+    /// Whether `(surface, id)` is currently dirty, **without clearing
+    /// it** — [`Self::take_dirty`]'s non-consuming counterpart, for a
+    /// caller that must decide whether it can act on the dirtiness before
+    /// consuming it (see [`Tile::is_dirty`]).
+    ///
+    /// True in either of two cases, since 0.91.0: the tile is resident
+    /// and its own dirty rectangle is set, **or** it was dirty when an
+    /// eviction took it out of memory and nothing has consumed that record
+    /// yet. Before 0.91.0 only the first case existed, and the second read
+    /// as clean — which is exactly how a composite tile evicted mid-frame
+    /// used to lose its owed GPU upload.
     ///
     /// Peeks rather than gets, so asking does not bump LRU recency: a
     /// query is not an access, and a tile the caller then declines to
     /// upload should not have been promoted for having been asked about.
     #[must_use]
     pub fn is_dirty(&self, surface: SurfaceId, id: TileId) -> bool {
-        self.resident
-            .peek(&(surface, id))
-            .is_some_and(Tile::is_dirty)
+        let key = (surface, id);
+        self.resident.peek(&key).is_some_and(Tile::is_dirty) || self.evicted_dirty.contains(&key)
+    }
+
+    /// Whether `(surface, id)` is **resident in memory right now** — not
+    /// merely held somewhere ([`Self::contains_tile`], which is also
+    /// `true` for a paged-out or pending tile, so it is *not* a
+    /// substitute for this).
+    ///
+    /// # Why the distinction is load-bearing
+    ///
+    /// **Until 0.91.0 the reason was the dirty flag itself**: it lived
+    /// only in the resident [`Tile`], and paging one out and back in
+    /// reconstructed it through `Tile::from_texels`, which starts clean —
+    /// so a tile that was marked dirty, evicted, and paged back in read as
+    /// *not* dirty while an earlier upload of it was still what a GPU
+    /// atlas held. **That half is closed**: `evicted_dirty` now carries
+    /// the fact across the eviction, so [`Self::is_dirty`] answers `true`
+    /// for such a tile whether it is resident or not.
+    ///
+    /// What remains, and what this method is still for, is the *other*
+    /// half of the same question: a tile can be resident, byte-identical
+    /// to what a caller is about to write, and *still* have never been
+    /// uploaded — because it was materialized blank after a
+    /// [`Self::forget_surface`] rather than paged back in. No dirty-flag
+    /// mechanism can see that, since there is genuinely nothing owed on
+    /// the tile in hand; only the caller's own knowledge that the surface
+    /// was discarded can. A caller that wants to skip re-marking a tile
+    /// dirty on the grounds that its content is unchanged therefore still
+    /// needs this, and `aurora-app`'s `write_composited` is that caller —
+    /// see the next section for the bug that proved it.
+    ///
+    /// # What it does *not* mean
+    ///
+    /// It is **not** the condition "this tile's bytes are bytes somebody
+    /// wrote". A blank materialized by *any* [`Self::get`] is resident
+    /// the instant it exists, so residency cannot distinguish a real
+    /// upload's tile from a brand-new `Tile::blank()` some unrelated
+    /// caller happened to touch. An earlier version of this comment
+    /// claimed otherwise, and the claim was wrong: it was reproduced as
+    /// a live stale-pixel bug in 0.90.0 — `aurora-app`'s `sample_pixel`
+    /// (the Eyedropper) materialized a blank composite tile between a
+    /// document open's [`Self::forget_surface`] and the next redraw, and
+    /// `write_composited` then found it "resident and byte-identical" to
+    /// a transparent recomposite and skipped an upload the GPU atlas
+    /// genuinely still needed.
+    ///
+    /// So residency carries exactly one guarantee — *the same in-memory
+    /// [`Tile`] has existed continuously since the caller last looked*,
+    /// hence it was not materialized blank in the meantime. Any caller wanting the
+    /// stronger "somebody wrote these bytes" property needs that on the
+    /// *writer* side too: every other reader of the surface must avoid
+    /// materializing blanks (ask [`Self::contains_tile`] before
+    /// [`Self::get`]), which is what closed the bug above in 0.90.1.
+    ///
+    /// One `LruCache` lookup, no I/O, no allocation. Peeks rather than
+    /// gets, for [`Self::is_dirty`]'s reason: asking is not an access
+    /// and must not bump LRU recency.
+    #[must_use]
+    pub fn is_resident(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.resident.contains(&(surface, id))
     }
 
     /// Whether this store holds *any* content for `(surface, id)` —
@@ -602,14 +802,20 @@ impl TileStore {
     /// back from it.
     ///
     /// Nothing is flushed and nothing is awaited. A background write
-    /// already in flight for this key is left to complete and land on a
-    /// file this call has just deleted (or is about to be deleted by
-    /// it); its result then drains into `reconcile_pending`/[`Self::flush`]
-    /// against a `pending` entry that is gone, which those already
-    /// handle as an ordinary "no longer in pending" outcome. The
-    /// scratch file it recreates is orphaned rather than aliased — the
-    /// key is in neither map any more, so no read can reach it, and the
-    /// scratch directory is deleted with the session.
+    /// already in flight for this key is left to complete in its own
+    /// time — but its eventual result is not left to reconcile as an
+    /// ordinary success. **A key still in `pending` at this moment is
+    /// recorded in `forgotten_while_pending` before its `pending`
+    /// entry is dropped**, so when that write's result later drains into
+    /// `reconcile_pending`/[`Self::flush`], `discard_if_forgotten_while_pending`
+    /// deletes the file it just produced instead of letting it sit
+    /// unreferenced. (Before 0.115.2 that file was genuinely orphaned —
+    /// no key in any map could name it, so no read could reach it, but
+    /// nothing deleted it either until the whole scratch directory was
+    /// swept at session end. See
+    /// `forget_surface_drops_every_tile_of_that_surface_from_every_place_it_can_live`'s
+    /// own history for the real, timing-dependent CI failure that
+    /// disclosed it.)
     pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
         let key = (surface, id);
         let held = self.contains_tile(surface, id);
@@ -618,9 +824,135 @@ impl TileStore {
         // of `paged_out`, so the other order would leak the file.
         self.discard_stale_scratch_file(key);
         self.paged_out.remove(&key);
+        // Tombstone *before* `forget_pending` clears the entry this
+        // check reads -- the other order would always see it already
+        // gone. Only a key genuinely still in `pending` has a write left
+        // in flight for `discard_if_forgotten_while_pending` to catch;
+        // a key already `paged_out` was just handled synchronously
+        // above, and a key in neither has nothing coming.
+        if self.pending.contains_key(&key) {
+            self.forgotten_while_pending.insert(key);
+        }
         self.forget_pending(key);
         self.resident.pop(&key);
+        // Swept with the rest of what this key owns (0.91.0): the record
+        // outlives the tile it describes by design, so leaving it behind
+        // would make the brand-new blank the next `get` invents report
+        // dirty for an upload nothing owes any more.
+        self.evicted_dirty.remove(&key);
         held
+    }
+
+    /// [`Self::forget_tile`] for every tile this store currently holds
+    /// under `surface`, whichever of the three places it lives in.
+    /// Returns how many tiles were actually forgotten.
+    ///
+    /// **This destroys pixels, and that is its whole purpose** — the
+    /// same warning [`Self::forget_tile`] carries, multiplied by a
+    /// whole surface. It exists for the caller shape that owns a
+    /// surface id and has just finished with it for good: a document
+    /// being discarded, whose layer (and mask) surfaces would otherwise
+    /// stay resident in this store for the lifetime of the process with
+    /// nothing left able to name them. There is no way back from it,
+    /// and it is not an eviction knob — see [`Self::forget_tile`] for
+    /// that distinction, and for what happens to a background write
+    /// already in flight (nothing this call has to wait for).
+    ///
+    /// # Why it walks what the store holds, not the surface's grid
+    ///
+    /// The cost is O(tiles this store currently holds), not O(the
+    /// surface's declared tile grid), and that is deliberate rather
+    /// than a compromise. A layer's declared `bounds` is a *position
+    /// hint*, not an enforced clip on the pixels actually painted into
+    /// its surface (the same property that made 0.73.0's narrowed
+    /// composite invalidation unsound, and 0.73.1 revert it). A
+    /// bounds-derived walk would therefore visit exactly the tiles a
+    /// caller expected to exist and silently leave behind every tile
+    /// that was really leaking — the opposite of what this is for. The
+    /// store's own keys are the only exhaustive answer available.
+    ///
+    /// # Recency
+    ///
+    /// A sweep cannot reorder any *other* surface's LRU, in either of
+    /// its two steps:
+    ///
+    /// - Collecting the matching keys peeks rather than gets, the same
+    ///   rule [`Self::contains_tile`] and [`Self::is_dirty`] follow:
+    ///   `LruCache::iter` takes `&self`, so it structurally cannot
+    ///   promote anything. That matters for the surface-not-found case
+    ///   especially — sweeping a surface this store has never seen must
+    ///   be a genuine no-op, not a reordering of somebody else's tiles.
+    /// - Freeing a matched key does mutate `resident`, but only by
+    ///   removal: [`Self::forget_tile`]'s single call there is
+    ///   `LruCache::pop`, which unlinks that one node from the
+    ///   recency list and joins its two neighbours to each other. It
+    ///   never touches the head, and it never moves a node it did not
+    ///   remove, so every surviving entry keeps its position relative
+    ///   to every other. (`LruCache::get`, which *does* promote, is
+    ///   not on this path.)
+    pub fn forget_surface(&mut self, surface: SurfaceId) -> usize {
+        self.forget_surfaces(&HashSet::from([surface]))
+    }
+
+    /// [`Self::forget_surface`] for a whole set of surfaces at once,
+    /// in a single pass over what this store holds. Returns how many
+    /// tiles were actually forgotten, summed across all of them.
+    ///
+    /// **This destroys pixels** — every word of
+    /// [`Self::forget_surface`]'s warning applies here, and that
+    /// method is a one-element call into this one, so the two share a
+    /// body as well as a contract. Read its doc comment for why the
+    /// sweep walks the store's own keys rather than any surface's
+    /// declared tile grid, and for what a sweep does (nothing) to
+    /// another surface's LRU recency.
+    ///
+    /// # Why batching is not just sugar
+    ///
+    /// Because the per-surface cost is a full scan. Each sweep has to
+    /// look at every key in `resident`, `paged_out` and `pending` to
+    /// find the ones it owns, so calling [`Self::forget_surface`] in a
+    /// loop over a document's surfaces costs O(surfaces × tiles held)
+    /// — and the one caller shape this exists for, discarding a whole
+    /// document, has ~2 surfaces per layer and runs at exactly the
+    /// moment the store is fullest. One pass over the keys, testing
+    /// each against the requested set, is O(tiles held) instead.
+    pub fn forget_surfaces(&mut self, surfaces: &HashSet<SurfaceId>) -> usize {
+        let mut keys: HashSet<(SurfaceId, TileId)> = HashSet::new();
+        keys.extend(
+            self.resident
+                .iter()
+                .map(|(key, _)| *key)
+                .filter(|(held, _)| surfaces.contains(held)),
+        );
+        // `evicted_dirty` is chained in even though every key in it is
+        // also in `paged_out` today (0.91.0's own invariant): the sweep is
+        // this store's exhaustive "drop everything for these surfaces"
+        // operation, and making it depend on another map's invariant to
+        // reach one of its own sets is how a later change to either leaks.
+        for key in self
+            .paged_out
+            .keys()
+            .chain(self.pending.keys())
+            .chain(self.evicted_dirty.iter())
+        {
+            if surfaces.contains(&key.0) {
+                keys.insert(*key);
+            }
+        }
+        // An explicit loop, deliberately, rather than
+        // `keys.into_iter().filter(...).count()`: that idiom frees
+        // every tile only because `count` happens to drain the whole
+        // iterator, and a later edit to any short-circuiting adapter
+        // would silently stop the sweep part-way with nothing but the
+        // returned tally — which no small-fixture test would notice —
+        // to say so.
+        let mut freed = 0;
+        for (surface, id) in keys {
+            if self.forget_tile(surface, id) {
+                freed += 1;
+            }
+        }
+        freed
     }
 
     /// Blocks until every write submitted so far has actually reached
@@ -642,11 +974,26 @@ impl TileStore {
     ///
     /// Returns the first [`TileError::Io`] encountered among pending
     /// writes, if any failed.
+    ///
+    /// **A forgotten tile's result is handled the same way
+    /// `reconcile_pending` does** (0.115.2): dropped from this loop by
+    /// `discard_if_forgotten_while_pending`, which deletes the
+    /// file it produced rather than treating it as an ordinary success
+    /// or a reportable failure. This is in fact the only place that
+    /// path is exercised deterministically — `flush` blocks until the
+    /// writer thread has actually processed every job already in its
+    /// channel, `forget_tile`'s among them, so a caller that forgets a
+    /// tile mid-eviction and then flushes is guaranteed to see the file
+    /// gone by the time this call returns, with no dependence on how
+    /// the background thread happened to be scheduled.
     pub fn flush(&mut self) -> Result<(), TileError> {
         self.writer.flush();
         let mut first_err = None;
         for result in self.writer.drain_results() {
             if self.drop_if_superseded(&result) {
+                continue;
+            }
+            if self.discard_if_forgotten_while_pending(&result) {
                 continue;
             }
             match result.outcome {
@@ -743,6 +1090,20 @@ impl TileStore {
     /// must survive until `page_in` has actually succeeded, which is the
     /// whole point of the paragraph below.
     ///
+    /// **A second window of the same class, in branch (b), named rather
+    /// than left implicit.** That branch runs `forget_pending`, then
+    /// `paged_out.remove`, then `make_resident` — and `make_resident` is
+    /// what clears the key's `evicted_dirty` record. So for one statement
+    /// the key is in `evicted_dirty` while being in *none* of `resident`,
+    /// `pending` or `paged_out`, which reads against `evicted_dirty`'s own
+    /// "bounded by `paged_out`" claim. Harmless for exactly the reasons
+    /// above (single-threaded, private method, nothing observes the gap),
+    /// and deliberately not reordered to close it: putting `make_resident`
+    /// first would only trade this unobservable window for the *other*
+    /// unobservable window branch (c) already has — the key resident and
+    /// `paged_out` at once — and would cost branch (b) the stronger
+    /// "never both true even mid-branch" property stated above.
+    ///
     /// **A failed page-in keeps its mapping.** Branches (b) and (c)
     /// remove a key from `pending`/`paged_out` only once they hold a
     /// real, whole tile to put in `resident`. Until 0.52.2 they removed
@@ -779,8 +1140,7 @@ impl TileStore {
             let texels = codec::decode(bytes)?;
             self.forget_pending((surface, id));
             self.paged_out.remove(&(surface, id));
-            self.make_room();
-            self.resident.put((surface, id), Tile::from_texels(texels));
+            self.make_resident((surface, id), Tile::from_texels(texels));
             return Ok(());
         }
         // Same rule as the branch above, and this is the branch where it
@@ -796,8 +1156,7 @@ impl TileStore {
             self.paged_out.remove(&(surface, id));
             Ok(())
         } else {
-            self.make_room();
-            self.resident.put((surface, id), Tile::blank());
+            self.make_resident((surface, id), Tile::blank());
             self.stats.tiles_created += 1;
             Ok(())
         }
@@ -842,9 +1201,17 @@ impl TileStore {
     /// content. See [`Self::drop_if_superseded`] (the shared prologue
     /// [`Self::flush`] runs too) and [`Self::is_superseded`], and
     /// [`Stats::superseded_writes`] for the counter.
+    ///
+    /// **A forgotten tile's result is dropped too, but deletes rather
+    /// than ignores** (0.115.2) — see
+    /// [`Self::discard_if_forgotten_while_pending`], the second shared
+    /// prologue, run immediately after the one above.
     fn reconcile_pending(&mut self) {
         for result in self.writer.drain_results() {
             if self.drop_if_superseded(&result) {
+                continue;
+            }
+            if self.discard_if_forgotten_while_pending(&result) {
                 continue;
             }
             match result.outcome {
@@ -908,6 +1275,62 @@ impl TileStore {
             ok = result.outcome.is_ok(),
             "dropping a superseded write result"
         );
+        true
+    }
+
+    /// The second shared prologue both drain sites run, immediately
+    /// after [`Self::drop_if_superseded`] and for the same reason: a
+    /// result this method claims must not fall through to the ordinary
+    /// `Ok`/`Err` match either. Returns `true` — having deleted whatever
+    /// the write actually produced on an `Ok` outcome, and done nothing
+    /// on an `Err` one — when `key` was in
+    /// [`Self::forgotten_while_pending`], which [`Self::forget_tile`] is
+    /// the only inserter of.
+    ///
+    /// **Order matters**: this runs *after* the supersession check, not
+    /// before or merged with it. A key can only ever be in one of
+    /// `is_superseded`'s "different generation still in `pending`" state
+    /// or this set's "no generation in `pending` at all, because the key
+    /// was discarded" state — `forget_tile` clears `pending` for exactly
+    /// the key it tombstones here — so the two checks are looking at
+    /// disjoint keys in practice, but keeping them as two small,
+    /// separately-named methods (rather than one that tries to explain
+    /// both reasons a result might be moot) is what let 0.115.2 add this
+    /// one without touching `is_superseded`'s own, already-tested
+    /// contract for the *other* absent-key case: see
+    /// `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`,
+    /// which this method does not affect because
+    /// `ensure_resident`'s revisit branch never inserts into
+    /// `forgotten_while_pending` — only `forget_tile` does.
+    ///
+    /// An `Err` outcome removes the tombstone and stops there: the write
+    /// that would have produced the orphan never landed, so there is
+    /// nothing to delete, and reporting the failure (as the ordinary
+    /// `Err` arm would) would be about a tile nothing holds any more —
+    /// [`Self::retain_failed_write`] keeping its bytes alive is not a
+    /// trade worth paying for a tile with no reader left.
+    fn discard_if_forgotten_while_pending(&mut self, result: &WriteResult) -> bool {
+        let key = (result.surface, result.id);
+        if !self.forgotten_while_pending.remove(&key) {
+            return false;
+        }
+        if result.outcome.is_ok() {
+            let path = self.tile_path(key.0, key.1);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::error!(
+                        surface = ?key.0,
+                        tile = ?key.1,
+                        path = %path.display(),
+                        %err,
+                        "could not delete the scratch file a forgotten tile's in-flight write \
+                         produced after the fact; it is unreferenced but not removed"
+                    );
+                }
+            }
+        }
         true
     }
 
@@ -1124,9 +1547,24 @@ impl TileStore {
             }
         };
         self.stats.faults += 1;
-        self.make_room();
-        self.resident.put((surface, id), Tile::from_texels(texels));
+        self.make_resident((surface, id), Tile::from_texels(texels));
         Ok(())
+    }
+
+    /// Makes room and puts `tile` into `resident` under `key`, restoring
+    /// the dirty state an earlier eviction of this key would otherwise
+    /// have lost (`evicted_dirty`).
+    ///
+    /// Every one of the three places a tile enters `resident` goes through
+    /// here — [`Self::ensure_resident`]'s pending and blank branches and
+    /// `page_in` — so the restoration has one site rather than three to
+    /// keep in step.
+    fn make_resident(&mut self, key: (SurfaceId, TileId), mut tile: Tile) {
+        self.make_room();
+        if self.evicted_dirty.remove(&key) {
+            tile.mark_dirty(WHOLE_TILE);
+        }
+        self.resident.put(key, tile);
     }
 
     /// Evicts least-recently-used resident tiles, encoding and handing
@@ -1139,11 +1577,23 @@ impl TileStore {
     /// `LruCache::pop_lru` already orders by access recency across every
     /// key it holds, regardless of which surface a key belongs to, so
     /// this needs no surface-aware logic of its own to get that right.
+    ///
+    /// **Records a victim that was still dirty** (0.91.0) in
+    /// `evicted_dirty`, so the "an upload is still owed for this tile"
+    /// fact survives the round trip through the scratch disk that
+    /// `codec::encode`/`Tile::from_texels` cannot carry it across. See
+    /// that field's own doc comment for what is and is not preserved, and
+    /// `make_resident` for where it is put back.
     fn make_room(&mut self) {
         while self.resident.len() >= self.budget.get() {
             let Some(((victim_surface, victim_id), victim_tile)) = self.resident.pop_lru() else {
                 break;
             };
+            // Before the tile is dropped at the end of this iteration --
+            // it is the only thing that knows it was dirty.
+            if victim_tile.is_dirty() {
+                self.evicted_dirty.insert((victim_surface, victim_id));
+            }
             // Shared, not copied: the same bytes go into `pending` *and*
             // into the `WriteJob` below, and both are read-only for the
             // rest of their lives. Sharing one allocation turns what used
@@ -1215,6 +1665,7 @@ mod tests {
 
     use super::TileStore;
     use crate::tile::{CHANNELS, SurfaceId, TILE, TileId};
+    use std::collections::HashSet;
     use std::num::NonZeroUsize;
 
     fn store(budget: usize) -> (tempfile::TempDir, TileStore) {
@@ -1313,6 +1764,53 @@ mod tests {
     }
 
     #[test]
+    // `is_resident` exists precisely because `contains_tile` is *not* a
+    // substitute for it: the two disagree exactly on the paged-out case,
+    // which is the one where the tile in hand is not the same in-memory
+    // `Tile` the caller last looked at. (Its *dirty rectangle* is no
+    // longer what makes that matter: since 0.91.0 the store re-marks a
+    // reinstated tile dirty from its own `evicted_dirty` record, so a
+    // paged-out tile keeps reporting dirty. What residency still answers
+    // is the separate question of whether a resident tile could have been
+    // materialized blank by a `forget_surface` since. See `is_resident`'s
+    // own doc comment.) A caller that skips re-marking a tile dirty on
+    // "its bytes are unchanged" grounds has to be able to see that
+    // difference.
+    fn is_resident_is_false_for_a_paged_out_tile_contains_tile_still_holds() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        if store.get(s, a).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.is_resident(s, a), "a `get` makes a tile resident");
+        assert!(store.contains_tile(s, a));
+
+        // Budget of 1, so touching `b` evicts `a`. `contains_tile` still
+        // finds it (its bytes survive in `pending`/`paged_out`), but the
+        // `Tile` that held it is gone.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.is_resident(s, a),
+            "evicted to make room for `b`, so no longer in memory"
+        );
+        assert!(
+            store.contains_tile(s, a),
+            "still held, which is why `contains_tile` cannot stand in for `is_resident`"
+        );
+        assert!(store.is_resident(s, b), "the tile that took the slot");
+
+        // And forgetting it drops it from both views at once.
+        assert!(store.forget_tile(s, a));
+        assert!(!store.is_resident(s, a));
+        assert!(!store.contains_tile(s, a));
+    }
+
+    #[test]
     // The three places content can live are also the three places
     // `forget_tile` has to reach, or a caller rolling back a partial
     // read would drop the resident copy and leave a scratch file the
@@ -1371,6 +1869,291 @@ mod tests {
                 "forgetting a tile nothing holds must report that it held nothing"
             );
         }
+    }
+
+    #[test]
+    // The whole-surface sweep has to reach the same three places
+    // `forget_tile` does, for every tile of that surface -- and reach
+    // *only* that surface, since one store holds many.
+    fn forget_surface_drops_every_tile_of_that_surface_from_every_place_it_can_live() {
+        for evict_and_flush in [false, true] {
+            let (_dir, mut store) = store(1);
+            let doomed = SurfaceId::from_raw(1);
+            let spared = SurfaceId::from_raw(2);
+            let targets = [
+                TileId { x: 0, y: 0 },
+                TileId { x: 1, y: 0 },
+                TileId { x: 0, y: 1 },
+            ];
+            let bystander = TileId { x: 7, y: 7 };
+
+            for (surface, id) in targets
+                .iter()
+                .map(|id| (doomed, *id))
+                .chain(std::iter::once((spared, bystander)))
+            {
+                let Ok(tile) = store.get_mut(surface, id) else {
+                    unreachable!("a fresh store must serve this tile");
+                };
+                for sample in tile.texels_mut() {
+                    *sample = half::f16::from_f32(0.5);
+                }
+            }
+            let paths: Vec<std::path::PathBuf> = targets
+                .iter()
+                .map(|id| store.tile_path(doomed, *id))
+                .collect();
+            if evict_and_flush {
+                // A budget of 1 already evicted all but the last tile
+                // touched; the flush confirms those writes, so they sit
+                // in `paged_out` with real files behind them.
+                if let Err(err) = store.flush() {
+                    unreachable!("test-local scratch disk must accept the write: {err:?}");
+                }
+                assert!(
+                    paths.iter().any(|path| path.exists()),
+                    "at least one doomed tile really is on disk"
+                );
+            }
+            for id in targets {
+                assert!(store.contains_tile(doomed, id));
+            }
+            assert!(store.contains_tile(spared, bystander));
+
+            assert_eq!(
+                store.forget_surface(doomed),
+                targets.len(),
+                "every tile of the swept surface must be reported forgotten"
+            );
+
+            // Without this, the `evict_and_flush == false` pass's
+            // `!path.exists()` assertions below raced a background write
+            // still in flight for a doomed tile at the moment of the
+            // sweep — CI caught the race 0.115.2 closed
+            // (`forget_surface_drops_every_tile_of_that_surface_from_
+            // every_place_it_can_live` failing on a runner slow enough
+            // for the write to land *after* `forget_surface` returned).
+            // Flushing here forces that write to complete and drain
+            // through `discard_if_forgotten_while_pending`, so the file
+            // is deterministically gone rather than merely usually gone.
+            // A no-op for `evict_and_flush == true`, whose writes are
+            // already confirmed above.
+            if let Err(err) = store.flush() {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+
+            for (id, path) in targets.iter().zip(paths.iter()) {
+                assert!(
+                    !store.contains_tile(doomed, *id),
+                    "nothing may still hold a tile of the swept surface"
+                );
+                assert!(
+                    !path.exists(),
+                    "a swept tile's scratch file must be deleted, not orphaned"
+                );
+            }
+            assert!(
+                store.contains_tile(spared, bystander),
+                "another surface's tiles must be untouched by the sweep"
+            );
+            let Ok(tile) = store.get(spared, bystander) else {
+                unreachable!("a real store must serve this tile");
+            };
+            assert!(
+                // Bit equality rather than `==`: the round trip really
+                // is exact, and this workspace denies `float_cmp`.
+                tile.texels()
+                    .iter()
+                    .all(|sample| sample.to_bits() == half::f16::from_f32(0.5).to_bits()),
+                "the spared surface must keep its own pixels, not come back blank"
+            );
+        }
+    }
+
+    #[test]
+    // The deterministic version of the race the test above closes with a
+    // `flush()`: forces a tile's write to still be genuinely in flight —
+    // no eviction, no background thread, no timing — at the exact moment
+    // it is forgotten, so this cannot pass by accident the way the timing-
+    // dependent version above could before 0.115.2.
+    fn forget_tile_deletes_the_file_a_write_still_in_flight_at_forget_time_later_produces() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 3, y: 1 };
+        let path = store.tile_path(s, id);
+
+        // What `make_room` does at the instant of eviction, without a
+        // real eviction: a `pending` entry for a real generation, and
+        // -- the whole point -- no `WriteJob` submitted yet, so the
+        // write really is still to come.
+        store.write_generation = store.write_generation.wrapping_add(1);
+        let generation = store.write_generation;
+        let bytes: Arc<Vec<u8>> = Arc::new(vec![9, 9, 9, 9]);
+        store
+            .pending
+            .insert((s, id), (generation, Arc::clone(&bytes)));
+
+        assert!(
+            store.forget_tile(s, id),
+            "a key only in `pending` is still held"
+        );
+        assert!(
+            !path.exists(),
+            "nothing has been written yet -- there is nothing to have deleted"
+        );
+
+        // The write that was "in flight" lands only now, exactly as the
+        // background writer thread would complete it well after
+        // `forget_tile` already moved on.
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation,
+            path: path.clone(),
+            bytes,
+        });
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        assert!(
+            !path.exists(),
+            "a write that lands after its tile was forgotten must not leave the file behind -- \
+             this is what `discard_if_forgotten_while_pending` exists to catch"
+        );
+        assert!(
+            !store.contains_tile(s, id),
+            "forgetting must still be permanent even though a write for this key landed after it"
+        );
+    }
+
+    #[test]
+    // Sweeping a surface nothing was ever written to is a no-op that
+    // says so, rather than a panic or a phantom count.
+    fn forget_surface_of_an_untouched_surface_forgets_nothing() {
+        let (_dir, mut store) = store(4);
+        let written = SurfaceId::from_raw(11);
+        if store.get_mut(written, TileId { x: 0, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert_eq!(store.forget_surface(SurfaceId::from_raw(12)), 0);
+        assert!(
+            store.contains_tile(written, TileId { x: 0, y: 0 }),
+            "sweeping an untouched surface must not disturb a written one"
+        );
+    }
+
+    #[test]
+    // The sweep's key collection peeks rather than gets, for
+    // `contains_tile_does_not_bump_lru_recency`'s reason: a sweep of
+    // some *other* surface must not change which tile the next
+    // eviction picks.
+    fn forget_surface_of_an_untouched_surface_does_not_bump_lru_recency() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        for id in [old, new] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        // If the walk promoted anything, the eviction below would take
+        // `new` rather than `old`.
+        assert_eq!(store.forget_surface(SurfaceId::from_raw(999)), 0);
+        if store.get_mut(s, TileId { x: 2, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.resident.contains(&(s, old)),
+            "the least recently used tile must still be the one evicted"
+        );
+        assert!(store.resident.contains(&(s, new)));
+    }
+
+    #[test]
+    // The batched entry point, which `forget_surface` is now a
+    // one-element call into: one pass over the store's keys must free
+    // every requested surface and only those.
+    fn forget_surfaces_frees_every_requested_surface_and_spares_the_rest() {
+        let (_dir, mut store) = store(8);
+        let doomed = [SurfaceId::from_raw(1), SurfaceId::from_raw(2)];
+        let spared = SurfaceId::from_raw(3);
+        let ids = [TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 }];
+        for surface in doomed.iter().copied().chain(std::iter::once(spared)) {
+            for id in ids {
+                if store.get_mut(surface, id).is_err() {
+                    unreachable!("a fresh store must serve this tile");
+                }
+            }
+        }
+
+        let requested: HashSet<SurfaceId> = doomed
+            .iter()
+            .copied()
+            // A surface this store has never seen, mixed in: it must
+            // contribute nothing rather than throw the tally off.
+            .chain(std::iter::once(SurfaceId::from_raw(404)))
+            .collect();
+        assert_eq!(
+            store.forget_surfaces(&requested),
+            4,
+            "two surfaces of two tiles each, and nothing for the unseen one"
+        );
+        for surface in doomed {
+            for id in ids {
+                assert!(!store.contains_tile(surface, id));
+            }
+        }
+        for id in ids {
+            assert!(
+                store.contains_tile(spared, id),
+                "a surface that was not asked for must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    // The other half of the recency claim, which
+    // `forget_surface_of_an_untouched_surface_does_not_bump_lru_recency`
+    // cannot reach: a sweep that really *does* free tiles must still
+    // leave every surviving entry's position relative to every other
+    // exactly as it was. `forget_tile` removes via `LruCache::pop`,
+    // which unlinks one node and joins its neighbours; nothing on this
+    // path promotes.
+    fn a_sweep_that_frees_tiles_does_not_reorder_another_surfaces_lru() {
+        let (_dir, mut store) = store(3);
+        let s = surface();
+        let doomed = SurfaceId::from_raw(77);
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        // Touch order: `old`, then `new`, then the doomed surface's own
+        // tile -- so `old` is the least recently used of the survivors.
+        for (surface, id) in [(s, old), (s, new), (doomed, TileId { x: 9, y: 9 })] {
+            if store.get_mut(surface, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+
+        assert_eq!(
+            store.forget_surface(doomed),
+            1,
+            "this sweep must really free something, or it proves nothing"
+        );
+
+        // Refill to the budget, then push one past it. The victim must
+        // be `old`: if freeing the doomed tile had disturbed the two
+        // survivors' order, `new` would go instead.
+        for id in [TileId { x: 2, y: 0 }, TileId { x: 3, y: 0 }] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        assert!(
+            !store.resident.contains(&(s, old)),
+            "the least recently used survivor must still be the one evicted"
+        );
+        assert!(store.resident.contains(&(s, new)));
     }
 
     #[test]
@@ -1503,6 +2286,301 @@ mod tests {
         }
         assert_eq!(store.take_dirty(s, id), Some(rect));
         assert_eq!(store.take_dirty(s, id), None);
+    }
+
+    // -- Dirtiness across eviction (0.91.0) --
+    //
+    // Four tests around one property: an eviction must not silently
+    // consume the fact that a GPU upload is still owed. Every one of them
+    // forces a *real* eviction through `make_room` (budget 1, two tiles),
+    // rather than hand-constructing store state, because the whole bug
+    // was that the real eviction path dropped something.
+
+    /// AC-1. Before 0.91.0 this failed at the first post-eviction
+    /// `is_dirty`: the flag lived only in the resident `Tile`, and
+    /// `Tile::from_texels` rebuilt the paged-in tile clean.
+    #[test]
+    fn a_tile_evicted_while_dirty_still_reports_dirty_and_pages_back_in_dirty() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        });
+        assert!(store.is_dirty(s, a), "just marked");
+
+        // Budget of 1, so touching `b` evicts `a` -- while `a` is still
+        // dirty, which is the whole scenario.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.is_resident(s, a),
+            "evicted to make room for `b`, so no longer in memory"
+        );
+        assert!(
+            store.is_dirty(s, a),
+            "an eviction must not consume the fact that an upload is still owed"
+        );
+
+        // And paging it back in keeps that, so a consumer that only
+        // looks after the page-in sees it too.
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(store.is_resident(s, a));
+        assert!(store.is_dirty(s, a), "still owed after the page-in");
+        assert_eq!(
+            store.take_dirty(s, a),
+            Some(super::WHOLE_TILE),
+            "an eviction keeps only the fact, not the rectangle, so the whole tile is the only \
+             honest answer"
+        );
+        assert_eq!(store.take_dirty(s, a), None, "and consuming it clears it");
+        assert!(!store.is_dirty(s, a));
+    }
+
+    /// AC-4a. Mirrors the order `aurora_gpu::TileResidency::sync` really
+    /// uses: it calls `take_dirty` *before* `get`, so the record has to
+    /// be consumable while the tile is still non-resident -- and must not
+    /// then resurrect itself when the page-in finally happens, or every
+    /// frame would pay a second redundant ~512 KB upload.
+    #[test]
+    fn take_dirty_consumes_an_evicted_while_dirty_record_even_before_a_page_in() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(!store.is_resident(s, a), "evicted");
+
+        assert_eq!(
+            store.take_dirty(s, a),
+            Some(super::WHOLE_TILE),
+            "consumable without a page-in first, which is the order `sync` uses"
+        );
+        assert!(!store.is_dirty(s, a), "consumed");
+
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(
+            !store.is_dirty(s, a),
+            "a consumed record must not resurrect itself at page-in time"
+        );
+    }
+
+    /// The one scratch file `(s, id)` has on disk, found by name rather
+    /// than through the private `tile_path`: the leading per-store
+    /// `instance` component is deliberately unpredictable, the trailing
+    /// `_{surface}_{x}_{y}.tile` is not.
+    fn scratch_file(dir: &std::path::Path, s: SurfaceId, id: TileId) -> std::path::PathBuf {
+        let suffix = format!("_{}_{}_{}.tile", s.to_raw(), id.x, id.y);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory lives as long as the store");
+        };
+        let mut found: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.to_string_lossy().ends_with(&suffix) {
+                found.push(path);
+            }
+        }
+        match found.as_slice() {
+            [only] => only.clone(),
+            other => unreachable!("exactly one scratch file must end in {suffix}: {other:?}"),
+        }
+    }
+
+    /// AC-4c, and the store-level premise the 0.91.1 fix in
+    /// `aurora_gpu::TileResidency::sync` rests on: **after `take_dirty`
+    /// has consumed an evicted-while-dirty record and the page-in that
+    /// followed it then *failed*, nothing at the store level remembers
+    /// that an upload is owed.**
+    ///
+    /// `is_dirty` is `false` (the record was consumed), `is_resident` is
+    /// `false` (the page-in failed), and `contains_tile` is still `true`
+    /// (the mapping survives, which is what makes the retry possible at
+    /// all). That combination is *correct* here — the store's job is to
+    /// hand the record over exactly once — and it is precisely why the
+    /// atlas cannot rely on the store to bring the tile back: `sync` has to
+    /// invalidate its own slot mapping, or the tile reads as resident and
+    /// clean forever. This test pins the premise so a future change to the
+    /// store that quietly restored the record (making the GPU-side fix look
+    /// redundant) shows up here first.
+    ///
+    /// Runs on any machine — the GPU-side regression test
+    /// (`aurora-gpu`'s `residency_test.rs`) self-skips without an adapter,
+    /// so this keeps the half that needs no hardware always checked.
+    #[test]
+    fn a_failed_page_in_after_take_dirty_leaves_nothing_that_remembers_the_owed_upload() {
+        let (dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        let Some(first) = tile.texels_mut().first_mut() else {
+            unreachable!("a tile always has texels");
+        };
+        *first = half::f16::from_f32(0.5);
+        tile.mark_dirty(super::WHOLE_TILE);
+
+        // Budget of 1: touching `b` evicts `a` while it is still dirty.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        // Confirm the write, so `a`'s only copy is the file on disk and
+        // `ensure_resident` must take the page-in branch rather than
+        // reinstating it from `pending` (which cannot fail).
+        if let Err(err) = store.flush() {
+            unreachable!("the scratch write must land: {err}");
+        }
+        assert!(store.is_dirty(s, a), "evicted while dirty");
+
+        // `sync`'s real order: consume the record, *then* read the tile.
+        assert_eq!(store.take_dirty(s, a), Some(super::WHOLE_TILE));
+
+        // Deterministic page-in failure: the file is simply not there.
+        let path = scratch_file(dir.path(), s, a);
+        let hidden = path.with_extension("hidden");
+        if let Err(err) = std::fs::rename(&path, &hidden) {
+            unreachable!("renaming a file this test just watched appear: {err}");
+        }
+        assert!(
+            store.get(s, a).is_err(),
+            "the page-in must really fail, or this test proves nothing"
+        );
+
+        assert!(
+            !store.is_resident(s, a),
+            "the failed page-in put nothing in"
+        );
+        assert!(
+            !store.is_dirty(s, a),
+            "and the record is gone -- consumed before the read that failed. This is the whole \
+             reason `TileResidency::sync` has to drop its own slot mapping on that error."
+        );
+        assert!(
+            store.contains_tile(s, a),
+            "the paged-out mapping survives a failed read, so a retry is still possible"
+        );
+
+        // And the retry really does work once the file is back, which is
+        // what the atlas's slot invalidation buys.
+        if let Err(err) = std::fs::rename(&hidden, &path) {
+            unreachable!("restoring the file: {err}");
+        }
+        let Ok(tile) = store.get(s, a) else {
+            unreachable!("the scratch file is back, so this read must succeed");
+        };
+        assert_eq!(
+            tile.texels().first().map(|texel| texel.to_f32()),
+            Some(0.5),
+            "and it holds the edited pixels, not a blank"
+        );
+    }
+
+    /// AC-4b. The record is keyed like everything else this store holds,
+    /// so a surface-wide forget has to sweep it too -- otherwise a
+    /// discarded document's keys would leave entries behind, and the next
+    /// document reusing those `SurfaceId`s would find a brand-new blank
+    /// tile reporting dirty.
+    #[test]
+    fn forget_surface_clears_an_evicted_while_dirty_record() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.is_dirty(s, a), "evicted while dirty");
+
+        assert!(store.forget_surface(s) > 0, "something was held");
+        assert!(!store.is_dirty(s, a), "swept with everything else");
+        assert!(!store.contains_tile(s, a));
+
+        // And the blank the next `get` invents is clean, not a
+        // resurrection of the forgotten record.
+        if store.get(s, a).is_err() {
+            unreachable!("a forgotten tile reads back as a fresh blank");
+        }
+        assert!(!store.is_dirty(s, a), "a fresh blank is clean");
+    }
+
+    /// AC-4's negative control, and the reason the mechanism is a
+    /// *record* rather than "mark every paged-in tile dirty". That
+    /// broader implementation would pass all three tests above while
+    /// costing a redundant ~512 KB upload on every page-in for the life
+    /// of the process.
+    #[test]
+    fn a_tile_evicted_clean_pages_back_in_clean() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        // The upload that was owed happens: the flag is consumed while
+        // the tile is still resident, so the eviction below has nothing
+        // to preserve.
+        assert!(store.take_dirty(s, a).is_some());
+
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(!store.is_resident(s, a), "evicted");
+        assert!(!store.is_dirty(s, a), "and it was clean when it went");
+
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(
+            !store.is_dirty(s, a),
+            "a tile that was clean at eviction time must page back in clean -- re-uploading it \
+             would be pure waste"
+        );
     }
 
     // -- Eviction/revisit race (PLAN.md M1.1) --

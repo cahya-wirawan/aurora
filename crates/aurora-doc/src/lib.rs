@@ -9,8 +9,10 @@
 //! here yet); per-layer opacity, fill opacity, blend mode, visibility,
 //! and locking; and per-layer masks ([`LayerMask`], whose real
 //! per-pixel grayscale coverage lives on its own tile surface — see
-//! the [`mask`] module's own doc comment for the storage convention and
-//! for the three follow-ons it deliberately leaves open).
+//! the [`mask`] module's own doc comment for the storage convention,
+//! for the three follow-ons it deliberately leaves open, and for what
+//! [`forget_document_surfaces`] does and does not fix about surface
+//! lifetime).
 //! [`SelectionSet`] is
 //! the fourth: the document's current selection plus any named ones
 //! saved for later. [`History`] is the fifth and sixth: reversible
@@ -37,9 +39,9 @@ mod text_safety;
 mod tree;
 
 pub use error::DocError;
-pub use history::History;
+pub use history::{History, forget_document_surfaces};
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
-pub use mask::{MASK_SURFACE_BIT, read_mask_coverage, write_mask_coverage};
+pub use mask::{MASK_SURFACE_BIT, forget_mask_coverage, read_mask_coverage, write_mask_coverage};
 pub use selection::{Selection, SelectionSet};
 pub use text_safety::sanitize_display_name;
 pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

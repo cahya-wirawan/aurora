@@ -9,8 +9,19 @@
 //! trigger, a toggle, and a continuous drag — enough to validate the
 //! pattern every other widget follows; `TextField`
 //! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
-//! `ColorSwatch` ([`ColorSwatchState`]), and now `Scrollbar`
-//! ([`ScrollbarState`]) followed — **4 of the 12 named widgets**.
+//! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
+//! ([`ScrollbarState`]), and now `Tree` ([`TreeItemState`]) followed —
+//! **6 of the 12 named widgets**: button, checkbox, slider, scrollbar,
+//! colour swatch, and tree. (Recounted, not carried forward: this
+//! sentence said "4 of the 12" through `0.75.1`, a count inherited from
+//! PLAN.md's own stricter transcription of the same list — which reads
+//! "colour picker" where `design/gallery/index.html` has "Color
+//! swatch", so [`ColorSwatchState`] was going uncounted against a list
+//! it does match. `TextField` is deliberately *still* not counted: the
+//! list's own entry is a **number** field, and [`TextFieldState`] has
+//! no numeric value, range, or step semantics at all.
+//! `CommandPalette`, [`WidgetKind::Panel`] and [`WidgetKind::Dialog`]
+//! are not on the list in any form, so none of them moves this count.)
 //! `Scrollbar` is a deliberately narrow landing: a bounded position
 //! *model* with an accessibility node, a layout style, and a paint, but
 //! nothing in this crate scrolls any content yet. It has a real
@@ -18,22 +29,42 @@
 //! built-in theme; only its golden-image diff tests are unblessed
 //! (`#[ignore]`d pending a human bless on real GPU hardware, the same
 //! discipline every other widget's goldens already follow — see
-//! `scrollbar.rs`'s own module doc comment for the full account). The
-//! rest still need infrastructure that doesn't exist yet
-//! (real text shaping for dropdowns, a real scrolling container for
-//! `Tree` — which additionally needs hierarchical expand/collapse this
-//! crate models nowhere — popover layering for menus/tooltips,
-//! `aurora-vector` path rendering for the curve editor) and are
-//! deliberately left open rather than stubbed out half-built.
+//! `scrollbar.rs`'s own module doc comment for the full account).
+//! `Tree` ([`insert_tree_view`]/[`insert_tree_item`]) is the same
+//! shape: real hierarchy (a `Role::Tree` container holding real,
+//! nested `Role::TreeItem` rows), real expand/collapse that actually
+//! adds and removes child widgets, per-level indentation from `taffy`'s
+//! own padding accumulation, and a real gallery entry — but still **no
+//! scrolling container** (a tree taller than its parent overflows), **no
+//! disclosure-triangle glyph** (this crate draws no glyphs at all), and
+//! **no in-row content** (a row's own band holds nothing but the row, so
+//! the Layers-panel "thumbnail + checkbox + name on one line" shape
+//! isn't buildable yet — `tree_view.rs`'s own doc comment has the full
+//! list of what it does and doesn't promise). The rest still need
+//! infrastructure that doesn't exist yet
+//! (real text shaping for dropdowns, popover layering for
+//! menus/tooltips, `aurora-vector` path rendering for the curve editor)
+//! and are deliberately left open rather than stubbed out half-built.
 //!
-//! **No rendering**: every widget here produces layout (a `taffy::Style`,
-//! resolved from `aurora_theme::Scales` — invariant §7.3.10, no
-//! hardcoded spacing) and accessibility content (a real `accesskit::Node`
-//! with the right role/actions/value), but there is no vector-first
-//! rendering yet (a separate M1.7 bullet, blocked on `aurora-vector`
-//! still being an empty skeleton) — nothing here draws a pixel. This
-//! mirrors `WidgetTree` itself: a complete, tested logical model with
-//! painting layered on afterward, not built into the model.
+//! **Every module here is a model, not a painter** — and that is a
+//! division of labour, not a missing feature. A widget module produces
+//! layout (a `taffy::Style`, resolved from `aurora_theme::Scales` —
+//! invariant §7.3.10, no hardcoded spacing) and accessibility content
+//! (a real `accesskit::Node` with the right role/actions/value); the
+//! pixels are [`crate::paint_widget`]'s job, one layer over, which
+//! tessellates real geometry through `aurora-vector` for **eleven** of
+//! the [`WidgetKind`] variants below (every one except `Container`,
+//! [`WidgetKind::Dialog`] included as of `0.79.0`). This mirrors
+//! `WidgetTree` itself: a complete, tested logical model with painting
+//! layered on afterward, not built into the model.
+//!
+//! (That paragraph said "there is no vector-first rendering yet …
+//! nothing here draws a pixel" through `0.79.0`. It was written when
+//! `aurora-vector` really was an empty skeleton and went stale without
+//! being noticed. What is *actually* still missing is **glyphs**: no
+//! module here and nothing in `paint.rs` draws text, so every label,
+//! every dialog title and message, and every tree row's own name reach
+//! the accessibility tree and nothing else.)
 //!
 //! **One shared payload type**: [`WidgetTree`] is generic over a single
 //! payload `W` for the whole tree, so a tree containing more than one
@@ -50,6 +81,7 @@ mod list_row;
 mod scrollbar;
 mod slider;
 mod text_field;
+mod tree_view;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
@@ -70,9 +102,12 @@ pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
     set_text_field_disabled, text_field_state, with_text_field_mut,
 };
+pub use tree_view::{
+    MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
+    set_tree_item_disabled, set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
+};
 
 use accesskit::{Node, Role};
-#[cfg(test)]
 use aurora_theme::Scales;
 use taffy::Style;
 
@@ -104,6 +139,13 @@ pub enum WidgetKind {
     /// deliberately shared, generic variant rather than one per
     /// consumer.
     ListRow(ListRowState),
+    /// One row of a tree — a label, its own depth, and whether it is
+    /// selected, expanded, and declares children. Deliberately *not*
+    /// [`ListRowState`] (which stays exactly as it is): see
+    /// `tree_view.rs`'s and `list_row.rs`'s own module doc comments for
+    /// why a tree row went its own way rather than widening the shared
+    /// variant.
+    TreeItem(TreeItemState),
     /// A titled, dockable region's own root — `aurora-ui`'s own
     /// `insert_panel` (Layers/Properties/History today) is the first
     /// real consumer, but nothing about this variant is document- or
@@ -114,6 +156,33 @@ pub enum WidgetKind {
     /// index.html`'s own 12 named widgets — it's workspace chrome, not
     /// a component in that gallery's own sense.
     Panel,
+    /// A modal dialog's own root — `widgets::dialog`'s `insert_dialog` is
+    /// the only constructor. No state, for the same reason [`Panel`] has
+    /// none: its paint is a pure function of its own bounds and the
+    /// theme. Its fill is `surface.overlay` ("Elevation 2: modals,
+    /// dialogs", `design/tokens/vocabulary.md`), deliberately *not* the
+    /// `surface.raised` [`CommandPalette`] resolves, plus an
+    /// unconditional `border.default` outline — see
+    /// `paint::paint_dialog`. Not one of `design/gallery/index.html`'s
+    /// own 12 named widgets either, the same status [`Panel`] and
+    /// [`CommandPalette`] already have.
+    ///
+    /// **The unit-like shape is a real, disclosed trade-off.** The
+    /// moment a dialog needs a visual *variant* — a destructive
+    /// "danger" alert painting `state.error` where a neutral one paints
+    /// `surface.overlay` is the obvious first one — this has to become
+    /// `Dialog(DialogState)`, which breaks every exhaustive `match` on
+    /// [`WidgetKind`] in and above this crate. This enum carries no
+    /// `#[non_exhaustive]` to soften that, deliberately: adding one is
+    /// an API decision affecting every existing match site, not a
+    /// dialog-sized change, and the blast radius today is small (every
+    /// consumer is a path dependency inside this workspace — nothing
+    /// here is published). Recorded so the cost is visible when someone
+    /// does need the variant, not so it reads as already handled.
+    ///
+    /// [`Panel`]: WidgetKind::Panel
+    /// [`CommandPalette`]: WidgetKind::CommandPalette
+    Dialog,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]
@@ -166,6 +235,37 @@ fn spacing(value: u32) -> f32 {
 #[allow(clippy::cast_precision_loss)]
 fn type_size(value: u32) -> f32 {
     value as f32
+}
+
+/// One list-or-tree row's own height: a line of default UI text plus
+/// the smallest real spacing step above and below it. Both halves come
+/// from the token scales (invariant §7.3.10 — never a literal), through
+/// the same two helpers every other widget's own intrinsic size already
+/// goes through, so the `cast_precision_loss` allow lives in one place
+/// rather than at every call site.
+///
+/// Three consumers, which is why this is shared rather than private to
+/// `tree_view` (and why it is named for a *row* rather than a tree row
+/// — it was `tree_row_height` through `0.77.1`, when `tree_view` was
+/// the only widget that laid rows out):
+///
+/// 1. [`insert_tree_item`]'s own row layout — one row height tall, and
+///    the floor under a deeply indented row's width.
+/// 2. [`crate::paint_widget`] needs the same number: a tree row's own
+///    layout box grows to contain its children, so its *highlight* has
+///    to be clamped back to one row's height or a selected parent would
+///    paint over every descendant beneath it (`paint::paint_tree_item`).
+/// 3. `aurora_ui::panel`'s own shared `row_style`, which both the
+///    History and the Properties panel build their rows from — plain
+///    [`WidgetKind::ListRow`]s under a panel body rather than a tree,
+///    taking their `min_size` from here so a row in either panel is
+///    exactly as tall as a Layers row beside it and never a degenerate
+///    box. (It lived in `aurora_ui::history_panel` when this list was
+///    written, and served one panel; it moved and gained its second
+///    caller in `0.77.4`.)
+#[must_use]
+pub fn row_height(scales: &Scales) -> f32 {
+    type_size(scales.typography.size.md) + spacing(scales.spacing.xxs) * 2.0
 }
 
 /// The real, committed, owner-approved scales — shared by every widget

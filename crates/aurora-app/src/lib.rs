@@ -263,6 +263,17 @@
 //! samples the merged document directly at `doc_point`, matching
 //! `Drag::Eyedropper` itself, which never had that precondition.
 //!
+//! **And gated on `contains_tile`, 0.90.1**: reading the composite
+//! surface through `TileStore::get` *materialized* a blank tile there
+//! when none existed, which after 0.90.0's unchanged-tile upload skip
+//! became a real stale-pixel bug — an Eyedropper pick handled between a
+//! document open and the next redraw could leave the previous document's
+//! pixels in the GPU atlas indefinitely. `sample_pixel` now asks whether
+//! the tile was ever written before reading it, and returns `None` if
+//! not. No visible change to what the tool picks (a never-composited
+//! tile is transparent, i.e. already "nothing to pick"); see
+//! `sample_pixel`'s own doc comment for the full argument.
+//!
 //! **Undo/Redo** (PLAN.md's Undo/Redo bullet): `App` now keeps a live
 //! `history: aurora_doc::History` alongside `layers` (previously built
 //! once in `App::new`, used only to populate the History panel and
@@ -614,7 +625,8 @@ fn load_scales() -> anyhow::Result<Scales> {
 /// OS-standard signal at all — desktop-environment-specific, e.g.
 /// GNOME's own D-Bus settings portal) are real, separate follow-on
 /// spikes, honestly left open rather than guessed at; every other
-/// target here returns [`AccessibilityPreferences::default`].
+/// target here returns
+/// [`aurora_theme::AccessibilityPreferences::default`].
 /// `text_scale` stays `1.0` even on macOS: `AppKit` has no systemwide
 /// text-scale preference equivalent to iOS's Dynamic Type, so there is
 /// nothing real to read yet.
@@ -688,7 +700,7 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
 
 /// Builds a fresh, single-layer document from a decoded
 /// `aurora_io::Image` — the real "open a file" document construction
-/// [`Self::open_file`] needs, mirroring [`demo_document`]'s own shape
+/// [`App::open_file`] needs, mirroring [`demo_document`]'s own shape
 /// (built through `History`, not `LayerTree` directly, so the journal
 /// stays a meaningful record for the History panel and autosave) but
 /// with exactly the one real layer the opened file actually has, sized
@@ -1054,13 +1066,13 @@ fn verify_aur(path: &Path) -> bool {
 /// `tool` reseeds the Properties panel with `tool`'s own current
 /// options ([`tool_options`]) — opening a different document doesn't
 /// change which tool is selected, so the caller's own current
-/// `self.tool` is what this should show, not [`aurora_ui::Tool::
-/// default`].
+/// `self.tool` is what this should show, not
+/// [`aurora_ui::Tool::default`].
 ///
 /// # Errors
 ///
-/// Propagates [`aurora_widgets::WidgetError`] if clearing or
-/// repopulating any panel fails — structurally unreachable in practice
+/// Propagates [`aurora_widgets::WidgetError`] if repopulating any panel
+/// fails — structurally unreachable in practice
 /// (`workspace` is always a real `aurora_ui::build_workspace` with real
 /// panel bodies), but this function doesn't itself know that, so it
 /// reports rather than assumes.
@@ -1077,20 +1089,117 @@ fn replace_document(
     ),
     aurora_widgets::WidgetError,
 > {
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.layers.body)?;
+    // No `clear_panel_body` calls: all three `populate_*` functions
+    // empty their own panel body as their first step (`0.77.1` for
+    // Layers, `0.77.2` for History, `0.77.3` for Properties), so the
+    // explicit clears that used to stand here removed the same children
+    // the very next line removed again. Dropping them changes nothing a
+    // caller can observe, including the error: a missing panel body is
+    // still reported as the same `WidgetError::UnknownWidget`, just
+    // raised by the populate call instead of the clear before it.
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
-    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)?;
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body)?;
+    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
     let options = tool_options(tool);
     aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
+        scales,
         tool,
         &options,
     )?;
     Ok((layer_rows, topmost_pixel_layer(layers)))
+}
+
+/// The store-side half of replacing the current document with a freshly
+/// opened flat image: frees every tile the *outgoing* document still
+/// holds — its layer and mask surfaces
+/// (`aurora_doc::forget_document_surfaces`) plus this crate's own
+/// reserved composite-preview surface ([`composite_surface_id`], which
+/// no `LayerTree` can name and so no `aurora-doc` sweep can reach) —
+/// then writes `image`'s own pixels onto the incoming layer's surface
+/// (`aurora_io::write_into_store`). Returns how many tiles were freed,
+/// summed across both sweeps.
+///
+/// # Why the composite surface is swept here too
+///
+/// It is a leak, not a correctness bug, and the distinction is worth
+/// keeping straight. Every caller of this bumps `composite_cache`
+/// immediately afterwards, which invalidates every cached tile, and the
+/// recomposite path writes a *whole* tile — including a fully
+/// transparent one for a location with nothing visible — so a stale
+/// composite tile can never be displayed. What it can do is sit in the
+/// store forever: a composited tile the outgoing document produced at a
+/// grid position the incoming document never revisits has nothing left
+/// able to name it, exactly like the layer tiles this already sweeps.
+/// Across a long session of opens that is unbounded.
+///
+/// Two passes over the store's keys instead of one, deliberately.
+/// `aurora_doc::forget_document_surfaces` builds its set from a
+/// `LayerTree`/`History` and structurally cannot be told about a
+/// surface id this crate reserves, so folding the two would mean
+/// leaking that id downward into `aurora-doc`. One extra O(tiles held)
+/// pass on the document-open path is the cheaper trade.
+///
+/// # The order is the whole point, and it is not interchangeable
+///
+/// `aurora_core::IdGenerator::new` restarts a fresh
+/// `aurora_doc::LayerTree`'s layer-id counter at zero, and a
+/// `aurora_tile::SurfaceId` *is* a `LayerId` (ADR 0010 — derived, not
+/// allocated), so the incoming document's first layer claims exactly
+/// the surface the outgoing one's first layer already owns. That makes
+/// the two orderings do different things:
+///
+/// - Sweeping **after** the write deletes the pixels just written —
+///   the freshly opened document would come up blank.
+/// - Sweeping **before** it is what makes the incoming layer's surface
+///   genuinely empty, so `write_into_store`'s own documented
+///   assumption — "the rest of a freshly allocated tile is already
+///   zero", which is how it justifies writing only the region the
+///   image actually covers — actually holds.
+///
+/// The second is not merely tidier; it is a correctness fix. Nothing
+/// clips a tile read to a layer's declared `bounds` (`resolve_tile`
+/// does not, and a `bounds` is a position hint rather than an enforced
+/// clip anyway), and `aurora_io::write_aur` persists whole tiles. So a
+/// surviving tile of a *larger* previous document was composited onto
+/// the canvas for a smaller new one and written straight into the very
+/// same open's own autosave.
+///
+/// Takes the outgoing tree and history **by value**, the same contract
+/// as the `aurora_doc::forget_document_surfaces` it delegates to:
+/// sweeping a document that is still in use must not compile.
+fn replace_document_pixels(
+    store: &mut aurora_tile::TileStore,
+    outgoing_layers: aurora_doc::LayerTree,
+    outgoing_history: aurora_doc::History,
+    incoming_layers: &aurora_doc::LayerTree,
+    incoming_layer: aurora_doc::LayerId,
+    image: &aurora_io::Image,
+) -> usize {
+    let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
+        + store.forget_surface(composite_surface_id());
+    // Its own `else`, not folded into the write below: a layer with no
+    // surface means the document just opened has nowhere to put its
+    // pixels and will come up blank. That is worth a loud line even
+    // though `document_from_image` always builds a pixel layer -- every
+    // other skipped or failed path in this crate says so, and a silent
+    // blank canvas is the one outcome a user cannot diagnose.
+    let Some(surface) = incoming_layers.surface_id(incoming_layer) else {
+        tracing::error!(
+            ?incoming_layer,
+            "the opened document's layer has no surface; its pixels were not written into the \
+             tile store and the canvas will be blank"
+        );
+        return freed;
+    };
+    if let Err(err) = aurora_io::write_into_store(image, store, surface) {
+        tracing::warn!(
+            ?err,
+            "failed to write the opened image's pixels into the tile store"
+        );
+    }
+    freed
 }
 
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
@@ -2516,7 +2625,7 @@ impl FileDialogAccess for SystemFileDialog {
 /// [`App::save_file`] still need to read/decode or encode/write it),
 /// or because it needs live document state `activate_command` is
 /// deliberately kept free of (`Undo`/`Redo` — [`App::handle_key_event`]/
-/// [`App::handle_menu_event`] run them via the same [`run_command`]
+/// `App::handle_menu_event` run them via the same [`run_command`]
 /// path `Ctrl+Z`/`Ctrl+Shift+Z` already use, so there is exactly one
 /// place either command's own logic lives, not a second copy here).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2655,7 +2764,7 @@ fn command_close_target(
 /// this function is deliberately kept free of `layers`/`history`/
 /// `pixel_history`/`aurora_tile::TileStore`, so it stays exactly as
 /// pure and unit-testable as it already was; the caller
-/// ([`App::handle_key_event`]/[`App::handle_menu_event`], both of
+/// ([`App::handle_key_event`]/`App::handle_menu_event`, both of
 /// which already own that state) runs the real undo/redo via
 /// [`run_command`], the same path `Ctrl+Z`/`Ctrl+Shift+Z` themselves
 /// use. Logs and returns `None` for any other id.
@@ -3341,16 +3450,52 @@ fn run_command(
 /// shared refresh step, the same `clear_panel_body` + `populate_*`
 /// pattern [`replace_document`] already uses for a freshly opened
 /// document, just for one panel instead of two.
+///
+/// **The scales are resolved here rather than threaded in** (0.77.2,
+/// when History rows gained a real token-derived height). The only
+/// caller is [`run_command`], which already carries ten parameters and
+/// an `#[allow(clippy::too_many_arguments)]`; adding an eleventh purely
+/// to pass a value [`load_scales`] can read from a `const`-embedded
+/// design file is a worse trade than reading it here. A parse failure
+/// is logged and the refresh abandoned — the same arm the
+/// `clear_panel_body` failure below already takes, and never an
+/// `unwrap`/`expect` (workspace-denied lints; this crate holds a
+/// professional's unsaved work). The consequence of that arm is an
+/// out-of-date History panel, not a lost edit: the undo/redo it follows
+/// has already been applied to the real document.
+///
+/// **This is an O(n) rebuild of the whole panel on every structural
+/// undo/redo, and re-reading the design file is the cheap part of it.**
+/// The scales parse was measured at roughly 20 µs — negligible. What
+/// costs is [`aurora_ui::populate_history_panel`] itself: it tears down
+/// every existing row widget and inserts one per journal entry, up to
+/// the 1001 `History::journal_descriptions` can return. And because
+/// undo and redo are themselves journaled steps, the journal grows with
+/// each one, so repeated `Ctrl+Z` makes every successive rebuild
+/// strictly larger — on the UI thread, which invariant §7.3.4 says must
+/// never block. It is tolerable today only because a real session's
+/// journal is short. The fix is the same one both panels already carry
+/// as an open item: an incremental refresh that touches only the rows
+/// that changed, or a virtualized list that only ever builds the
+/// visible ones (roughly 14 of them, `aurora_ui::history_panel`'s own
+/// doc comment).
+///
+/// No `clear_panel_body` call of its own: `populate_history_panel`
+/// empties the body itself as its first step (`0.77.2`), so an external
+/// clear here was doing the same work twice.
 fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_doc::History) {
-    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body) {
-        tracing::warn!(
-            ?err,
-            "failed to clear the History panel before refreshing it"
-        );
-        return;
-    }
+    let scales = match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to load the design scales; leaving the History panel as it is"
+            );
+            return;
+        }
+    };
     if let Err(err) =
-        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)
+        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &scales, history)
     {
         tracing::warn!(?err, "failed to repopulate the History panel");
     }
@@ -3360,8 +3505,9 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
 /// populate_properties_panel`] shows for `tool` — this crate's own
 /// per-tool parameters, not `aurora-ui`'s (that crate carries no
 /// Brush/Eraser-specific knowledge at all, see
-/// `aurora_ui::properties_panel`'s own doc comment). Only [`Tool::Brush`]
-/// and [`Tool::Eraser`] have a real parameter today ([`BRUSH_RADIUS`]/
+/// `aurora_ui::properties_panel`'s own doc comment). Only
+/// [`aurora_ui::Tool::Brush`] and [`aurora_ui::Tool::Eraser`] have a real
+/// parameter today ([`BRUSH_RADIUS`]/
 /// [`ERASER_RADIUS`]); every other tool (`Move`, `MarqueeSelect`, `Zoom`,
 /// `Pan`, `Eyedropper`) has no real backing data anywhere in this crate
 /// yet, so it gets an honest empty list rather than an invented option —
@@ -3380,26 +3526,44 @@ fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
     }
 }
 
-/// Clears and repopulates the Properties panel for `tool` — the same
-/// `clear_panel_body` + `populate_*` pattern [`refresh_history_panel`]
-/// already uses, just for the Properties panel and [`tool_options`]
-/// instead of a `History` journal. [`AppCommand::SelectTool`]'s own
-/// refresh step: clearing first matters here specifically, since without
-/// it switching from a tool with real options (Brush) to one without
-/// (Move) would leave the previous tool's stale rows sitting in the
-/// panel instead of a real empty state.
+/// Repopulates the Properties panel for `tool` — the same shape
+/// [`refresh_history_panel`] has, just for the Properties panel and
+/// [`tool_options`] instead of a `History` journal.
+/// [`AppCommand::SelectTool`]'s own refresh step.
+///
+/// Emptying the body first matters here specifically, since without it
+/// switching from a tool with real options (Brush) to one without (Move)
+/// would leave the previous tool's stale rows sitting in the panel
+/// instead of a real empty state. `aurora_ui::
+/// populate_properties_panel` does that for itself as of `0.77.3`, the
+/// same contract its two sibling `populate_*` functions already had, so
+/// the explicit `clear_panel_body` that used to stand here was doing the
+/// work twice.
+///
+/// The design scales are resolved here rather than threaded through
+/// [`run_command`], the same way [`refresh_history_panel`] already does
+/// it: `aurora_ui::Workspace` carries no `Scales` of its own. A failure
+/// to load them warns and returns, leaving the panel showing the previous
+/// tool's options rather than losing anything — it is a stale panel, not
+/// a lost edit, and this crate denies `unwrap`/`panic` besides. Unlike
+/// [`refresh_history_panel`], the rebuild cost of doing this per call is
+/// not worth a caveat: [`tool_options`] yields at most one row.
 fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) {
-    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body) {
-        tracing::warn!(
-            ?err,
-            "failed to clear the Properties panel before refreshing it"
-        );
-        return;
-    }
+    let scales = match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to load the design scales; leaving the Properties panel as it is"
+            );
+            return;
+        }
+    };
     let options = tool_options(tool);
     if let Err(err) = aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
+        &scales,
         tool,
         &options,
     ) {
@@ -5048,9 +5212,14 @@ fn perform_undo_redo(
     // layer's visibility, kind and blend mode to choose the GPU fast
     // path or the CPU fallback **for the whole document**, and several
     // undoable structural steps flip it: `SetBlendMode` on a root-level
-    // pixel layer across the `Normal` boundary, and `SetVisible`,
-    // `Reparent`, `RemoveById` or `Restore` of a root-level non-`Normal`
-    // layer. When it flips, every visible tile's compositing *path*
+    // pixel layer across the GPU-expressible boundary (`Normal`/
+    // `Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/`LinearDodge`/
+    // `LinearBurn`/`ColorBurn`/`ColorDodge`/`Overlay`/`Dissolve` on one
+    // side, the other 15 modes on the other), and
+    // `SetVisible`, `Reparent`, `RemoveById` or `Restore` of a
+    // root-level layer that is itself disqualifying (a group, or a
+    // pixel layer at one of those other 15 modes). When it flips, every
+    // visible tile's compositing *path*
     // changes while a per-layer `Rect` names only one layer's own
     // region -- a quantity no `Rect` can express.
     //
@@ -6053,12 +6222,60 @@ impl CompositeBudget {
 /// `composite_document_blends_two_group_children_via_a_non_normal_blend_mode_against_a_translucent_backdrop`
 /// below for this fix verified end to end through a real group.
 ///
-/// `None` if `id` doesn't exist, isn't visible, or (for a
+/// `None` if `id` doesn't exist, isn't visible, (for a
 /// [`aurora_doc::LayerKind::Pixel`]) its tile fails to load — the same
 /// "one bad tile shouldn't abort the rest" discipline
 /// [`recomposite_visible_tiles`]/[`composite_document`] already use:
 /// the caller simply omits this contributor from its own composite
-/// rather than propagating the error further.
+/// rather than propagating the error further — or it has *nothing
+/// stored* at this tile (the most frequent case of the four; see
+/// below).
+///
+/// Also `None` — new in 0.87.0, and the ordinary case rather than an
+/// error one — for a **visible** [`aurora_doc::LayerKind::Pixel`] layer
+/// with *nothing ever stored* on its surface overlapping this tile:
+/// `aurora_tile::TileStore::contains_tile` for the same-origin branch,
+/// [`LayerWindow::is_blank`] for the windowed one. Before this, both
+/// branches asked the store for the tile unconditionally and got
+/// `Some(`all-zero texels`)` back, because the store's lazy paging
+/// answers a coordinate nothing was ever painted at by *materializing* a
+/// blank tile rather than by signalling absence — so every caller then
+/// paid a full contributor's worth of compositing work (on the GPU path,
+/// a tile-sized upload, a blend pass and a readback) to add nothing.
+///
+/// **Why that's output-preserving, stated as the precondition it
+/// actually is** (0.87.0 claimed "bit-identical for every blend mode",
+/// which overclaimed a mode-independent identity; corrected in 0.87.1).
+/// The identity is a property of one multiply in
+/// `aurora_render::composite_layer_into`, not of any blend formula: it
+/// scales the *whole* per-mode blend result by `alpha = src_a *
+/// opacity`, which is `0.0` at every texel of a blank tile, so the fold
+/// reduces to `Co = Cb` and `result_a = dst_a` — the destination
+/// untouched — for any mode **whose blend function returns a finite
+/// value**. Finiteness is the real precondition, and it is not free:
+/// `0.0 * NaN` is NaN in IEEE-754, not `0.0`, so a mode that can return
+/// NaN would corrupt the destination rather than leave it alone, and
+/// skipping it would then *differ* from compositing it. All 26 modes
+/// satisfy it as of 0.87.1 — `Hue`/`Saturation`/`Color` did **not**
+/// before that, via a NaN in `aurora_render`'s own `clip_color`, fixed
+/// in the same commit as this paragraph. A future mode must satisfy it
+/// too; see `clip_color`'s doc comment for the trap.
+///
+/// See the branch's own comment for why "never stored" must stay
+/// distinct from "stored, and fully transparent" (an erased tile is real
+/// content and still resolves), and PLAN.md's M1.10 "Empty-tile GPU
+/// composite work".
+///
+/// **One disclosed narrowing** (0.87.1, from review): both guards return
+/// *before* [`apply_mask`] runs, so a layer with nothing stored at this
+/// tile never attempts its mask-coverage read. A broken or unreadable
+/// mask scratch tile under an unpainted region therefore no longer
+/// charges `CompositeBudget::note_store_error`, so
+/// [`composite_document`] no longer refuses an export for it. Pixel
+/// output is unaffected — that layer contributes nothing there either
+/// way — but [`WindowKind::MaskCoverage`]'s doc comment states the
+/// export-refusal contract in absolute terms, so the exception is
+/// recorded in both places rather than left to be discovered.
 ///
 /// **Origin handling doesn't get any harder with nesting**:
 /// [`aurora_doc::LayerKind::Group`] has no `bounds`/offset of its own —
@@ -6137,6 +6354,52 @@ fn resolve_tile(
             let surface = layers.surface_id(id)?;
             let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
             let texels = if origin == reference_origin {
+                // **Nothing was ever stored here, so there is nothing to
+                // composite** (0.87.0). `TileStore::get` *materializes* an
+                // untouched tile -- allocates it, makes it resident,
+                // promotes it in the LRU and (residency being capped) can
+                // evict a real tile to make room, paying a synchronous
+                // encode and scratch-disk write -- purely to hand back
+                // zeros. `contains_tile` answers the same question in
+                // three hash lookups, and this is exactly the guard
+                // `read_layer_window` (the windowed sibling below) already
+                // applies to each of its up-to-four source tiles.
+                //
+                // Returning `None` is **bit-identical** to the
+                // `Some(`all-zero texels`)` it replaces:
+                // `aurora_render::composite_layer_into` derives
+                // `as = src_a * opacity`, which is `0.0` at every texel of
+                // a blank tile, and the fold then reduces to
+                // `Co = Cb` and `result_a = dst_a` -- the destination
+                // untouched.
+                //
+                // That holds for a mode whose blend function returns a
+                // *finite* value, which is the precondition, not "for
+                // every mode unconditionally" (0.87.0's own wording; see
+                // this function's doc comment for the correction). Every
+                // mode satisfies it as of 0.87.1; three did not before,
+                // because `0.0 * NaN` is NaN rather than `0.0` and
+                // `aurora_render`'s `clip_color` could return NaN.
+                //
+                // The mask and `Dissolve` tails below are
+                // skipped for the same reason: masking can only *reduce*
+                // an already-zero alpha, and `dissolve_gate` weights each
+                // texel's gate by `texel_alpha * opacity`, so it too
+                // yields a fully transparent buffer.
+                //
+                // **"Never stored" is not "transparent."** The two look
+                // the same in the texels and are different facts, and only
+                // the first one is safe to skip. A tile that was painted
+                // and then erased to `(0, 0, 0, 0)` has
+                // `contains_tile == true` -- the check consults
+                // `resident`/`pending`/`paged_out`, never tile content --
+                // so it still takes the full path below, which is what
+                // keeps this from quietly changing the meaning of an
+                // eraser stroke. See
+                // `resolve_tile_still_resolves_a_tile_written_to_full_transparency`.
+                if !store.contains_tile(surface, tile_id) {
+                    return None;
+                }
                 match store.get(surface, tile_id) {
                     Ok(tile) => tile.texels().to_vec(),
                     Err(err) => {
@@ -6166,15 +6429,34 @@ fn resolve_tile(
                     }
                 }
             } else {
-                read_layer_window(
+                let window = read_layer_window(
                     store,
                     surface,
                     origin,
                     doc_origin,
                     budget,
                     WindowKind::LayerPixels,
-                )
-                .into_texels()
+                );
+                // The windowed half of the same-origin guard above, and
+                // the same bit-identical reasoning: a window with nothing
+                // stored under any of the up-to-four source tiles it
+                // overlaps contributes no texel to this composite, so skip
+                // it rather than materializing the all-zero buffer
+                // `into_texels` would.
+                //
+                // [`LayerWindow::is_blank`], deliberately, and **not**
+                // `texels.is_none()` alone: the latter is also true when
+                // every overlapping source tile existed but *failed to
+                // read*, which must keep going down the ordinary path so
+                // `read_layer_window`'s own error charging
+                // (`CompositeBudget::note_store_error`, which the export
+                // refusal is built on) is not quietly dropped. `is_blank`
+                // is "blank *and known to be*" -- nothing stored and
+                // nothing unread.
+                if window.is_blank() {
+                    return None;
+                }
+                window.into_texels()
             };
             // Masking runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play, and by how much,
@@ -6380,7 +6662,12 @@ fn resolve_tile(
 /// up fractional — a lone opaque-white root layer at 50% opacity folds
 /// to `(0.5, 0.5, 0.5, 0.5)` — so this function runs
 /// `aurora_render::un_premultiply_in_place` on the finished accumulator
-/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`. That
+/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`.
+/// **As of 0.94.0 that pass is conditional on at least one root having
+/// actually folded** — see the `folded == 0` block at the end of the body
+/// for the three-fact argument that skipping it there is output-identical
+/// rather than an approximation. The *contract* is unchanged: what this
+/// returns is straight-alpha texels either way. That
 /// is the same step `resolve_tile`'s `Group` arm has always run on a
 /// group's isolated buffer, and it was missing here (and from the GPU
 /// compositing path, which now reaches the identical call through
@@ -6403,6 +6690,36 @@ fn resolve_tile(
 /// itself is visible. `1` is the depth passed to [`resolve_tile`], the
 /// same depth `aurora-doc`'s own validator starts its budget at for a
 /// root-level layer.
+///
+/// # Returns
+///
+/// The finished straight-alpha texels **and how many roots were actually
+/// folded into them** — i.e. how many calls to
+/// `aurora_render::composite_layer_into` this tile cost. Zero means **no
+/// root contributed** — which arises three ways, not one: `layers.roots()`
+/// was empty so the loop body never ran at all (the case
+/// `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+/// exercises); every root declined at this tile ([`resolve_tile`] returned
+/// `None` for all of them, e.g. nothing stored under the tile); or
+/// [`CompositeBudget`] refused further work before any root resolved
+/// (`charge_node`/depth refusals, which also return `None`). All three
+/// leave the returned buffer `aurora_render::transparent_tile`'s
+/// own untouched output — which since 0.94.0 is returned *without* the
+/// straightening pass running over it, since on that specific buffer the
+/// pass is a bitwise identity. So this count is now load-bearing for more
+/// than diagnostics: it is the predicate that skip reads.
+///
+/// That count is the only signal distinguishing those two cases: the
+/// texels alone cannot, and scanning them for non-transparency would cost
+/// more than the work being described. It exists because
+/// [`RecompositeTileCosts`] needs it to split `cpu_fallback_empty` from
+/// `cpu_fallback_real`, and it is returned **by value rather than credited
+/// to a process-global counter** (which is how 0.93.0 first did it):
+/// [`composite_document`] and this crate's own tests call this function
+/// without holding `GPU_TEST_LOCK`, so a global would let one thread's
+/// fold land inside another thread's measurement window under a threaded
+/// `cargo test` and silently reclassify an empty tile as real (0.93.1).
+/// Every caller that does not care can discard it.
 fn composite_roots_into_tile(
     layers: &aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
@@ -6410,8 +6727,9 @@ fn composite_roots_into_tile(
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
-) -> Vec<half::f16> {
+) -> (Vec<half::f16>, usize) {
     let mut composited = aurora_render::transparent_tile();
+    let mut folded = 0_usize;
     for &id in layers.roots().iter().rev() {
         if let Some((texels, opacity, blend_mode)) = resolve_tile(
             id,
@@ -6424,30 +6742,708 @@ fn composite_roots_into_tile(
             budget,
         ) {
             aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
+            folded = folded.saturating_add(1);
         }
     }
     // The accumulator has stopped being an accumulator and is now this
     // tile's finished composite, handed to callers (export, the
     // eyedropper, the canvas atlas) that all expect straight alpha --
     // see this function's own doc comment above.
-    aurora_render::un_premultiply_in_place(&mut composited);
-    composited
+    //
+    // # Skipped entirely when `folded == 0` (0.94.0)
+    //
+    // **This is output-identical, not an approximation.** Three facts
+    // compose into that, and all three are pinned by tests rather than
+    // asserted here:
+    //
+    // 1. *Provenance.* `composited` was seeded by
+    //    `aurora_render::transparent_tile` above and the **only** thing
+    //    that ever writes to it is the `composite_layer_into` call in the
+    //    loop above -- which sits inside the same `if let Some(..)` that
+    //    increments `folded`. So `folded == 0` means literally no write
+    //    happened, and the buffer is still `transparent_tile`'s own
+    //    output. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+    //    (and its never-painted-pixel-layer sibling) pin that end to end,
+    //    on bits.
+    // 2. *What that output is.* `transparent_tile` is all canonical
+    //    `+0.0` -- bit pattern `0x0000`, not `-0.0`, not a subnormal --
+    //    pinned in the crate that owns it by
+    //    `transparent_tile_is_all_canonical_positive_zero_bits`.
+    // 3. *What this pass does to it.* On an all-`0x0000` buffer
+    //    `un_premultiply_in_place` is a **bitwise identity**: every alpha
+    //    is `0.0`, so its `alpha > 0.0` arm never runs, its else-arm
+    //    writes the identical `0x0000` back into `r`/`g`/`b`, and `a` is
+    //    never assigned. Pinned by
+    //    `un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile`,
+    //    deliberately in `aurora-render` next to the function itself, so
+    //    that changing the zero-alpha arm fails *there* rather than
+    //    silently changing what this caller writes into the composite
+    //    surface.
+    //
+    // What it buys: this pass is a full 262,144-sample chunked walk with
+    // an `f16 -> f32 -> f16` round trip per channel, and 0.93.1's
+    // hand-split measured it at **~6.49 ms of the GPU-path benchmark's
+    // ~9.87 ms `cpu_fallback_empty`** -- the largest single lever that
+    // diagnostic round found. Most tiles of most frames are exactly this
+    // case: the visible grid extends well past whatever the user has
+    // painted.
+    //
+    // **Why the condition is `folded == 0` and not "the buffer looks
+    // transparent."** The weaker premise would cover more tiles (a real
+    // layer that resolved to fully transparent texels), but establishing
+    // it requires scanning all 262,144 samples -- which is the same
+    // whole-buffer pass being removed, so it would spend the win to find
+    // it. `folded` is already counted for `RecompositeTileCosts`, so this
+    // condition costs nothing.
+    //
+    // **The skip has its own regression guard** as of 0.94.1, and needs
+    // one for the same reason `GpuBlendDispatches` does: being
+    // output-identical is exactly what makes losing it invisible to every
+    // output assertion here. Mutating this condition to `true` (the
+    // pre-0.94.0 behaviour) left all 384 `aurora-app` tests green. So the
+    // call reports itself — see [`COMPOSITE_STRAIGHTEN_PASSES`] and
+    // `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`,
+    // which asserts zero calls for a zero-fold tile and one for a tile
+    // that folded a root.
+    if folded > 0 {
+        aurora_render::un_premultiply_in_place(&mut composited);
+        note_composite_straighten_pass();
+    }
+    (composited, folded)
 }
 
-/// Whether every visible root-level layer in `layers` is a `Normal`-blend
-/// [`aurora_doc::LayerKind::Pixel`] layer — no groups, no other blend
-/// mode — the exact case [`begin_gpu_composite_tile`] can correctly express via
-/// `aurora_render::TileCompositor::composite_over_with_opacity`'s
-/// fixed-function alpha blend unit (opacity-scaled `Normal` "source-
-/// over," nothing else). A single disqualifying layer (a visible group,
-/// or a visible pixel layer at any blend mode other than
-/// [`aurora_doc::BlendMode::Normal`]) routes the *whole document* back
-/// to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which already
-/// composites every one of those cases correctly — this only exists to
-/// find a faster path for the common case, never to replace the CPU
-/// path's own correctness. An invisible layer never disqualifies (it
-/// contributes nothing on either path), matching [`resolve_tile`]'s own
-/// `layers.visible(id) != Some(true)` early return; a layer with no
+/// Whether every visible root-level layer in `layers` is an
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the seventeen
+/// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
+/// no groups, no eighteenth mode. The seventeen are (count corrected in
+/// 0.107.1, and again in 0.115.0, which found this sentence reading
+/// "fourteen" against a fifteen-bullet list — 0.114.0 bumped the trailing
+/// clause below to "fifteen" and the opening sentence not at all, exactly the
+/// drift 0.107.1 had already corrected once:
+/// this header said "eight" from 0.106.0 to 0.107.0 while the list below
+/// already had nine bullets, so it was stale by one before `ColorBurn`
+/// made it stale by two — the bullets, `GpuBlendDispatch::ALL`'s own
+/// length and the predicate's `match` are the load-bearing lists, and
+/// this sentence is the hand-maintained one that drifted; 0.108.0 took it
+/// to eleven along with the `ColorDodge` bullet and arm it describes, and
+/// 0.110.0 to twelve along with the `Overlay` ones, 0.111.0 to
+/// thirteen along with the `HardLight` ones, 0.113.0 to fourteen along
+/// with the `LinearLight` ones, 0.114.0 to fifteen along with the
+/// `VividLight` ones, 0.115.0 to sixteen along with the `HardMix`
+/// ones, and 0.116.0 to seventeen along with the `PinLight` ones — that last
+/// round bumping this sentence, the trailing clause and the closing
+/// "all N non-`Normal` modes carry a counter" line in the same edit,
+/// which is what the two prior drifts show is the only reliable way):
+///
+/// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
+///   `blend_mode` recorded, which *is* `Normal`), composited by
+///   `aurora_render::TileCompositor::composite_over_with_opacity`'s
+///   fixed-function alpha blend unit — opacity-scaled "source-over,"
+///   the only formula that unit can express at all.
+/// - [`aurora_doc::BlendMode::Multiply`] (0.84.0), composited by
+///   `aurora_render::TileCompositor::composite_multiply_over_with_opacity`,
+///   which computes the whole composite — the `Cb * Cs` *and* the "over"
+///   — in WGSL against a sampled backdrop, so the fixed-function unit's
+///   `Normal`-only limitation does not apply to it.
+/// - [`aurora_doc::BlendMode::Darken`] (0.85.0), composited by
+///   `aurora_render::TileCompositor::composite_darken_over_with_opacity`,
+///   the second mode ported to WGSL and built to exactly the same shape
+///   as the `Multiply` sibling above — the whole composite, the
+///   per-channel `min(Cb, Cs)` *and* the "over", computed against a
+///   sampled backdrop. It reaches [`begin_gpu_composite_tile`]'s blend
+///   dispatch as its own arm, and shares the *same single* `spare`
+///   ping-pong accumulator a `Multiply` layer would use rather than
+///   needing one of its own. Not to be confused with
+///   `aurora_doc::BlendMode::DarkerColor`, which picks one whole
+///   `(R, G, B)` triple by luminosity and is still CPU-only.
+/// - [`aurora_doc::BlendMode::Lighten`] (0.95.0), composited by
+///   `aurora_render::TileCompositor::composite_lighten_over_with_opacity`,
+///   the third mode ported to WGSL and the exact mirror of the `Darken`
+///   entry above — the same whole-composite-in-the-shader shape, with a
+///   per-channel `max(Cb, Cs)` where that one has a `min`. It too
+///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own
+///   arm and shares the *same single* `spare` ping-pong accumulator. Not
+///   to be confused with `aurora_doc::BlendMode::LighterColor`, which
+///   picks one whole `(R, G, B)` triple by luminosity and is still
+///   CPU-only.
+/// - [`aurora_doc::BlendMode::Screen`] (0.102.0), composited by
+///   `aurora_render::TileCompositor::composite_screen_over_with_opacity`,
+///   the fourth mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the three entries above. Its
+///   blend line is the first that is real arithmetic on both operands
+///   rather than a single intrinsic — `Cb + Cs - Cb*Cs` per channel,
+///   written as that literal sum in `fs_composite_screen` so it stays
+///   line-for-line comparable against `aurora_render`'s own
+///   `blend_channel` arm. It too reaches [`begin_gpu_composite_tile`]'s
+///   blend dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::Difference`] (0.104.0), composited by
+///   `aurora_render::TileCompositor::composite_difference_over_with_opacity`,
+///   the fifth mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the four entries above —
+///   `|Cb - Cs|` per channel, one componentwise `abs()` on the difference
+///   in `fs_composite_difference`. Deliberately **not**
+///   `max(Cb - Cs, 0)`: that is `aurora_doc::BlendMode::Subtract`, a
+///   different mode which agrees with this one only where `Cb >= Cs` and
+///   is still CPU-only. Not to be confused with
+///   `aurora_doc::BlendMode::Exclusion` either — the "softer Difference"
+///   of the textbooks (`Cb + Cs - 2*Cb*Cs`), likewise still CPU-only and
+///   this crate's own test-module `CPU_ONLY_BLEND_MODE` stand-in (plain
+///   backticks: that const is `cfg(test)`, so a link would dangle). It too
+///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own arm
+///   and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::LinearDodge`] (0.105.0), composited by
+///   `aurora_render::TileCompositor::composite_linear_dodge_over_with_opacity`,
+///   the sixth mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the five entries above —
+///   `min(Cb + Cs, 1)` per channel, one componentwise `min` against a
+///   `vec3<f32>(1.0)` splat in `fs_composite_linear_dodge`. The second
+///   ported formula that is real arithmetic on both operands rather than a
+///   single intrinsic, and the first in which **the clamp is part of the
+///   mode rather than a defensive guard**: `Cb + Cs` is unbounded above
+///   and this mode is *defined* as the clamped sum (Photoshop's "Add").
+///   Deliberately **not** `max(Cb + Cs - 1, 0)`: that is
+///   `aurora_doc::BlendMode::LinearBurn`, this mode's exact mirror image
+///   (same sum, opposite offset, opposite clamp direction) — the realistic
+///   copy-paste hazard, since the two differ by
+///   three characters, and as of 0.106.0 it is admitted here too (the
+///   bullet directly below), so the hazard runs in both directions between
+///   two modes that both have a real GPU arm. Its nearest *arithmetic*
+///   neighbour is
+///   `Screen` (`Cb + Cs - Cb*Cs`, the same sum with a correction term
+///   instead of a clamp), already admitted above. And not to be confused
+///   with [`aurora_doc::BlendMode::ColorDodge`], the other dodge-family
+///   mode (`min(1, Cb / (1 - Cs))`) — **admitted here too as of 0.108.0**,
+///   the last mode bullet below. The two share half a word, and they also
+///   share something less obvious and more dangerous: `ColorDodge` clamps
+///   exactly when `Cb + Cs >= 1`, which is exactly when *this* mode
+///   clamps, so no clamped channel can ever tell the two apart. It too
+///   reaches
+///   [`begin_gpu_composite_tile`]'s blend dispatch as its own arm and
+///   shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::LinearBurn`] (0.106.0), composited by
+///   `aurora_render::TileCompositor::composite_linear_burn_over_with_opacity`,
+///   the seventh mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the six entries above —
+///   `max(Cb + Cs - 1, 0)` per channel, one componentwise `max` against a
+///   `vec3<f32>(0.0)` splat in `fs_composite_linear_burn`. The exact
+///   mirror image of the `LinearDodge` bullet directly above: same sum,
+///   opposite offset, opposite clamp direction, and **the clamp is part of
+///   the mode** at this end too (`Cb + Cs - 1` reaches `-1`, so dropping
+///   the `max` would emit negative colour channels as well as computing a
+///   different function). Because the two blend lines differ by three
+///   characters and *both* now exist, this one's was derived from
+///   `aurora_render`'s own `blend_channel` arm rather than copied from
+///   `fs_composite_linear_dodge` and edited. Deliberately **not**
+///   `Cb * Cs`: that is `Multiply`, this mode's nearest neighbour in
+///   behaviour rather than spelling (both darken, both give `0` for a zero
+///   backdrop, and the two agree exactly where `(1 - Cb) * (1 - Cs) == 0`),
+///   already admitted above. And not to be confused with
+///   [`aurora_doc::BlendMode::ColorBurn`], the other burn-family mode
+///   (`1 - min(1, (1 - Cb) / Cs)`) — **admitted here too as of 0.107.0**,
+///   the bullet directly below, so this hazard now runs in both
+///   directions between two modes that both have a real GPU arm, and
+///   those two arms are *adjacent* in [`begin_gpu_composite_tile`]'s
+///   `match`, which is where the hazard actually lives. The names share
+///   half a word and nothing about the arithmetic is close. It too
+///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own arm
+///   and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::ColorBurn`] (0.107.0), composited by
+///   `aurora_render::TileCompositor::composite_color_burn_over_with_opacity`,
+///   the eighth mode ported to WGSL and reaching this predicate through
+///   the same whole-composite-in-the-shader shape as the seven entries
+///   above — but **the first whose shader needed more than one
+///   componentwise expression**. `aurora_render`'s own `blend_channel`
+///   arm is three branches per channel — `Cb == 1` yields `1`, else
+///   `Cs == 0` yields `0`, else `1 - min(1, (1 - Cb) / Cs)` — and two of
+///   those three are per-channel *conditions* rather than arithmetic, so
+///   `fs_composite_color_burn` factors them into a
+///   `color_burn_channel(cb, cs)` helper (one of that file's two
+///   per-channel blend helpers; it was that file's first non-entry-point
+///   function when 0.107.0 added it, but 0.109.0's shared
+///   `straight_backdrop()`/`fold_over()` now precede it, so the ordinal is
+///   dropped rather than re-counted) called once per channel. **Branch order is
+///   load-bearing**: `Cb == 1` is tested first, so a white backdrop under
+///   a black source — both conditions true at once, and an ordinary pixel
+///   rather than a contrived one — yields `1.0`, not `0.0`. Both guards
+///   are arithmetically redundant under IEEE-754 and both are still
+///   required, because WGSL does not promise IEEE division by zero; see
+///   the compositor method's own comment for that argument and for which
+///   of the two mutations 0.107.0 could and could not kill on
+///   Vulkan/NVIDIA. Deliberately **not** `min(1, Cb / (1 - Cs))`:
+///   that is [`aurora_doc::BlendMode::ColorDodge`], the *other*
+///   guarded-division mode, whose branch conditions are `Cb == 0` and
+///   `Cs == 1` rather than this one's `Cb == 1` and `Cs == 0`, and which
+///   is **admitted here too as of 0.108.0** (the bullet below), in the
+///   dispatch arm directly after this one's. (Until 0.108.0 this sentence
+///   printed that formula with a spurious outer `1 -`, i.e. *this* mode's
+///   shape wearing the other's operands; it was one of six sites that
+///   made the same slip, all corrected in that round — though 0.108.0's
+///   own commit message and PLAN.md entry said *five*, having left the
+///   sixth, the `ColorBurn` dispatch-arm comment in
+///   `begin_gpu_composite_tile`, out of a count it had already fixed;
+///   0.108.1 corrected the figure. The distinction this sentence drew —
+///   the branch conditions — was always right.) And not
+///   `max(Cb + Cs - 1, 0)`, which is
+///   `LinearBurn`, the bullet directly above. **It is also the first
+///   admitted mode whose blend term is not symmetric in `Cb`/`Cs`**: the
+///   seven above each disclose that a transposed `src`/`backdrop` binding
+///   is invisible to their blend term, leaving only the asymmetric "over"
+///   to catch it, whereas here `B(Cb, Cs) != B(Cs, Cb)` in general, so a
+///   transpose is observable even at effective alpha `1.0`. Non-unit
+///   fixture opacity is therefore sufficient-but-not-necessary for this
+///   one mode, and `TRANSPOSE_COVERAGE`'s standing guard is deliberately
+///   *not* special-cased for it (plain backticks: that const is
+///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
+///   dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::ColorDodge`] (0.108.0), composited by
+///   `aurora_render::TileCompositor::composite_color_dodge_over_with_opacity`,
+///   the ninth mode ported to WGSL and the **second** whose shader needs
+///   more than one componentwise expression — `ColorBurn`, the bullet
+///   directly above, was the first, and the two are structural mirror
+///   images. `aurora_render`'s own `blend_channel` arm is three branches
+///   per channel — `Cb == 0` yields `0`, else `Cs == 1` yields `1`, else
+///   `min(1, Cb / (1 - Cs))` — and two of those three are per-channel
+///   *conditions* rather than arithmetic, so `fs_composite_color_dodge`
+///   factors them into a `color_dodge_channel(cb, cs)` helper (the other of
+///   that file's two per-channel blend helpers -- second of them, though no
+///   longer that file's second non-entry-point function, since 0.109.0's
+///   shared `straight_backdrop()`/`fold_over()` precede both) called once
+///   per channel.
+///   **Branch order is load-bearing, and it is the mirror of `ColorBurn`'s
+///   rather than the same**: `Cb == 0` is tested first, so a black backdrop
+///   under a white source — both conditions true at once, and an ordinary
+///   pixel rather than a contrived one — yields `0.0`, not `1.0`.
+///
+///   **Both guards are arithmetically redundant under IEEE-754, both are
+///   still required, and — unlike `ColorBurn`'s — they are redundant for
+///   two different reasons**, which 0.108.0 measured rather than reasoned
+///   about. Deleting the `Cb == 0` guard is killed **deterministically**,
+///   because `0 / (1 - Cs)` is a well-defined `+0` for every `Cs < 1`
+///   rather than a `0/0`: no division-by-zero semantics are involved on the
+///   surviving path at all, and the guard changes the answer only at
+///   `Cs == 1`, where the second guard fires in its place. Deleting the
+///   `Cs == 1` guard **survived every test in `aurora-render`** on
+///   Vulkan/NVIDIA, because `Cb / 0` is `+inf` there and `min(1, inf)` is
+///   the `1` the guard would have returned — the disclosed, expected result
+///   of a portability guard on IEEE hardware, since WGSL does not promise
+///   IEEE division by zero. See the compositor method's own comment.
+///
+///   Deliberately **not** `1 - min(1, (1 - Cb) / Cs)`: that is `ColorBurn`,
+///   whose dispatch arm is *directly adjacent* to this one's, which is
+///   where the copy-paste hazard between the guarded-division pair actually
+///   lives — so this one's shader was derived from `blend_channel`'s own
+///   Rust arm rather than copied from `fs_composite_color_burn`. And not
+///   `min(Cb + Cs, 1)`, which is `LinearDodge`, already admitted above; the
+///   two share half a name *and* their clamp boundary, since
+///   `min(1, Cb / (1 - Cs))` clamps exactly when `Cb + Cs >= 1`, so **no
+///   clamped channel can ever distinguish the two**. **It is the second
+///   admitted mode whose blend term is not symmetric in `Cb`/`Cs`**
+///   (`ColorBurn` was the first), so a transposed `src`/`backdrop` binding
+///   is observable here even at effective alpha `1.0` — measured at both
+///   `0.5` and `1.0` in 0.108.0. Non-unit fixture opacity is therefore
+///   sufficient-but-not-necessary for this mode too, and
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for both (plain backticks: that const is
+///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
+///   dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::Overlay`] (0.110.0), composited by
+///   `aurora_render::TileCompositor::composite_overlay_over_with_opacity`,
+///   the tenth mode ported to WGSL and a **third** shader shape again:
+///   `aurora_render`'s own `blend_channel` arm is one line,
+///   `blend_channel(HardLight, cs, cb)` — `HardLight` with the two channel
+///   arguments *swapped* — which substitutes out to
+///   `Multiply(Cs, 2*Cb)` where `Cb <= 0.5` and `Screen(Cs, 2*Cb - 1)`
+///   otherwise. Note the branch tests the **backdrop**, not the source;
+///   branching on the source computes `HardLight` — which, **as of 0.111.0,
+///   *is* admitted here and does have its own WGSL entry point**. (This
+///   bullet said the opposite at 0.110.0, correctly for its time; the
+///   consequence of the change is that a wrong branch operand here no longer
+///   merely computes an unreachable formula, it computes a sibling arm that
+///   really ships.)
+///
+///   **`fs_composite_overlay` is the first entry point in
+///   `composite.wgsl` to use a componentwise `select()`, and that is a
+///   reasoned exception rather than a new default.** `ColorBurn` and
+///   `ColorDodge` above needed per-channel helper *functions* precisely
+///   because a `select()` evaluates **both** arms and their discarded arm
+///   holds a division undefined in the lanes the branch excludes. Both of
+///   `Overlay`'s arms are finite multiply/add on operands already in
+///   `[0, 1]`, so evaluating both is harmless. There is no guard here at
+///   all, and no branch-order question — the two arms are exclusive on a
+///   total order.
+///
+///   **The two arms agree bit-exactly at `Cb == 0.5`** (the low arm gives
+///   `Cs * 1.0`; the high arm's `t` is exactly `0.0`, so
+///   `Cs + 0.0 - Cs * 0.0`), which makes the mode continuous there — and
+///   makes a `<=` → `<` mutation **unkillable in principle**. 0.110.0 ran
+///   that mutation for real and it survived, as predicted; it is disclosed
+///   in `aurora_render`'s `composite_overlay_*` suite rather than tested
+///   around.
+///
+///   **Two degeneracies, both verified algebraically:**
+///   `Overlay(0.5, Cs) = Cs` (a backdrop channel at exactly `0.5` is
+///   `Normal`), and `Overlay(Cb, 0.5) = Cb` for **every** `Cb` (a *source*
+///   channel at exactly `0.5` makes this mode a total no-op). Together with
+///   the branch on `Cb <= 0.5` they are why
+///   `NORMAL_MULTIPLY_OVERLAY_STACK` is the first sibling fixture in this
+///   crate not built on a `Multiply` layer of `0.5` grey — its `l2` colour is
+///   `0.75` grey instead, its *opacity* being `1.0` exactly as every
+///   sibling's is. A `0.5`-grey `Multiply` would have halved the accumulator,
+///   driving every backdrop channel to or below `0.5`, leaving the high arm
+///   unreachable and every channel crowding the `Normal`-degenerate
+///   boundary.
+///
+///   **The `HardLight` collision rule**, which every fixture here is chosen
+///   against, and which as of 0.111.0 runs both ways between two live
+///   dispatch arms: `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two agree
+///   exactly wherever `Cb` and `Cs` share a side of `0.5` (both `<=` gives
+///   `2*Cb*Cs` either way; both `>` gives `2*Cb + 2*Cs - 1 - 2*Cb*Cs`
+///   either way) and differ only where they straddle it.
+///
+///   **It is the third admitted mode whose blend term is not symmetric in
+///   `Cb`/`Cs`, and the first whose asymmetry is *conditional*.**
+///   `ColorBurn` and `ColorDodge` are asymmetric everywhere; the seven
+///   modes before them are commutative everywhere. By the collision rule
+///   with `Overlay` on both sides, `B(Cb, Cs) == B(Cs, Cb)` in every
+///   channel whose operands share a side of `0.5`, and differs only in a
+///   straddling channel — so `NORMAL_MULTIPLY_OVERLAY_STACK` straddles in
+///   **all three** channels, and 0.110.0 confirmed by real measurement that
+///   a transposed binding is observable there at effective alpha `1.0` as
+///   well as at `0.5`. Non-unit fixture opacity is therefore
+///   sufficient-but-not-necessary for **seven of the sixteen** non-`Normal`
+///   admitted modes as of
+///   0.116.0 — `PinLight` is the seventh, its blend term being symmetric only
+///   on a measure-zero set, so any generically chosen fixture sees its
+///   transpose at `1.0`; note that makes it a *different* kind of exception
+///   from `Overlay`/`HardLight`, whose symmetry set is the straddling half of
+///   the square. 0.115.0's own `HardMix` moved the denominator from
+///   fourteen to fifteen without joining the six — its blend term is
+///   symmetric away from one corner point, so it is the rule the six are
+///   exceptions to (the sixth being `VividLight`, whose asymmetry is
+///   unconditional *and* structural — it branches on the source, so a
+///   transposed pair branches on the backdrop — and whose own fixture
+///   catches a transpose at `1.0` in all three channels, measured; note
+///   that this mode *does* have blind opacities, contrary to what 0.114.0
+///   first wrote here, so it is the fixture and not the formula that makes
+///   the `0.5` unnecessary — see `TRANSPOSE_COVERAGE`'s standing guard for
+///   the affine criterion; the fifth being `LinearLight`, whose
+///   *unconditional*
+///   asymmetry makes a transpose observable at alpha `1.0` even though its
+///   own fixture's interior channels are blind to one at exactly `0.5` —
+///   see `solid_stack_texel_cpu` for how the standing guard now catches
+///   that case computationally instead), and
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for all six (plain backticks: that const is
+///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
+///   dispatch as its own arm and shares the *same single* `spare` ping-pong
+///   accumulator.
+/// - [`aurora_doc::BlendMode::HardLight`] (0.111.0), composited by
+///   `aurora_render::TileCompositor::composite_hard_light_over_with_opacity`,
+///   the eleventh mode ported to WGSL and **the exact transposed twin of the
+///   `Overlay` bullet directly above**: `HardLight(Cb, Cs) = Overlay(Cs, Cb)`
+///   *and* `Overlay(Cb, Cs) = HardLight(Cs, Cb)`. `aurora_render`'s own
+///   `blend_channel` arm is a real two-branch body — `Multiply(Cb, 2*Cs)`
+///   where `Cs <= 0.5`, else `Screen(Cb, 2*Cs - 1)`, i.e. `Cb * 2*Cs` and
+///   `Cb + t - Cb*t` with `t = 2*Cs - 1`, `Cb` first in both delegates.
+///
+///   **The branch tests the *source*, not the backdrop** — the one and only
+///   semantic difference from its neighbour, which is why
+///   `fs_composite_hard_light` was derived from that Rust arm rather than
+///   copied from `fs_composite_overlay` and transposed. The textual evidence
+///   is in the shader (`cb * (2.0 * s.rgb)` here against the sibling's
+///   `s.rgb * (2.0 * cb)`) but is for a *reader*, not a test: 0.111.0's
+///   mutation (m) rewrote that low arm into the sibling's shape and the whole
+///   suite stayed green, correctly — both forms are `2*Cb*Cs`
+///   bit-identically. The branch condition and the *high* arm's base operand
+///   are the observable parts, and both were confirmed killed for real.
+///
+///   **This is the first mode ported whose transposed twin was already a live
+///   entry point and dispatch arm**, so the wrong-arm hazard is now
+///   *bidirectional* between two shipped GPU modes. Three separate mutations
+///   — a transposed `src`/`backdrop` binding, a branch on `cb`, and a
+///   `fragment_entry` naming the sibling — all produce the same wrong answer,
+///   and all three are invisible in any channel whose operands share a side of
+///   `0.5`.
+///
+///   **The two arms agree bit-exactly at `Cs == 0.5`** (the low arm gives
+///   `Cb * 1.0`; the high arm's `t` is exactly `0.0`, so `Cb + 0.0 - Cb*0.0`),
+///   making the mode continuous there — and making a `<=` → `<` mutation
+///   **unkillable in principle**. 0.111.0 ran that mutation for real and it
+///   survived, as predicted; it is disclosed in `aurora_render`'s
+///   `composite_hard_light_*` suite rather than tested around.
+///
+///   **Two degeneracies, both verified algebraically, and both the
+///   *transpose* of the sibling's correspondingly-numbered one:**
+///   `HardLight(0.5, Cs) = Cs` (a **backdrop** channel at exactly `0.5` is
+///   `Normal`, and note this is *not* the branch boundary here), and
+///   `HardLight(Cb, 0.5) = Cb` for **every** `Cb` (a **source** channel at
+///   exactly `0.5` makes this mode a total no-op — and this one *is* the
+///   branch boundary, which is exactly why the `<=` mutation cannot be
+///   killed). A third, worth naming because it does *not* transfer from the
+///   sibling: a black or white **source** channel erases the backdrop
+///   (`HardLight(Cb, 0) = 0`, `HardLight(Cb, 1) = 1`), while a black or white
+///   *backdrop* is not degenerate here at all.
+///
+///   **The two-way collision rule**: the two modes agree exactly wherever
+///   `Cb` and `Cs` share a side of `0.5` (both `<=` gives `2*Cb*Cs` either
+///   way; both `>` gives `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way) and differ
+///   only where they straddle it. `NORMAL_MULTIPLY_HARD_LIGHT_STACK`
+///   deliberately reuses `NORMAL_MULTIPLY_OVERLAY_STACK`'s three colours
+///   verbatim, so the two fixtures' goldens are a direct read-out of that
+///   rule, and it straddles in **all three** channels for the same reason its
+///   sibling does.
+///
+///   **It is the fourth admitted mode whose blend term is not symmetric in
+///   `Cb`/`Cs`, and the second whose asymmetry is *conditional*** (`Overlay`
+///   was the first; `ColorBurn` and `ColorDodge` are asymmetric everywhere).
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for all six such modes (four when this paragraph was
+///   written in 0.111.0; count corrected in 0.114.1 — plain backticks: that
+///   const is `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s
+///   blend dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::LinearLight`] (0.113.0), composited by
+///   `aurora_render::TileCompositor::composite_linear_light_over_with_opacity`,
+///   the twelfth mode ported to WGSL — and **structurally the simplest since
+///   `LinearBurn`, which is the news of its round**. The two overlay-family
+///   modes directly above it are two-call delegations that became a
+///   componentwise `select()`; this one's `aurora_render::blend_channel` arm is
+///   a *single unconditional expression*,
+///   `(cb + 2.0 * cs - 1.0).clamp(0.0, 1.0)`, so
+///   `fs_composite_linear_light` has **no branch and no `select()`** and is
+///   shaped like `fs_composite_linear_burn`'s instead. Its branch form
+///   (`Cs <= 0.5 -> LinearBurn(Cb, 2*Cs)`, else `LinearDodge(Cb, 2*Cs - 1)`)
+///   collapses to that clamp because each branch can only reach the one bound
+///   it would have applied anyway — proved numerically by
+///   `aurora_render`'s own `linear_light_simplified_form_matches_the_branch_
+///   form_for_several_inputs`, which predates the port. So this round had **no
+///   branch-boundary test to write and no unkillable `<=`/`<` mutation to
+///   disclose**, unlike each of the two before it.
+///
+///   **It is the first `clamp()` in `shaders/composite.wgsl`**, and WGSL
+///   specifies float `clamp(e1, e2, e3)` as `min(max(e1, e2), e3)` — so
+///   despite containing neither token it carries two NaN-laundering
+///   intrinsics, and deleting `straight_backdrop`'s guard is **not** caught by
+///   this mode's transparent-backdrop test. Predicted from the rule 0.110.0
+///   wrote down, then measured; the detector count stays at five, and this is
+///   the first time that rule predicted a *non*-detection.
+///
+///   **The near-miss set has a genuinely dangerous member.** Dropping the
+///   `2.0 *` gives `clamp(Cb + Cs - 1, 0, 1)`, whose upper bound is
+///   unreachable for operands in `[0, 1]` — so it **is** `max(Cb + Cs - 1, 0)`,
+///   which is `LinearBurn`, a live GPU entry point and dispatch arm.
+///   `min(Cb + Cs, 1)` is likewise exactly `LinearDodge`, also live. Both slips
+///   therefore degrade silently to another shipped mode. `Overlay` and
+///   `HardLight`, despite being the adjacent arms, are *not* plausible
+///   confusions in either direction: they branch and this does not.
+///
+///   **Two degeneracies, both on the source side:**
+///   `LinearLight(Cb, 0.5) = Cb` for every `Cb` (a source channel at exactly
+///   `0.5` is a total no-op), and `LinearLight(Cb, 0) = 0` /
+///   `LinearLight(Cb, 1) = 1` (a black or white source channel erases the
+///   backdrop). A `0.5` **backdrop** channel is deliberately *not* degenerate
+///   here — `LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)` still depends on
+///   `Cs` — which is the opposite of `HardLight` and is why several fixtures
+///   use one.
+///
+///   **It is the fifth admitted mode whose blend term is asymmetric in
+///   `Cb`/`Cs`, and the third whose asymmetry is *unconditional***
+///   (`ColorBurn` and `ColorDodge` are the other two; `Overlay` and
+///   `HardLight` are asymmetric only in straddling channels):
+///   `B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` before the clamp. **What that does
+///   *not* mean is that a transpose is always observable, and this round
+///   worked out why algebraically before measuring it**: over an opaque
+///   backdrop at effective alpha `a`, a *railed* channel's two orders share a
+///   `B` and only `(1-a)*Cb` vs `(1-a)*Cs` survives — nothing at `a = 1` —
+///   while an *interior* channel has
+///   `out - out_transposed = (Cb - Cs)*(1 - 2a)`, which is **zero at
+///   `a = 0.5`**. The two laundering mechanisms are exactly complementary, so
+///   `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` deliberately carries all three clamp
+///   regimes: its two railed channels catch a transpose at its own `0.5` and
+///   its one interior channel catches one at `1.0`, both measured.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for this mode too (plain backticks: that const is
+///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
+///   its own arm and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::VividLight`] (0.114.0), composited by
+///   `aurora_render::TileCompositor::composite_vivid_light_over_with_opacity`,
+///   the thirteenth mode ported to WGSL — and the **first whose blend term is
+///   built entirely out of two other ported modes**, which is the news of its
+///   round. Its `aurora_render::blend_channel` arm is a branch whose two arms
+///   are `ColorBurn(Cb, 2*Cs)` and `ColorDodge(Cb, 2*Cs - 1)`, both admitted
+///   here since 0.107.0 and 0.108.0, so its shader adds one helper that
+///   delegates to their per-channel ones and computes nothing else. It is
+///   called three times rather than written as a componentwise `select()`:
+///   those two callees' guards are *early returns* keeping a division out of
+///   the lanes where its divisor is zero, and a `select()` would evaluate both
+///   arms everywhere. **This is the first mode to inherit both
+///   guarded-division modes' portability gaps at once** —
+///   `color_burn_channel`'s `cs == 0.0` guard and `color_dodge_channel`'s
+///   `cs == 1.0` guard are each arithmetically redundant only because this
+///   adapter divides by zero to `+inf`, where WGSL promises an indeterminate
+///   value. Its degeneracies are the family's plus one no sibling has: a
+///   **backdrop** channel at `0` or `1` erases the *source* entirely
+///   (`VividLight(0, Cs) = 0`, `VividLight(1, Cs) = 1`), so
+///   `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` is constrained by the real `Multiply`
+///   fold and not just by `l1`'s literals. Its `<=` branch boundary is
+///   continuous — both arms give `Cb` at `Cs == 0.5`, guard points included —
+///   so that comparison's direction is **unkillable at these suites'
+///   tolerance**, the third such case after `Overlay` and `HardLight`;
+///   `aurora-render`'s
+///   `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
+///   proves the arm-equality exhaustively over every `f16`-representable `Cb`
+///   in `[0, 1]`, which is the honest scope of the claim: outside that domain
+///   (a general `f32` `Cb` from a non-opaque backdrop's division, or an
+///   unclamped `Cb > 1`) the two arms can differ — see that mode's own shader
+///   comment. Its asymmetry is unconditional *and structural* (it branches on
+///   the source, so a transposed pair branches on the backdrop) and, unlike
+///   `LinearLight`, it is **not affine in its operands** — which, contrary to
+///   0.114.0's first draft here, does *not* mean it has no blind opacity: the
+///   fold's transpose gap is affine in `a` for every mode, so a channel goes
+///   blind wherever `Cb - Cs` and `B(Cb, Cs) - B(Cs, Cb)` have opposite signs,
+///   clamp-interior in both orders or not. Two things launder a transpose here
+///   (rail agreement in the blend term, and that blind alpha), and what
+///   establishes observability is `TRANSPOSE_COVERAGE`'s arithmetic assertion,
+///   not the interiority heuristic. Its fixture is interior in both orders in
+///   red and blue, upper-railed in green in the shipped order only, and rails
+///   in both orders nowhere — so no channel's blind alpha falls on `0.5` or
+///   `1.0`, and the transpose is caught in all three channels at `0.5` **and**
+///   at `1.0`, measured — the first roster row for which that holds at both.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for this mode too (plain backticks: that const is
+///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
+///   its own arm and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::HardMix`] (0.115.0), composited by
+///   `aurora_render::TileCompositor::composite_hard_mix_over_with_opacity`,
+///   the fourteenth mode ported to WGSL — and the **first whose blend term is
+///   one whole other ported mode's helper plus a comparison**. Its
+///   `aurora_render::blend_channel` arm is
+///   `if VividLight(Cb, Cs) < 0.5 { 0.0 } else { 1.0 }`, and `VividLight` has
+///   been admitted here since 0.114.0, so its shader adds one helper that
+///   calls `vivid_light_channel` and thresholds it. **The news of its round is
+///   a closed form**: both of `VividLight`'s arms cross `0.5` at exactly
+///   `Cb + Cs == 1`, so `HardMix(Cb, Cs) = 1` iff `Cb + Cs >= 1` —
+///   **everywhere except the single point `(Cb, Cs) = (0, 1)`, where it is
+///   `0`**, because `color_dodge_channel` tests `cb == 0.0` before
+///   `cs == 1.0` and the first guard wins. Verified exhaustively over a
+///   `1/256` grid plus an edge refinement: one exception, and exactly two
+///   asymmetric pairs, `(0, 1)` and `(1, 0)`. So its blend term is
+///   **symmetric everywhere except that corner**, with **no interior
+///   asymmetric pair at all** — which makes `NORMAL_MULTIPLY_HARD_MIX_STACK`
+///   the first roster fixture whose red channel is chosen to *be* that corner:
+///   two of its three channels see a transposed dispatch arm only through the
+///   fold's own `(1 - a)*(Cb - Cs)` term, so the `0.5` opacity
+///   `TRANSPOSE_COVERAGE`'s guard demands is genuinely load-bearing there,
+///   while red sees it in `B` too and by a full `1.0`. Its degeneracies are
+///   its own: a **backdrop** channel at `0` or `1` fixes `B` outright, and —
+///   provably, not coincidentally — **every `B = 0` channel agrees with
+///   `ColorBurn` and every `B = 1` channel with `ColorDodge`**, so separating
+///   both of its grand-callees needs a fixture carrying both rails. Its
+///   `< 0.5` threshold is the **first branch comparison on this path whose
+///   direction is killable**: unlike `Overlay`, `HardLight` and `VividLight`,
+///   whose two branches agree *at* their boundary, this one's arms are the
+///   constants `0.0` and `1.0`, so an input landing exactly on `0.5` flips a
+///   whole channel — and `Cb + Cs == 1` with binary-exact operands gives
+///   exactly that. It also inherits both guarded-division portability gaps
+///   through `vivid_light_channel`, but the threshold **masks** them, mapping
+///   `0.0`, `1.0` and `+inf` alike onto a `0.0` or `1.0`; and it is a *total*
+///   `NaN` launderer, by an argument no prior mode has — `NaN < 0.5` is
+///   `false` on every backend, so it cannot return a non-finite value even if
+///   `min()` propagated one.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for this mode too (plain backticks: that const is
+///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
+///   its own arm and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::PinLight`] (0.116.0), composited by
+///   `aurora_render::TileCompositor::composite_pin_light_over_with_opacity`,
+///   the fifteenth mode ported to WGSL — and the last branch-on-the-source
+///   overlay-family mode except `SoftLight`. Its `aurora_render::blend_channel`
+///   arm is `if Cs <= 0.5 { Darken(Cb, 2*Cs) } else { Lighten(Cb, 2*Cs - 1) }`,
+///   i.e. a `min` and a `max` behind a branch, so its shader is one
+///   componentwise `select()` with no per-channel helper — the cheapest port
+///   since `Overlay`. **The news of its round is its blind set**, verified
+///   exhaustively over a 129×129 rational grid on `[0, 1]²`: writing
+///   `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, the blend term is
+///   symmetric (`D1 == 0`, hence blind to a transposed arm at effective alpha
+///   `1.0`) on exactly four classes, with **zero** grid members outside them —
+///   `Cb == Cs`; **`|Cb - Cs| == 0.5`**; one operand `0` with the other
+///   `<= 0.5`; one operand `1` with the other `> 0.5`. The second is a hazard
+///   class **no previously ported mode has**, and it is the one to carry
+///   forward: `(0.25, 0.75)` and `(0.5, 1.0)` are both in it, and both are
+///   values a fixture picks by habit. Blindness at `a = 0.5` — the opacity
+///   `TRANSPOSE_COVERAGE`'s guard demands — needs `D0 + D1 == 0` with
+///   `D0 != 0`, which over that grid holds at **exactly two pairs, `(0, 1)` and
+///   `(1, 0)`**: the same corner `HardMix` found, reached here for an unrelated
+///   reason. `NORMAL_MULTIPLY_PIN_LIGHT_STACK` sits off all five sets, and its
+///   transpose is measured caught in all three channels at `0.5` **and** at
+///   `1.0`. Its degeneracies are `Darken`'s and `Lighten`'s: **every
+///   backdrop-wins channel (`B == Cb`) provably agrees with `Darken` in the low
+///   branch and `Lighten` in the high branch**, both live GPU arms, so
+///   separating them needs a *source-derived* channel per branch. Its
+///   `<= 0.5` branch comparison is the **second on this path whose direction is
+///   killable** (after `HardMix`) and the first whose kill needs an
+///   out-of-gamut backdrop to exist: the two arms agree for every `Cb` in
+///   `[0, 1]`, and diverge only where `straight_backdrop`'s unclamped division
+///   yields `Cb > 1`. It is **not** a sixth `NaN`-guard detector — both arms are
+///   a bare `min`/`max`, which launder on this adapter, so it sits in
+///   `Darken`/`Lighten`'s class.
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for this mode too (plain backticks: that const is
+///   `cfg(test)`). It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
+///   its own arm and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
+///   GPU-side support at all and never reaches
+///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
+///   `Dissolve` is not a colour-blend function; it is a per-pixel
+///   binary visibility decision, and [`resolve_tile`] already makes that
+///   decision on the CPU ([`dissolve_gate`]) *before* returning, handing
+///   back an already-gated buffer at `(opacity = 1.0, blend_mode =
+///   Normal)`. Whatever consumes that tuple therefore only ever sees
+///   `Normal` — so admitting `Dissolve` here reuses the existing
+///   `Normal` GPU arm exactly and adds no WGSL. It is also safe to route
+///   either way: `dissolve_gate`'s noise is a pure function of a texel's
+///   *absolute document-space* position (never a tile-relative
+///   coordinate, never RNG state, never layer identity — see its own doc
+///   comment), so the GPU and CPU paths, which call the same
+///   [`resolve_tile`] with the same `doc_origin`, are handed bit-
+///   identical gated texels. `recomposite_visible_tiles_gpu_and_cpu_
+///   paths_agree_on_a_dissolve_blend_document` pins that on real
+///   hardware.
+///
+/// **All sixteen non-`Normal` modes above carry a GPU dispatch counter**, as
+/// of 0.103.0, which retrofitted one onto each of the five admitted then
+/// (and `Difference` has carried one from its own first round in 0.104.0,
+/// `LinearDodge` from its own in 0.105.0, `LinearBurn` from its own in
+/// 0.106.0, `ColorBurn` from its own in 0.107.0, `ColorDodge` from its own
+/// in 0.108.0, `Overlay` from its own in 0.110.0, `HardLight` from its own
+/// in 0.111.0, `LinearLight` from its own in 0.113.0, `VividLight` from its
+/// own in 0.114.0, `HardMix` from its own in 0.115.0 and `PinLight` from its own
+/// in 0.116.0 — deliberately stated
+/// without
+/// ordinals, because "counter acquired Nth" and the bullets' own "Nth
+/// mode ported to WGSL" are two different orderings that disagree by
+/// one, `Normal` being ported but uncounted) — the
+/// per-mode bullets deliberately no longer say so one at
+/// a time, because as of that round it is true of every one of them and
+/// repeating it sixteen times only invites the list to drift out of step
+/// again. `GpuBlendDispatches` is the single place that convention, and
+/// the gap it closes, is documented. `Normal` itself is deliberately
+/// uncounted, for the reason [`GpuBlendDispatch`] gives.
+///
+/// A single disqualifying layer (a visible group, or a visible pixel
+/// layer at any of the other 10 blend modes — 27 `aurora_doc::BlendMode`
+/// variants minus the seventeen admitted above; the figure was left at 13
+/// through 0.114.0, corrected in 0.114.1, and re-derived each round since)
+/// routes the *whole document*
+/// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
+/// already composites every one of those cases correctly — this only
+/// exists to find a faster path for the common cases, never to replace
+/// the CPU path's own correctness. An invisible layer never disqualifies
+/// (it contributes nothing on either path), matching [`resolve_tile`]'s
+/// own `layers.visible(id) != Some(true)` early return; a layer with no
 /// explicit `blend_mode` recorded is treated as `Normal`, matching
 /// `resolve_tile`'s own `.unwrap_or(aurora_doc::BlendMode::Normal)`.
 ///
@@ -6464,7 +7460,25 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                 (layers.kind(id), layers.blend_mode(id)),
                 (
                     Some(aurora_doc::LayerKind::Pixel { .. }),
-                    Some(aurora_doc::BlendMode::Normal) | None
+                    Some(
+                        aurora_doc::BlendMode::Normal
+                            | aurora_doc::BlendMode::Multiply
+                            | aurora_doc::BlendMode::Darken
+                            | aurora_doc::BlendMode::Lighten
+                            | aurora_doc::BlendMode::Screen
+                            | aurora_doc::BlendMode::Difference
+                            | aurora_doc::BlendMode::LinearDodge
+                            | aurora_doc::BlendMode::LinearBurn
+                            | aurora_doc::BlendMode::ColorBurn
+                            | aurora_doc::BlendMode::ColorDodge
+                            | aurora_doc::BlendMode::Overlay
+                            | aurora_doc::BlendMode::HardLight
+                            | aurora_doc::BlendMode::LinearLight
+                            | aurora_doc::BlendMode::VividLight
+                            | aurora_doc::BlendMode::HardMix
+                            | aurora_doc::BlendMode::PinLight
+                            | aurora_doc::BlendMode::Dissolve
+                    ) | None
                 )
             )
     })
@@ -6503,8 +7517,10 @@ fn decode_f16_samples(data: &[u8]) -> Option<Vec<half::f16>> {
 }
 
 /// One composite tile's GPU readback, issued
-/// (`copy_texture_to_buffer` + `queue.submit` + `slice.map_async`) but
-/// not yet resolved — the "phase 1" unit [`begin_tile_readback`]
+/// (`copy_texture_to_buffer` recorded by [`record_tile_readback`], the
+/// tile's single `queue.submit`, then `slice.map_async` in
+/// [`map_pending_readback`]) but
+/// not yet resolved — the "phase 1" unit [`map_pending_readback`]
 /// produces and [`finish_tile_readback`] consumes, once a single
 /// per-frame `device.poll` has driven every pending tile's `map_async`
 /// callback to completion. See [`recomposite_visible_tiles`]'s own doc
@@ -6526,33 +7542,33 @@ struct PendingGpuReadback {
     rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
-/// Issues the GPU→CPU readback for one already-composited destination
-/// `texture` — `copy_texture_to_buffer`, `queue.submit`, and
-/// `slice.map_async` — without blocking on any of it: deliberately no
-/// `device.poll` call here at all, unlike this function's own
-/// single-tile-at-a-time predecessor. This is phase 1's own per-tile
-/// unit of work; [`recomposite_visible_tiles`] calls this once per
-/// GPU-qualifying tile, collects every [`PendingGpuReadback`] it
-/// returns into a `Vec`, then polls **once** for the whole batch before
-/// resolving any of them via [`finish_tile_readback`].
+/// Records the GPU→CPU copy for one already-composited destination
+/// `texture` into `encoder` and returns the destination buffer —
+/// `copy_texture_to_buffer` and nothing else. Deliberately **no
+/// submit and no `device.poll`**.
+///
+/// This is one half of what was a single `begin_tile_readback` before
+/// 0.86.0; [`map_pending_readback`] is the other. They were split
+/// because the copy has to be *recorded* into the same per-tile encoder
+/// that carries the tile's clear and blend passes (so the whole tile
+/// costs one `queue.submit`), while the `map_async` that turns the
+/// result into a [`PendingGpuReadback`] can only legally happen *after*
+/// that submit. One function could not sit on both sides of the submit;
+/// two can.
 ///
 /// `texture` must be `Rgba16Float`, `TILE`×`TILE`, with `COPY_SRC` usage,
 /// matching [`begin_gpu_composite_tile`]'s own destination texture.
-fn begin_tile_readback(
+fn record_tile_readback(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
-    tile_id: aurora_tile::TileId,
-) -> PendingGpuReadback {
+) -> wgpu::Buffer {
     let bytes_per_row = aurora_tile::TILE * 8; // Rgba16Float, already 256-byte aligned.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu-composite-readback"),
         size: u64::from(bytes_per_row) * u64::from(aurora_tile::TILE),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("gpu-composite-readback"),
     });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -6575,17 +7591,33 @@ fn begin_tile_readback(
             depth_or_array_layers: 1,
         },
     );
-    queue.submit(std::iter::once(encoder.finish()));
-
-    let (tx, rx) = std::sync::mpsc::channel();
     readback
+}
+
+/// Starts the asynchronous map of a readback `buffer`
+/// [`record_tile_readback`] filled, pairing it with its `tile_id` as the
+/// [`PendingGpuReadback`] phase 3 will resolve. No `device.poll` here:
+/// [`recomposite_visible_tiles`] polls **once** for the whole frame's
+/// batch, then drains every pending tile via [`finish_tile_readback`].
+///
+/// **Precondition: the command buffer that recorded the copy into
+/// `buffer` must already have been submitted.** `map_async` on a buffer
+/// whose filling copy is still sitting in an unfinished encoder would
+/// map it before the copy ever runs, and the caller would decode stale
+/// or uninitialised bytes as if they were the tile's composite — a
+/// silently wrong tile, not an error. [`begin_gpu_composite_tile`] is
+/// the only caller and calls this on the line after its single
+/// `queue.submit`; keep it that way.
+fn map_pending_readback(buffer: wgpu::Buffer, tile_id: aurora_tile::TileId) -> PendingGpuReadback {
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
     PendingGpuReadback {
         tile_id,
-        buffer: readback,
+        buffer,
         rx,
     }
 }
@@ -6676,11 +7708,1296 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     })
 }
 
+/// Creates one member of [`begin_gpu_composite_tile`]'s ping-pong
+/// accumulator pair: a tile-sized `Rgba16Float` texture cleared to fully
+/// transparent black, plus its default view. Called at most twice per
+/// tile, and each call is separately lazy — the second member only
+/// exists once a `Multiply`, `Darken`, `Lighten` or `Screen` layer has
+/// actually reached that
+/// tile. There is exactly **one** second member however many such layers
+/// (or however many distinct modes) the stack holds: the ping-pong needs
+/// a place to render that is not the backdrop, and one spare texture
+/// serves every non-`Normal` arm in turn.
+///
+/// Usage is `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`.
+/// `RENDER_ATTACHMENT` because every blend pass renders into one of the
+/// pair; `COPY_SRC` because the final readback copies out of whichever
+/// one ended up holding the fold; and `TEXTURE_BINDING` because
+/// `composite_multiply_over_with_opacity`,
+/// `composite_darken_over_with_opacity`,
+/// `composite_lighten_over_with_opacity` and
+/// `composite_screen_over_with_opacity` *sample* their backdrop, and
+/// which member is the backdrop is not known until the layer stack has
+/// been walked — so both must be bindable. No `COPY_DST`: nothing ever
+/// reaches these through `queue.write_texture`, only through render
+/// passes.
+///
+/// The clear is a real render pass rather than a `LoadOp::Clear` on the
+/// first blend, because `composite_over_with_opacity` always uses
+/// `LoadOp::Load` — it has no "this is the first layer" mode — so an
+/// accumulator a `Normal` layer blends onto must already hold known
+/// transparent content.
+///
+/// **Recorded onto the caller's encoder, not submitted here** (0.86.0).
+/// Until then this function opened its own `wgpu::CommandEncoder` and
+/// submitted it, which cost every composite tile one whole queue
+/// submission (two, for a tile that also needed the `spare`) before a
+/// single layer had been blended. It now records the clear pass into the
+/// one encoder [`begin_gpu_composite_tile`] opens for the whole tile, so
+/// the clear, every layer's blend pass and the readback copy all travel
+/// in one command buffer. Ordering is unaffected: passes within a single
+/// command buffer execute in recording order, and this one is recorded
+/// before any pass that loads from the texture it clears.
+///
+/// **That reasoning is load-bearing for the first member only.** The
+/// second (`spare`) is created inside whichever blend-math arm reaches
+/// this tile first, and handed straight to that arm's compositor method
+/// as its `dst`, which clears and fully overwrites it (`LoadOp::Clear`,
+/// no blending, a fullscreen triangle), so nothing ever reads its
+/// cleared contents.
+/// The clear stays for both because this is one shared constructor and
+/// "every accumulator starts transparent" is the simpler invariant to
+/// keep than "this one may hold garbage as long as the next pass happens
+/// to be a blend-math pass" — a future caller would inherit the safe
+/// shape rather than the conditional one. What 0.84.1 removed is the
+/// *unconditional* second call: an all-`Normal` document now pays for
+/// one texture and one clear per tile, not two.
+fn create_composite_accumulator(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    size: wgpu::Extent3d,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("gpu-composite-clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+
+    (texture, view)
+}
+
+/// Returns `slot`'s accumulator pair, creating and clearing it via
+/// [`create_composite_accumulator`] first if the slot is empty.
+///
+/// **Why this exists at all**: `Option::get_or_insert_with` is the
+/// obvious call here and does not compile — the closure would have to
+/// capture `&mut encoder`, and that borrow would then live as long as
+/// the returned `&mut` reference into `slot`, which the compositor
+/// calls immediately downstream also need `&mut encoder` for. The
+/// `take()`/`insert()` pair sequences the two borrows instead: the
+/// `&mut encoder` handed to [`create_composite_accumulator`] is
+/// released when that call returns, *before* `slot.insert` takes its
+/// own borrow of `slot`.
+///
+/// **And why not `is_none()` + `as_mut()`**: 0.86.0 wrote exactly that,
+/// three times over (the `current` accumulator, and the `spare` in each
+/// of the `Multiply` and `Darken` arms), which left three `else` arms
+/// that could not fire — a slot filled one statement earlier cannot be
+/// empty. This workspace has removed that same class of unfireable
+/// guard once already (see [`begin_gpu_composite_tile`]'s own note on
+/// 0.84.0's index guards). `Option::insert` returns the `&mut` to what
+/// it just stored, so there is no second, fallible lookup to guard:
+/// the unreachable state is unrepresentable rather than defended
+/// against. 0.86.1.
+fn accumulator_or_create<'slot>(
+    slot: &'slot mut Option<(wgpu::Texture, wgpu::TextureView)>,
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    size: wgpu::Extent3d,
+    label: &str,
+) -> &'slot mut (wgpu::Texture, wgpu::TextureView) {
+    let pair = match slot.take() {
+        Some(existing) => existing,
+        None => create_composite_accumulator(device, encoder, size, label),
+    };
+    slot.insert(pair)
+}
+
+/// Which of [`begin_gpu_composite_tile`]'s non-`Normal` blend dispatches
+/// a [`note_gpu_blend_dispatch`] call is reporting — the address into
+/// `GpuBlendDispatches`, and the one part of that mechanism that is
+/// **not** `#[cfg(test)]`. (Plain backticks, not a link, throughout this
+/// comment: the counter does not exist outside `cfg(test)`, and this enum
+/// does, so a link would dangle in the only configuration this item has.)
+///
+/// It cannot be, because the shipping build's dispatch arms still name a
+/// variant when they call the no-op twin of `note_gpu_blend_dispatch`.
+/// Keeping the enum unconditional and the counters conditional is what
+/// lets one call site serve both builds without a `#[cfg]` at the call
+/// site itself.
+///
+/// The variants are exactly the fifteen modes
+/// [`document_qualifies_for_gpu_compositing`] admits *other than*
+/// `Normal`, which is deliberately absent: the `Normal` arm is shared by
+/// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
+/// has already reduced to `Normal`, so a count taken there could not tell
+/// the two apart. See `GpuBlendDispatches` for the `Dissolve` variant's
+/// call site and why it is where it is.
+///
+/// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
+/// consequence of 0.103.1 rather than an inconsistency.** The other thirteen
+/// are named by real dispatch arms that exist in both builds, so they are
+/// constructed in both. `Dissolve` has no arm; the only thing that ever
+/// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
+/// behind `cfg(test)` so the shipping build stops paying for a
+/// `LayerTree::blend_mode` probe on the hot path. That left the variant
+/// constructed nowhere outside tests, which the flagless `cargo check -p
+/// aurora-app` correctly reports as `dead_code` — so the variant follows
+/// its only constructor rather than being silenced with an `allow`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuBlendDispatch {
+    Multiply,
+    Darken,
+    Lighten,
+    Screen,
+    Difference,
+    LinearDodge,
+    LinearBurn,
+    ColorBurn,
+    ColorDodge,
+    Overlay,
+    HardLight,
+    LinearLight,
+    VividLight,
+    HardMix,
+    PinLight,
+    #[cfg(test)]
+    Dissolve,
+}
+
+#[cfg(test)]
+impl GpuBlendDispatch {
+    /// Every variant, once, adjacent to the enum it enumerates (0.104.1).
+    ///
+    /// `GpuBlendDispatches::counter`'s `match` is exhaustive, so a variant
+    /// added without an arm is a compile error there. Nothing makes a
+    /// variant missing from the *test* a compile error, and
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter` is the only
+    /// assertion in either crate that can see a counter mis-wire at all —
+    /// 0.104.0's mutation (g) killed on that one test and nothing else,
+    /// out of 394. Before this constant existed the test kept its own
+    /// hand-written copy of the variant list, so the enum and its only
+    /// real coverage could drift apart in two independent places.
+    ///
+    /// This does not close the gap — `ALL` is still hand-maintained, and
+    /// no stable API counts an enum's variants — but it collapses the two
+    /// driftable lists into one, sitting directly under the definition a
+    /// new variant is added to. The fixed `[Self; 14]` length is part of
+    /// that signal: a fifteenth variant cannot be appended here without the
+    /// author also editing the count, and the test asserts the same `14`
+    /// as a literal so the expectation is stated in both places.
+    ///
+    /// **As of 0.112.0 this length is no longer the only check on it, and
+    /// prose elsewhere should name the two tests below rather than restate
+    /// a number.** A hand-maintained count restated in prose drifts:
+    /// 0.111.1 had to correct this very doc comment for reading
+    /// `[Self; 11]` directly above an array of twelve, a self-contradiction
+    /// a reader could see and no test could. Two derived checks now stand
+    /// behind it, neither of which can be satisfied by editing a literal:
+    ///
+    /// - `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_
+    ///   with_a_dispatch_counter` measures the predicate's admitted set by
+    ///   *calling* it once per `aurora_doc::BlendMode::ALL` variant, and
+    ///   requires it to be this list plus exactly `Normal`.
+    /// - `gpu_blend_dispatch_count_matches_the_render_crates_blend_math_
+    ///   pass_count`
+    ///   ties this length to `aurora_render::BLEND_MATH_PASS_COUNT`, which
+    ///   is derived from `shaders/composite.wgsl`'s own `@fragment` entry
+    ///   points — so the figure is anchored to shader source in another
+    ///   crate rather than to a number someone typed twice.
+    ///
+    /// (The
+    /// mechanism did its job on its first six outings: `LinearDodge` in
+    /// 0.105.0 went from `[Self; 6]` to `[Self; 7]` in one edit,
+    /// `LinearBurn` in 0.106.0 from `[Self; 7]` to `[Self; 8]`,
+    /// `ColorBurn` in 0.107.0 from `[Self; 8]` to `[Self; 9]`,
+    /// `ColorDodge` in 0.108.0 from `[Self; 9]` to `[Self; 10]`, and
+    /// `Overlay` in 0.110.0 from `[Self; 10]` to `[Self; 11]`,
+    /// `HardLight` in 0.111.0 from `[Self; 11]` to `[Self; 12]`, and
+    /// `LinearLight` in 0.113.0 from `[Self; 12]` to `[Self; 13]`, and
+    /// `VividLight` in 0.114.0 from `[Self; 13]` to `[Self; 14]`, and
+    /// `HardMix` in 0.115.0 from `[Self; 14]` to `[Self; 15]`, and `PinLight`
+    /// in 0.116.0 from `[Self; 15]` to `[Self; 16]`, with the
+    /// test's own literal the only other place to touch each time. **Both
+    /// halves of that belong in one edit**: 0.107.1 had to correct a round
+    /// that left this prose quoting one length while the literal below read
+    /// another, which is the exact self-contradiction the fixed length
+    /// exists to prevent. As of
+    /// 0.105.3 it also feeds
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument`, so a variant added here without a
+    /// [`TRANSPOSE_COVERAGE`] row fails that guard too.)
+    ///
+    /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
+    /// why that one variant is test-only.
+    const ALL: [Self; 16] = [
+        Self::Multiply,
+        Self::Darken,
+        Self::Lighten,
+        Self::Screen,
+        Self::Difference,
+        Self::LinearDodge,
+        Self::LinearBurn,
+        Self::ColorBurn,
+        Self::ColorDodge,
+        Self::Overlay,
+        Self::HardLight,
+        Self::LinearLight,
+        Self::VividLight,
+        Self::HardMix,
+        Self::PinLight,
+        Self::Dissolve,
+    ];
+}
+
+/// Test-only counts of the times [`begin_gpu_composite_tile`] has
+/// actually dispatched a real GPU blend pass for each non-`Normal` blend
+/// mode the GPU path admits.
+///
+/// **The gap this closes.** Every blend-mode test in this crate is either
+/// a differential ("the GPU path's texel equals the CPU path's") or a
+/// predicate assertion ("this document qualifies for the GPU path").
+/// Neither can see whether the GPU arm *ran*: delete a mode's arm from
+/// [`begin_gpu_composite_tile`]'s `match` and every tile of that mode
+/// falls through the defensive `_` arm to the CPU path, which computes
+/// the same correct pixels — so the differential compares the CPU path
+/// against itself and still passes, and the predicate still holds because
+/// the predicate is a different function. A refactor could therefore drop
+/// a mode off the GPU path silently. So each arm reports itself here, and
+/// that mode's own test asserts the exact count it expects.
+///
+/// **Per-mode history, which is the evidence for the paragraph above**
+/// rather than a claim about it:
+///
+/// - `Darken` (0.85.1): the counter was retrofitted one round after the
+///   port, having first *performed* the deletion against 0.85.0 and
+///   watched the entire suite stay green.
+/// - `Lighten` (0.95.0): instrumented in its own first round rather than
+///   after the fact, which is what `Darken`'s history argued for.
+/// - `Screen` (0.102.0): same, and the mutation was performed for real
+///   against that round's own diff — this counter was the **only**
+///   assertion of ~390 in the crate that caught it (PLAN.md's 0.102.0
+///   entry).
+/// - `Multiply` and `Dissolve` (0.103.0, this struct's own round): both
+///   predate the convention and had no counter at all until the three
+///   per-mode statics were merged into this one indexed struct, at which
+///   point retrofitting them cost a field and an arm each rather than a
+///   copied block each. `Multiply` matters most of the five ("the five"
+///   was the 0.103.0 count; ten are counted as of 0.108.0, see below):
+///   the app's own default startup document carries a `Multiply` layer,
+///   so it is the arm every user's first frame takes.
+/// - `Difference` (0.104.0): instrumented in its own first round, and the
+///   first mode to be added *after* the merge — which cost exactly what
+///   the merge predicted, one variant, one field and one `counter` arm,
+///   with no copied block anywhere.
+/// - `LinearDodge` (0.105.0): the same, and the second data point for that
+///   prediction — one variant, one field, one `counter` arm, plus the
+///   `GpuBlendDispatch::ALL` entry 0.104.1 added so the enum and the only
+///   test that can see a counter mis-wire cannot drift apart.
+/// - `LinearBurn` (0.106.0): the same again, and the first mode added after
+///   0.105.3's transpose guard existed — so its `ALL` entry also had to
+///   come with a `TRANSPOSE_COVERAGE` row and a fixture carrying a
+///   non-opaque `LinearBurn` layer, or
+///   `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+///   transposed_argument` fails headlessly. That is the guard working as
+///   designed rather than an extra cost of the port.
+/// - `ColorBurn` (0.107.0): the same again — one variant, one field, one
+///   `counter` arm, one `GpuBlendDispatch::ALL` entry and one
+///   `TRANSPOSE_COVERAGE` row. The interesting part is what its round
+///   found rather than what the counter cost: this is the first admitted
+///   mode whose blend term is **asymmetric** in `Cb`/`Cs`, so unlike the
+///   seven before it a transposed `src`/`backdrop` binding is observable
+///   from the blend term alone, at any opacity. Its fixture still carries
+///   non-unit opacity anyway, because the transpose guard is deliberately
+///   uniform rather than special-cased for one mode.
+/// - `ColorDodge` (0.108.0): the same again, at the same cost, and the
+///   second asymmetric mode — so "asymmetric" stopped being a one-off
+///   exception in this list and became a class with two members. Its round
+///   also found that this mode's two guards are redundant for *different*
+///   reasons (the first without touching division-by-zero semantics at all,
+///   so its deletion is killed deterministically; the second only on an
+///   IEEE adapter, so its deletion survives here), which is a finding about
+///   the mode rather than about the counter — the counter itself cost one
+///   variant, one field, one `counter` arm, one `ALL` entry and one
+///   `TRANSPOSE_COVERAGE` row, exactly as predicted.
+/// - `Overlay` (0.110.0): the same again, at the same cost, and the **third**
+///   asymmetric mode — but asymmetric in a new *way*, which is why it earns
+///   a bullet rather than joining the class silently. `ColorBurn`'s and
+///   `ColorDodge`'s asymmetry is unconditional; `Overlay`'s is
+///   **conditional**, holding only in channels where `Cb` and `Cs` straddle
+///   `0.5` (wherever they share a side, `Overlay(Cb, Cs) == Overlay(Cs, Cb)`
+///   exactly, by the same collision rule that makes `Overlay` and
+///   `HardLight` agree there). So its fixture,
+///   `NORMAL_MULTIPLY_OVERLAY_STACK`, is the first in this list chosen for a
+///   property of its *operand pairs* rather than only its opacity: all three
+///   channels straddle. That fixture is also the first here **not** built on
+///   a `Multiply` layer of `0.5` grey — its `l2` colour is `0.75` grey, its
+///   opacity `1.0` like every sibling's — because `0.5` is exactly this
+///   mode's own no-op value on the source side, and a `0.5`-grey `Multiply`
+///   drives every backdrop channel to or below `0.5` on the other. Its round
+///   also confirmed the
+///   `<=` → `<` mutation is unkillable in principle (the two arms are
+///   bit-identical at `Cb == 0.5`), which is disclosed rather than tested
+///   around.
+/// - `HardLight` (0.111.0): the same again, at the same cost — one variant,
+///   one field, one `counter` arm, one `ALL` entry and one
+///   `TRANSPOSE_COVERAGE` row — and the **fourth** asymmetric mode, joining
+///   `Overlay` as the second *conditionally* asymmetric one. What earns it a
+///   bullet is not the counter's cost but that it is the first mode ported
+///   whose transposed twin was **already a live dispatch arm** (`Overlay`,
+///   the arm directly above it in `begin_gpu_composite_tile`'s `match`), so
+///   the wrong-arm hazard became bidirectional between two shipped modes.
+///   Its fixture, `NORMAL_MULTIPLY_HARD_LIGHT_STACK`, deliberately reuses the
+///   sibling's three colours verbatim rather than picking fresh ones: that
+///   makes the two goldens a direct read-out of the collision rule, and makes
+///   each round's vacuity guard the *other* mode. Its round also re-confirmed
+///   the `<=` → `<` mutation unkillable, on its own boundary (`Cs == 0.5`
+///   this time, the source side), and found this mode to be the fifth
+///   detector of the shared `straight_backdrop()` guard's removal — predicted
+///   from the formula, then measured.
+/// - `LinearLight` (0.113.0): the same again, at the same cost — one variant,
+///   one field, one `counter` arm, one `ALL` entry and one
+///   `TRANSPOSE_COVERAGE` row — and the **fifth** asymmetric mode, joining
+///   `ColorBurn` and `ColorDodge` as the *third* whose asymmetry is
+///   unconditional rather than straddle-dependent. What earns it a bullet is
+///   neither the counter's cost nor the asymmetry class but a finding that
+///   changes how a fixture for this kind of mode must be chosen: its blend
+///   term is unconditionally asymmetric and yet **the two ways a transpose
+///   gets laundered here are exactly complementary**, so non-unit opacity is
+///   not merely sufficient-but-unnecessary — at effective alpha exactly `0.5`
+///   it makes a clamp-*interior* channel go **blind**
+///   (`out - out_transposed = (Cb - Cs)*(1 - 2a)`, zero at `a = 0.5`), while a
+///   *railed* channel is blind at `a = 1` instead. Its fixture,
+///   `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK`, therefore carries all three clamp
+///   regimes rather than being chosen for its opacity alone: measured, the
+///   transpose shows in its two railed channels at `0.5` and in its one
+///   interior channel at `1.0`. Its round also found this mode is **not** a
+///   sixth detector of `straight_backdrop`'s guard removal — the first time
+///   0.110.0's rule predicted a *non*-detection — because WGSL defines float
+///   `clamp` as `min(max(..))` and so launders a `NaN` despite the shader
+///   containing neither token.
+///
+/// **Why a struct of named fields and an exhaustive `match`, not a
+/// `[AtomicU64; N]` indexed by discriminant.** This workspace denies
+/// `indexing_slicing`, so an array would have to be read through
+/// `.get(i)`, which degrades to `Option` — and that `Option`'s `None` arm
+/// is either a denied `panic!` or a silently dropped count. A silently
+/// dropped count is *exactly* the failure class these counters exist to
+/// detect, so the array shape would undermine its own purpose. The
+/// `match` in [`GpuBlendDispatches::counter`] instead makes the compiler
+/// refuse to build until every [`GpuBlendDispatch`] variant has both a
+/// field and an arm, so a mode added later cannot reach the GPU
+/// uncounted.
+///
+/// **Soundness.** Reads and writes are `Relaxed` and the counters are
+/// process-global, which is sound only because every caller of
+/// [`begin_gpu_composite_tile`] needs a real `GpuContext` and this
+/// module's `real_gpu_context` hands one out only under `GPU_TEST_LOCK` —
+/// so no two GPU tests are ever inside these counters at once, and the
+/// lock supplies the ordering. Merging the three statics into one struct
+/// does not change that argument: the counters are still separate
+/// `AtomicU64`s, still only touched under that lock, and
+/// `take_gpu_blend_dispatch_count` still reads-and-zeroes one mode at a
+/// time.
+///
+/// **What it cannot see.** It counts the dispatch
+/// [`begin_gpu_composite_tile`] records, and nothing else — not what
+/// `aurora_render::TileCompositor`'s own methods then do, and not whether
+/// the shader behind a given method computes the right formula. The
+/// absolute-golden assertion in each mode's test is what covers the
+/// second of those; `aurora-render`'s own shader tests cover the first.
+#[cfg(test)]
+struct GpuBlendDispatches {
+    multiply: std::sync::atomic::AtomicU64,
+    darken: std::sync::atomic::AtomicU64,
+    lighten: std::sync::atomic::AtomicU64,
+    screen: std::sync::atomic::AtomicU64,
+    difference: std::sync::atomic::AtomicU64,
+    linear_dodge: std::sync::atomic::AtomicU64,
+    linear_burn: std::sync::atomic::AtomicU64,
+    color_burn: std::sync::atomic::AtomicU64,
+    color_dodge: std::sync::atomic::AtomicU64,
+    overlay: std::sync::atomic::AtomicU64,
+    hard_light: std::sync::atomic::AtomicU64,
+    linear_light: std::sync::atomic::AtomicU64,
+    vivid_light: std::sync::atomic::AtomicU64,
+    hard_mix: std::sync::atomic::AtomicU64,
+    pin_light: std::sync::atomic::AtomicU64,
+    dissolve: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl GpuBlendDispatches {
+    /// All sixteen counters at zero. `const` so the static below is a
+    /// compile-time initializer rather than a lazily-initialized cell,
+    /// exactly as the three separate `AtomicU64::new(0)` statics it
+    /// replaces were.
+    const fn new() -> Self {
+        Self {
+            multiply: std::sync::atomic::AtomicU64::new(0),
+            darken: std::sync::atomic::AtomicU64::new(0),
+            lighten: std::sync::atomic::AtomicU64::new(0),
+            screen: std::sync::atomic::AtomicU64::new(0),
+            difference: std::sync::atomic::AtomicU64::new(0),
+            linear_dodge: std::sync::atomic::AtomicU64::new(0),
+            linear_burn: std::sync::atomic::AtomicU64::new(0),
+            color_burn: std::sync::atomic::AtomicU64::new(0),
+            color_dodge: std::sync::atomic::AtomicU64::new(0),
+            overlay: std::sync::atomic::AtomicU64::new(0),
+            hard_light: std::sync::atomic::AtomicU64::new(0),
+            linear_light: std::sync::atomic::AtomicU64::new(0),
+            vivid_light: std::sync::atomic::AtomicU64::new(0),
+            hard_mix: std::sync::atomic::AtomicU64::new(0),
+            pin_light: std::sync::atomic::AtomicU64::new(0),
+            dissolve: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The one counter `which` addresses.
+    ///
+    /// The `match` is exhaustive and total by construction — no `_` arm,
+    /// no fallible lookup, so there is no "which counter?" failure to
+    /// either defend against or drop on the floor. See
+    /// [`GpuBlendDispatches`] for why that mattered enough to spend sixteen
+    /// named fields on.
+    ///
+    /// That every variant maps to a *distinct* counter is not something
+    /// the compiler checks — two arms could name the same field — so
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter` asserts it
+    /// directly, on a local instance rather than the global static.
+    fn counter(&self, which: GpuBlendDispatch) -> &std::sync::atomic::AtomicU64 {
+        match which {
+            GpuBlendDispatch::Multiply => &self.multiply,
+            GpuBlendDispatch::Darken => &self.darken,
+            GpuBlendDispatch::Lighten => &self.lighten,
+            GpuBlendDispatch::Screen => &self.screen,
+            GpuBlendDispatch::Difference => &self.difference,
+            GpuBlendDispatch::LinearDodge => &self.linear_dodge,
+            GpuBlendDispatch::LinearBurn => &self.linear_burn,
+            GpuBlendDispatch::ColorBurn => &self.color_burn,
+            GpuBlendDispatch::ColorDodge => &self.color_dodge,
+            GpuBlendDispatch::Overlay => &self.overlay,
+            GpuBlendDispatch::HardLight => &self.hard_light,
+            GpuBlendDispatch::LinearLight => &self.linear_light,
+            GpuBlendDispatch::VividLight => &self.vivid_light,
+            GpuBlendDispatch::HardMix => &self.hard_mix,
+            GpuBlendDispatch::PinLight => &self.pin_light,
+            GpuBlendDispatch::Dissolve => &self.dissolve,
+        }
+    }
+}
+
+#[cfg(test)]
+static GPU_BLEND_DISPATCHES: GpuBlendDispatches = GpuBlendDispatches::new();
+
+/// Increments `which`'s counter in [`GPU_BLEND_DISPATCHES`]. Called from
+/// [`begin_gpu_composite_tile`] once per tile per layer of that mode,
+/// immediately after the compositor call it is reporting — except
+/// `Dissolve`, whose count is taken from the layer's raw `aurora_doc`
+/// blend mode ahead of the blend `match`, *before* [`resolve_tile`] has
+/// even reduced it to `Normal`, and therefore before any compositor call
+/// at all. See [`note_dissolve_dispatch`] and its call site's own comment
+/// for why that site is the only one that works.
+#[cfg(test)]
+fn note_gpu_blend_dispatch(which: GpuBlendDispatch) {
+    GPU_BLEND_DISPATCHES
+        .counter(which)
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all. The instrumentation
+/// exists to make a test non-vacuous, not to be carried by the editor —
+/// so `GpuBlendDispatches` itself is `#[cfg(test)]` and this no-op is
+/// what every dispatch arm compiles down to everywhere else. Only
+/// [`GpuBlendDispatch`] survives into the shipping build, and only as the
+/// argument type this discards. The counter itself does not exist outside
+/// `cfg(test)`, which is why it is named here in plain backticks rather
+/// than linked.
+#[cfg(not(test))]
+fn note_gpu_blend_dispatch(_which: GpuBlendDispatch) {}
+
+/// Counts a `Dissolve` layer's GPU dispatch, if `id` is one — the whole
+/// guard, not just the increment.
+///
+/// **Why the *check* is inside a `#[cfg]`-split helper and not written
+/// inline at the call site** (0.103.1). Every other mode's dispatch arm
+/// is entered because [`begin_gpu_composite_tile`]'s blend `match`
+/// already matched that mode, so its counter costs the shipping build
+/// exactly one call to the no-op twin of [`note_gpu_blend_dispatch`] with
+/// a `const` argument — elided to nothing. `Dissolve` has no such arm
+/// ([`resolve_tile`] has already reduced it to `Normal`), so proving it
+/// dispatched needs a `LayerTree::blend_mode` lookup, and that lookup is
+/// *not* free: it is a `HashMap` probe, once per root layer per composite
+/// tile per frame, on the path PLAN.md measures at ~73% of the GPU-path
+/// frame mean. Written inline it would have run in the shipping build,
+/// which contradicts the framing this instrumentation is sold under —
+/// test-only, never carried by the editor. Splitting the guard itself
+/// puts the lookup behind the same `cfg(test)` wall as every other
+/// counter's logic, so the shipping build never evaluates it at all.
+#[cfg(test)]
+fn note_dissolve_dispatch(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) {
+    // `None` (no recorded blend mode) means `Normal`, matching
+    // `resolve_tile`'s own `.unwrap_or`, so it is correctly not counted.
+    if layers.blend_mode(id) == Some(aurora_doc::BlendMode::Dissolve) {
+        note_gpu_blend_dispatch(GpuBlendDispatch::Dissolve);
+    }
+}
+
+/// The shipping build's version: nothing at all, and in particular **no
+/// `LayerTree::blend_mode` lookup** — both arguments are discarded
+/// unread. See the `cfg(test)` twin above for why that mattered enough to
+/// split the guard rather than only the increment.
+#[cfg(not(test))]
+fn note_dissolve_dispatch(_layers: &aurora_doc::LayerTree, _id: aurora_doc::LayerId) {}
+
+/// Reads `which`'s counter in [`GPU_BLEND_DISPATCHES`] and resets it to
+/// zero in one atomic step, so a caller gets the count since *its* own
+/// last call rather than a total accumulated across whatever ran before.
+///
+/// Deliberately here, beside [`note_gpu_blend_dispatch`], rather than
+/// inside `mod tests` where the three per-mode accessors it replaces
+/// lived: one function for seven modes is not worth seven lines of `use
+/// super::{…}` churn every time a mode is added.
+///
+/// The swap is `Relaxed` for the same reason the increment is — see
+/// [`GpuBlendDispatches`]'s soundness paragraph.
+#[cfg(test)]
+fn take_gpu_blend_dispatch_count(which: GpuBlendDispatch) -> u64 {
+    GPU_BLEND_DISPATCHES
+        .counter(which)
+        .swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only count of the `queue.submit` calls
+/// [`begin_gpu_composite_tile`] itself has issued — the whole point of
+/// 0.86.0 being that this is now exactly **one per composited tile**,
+/// however many accumulators that tile creates and however many layers
+/// it folds.
+///
+/// **What it can and cannot see** (the same disclosure
+/// [`GpuBlendDispatches`] carries about itself). It counts the
+/// submit `begin_gpu_composite_tile` makes, and nothing else. It would
+/// **not** notice a `queue.submit` reintroduced inside one of
+/// `aurora_render::TileCompositor`'s own methods — those are in another
+/// crate, and a per-tile count of 1 would remain a per-tile count of 1
+/// while every layer quietly submitted again underneath it. What guards
+/// that other half is `aurora-render`'s own
+/// `composite_over_with_opacity_records_into_the_encoder_without_submitting_it`,
+/// which holds an unsubmitted encoder and proves the destination has not
+/// changed yet. Neither check subsumes the other, and both are needed.
+///
+/// Reads and writes are `Relaxed` and the counter is process-global,
+/// which is sound for the same reason `GpuBlendDispatches` is: every
+/// caller of `begin_gpu_composite_tile` needs a real `GpuContext`, and
+/// this module's `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK`, so no two GPU tests are inside this counter at once.
+#[cfg(test)]
+static GPU_COMPOSITE_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`GPU_COMPOSITE_SUBMITS`]. Called from
+/// [`begin_gpu_composite_tile`] immediately after the one
+/// `queue.submit` it is reporting.
+#[cfg(test)]
+fn note_gpu_composite_submit() {
+    GPU_COMPOSITE_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all, exactly as with
+/// [`note_gpu_blend_dispatch`] above.
+#[cfg(not(test))]
+fn note_gpu_composite_submit() {}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of the `aurora_render::un_premultiply_in_place` calls
+    /// [`composite_roots_into_tile`] has actually made on **this thread**.
+    ///
+    /// **Why this exists** (0.94.1). 0.94.0 made that call conditional on
+    /// `folded > 0`, and the whole argument for the skip is that it is
+    /// *output-identical* — which is precisely what makes its removal
+    /// invisible to every output assertion in this crate. Mutating the guard
+    /// back to `if true`, i.e. the pre-0.94.0 always-run behaviour, was
+    /// measured to leave all 384 `aurora-app` tests green, so nothing would
+    /// have caught a later refactor quietly handing the whole ~6.5 ms/frame
+    /// win back. This is the same gap, and the same remedy, as
+    /// [`GpuBlendDispatches`]: the only observable that distinguishes
+    /// "skipped" from "ran and computed the identical bits" is whether the
+    /// call happened, so the call site reports itself and
+    /// `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`
+    /// asserts both directions.
+    ///
+    /// **Thread-local, deliberately not a process-global atomic.** This is
+    /// the counter shape 0.93.1 had to reach for the fold count: unlike
+    /// [`GpuBlendDispatches`], whose every caller needs a `GpuContext` and
+    /// therefore holds `GPU_TEST_LOCK`, [`composite_roots_into_tile`] is
+    /// called by [`composite_document`] and by many of this crate's own tests
+    /// with no lock at all. A process-global would let one thread's
+    /// straightening pass land inside another thread's measurement window
+    /// under a threaded `cargo test` and make the assertion below flaky. The
+    /// pass runs synchronously on the calling thread, so a thread-local is
+    /// both immune to that and strictly cheaper.
+    static COMPOSITE_STRAIGHTEN_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Increments [`COMPOSITE_STRAIGHTEN_PASSES`]. Called from
+/// [`composite_roots_into_tile`] immediately after the one
+/// `aurora_render::un_premultiply_in_place` call it is reporting, inside
+/// the same `folded > 0` block — so it is unreachable exactly when that
+/// call is.
+#[cfg(test)]
+fn note_composite_straighten_pass() {
+    COMPOSITE_STRAIGHTEN_PASSES.with(|passes| passes.set(passes.get().saturating_add(1)));
+}
+
+/// The shipping build's version: nothing at all, exactly as with the two
+/// `note_*` pairs above.
+#[cfg(not(test))]
+fn note_composite_straighten_pass() {}
+
+/// Test-only tally of [`recomposite_visible_tiles`]'s `write_composited`
+/// decisions, in three buckets:
+///
+/// - `[0]` **skipped** — the tile was continuously resident *and* every
+///   sample recomputed bitwise identically, so neither the
+///   `copy_from_slice` nor the `mark_dirty` happened.
+/// - `[1]` **changed** — the tile was resident but at least one sample
+///   differs, so it was copied and dirtied, exactly as before 0.90.0.
+/// - `[2]` **`not_resident`** — the tile was *not* resident when asked
+///   (never written, evicted and paged out, or its whole surface
+///   `forget_surface`d), so the content comparison is not trustworthy and
+///   the write is taken unconditionally. This is the correctness guard,
+///   not an optimization miss.
+///
+/// # What this counts, and what it does not
+///
+/// It counts **`write_composited`'s own decisions, not GPU uploads.**
+/// The upload decision is one layer down, in
+/// `aurora_gpu::TileResidency::sync`, which skips a tile only when it is
+/// *also* already resident in that atlas — a tile absent from the atlas
+/// is re-uploaded whether or not it is dirty. So bucket `[0]` is an
+/// **upper bound** on the uploads this change removes and never the
+/// measurement of them. `SyncStats`'s own `uploaded` / `bytes_uploaded`
+/// (already reported by `report_frame_counters`) is the realized number.
+/// The two are separate skip points and must not be quoted as one figure.
+///
+/// Same soundness argument as [`GPU_COMPOSITE_SUBMITS`] and
+/// [`RECOMPOSITE_PHASE_NANOS`]: process-global and `Relaxed`, which is
+/// fine because a GPU caller reaches it only via `real_gpu_context`'s
+/// `GPU_TEST_LOCK`. A CPU-only caller of `recomposite_visible_tiles`
+/// holds no such lock and also accumulates here, which is exactly why
+/// `take_composite_write_outcomes` reads-and-zeroes and why its callers
+/// zero it once before their own measurement.
+///
+/// Nothing about *timing* is asserted on these numbers; the three tests
+/// added in 0.90.0 do assert on the bucket a specific, deliberately
+/// constructed tile lands in, since that is the behaviour under test.
+#[cfg(test)]
+static COMPOSITE_WRITE_OUTCOMES: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Credits one [`COMPOSITE_WRITE_OUTCOMES`] bucket. An out-of-range
+/// `slot` is silently dropped rather than panicking — `indexing_slicing`
+/// is denied workspace-wide, and this is instrumentation, which must
+/// never be able to cost a user their work.
+#[cfg(test)]
+fn note_composite_write(slot: usize) {
+    if let Some(counter) = COMPOSITE_WRITE_OUTCOMES.get(slot) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Bucket `[0]`: resident and bitwise unchanged, so the write was skipped.
+#[cfg(test)]
+fn note_composite_write_skipped() {
+    note_composite_write(0);
+}
+
+/// Bucket `[1]`: resident, but the content really changed.
+#[cfg(test)]
+fn note_composite_write_changed() {
+    note_composite_write(1);
+}
+
+/// Bucket `[2]`: not resident, so the write was taken unconditionally.
+#[cfg(test)]
+fn note_composite_write_not_resident() {
+    note_composite_write(2);
+}
+
+/// The shipping build's versions: nothing at all, exactly as with
+/// [`note_gpu_composite_submit`] above. The counter itself does not
+/// exist outside `cfg(test)`.
+#[cfg(not(test))]
+fn note_composite_write_skipped() {}
+/// See [`note_composite_write_skipped`].
+#[cfg(not(test))]
+fn note_composite_write_changed() {}
+/// See [`note_composite_write_skipped`].
+#[cfg(not(test))]
+fn note_composite_write_not_resident() {}
+
+/// Test-only tally of how far [`RecompositeTileCosts`]'s per-tile marks
+/// got **out of balance** with the tiles that actually entered
+/// [`recomposite_visible_tiles`]'s phase-1 loop body. Zero is the only
+/// correct value; anything else means a classifying mark is missing,
+/// duplicated, or firing on a tile that never reached the loop body.
+///
+/// # Why this exists, and what 0.93.0 got wrong
+///
+/// 0.93.0 claimed the *timing* residual (the five sub-costs' sum against
+/// phase 1's own single mark, printed by `report_recomposite_tile_costs`)
+/// was a bookkeeping self-check that would catch a misplaced mark. **It
+/// cannot, and this counter is what replaces that claim with a real
+/// check.** `RecompositeTileCosts::credit` unconditionally credits
+/// `now.duration_since(self.last)` to whichever in-range slot it is handed
+/// and then advances `self.last`, so the five slots' sum is *identically*
+/// the span from the first credit to the last no matter which slot
+/// receives which interval. Deleting the `mark_gpu_issue` call site
+/// outright was demonstrated (Red-team, 0.93.1) to leave that residual
+/// bit-for-bit unchanged at 0.0001 ms while 1.5 ms of real GPU dispatch
+/// silently moved into another slot. The residual only ever detects an
+/// interval nothing credits at all — the two small head/tail gaps outside
+/// the first and last marks — never a misclassification.
+///
+/// A *count* mismatch is detectable, which is what this is:
+/// [`RecompositeTileCosts::begin_tile`] counts one tile entering the loop
+/// body, [`RecompositeTileCosts::mark_gpu_issue`] counts one classifying
+/// mark, and [`RecompositeTileCosts::finish`] credits the difference here.
+/// Deleting either call site now shows up as a non-zero value.
+///
+/// It does *not* prove the two `(reachable, issued)` arms map to the right
+/// slots — that is what
+/// `recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`
+/// asserts separately — nor that any slot's *magnitude* is right, which
+/// nothing asserts anywhere.
+///
+/// Same soundness argument as [`COMPOSITE_WRITE_OUTCOMES`] and
+/// [`RECOMPOSITE_PHASE_NANOS`]: process-global and `Relaxed`, which is why
+/// `take_recomposite_mark_imbalance` reads-and-zeroes and why its callers
+/// zero it once before measuring. Unlike a timing slot it is also
+/// order-insensitive: a foreign `recomposite_visible_tiles` call on
+/// another thread contributes its own zero, so it can inflate the total
+/// only by being genuinely unbalanced itself.
+#[cfg(test)]
+static RECOMPOSITE_MARK_IMBALANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Credits `by` to [`RECOMPOSITE_MARK_IMBALANCE`].
+///
+/// Unlike the `note_*` helpers above this one needs no `cfg(not(test))`
+/// twin: its only caller is [`RecompositeTileCosts::finish`], which is
+/// itself a `cfg(test)`-only body (the shipping build's `finish` is an
+/// empty no-op), so nothing outside `cfg(test)` names it.
+#[cfg(test)]
+fn note_recomposite_mark_imbalance(by: u64) {
+    RECOMPOSITE_MARK_IMBALANCE.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only wall-clock accumulator for [`recomposite_visible_tiles`]'s
+/// own three internal phases, in nanoseconds: `[0]` phase 1 (the
+/// per-tile loop that either issues a GPU composite or composites on the
+/// CPU immediately), `[1]` phase 2 (the single per-frame
+/// `device.poll(Wait)`), `[2]` phase 3 (draining every pending tile's
+/// readback and writing it into the composite surface).
+///
+/// **What this measures, stated precisely.** Wall-clock time spent
+/// inside each phase on the calling thread. For phase 2 that is *how
+/// long the frame blocked waiting on the GPU*, which is not the same
+/// thing as how long the GPU spent executing — work may already have
+/// completed before the poll was reached, or several tiles' work may
+/// overlap. Real GPU execution time needs `wgpu` timestamp queries
+/// (`Features::TIMESTAMP_QUERY` plus a query set per pass), which this
+/// diagnostic round deliberately does not add. Read phase 2 as "stall",
+/// not as "GPU cost".
+///
+/// Same soundness argument as [`GPU_COMPOSITE_SUBMITS`] and
+/// [`GpuBlendDispatches`]: the counter is process-global and
+/// `Relaxed`, which is fine because every caller that reaches the GPU
+/// arms holds `GPU_TEST_LOCK` via `real_gpu_context`. A *CPU-only*
+/// caller of `recomposite_visible_tiles` does not hold that lock and
+/// will also accumulate here, which is exactly why
+/// `take_recomposite_phase_ms` reads-and-zeroes and why its callers zero
+/// it once before their own measurement loop.
+///
+/// Nothing is ever asserted on these numbers — they exist to answer
+/// "which phase costs the most", printed under `--nocapture`.
+///
+/// Phase 1 is split five ways again by
+/// [`RECOMPOSITE_TILE_COST_NANOS`] (0.93.0), which answers *which branch*
+/// of the per-tile loop the phase-1 figure is actually made of.
+#[cfg(test)]
+static RECOMPOSITE_PHASE_NANOS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test-only phase stopwatch feeding [`RECOMPOSITE_PHASE_NANOS`]. Built
+/// once at the top of [`recomposite_visible_tiles`]; `mark` is called at
+/// the end of each of its three phases, in order.
+#[cfg(test)]
+#[derive(Debug)]
+struct RecompositePhases {
+    /// When the phase now in progress began.
+    last: std::time::Instant,
+    /// Which [`RECOMPOSITE_PHASE_NANOS`] slot the next `mark` credits. A
+    /// fourth or later `mark` would find no slot and is silently
+    /// dropped rather than panicking (`indexing_slicing` is denied
+    /// workspace-wide, and this is instrumentation — it must never be
+    /// able to cost a user their work).
+    phase: usize,
+}
+
+#[cfg(test)]
+impl RecompositePhases {
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            phase: 0,
+        }
+    }
+
+    fn mark(&mut self) {
+        let now = std::time::Instant::now();
+        // `duration_since`, never `now - self.last`: `Sub` for `Instant`
+        // panics on an inverted pair, and this crate denies `panic`.
+        let elapsed = now.duration_since(self.last);
+        if let Some(slot) = RECOMPOSITE_PHASE_NANOS.get(self.phase) {
+            let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            slot.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last = now;
+        self.phase = self.phase.saturating_add(1);
+    }
+}
+
+/// The shipping build's version: a zero-sized type whose `mark` compiles
+/// to nothing, exactly as [`note_gpu_composite_submit`] does above. The
+/// counter itself does not exist outside `cfg(test)`.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RecompositePhases;
+
+#[cfg(not(test))]
+impl RecompositePhases {
+    fn start() -> Self {
+        Self
+    }
+
+    // `&mut self` deliberately mirrors the `cfg(test)` signature so the
+    // call sites are identical in both builds; there is nothing to read.
+    #[allow(clippy::unused_self)]
+    fn mark(&mut self) {}
+}
+
+/// Test-only wall-clock accumulator splitting
+/// [`RECOMPOSITE_PHASE_NANOS`]'s phase 1 — the per-tile loop — into five
+/// named per-branch sub-costs, in nanoseconds:
+///
+/// - `[0]` **`gpu_issue_ok`**: time inside the GPU arm on a tile where
+///   [`begin_gpu_composite_tile`] returned `Some`, i.e. real GPU work was
+///   recorded and submitted for this tile.
+/// - `[1]` **`gpu_issue_declined`**: time inside the GPU arm on a tile
+///   where the arm was *reachable* (the document qualifies and both `gpu`
+///   and `compositor` are available) but [`begin_gpu_composite_tile`]
+///   returned `None`, so the loop fell through to the CPU. **This, and
+///   only this, is 0.87.1's disclosed double root walk's first half** — a
+///   blank tile of a qualifying document resolving its whole root stack,
+///   about to resolve it again on the CPU — isolated on its own for the
+///   first time (0.93.0), rather than folded anonymously into phase 1's
+///   single number. It measured 0.03 ms of a ~10.7 ms phase 1, i.e. the
+///   double walk is real but is not where the time goes; 0.93.0's PLAN.md
+///   entry originally mis-attributed slot `[2]`'s 8.95 ms to it as well,
+///   corrected in 0.93.1.
+/// - `[2]` **`cpu_fallback_empty`**: the CPU fallback ran (the
+///   [`composite_roots_into_tile`] + `write_composited` pair) and folded
+///   **zero** roots, so the "composite" was a transparent accumulator.
+///
+///   **A composite interval, not one cost.** This slot cannot distinguish
+///   its own sub-parts, and on the GPU-path benchmark it is phase 1's
+///   largest single number (8.95 ms of 10.68 ms), so what it contains
+///   matters. In order: `aurora_render::transparent_tile`'s
+///   allocate-and-zero of a whole `SAMPLES`-length buffer; the second root
+///   walk that folds nothing; and `write_composited`'s `is_resident`
+///   check, `get_mut`, and full-tile bitwise comparison
+///   (`tiles_are_bitwise_identical`). A hand-instrumented split
+///   (Red-team, 0.93.1, same RTX 3090) put `aurora_render::un_premultiply_in_place`
+///   at ~6.49 ms of this slot, `write_composited` at ~2.82 ms and the root
+///   walk at only ~0.24 ms.
+///
+///   **The un-premultiply pass is no longer in this slot at all (0.94.0).**
+///   [`composite_roots_into_tile`] skips it when `folded == 0`, which is
+///   exactly the condition that routes a tile to *this* slot — see that
+///   function's own `folded == 0` block for why the skip is
+///   output-identical. So this slot's own before/after value **is** the
+///   measurement of that change, which is why 0.93.1's named follow-on of
+///   adding sixth and seventh slots was not needed to land it.
+/// - `[3]` **`cpu_fallback_real`**: the CPU fallback ran and folded at
+///   least one root, i.e. it did genuine per-texel blend math. It **still
+///   contains the un-premultiply pass** — which `[2]` no longer does, since
+///   0.94.0 skips it for exactly the zero-fold tiles `[2]` times — plus the
+///   same `write_composited` tail, so it is not "blend math" on its own
+///   either: on the CPU-fallback
+///   benchmark the same hand-split put real blending at ~4.51 ms of its
+///   6.44 ms, with ~3.45 ms un-premultiply and ~1.50 ms write spread
+///   across both CPU slots.
+/// - `[4]` **`other`**: everything else in the loop —
+///   `residency.visible_tiles()`'s own iteration, the `cache.is_current`
+///   skips, `doc_origin_for`, the trailing overhead after the last tile,
+///   **and the whole `issued` block whenever the GPU arm is not reachable
+///   at all**. That last case is deliberate: on a document that never
+///   qualifies for GPU compositing (the CPU-fallback benchmark) slots
+///   `[0]` and `[1]` should read an honest `0.0`, because no GPU arm was
+///   ever entered — crediting the `gpu_qualifies` test itself to a
+///   `gpu_issue` slot would invent GPU cost where there is none.
+///
+///   It also absorbs two things its name does not suggest, both real: the
+///   **whole pre-loop setup** between [`RecompositeTileCosts::start`] and
+///   the first [`RecompositeTileCosts::begin_tile`] — `composite_reference_origin`,
+///   [`document_qualifies_for_gpu_compositing`], `CompositeBudget::for_pass`
+///   and the two closure constructions — and the `Some(pending)` arm's
+///   `pending_gpu.push(pending)`, which takes no mark of its own and rolls
+///   into the *next* iteration's `begin_tile`. `other = 0.00 ms` in the
+///   0.93.0 measurements is therefore a property of that specific
+///   one-root-layer fixture (a `roots()` walk of length one, a `Vec::push`)
+///   and not evidence that these costs are free in general.
+///
+/// The `cpu_fallback_empty` / `cpu_fallback_real` split comes from the fold
+/// count [`composite_roots_into_tile`] returns, not from inspecting the
+/// returned texels; see that function's own `# Returns` section for why,
+/// and for why 0.93.1 replaced 0.93.0's process-global counter with a
+/// return value.
+///
+/// **Exhaustive and non-overlapping by construction.** Every mark credits
+/// the interval since the previous mark and then resets the clock, so the
+/// five slots partition the same window `RecompositePhases`'s first `mark`
+/// measures — the stopwatch is started in the same breath as
+/// `RecompositePhases::start` and the last credit is taken immediately
+/// before phase 1 formally closes.
+///
+/// **What the printed residual does and does not catch.** The two are
+/// independent stopwatches over one interval, and
+/// `report_recomposite_tile_costs` prints their difference. That difference
+/// detects exactly one class of bug: an interval **nothing credits at
+/// all**, which here is only the two small gaps outside the marks —
+/// between `start()` and the first `begin_tile()` on a pass whose loop body
+/// is never entered, and between the last credit and `phases.mark()`. It
+/// **cannot** detect a misplaced, swapped, or deleted interior mark, which
+/// is the failure that would actually matter: `credit` credits
+/// `duration_since(self.last)` to whatever in-range slot it is given and
+/// always advances `self.last`, so the sum is identically the span from
+/// the first credit to the last regardless of which slot got which
+/// interval. Deleting the `mark_gpu_issue` call site was demonstrated to
+/// leave the residual bit-for-bit unchanged while 1.5 ms of real GPU
+/// dispatch moved silently into `other` (Red-team, 0.93.1). The residual is
+/// also *not* sensitive to per-tile clock-read count — a per-tile
+/// `Instant::now` lands inside a credited interval, not outside every one
+/// of them — so 0.93.0's "five extra clock reads per tile sets the
+/// tolerance" was wrong too. [`RECOMPOSITE_MARK_IMBALANCE`] is the real
+/// self-check that replaces the claim.
+///
+/// Same soundness argument as [`RECOMPOSITE_PHASE_NANOS`]: process-global
+/// and `Relaxed`, which is why `take_recomposite_tile_cost_ms`
+/// reads-and-zeroes and why its callers zero it once before measuring.
+///
+/// **Nothing is ever asserted on these timings.** They exist to answer
+/// "which branch of the phase-1 loop actually costs the ~10 ms", printed
+/// under `--nocapture`. The one test that does assert
+/// (`recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`)
+/// asserts that the two *structurally* impossible slots are zero, that both
+/// CPU slots were reached, and that [`RECOMPOSITE_MARK_IMBALANCE`] came out
+/// zero — never a magnitude.
+#[cfg(test)]
+static RECOMPOSITE_TILE_COST_NANOS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test-only fold census for the CPU-fallback compositing arm, in two
+/// slots (0.97.1):
+///
+/// - `[0]` **folds**: how many roots [`composite_roots_into_tile`] actually
+///   blended, summed over every tile that took the CPU fallback.
+/// - `[1]` **real-fold tiles**: how many tiles folded *at least one* root,
+///   i.e. how many `cpu_fallback_real` classifications happened.
+///
+/// **Why these two and not one.** 0.97.0's PLAN.md entry quoted
+/// "2.583 folds/frame" from a throwaway `eprintln!` that was reverted
+/// before committing, so the figure could not be re-derived from the tree
+/// — and worse, the bare fold count is not even the number the verdict
+/// needed. `composite_roots_into_tile` seeds its accumulator with
+/// [`aurora_render::transparent_tile`], so a tile's **first** fold always
+/// takes [`aurora_render::composite_layer_into`]'s
+/// `backdrop_alpha == 0.0` arm (the benchmark's `fold_onto_transparent`
+/// condition) and only its second and later folds *can* take the dividing
+/// arm (`fold_onto_opaque`). The split is therefore exactly
+/// `first_folds = slot[1]` and `later_folds = slot[0] - slot[1]`, which is
+/// what says which benchmark column a document's cost should be read from.
+///
+/// **"Can", not "does" (0.100.1, Red-team RT-100-01).** The arm is chosen
+/// **per texel**, inside `aurora-render`, on the accumulator's own alpha at
+/// that texel. So `later_folds` is a structural count of folds onto a
+/// non-empty *fold sequence*, and it is an upper bound on the dividing-arm
+/// folds, exact only where the layers already folded actually left alpha
+/// behind — a second fold over an all-transparent first layer counts here
+/// and takes the cheap arm at every texel. No counter in this crate can
+/// tell those apart; a caller that needs the distinction has to establish
+/// the backdrop's stored alpha itself, as
+/// `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+/// now does by reading a pre-seeded tile back.
+/// Both slots come from `folded`, the value
+/// [`RecompositeTileCosts::mark_cpu_fallback`] is already handed, so
+/// nothing new is computed on the frame path and no shipping build gains a
+/// counter at all.
+///
+/// Same process-global `Relaxed` soundness argument as
+/// [`RECOMPOSITE_TILE_COST_NANOS`] above, and the same consequence: a
+/// CPU-only caller that does not hold `GPU_TEST_LOCK` also accumulates
+/// here, which is why [`RecompositeTileCosts`]'s reader zeroes it before
+/// its own measurement loop.
+#[cfg(test)]
+static RECOMPOSITE_FOLD_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Credits one CPU-fallback tile's `folded` count to
+/// [`RECOMPOSITE_FOLD_COUNTS`]. A zero-fold tile contributes to neither
+/// slot: it ran no blend math at all, so counting it as a "real-fold tile"
+/// would make `later_folds` come out negative-shaped.
+///
+/// Needs no `cfg(not(test))` twin, for exactly
+/// [`note_recomposite_mark_imbalance`]'s reason: its only caller is
+/// [`RecompositeTileCosts::mark_cpu_fallback`], whose shipping-build body
+/// is an empty no-op, so nothing outside `cfg(test)` names it.
+#[cfg(test)]
+fn note_recomposite_folds(folded: usize) {
+    if folded == 0 {
+        return;
+    }
+    let folded = u64::try_from(folded).unwrap_or(u64::MAX);
+    if let Some(total) = RECOMPOSITE_FOLD_COUNTS.first() {
+        total.fetch_add(folded, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(tiles) = RECOMPOSITE_FOLD_COUNTS.get(1) {
+        tiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test-only per-branch stopwatch feeding [`RECOMPOSITE_TILE_COST_NANOS`].
+/// Built once at the top of [`recomposite_visible_tiles`], alongside
+/// [`RecompositePhases`]; the `mark_*` methods are called at each branch
+/// boundary inside its phase-1 loop.
+#[cfg(test)]
+#[derive(Debug)]
+struct RecompositeTileCosts {
+    /// When the interval now in progress began.
+    last: std::time::Instant,
+    /// How many tiles have entered the phase-1 loop body this pass, one per
+    /// [`Self::begin_tile`].
+    tiles_begun: u64,
+    /// How many classifying marks have fired this pass, one per
+    /// [`Self::mark_gpu_issue`]. [`Self::finish`] reconciles this against
+    /// `tiles_begun`; see [`RECOMPOSITE_MARK_IMBALANCE`].
+    classifications: u64,
+    /// How many tiles took the CPU fallback this pass, one per
+    /// [`Self::mark_cpu_fallback`]. Bounded above by `tiles_begun`, which
+    /// [`Self::finish`] also checks.
+    cpu_fallbacks: u64,
+}
+
+#[cfg(test)]
+impl RecompositeTileCosts {
+    /// Real GPU work was recorded and submitted for this tile.
+    const GPU_ISSUE_OK: usize = 0;
+    /// The GPU arm was reachable but declined; 0.87.1's double root walk.
+    const GPU_ISSUE_DECLINED: usize = 1;
+    /// CPU fallback ran, zero roots folded.
+    const CPU_EMPTY: usize = 2;
+    /// CPU fallback ran, at least one root folded: real blend math.
+    const CPU_REAL: usize = 3;
+    /// Loop overhead, plus the whole `issued` block when the GPU arm is
+    /// unreachable.
+    const OTHER: usize = 4;
+
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            tiles_begun: 0,
+            classifications: 0,
+            cpu_fallbacks: 0,
+        }
+    }
+
+    /// Credits the interval since the previous mark to `slot` and restarts
+    /// the clock. An out-of-range `slot` is silently dropped rather than
+    /// panicking, matching [`RecompositePhases::mark`]'s own convention:
+    /// `indexing_slicing` is denied workspace-wide, and this is
+    /// instrumentation, which must never be able to cost a user their work.
+    ///
+    /// **This is why the printed timing residual is not a self-check.** The
+    /// interval is credited to whatever in-range slot arrives, and
+    /// `self.last` advances either way, so the five slots always sum to the
+    /// same span no matter how the intervals are distributed among them.
+    /// The count-based reconciliation in [`Self::finish`] is the real
+    /// check; see [`RECOMPOSITE_MARK_IMBALANCE`].
+    fn credit(&mut self, slot: usize) {
+        let now = std::time::Instant::now();
+        // `duration_since`, never `now - self.last`: `Sub` for `Instant`
+        // panics on an inverted pair, and this crate denies `panic`.
+        let elapsed = now.duration_since(self.last);
+        if let Some(counter) = RECOMPOSITE_TILE_COST_NANOS.get(slot) {
+            let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            counter.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last = now;
+    }
+
+    /// One tile has entered the phase-1 loop body. Credits the loop
+    /// overhead that got here — iteration, `is_current` skips,
+    /// `doc_origin_for`, and on the first call the whole pre-loop setup —
+    /// to `other`, and counts the tile for [`Self::finish`]'s
+    /// reconciliation.
+    fn begin_tile(&mut self) {
+        self.tiles_begun = self.tiles_begun.saturating_add(1);
+        self.credit(Self::OTHER);
+    }
+
+    /// The `issued` block just closed. `reachable` is whether the GPU arm
+    /// could be entered at all this pass; `issued` is whether
+    /// [`begin_gpu_composite_tile`] returned `Some`.
+    ///
+    /// This is the pass's one *classifying* mark per tile: it fires on
+    /// every tile that reached the loop body, on all three
+    /// `(reachable, issued)` arms, which is what makes counting it a
+    /// meaningful cross-check against [`Self::begin_tile`].
+    fn mark_gpu_issue(&mut self, reachable: bool, issued: bool) {
+        let slot = match (reachable, issued) {
+            (false, _) => Self::OTHER,
+            (true, true) => Self::GPU_ISSUE_OK,
+            (true, false) => Self::GPU_ISSUE_DECLINED,
+        };
+        self.classifications = self.classifications.saturating_add(1);
+        self.credit(slot);
+    }
+
+    /// The CPU fallback arm just closed. `folded` is how many roots
+    /// [`composite_roots_into_tile`] actually blended into this tile, which
+    /// decides which of the two CPU slots takes the cost — passed by value
+    /// rather than read off a process-global counter (0.93.1) so a
+    /// concurrent [`composite_document`] on another thread cannot
+    /// reclassify an empty tile as real.
+    ///
+    /// The same `folded` also feeds [`RECOMPOSITE_FOLD_COUNTS`] (0.97.1),
+    /// which is what makes the folds-per-frame figure — and, more to the
+    /// point, its first-fold / later-fold split — re-derivable from the
+    /// tree instead of from a reverted `eprintln!`.
+    fn mark_cpu_fallback(&mut self, folded: usize) {
+        note_recomposite_folds(folded);
+        let slot = if folded == 0 {
+            Self::CPU_EMPTY
+        } else {
+            Self::CPU_REAL
+        };
+        self.cpu_fallbacks = self.cpu_fallbacks.saturating_add(1);
+        self.credit(slot);
+    }
+
+    /// Phase 1 is closing. Credits the loop's trailing overhead to `other`
+    /// and reconciles the per-tile mark counts, crediting any discrepancy
+    /// to [`RECOMPOSITE_MARK_IMBALANCE`]:
+    ///
+    /// - exactly one [`Self::mark_gpu_issue`] must have fired per tile that
+    ///   entered the loop body, and
+    /// - [`Self::mark_cpu_fallback`] must have fired at most once per such
+    ///   tile.
+    ///
+    /// Both are structural properties of the loop body, so a non-zero total
+    /// means an edit moved, dropped, or duplicated a mark — the failure the
+    /// printed timing residual was wrongly claimed to catch.
+    fn finish(&mut self) {
+        self.credit(Self::OTHER);
+        let missing = self.tiles_begun.abs_diff(self.classifications);
+        let excess = self.cpu_fallbacks.saturating_sub(self.tiles_begun);
+        note_recomposite_mark_imbalance(missing.saturating_add(excess));
+    }
+}
+
+/// The shipping build's version: a zero-sized type whose `mark_*` methods
+/// compile to nothing, exactly as [`RecompositePhases`]'s own
+/// `cfg(not(test))` twin does above. The counter itself does not exist
+/// outside `cfg(test)`.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RecompositeTileCosts;
+
+#[cfg(not(test))]
+impl RecompositeTileCosts {
+    fn start() -> Self {
+        Self
+    }
+
+    // `&mut self` and the parameters deliberately mirror the `cfg(test)`
+    // signatures so the call sites are identical in both builds; there is
+    // nothing to read.
+    #[allow(clippy::unused_self)]
+    fn begin_tile(&mut self) {}
+
+    /// See [`Self::begin_tile`].
+    #[allow(clippy::unused_self)]
+    fn mark_gpu_issue(&mut self, _reachable: bool, _issued: bool) {}
+
+    /// See [`Self::begin_tile`].
+    #[allow(clippy::unused_self)]
+    fn mark_cpu_fallback(&mut self, _folded: usize) {}
+
+    /// See [`Self::begin_tile`].
+    #[allow(clippy::unused_self)]
+    fn finish(&mut self) {}
+}
+
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
-/// the whole document: every visible top-level layer is a `Normal`-blend
-/// [`aurora_doc::LayerKind::Pixel`] layer, no groups. Callers must check
-/// that first — this function does not re-check it itself.
+/// the whole document: every visible top-level layer is an
+/// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply`,
+/// `Darken`, `Lighten`, `Screen` or `Dissolve`, no groups. Callers must
+/// check that first —
+/// this function does not re-check it itself, beyond one defensive bail
+/// (below).
 ///
 /// Reuses [`resolve_tile`] once per visible root-level layer, bottom to
 /// top, exactly as [`recomposite_visible_tiles`]'s own CPU path already
@@ -6688,28 +9005,104 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// (`read_layer_window`/direct `TileStore::get`) `resolve_tile`'s own
 /// `Pixel` branch already establishes, not reimplemented here. Since
 /// [`document_qualifies_for_gpu_compositing`] has already ruled out every
-/// group and every non-`Normal` blend mode for this document,
-/// `resolve_tile`'s own returned `aurora_render::BlendMode` is guaranteed
-/// `Normal` for every entry this collects — `composite_over_with_opacity`'s
-/// own fixed-function "source-over" *is* that formula exactly, so unlike
-/// `composite_tile_cpu` this needs no blend-mode dispatch of its own.
+/// group and every blend mode outside `{Normal, Multiply, Darken,
+/// Lighten, Screen, Dissolve}` for
+/// this document — and `resolve_tile` itself turns a `Dissolve` layer
+/// into an already-gated buffer at `Normal` before returning —
+/// `resolve_tile`'s own returned `aurora_render::BlendMode` is one of
+/// `{Normal, Multiply, Darken, Lighten, Screen}` for every entry this
+/// collects, and the
+/// `match` below dispatches on it. A sixth mode reaching here would
+/// mean the predicate
+/// and this function had drifted apart, so that arm logs and returns
+/// `None` (falling this tile back to the CPU path) rather than
+/// compositing the wrong formula silently.
+///
+/// **A ping-pong accumulator pair, not one destination texture.**
+/// `composite_over_with_opacity` blends in place: its destination is
+/// both the backdrop it loads and the target it stores, so `Normal`
+/// needs only one texture. A real blend-math pass
+/// (`composite_multiply_over_with_opacity`,
+/// `composite_darken_over_with_opacity`,
+/// `composite_lighten_over_with_opacity`,
+/// `composite_screen_over_with_opacity`)
+/// cannot — it *samples* the backdrop to compute `B(Cb, Cs)`, and
+/// sampling the texture a pass renders into is undefined, so its `dst`
+/// must be a different view from its `backdrop` (those methods' own
+/// documented aliasing rule). This function therefore keeps up to
+/// **two** identically-sized `Rgba16Float` accumulators — `current`,
+/// always holding the fold so far, and `spare`, the second member the
+/// ping-pong needs:
+///
+/// - `Normal` blends in place onto `current`; nothing moves, and no
+///   second texture is touched or even created.
+/// - Every *other* expressible mode — `Multiply` (0.84.0), `Darken`
+///   (0.85.0), `Lighten` (0.95.0) and `Screen` (0.102.0) — reads
+///   `current` as the backdrop
+///   and writes the finished
+///   composite into `spare`, then the two swap places. This is one
+///   mechanism, not one per mode: `spare` is a single shared texture
+///   that whichever arm needs it takes a turn with, so a stack mixing
+///   all four ping-pongs between exactly the same two
+///   accumulators an all-`Multiply` stack would.
+///
+/// **Each is created separately and lazily** (0.84.1). `current` is
+/// created by the first root layer that resolves. Until 0.87.0 that was
+/// not the same as "this tile has painted content" — the lazy-paging
+/// correction below (0.86.1) spelled out that a visible layer resolved
+/// at *every* tile coordinate, so only a tile with no visible layer
+/// anywhere did zero GPU work. As of 0.87.0 a visible layer resolves
+/// only where it has content *stored* ([`resolve_tile`] returns `None`
+/// otherwise), so an ordinary blank tile of an ordinary visible document
+/// now creates no accumulator and does zero GPU work too — see "What a
+/// bailed tile actually costs" below, which is the same statement from
+/// the cost side. `spare` is created by the first blend-math layer
+/// of *any* expressible mode that actually
+/// reaches this tile — never before, and never a second time for a
+/// second mode — so an all-`Normal` document (every
+/// plain imported PNG/JPEG/TIFF) allocates and clears exactly one
+/// accumulator per tile, the same cost it had before 0.84.0 introduced
+/// the pair at all. Both carry `RENDER_ATTACHMENT | COPY_SRC |
+/// TEXTURE_BINDING`, because after a swap either one can end up being
+/// the backdrop a later blend-math layer samples, and either one can end
+/// up being the member the readback copies from. Neither is cached
+/// across tiles or frames; doing so is separate, deliberately deferred
+/// work.
+///
+/// The swap is `std::mem::swap` on the two owned `(texture, view)`
+/// pairs, not an index into a `[_; 2]`: an index has out-of-range values
+/// that then have to be defended against or assumed away, whereas moving
+/// the pairs themselves keeps each texture with its own view by
+/// construction and leaves "which member is current" with no wrong state
+/// to be in. (0.84.0 used a `usize` index guarded by two bail branches
+/// that could not actually fire — the unsigned `1 - current` they
+/// nominally protected against would have gone wrong before either guard
+/// ran. 0.84.1 removed the index and both guards together.)
 ///
 /// For each resolved layer (bottom to top), immediately: uploads its own tile-sized
 /// texel window into a fresh scratch `Rgba16Float` source texture
-/// (`TEXTURE_BINDING | COPY_DST`), then
-/// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
-/// onto one shared destination texture (`RENDER_ATTACHMENT | COPY_SRC`,
-/// cleared to fully transparent black first, since
-/// `composite_over_with_opacity` always uses `LoadOp::Load`).
+/// (`TEXTURE_BINDING | COPY_DST`), then dispatches on that layer's blend
+/// mode as above. Every accumulator is cleared to fully transparent
+/// black at creation — load-bearing for `current`, whose very first
+/// `Normal` blend uses `LoadOp::Load` and so needs real, known content
+/// under it; belt-and-braces for `spare`, which the blend-math pass that
+/// created it overwrites completely. See
+/// [`create_composite_accumulator`]'s own doc comment.
 ///
 /// **Leaves a premultiplied accumulator behind, on purpose**: once the
-/// fold is done that shared destination holds *premultiplied* alpha —
+/// fold is done the `current` accumulator holds *premultiplied* alpha —
 /// the fixed-function `AlphaBlending` unit accumulating onto a cleared,
 /// fully transparent target leaves exactly the state
 /// `aurora_render::composite_layer_into` leaves on the CPU side (a lone
 /// opaque-white layer at 50% opacity gives `(0.5, 0.5, 0.5, 0.5)`, not
 /// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
 /// `composite_over_with_opacity`'s own correct and unchanged contract.
+/// Every blend-math method writes premultiplied texels too (named as a
+/// family rather than enumerated, per the same reasoning at this
+/// function's own `all six … methods` fix, 0.106.1 — the list grows by
+/// one every time a mode is ported, and this was the duplicate of that
+/// same stale sentence it missed), so no blend-mode layer in the stack
+/// changes this.
 /// Converting that back to the straight alpha the tile store and
 /// everything downstream of it expect is
 /// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
@@ -6722,10 +9115,85 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// translucent composite tile — and so every export and every eyedropper
 /// read — carried premultiplied values.
 ///
-/// **Issues the readback, does not wait for it**: the destination texture's
-/// GPU→CPU copy is *started* via [`begin_tile_readback`] — which itself
-/// issues `copy_texture_to_buffer` + `queue.submit` + `slice.map_async`
-/// with no `device.poll` call — and this function returns the resulting
+/// **One `wgpu::CommandEncoder` and one `queue.submit` for the whole
+/// tile** (0.86.0). This function opens a single encoder before walking
+/// the layer stack and records everything into it — each accumulator's
+/// clear pass ([`create_composite_accumulator`]), every layer's blend
+/// pass, and the final readback copy ([`record_tile_readback`]) — then
+/// submits it exactly once at the bottom. Before 0.86.0 each of those
+/// steps created and submitted its own command buffer, because
+/// `aurora_render::TileCompositor`'s methods each ended in a
+/// `queue.submit` of their own; they are pure recorders now. The
+/// simplest real case — one `Normal` layer — went from **three**
+/// submits per tile (clear, layer, readback) to one; an N-layer tile
+/// from N + 2 (or N + 3 once a blend-math layer forces the
+/// `spare` accumulator's clear) to one.
+///
+/// This is safe precisely because ordering inside a command buffer is
+/// recording order: the clear is recorded before the first
+/// `LoadOp::Load` blend that needs it, each ping-pong pass is recorded
+/// after the pass whose output it samples, and the readback copy is
+/// recorded last. `aurora-render`'s two "chained through a ping-pong
+/// pair" tests pin exactly that hazard pair inside one command buffer on
+/// real hardware, and this module's own
+/// `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile`
+/// pins the count.
+///
+/// **What a bailed tile actually costs** (stated precisely; 0.86.0's
+/// own wording claimed "costs nothing" for both bails, which was true of
+/// only one of them — corrected in 0.86.1). Both early returns below
+/// drop the encoder without calling `finish()`, so neither submits a
+/// command buffer, and every *recorded* pass — clears, blends, the
+/// readback copy — is discarded unexecuted. That is the whole cost for
+/// one of the two:
+///
+/// - **No accumulator was ever created** (`current?`, below): genuinely
+///   zero GPU work. The loop resolved nothing, so nothing was recorded
+///   and nothing was uploaded either. Where before 0.86.0 this bail had
+///   already submitted a clear pass no one would read, it now issues
+///   literally nothing. **Reachable for an ordinary blank tile of an
+///   ordinary visible document as of 0.87.0**, which is the whole point
+///   of that change: [`resolve_tile`] now returns `None` for a visible
+///   layer with nothing *stored* at this tile, so panning into blank
+///   canvas takes this bail instead of uploading, blending, submitting
+///   and reading back transparency per layer per tile. It used to need
+///   every layer in the document to be invisible or unreadable — an edge
+///   case, which is why the cost above was worth spelling out and is now
+///   worth even less.
+/// - **An inexpressible blend mode** (the `other_mode` arm): the
+///   recorded command buffer is discarded, but the uploads already
+///   issued are **not** undone. `queue.write_texture` is a queue-level
+///   operation, not a command recorded into this function's encoder, so
+///   by the time this bail fires every layer processed *before* it —
+///   including the offending layer itself, whose source texels are
+///   uploaded before its mode is matched on — has already had its
+///   full tile-sized `Rgba16Float` window (`TILE × TILE × 8` bytes)
+///   written to a fresh GPU texture, and dropping an unfinished encoder
+///   cannot take that back. So this bail costs one such upload per
+///   layer up to and including the offending one, plus those textures'
+///   own allocation; what it saves relative to pre-0.86.0 is the clear
+///   and blend *passes*, which used to be submitted and executed and
+///   are now discarded. Cheaper than it was, not free.
+///
+/// The distinction is academic while the real caller and
+/// `document_qualifies_for_gpu_compositing` agree — that arm is not
+/// reachable through `recomposite_visible_tiles` — but it is exactly
+/// what a direct caller (and
+/// `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`)
+/// pays.
+///
+/// **Scope is one tile.** [`recomposite_visible_tiles`]'s existing
+/// per-frame batching — every tile's work issued before a single
+/// `device.poll` resolves them all — is untouched; this is one submit
+/// per *tile*, not per frame. Folding several tiles into one command
+/// buffer is a further, deliberately separate change.
+///
+/// **Issues the readback, does not wait for it**: the `current`
+/// accumulator's
+/// GPU→CPU copy is recorded by [`record_tile_readback`], carried out by
+/// the single submit above, and handed to [`map_pending_readback`] —
+/// `slice.map_async` with no `device.poll` call — and this function
+/// returns the resulting
 /// [`PendingGpuReadback`] unresolved. This is the "phase 1" half of the
 /// batched shape [`recomposite_visible_tiles`]'s own doc comment
 /// describes: every visible tile's GPU work (this function, once per
@@ -6747,16 +9215,56 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// CPU-only, a one-shot operation where this isn't latency-critical the
 /// way the live canvas is.
 ///
-/// `None` if there are no visible root-level layers at all (an empty
-/// composite tile — cheaper handled by the CPU path's own "empty
-/// `layers` → transparent black" default than by a real, empty GPU round
-/// trip) — the caller falls back to the CPU path for this one tile
+/// `None` if no visible root-level layer has any **stored** content
+/// overlapping this tile — either because there is no visible root layer
+/// at all, or (as of 0.87.0) because not one of them has ever had a pixel
+/// stored at the tile being composited. That case is cheaper handled by
+/// the CPU path's own blank-tile handling than by a real, empty GPU
+/// round trip. The caller falls back to the CPU path for this one tile
 /// immediately, without anything to batch, the same "one bad tile
 /// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
-/// already use. A real GPU-side failure (a lost device, a bad map) can no
-/// longer be detected here — resolving the map is [`finish_tile_readback`]'s
-/// job now, in phase 3, once this function has already returned.
-#[allow(clippy::too_many_arguments)]
+/// already use.
+///
+/// The second half of that is new in 0.87.0. Before it, a visible layer
+/// resolved at *every* tile coordinate, because the tile store answers
+/// an unpainted coordinate by materializing a blank tile rather than by
+/// signalling absence, so a blank region of a document with any visible
+/// layer still took the full GPU path and composited transparency for
+/// real. [`resolve_tile`] now asks `aurora_tile::TileStore::contains_tile`
+/// (same-origin branch) and [`LayerWindow::is_blank`] (windowed branch)
+/// first and answers `None` for such a layer, so this bail is reachable
+/// for an ordinary blank tile of an ordinary visible document. What it
+/// deliberately does **not** cover is a tile painted and then erased to
+/// full transparency: that is real stored content, `contains_tile`
+/// reports it as present, and it still takes the whole path — only
+/// "never stored" is safe to treat as absence. See the lazily-built
+/// accumulators' own comment in the body, and PLAN.md's M1.10
+/// "Empty-tile GPU composite work". Also `None` for the one defensive
+/// case above — a resolved blend mode outside `{Normal, Multiply,
+/// Darken, Lighten, Screen}` — logged, falling this one tile back to the
+/// CPU
+/// path, and
+/// not reachable through the real caller while the predicate and this
+/// function agree (it *is* reachable by calling this function directly,
+/// which is what
+/// `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
+/// does, so the arm is covered rather than merely asserted about). A
+/// real GPU-side failure (a lost device, a bad map) can no longer be
+/// detected here — resolving the map is [`finish_tile_readback`]'s job
+/// now, in phase 3, once this function has already returned.
+// `too_many_lines`: 162, against a 100 limit, re-measured at 0.102.0 by
+// temporarily removing this allow (it was 143 at 0.95.0 and 124 at
+// 0.86.1, and first crossed the limit on the second ported blend mode,
+// 0.85.0, at 107). The body is one loop whose `match` gains a fixed
+// 19-line arm per mode, including its dispatch counter -- `Screen`'s own
+// arm, added in 0.102.0, cost exactly the 19 the 0.95.0 figure predicted
+// (143 + 19 = 162), which is now a measured regularity rather than an
+// estimate. It will keep drifting by that much as more modes land. Splitting the arms out would mean
+// handing each a `&mut` borrow of both accumulator `Option`s plus
+// `device`/`queue`/`tile_extent`, which is exactly the shape the swap
+// exists to keep local. The same allow `recomposite_visible_tiles` just
+// below and several sibling tests in this module already carry.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn begin_gpu_composite_tile(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
@@ -6775,17 +9283,128 @@ fn begin_gpu_composite_tile(
         depth_or_array_layers: 1,
     };
 
-    // Built lazily, on the first root layer that actually resolves to
-    // real content for this tile -- a tile with no touched layer
-    // anywhere must do zero GPU work and return `None`, exactly as the
-    // collect-then-check-empty shape this replaces did. Resolving and
-    // compositing one layer at a time this way (rather than collecting
-    // every root's own `Vec<half::f16>` before uploading any of them)
-    // means this tile's peak memory is one resolved layer's texels plus
-    // one GPU-side src/dst texture pair, not one texel buffer per
-    // visible root -- the same shape `composite_roots_into_tile`'s own
-    // CPU path already has (0.51.0).
-    let mut dst: Option<(wgpu::Texture, wgpu::TextureView)> = None;
+    // **One encoder for this whole tile** (0.86.0). Every accumulator
+    // clear, every layer's blend pass and the final readback copy are
+    // recorded into this one command buffer and submitted exactly once,
+    // at the bottom. Before 0.86.0 each of those recorded and submitted
+    // its own: a single-layer document -- the common case, and the shape
+    // of the app's own default startup document's `Normal` layer -- cost
+    // three `queue.submit` calls per tile (clear, layer, readback), and
+    // an N-layer tile cost N + 2 (or N + 3 once a blend-math layer forced
+    // the `spare` accumulator's clear).
+    //
+    // Ordering is unaffected, and that is the load-bearing claim:
+    // passes within a single command buffer execute in recording order,
+    // so the clear still precedes the first `LoadOp::Load` blend, each
+    // ping-pong pass still sees the previous pass's finished output in
+    // the texture it samples, and the readback copy still happens last.
+    // `aurora-render`'s two "chained through a ping-pong pair" tests pin
+    // exactly that, inside one command buffer, on real hardware.
+    //
+    // Note it is *created* here, before the loop, but nothing is
+    // recorded into it unless a layer actually resolves. An encoder that
+    // is dropped without `finish()` submits nothing at all, which is why
+    // both early-exit paths below can simply return: see them for the
+    // detail.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu-composite-tile"),
+    });
+
+    // Built lazily, on the first root layer that actually resolves for
+    // this tile; if none does, no GPU work is issued and this returns
+    // `None`, exactly as the collect-then-check-empty shape this
+    // replaces did.
+    //
+    // **How often "none does" actually happens, honestly** (rewritten in
+    // 0.87.0, which changed the answer; 0.86.1's own correction of
+    // 0.86.0 described the behaviour accurately as it then stood).
+    // `resolve_tile` now yields `None` **per layer** whenever that layer
+    // has nothing *stored* at this tile -- not only when it is invisible
+    // or unreadable. It used to be the latter: `TileStore::get`/
+    // `ensure_resident` answer any tile coordinate ever asked for with
+    // `Ok(`a blank tile`)` rather than signalling absence, which is core
+    // to their lazy-paging design, so a visible layer whose real pixels
+    // were a thousand tiles away still resolved *here*, to transparent
+    // texels, and panning into blank canvas cost a full upload, blend,
+    // submit and readback per visible layer per tile to produce
+    // transparent output. `resolve_tile` asks
+    // `TileStore::contains_tile` (same-origin) and
+    // `LayerWindow::is_blank` (windowed) before it asks for texels, so
+    // that work is no longer paid: a tile no visible layer has ever
+    // painted resolves nothing, records nothing, uploads nothing, and
+    // takes the `current?` bail below.
+    //
+    // What it does *not* claim: this is not "the tile looks
+    // transparent". A tile painted and then erased to `(0, 0, 0, 0)` is
+    // stored content -- `contains_tile` consults residency, not texel
+    // values -- and still goes through the full path here. Only "never
+    // stored" is treated as absence, which is the one form of blankness
+    // that is provably bit-identical to skipping. See PLAN.md, M1.10,
+    // "Empty-tile GPU composite work".
+    //
+    // **Peak GPU memory is O(N) in this tile's visible root layers**
+    // (corrected in 0.86.1; the 0.86.0 wording below claimed O(1),
+    // which described the pre-0.86.0 submit-per-layer behaviour). CPU
+    // side it is still O(1): one resolved layer's `Vec<half::f16>` and
+    // its `bytes` staging copy at a time, both dropped at the end of
+    // each iteration, rather than every root's texels collected up
+    // front -- the same shape `composite_roots_into_tile`'s own CPU path
+    // has (0.51.0). GPU side it is not, and 0.86.0's single-encoder
+    // batching is why: each iteration creates a fresh `src_texture`
+    // (plus the uniform buffer and bind group the compositor call
+    // builds), and with no intermediate `queue.submit` those stay
+    // referenced by the still-unfinished encoder for the rest of the
+    // loop. Dropping the Rust handle at the end of the iteration does
+    // not free them; the recorded commands hold them. So an N-layer
+    // tile holds N tile-sized `Rgba16Float` source textures
+    // (`TILE × TILE × 8` bytes each) plus the accumulator pair live
+    // until this tile's one submit-and-readback completes, where
+    // pre-0.86.0 it held one at a time. They are transient -- freed once
+    // that submit retires -- and this is the price of AC-1's single
+    // submit per tile, taken deliberately rather than by accident.
+    //
+    // Two *separately* lazy accumulators, not one eagerly-created pair.
+    // `current` always holds the fold so far and is created by the first
+    // layer that resolves at all; `spare` is the second member the
+    // ping-pong needs, and it is created only by the first blend-math
+    // layer -- `Multiply`, `Darken`, `Lighten` or `Screen` -- that
+    // actually reaches this tile. None of them can blend
+    // in place (each samples its backdrop, and sampling the render
+    // target is undefined -- see those methods' own
+    // aliasing rule), so they, and only they, need a second texture to
+    // render into. One `spare` serves all of them: it is a shared
+    // scratch target the arms take turns rendering into, not a per-mode
+    // resource, so a stack mixing them allocates no more than a
+    // single-mode one does.
+    // An all-`Normal` document -- every plain imported
+    // PNG/JPEG/TIFF -- therefore allocates and clears exactly one
+    // accumulator per tile, exactly as it did before 0.84.0 introduced
+    // the pair; the second texture and its own clear pass are not spent
+    // on a document that would never read them.
+    //
+    // The swap is `std::mem::swap` on the two `Option` payloads rather
+    // than an index into a `[_; 2]`: an index invites an out-of-range
+    // value that has to be either defended against or assumed away,
+    // while moving the whole `(texture, view)` pair keeps each texture
+    // with its own view by construction and makes "which member is
+    // current" unrepresentable in any wrong state. The readback at the
+    // end copies out of `current`, whichever texture that now is.
+    //
+    // **The two `wgpu` debug labels below denote identity, not role.**
+    // `"gpu-composite-a"` and `"gpu-composite-b"` are baked into each
+    // texture at creation and never change, but `std::mem::swap`
+    // exchanges which one the `current`/`spare` bindings name — so after
+    // an odd number of blend-math layers the texture labelled `-b` *is*
+    // `current`, and the readback below copies out of it. A `wgpu`
+    // validation message or a frame capture naming one of these is
+    // therefore pointing at a physical texture, not at "the
+    // accumulator" or "the scratch target"; work out the role from the
+    // number of blend-math layers this tile saw, not from the letter.
+    // The labels are left as identities on purpose: a role-shaped label
+    // would be wrong for half of every tile's passes, which is worse
+    // than one that is never wrong and merely does not say the role.
+    let mut current: Option<(wgpu::Texture, wgpu::TextureView)> = None;
+    let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
     for &id in layers.roots().iter().rev() {
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
@@ -6793,7 +9412,7 @@ fn begin_gpu_composite_tile(
         // tile's roots, not one each: in a well-formed tree their
         // subtrees are disjoint, so the sum of their node counts is
         // still bounded by the tree's own length.
-        let Some((texels, opacity, _blend_mode)) = resolve_tile(
+        let Some((texels, opacity, blend_mode)) = resolve_tile(
             id,
             layers,
             store,
@@ -6806,53 +9425,56 @@ fn begin_gpu_composite_tile(
             continue;
         };
 
-        let (_dst_texture, dst_view) = &*dst.get_or_insert_with(|| {
-            let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("gpu-composite-dst"),
-                size: tile_extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
-                // for the readback below -- nothing samples this texture, so it
-                // needs no `TEXTURE_BINDING`.
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // **The `Dissolve` dispatch counter, and why it is here rather
+        // than in either of the two places that look more natural**
+        // (0.103.0). `Dissolve` never reaches the `match` below as
+        // `Dissolve`: `resolve_tile` intercepts it in *both* its `Pixel`
+        // and `Group` branches, applies `dissolve_gate` on the CPU, and
+        // returns `(gated texels, 1.0, BlendMode::Normal)`. So there is no
+        // `Dissolve` arm to instrument, and the two obvious alternatives
+        // are each wrong in a way that would make the counter useless:
+        //
+        // - **Not inside `resolve_tile`.** That function is the *shared*
+        //   resolver: `composite_roots_into_tile`, the CPU path, calls it
+        //   too. A counter there would tick for CPU-only composites, so it
+        //   would stay non-zero after the very mutation it exists to catch
+        //   (removing `Dissolve` from
+        //   `document_qualifies_for_gpu_compositing`, which routes the
+        //   whole document to the CPU) -- a non-zero, meaningless count
+        //   instead of a failing assertion.
+        // - **Not inside the shared `Normal` arm below.** That arm is
+        //   taken by real `Normal` layers *and* by `Dissolve`-resolved
+        //   ones, so a count taken there cannot tell "a `Dissolve` layer
+        //   dispatched" from "an ordinary `Normal` layer dispatched".
+        //
+        // Here is the one site that is both GPU-only and `Dissolve`-only:
+        // past the `continue` above, so it fires only for a layer that
+        // really resolved and really is part of this tile's GPU dispatch,
+        // and reading the layer's *raw* `aurora_doc` blend mode, which is
+        // the only place the `Dissolve` fact still exists.
+        //
+        // **The blend-mode *check* lives inside the helper, not here**
+        // (0.103.1). Unlike the four real dispatch arms below, whose
+        // counters cost the shipping build one elided no-op call each,
+        // this one needs a `HashMap` probe to know whether to count --
+        // and this loop body runs once per root layer per composite tile
+        // per frame. Written inline that probe would run in the shipping
+        // build; `note_dissolve_dispatch`'s `#[cfg(not(test))]` twin
+        // discards both arguments unread instead. See its doc comment.
+        note_dissolve_dispatch(layers, id);
 
-            // Clear to fully transparent black -- `composite_over_with_opacity`
-            // always preserves existing content (`LoadOp::Load`), so the
-            // destination needs real, known-transparent content before the first
-            // real layer blends onto it.
-            {
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("gpu-composite-clear"),
-                });
-                {
-                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("gpu-composite-clear"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &dst_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                }
-                queue.submit(std::iter::once(encoder.finish()));
-            }
-
-            (dst_texture, dst_view)
-        });
+        // Created on the first layer that resolves, reused by every one
+        // after it. Deliberately not `get_or_insert_with` -- see
+        // `accumulator_or_create`'s own doc comment for why that does
+        // not compile, and why this shape leaves no unreachable "the
+        // accumulator vanished" arm behind (0.86.1).
+        let current_accumulator = accumulator_or_create(
+            &mut current,
+            device,
+            &mut encoder,
+            tile_extent,
+            "gpu-composite-a",
+        );
 
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gpu-composite-src"),
@@ -6884,23 +9506,912 @@ fn begin_gpu_composite_tile(
             tile_extent,
         );
         let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        compositor.composite_over_with_opacity(gpu, dst_view, &src_view, opacity);
+
+        match blend_mode {
+            // The fixed-function blend unit computes "source over" in
+            // place: `current` is both the backdrop it loads and the
+            // target it stores, so nothing moves and no second texture
+            // is ever needed.
+            aurora_render::BlendMode::Normal => {
+                compositor.composite_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &current_accumulator.1,
+                    &src_view,
+                    opacity,
+                );
+            }
+            // Reads `current` as the sampled backdrop and writes the
+            // finished composite into `spare` -- they must be different
+            // views (`composite_multiply_over_with_opacity`'s own
+            // aliasing rule), which is the entire reason a second
+            // texture exists, and why it is created right here, on the
+            // first blend-math layer that actually reaches this tile,
+            // rather than alongside the first accumulator. `spare` is
+            // shared with the `Darken`, `Lighten`, `Screen`,
+            // `Difference`, `LinearDodge`, `LinearBurn` and `ColorBurn`
+            // arms below rather than owned by
+            // this one: `accumulator_or_create` creates it once,
+            // whichever of the eight blend-math arms gets there first. The written
+            // one is now the fold, so the two swap places: what was
+            // `spare` becomes `current`, and the exhausted backdrop
+            // becomes the next blend-math pass's render target.
+            aurora_render::BlendMode::Multiply => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_multiply_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                // Retrofitted in 0.103.0, three rounds after this arm
+                // itself landed -- and the most load-bearing of the five,
+                // because the app's own default startup document carries a
+                // `Multiply` layer, so this is the arm every user's first
+                // frame takes. See `GpuBlendDispatches`. ("the five" was
+                // the 0.103.0 count; there are eight counted modes as of
+                // 0.106.0, and `GpuBlendDispatches` states the live one.)
+                note_gpu_blend_dispatch(GpuBlendDispatch::Multiply);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The second ported mode (0.85.0), through the *same*
+            // mechanism as the `Multiply` arm directly above -- the same
+            // single `spare` accumulator (created here only if no
+            // earlier blend-math layer already created it), the same
+            // sample-backdrop/write-spare/swap sequence, the same
+            // aliasing rule. Only the compositor method, and so the WGSL
+            // entry point behind it, differs: `min(Cb, Cs)` per channel
+            // instead of `Cb * Cs`.
+            aurora_render::BlendMode::Darken => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_darken_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                // Reports that this arm really ran -- see
+                // `GpuBlendDispatches` for the mutation (deleting this
+                // whole arm) that every 0.85.0 test survived.
+                note_gpu_blend_dispatch(GpuBlendDispatch::Darken);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The third ported mode (0.95.0), through the *same*
+            // mechanism as the two arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `max(Cb, Cs)` per channel. Instrumented from its first
+            // round rather than retrofitted -- see
+            // `GpuBlendDispatches`.
+            aurora_render::BlendMode::Lighten => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_lighten_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Lighten);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The fourth ported mode (0.102.0), through the *same*
+            // mechanism as the three arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `Cb + Cs - Cb*Cs` per channel, the first ported formula
+            // that is arithmetic on both operands rather than one
+            // intrinsic. Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            aurora_render::BlendMode::Screen => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_screen_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Screen);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The fifth ported mode (0.104.0), through the *same*
+            // mechanism as the four arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `|Cb - Cs|` per channel, one componentwise `abs()` on the
+            // difference -- deliberately not `max(Cb - Cs, 0)`, which is
+            // `Subtract`, a different and still-CPU-only mode.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            aurora_render::BlendMode::Difference => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_difference_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Difference);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The sixth ported mode (0.105.0), through the *same*
+            // mechanism as the five arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `min(Cb + Cs, 1)` per channel. Deliberately not
+            // `max(Cb + Cs - 1, 0)`, which is `LinearBurn`, this mode's
+            // exact mirror image -- a different mode, and as of 0.106.0 the
+            // arm directly below rather than a CPU-only one, so the two
+            // arms must not be confused in either direction; not
+            // `Cb + Cs - Cb*Cs`, which is `Screen`, its nearest arithmetic
+            // neighbour and the arm directly above the `Difference` one;
+            // and not `ColorDodge`, the other dodge-family mode -- on the
+            // GPU as of 0.108.0, in the last blend arm of this `match`, and
+            // sharing this mode's exact clamp boundary
+            // (`min(1, Cb/(1-Cs))` clamps iff `Cb + Cs >= 1`, iff this mode
+            // clamps), so no clamped channel can tell the two apart.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            aurora_render::BlendMode::LinearDodge => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_linear_dodge_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::LinearDodge);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The seventh ported mode (0.106.0), through the *same*
+            // mechanism as the six arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `max(Cb + Cs - 1, 0)` per channel, the exact mirror image of
+            // the `LinearDodge` arm directly above -- same sum, opposite
+            // offset, opposite clamp direction, and the two blend lines
+            // differ by three characters. Because *both* arms now exist,
+            // the copy-paste hazard runs in both directions; the shader
+            // behind this one was written from `aurora_render`'s own
+            // `blend_channel` arm rather than copied from
+            // `fs_composite_linear_dodge`. Deliberately not `Cb * Cs`,
+            // which is `Multiply` (this mode's nearest neighbour in
+            // *behaviour*: both darken, both give 0 for a zero backdrop),
+            // and not `ColorBurn`, the other burn-family mode -- **on the
+            // GPU as of 0.107.0, in the arm directly below this one**, so
+            // that hazard now runs in both directions between two
+            // adjacent arms. Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs
+            // for real ((l) of its matrix). It is caught only because
+            // `NORMAL_MULTIPLY_LINEAR_BURN_STACK`'s `LinearBurn` layer
+            // sits at opacity 0.5 -- the blend term is commutative, so the
+            // asymmetric fold is the only thing that can see the swap. See
+            // `TRANSPOSE_COVERAGE` and its guard test.
+            aurora_render::BlendMode::LinearBurn => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_linear_burn_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::LinearBurn);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The eighth ported mode (0.107.0), through the *same*
+            // mechanism as the seven arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `1 - min(1, (1 - Cb) / Cs)` per channel, guarded by
+            // `Cb == 1 -> 1` first and `Cs == 0 -> 0` second, in that
+            // order.
+            //
+            // **This arm and the `LinearBurn` one directly above are the
+            // burn family's two members, and that adjacency is the real
+            // copy-paste hazard** -- not the two formulas, which have
+            // nothing in common (`max(Cb + Cs - 1, 0)` against a guarded
+            // division). Sharing half a name is the whole risk, and it
+            // lives here rather than in the shaders. Deliberately not
+            // `min(1, Cb / (1 - Cs))`, which is `ColorDodge`, the *other*
+            // guarded-division mode -- **on the GPU as of 0.108.0, in the
+            // arm directly below this one**, so that hazard now runs in
+            // both directions between two adjacent arms whose formulas
+            // *are* structural mirror images (unlike this arm and the
+            // `LinearBurn` one above). Its branch conditions are `Cb == 0`
+            // and `Cs == 1`, this one's are `Cb == 1` and `Cs == 0`. (Until
+            // 0.108.0 this comment printed that formula with a spurious
+            // outer `1 -` -- one of six sites that made the same slip,
+            // all corrected then. **This arm's comment is the site
+            // 0.108.0's own count missed**, which is why that round said
+            // "five"; 0.108.1 corrected the count everywhere it appeared,
+            // without touching any of the already-correct fixes.)
+            // Instrumented from its first
+            // round -- see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`,
+            // and transposing the first two is a live mutation this round
+            // runs for real ((o) of its matrix). **Unlike every arm above
+            // it, this one's blend term is asymmetric** --
+            // `B(Cb, Cs) != B(Cs, Cb)` -- so the transpose is observable
+            // here even at effective alpha `1.0`, which 0.107.0 confirmed
+            // by running the mutation at both `0.5` and `1.0`.
+            // `NORMAL_MULTIPLY_COLOR_BURN_STACK` still carries `0.5` on
+            // its `ColorBurn` layer, because `TRANSPOSE_COVERAGE`'s guard
+            // is deliberately not special-cased for this mode: non-unit
+            // opacity is now sufficient-but-not-necessary here, and a
+            // conservative guard that still demands it costs nothing.
+            aurora_render::BlendMode::ColorBurn => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_color_burn_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::ColorBurn);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The ninth ported mode (0.108.0), through the *same*
+            // mechanism as the eight arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `min(1, Cb / (1 - Cs))` per channel -- **no outer `1 -`,
+            // that is the arm directly above** -- guarded by
+            // `Cb == 0 -> 0` first and `Cs == 1 -> 1` second, in that
+            // order.
+            //
+            // **This arm and the `ColorBurn` one directly above are the
+            // guarded-division pair, and that adjacency is the real
+            // copy-paste hazard.** Unlike the `LinearBurn`/`ColorBurn`
+            // adjacency, where the two formulas have nothing in common,
+            // these two are genuine structural mirror images: same
+            // two-guard shape, same clamped quotient, mirrored branch
+            // conditions (`Cb == 0`/`Cs == 1` here against `Cb == 1`/
+            // `Cs == 0` above), mirrored operands. So the shader behind
+            // this one was derived from `aurora_render`'s own
+            // `blend_channel` arm rather than copied from
+            // `fs_composite_color_burn`. Deliberately not
+            // `min(Cb + Cs, 1)` either, which is `LinearDodge`, the other
+            // dodge-family mode and already on the GPU -- and worth naming
+            // because the resemblance is more than the shared word: this
+            // mode clamps exactly when `Cb + Cs >= 1`, which is exactly
+            // when `LinearDodge` clamps, so no clamped channel can tell
+            // the two apart. Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`,
+            // and transposing the first two is a live mutation this round
+            // runs for real ((n) of its matrix). **Like the `ColorBurn`
+            // arm above and unlike the seven before it, this one's blend
+            // term is asymmetric** -- `B(Cb, Cs) != B(Cs, Cb)` -- so the
+            // transpose is observable here even at effective alpha `1.0`,
+            // which 0.108.0 confirmed by running the mutation at both
+            // `0.5` and `1.0`. `NORMAL_MULTIPLY_COLOR_DODGE_STACK` still
+            // carries `0.5` on its `ColorDodge` layer, because
+            // `TRANSPOSE_COVERAGE`'s guard is deliberately not
+            // special-cased for either asymmetric mode: non-unit opacity
+            // is now sufficient-but-not-necessary for six of the fifteen
+            // non-`Normal` admitted modes
+            // (`Overlay`, 0.110.0, and `HardLight`, 0.111.0, joined them
+            // conditionally; `LinearLight`, 0.113.0, and `VividLight`,
+            // 0.114.0, unconditionally; `HardMix`, 0.115.0, moved the
+            // denominator to fifteen without joining the six -- its blend
+            // term is symmetric away from one corner point),
+            // and a conservative guard that still demands it costs
+            // nothing.
+            aurora_render::BlendMode::ColorDodge => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_color_dodge_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::ColorDodge);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The tenth ported mode (0.110.0), through the *same* mechanism
+            // as the nine arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor method,
+            // and so the WGSL entry point behind it, differs:
+            // `Multiply(Cs, 2*Cb)` where `Cb <= 0.5`, else
+            // `Screen(Cs, 2*Cb - 1)` -- **the branch is on the backdrop**,
+            // and `fs_composite_overlay` writes it as one componentwise
+            // `select()`, this file's first (legitimate here because both
+            // arms are finite multiply/add, unlike the guarded-division
+            // pair's, whose discarded arm would divide by zero).
+            //
+            // **The copy-paste hazard for this arm was not an adjacent arm
+            // at 0.110.0, and as of 0.111.0 it is.** It is `HardLight`,
+            // which is this mode with its two channel arguments swapped.
+            // That mode is now admitted by
+            // `document_qualifies_for_gpu_compositing`, has its own WGSL
+            // entry point, and sits in the arm **directly below** this one
+            // -- so it can be reached by a mistyped `fragment_entry` as well
+            // as *computed* by getting this mode's own operand order wrong.
+            // (Everything this comment said before 0.111.0 was true then;
+            // that port had to come back and correct it, which is the same
+            // discipline the burn and dodge pairs' comments already
+            // document.) Deliberately not `Cs * 2*Cb` in the
+            // other branch either: the two arms are `Multiply` and `Screen`
+            // with a doubled backdrop, so a wrong arm silently degrades to
+            // one of two modes that are themselves on the GPU.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs
+            // for real ((h) of its matrix). **This one's blend term is
+            // asymmetric like the two arms above, but only
+            // *conditionally*** -- `B(Cb, Cs) == B(Cs, Cb)` exactly where
+            // the two operands share a side of `0.5`, and differs only
+            // where they straddle it. `NORMAL_MULTIPLY_OVERLAY_STACK`
+            // straddles in all three channels for that reason, and 0.110.0
+            // confirmed the transpose is observable there at effective
+            // alpha `1.0` as well as at `0.5`. That fixture still carries
+            // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
+            // guard is deliberately not special-cased for any of the six
+            // asymmetric modes: non-unit opacity is now
+            // sufficient-but-not-necessary for six of the fifteen
+            // non-`Normal` admitted modes, and a
+            // conservative guard that still demands it costs nothing.
+            aurora_render::BlendMode::Overlay => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_overlay_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Overlay);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The eleventh ported mode (0.111.0), through the *same*
+            // mechanism as the ten arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor method,
+            // and so the WGSL entry point behind it, differs:
+            // `Multiply(Cb, 2*Cs)` where `Cs <= 0.5`, else
+            // `Screen(Cb, 2*Cs - 1)` -- **the branch is on the source**,
+            // which is the single semantic difference from the arm directly
+            // above, and `fs_composite_hard_light` writes it as one
+            // componentwise `select()` on `s.rgb` (legitimate here for the
+            // sibling's reason: both arms are finite multiply/add, unlike the
+            // guarded-division pair's, whose discarded arm would divide by
+            // zero).
+            //
+            // **The copy-paste hazard for this arm is the arm directly
+            // above, and for the first time in this `match` that adjacent
+            // arm is also the *transposed twin*.** The burn pair and the
+            // guarded-division pair are hazards by adjacency and family
+            // resemblance; here adjacency and transposition coincide, so
+            // three different slips -- transposing `&src_view` and
+            // `&current_accumulator.1` below, branching on `cb` in the
+            // shader, or naming `fs_composite_overlay` as the
+            // `fragment_entry` -- all land on the *same* wrong answer, which
+            // is `Overlay`'s. That is why the shader behind this one was
+            // derived from `aurora_render`'s own `blend_channel` arm rather
+            // than copied from `fs_composite_overlay` and transposed: the
+            // two differ in exactly one place, and copy-and-fix is how that
+            // one place gets left alone. Deliberately not `Cb * 2*Cs` in the
+            // other branch either, and deliberately not `Cs * 2*Cb` in this
+            // one -- the latter being `Overlay`'s own low arm and so the
+            // realistic copy-paste slip here: the two arms are `Multiply` and
+            // `Screen` with a doubled *source*, so a wrong arm silently
+            // degrades to one of two modes that are themselves on the GPU.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs
+            // for real ((h) of its matrix). **This one's blend term is
+            // asymmetric like the three arms above, but only
+            // *conditionally*, as the sibling's is** -- `B(Cb, Cs) ==
+            // B(Cs, Cb)` exactly where the two operands share a side of
+            // `0.5`, and differs only where they straddle it.
+            // `NORMAL_MULTIPLY_HARD_LIGHT_STACK` straddles in all three
+            // channels for that reason, and 0.111.0 confirmed the transpose
+            // is observable there at effective alpha `1.0` as well as at
+            // `0.5`. That fixture still carries `0.5` on its `HardLight`
+            // layer, because `TRANSPOSE_COVERAGE`'s guard is deliberately
+            // not special-cased for any of the four asymmetric modes.
+            aurora_render::BlendMode::HardLight => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_hard_light_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::HardLight);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // `BlendMode::LinearLight` (0.113.0), the twelfth mode ported to
+            // WGSL: `clamp(Cb + 2*Cs - 1, 0, 1)`, one unconditional
+            // expression. **No branch and no `select()`, unlike the two arms
+            // directly above** -- `aurora_render`'s own `blend_channel` arm is
+            // a single clamped sum, its branch form having been proved
+            // (numerically, by a test predating this port) to collapse to
+            // exactly that. So this arm's shader is shaped like
+            // `fs_composite_linear_burn`'s, not like its two neighbours'.
+            //
+            // **The copy-paste hazard for this arm is NOT the arm directly
+            // above it, and that is a genuine structural difference from the
+            // last two rounds.** `Overlay` and `HardLight` are adjacent and
+            // are each other's transpose; nothing about them resembles this
+            // mode's arithmetic. The real hazards are the **two `linear_*`
+            // arms further up this `match`**:
+            //
+            //   - dropping the `2.0 *` in the shader computes `LinearBurn`
+            //     *exactly* (the upper clamp bound is unreachable for operands
+            //     in `[0, 1]`, so the expression reduces to
+            //     `max(Cb + Cs - 1, 0)`), and that is a live arm above;
+            //   - `min(Cb + Cs, 1)` is `LinearDodge`, also a live arm above.
+            //
+            // Both slips therefore degrade silently to another *shipped* mode
+            // rather than to nonsense, which is the hazard class `HardLight`'s
+            // round introduced, reached here by arithmetic instead of by a
+            // wrong branch operand. Calling
+            // `composite_linear_burn_over_with_opacity` or
+            // `composite_linear_dodge_over_with_opacity` here by mistake is
+            // the same hazard one level up. Instrumented from its first
+            // round -- see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real ((h) of its matrix). **This mode's blend term is
+            // *unconditionally* asymmetric** -- `B(Cb, Cs) - B(Cs, Cb) =
+            // Cs - Cb` before the clamp, unlike the two conditionally
+            // asymmetric arms above -- **but that does not make a transpose
+            // observable at every opacity, and this round worked out why
+            // before measuring it.** Over an opaque backdrop at effective
+            // alpha `a`, a *railed* channel's two orders share a `B` so only
+            // `(1-a)*Cb` vs `(1-a)*Cs` survives (nothing at `a = 1`), while an
+            // *interior* channel has `out - out_transposed =
+            // (Cb - Cs)*(1 - 2a)`, which is **zero at `a = 0.5`**. The two
+            // laundering mechanisms are exactly complementary, so
+            // `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` carries all three clamp
+            // regimes: measured, the transpose shows in its two railed
+            // channels at `0.5` and in its one interior channel at `1.0`. That
+            // fixture still uses `0.5` on its `LinearLight` layer, because
+            // `TRANSPOSE_COVERAGE`'s guard is deliberately not special-cased
+            // for any asymmetric mode -- and here, unusually, that
+            // conservative rule is what a naive reading would have called the
+            // *worse* choice.
+            aurora_render::BlendMode::LinearLight => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_linear_light_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::LinearLight);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The thirteenth ported mode (0.114.0), through the *same*
+            // mechanism as every arm above: one ping-pong swap, one spare
+            // accumulator, no new state.
+            //
+            // **The wrong-arm hazard here is a *call graph*, not a name.**
+            // This mode's shader delegates, per channel, to
+            // `color_burn_channel` and `color_dodge_channel` -- the helpers
+            // `ColorBurn` and `ColorDodge` installed -- so the two arms it
+            // could be confused with are those two, further up this `match`
+            // and both live:
+            //
+            //   - calling `composite_color_burn_over_with_opacity` here
+            //     computes `ColorBurn(Cb, Cs)`, which agrees with this mode
+            //     wherever a channel's burn branch happens to rail;
+            //   - calling `composite_color_dodge_over_with_opacity` computes
+            //     `ColorDodge(Cb, Cs)`, agreeing wherever a dodge channel
+            //     rails.
+            //
+            // Neither is a *name* collision -- `vivid_light` looks nothing
+            // like either -- which is why the fixture, not the label, is what
+            // catches it: `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` spans both
+            // branches and keeps one channel clamp-interior in each, so
+            // neither rival agrees in all three channels. Instrumented from
+            // its first round -- see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real. **This mode's blend term is *unconditionally* and
+            // *structurally* asymmetric** -- `B(Cb, Cs)` branches on `Cs`
+            // while `B(Cs, Cb)` branches on `Cb`, so a straddling pair takes
+            // two different families under transposition. **Unlike
+            // `LinearLight` directly above it is not affine in its operands**,
+            // so that mode's `(Cb - Cs)*(1 - 2a)` form has no analogue here --
+            // which is *not* the same as having no blind opacity, and 0.114.0's
+            // first draft of this comment conflated the two. The fold's own
+            // transpose gap,
+            // `(1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`, is affine in `a`
+            // for every mode, so a channel goes blind at
+            // `a* = D0 / (D0 - D1)` whenever `D0 = Cb - Cs` and
+            // `D1 = B(Cb, Cs) - B(Cs, Cb)` have opposite signs -- interior in
+            // both operand orders or not (in the burn branch, blind at exactly
+            // `a = 0.5` is `2*Cb*Cs + Cb + Cs == 1`; `Cb = 0.3`, `Cs = 0.4375`
+            // is such a pair, interior in both orders). So two things launder a
+            // transpose here: *rail agreement* in the blend term, and that
+            // blind alpha. The fixture is interior in both orders in red and
+            // blue and upper-railed in green in the shipped order alone, rails
+            // in both orders nowhere, and has no channel whose blind alpha is
+            // `0.5` or `1.0` -- so the transpose is caught in all three at both
+            // opacities, measured, not reasoned about. What proves that is
+            // `TRANSPOSE_COVERAGE`'s arithmetic assertion (0.113.1), which for
+            // this mode is necessary rather than redundant; the fixture still
+            // uses `0.5` on its `VividLight` layer because that guard is
+            // deliberately not special-cased for any asymmetric mode.
+            aurora_render::BlendMode::VividLight => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_vivid_light_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::VividLight);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The fourteenth ported mode (0.115.0), through the *same*
+            // mechanism as every arm above: one ping-pong swap, one spare
+            // accumulator, no new state.
+            //
+            // **The wrong-arm hazard is the widest in this `match`**, because
+            // this mode's shader reaches three other live entry points
+            // transitively: `hard_mix_channel` calls `vivid_light_channel`,
+            // which calls `color_burn_channel` and `color_dodge_channel`. So
+            // three arms above compute something this one agrees with over part
+            // of any fixture:
+            //
+            //   - `composite_vivid_light_over_with_opacity` computes exactly
+            //     what dropping this mode's threshold computes, and agrees in
+            //     any channel where `VividLight` is already `0` or `1`;
+            //   - `composite_color_burn_over_with_opacity` agrees in every
+            //     channel whose `B` is `0`, and
+            //     `composite_color_dodge_over_with_opacity` in every channel
+            //     whose `B` is `1` -- **provably**, not coincidentally
+            //     (`Cb + Cs < 1` forces `ColorBurn = 0`; `Cb + Cs >= 1` forces
+            //     `ColorDodge = 1`).
+            //
+            // `NORMAL_MULTIPLY_HARD_MIX_STACK` is chosen against all three:
+            // both rails present, and every channel off both of `VividLight`'s
+            // own rails except the corner. Instrumented from its first round --
+            // see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real. **This mode's blend term is symmetric everywhere except the
+            // single point `(Cb, Cs) = (0, 1)`** -- `HardMix(Cb, Cs) = 1` iff
+            // `Cb + Cs >= 1`, which is symmetric, with that one guard-ordering
+            // exception -- so the *blend term* alone is blind to a transpose in
+            // every non-corner channel. What still catches this mutation
+            // broadly is the fold's own `(1 - a)*(Cb - Cs)` term, nonzero
+            // wherever `Cb != Cs` at non-unit `a`, which is why the fixture's
+            // `0.5` opacity is load-bearing here rather than merely demanded.
+            // The fixture's red channel *is* the corner, so it sees the
+            // transpose in the blend term too -- a full `1.0` apart, the
+            // largest gap any roster fixture has. `TRANSPOSE_COVERAGE`'s
+            // arithmetic assertion (0.113.1) is what measures all of that.
+            aurora_render::BlendMode::HardMix => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_hard_mix_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::HardMix);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // The fifteenth ported mode (0.116.0), through the *same*
+            // mechanism as every arm above: one ping-pong swap, one spare
+            // accumulator, no new state.
+            //
+            // **The wrong-arm hazard here has two shapes pointing at different
+            // arms.** Lexically, `composite_hard_light_over_with_opacity`,
+            // `composite_linear_light_over_with_opacity` and
+            // `composite_vivid_light_over_with_opacity` are three live siblings
+            // whose names differ from this one by a word. Arithmetically, the
+            // arms at risk are `composite_darken_over_with_opacity` and
+            // `composite_lighten_over_with_opacity`, which share no word with
+            // this mode's name but *are* its two branches -- and which it
+            // **provably** agrees with in every backdrop-wins channel (`Darken`
+            // in the low branch, `Lighten` in the high one). So separating them
+            // needs a *source-derived* channel per branch, which
+            // `NORMAL_MULTIPLY_PIN_LIGHT_STACK` carries.
+            // Instrumented from its first round -- see `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real. **This mode's blend term is symmetric on exactly four
+            // classes** -- `Cb == Cs`, `|Cb - Cs| == 0.5`, an operand at `0`
+            // with the other `<= 0.5`, an operand at `1` with the other `> 0.5`
+            // -- verified exhaustively over a 129x129 rational grid with no
+            // members outside them, and the second of those is a hazard class no
+            // previously ported mode has. It is blind at `a = 0.5` only at
+            // `(0, 1)`/`(1, 0)`. The fixture avoids all five, so the transpose
+            // is caught in all three channels at both `0.5` and `1.0`, measured.
+            // `TRANSPOSE_COVERAGE`'s arithmetic assertion (0.113.1) is what
+            // measures that.
+            aurora_render::BlendMode::PinLight => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_pin_light_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::PinLight);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
+            // Unreachable through the real caller: `document_qualifies_
+            // for_gpu_compositing` admits only `Normal`, `Multiply`,
+            // `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
+            // `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`,
+            // `HardLight`, `LinearLight`, `VividLight`, `HardMix`,
+            // `PinLight`
+            // and `Dissolve` (which `resolve_tile` has already reduced to
+            // `Normal` by the time it gets here), and
+            // `recomposite_visible_tiles` checks it before calling this.
+            // If the two ever drift apart, bail to the CPU path rather
+            // than composite some other mode with the wrong formula --
+            // a silently wrong composite is the worse failure. Reachable
+            // by calling this function directly, which is what
+            // `begin_gpu_composite_tile_falls_back_for_an_inexpressible_
+            // blend_mode` does, so this arm is covered by a real test
+            // rather than only reasoned about.
+            other_mode => {
+                tracing::warn!(
+                    ?other_mode,
+                    "a blend mode the GPU composite path cannot express reached \
+                     begin_gpu_composite_tile -- falling back to the CPU path for this tile"
+                );
+                return None;
+            }
+        }
     }
 
-    let (dst_texture, _dst_view) = dst?;
+    // `?`: not one root layer resolved, so no accumulator was ever
+    // created and there is nothing to read back -- the caller falls this
+    // one tile back to the CPU path, which handles "no visible layers"
+    // as transparent black for free.
+    //
+    // **When this fires** (rewritten in 0.87.0): whenever no visible
+    // root layer has any *stored* content at this tile -- because the
+    // tree is entirely invisible or unreadable, or simply because this
+    // tile is one nobody has ever painted. Until 0.87.0 only the first
+    // of those reached here: a visible layer resolved at every tile
+    // coordinate, because the tile store answers an unpainted one with a
+    // blank tile rather than with absence, so a document with one
+    // visible layer never reached this line however far the viewport
+    // panned from that layer's painted pixels. `resolve_tile`'s own
+    // `contains_tile`/`is_blank` guards changed that. A tile written and
+    // then erased to full transparency is *not* one of these cases --
+    // that is stored content and composites for real. See the
+    // accumulators' own comment above and PLAN.md's M1.10 "Empty-tile
+    // GPU composite work".
+    //
+    // `encoder` is dropped here without `finish()`, so no command buffer
+    // reaches the queue. For *this* bail that means zero GPU work of any
+    // kind, since the loop never got as far as an upload either, where
+    // before 0.86.0 it had already submitted a clear pass no one would
+    // read. The inexpressible-blend-mode bail above is the weaker case:
+    // it likewise discards its recorded passes, but the
+    // `queue.write_texture` uploads it already issued are queue-level
+    // operations and are not undone -- see this function's own doc
+    // comment for the full accounting.
+    let (composite_texture, _view) = current?;
 
-    // `dst_texture` now holds this tile's finished composite in
-    // *premultiplied* alpha -- the fixed-function `AlphaBlending` fold
-    // onto a cleared, fully transparent target leaves exactly the state
+    // `composite_texture` -- whichever member of the pair the fold ended
+    // on -- now holds this tile's finished composite in *premultiplied*
+    // alpha. The fixed-function `AlphaBlending` fold onto a cleared,
+    // fully transparent target leaves exactly the state
     // `aurora_render::composite_layer_into` leaves on the CPU side (a
     // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
-    // not the straight (1.0, 1.0, 1.0, 0.5)). That is left as it is:
-    // `finish_tile_readback` straightens the decoded samples on the CPU,
-    // in the one shared `aurora_render::un_premultiply_in_place` the CPU
-    // path also goes through, rather than this function spending a
-    // second per-tile texture and an extra queue submission on a GPU
-    // pass to do the same division a different way.
-    Some(begin_tile_readback(device, queue, &dst_texture, tile_id))
+    // not the straight (1.0, 1.0, 1.0, 0.5)), and every blend-math
+    // `composite_*_over_with_opacity` method writes premultiplied texels
+    // too -- deliberately named as a family rather than enumerated here,
+    // since the list grows by one every time a mode is ported, exactly as
+    // `aurora-render`'s own `BlendPass` doc comment
+    // (`crates/aurora-render/src/composite.rs`) says of the same set, and
+    // for the same reason -- so a layer at any GPU-expressible mode in the
+    // stack does not change this. That
+    // is left as it is: `finish_tile_readback` straightens the decoded
+    // samples on the CPU, in the one shared
+    // `aurora_render::un_premultiply_in_place` the CPU path also goes
+    // through, rather than this function spending a second per-tile
+    // texture and an extra queue submission on a GPU pass to do the same
+    // division a different way.
+    //
+    // Recorded into the same encoder as everything above, then submitted
+    // with it: one `queue.submit` for this whole tile. The `map_async`
+    // that follows is deliberately *after* that submit -- see
+    // `map_pending_readback`'s own documented precondition for what
+    // mapping a buffer whose filling copy is still unsubmitted would
+    // silently do.
+    let readback = record_tile_readback(device, &mut encoder, &composite_texture);
+    queue.submit(std::iter::once(encoder.finish()));
+    note_gpu_composite_submit();
+    Some(map_pending_readback(readback, tile_id))
+}
+
+/// Whether two whole-tile texel buffers are bitwise identical — the
+/// predicate [`recomposite_visible_tiles`]' `write_composited` asks to
+/// decide whether a recomposited tile's bytes actually moved.
+///
+/// **Deliberately not `==`.** `-0.0 == 0.0` is `true` while the two have
+/// different bit patterns the GPU can distinguish, and `NaN != NaN` would
+/// report an unchanged tile as changed forever. Bitwise identity is the
+/// correct predicate for "the bytes an upload would produce are the bytes
+/// it already produced".
+///
+/// **Relation to the hand-written
+/// `zip(..).all(|(have, want)| have.to_bits() == want.to_bits())` loop this
+/// replaced (0.94.0).** Identical to it on equal-length inputs — verified
+/// exhaustively over the whole `f16` bit-pattern space, zero disagreements
+/// (Red-team, 0.94.1) — and deliberately *stricter* on unequal ones: `zip`
+/// stops at the shorter side, so the old loop answered `true` for two
+/// buffers where one is a truncated prefix of the other, where this answers
+/// `false`. 0.94.0's own "same predicate, cheaper spelling" overstated that
+/// by claiming exact equivalence. The difference is unreachable in practice
+/// rather than merely unlikely: `write_composited`'s own length guard runs
+/// *before* this call and returns early on a mismatch.
+///
+/// So this is an **implementation** change to a hot loop, not a change of
+/// meaning: `half::slice::HalfFloatSliceExt::reinterpret_cast` is a safe,
+/// zero-copy `&[u16]` view of the very same memory (no `unsafe` here, and
+/// no copy), and `[u16]` slice equality *is* element-wise `f16::to_bits`
+/// equality — with a length check and a `memcmp`-shaped comparison the
+/// compiler can vectorize, instead of a per-sample `to_bits` round trip.
+///
+/// A length mismatch therefore answers `false`. Callers must still treat a wrongly
+/// sized buffer as their own decision rather than reading `false` as
+/// "content changed" — `write_composited` has its own length guard ahead
+/// of this, and keeps it.
+#[must_use]
+fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
+    use half::slice::HalfFloatSliceExt as _;
+    have.reinterpret_cast() == want.reinterpret_cast()
 }
 
 /// Recomposites every tile in `residency`'s own currently-visible grid
@@ -6971,13 +10482,28 @@ fn begin_gpu_composite_tile(
 /// **GPU-accelerated for the common case, real now, not just a primitive
 /// sitting unwired**: when `gpu`/`compositor` are both `Some` *and*
 /// [`document_qualifies_for_gpu_compositing`] confirms the whole document
-/// is GPU-tractable (every visible root-level layer a `Normal`-blend
-/// [`aurora_doc::LayerKind::Pixel`] layer, no groups), each tile is
+/// is GPU-tractable (every visible root-level layer an
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the blend modes that
+/// predicate admits, no groups), each tile is
 /// composited via [`begin_gpu_composite_tile`]/[`finish_tile_readback`] —
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
-/// fixed-function blend unit, not the CPU loop — closing the exact gap
+/// fixed-function blend unit for `Normal`, and a real WGSL blend-math
+/// entry point per ported mode for the rest, not the CPU loop —
+/// closing the
+/// exact gap
 /// `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" finding named as
-/// the reason `aurora_render::TileCompositor` exists at all. A tile whose
+/// the reason `aurora_render::TileCompositor` exists at all.
+///
+/// **The admitted-mode list is deliberately not re-enumerated here.**
+/// [`document_qualifies_for_gpu_compositing`] carries the maintained one,
+/// mode by mode with the round each was ported in, and
+/// [`begin_gpu_composite_tile`]'s own `match` is the executable copy;
+/// this comment drifted a whole round behind that list twice (it still
+/// said four ported modes after `Difference` landed in 0.104.0 and
+/// `LinearDodge` in 0.105.0, corrected in 0.105.1), so it now points at
+/// the list instead of duplicating it.
+///
+/// A tile whose
 /// document doesn't qualify, or whose own GPU work fails
 /// ([`finish_tile_readback`]'s own `None`), or when `gpu`/`compositor`
 /// aren't available at all (`None`, e.g. no GPU device this session)
@@ -6985,11 +10511,19 @@ fn begin_gpu_composite_tile(
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// non-`Normal` blend modes and group isolation on the GPU (would need a
-/// full WGSL port of all 26 blend formulas, or per-group isolated GPU
-/// passes — separate, much bigger follow-on work), and export
-/// (`composite_document`, a one-shot operation, not latency-critical the
-/// way the live canvas is).
+/// the other **10** blend modes and group isolation on the GPU. That 10
+/// is the app-level count — 27 real `aurora_doc::BlendMode` variants
+/// minus the seventeen the predicate admits — and closing it would need the
+/// remaining **11** blend formulas ported to WGSL, which is
+/// `aurora-render`'s own count over its own 26-variant enum; the one
+/// mode between the two figures is `Normal`, which needs no formula
+/// because the fixed-function unit already expresses it, and `Dissolve`
+/// is in neither set because [`resolve_tile`] gates it to `Normal`
+/// before any GPU dispatch sees it. `TileCompositor`'s own doc comment
+/// is the maintained home of both numbers and of why they differ. Plus
+/// per-group isolated GPU passes; separate, much bigger follow-on work.
+/// And export (`composite_document`, a one-shot operation, not
+/// latency-critical the way the live canvas is).
 ///
 /// **Batched in three phases, one blocking wait per frame instead of one
 /// per tile**: this used to call a single `gpu_composite_tile` helper per
@@ -7008,8 +10542,9 @@ fn begin_gpu_composite_tile(
 /// pending tile's result ([`finish_tile_readback`], whose own `rx.recv()`
 /// now returns immediately since the single poll above already resolved
 /// it). A tile that doesn't qualify for the GPU path at all — a
-/// disqualified document, no GPU/compositor this session, or a tile with
-/// no visible layers of its own — is composited via the CPU path
+/// disqualified document, no GPU/compositor this session, or a tile no
+/// visible layer has any stored content at (0.87.0; before that, a tile
+/// with no visible layers at all) — is composited via the CPU path
 /// immediately, inline in the same first pass, since the CPU path never
 /// blocks on the GPU and so has nothing to batch; only genuinely
 /// GPU-issued tiles wait for the one shared poll. **What this changes and
@@ -7044,6 +10579,15 @@ fn recomposite_visible_tiles(
     gpu: Option<&aurora_gpu::GpuContext>,
     mut compositor: Option<&mut aurora_render::TileCompositor>,
 ) {
+    // Test-only, no-op in the shipping build (see `RecompositePhases`).
+    let mut phases = RecompositePhases::start();
+    // Started in the same breath as `phases`, so the five per-branch
+    // sub-costs partition exactly the window `phases`' first `mark` below
+    // measures and the reconciliation in `report_recomposite_tile_costs`
+    // is against the same interval. Also test-only, also a no-op in the
+    // shipping build (see `RecompositeTileCosts`).
+    let mut tile_costs = RecompositeTileCosts::start();
+
     // The tile grid `residency.visible_tiles()` walks is anchored to the
     // *active* layer's own origin (`canvas_local_origin`'s own doc
     // comment) — every other layer's own document-space tile boundaries
@@ -7090,10 +10634,89 @@ fn recomposite_visible_tiles(
     // of checking a length itself rather than trusting one. Skipping
     // leaves the tile un-cached, exactly as a `get_mut` failure does, so
     // a later redraw retries it.
+    //
+    // # Skipping the write when nothing changed (0.90.0)
+    //
+    // Most tiles of most frames recomposite to *exactly* the result
+    // already stored -- very often an all-transparent one, since the
+    // visible grid extends well past whatever the user has painted. Both
+    // the `copy_from_slice` and, far more expensively, the `mark_dirty`
+    // that follows it are then pure waste: the dirty flag is what makes
+    // `aurora_gpu::TileResidency::sync` serialize the tile through its
+    // `f16 -> premultiply -> le_bytes` loop and hand ~512 KB to
+    // `queue.write_texture`. So this removes work rather than speeding it
+    // up. `cache.mark_current` still happens on both branches: whether
+    // the bytes moved has nothing to do with whether the tile is now
+    // computed for this invalidation generation.
+    //
+    // **The residency guard is a correctness requirement, not a
+    // heuristic.** A bare byte-equality test is unsound, in two real and
+    // reachable ways, both of which share one root cause: an equal
+    // comparison only proves the atlas is current *if* the tile in hand
+    // is the same in-memory `Tile` that the last upload read.
+    //
+    // 1. `replace_document_pixels` calls
+    //    `store.forget_surface(composite_surface_id())` on every document
+    //    open, so the next `get_mut` here materializes a brand-new
+    //    `Tile::blank()`. A new document whose composite at that tile is
+    //    transparent compares equal to that blank -- while the GPU atlas
+    //    still holds the *previous* document's pixels for the same tile
+    //    id. Skipping would leave them on screen.
+    // 2. **Closed in 0.91.0.** `Tile::from_texels`, which is how a tile
+    //    paged out to the scratch disk comes back, always starts
+    //    `dirty: None`, so dirty -> evicted -> paged back in used to lose
+    //    the flag entirely. `TileStore` now records a key that was dirty
+    //    when its own eviction took it out of memory and re-marks it on
+    //    the way back in (`TileStore::is_dirty`'s own doc comment has the
+    //    mechanism), so **this case no longer needs the guard** -- an
+    //    evicted-and-reinstated composite tile reports dirty on its own.
+    //
+    // **Case 1 is what keeps the guard.** No dirty-flag mechanism can see
+    // it: a tile materialized blank after a `forget_surface` genuinely has
+    // nothing owed on it, and the mismatch is entirely between the atlas
+    // and a surface that was discarded out from under it.
+    // `TileStore::is_resident` is exactly the "same in-memory `Tile`
+    // throughout" condition, and it is asked *before* `get_mut`, which
+    // would otherwise page the tile in (or materialize it blank) and make
+    // every tile look resident. `contains_tile` would not do: it is also
+    // `true` for a paged-out tile, which is a tile this must still be able
+    // to distinguish.
+    //
+    // **The guard is only sound because this is the composite surface's
+    // sole materializer (0.90.1).** `is_resident` is `true` for a tile
+    // that some *other* caller materialized blank, so a second reader of
+    // `composite_surface_id()` reaching it through `TileStore::get`
+    // reintroduces case 1 wholesale: open a document (`forget_surface`),
+    // let an Eyedropper pick be handled before the next redraw (`rfd`'s
+    // dialog blocks the UI thread and redraws are only requested from
+    // `about_to_wait`, so a press queued during the dialog is; and
+    // `begin_drag` samples on a *fresh* press, no surviving drag needed),
+    // and that one tile is resident-blank -- whereupon this skips and the
+    // atlas keeps the previous document's pixels there. 0.90.0 shipped
+    // that as a disclosed residual and it was then reproduced end to end
+    // against a real atlas readback. It is closed in `sample_pixel`, the
+    // only such reader, by asking `contains_tile` before `get`; see that
+    // function's own doc comment. **So: a new reader of
+    // `composite_surface_id()` must not use `TileStore::get` without the
+    // same gate.** 0.91.0's dirty-across-eviction fix does *not* retire
+    // this requirement -- it closes case 2, and this is case 1, whose
+    // mismatch is between the atlas and a surface that was discarded, with
+    // no owed upload anywhere for a dirty flag to carry. Retiring the
+    // guard would mean something else entirely: a per-surface generation
+    // the atlas records alongside each slot, so a `forget_surface` could
+    // invalidate the slots itself (PLAN.md, M1.10).
+    //
+    // The comparison itself is `tiles_are_bitwise_identical` -- bitwise,
+    // deliberately not `==`; see that function's own doc comment for why,
+    // and for why 0.94.0's faster spelling of it is an implementation
+    // change rather than a weaker predicate.
     let write_composited = |store: &mut aurora_tile::TileStore,
                             cache: &mut CompositeCache,
                             tile_id: aurora_tile::TileId,
                             composited: &[half::f16]| {
+        // Asked *before* `get_mut`, which pages the tile in (or
+        // materializes it blank) and would make every tile look resident.
+        let was_resident = store.is_resident(composite_surface_id(), tile_id);
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
             return;
         };
@@ -7106,10 +10729,22 @@ fn recomposite_visible_tiles(
             );
             return;
         }
-        dest.texels_mut().copy_from_slice(composited);
-        dest.mark_dirty(full_tile);
+        let unchanged = was_resident && tiles_are_bitwise_identical(dest.texels(), composited);
+        if unchanged {
+            note_composite_write_skipped();
+        } else {
+            dest.texels_mut().copy_from_slice(composited);
+            dest.mark_dirty(full_tile);
+            if was_resident {
+                note_composite_write_changed();
+            } else {
+                note_composite_write_not_resident();
+            }
+        }
         cache.mark_current(tile_id);
     };
+    // Returns `composite_roots_into_tile`'s own `(texels, roots folded)`
+    // pair unchanged; phase 3's caller below discards the count.
     let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
                                    store: &mut aurora_tile::TileStore,
                                    tile_id: aurora_tile::TileId,
@@ -7120,10 +10755,19 @@ fn recomposite_visible_tiles(
     };
 
     // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
-    // work (clear + per-layer blend + readback submit/map_async), with
-    // no blocking wait yet. A tile with nothing to batch -- the document
+    // work (clear + per-layer blend + readback copy), with
+    // no blocking wait yet. As of 0.86.0 each such tile costs exactly
+    // **one** `queue.submit` -- `begin_gpu_composite_tile` records all of
+    // that into a single command encoder -- where it used to cost one
+    // per pass. That is strictly a per-*tile* change: this loop still
+    // issues one submit per qualifying tile, and phase 2's single
+    // per-frame `device.poll` below is untouched. Folding several tiles
+    // into one command buffer is separate, deliberately unattempted work.
+    // A tile with nothing to batch -- the document
     // doesn't qualify, `gpu`/`compositor` aren't available this session,
-    // or this specific tile has no visible layers at all -- is
+    // or no visible layer has ever stored a pixel at this specific tile
+    // (0.87.0; that last case used to require the layers themselves to be
+    // invisible) -- is
     // composited on the CPU path immediately, right here, since that
     // path never blocks on the GPU.
     let mut pending_gpu: Vec<PendingGpuReadback> = Vec::new();
@@ -7132,11 +10776,37 @@ fn recomposite_visible_tiles(
     // reported" flag deliberately is not, so a malformed document warns
     // once per pass rather than once per invalidated tile per frame.
     let mut budget = CompositeBudget::for_pass(layers);
+    // All three conditions are loop-invariant, so this is computed once
+    // rather than per tile. Diagnostic use only (`RecompositeTileCosts`),
+    // deliberately *not* substituted into the `issued` block below: it is
+    // what distinguishes "never entered the GPU arm at all" -- the whole
+    // CPU-fallback benchmark -- from "entered, the GPU declined, fell
+    // through to the CPU", which is 0.87.1's disclosed double root walk.
+    //
+    // This line, and the per-tile `issued.is_some()` handed to
+    // `mark_gpu_issue` below, are **not** behind `cfg(test)`: they are
+    // computed in every build and passed to a `cfg(not(test))` no-op that
+    // discards them. No shipping-build *behaviour* changes either way, and
+    // an optimized release build drops them entirely (checked at 0.93.0 --
+    // `nm`/`strings` on the release binary reference no new symbol). An
+    // unoptimized debug build (`cargo run -p aurora-app` with no
+    // `--release`) does keep them: two cheap boolean reads once per pass
+    // and one `Option::is_some` per tile, trivially negligible against a
+    // loop that composites 256x256 tiles -- stated rather than implied,
+    // since "the shipping build is unaffected" is only true of the profile
+    // Aurora actually ships.
+    let gpu_arm_reachable = gpu_qualifies && gpu.is_some() && compositor.is_some();
     for tile_id in residency.visible_tiles() {
         if cache.is_current(tile_id) {
             continue;
         }
         let doc_origin = doc_origin_for(tile_id);
+        // Credits this iteration's loop overhead so far -- including any
+        // `is_current` skips walked to get here -- to the `other` slot,
+        // and counts one tile as having entered the loop body, which is
+        // what `RecompositeTileCosts::finish` reconciles the classifying
+        // marks below against.
+        tile_costs.begin_tile();
 
         let issued = if gpu_qualifies {
             match (gpu, compositor.as_deref_mut()) {
@@ -7158,15 +10828,53 @@ fn recomposite_visible_tiles(
         } else {
             None
         };
+        tile_costs.mark_gpu_issue(gpu_arm_reachable, issued.is_some());
 
         if let Some(pending) = issued {
             pending_gpu.push(pending);
         } else {
-            let composited =
+            // **A blank tile of a GPU-qualifying document resolves its
+            // whole root stack twice** (disclosed 0.87.1, accepted as a
+            // residual). `begin_gpu_composite_tile` above walks every
+            // root, has each one bail in `resolve_tile`, creates no
+            // accumulator and returns `None` -- indistinguishable here
+            // from "the GPU path declined for some other reason" -- so
+            // this fallback walks the same roots again. `budget.next_tile`
+            // (called on both paths, see the comment above) just resets
+            // its per-tile counter, so calling it twice is idempotent, not
+            // a double charge -- the real cost is the duplicated CPU-side
+            // root walk itself.
+            //
+            // Cheap in absolute terms after 0.87.0 (each of those
+            // resolves is now three hash lookups, not a tile
+            // materialization), but it is a real new steady-state cost
+            // on exactly the path 0.87.0 exists to make cheap, so it is
+            // stated rather than left implicit. Fixing it properly means
+            // giving `begin_gpu_composite_tile` a return type that
+            // separates "nothing resolved, and the tile is genuinely
+            // empty" from "bailed, fall back" -- a larger change than
+            // this correction round should carry. See PLAN.md, M1.10,
+            // "Empty-tile GPU composite work".
+            //
+            // As of 0.93.0 that cost is measured on its own, as
+            // `RECOMPOSITE_TILE_COST_NANOS`'s `gpu_issue_declined` slot,
+            // rather than folded anonymously into phase 1's single number.
+            // **And it turned out to be small**: 0.03 ms of the GPU-path
+            // benchmark's ~10.7 ms phase 1, with an independent
+            // hand-split putting the walk itself at ~0.24 ms. So the
+            // double walk is a real, still-open residual, but it is not
+            // where phase 1's time goes -- see PLAN.md, M1.10, 0.93.1.
+            let (composited, folded) =
                 composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
             write_composited(store, cache, tile_id, &composited);
+            tile_costs.mark_cpu_fallback(folded);
         }
     }
+    // The loop's trailing overhead, credited before phase 1 formally
+    // closes so the five sub-costs still partition phase 1's own mark,
+    // and the point where the per-tile mark balance is reconciled.
+    tile_costs.finish();
+    phases.mark();
 
     // Phase 2: one poll for the whole frame -- drives every pending
     // tile's `map_async` callback to completion in a single blocking
@@ -7177,6 +10885,7 @@ fn recomposite_visible_tiles(
             timeout: None,
         });
     }
+    phases.mark();
 
     // Phase 3: drain every pending tile's result. `rx.recv()` inside
     // `finish_tile_readback` returns immediately here, since phase 2's
@@ -7190,10 +10899,13 @@ fn recomposite_visible_tiles(
             texels
         } else {
             let doc_origin = doc_origin_for(tile_id);
-            composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget)
+            // Phase 3, not phase 1: nothing here is credited to any of the
+            // five phase-1 sub-costs, so the fold count is discarded.
+            composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget).0
         };
         write_composited(store, cache, tile_id, &composited);
     }
+    phases.mark();
 }
 
 /// Which composite `aurora_tile::TileId`s [`recomposite_visible_tiles`]
@@ -7251,13 +10963,22 @@ fn recomposite_visible_tiles(
 /// currently cached tile at once, not just the one(s) the triggering
 /// edit actually touched. `aurora_tile::TileStore`'s own per-tile dirty
 /// flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are deliberately
-/// *not* reused for either kind of invalidation here: they only track
-/// resident tiles, so a tile dirtied by an edit and then evicted before
-/// a redraw ever consumes its flag would silently stop being reported
-/// dirty at all — a real correctness risk (a stale composite shown as
-/// current) both `bump` and `invalidate` avoid by acting synchronously,
-/// from data the caller already has in hand, rather than by querying
-/// tile-store state later.
+/// *not* reused for either kind of invalidation here, and the reason is
+/// **not** that they are lossy — since 0.91.0 they survive eviction
+/// (`TileStore::is_dirty`), with one narrow exception worth stating rather
+/// than glossing: a `sync` whose page-in *fails* has already consumed the
+/// record, and what gets that tile re-uploaded on a later frame is
+/// `TileResidency::sync` dropping the atlas slot's mapping, not the dirty
+/// flag surviving (0.91.1). It is that they answer a different question.
+/// A tile's dirty flag means "this tile's bytes have changed since the
+/// last GPU upload read them"; what this cache tracks is "this tile still
+/// needs recompositing *from the document*", which no amount of tile-store
+/// state can know — a layer's opacity changing dirties no tile at all
+/// until something recomposites. The two are also consumed by different
+/// owners: `aurora_gpu::TileResidency::sync` takes the dirty flag, so a
+/// cache reading it would be racing that consumer for the same bit. Acting
+/// synchronously, from data the caller already has in hand, is what keeps
+/// the two independent.
 ///
 /// `current` only ever grows within a session between bumps — a tile
 /// computed once is never individually evicted, even once panned away
@@ -7338,7 +11059,7 @@ impl CompositeCache {
         self.invalidate_doc_rects(std::slice::from_ref(&rect), reference_origin);
     }
 
-    /// [`Self::invalidate_doc_rect`] for a whole set of regions at once,
+    /// `Self::invalidate_doc_rect` for a whole set of regions at once,
     /// in **one** pass over the cache — every rule that method documents
     /// applies unchanged, `reference_origin` requirement included.
     ///
@@ -7597,6 +11318,19 @@ enum WindowKind {
     /// [`Self::LayerPixels`] does. It is a real behaviour change from
     /// before mask pixels existed (a mask could not fail to read at
     /// all then), stated here rather than left to be discovered.
+    ///
+    /// **One exception, deliberate** (0.87.0, disclosed in 0.87.1):
+    /// [`resolve_tile`] now returns before [`apply_mask`] is ever
+    /// reached for a layer with nothing *stored* at the tile being
+    /// composited, so that layer's mask is not read there and an
+    /// unreadable mask tile under an unpainted region charges nothing
+    /// and forces no export refusal. The refusal above is therefore
+    /// "wherever the mask is actually consulted", not literally every
+    /// tile the mask surface spans. Accepted rather than worked around:
+    /// a layer with no stored pixels at that tile contributes nothing to
+    /// the export either way, masked or not, so no output is degraded by
+    /// letting the export proceed — which is the harm the refusal exists
+    /// to prevent.
     MaskCoverage,
 }
 
@@ -8015,7 +11749,10 @@ fn composite_document(
                 // `(0, 0)` as the reference origin: an export always
                 // measures from the document's own origin, unlike the
                 // on-screen path, which measures from the viewport.
-                let composited = composite_roots_into_tile(
+                // The fold count is only of interest to
+                // `recomposite_visible_tiles`'s own diagnostic split; an
+                // export composites every tile either way.
+                let (composited, _folded) = composite_roots_into_tile(
                     layers,
                     store,
                     tile_id,
@@ -8151,10 +11888,24 @@ fn press_layer_row(
 
 /// Selects `layer_id` as the active layer: sets `*active_layer`, marks
 /// its own Layers-panel row (`layer_rows` —
-/// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
-/// selected (`accesskit::Node::set_selected`), clearing that state from
-/// every other row, and re-establishes `view`'s own pan bound against
-/// the newly active layer ([`clamp_pan_to_active_layer`]). Pushing the
+/// `aurora_ui::populate_layers_panel`'s own return value) selected via
+/// `aurora_widgets::widgets::set_tree_item_selected`, clearing that
+/// state from every other row, and re-establishes `view`'s own pan bound
+/// against
+/// the newly active layer ([`clamp_pan_to_active_layer`]).
+///
+/// **Through the widget's own setter, not `accesskit::Node::set_selected`
+/// on the row's node.** Since 0.77.0 those rows are real
+/// `aurora_widgets::widgets::TreeItem`s, and a hand-written node loses
+/// three separate things: `aurora_widgets::paint_widget` reads
+/// `TreeItemState::selected` to decide whether to draw the highlight at
+/// all (so the selection would be announced and never painted), the next
+/// `refresh_node` any other row mutator triggers would rebuild the node
+/// from that untouched state and silently revert the announcement too,
+/// and `WidgetTree::set_accessibility` alone never widens the tree-wide
+/// damage region, so even a correct highlight would not repaint.
+///
+/// Pushing the
 /// updated accessibility tree to the platform is still the caller's job
 /// (`App::push_accessibility`), the same "pure dispatch, caller owns the
 /// one real platform side-effect" split every other function in this
@@ -8180,12 +11931,15 @@ fn select_layer(
     let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
     for (&row, &id) in layer_rows {
-        let Some(node) = workspace.tree.accessibility(row) else {
-            continue;
-        };
-        let mut node = node.clone();
-        node.set_selected(id == layer_id);
-        if let Err(err) = workspace.tree.set_accessibility(row, node) {
+        // `warn!`, not `?`: this function returns `()`, and a row that
+        // has somehow gone missing must not take the rest of the
+        // selection with it -- nor become a panic, which this workspace
+        // denies outright.
+        if let Err(err) = aurora_widgets::widgets::set_tree_item_selected(
+            &mut workspace.tree,
+            row,
+            id == layer_id,
+        ) {
             tracing::warn!(?err, "failed to update a layer row's selection state");
         }
     }
@@ -8654,8 +12408,45 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
 /// needs to pick a real, already-painted colour. `None` for a negative
 /// coordinate (`TileId`'s own fields are unsigned, so there is no tile
 /// there — the same "outside the surface" case
-/// [`aurora_gpu::TileResidency::set_origin`]'s own doc comment names) or
-/// if paging the touched tile in fails.
+/// [`aurora_gpu::TileResidency::set_origin`]'s own doc comment names),
+/// if the touched tile was never written at all, or if paging it in
+/// fails.
+///
+/// # Why the `contains_tile` gate is a correctness requirement (0.90.1)
+///
+/// [`aurora_tile::TileStore::get`] *materializes* a never-written tile:
+/// it hands back a brand-new `Tile::blank()` and makes it resident. For
+/// this function's own answer that is merely wasteful — a blank reads
+/// back as fully transparent, which is the same "nothing to pick"
+/// [`eyedropper_sample`] already turns into `None` for `a == 0.0`. For
+/// the *composite* surface it was a live stale-pixel bug, reproduced
+/// end to end against a real GPU atlas:
+///
+/// `replace_document_pixels` calls
+/// `store.forget_surface(composite_surface_id())` on every document
+/// open, so no composite tile is resident afterwards. `rfd`'s file
+/// dialog blocks the UI thread while it is open and a redraw is only
+/// requested from `about_to_wait`, so a primary-button press queued
+/// during the dialog is handled *before* the next redraw — and on the
+/// Eyedropper tool `begin_drag` samples immediately, on a fresh press,
+/// with no surviving drag needed. That one `get` then leaves a
+/// resident-blank composite tile behind. When the new document
+/// recomposites transparent at the same tile, `write_composited`'s
+/// residency-guarded byte comparison finds "resident and byte-identical"
+/// and skips the dirty mark — so `aurora_gpu::TileResidency::sync` never
+/// re-uploads it and the atlas keeps showing the *previous* document's
+/// pixels there until something else happens to re-dirty that tile.
+/// (Panning does not: `TileResidency::set_origin` never touches its slot
+/// bookkeeping, and slot addressing is `id % grid`, independent of
+/// origin.)
+///
+/// Asking first closes that: this is the only non-test reader of
+/// [`composite_surface_id`] outside `write_composited`, so with the gate
+/// in place `write_composited` is the sole materializer of that surface
+/// and its residency guard's "resident implies the bytes an upload read"
+/// inference holds again. See also
+/// [`aurora_tile::TileStore::is_resident`]'s own doc comment, which
+/// records that residency alone cannot carry that guarantee.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 // x/y/r/g/b/a are the clearest names for "one pixel coordinate, one
@@ -8675,6 +12466,12 @@ fn sample_pixel(
         x: px / aurora_tile::TILE,
         y: py / aurora_tile::TILE,
     };
+    // Asked *before* `get`, which would materialize a blank tile and make
+    // it resident -- see this function's own doc comment for why that is a
+    // correctness problem for the composite surface and not just waste.
+    if !store.contains_tile(surface, tile_id) {
+        return None;
+    }
     let tile = store.get(surface, tile_id).ok()?;
     let (lx, ly) = (px % aurora_tile::TILE, py % aurora_tile::TILE);
     let index = (ly * aurora_tile::TILE + lx) as usize * aurora_tile::CHANNELS;
@@ -8697,8 +12494,12 @@ fn sample_pixel(
 /// layer's own surface), then reads the already-composited RGB back via
 /// [`sample_pixel`]. `None` — "nothing to pick" — for a fully
 /// transparent texel (no visible layer painted there) exactly as before,
-/// and for the same out-of-bounds/paging-failure cases [`sample_pixel`]
-/// itself already returns `None` for.
+/// and for the same out-of-bounds, never-composited, and paging-failure
+/// cases [`sample_pixel`] itself already returns `None` for. The
+/// never-composited case reaches the same answer a materialized blank
+/// would have (transparent, so nothing to pick) without materializing
+/// one — which is a correctness requirement, not a saving; see
+/// [`sample_pixel`]'s own doc comment.
 #[must_use]
 fn eyedropper_sample(
     store: &mut aurora_tile::TileStore,
@@ -9268,7 +13069,7 @@ struct App {
     ///
     /// **One slot, deliberately.** A modal alert blocks everything else
     /// ([`handle_key`]'s own routing order, and — since 0.68.2 —
-    /// [`App::handle_menu_event`]'s), so a second one could never be
+    /// `App::handle_menu_event`'s), so a second one could never be
     /// interacted with anyway; [`open_dialog`]'s own "already open is a
     /// no-op" guard is what makes that concrete. **Three callers open
     /// one today**: crash recovery at construction, if
@@ -9333,8 +13134,8 @@ struct App {
     /// The live document's own layer structure — built once in
     /// [`App::new`] (from [`demo_document`] or a recovered autosave) and
     /// kept alive from then on. This is what [`Self::active_layer`]/
-    /// [`LayerTree::surface_id`] read to find somewhere for the Brush
-    /// tool to actually paint.
+    /// [`aurora_doc::LayerTree::surface_id`] read to find somewhere for
+    /// the Brush tool to actually paint.
     layers: aurora_doc::LayerTree,
     /// The document's own real, independent canvas size — `(width,
     /// height)`, in document-space pixels. **Not** derived from any
@@ -9420,10 +13221,17 @@ struct App {
     /// at construction time ([`topmost_pixel_layer`]), real-time-
     /// changeable now by clicking a row in the Layers panel
     /// ([`Self::layer_rows`], [`Self::handle_pointer_pressed`]). `None`
-    /// for a document with no pixel layer at all, or once one is
-    /// clicked that turns out to be a group (groups are never inserted
-    /// into `layer_rows` at all, so this can't actually happen via a
-    /// click — only via never having a pixel layer to begin with).
+    /// for a document with no pixel layer at all.
+    ///
+    /// **This can hold a group's `LayerId`, not just a pixel layer's.**
+    /// `layer_rows` maps every row `populate_layers_panel` inserts,
+    /// group rows included (`aurora_ui::layers_panel::insert_layer_row`
+    /// inserts unconditionally), and [`select_layer`] sets `*active_layer`
+    /// from whichever row was clicked with no `LayerKind` check. A caller
+    /// reading this field for anything pixel-specific (paint/erase
+    /// targets, the Move tool) must itself confirm the kind rather than
+    /// assume it, the same way [`topmost_pixel_layer`] already does at
+    /// construction time.
     ///
     /// **The canvas pan boundary is a function of this field, of this
     /// layer's own `bounds`, and of the canvas area's own size.** The
@@ -9667,9 +13475,12 @@ impl App {
                 unreachable!("workspace.layers was just built by build_workspace above: {err:?}")
             }
         };
-        if let Err(err) =
-            aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)
-        {
+        if let Err(err) = aurora_ui::populate_history_panel(
+            &mut workspace.tree,
+            workspace.history,
+            &scales,
+            &history,
+        ) {
             unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
         // Seeded from the tool this session actually starts with
@@ -9680,6 +13491,7 @@ impl App {
         if let Err(err) = aurora_ui::populate_properties_panel(
             &mut workspace.tree,
             workspace.properties,
+            &scales,
             aurora_ui::Tool::default(),
             &tool_options(aurora_ui::Tool::default()),
         ) {
@@ -9952,6 +13764,15 @@ impl App {
     /// session defaults — a newly opened document has no relationship
     /// to whatever pan/zoom/selection/in-progress-drag the *previous*
     /// one had.
+    ///
+    /// The *previous* document's tiles are freed from the shared store
+    /// before the new one's pixels are written, in that order and not
+    /// the other ([`replace_document_pixels`], which owns the full
+    /// argument): both documents' surface ids derive from `LayerId`s
+    /// that restart at zero, so they alias — sweeping afterwards would
+    /// delete the document just opened, and not sweeping at all left
+    /// the previous document's pixels to be composited onto a smaller
+    /// new one and persisted into this very call's own autosave.
     fn open_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.open_aur_file(path);
@@ -9988,15 +13809,34 @@ impl App {
         // here, rather than derived back out of the one layer just
         // built from it (`document_canvas_size`'s own fallback role).
         let canvas_size = (image.width(), image.height());
+
+        // Every fallible step is behind us: nothing below this line can
+        // still bail out, so this is the point at which the incoming
+        // document becomes *the* document. The swap hands back the
+        // outgoing tree/history by value, which is exactly what
+        // `replace_document_pixels` needs to sweep them -- and taking
+        // them out of `self` in the same statement that installs the
+        // new ones is what makes it impossible to sweep a document that
+        // is still live. Do not introduce a fallible step between here
+        // and the sweep/write below.
+        let outgoing_layers = std::mem::replace(&mut self.layers, layers);
+        let outgoing_history = std::mem::replace(&mut self.history, history);
+
         if let Some(store) = self.tile_store.as_mut() {
-            if let Some(surface) = layers.surface_id(layer_id)
-                && let Err(err) = aurora_io::write_into_store(&image, store, surface)
-            {
-                tracing::warn!(
-                    ?err,
-                    "failed to write the opened image's pixels into the tile store"
-                );
-            }
+            // Sweep, *then* write -- see `replace_document_pixels` for
+            // why that order is forced and what the other one costs.
+            let freed = replace_document_pixels(
+                store,
+                outgoing_layers,
+                outgoing_history,
+                &self.layers,
+                layer_id,
+                &image,
+            );
+            tracing::debug!(
+                freed_tiles = freed,
+                "freed the previous document's tiles before writing the opened image's"
+            );
             // After the pixels land in the store, not before: the
             // autosave container carries this document's real tiles now,
             // so writing it first would persist an empty one.
@@ -10010,13 +13850,18 @@ impl App {
             self.skipped_tiles = aurora_io::SkippedTiles::new();
             write_autosave(
                 &autosave_path(),
-                &layers,
-                &history,
+                &self.layers,
+                &self.history,
                 canvas_size,
                 &mut self.skipped_tiles,
                 store,
             );
         } else {
+            // Nothing to free beyond the in-memory structure itself:
+            // with no live tile store there is no surface anything
+            // could still be holding tiles under, so dropping the
+            // outgoing tree/history here *is* the whole cleanup.
+            drop((outgoing_layers, outgoing_history));
             tracing::warn!("no live tile store; skipping the opened document's autosave");
             // `self.skipped_tiles` keeps whatever the *previous* document
             // carried -- harmlessly stale, not wrong: with no live store,
@@ -10025,12 +13870,11 @@ impl App {
             // different document can never reach a file on disk.
         }
 
-        self.layers = layers;
         self.canvas_size = canvas_size;
-        self.history = history;
         // A freshly opened document has no relationship to the previous
-        // one's own undo state either -- `self.history` above is a
-        // brand-new, empty `History` (not merged with the old one), so
+        // one's own undo state either -- the `std::mem::replace` above
+        // installed a brand-new, empty `History` (not merged with the
+        // old one, which was swept and dropped instead), so
         // keeping the old `pixel_history`/`undo_order` around would let
         // Ctrl+Z reach into a document that's no longer open, and
         // `undo_order` would already be desynced from `history`'s own
@@ -10075,6 +13919,18 @@ impl App {
     /// (logged) if there's no live tile store, the file fails to open,
     /// or `read_aur` itself fails (corrupt file, missing manifest/
     /// history entry, or an unsupported future schema version).
+    ///
+    /// **Unlike [`Self::open_file`], this deliberately does not sweep
+    /// the outgoing document** — no [`replace_document_pixels`], no
+    /// `aurora_doc::forget_document_surfaces` — because `read_aur` has
+    /// already filled the store by the time this holds a tree it could
+    /// sweep against. So the outgoing document's tiles leak here, and
+    /// residue outside the incoming document's own persisted grids can
+    /// still show through. What is *not* left is residue *inside* those
+    /// grids: `aurora_io`'s reader clears every grid position the file
+    /// elided as blank (0.82.1). PLAN.md's 0.82.1 addendum has the full
+    /// account, including why closing the rest needs an architectural
+    /// change rather than a patch here.
     fn open_aur_file(&mut self, path: &Path) {
         let Some(store) = self.tile_store.as_mut() else {
             tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
@@ -11601,6 +15457,26 @@ fn draw_widget_paints<'pass>(
 #[cfg(target_os = "macos")]
 const MUDA_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// A floor on the real window's logical size, independent of anything a
+/// dialog or panel does on its own. Engineering defaults, not design
+/// tokens — the same "no dedicated token exists, use a justified literal"
+/// call `docs/taffy-behaviors.md` and `command_palette_style` already make
+/// for this class of value.
+///
+/// This is the guard the dialog-overlay round (`0.77.6`/`0.77.7`) named but
+/// didn't add: below roughly 34 logical px of window height, an open
+/// dialog's own action button falls outside `workspace.root`'s bounds and
+/// stops being hit-testable, while `handle_dialog_pointer` still swallows
+/// every click — the app going mouse-dead with only `Escape`/`Enter` left.
+/// `RAIL_MIN_WIDTH` (`aurora_ui::workspace`, 150px) is the closest existing
+/// precedent for "the rail alone needs at least this much"; `MIN_WINDOW_WIDTH`
+/// leaves real room for the canvas and divider beside it, and
+/// `MIN_WINDOW_HEIGHT` sits an order of magnitude above the dialog
+/// threshold rather than merely above it, so ordinary DPI/scale rounding
+/// can't erode the margin back down to the reachable-but-uncomfortable range.
+const MIN_WINDOW_WIDTH: f64 = 640.0;
+const MIN_WINDOW_HEIGHT: f64 = 480.0;
+
 impl ApplicationHandler<accesskit_winit::Event> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -11614,7 +15490,11 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         let attrs = Window::default_attributes()
             .with_title("Aurora")
             .with_visible(false)
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                MIN_WINDOW_WIDTH,
+                MIN_WINDOW_HEIGHT,
+            ));
         let window = match el.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -11986,37 +15866,43 @@ mod tests {
         ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
-        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
-        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
-        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
-        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
-        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
-        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
-        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
-        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
+        COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
+        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
+        Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
+        GpuBlendDispatch, GpuBlendDispatches, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS, RECOMPOSITE_MARK_IMBALANCE,
+        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
+        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -12026,10 +15912,75 @@ mod tests {
     #[cfg(unix)]
     use super::create_dir_owner_only;
     use aurora_doc::SelectionSet;
+    use aurora_theme::{Palette, ThemeSet};
     use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
+
+    /// The blend mode every fixture uses when what it needs is "a mode
+    /// `document_qualifies_for_gpu_compositing` still rejects" — not
+    /// `Screen` specifically.
+    ///
+    /// **Why this const exists at all** (0.102.0). Six fixtures below used
+    /// `aurora_doc::BlendMode::Screen` purely as a stand-in for "not
+    /// GPU-expressible", each written when `Screen` happened to be on the
+    /// rejected side of the predicate. Porting `Screen` to the GPU path
+    /// broke all six loudly (their own `assert!(!document_qualifies_for_
+    /// gpu_compositing(...))` setup asserts fired), and two of them are
+    /// PLAN.md-tracked *performance benchmarks* whose whole subject is the
+    /// CPU fallback path — those would have gone on "passing" while
+    /// silently measuring the GPU path instead, which is the worse
+    /// failure. Naming the intent once means the next ported mode moves
+    /// this one line rather than re-auditing every fixture.
+    ///
+    /// **Why `Exclusion` specifically.** It is separable and branch-free
+    /// (`cb + cs - 2*cb*cs`, arithmetically the nearest neighbour of
+    /// `Screen`'s own `cb + cs - cb*cs`), so a fixture retargeted onto it
+    /// exercises the same *kind* of CPU formula it exercised before; and
+    /// it has both a real `aurora_render::blend_channel` arm and a real
+    /// `translate_blend_mode` mapping, so it is a *genuinely rejected*
+    /// mode rather than an unimplemented one that would degrade to
+    /// `Normal` at the translation boundary and quietly change what the
+    /// fixture composites.
+    ///
+    /// `a_single_layer_at_the_cpu_only_blend_mode_does_not_qualify_for_gpu_compositing`
+    /// is what keeps the choice honest: if a later round ports
+    /// `Exclusion` too, that test fails and this const has to move, rather
+    /// than every fixture that leans on it silently changing meaning.
+    const CPU_ONLY_BLEND_MODE: aurora_doc::BlendMode = aurora_doc::BlendMode::Exclusion;
+
+    /// The guard behind [`CPU_ONLY_BLEND_MODE`]: the one property every
+    /// fixture using that const actually depends on, asserted in exactly
+    /// one place instead of implied in six.
+    ///
+    /// Headless — `document_qualifies_for_gpu_compositing` is a pure
+    /// predicate over an `aurora_doc::LayerTree` and needs no GPU adapter.
+    #[test]
+    fn a_single_layer_at_the_cpu_only_blend_mode_does_not_qualify_for_gpu_compositing() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        };
+        let id = match layers.add_pixel_layer("cpu-only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(id, CPU_ONLY_BLEND_MODE) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "CPU_ONLY_BLEND_MODE ({CPU_ONLY_BLEND_MODE:?}) must still be rejected by \
+             document_qualifies_for_gpu_compositing -- every fixture that uses it as a \
+             stand-in for \"not GPU-expressible\" is silently measuring the wrong path \
+             otherwise. If this mode has just been ported to the GPU, move the const to \
+             another still-CPU-only mode rather than deleting this assertion."
+        );
+    }
 
     /// Only `*.tile` files, never a bare directory-entry count: since
     /// 0.67.0 a scratch directory also holds
@@ -12255,6 +16206,20 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(false));
+        // The *payload*, not only the node. `aurora_widgets::
+        // paint_widget` reads `TreeItemState::selected` to decide
+        // whether to draw the highlight at all, so a selection that
+        // reached the accessibility node alone would be announced to a
+        // screen reader and never painted on screen -- exactly the bug
+        // the pre-0.77.0 hand-rolled `set_selected` had.
+        assert!(matches!(
+            workspace.tree.payload(row_a),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+        ));
+        assert!(matches!(
+            workspace.tree.payload(row_b),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if !state.selected
+        ));
 
         // Selecting the other layer must flip both rows, not just add
         // to whatever was already selected.
@@ -12275,6 +16240,14 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(true));
+        assert!(matches!(
+            workspace.tree.payload(row_a),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if !state.selected
+        ));
+        assert!(matches!(
+            workspace.tree.payload(row_b),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+        ));
     }
 
     // -- the pan bound and a *changing* active layer --
@@ -13484,6 +17457,22 @@ mod tests {
 
     #[test]
     fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
+        // Everything under the body, at every depth -- not just the
+        // tree container's own direct children. Counting only the
+        // direct ones would pass even if a *nested* row (a row inside a
+        // group row) survived the clear, which is exactly the leftover
+        // this test exists to rule out.
+        fn total_descendants(
+            tree: &aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+            id: aurora_widgets::WidgetId,
+        ) -> usize {
+            tree.children(id)
+                .unwrap_or_default()
+                .iter()
+                .map(|&child| 1 + total_descendants(tree, child))
+                .sum()
+        }
+
         let mut workspace = aurora_ui::build_workspace();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -13500,19 +17489,39 @@ mod tests {
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }
-        if aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &old_history)
-            .is_err()
+        if aurora_ui::populate_history_panel(
+            &mut workspace.tree,
+            workspace.history,
+            &scales,
+            &old_history,
+        )
+        .is_err()
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }
+        // One level deeper than `layers.body`: since 0.77.0
+        // `populate_layers_panel` inserts a `Role::Tree` container of
+        // its own under the body and parents every row to *that*, so
+        // `children(body)` is always exactly `[the tree]`.
+        let layer_tree_root =
+            |workspace: &aurora_ui::Workspace| match workspace.tree.children(workspace.layers.body)
+            {
+                Some([only]) => *only,
+                other => unreachable!("expected exactly one tree container, got {other:?}"),
+            };
         assert!(
             workspace
                 .tree
-                .children(workspace.layers.body)
+                .children(layer_tree_root(&workspace))
                 .unwrap_or(&[])
                 .len()
                 > 1,
             "the demo document must have seeded more than one row"
+        );
+        let seeded = total_descendants(&workspace.tree, workspace.layers.body);
+        assert!(
+            seeded > 2,
+            "the demo document must have seeded a tree container plus several rows, got {seeded}"
         );
 
         let image = fake_image(8, 8);
@@ -13531,10 +17540,16 @@ mod tests {
         assert_eq!(
             workspace
                 .tree
-                .children(workspace.layers.body)
+                .children(layer_tree_root(&workspace))
                 .map(<[_]>::len),
             Some(1),
             "old demo rows must be gone, replaced by exactly the new layer's own row"
+        );
+        assert_eq!(
+            total_descendants(&workspace.tree, workspace.layers.body),
+            2,
+            "and nothing at all survives below that: exactly the tree container and one row, \
+             counted at every depth rather than only the tree's own direct children"
         );
         assert_eq!(
             workspace
@@ -13548,6 +17563,231 @@ mod tests {
         assert_eq!(active_layer, Some(new_layer_id));
         assert_eq!(layer_rows.len(), 1);
         assert_eq!(layer_rows.values().copied().next(), Some(new_layer_id));
+    }
+
+    /// [`fake_image`] with a caller-chosen colour, so two documents in
+    /// the same test can be told apart texel by texel. Kept separate
+    /// rather than growing a parameter onto `fake_image`, whose dozen
+    /// or so callers do not care what colour they get.
+    fn filled_image(width: u32, height: u32, rgba: [f32; 4]) -> aurora_io::Image {
+        let samples: Vec<half::f16> = (0..width as usize * height as usize)
+            .flat_map(|_| rgba.map(half::f16::from_f32))
+            .collect();
+        match aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// `App` itself is not constructible under test (see
+    /// `loading_a_documents_view_leaves_a_moved_layers_origin_non_negative`
+    /// for why), so these two call the store-side step
+    /// `App::open_file` delegates to — [`replace_document_pixels`] —
+    /// rather than re-spelling its sweep-then-write body here, which
+    /// would let the real one drift while the suite stayed green.
+    #[test]
+    fn replacing_a_documents_pixels_frees_the_outgoing_documents_tiles_and_keeps_the_incoming_ones()
+    {
+        let (_scratch, mut store) = real_tile_store();
+
+        // The outgoing document: 600x600, which at TILE = 256 is a 3x3
+        // tile grid, so its far corner tile is one only *it* covers.
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+        let far_corner = aurora_tile::TileId { x: 2, y: 2 };
+        assert!(
+            store.contains_tile(outgoing_surface, far_corner),
+            "a 600x600 image spans a 3x3 grid at TILE = {}",
+            aurora_tile::TILE
+        );
+
+        // The incoming one: smaller, a different colour -- and, by
+        // construction, the *same* surface.
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let Some(incoming_surface) = incoming_layers.surface_id(incoming_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        // Pinned deliberately, before the call under test: the whole
+        // reason the sweep has to come first is that these two ids
+        // collide (`IdGenerator::new` restarts at zero, and a
+        // `SurfaceId` is a `LayerId`). If a later change ever gives
+        // documents distinct surface-id namespaces, this fails loudly
+        // instead of leaving the rest of the test quietly vacuous.
+        assert_eq!(
+            outgoing_surface, incoming_surface,
+            "two freshly built documents must still alias the same surface for this test to \
+             mean anything"
+        );
+
+        let freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        assert_eq!(freed, 9, "the outgoing document's whole 3x3 tile grid");
+        assert!(
+            !store.contains_tile(incoming_surface, far_corner),
+            "a tile only the outgoing document ever covered must not survive onto the incoming \
+             document's (aliasing) surface"
+        );
+
+        let read = match aurora_io::read_from_store(&mut store, incoming_surface, 100, 100) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(first) = read.samples().get(0..4) else {
+            unreachable!("a 100x100 RGBA image has at least one texel");
+        };
+        assert_eq!(
+            first,
+            [0.0, 0.0, 1.0, 1.0].map(half::f16::from_f32),
+            "the incoming image's own pixels must be what the surface holds -- neither the \
+             outgoing document's colour nor a blank tile"
+        );
+    }
+
+    /// The third surface no `LayerTree` can name: this crate's own
+    /// reserved composite-preview surface ([`composite_surface_id`]).
+    /// `aurora_doc::forget_document_surfaces` builds its sweep set from
+    /// a tree and a history, so it structurally cannot reach this one —
+    /// which meant every composited tile the outgoing document produced
+    /// survived every open, forever.
+    ///
+    /// A leak only, never a stale-pixel bug: `composite_cache.bump()`
+    /// runs right after this on both open paths and the recomposite
+    /// writes whole tiles. So this asserts the tile is *gone*, not that
+    /// anything reads differently.
+    #[test]
+    fn replacing_a_documents_pixels_also_frees_the_reserved_composite_surfaces_tiles() {
+        let (_scratch, mut store) = real_tile_store();
+
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        // A composited tile at a grid position the 100x100 incoming
+        // document never revisits -- the case that leaked.
+        let far_corner = aurora_tile::TileId { x: 2, y: 2 };
+        if let Err(err) = store.get_mut(composite_surface_id(), far_corner) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            store.contains_tile(composite_surface_id(), far_corner),
+            "the composite tile this test is about must actually exist before the call"
+        );
+
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+
+        let freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        assert!(
+            !store.contains_tile(composite_surface_id(), far_corner),
+            "the reserved composite surface's tiles must be freed along with the outgoing \
+             document's own"
+        );
+        assert_eq!(
+            freed, 10,
+            "the outgoing document's 3x3 grid plus the one composite tile"
+        );
+    }
+
+    /// The correctness half, distinct from the leak half above: nothing
+    /// clips a tile read to a layer's declared `bounds`, and
+    /// `aurora_io::write_into_store` writes only the region the image
+    /// covers (relying on a freshly allocated tile being zero). So
+    /// without the sweep, the part of the incoming document's edge tile
+    /// that its own image does *not* cover still reads the outgoing
+    /// document's paint -- which is composited onto the canvas and
+    /// written into the same open's own autosave.
+    #[test]
+    fn an_opened_images_partial_edge_tile_holds_no_pixels_from_the_previous_document() {
+        let (_scratch, mut store) = real_tile_store();
+
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let Some(incoming_surface) = incoming_layers.surface_id(incoming_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        assert_eq!(
+            outgoing_surface, incoming_surface,
+            "the two documents must still alias the same surface for this test to mean anything"
+        );
+
+        let _freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        // The whole of tile (0, 0) -- 256x256, of which the incoming
+        // 100x100 image covers only the top-left corner.
+        let read = match aurora_io::read_from_store(
+            &mut store,
+            incoming_surface,
+            aurora_tile::TILE,
+            aurora_tile::TILE,
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // (150, 150): inside that one tile, outside the incoming
+        // image's own 100x100 extent, and squarely inside what the
+        // outgoing document had painted red.
+        let start = (150 * aurora_tile::TILE as usize + 150) * aurora_tile::CHANNELS;
+        let Some(outside) = read.samples().get(start..start + aurora_tile::CHANNELS) else {
+            unreachable!("a 256x256 RGBA image has a texel at (150, 150)");
+        };
+        assert_eq!(
+            outside,
+            [0.0, 0.0, 0.0, 0.0].map(half::f16::from_f32),
+            "a texel outside the opened image's own extent must be empty, not the previous \
+             document's paint"
+        );
     }
 
     #[test]
@@ -14368,7 +18608,13 @@ mod tests {
     /// `document_qualifies_for_gpu_compositing` is a *document-wide*
     /// predicate: it chooses the GPU fast path or the CPU fallback for
     /// every visible tile at once. Undoing a `SetBlendMode` on a
-    /// root-level pixel layer across the `Normal` boundary flips it, so
+    /// root-level pixel layer across the GPU-expressible boundary
+    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/
+    /// `LinearDodge`/`LinearBurn`/`ColorBurn`/`ColorDodge`/`Overlay`/
+    /// `Dissolve` on
+    /// one
+    /// side, the other 15 modes on the
+    /// other) flips it, so
     /// the whole document's compositing path changes while the step's own
     /// reported rect names one layer's region. This pins both halves:
     /// that the flip is real, and that [`perform_undo_redo`] answers
@@ -14421,16 +18667,22 @@ mod tests {
             "setup: two Normal-blend root pixel layers must qualify for the GPU path"
         );
 
-        if let Err(err) =
-            history.set_blend_mode(&mut layers, other, aurora_doc::BlendMode::Multiply)
-        {
+        // [`CPU_ONLY_BLEND_MODE`], not `Multiply`: 0.84.0 moved `Multiply`
+        // onto the *admitted* side of the predicate, so setting it here
+        // would no longer flip the path and this test would prove
+        // nothing. It read `Screen` literally until 0.102.0 ported that
+        // mode too, which is exactly the drift the const now names in one
+        // place. The `assert!(!before, ...)` below is what catches it if
+        // the boundary moves again.
+        if let Err(err) = history.set_blend_mode(&mut layers, other, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
         let before = document_qualifies_for_gpu_compositing(&layers);
         assert!(
             !before,
-            "setup: a root-level Multiply layer must route the whole document to the CPU path"
+            "setup: a root-level {CPU_ONLY_BLEND_MODE:?} layer must route the whole document \
+             to the CPU path"
         );
 
         let invalidation = perform_undo_redo(
@@ -16708,6 +20960,135 @@ mod tests {
         })
     }
 
+    /// Reads [`GPU_COMPOSITE_SUBMITS`] and resets it to zero in one
+    /// step, exactly as [`take_gpu_blend_dispatch_count`] does for the
+    /// per-mode blend counters and for the same reason: a test that only
+    /// read it would be counting every earlier GPU test in this binary
+    /// too.
+    fn take_gpu_composite_submit_count() -> u64 {
+        GPU_COMPOSITE_SUBMITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`COMPOSITE_STRAIGHTEN_PASSES`] and resets it to zero, the
+    /// same read-and-zero shape as the two counters above.
+    ///
+    /// No lock and no atomic ordering to reason about: the counter is
+    /// thread-local, so what this returns is the calls *this* thread made
+    /// since its own last call — see [`COMPOSITE_STRAIGHTEN_PASSES`]'s own
+    /// doc comment for why a process-global would have been flaky here
+    /// where it is sound for [`GpuBlendDispatches`].
+    fn take_composite_straighten_passes() -> u64 {
+        COMPOSITE_STRAIGHTEN_PASSES.with(|passes| passes.replace(0))
+    }
+
+    /// Reads [`RECOMPOSITE_PHASE_NANOS`] and resets it to zero in the
+    /// same read-and-zero shape as the two counters above, converting to
+    /// milliseconds for reporting: `[phase 1, phase 2, phase 3]` of
+    /// [`recomposite_visible_tiles`].
+    ///
+    /// Diagnostic only — nothing asserts on the result, and phase 2 is
+    /// *wall-clock stall on the poll*, not GPU execution time. See
+    /// [`RECOMPOSITE_PHASE_NANOS`]'s own doc comment for the full
+    /// limitation.
+    fn take_recomposite_phase_ms() -> [f64; 3] {
+        let mut out = [0.0_f64; 3];
+        for (slot, dest) in RECOMPOSITE_PHASE_NANOS.iter().zip(out.iter_mut()) {
+            let nanos = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest = nanos as f64 / 1_000_000.0;
+            }
+        }
+        out
+    }
+
+    /// Reads [`RECOMPOSITE_TILE_COST_NANOS`] and resets it to zero, same
+    /// read-and-zero shape as [`take_recomposite_phase_ms`] above,
+    /// converting to milliseconds:
+    /// `[gpu_issue_ok, gpu_issue_declined, cpu_fallback_empty,
+    /// cpu_fallback_real, other]` — the five-way split of phase 1's own
+    /// per-tile loop (0.93.0).
+    ///
+    /// Diagnostic only. The five sum to phase 1 by construction — which is
+    /// exactly why that sum is *not* a self-check on where each interval
+    /// landed; [`take_recomposite_mark_imbalance`] is. See
+    /// [`RECOMPOSITE_TILE_COST_NANOS`]'s own doc comment for what each slot
+    /// means, for why `gpu_issue_ok`/`gpu_issue_declined` read zero on a
+    /// document that never qualifies for GPU compositing, and for what
+    /// `cpu_fallback_empty` actually contains.
+    fn take_recomposite_tile_cost_ms() -> [f64; 5] {
+        let mut out = [0.0_f64; 5];
+        for (slot, dest) in RECOMPOSITE_TILE_COST_NANOS.iter().zip(out.iter_mut()) {
+            let nanos = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest = nanos as f64 / 1_000_000.0;
+            }
+        }
+        out
+    }
+
+    /// Reads [`RECOMPOSITE_MARK_IMBALANCE`] and resets it to zero, same
+    /// read-and-zero shape as the counters above (0.93.1).
+    ///
+    /// **Zero is the only correct value.** Anything else means a phase-1
+    /// classifying mark was dropped, duplicated, or fired on a tile that
+    /// never entered the loop body — see that counter's own doc comment for
+    /// why this, and not the printed timing residual, is the real
+    /// bookkeeping check.
+    fn take_recomposite_mark_imbalance() -> u64 {
+        RECOMPOSITE_MARK_IMBALANCE.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`RECOMPOSITE_FOLD_COUNTS`] and resets it to zero, same
+    /// read-and-zero shape as the counters above (0.97.1):
+    /// `[folds, real_fold_tiles]` — slot 1 is the one callers name
+    /// `first_folds`, because one fold per real-fold tile is a first fold
+    /// and the two counts are therefore the same number under two names
+    /// (0.100.1, Critic G-07: the naming hop is stated at both ends now
+    /// rather than left to the reader).
+    ///
+    /// Diagnostic only, and no *timing* magnitude is asserted on it.
+    /// See that counter's own doc comment for why the *pair* rather than
+    /// the fold total is the load-bearing number: `real_fold_tiles` is
+    /// exactly the count of folds onto a transparent accumulator, and
+    /// `folds - real_fold_tiles` is exactly the count of folds onto a
+    /// non-empty one.
+    ///
+    /// **What that second number is not (0.100.1, Red-team RT-100-01).**
+    /// It is a *structural* count, not a branch-taken count. Which arm
+    /// `aurora_render`'s `fold_texel` took is decided per texel on
+    /// `backdrop_alpha > 0.0` inside `aurora-render`, and nothing in this
+    /// crate can see it: a later fold onto a fully *transparent*
+    /// accumulator would be counted here identically while taking the
+    /// cheap arm at every texel. Earlier wording here ("exactly the count
+    /// that took the dividing arm") claimed more than the counter can
+    /// support.
+    fn take_recomposite_fold_counts() -> [u64; 2] {
+        let mut out = [0_u64; 2];
+        for (slot, dest) in RECOMPOSITE_FOLD_COUNTS.iter().zip(out.iter_mut()) {
+            *dest = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Reads [`COMPOSITE_WRITE_OUTCOMES`] and resets it to zero, in the
+    /// same read-and-zero shape as the counters above:
+    /// `[skipped, changed, not_resident]`.
+    ///
+    /// Bucket 0 is an **upper bound** on the GPU uploads 0.90.0's skip
+    /// removes, never the measurement of them — the upload decision is a
+    /// separate skip point inside `aurora_gpu::TileResidency::sync`, whose
+    /// own `SyncStats` is the realized figure. See
+    /// [`COMPOSITE_WRITE_OUTCOMES`] for the full statement.
+    fn take_composite_write_outcomes() -> [u64; 3] {
+        let mut out = [0_u64; 3];
+        for (slot, dest) in COMPOSITE_WRITE_OUTCOMES.iter().zip(out.iter_mut()) {
+            *dest = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -16789,6 +21170,19 @@ mod tests {
             unreachable!("a real tile always has at least one full texel");
         };
         (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
+    }
+
+    /// [`read_first_texel`]'s whole-tile counterpart — every sample of
+    /// the tile, in storage order, converted to `f32`.
+    fn read_all_texels(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: aurora_tile::TileId,
+    ) -> Vec<f32> {
+        let Ok(t) = store.get(surface, tile) else {
+            unreachable!("just written");
+        };
+        t.texels().iter().map(|s| s.to_f32()).collect()
     }
 
     /// Renders `residency` through `canvas`/`pipeline` into a
@@ -17354,15 +21748,21 @@ mod tests {
         fill_solid(&mut store, above_surface, tile_id, [0.0, 1.0, 0.0, 1.0]);
 
         // Sanity check: `active`'s own surface really is transparent at
-        // this point -- never painted at all.
+        // this point -- never painted at all. Since 0.90.1 `sample_pixel`
+        // says that as `None` rather than `Some([0.0; 4])`: it asks
+        // `contains_tile` first instead of materializing a blank tile to
+        // read zeros out of (see its own doc comment -- on the composite
+        // surface that side effect was a real bug). `None` is the
+        // *stronger* statement of what this check wants, since a tile
+        // that was written all-zero would still be `Some`.
         let Some(active_surface) = layers.surface_id(active) else {
             unreachable!("just created as a pixel layer");
         };
-        let actives_own = sample_pixel(&mut store, active_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
-        #[allow(clippy::float_cmp)]
-        {
-            assert_eq!(actives_own, [0.0, 0.0, 0.0, 0.0]);
-        }
+        assert_eq!(
+            sample_pixel(&mut store, active_surface, (5.0, 5.0)),
+            None,
+            "the active layer must never have been painted at this point"
+        );
 
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
@@ -20947,9 +25347,8 @@ mod tests {
     // Real integration test for `LayerMask` aggregation on a plain
     // `Pixel` layer, mirroring the shape of every prior aggregation
     // round's own `composite_document_*` test. `top` is opaque blue,
-    // covering the full 10x10 document, with a real mask
-    // (`LayerTree::add_mask`, the same API the Layers panel would use)
-    // covering only its left half (x in [0, 5)). `bottom` is opaque red,
+    // covering the full 10x10 document, with a real mask covering only
+    // its left half (x in [0, 5)). `bottom` is opaque red,
     // full coverage, no mask. Expected: left half shows `top`'s own
     // blue (inside the mask), right half shows `bottom`'s red through
     // (outside the mask, `top` contributes nothing there) -- a hard
@@ -20959,6 +25358,19 @@ mod tests {
     // never painted, so `mask.bounds` is the only thing deciding
     // anything. `composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage`
     // is the counterpart that paints one.
+    //
+    // On the API this and the other mask fixtures below call: they use
+    // `LayerTree::add_mask` directly, and **a future Layers-panel
+    // "add mask" action must not**. `aurora_doc::History::add_mask` is
+    // the one to reach for -- it records the add for undo *and*, since
+    // 0.81.0, clears any coverage a previous mask on that layer left
+    // behind on the same derived surface. The bare `LayerTree` call
+    // does neither, so a panel wired to it would ship a mask that opens
+    // wearing a deleted mask's pixels, shifted. These fixtures are
+    // unaffected only because none of them removes a mask, and the ones
+    // that paint coverage paint it onto a surface no earlier mask
+    // touched -- an accident of the fixtures, not a property of the
+    // API. See `aurora_doc::mask`'s lifecycle notes.
     fn composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();
@@ -21736,6 +26148,192 @@ mod tests {
         assert_eq!(result, (0.0, 0.0, 0.0, 0.0));
     }
 
+    /// Pins fact 1 of 0.94.0's three-fact skip argument, at the caller:
+    /// when no root folds, what `composite_roots_into_tile` returns is
+    /// bitwise all-zero — not merely "near transparent", and not
+    /// something whose zero-ness depends on the straightening pass that
+    /// is now skipped.
+    ///
+    /// The assertion is on `to_bits`, not on `f32` values, deliberately:
+    /// `-0.0 == 0.0` would let a sign-bit difference pass a value
+    /// comparison, and `write_composited`'s unchanged-tile skip compares
+    /// bits, so bits are what matter downstream. `folded == 0` is
+    /// asserted alongside, since it is the predicate the skip reads —
+    /// a version of this test that only checked the texels would still
+    /// pass if `folded` started coming back wrong.
+    ///
+    /// No GPU needed: this calls the CPU helper directly.
+    #[test]
+    fn composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds() {
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (composited, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(folded, 0, "an empty layer tree folds nothing");
+        assert_eq!(composited.len(), aurora_tile::SAMPLES);
+        assert!(
+            composited.iter().all(|sample| sample.to_bits() == 0),
+            "a zero-fold tile must be bitwise all-zero, not merely near-transparent"
+        );
+    }
+
+    /// The same claim on the case that actually dominates a real frame,
+    /// and the one an empty-`LayerTree` test cannot reach: a **real,
+    /// visible pixel layer that has simply never painted at the queried
+    /// tile**. Eight of `unchanged_skip_fixture`'s nine visible tiles are
+    /// this, and so is most of the benchmark grid.
+    ///
+    /// Worth having separately because the two get to `folded == 0` by
+    /// different routes. Above, `layers.roots()` is empty and the loop
+    /// body never runs at all. Here the loop runs, walks a root, and
+    /// `resolve_tile` declines — so this is what would catch a regression
+    /// where `resolve_tile` starts returning `Some` with an all-zero
+    /// buffer for a never-painted layer (materializing a blank tile,
+    /// say). That would leave the texels identical while making `folded`
+    /// nonzero, silently costing the straightening pass back on every
+    /// blank tile without changing any pixel — invisible to every other
+    /// test in this module.
+    #[test]
+    fn composite_roots_into_tile_folds_nothing_at_a_tile_a_real_layer_never_painted() {
+        let (_dir, mut store, layers, _surface, painted) = unchanged_skip_fixture();
+        // Two tiles right of the one `unchanged_skip_fixture` filled, so
+        // the store has nothing at all under this tile. **That, and not
+        // the layer's `bounds`, is what makes `resolve_tile` decline**:
+        // the layer's own origin is `(0, 0)`, which equals the
+        // `reference_origin` passed below, so `resolve_tile` takes its
+        // same-origin arm and returns `None` on
+        // `!store.contains_tile(surface, tile_id)` — a tile this fixture
+        // never stored. No clipping against `bounds` happens on that arm
+        // at all (and the fixture's `fill_solid` fills a whole tile, not
+        // the declared 10x10 sub-rect), so a reader must not take this
+        // test as evidence about bounds clipping.
+        let never_painted = aurora_tile::TileId {
+            x: painted.x + 2,
+            y: painted.y,
+        };
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (composited, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            never_painted,
+            (i64::from(never_painted.x) * i64::from(aurora_tile::TILE), 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(
+            folded, 0,
+            "a visible layer that never painted at this tile must decline, not fold a blank"
+        );
+        assert_eq!(composited.len(), aurora_tile::SAMPLES);
+        assert!(
+            composited.iter().all(|sample| sample.to_bits() == 0),
+            "a zero-fold tile must be bitwise all-zero, not merely near-transparent"
+        );
+    }
+
+    /// **The skip's own regression guard** (0.94.1), and the one thing no
+    /// output assertion in this module can be: 0.94.0's whole argument is
+    /// that skipping `aurora_render::un_premultiply_in_place` for a
+    /// zero-fold tile is *output-identical*, which means every test that
+    /// checks texels passes whether the pass ran or not. Mutating
+    /// `composite_roots_into_tile`'s `folded > 0` to `true` — the exact
+    /// pre-0.94.0 behaviour — left all 384 tests in this crate green, so a
+    /// later refactor could hand the whole ~6.5 ms/frame win back with a
+    /// fully green gate.
+    ///
+    /// So this asserts on **calls**, via
+    /// [`COMPOSITE_STRAIGHTEN_PASSES`], in both directions from one
+    /// fixture: zero calls for the never-painted tile (which the mutation
+    /// above would turn into one, failing here), and at least one for the
+    /// tile the fixture really filled (which mutating the guard to `false`
+    /// would turn into zero — the direction
+    /// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+    /// and four other tests already catch on output, and this one now
+    /// catches directly).
+    ///
+    /// The two calls each build their own `CompositeBudget`, exactly as
+    /// the per-tile loop does, so neither inherits the other's spend.
+    /// No GPU needed: this calls the CPU helper directly.
+    #[test]
+    fn composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded() {
+        let (_dir, mut store, layers, _surface, painted) = unchanged_skip_fixture();
+        let never_painted = aurora_tile::TileId {
+            x: painted.x + 2,
+            y: painted.y,
+        };
+
+        // Whatever ran on this thread before is not this test's business;
+        // the counter is thread-local, so this is the whole reset needed.
+        let _ = take_composite_straighten_passes();
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (_zero_fold, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            never_painted,
+            (i64::from(never_painted.x) * i64::from(aurora_tile::TILE), 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(folded, 0, "the fixture never stored this tile");
+        assert_eq!(
+            take_composite_straighten_passes(),
+            0,
+            "a zero-fold tile must skip the straightening pass entirely, not run it and get \
+             identical bits"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (_real_fold, folded) =
+            composite_roots_into_tile(&layers, &mut store, painted, (0, 0), (0, 0), &mut budget);
+        assert_eq!(folded, 1, "the fixture filled exactly this tile");
+        assert!(
+            take_composite_straighten_passes() >= 1,
+            "a tile that folded a root must still run the straightening pass -- skipping it \
+             there would return premultiplied texels"
+        );
+    }
+
+    /// 0.94.0's faster spelling of `write_composited`'s comparison is an
+    /// implementation change, so this pins the two cases that make it a
+    /// *bitwise* predicate rather than `==`, and would silently regress
+    /// if someone "simplified" it to `have == want`.
+    ///
+    /// `-0.0` is built with `from_bits(0x8000)` rather than
+    /// `from_f32(-0.0)` so the test states the exact bit pattern it means
+    /// instead of depending on a conversion to preserve a sign bit.
+    #[test]
+    fn tiles_are_bitwise_identical_distinguishes_negative_zero_and_matches_nan_to_itself() {
+        let zero = half::f16::from_f32(0.0);
+        let negative_zero = half::f16::from_bits(0x8000);
+        let nan = half::f16::from_f32(f32::NAN);
+        assert_eq!(zero.to_bits(), 0, "the +0.0 side must be canonical");
+        assert!(
+            !tiles_are_bitwise_identical(&[zero], &[negative_zero]),
+            "-0.0 and +0.0 differ in bits and must compare as changed"
+        );
+        assert!(
+            tiles_are_bitwise_identical(&[nan], &[nan]),
+            "a NaN must match itself, or an unchanged tile is changed forever"
+        );
+        assert!(tiles_are_bitwise_identical(&[zero, nan], &[zero, nan]));
+        assert!(!tiles_are_bitwise_identical(
+            &[zero],
+            &[half::f16::from_f32(1.0)]
+        ));
+        assert!(
+            !tiles_are_bitwise_identical(&[zero], &[zero, zero]),
+            "a length mismatch answers false"
+        );
+    }
+
     #[test]
     fn recomposite_visible_tiles_skips_an_already_current_tile() {
         let Some(context) = real_gpu_context() else {
@@ -21806,6 +26404,114 @@ mod tests {
         );
     }
 
+    /// The trip-wire for 0.93.0's five-way phase-1 split
+    /// (`RECOMPOSITE_TILE_COST_NANOS`), in two parts.
+    ///
+    /// **1. `mark_gpu_issue`'s slot mapping.** `gpu: None, compositor:
+    /// None` makes the GPU arm *unreachable*, so the two `gpu_issue_*`
+    /// slots can never legitimately be credited. This catches slot-
+    /// *selection* corruption — an edit that made the `(false, _)` arm pick
+    /// `GPU_ISSUE_DECLINED` instead of `OTHER`, say. It is deliberately
+    /// **not** a general "mark placement" guard, and 0.93.0's doc claimed
+    /// it was: with the `mark_gpu_issue` call site *deleted* this half
+    /// still passes, since both `gpu_issue_*` slots then read a trivial
+    /// zero either way.
+    ///
+    /// **2. The per-tile mark balance** (`RECOMPOSITE_MARK_IMBALANCE`,
+    /// 0.93.1) is what covers that hole: exactly one classifying mark must
+    /// fire per tile that entered the phase-1 loop body, so a dropped or
+    /// duplicated `mark_gpu_issue` shows up as a non-zero imbalance here
+    /// regardless of which slots happen to be reachable.
+    ///
+    /// Both parts are genuinely deterministic; the timing values themselves
+    /// are not, and nothing here asserts a magnitude.
+    ///
+    /// The grid is 4x4 composite tiles (`TileResidency::grid_for` is
+    /// `viewport.div_ceil(TILE) + 1` per axis, so a 600x600 viewport gives
+    /// `600.div_ceil(256) + 1 == 4`) with exactly one of them painted, so
+    /// the run is guaranteed to exercise both CPU slots: one tile folds a
+    /// root (`cpu_fallback_real`) and fifteen fold none
+    /// (`cpu_fallback_empty`). Both are asserted merely non-zero, which is
+    /// robust — `Instant` has nanosecond resolution here and blending or
+    /// allocating a whole 256x256 tile costs microseconds — while no upper
+    /// bound is asserted at all, since that would be a timing claim. The
+    /// assertions do not depend on the exact tile count either way; the
+    /// count is stated because 0.93.0's version of this comment stated it
+    /// wrongly (3x3, `600/256 + 1`, eight empty tiles).
+    ///
+    /// A `GpuContext` is still needed for `TileResidency::new`, so this
+    /// test self-skips without an adapter like every other GPU-gated test
+    /// in this module. That also supplies the serialization the assertion
+    /// needs: `real_gpu_context` holds `GPU_TEST_LOCK` for the returned
+    /// guard's whole lifetime, and every other test in this binary that
+    /// reaches `recomposite_visible_tiles` needs the same guard, so
+    /// nothing else can be accumulating into these process-global slots
+    /// between the zeroing below and the read.
+    #[test]
+    fn recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (600, 600));
+        let mut cache = CompositeCache::default();
+        // Discard whatever earlier tests in this binary accumulated, so
+        // the read below describes only this call.
+        let _ = take_recomposite_tile_cost_ms();
+        let _ = take_recomposite_mark_imbalance();
+        recomposite_visible_tiles(
+            &residency, &layers, None, &mut store, &mut cache, None, None,
+        );
+
+        let [gpu_ok, gpu_declined, cpu_empty, cpu_real, _other] = take_recomposite_tile_cost_ms();
+        let imbalance = take_recomposite_mark_imbalance();
+        assert!(
+            gpu_ok == 0.0 && gpu_declined == 0.0,
+            "with no GpuContext and no TileCompositor the GPU arm is unreachable, so neither \
+             gpu_issue slot can be credited; got gpu_issue_ok={gpu_ok} \
+             gpu_issue_declined={gpu_declined} -- mark_gpu_issue's (reachable, issued) -> slot \
+             mapping is wrong"
+        );
+        assert_eq!(
+            imbalance, 0,
+            "exactly one classifying mark must fire per tile that entered the phase-1 loop \
+             body; a non-zero imbalance means a mark was dropped, duplicated, or fired on a \
+             tile that never reached the loop body -- the failure the printed timing residual \
+             cannot see"
+        );
+        assert!(
+            cpu_real > 0.0,
+            "the one painted tile must land in cpu_fallback_real; got {cpu_real}"
+        );
+        assert!(
+            cpu_empty > 0.0,
+            "the fifteen unpainted tiles of the 4x4 grid must land in cpu_fallback_empty; \
+             got {cpu_empty}"
+        );
+    }
+
     #[test]
     fn recomposite_visible_tiles_recomputes_a_tile_after_the_cache_is_bumped() {
         let Some(context) = real_gpu_context() else {
@@ -21865,6 +26571,712 @@ mod tests {
             (1.0, 0.0, 0.0, 1.0),
             "bump must force a real recompute, overwriting the poked value"
         );
+    }
+
+    // -- `write_composited`'s unchanged-tile skip and its residency
+    // guard (0.90.0). All three share one fixture: a single solid
+    // pixel layer, one real GPU context, and *two* recomposite passes
+    // with a `residency.sync` in between -- the sync matters, because it
+    // is what consumes the dirty flags `recomposite_visible_tiles` sets,
+    // exactly as `App::redraw` does. Without it the second pass would be
+    // comparing against a tile that is still dirty from the first, and
+    // the assertions below would not mean what they say.
+
+    /// The fixture all three 0.90.0 tests build: a `256x256`-viewport
+    /// residency (a 3x3 visible grid), one solid red pixel layer, and a
+    /// composite cache. Returns everything the caller needs to drive two
+    /// passes by hand.
+    ///
+    /// The layer surface is filled at tile `(0, 0)` only, so of the nine
+    /// visible tiles exactly one has real content and the other eight
+    /// recomposite to transparent — which is the shape the real frame
+    /// path has too, and the reason the skip is worth anything.
+    fn unchanged_skip_fixture() -> (
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_doc::LayerTree,
+        aurora_tile::SurfaceId,
+        aurora_tile::TileId,
+    ) {
+        let (dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        (dir, store, layers, surface, tile_id)
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_skips_the_dirty_mark_when_a_tile_recomposites_byte_identically() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, _surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        // What `App::redraw` does next, and the reason it is here: `sync`
+        // is what *consumes* the dirty flags the pass above set.
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let first = take_composite_write_outcomes();
+        assert_eq!(
+            first[0], 0,
+            "the very first pass has no resident composite tile to compare against, so nothing \
+             can be skipped: {first:?}"
+        );
+
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[0] >= 1,
+            "a tile recomposited from unchanged layer content must land in the skipped bucket: \
+             {second:?}"
+        );
+        assert_eq!(
+            second[1], 0,
+            "nothing about the document changed between the two passes, so no tile may be \
+             reported as changed: {second:?}"
+        );
+        assert!(
+            !store.is_dirty(composite_surface_id(), tile_id),
+            "the skip's whole point: the tile must not be re-marked dirty, so \
+             TileResidency::sync has nothing to serialize and upload for it"
+        );
+        // And the skip must not have corrupted what is stored: the tile
+        // still reads back as the layer's own content.
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (1.0, 0.0, 0.0, 1.0),
+            "skipping the write must leave the already-correct content in place"
+        );
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_still_dirties_a_tile_whose_content_really_changed() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let _ = take_composite_write_outcomes();
+
+        // Repaint the *layer*, not the composite surface: this is the
+        // ordinary "the user painted something" case, and the one the
+        // skip must never swallow.
+        fill_solid(&mut store, surface, tile_id, [0.0, 0.0, 1.0, 1.0]);
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[1] >= 1,
+            "the repainted tile must be reported as changed, not skipped: {second:?}"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), tile_id),
+            "a tile whose content really changed must still be marked dirty, or the atlas keeps \
+             showing the old pixels"
+        );
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (0.0, 0.0, 1.0, 1.0),
+            "and the new content must be what got written"
+        );
+    }
+
+    #[test]
+    // The correctness regression guard for the residency guard itself.
+    // `replace_document_pixels` calls
+    // `store.forget_surface(composite_surface_id())` on every document
+    // open, after which `get_mut` hands back a brand-new `Tile::blank()`
+    // -- while the GPU atlas still holds the *previous* document's pixels
+    // for the same tile id. A bare byte-equality skip would compare a
+    // freshly composited transparent tile against that blank, find them
+    // equal, skip the dirty mark, and leave the old document on screen.
+    // This test constructs exactly that: forget the surface, change
+    // nothing else, and require the write to be taken anyway.
+    fn a_forgotten_composite_tile_is_dirtied_again_even_though_its_content_is_unchanged() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, _surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let _ = take_composite_write_outcomes();
+
+        // Exactly what `replace_document_pixels` does on a document open.
+        // The layer content is left completely alone, so every tile
+        // recomposites to the same bytes it already held.
+        let forgotten = store.forget_surface(composite_surface_id());
+        assert!(
+            forgotten > 0,
+            "the first pass must have written at least one composite tile to forget"
+        );
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[2] >= 1,
+            "a forgotten tile is not resident, so the write must be taken unconditionally rather \
+             than compared: {second:?}"
+        );
+        assert_eq!(
+            second[0], 0,
+            "and none of the forgotten surface's tiles may be skipped -- that is the stale-pixel \
+             bug the residency guard exists to prevent: {second:?}"
+        );
+        // The tile that actually exercises the residency guard. `tile_id`
+        // is (0, 0), the one tile `unchanged_skip_fixture` fills solid
+        // red, so a blank there differs from the recomposite regardless of
+        // the guard and asserting on it is tautological -- it would pass
+        // with the guard deleted. At a 256x256 residency the visible grid
+        // is 2x2 (`aurora-gpu`'s own
+        // `visible_tiles_covers_exactly_the_grid_from_the_current_origin`),
+        // and the fixture's layer is 10x10, so (1, 1) recomposites fully
+        // transparent -- byte-identical to the blank `get_mut` hands back
+        // after `forget_surface`. *That* is the comparison only residency
+        // can break, and the one whose skip would leave the previous
+        // document's pixels in the atlas.
+        let transparent_tile = aurora_tile::TileId { x: 1, y: 1 };
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), transparent_tile),
+            (0.0, 0.0, 0.0, 0.0),
+            "the fixture's 10x10 layer cannot reach tile (1, 1), so its recomposite must be \
+             transparent -- i.e. byte-identical to a blank, which is what makes the next assertion \
+             mean something"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), transparent_tile),
+            "a tile that recomposites byte-identically to the blank left by forget_surface must \
+             still be dirtied, or TileResidency::sync never re-uploads it and the atlas keeps the \
+             previous document's pixels there"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), tile_id),
+            "and the filled tile too, for the same reason"
+        );
+    }
+
+    /// Reads one texel straight out of the GPU atlas slot `id` currently
+    /// occupies — `TileResidency`'s own toroidal addressing (`id % grid`,
+    /// the same arithmetic `sync` uses), so this is the *uploaded* pixel
+    /// rather than whatever the tile store happens to hold. The ground
+    /// truth for "did `sync` actually replace what the previous document
+    /// left on screen", which no store-side or counter-side assertion can
+    /// answer.
+    ///
+    /// Kept next to its one caller rather than beside
+    /// [`render_and_sample_pixel`]: that helper renders the atlas
+    /// *through* `CanvasPipeline` and answers a different question (what
+    /// the canvas samples at a screen pixel, blend state and zoom
+    /// included). This one deliberately skips all of that.
+    fn atlas_texel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        residency: &aurora_gpu::TileResidency,
+        id: aurora_tile::TileId,
+    ) -> [f32; 4] {
+        let texture = residency.texture();
+        let grid = (
+            texture.width() / aurora_tile::TILE,
+            texture.height() / aurora_tile::TILE,
+        );
+        assert!(
+            grid.0 > 0 && grid.1 > 0,
+            "the atlas is at least one tile on each axis"
+        );
+        let slot = (id.x % grid.0, id.y % grid.1);
+        // 8 bytes per texel: the atlas is `Rgba16Float`. At TILE = 256
+        // that is 2048, already a multiple of wgpu's 256-byte row
+        // alignment, so no padding arithmetic is needed.
+        let bytes_per_row = aurora_tile::TILE * 8;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas-texel-readback"),
+            size: u64::from(bytes_per_row) * u64::from(aurora_tile::TILE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("atlas-texel-readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: slot.0 * aurora_tile::TILE,
+                    y: slot.1 * aurora_tile::TILE,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(aurora_tile::TILE),
+                },
+            },
+            wgpu::Extent3d {
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let Ok(Ok(())) = rx.recv() else {
+            unreachable!("map_async must complete once the device has been polled to idle");
+        };
+        let Ok(data) = slice.get_mapped_range() else {
+            unreachable!("the buffer was just confirmed mapped successfully above");
+        };
+        let mut out = [0.0_f32; 4];
+        for (channel, dest) in out.iter_mut().enumerate() {
+            let Some(&[lo, hi]) = data.get(channel * 2..channel * 2 + 2) else {
+                unreachable!("one whole tile was copied, so its first 8 bytes exist");
+            };
+            *dest = half::f16::from_bits(u16::from(lo) | (u16::from(hi) << 8)).to_f32();
+        }
+        drop(data);
+        readback.unmap();
+        out
+    }
+
+    #[test]
+    /// The end-to-end regression guard for the stale-pixel bug 0.90.0
+    /// disclosed as a residual and 0.90.1 fixed: an Eyedropper pick
+    /// handled between a document open and the next redraw used to
+    /// materialize a blank-but-*resident* composite tile, which made
+    /// `write_composited`'s residency-guarded byte comparison skip a
+    /// dirty mark the GPU atlas genuinely still needed.
+    ///
+    /// Why the event ordering is ordinary rather than exotic:
+    /// `rfd::FileDialog::pick_file` blocks the UI thread while the dialog
+    /// is open, redraws are only requested from `about_to_wait` (after the
+    /// current event batch drains), and on the Eyedropper tool
+    /// `begin_drag` samples on a *fresh* primary press — no surviving drag
+    /// needed. So a click queued during the dialog is handled first.
+    ///
+    /// This asserts the fix at both ends: the sample must not make the
+    /// tile resident, and the atlas must really stop showing the previous
+    /// document's red. Read back from the atlas itself, because the whole
+    /// failure mode is a store that looks right while the GPU shows
+    /// something else.
+    // 111 lines against a 100-line lint. One strictly ordered sequence —
+    // build and upload document A, open document B, sample, redraw,
+    // read back — where every step is meaningless without the ones
+    // before it; the ordering *is* what the test asserts, so splitting
+    // it would either duplicate the whole two-document fixture or let a
+    // later edit reorder the steps without any single test failing. Same
+    // trade the surrounding real-GPU tests already make.
+    #[allow(clippy::too_many_lines)]
+    fn an_eyedropper_pick_between_a_document_open_and_the_next_redraw_cannot_strand_stale_atlas_pixels()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        // `real_tile_store`'s own 16-tile budget would page across this
+        // 2x2 visible grid plus two documents' layer surfaces, and
+        // eviction is a *separate*, still-open hole (PLAN.md's M1.10
+        // 0.90.0 entry) that would confuse what this test is measuring.
+        let (_scratch, mut store) = diff_tile_store();
+
+        // The outgoing document: 512x512 solid red, which at TILE = 256
+        // covers every tile of the 2x2 visible grid completely.
+        let outgoing_image = filled_image(512, 512, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("document_from_image always builds a pixel layer");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        // Frame 1, exactly as `redraw` runs it: composite, then sync.
+        recomposite_visible_tiles(
+            &residency,
+            &outgoing_layers,
+            Some(outgoing_layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+
+        // The victim: a tile inside the visible grid that the *outgoing*
+        // document covers and the incoming one cannot reach.
+        let victim = aurora_tile::TileId { x: 1, y: 1 };
+        let before = atlas_texel(context.device(), context.queue(), &residency, victim);
+        assert!(
+            (before[0] - 1.0).abs() < 0.01 && before[3] > 0.99,
+            "the outgoing document's red must really be in the atlas, or this test proves nothing: \
+             {before:?}"
+        );
+
+        // The document open: 100x100 blue, which only ever reaches tile
+        // (0, 0). `replace_document_pixels` is the real store-side step
+        // `App::open_file` delegates to, and its
+        // `forget_surface(composite_surface_id())` is the whole setup.
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let _freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+        // What `App::open_file` does right after. A bump forces a
+        // recompute and says nothing about residency, which is precisely
+        // why it never prevented this bug.
+        cache.bump();
+        assert!(
+            !store.contains_tile(composite_surface_id(), victim),
+            "forget_surface must really have dropped the composite surface"
+        );
+
+        // The attack: one Eyedropper pick, before the next redraw, at a
+        // document point inside the victim tile. Both documents sit at
+        // (0, 0), so `active_layer_origin` is (0, 0) either way.
+        let picked = eyedropper_sample(&mut store, (0.0, 0.0), (300.0, 300.0));
+        assert_eq!(
+            picked, None,
+            "a never-composited tile has no colour to pick -- the same answer a materialized blank \
+             would have given, reached without materializing one"
+        );
+        assert!(
+            !store.is_resident(composite_surface_id(), victim),
+            "and the sample must not have made the tile resident: that resident blank is exactly \
+             what write_composited's residency guard would then mistake for the bytes of a real \
+             upload"
+        );
+        assert!(
+            !store.contains_tile(composite_surface_id(), victim),
+            "nor materialized it at all"
+        );
+
+        // Frame 2: the next redraw, now for the new document.
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &incoming_layers,
+            Some(incoming_layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let outcomes = take_composite_write_outcomes();
+        assert_eq!(
+            outcomes[0], 0,
+            "no tile of a just-forgotten composite surface may be skipped: {outcomes:?}"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), victim),
+            "the victim must be dirty, or sync has no reason to overwrite the previous document's \
+             pixels in its atlas slot"
+        );
+        let stats = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        assert!(
+            stats.uploaded >= 1,
+            "and sync must actually upload it: {stats:?}"
+        );
+
+        // The proof, from the atlas rather than the store: the incoming
+        // document is transparent at this tile, so the outgoing one's red
+        // must be gone.
+        let after = atlas_texel(context.device(), context.queue(), &residency, victim);
+        assert!(
+            after[3] < 0.01 && after[0] < 0.01,
+            "the atlas must show the incoming document's transparency, not the outgoing \
+             document's pixels (before {before:?}, after {after:?}, write_composited outcomes \
+             {outcomes:?}, sync {stats:?})"
+        );
+    }
+
+    /// A scratch store deliberately **too small** for one frame's working
+    /// set: 3 tiles against a 2x2 visible composite grid plus the same
+    /// document's own 2x2 layer grid, i.e. 8 distinct keys. Three rather
+    /// than four specifically because `recomposite_visible_tiles`'s GPU
+    /// path writes every composite tile in its phase-3 drain, so a
+    /// four-tile budget would leave all four resident again by the time
+    /// `sync` runs and the test would exercise nothing. That is the
+    /// opposite of what [`diff_tile_store`] is for, and it is not a
+    /// pathological fixture — at Aurora's 300,000 x 300,000 px document
+    /// ceiling a budget smaller than the working set is the *design
+    /// assumption* (invariant §7.3.1), and this session's own frame
+    /// measurements saw several composite tiles per frame evicted mid-pass
+    /// at ordinary document sizes.
+    fn evicting_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(3) else {
+            unreachable!("3 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    #[test]
+    /// AC-2: the end-to-end regression guard for the eviction hole 0.90.0
+    /// disclosed and 0.91.0 closed. `write_composited` marks a composite
+    /// tile dirty; a *later* tile of the same
+    /// [`recomposite_visible_tiles`] pass makes the store page that tile
+    /// out under budget pressure; before 0.91.0 it came back through
+    /// `Tile::from_texels` clean, so `aurora_gpu::TileResidency::sync`'s
+    /// `is_dirty` peek declined an upload and the atlas kept the *previous*
+    /// frame's pixels.
+    ///
+    /// Read back from the real atlas texture, not the store: the whole
+    /// failure mode is a tile store that holds exactly the right pixels
+    /// while the GPU shows something else, so any store-side assertion
+    /// would pass on the broken code.
+    ///
+    /// Frame 1 syncs with `force = true` deliberately — the setup step
+    /// that puts the "stale" content in the atlas must not itself be
+    /// defeatable by the very bug under test.
+    fn a_composite_tile_evicted_mid_pass_is_still_re_uploaded_to_the_real_atlas() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_scratch, mut store) = evicting_tile_store();
+
+        // 512x512 covers the whole 2x2 visible grid at TILE = 256, so
+        // every visible tile has real content on both frames.
+        let red = filled_image(512, 512, [1.0, 0.0, 0.0, 1.0]);
+        let (layers, _history, layer) = document_from_image("evicting", &red);
+        let Some(layer_surface) = layers.surface_id(layer) else {
+            unreachable!("document_from_image always builds a pixel layer");
+        };
+        if let Err(err) = aurora_io::write_into_store(&red, &mut store, layer_surface) {
+            unreachable!("{err:?}");
+        }
+
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let visible: Vec<aurora_tile::TileId> = residency.visible_tiles().collect();
+        assert_eq!(visible.len(), 4, "a 256x256 viewport is a 2x2 grid");
+
+        // Frame 1: red into the atlas.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            true,
+            usize::MAX,
+        );
+        for id in &visible {
+            let texel = atlas_texel(context.device(), context.queue(), &residency, *id);
+            assert!(
+                (texel[0] - 1.0).abs() < 0.01 && texel[3] > 0.99,
+                "the red frame must really be in the atlas, or this test proves nothing: {id:?} \
+                 {texel:?}"
+            );
+        }
+
+        // The edit: repaint the same layer blue, so every visible
+        // composite tile's content genuinely changes.
+        let blue = filled_image(512, 512, [0.0, 0.0, 1.0, 1.0]);
+        if let Err(err) = aurora_io::write_into_store(&blue, &mut store, layer_surface) {
+            unreachable!("{err:?}");
+        }
+        cache.bump();
+
+        // Frame 2, exactly as `redraw` runs it: recomposite, then sync.
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let outcomes = take_composite_write_outcomes();
+
+        // The scenario is asserted, not assumed: at least one visible
+        // composite tile really was paged out again between being written
+        // and being synced, and it really does still report dirty.
+        let evicted: Vec<aurora_tile::TileId> = visible
+            .iter()
+            .copied()
+            .filter(|id| !store.is_resident(composite_surface_id(), *id))
+            .collect();
+        assert!(
+            !evicted.is_empty(),
+            "the store's budget must be small enough to page a just-written composite tile out \
+             mid-pass, or this test exercises nothing: outcomes {outcomes:?}"
+        );
+        for id in &evicted {
+            assert!(
+                store.is_dirty(composite_surface_id(), *id),
+                "an upload is still owed for {id:?}, evicted while dirty"
+            );
+        }
+
+        let stats = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+
+        // The proof, from the atlas: no visible tile may still show red.
+        for id in &visible {
+            let texel = atlas_texel(context.device(), context.queue(), &residency, *id);
+            assert!(
+                texel[2] > 0.99 && texel[0] < 0.01,
+                "the atlas must show the edited document at {id:?}, not the previous frame's \
+                 pixels ({texel:?}; evicted mid-pass {evicted:?}, write_composited outcomes \
+                 {outcomes:?}, sync {stats:?})"
+            );
+        }
     }
 
     // -- `CompositeCache::invalidate_doc_rect` and the narrowed
@@ -23290,8 +28702,65 @@ mod tests {
         );
     }
 
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 11 modes the GPU
+    /// path still cannot express" (27 `aurora_doc::BlendMode` variants
+    /// minus the sixteen admitted as of 0.115.0: `Normal`, `Multiply`,
+    /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
+    /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`, `HardLight`,
+    /// `LinearLight`, `VividLight`, `HardMix` and `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
+    /// mapping and a real CPU formula, so it is a genuine blend mode
+    /// being rejected, not an unimplemented one. This used to use
+    /// `Multiply`, which 0.84.0 moved to the *admitted* side, and then
+    /// `Screen`, which 0.102.0 moved there too. `Difference` joined the
+    /// admitted side in 0.104.0, `LinearDodge` in 0.105.0, `LinearBurn` in
+    /// 0.106.0 and `ColorBurn` in 0.107.0, and this
+    /// const was untouched by any of them, which
+    /// is the point; the sibling tests below
+    /// pin that direction. Going through the const rather than naming a
+    /// mode literally is what makes the next such move one edit.
+    ///
+    /// **The count in the first sentence is hand-maintained, and it
+    /// drifted**: it read "19 … the eight admitted as of 0.105.0" from
+    /// 0.105.0 through 0.107.0, so it was two rounds and two modes stale
+    /// by the time 0.107.1 corrected it. Nothing derives it from
+    /// [`document_qualifies_for_gpu_compositing`]'s own admitted set, and
+    /// nothing fails when it is wrong — see PLAN.md's 0.107.1 entry for
+    /// the named follow-on that would.
     #[test]
     fn document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, CPU_ONLY_BLEND_MODE) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "a GPU-inexpressible blend mode anywhere at the root must disqualify the whole \
+             document"
+        );
+    }
+
+    /// The other half of the boundary 0.84.0 moved: `Multiply` is now
+    /// expressible on the GPU path
+    /// (`composite_multiply_over_with_opacity`), so a root-level
+    /// `Multiply` pixel layer must *not* disqualify the document. Pins
+    /// the widened `matches!` arm directly, headlessly — the
+    /// GPU-vs-CPU differential tests below prove the resulting composite
+    /// is actually right.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_multiply_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
         let bounds = aurora_core::Rect {
             x: 0,
@@ -23310,8 +28779,854 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert!(
-            !document_qualifies_for_gpu_compositing(&layers),
-            "a non-Normal blend mode anywhere at the root must disqualify the whole document"
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Multiply pixel layer must qualify for the GPU path as of 0.84.0"
+        );
+    }
+
+    /// The second ported mode (0.85.0): `Darken` is expressible on the
+    /// GPU path (`composite_darken_over_with_opacity`), so a root-level
+    /// `Darken` pixel layer must *not* disqualify the document. Pins the
+    /// fourth `matches!` alternative directly, headlessly — the
+    /// GPU-vs-CPU differential tests below prove the resulting composite
+    /// is actually right.
+    ///
+    /// Deliberately `Darken`, not `DarkerColor`: the latter picks one
+    /// whole `(R, G, B)` triple by luminosity, has no WGSL entry point,
+    /// and must stay disqualified. Nothing here asserts that directly,
+    /// but `document_qualifies_for_gpu_compositing_is_false_for_a_non_
+    /// normal_blend_mode` covers the general case with
+    /// [`CPU_ONLY_BLEND_MODE`].
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_darken_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Darken) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Darken pixel layer must qualify for the GPU path as of 0.85.0"
+        );
+    }
+
+    /// The third ported mode (0.95.0): `Lighten` is expressible on the
+    /// GPU path (`composite_lighten_over_with_opacity`), so a root-level
+    /// `Lighten` pixel layer must *not* disqualify the document. Pins the
+    /// fifth `matches!` alternative directly, headlessly — the GPU-vs-CPU
+    /// differential test below proves the resulting composite is actually
+    /// right.
+    ///
+    /// Deliberately `Lighten`, not `LighterColor`: the latter picks one
+    /// whole `(R, G, B)` triple by luminosity, has no WGSL entry point,
+    /// and must stay disqualified. Nothing here asserts that directly,
+    /// but `document_qualifies_for_gpu_compositing_is_false_for_a_non_
+    /// normal_blend_mode` covers the general case with
+    /// [`CPU_ONLY_BLEND_MODE`].
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_lighten_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Lighten) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Lighten pixel layer must qualify for the GPU path as of 0.95.0"
+        );
+    }
+
+    /// The fourth ported mode (0.102.0): `Screen` is expressible on the
+    /// GPU path (`composite_screen_over_with_opacity`), so a root-level
+    /// `Screen` pixel layer must *not* disqualify the document. Pins the
+    /// sixth `matches!` alternative directly, headlessly — the GPU-vs-CPU
+    /// differential test below proves the resulting composite is actually
+    /// right.
+    ///
+    /// This is the assertion that inverts what six fixtures in this module
+    /// used to rely on: `Screen` was this suite's own stand-in for "a mode
+    /// the GPU path rejects" until this round, which is why they now go
+    /// through [`CPU_ONLY_BLEND_MODE`] instead. See that const.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_screen_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Screen) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Screen pixel layer must qualify for the GPU path as of 0.102.0"
+        );
+    }
+
+    /// The fifth ported mode (0.104.0): `Difference` is expressible on the
+    /// GPU path (`composite_difference_over_with_opacity`), so a root-level
+    /// `Difference` pixel layer must *not* disqualify the document. Pins
+    /// the sixth `matches!` alternative directly, headlessly — the
+    /// GPU-vs-CPU differential test below proves the resulting composite is
+    /// actually right.
+    ///
+    /// Deliberately `Difference`, not `Subtract` or `Exclusion`: those two
+    /// are its near neighbours (`max(Cb - Cs, 0)` and `Cb + Cs - 2*Cb*Cs`
+    /// respectively), have no WGSL entry point, and must stay disqualified.
+    /// [`CPU_ONLY_BLEND_MODE`] is `Exclusion`, so
+    /// `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    /// blend_mode` already pins one of those two on the rejected side, and
+    /// this round deliberately left that const alone.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_difference_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Difference) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Difference pixel layer must qualify for the GPU path as of 0.104.0"
+        );
+    }
+
+    /// The sixth ported mode (0.105.0): `LinearDodge` is expressible on the
+    /// GPU path (`composite_linear_dodge_over_with_opacity`), so a
+    /// root-level `LinearDodge` pixel layer must *not* disqualify the
+    /// document. Pins the seventh `matches!` alternative directly,
+    /// headlessly — the GPU-vs-CPU differential test below proves the
+    /// resulting composite is actually right.
+    ///
+    /// Deliberately `LinearDodge`. Of its three neighbours, one must stay
+    /// disqualified and two no longer do:
+    ///
+    /// - `LinearBurn` (`max(Cb + Cs - 1, 0)`), this mode's exact mirror
+    ///   image and the realistic copy-paste hazard, **is admitted as of
+    ///   0.106.0** and has its own sibling test below
+    ///   (`document_qualifies_for_gpu_compositing_admits_a_linear_burn_
+    ///   blend_mode`). Until that round it was listed here as a mode that
+    ///   must stay disqualified, which is why this bullet is called out
+    ///   rather than quietly deleted: nothing about *this* test changed,
+    ///   only what is true of that mode;
+    /// - `ColorDodge` (`min(1, Cb / (1 - Cs))`), the *other* dodge-family
+    ///   mode, **is admitted as of 0.108.0** and likewise has its own
+    ///   sibling test below
+    ///   (`document_qualifies_for_gpu_compositing_admits_a_color_dodge_
+    ///   blend_mode`). This bullet listed it as a mode that must stay
+    ///   disqualified until that round, and is called out for the same
+    ///   reason the `LinearBurn` one above is: nothing about *this* test
+    ///   changed, only what is true of that mode. Its hazard has moved
+    ///   rather than gone away. It is no longer "shares half a name with
+    ///   this one and nothing else" — it is the two *adjacent
+    ///   guarded-division dispatch arms* (`ColorBurn` and `ColorDodge`)
+    ///   being confused with each other, which is where 0.107.0 and
+    ///   0.108.0 both put it. And the resemblance to *this* mode is now
+    ///   substantive rather than nominal: `min(1, Cb / (1 - Cs))` clamps
+    ///   exactly when `Cb + Cs >= 1`, which is exactly when
+    ///   `min(Cb + Cs, 1)` clamps, so a clamped channel cannot separate
+    ///   the two at all — the degeneracy `aurora-render`'s own
+    ///   `composite_color_dodge_*` suite header records as its fourth;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
+    ///   already pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as
+    ///   0.104.0 did — and every round from 0.105.0 through 0.108.0 has
+    ///   left it alone since, which is why it is the one neighbour here
+    ///   still on the rejected side.
+    ///
+    /// Nothing here asserts `ColorDodge` directly; the sibling test named
+    /// in its bullet is what pins that mode's own predicate arm.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_linear_dodge_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::LinearDodge) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level LinearDodge pixel layer must qualify for the GPU path as of 0.105.0"
+        );
+    }
+
+    /// The seventh blend-math mode's predicate arm (0.106.0), the sibling
+    /// of `document_qualifies_for_gpu_compositing_admits_a_linear_dodge_
+    /// blend_mode` directly above. Headless and pure — the GPU-vs-CPU
+    /// differential `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_
+    /// a_linear_burn_blend_document` is what checks the resulting composite
+    /// is actually right, and the counter assertion inside it is what
+    /// checks the GPU arm ran at all.
+    ///
+    /// Deliberately `LinearBurn`, and deliberately not either of the two
+    /// neighbours that must stay disqualified:
+    ///
+    /// - `Subtract` (`max(Cb - Cs, 0)`), which shares this mode's clamp
+    ///   direction and its subtraction while differing in *what* is
+    ///   subtracted — near enough to be a real copy-paste hazard;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
+    ///   already pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as
+    ///   0.104.0 and 0.105.0 did — so both tracked CPU-fallback benchmarks
+    ///   stay comparable across it and no fixture needed retargeting.
+    ///
+    /// Two modes are deliberately *not* in that list. `LinearDodge`, this
+    /// mode's exact mirror image, has been admitted since 0.105.0. And
+    /// **`ColorBurn` — the *other* burn-family mode, which shares half a
+    /// name with this one and nothing else — has been admitted since
+    /// 0.107.0**; this doc comment listed it as a mode that "must stay
+    /// disqualified" until that round, and the claim was corrected in the
+    /// same commit that admitted it. For both, the hazard is now about the
+    /// two dispatch arms being confused with each other, not about one
+    /// leaking onto the GPU path.
+    ///
+    /// Nothing here asserts the first directly — that general case is
+    /// what [`CPU_ONLY_BLEND_MODE`]'s own test covers.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_linear_burn_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::LinearBurn) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level LinearBurn pixel layer must qualify for the GPU path as of 0.106.0"
+        );
+    }
+
+    /// The eighth blend-math mode's predicate arm (0.107.0), the sibling
+    /// of `document_qualifies_for_gpu_compositing_admits_a_linear_burn_
+    /// blend_mode` directly above. Headless and pure — the GPU-vs-CPU
+    /// differential `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_
+    /// a_color_burn_blend_document` is what checks the resulting composite
+    /// is actually right, and the counter assertion inside it is what
+    /// checks the GPU arm ran at all.
+    ///
+    /// Deliberately `ColorBurn`. When this test was written 0.107.0 also
+    /// listed `ColorDodge` (`min(1, Cb / (1 - Cs))`) among the neighbours
+    /// that "must stay disqualified" — **that claim is false as of
+    /// 0.108.0**, which admitted it, and the sibling
+    /// `document_qualifies_for_gpu_compositing_admits_a_color_dodge_blend_mode`
+    /// directly below now asserts the opposite. (That bullet also printed
+    /// the formula with a spurious outer `1 -`, one of six sites that made
+    /// the same slip; all six were corrected in the same round, though that
+    /// round's own count said five — it missed the `ColorBurn` dispatch-arm
+    /// comment in `begin_gpu_composite_tile`, which was fixed but not
+    /// counted. 0.108.1 corrected the count.) What
+    /// remains true is the *shape* of the relationship: `ColorDodge` is the
+    /// other guarded-division mode and the nearest thing in the whole enum
+    /// to this one's — same two-guard structure, same clamped quotient,
+    /// mirrored operands and mirrored branch conditions (`Cb == 0` and
+    /// `Cs == 1` against this mode's `Cb == 1` and `Cs == 0`) — which is
+    /// exactly why their two dispatch arms sit adjacent and why each
+    /// shader was written from `blend_channel` rather than from the other.
+    ///
+    /// The neighbours that *do* still have to stay disqualified:
+    ///
+    /// - `VividLight`, which is *defined* in terms of this mode
+    ///   (`blend_channel` dispatches its `Cs <= 0.5` half straight to the
+    ///   `ColorBurn` arm), so admitting `ColorBurn` at the predicate is
+    ///   exactly the kind of change that could look like it admits
+    ///   `VividLight` too. It does not, and must not: `VividLight` has no
+    ///   WGSL entry point;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
+    ///   already pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as
+    ///   0.104.0, 0.105.0 and 0.106.0 did — so both tracked CPU-fallback
+    ///   benchmarks stay comparable across it and no fixture needed
+    ///   retargeting.
+    ///
+    /// Note `LinearBurn`, the other burn-family mode, is *not* in that
+    /// list: it has been admitted since 0.106.0. The half-a-name hazard is
+    /// therefore about the two adjacent dispatch arms being confused with
+    /// each other, not about one leaking onto the GPU path.
+    ///
+    /// Nothing here asserts the first two directly — that general case is
+    /// what [`CPU_ONLY_BLEND_MODE`]'s own test covers.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_color_burn_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::ColorBurn) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level ColorBurn pixel layer must qualify for the GPU path as of 0.107.0"
+        );
+    }
+
+    /// The ninth blend-math mode's predicate arm (0.108.0), the sibling of
+    /// `document_qualifies_for_gpu_compositing_admits_a_color_burn_blend_
+    /// mode` directly above. Headless and pure — the GPU-vs-CPU
+    /// differential `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_
+    /// a_color_dodge_blend_document` is what checks the resulting composite
+    /// is actually right, and the counter assertion inside it is what
+    /// checks the GPU arm ran at all.
+    ///
+    /// **This test is also what makes the sibling above's corrected bullet
+    /// checkable rather than asserted**: that test's doc comment used to
+    /// name `ColorDodge` as a neighbour which "must stay disqualified", and
+    /// this test is the direct contradiction of it. If a later round reverts
+    /// the predicate arm, this fails rather than that prose quietly becoming
+    /// true again.
+    ///
+    /// Deliberately `ColorDodge`, and deliberately none of its neighbours,
+    /// every one of which must still stay disqualified:
+    ///
+    /// - `VividLight`, which is *defined* partly in terms of this mode
+    ///   (`aurora_render::blend_channel` dispatches its `Cs > 0.5` half
+    ///   straight to the `ColorDodge` arm, and its `Cs <= 0.5` half to the
+    ///   `ColorBurn` one), so admitting `ColorDodge` at the predicate is
+    ///   exactly the kind of change that could look like it admits
+    ///   `VividLight` too. **And as of this round `VividLight` is a mode
+    ///   whose *both* halves delegate to admitted modes**, which makes the
+    ///   confusion more available than it was, not less. It is still
+    ///   disqualified and must be, on the one reason that survives:
+    ///   `VividLight` has no WGSL entry point of its own, so no
+    ///   `fragment_entry` and no dispatch arm can express it. **The reason
+    ///   this bullet used to give second — "its branch is on `Cs`, which
+    ///   nothing on the GPU path expresses" — stopped being true in
+    ///   0.111.0**, when `fs_composite_hard_light` landed branching on `Cs`;
+    ///   a branch on the source is no longer a disqualifier by itself, and
+    ///   the conclusion here never depended on it;
+    /// - `Divide` (`Cs == 0 -> 1`, else `min(1, Cb / Cs)`), which is a
+    ///   *third* guarded division and the one this mode is genuinely easy to
+    ///   confuse with arithmetically rather than structurally — `Cb / Cs`
+    ///   against `Cb / (1 - Cs)`, the same clamp, one guard instead of two.
+    ///   Still CPU-only;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
+    ///   already pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as
+    ///   0.104.0 through 0.107.0 each did — so both tracked CPU-fallback
+    ///   benchmarks stay comparable across it and no fixture needed
+    ///   retargeting.
+    ///
+    /// Note `LinearDodge`, the other dodge-family mode, and `ColorBurn`,
+    /// the other guarded-division one, are *not* in that list: both have
+    /// been admitted since 0.105.0 and 0.107.0 respectively. The hazards
+    /// they pose are therefore about adjacent dispatch arms being confused
+    /// with each other, not about one leaking onto the GPU path.
+    ///
+    /// Nothing here asserts the first two directly — that general case is
+    /// what [`CPU_ONLY_BLEND_MODE`]'s own test covers.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_color_dodge_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::ColorDodge) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level ColorDodge pixel layer must qualify for the GPU path as of 0.108.0"
+        );
+    }
+
+    /// The twelfth blend-math mode's predicate arm (0.113.0).
+    ///
+    /// **Why this exists when neither `Overlay`'s (0.110.0) nor `HardLight`'s
+    /// (0.111.0) round added one.** That per-mode series stopped after
+    /// `ColorDodge`, and 0.112.0's
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` genuinely supersedes it for the failure this kind of
+    /// test was originally *meant* to catch: that derived test calls the real
+    /// predicate once per [`aurora_doc::BlendMode`] variant and pins the whole
+    /// admitted set, so a mode missing from the `matches!` fails there whether
+    /// or not it has a test of its own. This one is added anyway, for a reason
+    /// the derived test cannot serve: it names *this* mode and *this* round in
+    /// its failure message, so a bisect landing on a reverted predicate arm
+    /// reads "`LinearLight`, 0.113.0" rather than a set-difference dump. It is
+    /// twenty lines and headless. If a later round decides the series is dead
+    /// weight, deleting it is a defensible call — but delete it deliberately
+    /// rather than by omission, and say so.
+    ///
+    /// Deliberately `LinearLight`, and deliberately none of its neighbours,
+    /// each of which must still stay disqualified. **The bullet list below is
+    /// historical as of 0.113.0 and is deliberately left in the present tense
+    /// it was written in, with this sentence as the correction** (0.115.1):
+    /// `VividLight` was admitted in 0.114.0 and `HardMix` in 0.115.0, so two of
+    /// the modes it calls disqualified now qualify. Rewriting the bullets would
+    /// destroy the record of what this round could actually claim; the modes
+    /// this test *asserts* anything about are only the ones its own body names,
+    /// and its body names `LinearLight` alone. `PinLight` was ported in 0.116.0,
+    /// so `SoftLight` is the only member of the family still CPU-only, and
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` is what actually pins the whole admitted set at any
+    /// given commit — read that, not this list, for the current one.
+    ///
+    /// - `VividLight` and `PinLight`, the two remaining branch-on-the-source
+    ///   overlay-family modes (`VividLight` **as of 0.113.0 only**). `PinLight`
+    ///   is the one to watch: like this mode
+    ///   its branch form delegates to a pair of *admitted* modes
+    ///   (`Darken`/`Lighten`, where this mode's form uses
+    ///   `LinearBurn`/`LinearDodge`), so "both halves reach admitted arms" is
+    ///   now true of it too and is **not** what admits a mode. What admits one
+    ///   is having a WGSL entry point; `PinLight` has none, and unlike this
+    ///   mode its branch form does *not* collapse to a single expression —
+    ///   `min`/`max` do not telescope the way the two clamps do. (0.116.0 gave
+    ///   it one, `fs_composite_pin_light`, written as a `select()` over exactly
+    ///   those two arms — which is the branch this comment says cannot be
+    ///   collapsed, kept rather than collapsed, so the observation held);
+    /// - `SoftLight` and `HardMix`, the rest of that family, both still
+    ///   CPU-only **as of 0.113.0** — `HardMix` was ported in 0.115.0 and only
+    ///   `SoftLight` is still CPU-only of the two;
+    /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, which are near-misses for
+    ///   other modes rather than this one;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as every
+    ///   round since 0.104.0 except `Screen`'s has — so both PLAN.md-tracked
+    ///   CPU-fallback benchmarks stay comparable across it and no fixture
+    ///   needed retargeting.
+    ///
+    /// Note `LinearBurn` and `LinearDodge` — the two modes this one's formula
+    /// *degenerates to* under a dropped `2.0 *` or a dropped clamp bound — are
+    /// **not** in that list: both have been admitted since 0.106.0 and 0.105.0.
+    /// The hazard they pose is adjacent dispatch arms and near-miss arithmetic
+    /// being confused with each other, not one leaking onto the GPU path. That
+    /// is exactly why this mode's fixtures are chosen for their clamp regimes.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_
+    /// blend_document` is what checks the resulting composite is actually
+    /// right, and the counter assertion inside it is what checks the GPU arm
+    /// ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_linear_light_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::LinearLight) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level LinearLight pixel layer must qualify for the GPU path as of 0.113.0"
+        );
+    }
+
+    /// The thirteenth blend-math mode's predicate arm (0.114.0).
+    ///
+    /// Kept for the same narrow reason the `LinearLight` sibling directly above
+    /// gives, and no other: 0.112.0's
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` already pins the whole admitted set by *calling* the
+    /// predicate once per [`aurora_doc::BlendMode`] variant, so a mode missing
+    /// from the `matches!` fails there regardless. What this adds is a failure
+    /// message naming *this* mode and *this* round, so a bisect landing on a
+    /// reverted predicate arm reads "`VividLight`, 0.114.0" rather than a
+    /// set-difference dump.
+    ///
+    /// Deliberately `VividLight`, and deliberately none of its neighbours,
+    /// each of which must still stay disqualified:
+    ///
+    /// - `PinLight`, now the **only** remaining branch-on-the-source
+    ///   overlay-family mode whose two halves both reach admitted arms
+    ///   (`Darken`/`Lighten`). It is the one to watch for exactly the reason
+    ///   the sibling above gives, and this round strengthens rather than
+    ///   weakens that warning: this mode's admission was earned by writing a
+    ///   WGSL entry point that *delegates* to two existing helpers, which is
+    ///   the closest anything has come to "it composes out of admitted modes,
+    ///   so admit it". It still is not what admits a mode — `PinLight` has no
+    ///   entry point, so its layers must still fall to the CPU. (True of
+    ///   0.114.0 only; marked in 0.116.0, which gave it one and admitted it,
+    ///   exactly as this bullet demanded of any admission);
+    /// - `SoftLight` and `HardMix`, the rest of that family. `HardMix` is worth
+    ///   naming here for the first time: `blend_channel` implements it as a
+    ///   hard threshold on **this mode's own result**, so `VividLight` reaching
+    ///   the GPU makes `HardMix` the one CPU-only mode that now delegates to a
+    ///   *ported* mode's arm. That is a reason to check `HardMix`'s existing CPU
+    ///   tests still pass unchanged (they do — this round changed no
+    ///   `blend_channel` arm), not a reason to admit it: it has no entry point
+    ///   either. **All of which was true only of 0.114.0** (marked in 0.115.1):
+    ///   0.115.0 gave `HardMix` its own `fs_composite_hard_mix` and admitted it,
+    ///   which is what that bullet demanded of any admission and is recorded in
+    ///   `document_qualifies_for_gpu_compositing_admits_a_hard_mix_blend_mode`
+    ///   below. `SoftLight` alone is still CPU-only of the two;
+    /// - `Subtract` and `Divide`, near-misses for other modes rather than this
+    ///   one;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side. This round deliberately left that const
+    ///   alone, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable
+    ///   across it and no fixture needed retargeting.
+    ///
+    /// Note `ColorBurn` and `ColorDodge` — the two modes whose per-channel
+    /// helpers this one's shader literally calls — are **not** in that list:
+    /// both have been admitted since 0.107.0 and 0.108.0. The hazard they pose
+    /// is a wrong `fragment_entry` or a wrong `composite_*` call, not one
+    /// leaking onto the GPU path, which is why this mode's fixtures are chosen
+    /// to span both branches with a clamp-interior channel in each.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_vivid_light_
+    /// blend_document` is what checks the resulting composite is actually
+    /// right, and the counter assertion inside it is what checks the GPU arm
+    /// ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_vivid_light_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::VividLight) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level VividLight pixel layer must qualify for the GPU path as of 0.114.0"
+        );
+    }
+
+    /// The fourteenth blend-math mode's predicate arm (0.115.0).
+    ///
+    /// Kept for the same narrow reason the two siblings directly above give:
+    /// 0.112.0's
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` already pins the whole admitted set by *calling* the
+    /// predicate once per [`aurora_doc::BlendMode`] variant, so a mode missing
+    /// from the `matches!` fails there regardless. What this adds is a failure
+    /// message naming *this* mode and *this* round, so a bisect landing on a
+    /// reverted predicate arm reads "`HardMix`, 0.115.0" rather than a
+    /// set-difference dump.
+    ///
+    /// Deliberately `HardMix`, and deliberately none of its neighbours, each of
+    /// which must still stay disqualified:
+    ///
+    /// - `PinLight`, now the **last** unported branch-on-the-source
+    ///   overlay-family mode, and the last mode of any kind whose two halves
+    ///   both reach admitted arms (`Darken`/`Lighten`). Two rounds running have
+    ///   admitted a mode whose shader *delegates* to existing helpers — 0.114.0
+    ///   to `color_burn_channel`/`color_dodge_channel`, this round to
+    ///   `vivid_light_channel` — so the warning that "it composes out of
+    ///   admitted modes" is not what admits a mode is now carrying more weight
+    ///   than ever. It still is not: `PinLight` has no entry point, so its
+    ///   layers must still fall to the CPU. (True of 0.115.0 only; marked in
+    ///   0.116.0, which wrote `fs_composite_pin_light` and admitted it — the
+    ///   third round running to admit a mode built out of already-admitted
+    ///   pieces, and the third to have to earn it with an entry point);
+    /// - `SoftLight`, the remaining member of that family and the only one with
+    ///   genuinely independent math (its own `soft_light_d`), so nothing this
+    ///   round did brings it any closer;
+    /// - `Subtract` and `Divide`, near-misses for other modes rather than this
+    ///   one;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side. This round deliberately left that const
+    ///   alone, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable
+    ///   across it and no fixture needed retargeting.
+    ///
+    /// Note `VividLight`, `ColorBurn` and `ColorDodge` — the three modes this
+    /// one's shader reaches transitively — are **not** in that list: all three
+    /// have been admitted since 0.114.0, 0.107.0 and 0.108.0. The hazard they
+    /// pose is a wrong `fragment_entry` or a wrong `composite_*` call, not one
+    /// leaking onto the GPU path, and which channels can see each is settled by
+    /// `hard_mix_channel`'s degeneracy 2 rather than left to a fixture's luck.
+    ///
+    /// **This round also closes a note the `VividLight` arm's own comment left
+    /// open**: it named `HardMix` as "the one CPU-only mode that now delegates
+    /// to a *ported* mode's arm", and said that was a reason to check its CPU
+    /// tests rather than to admit it. Admitting it now needed a real WGSL entry
+    /// point of its own, exactly as that comment insisted — this round changed
+    /// no `blend_channel` arm and `hard_mix_produces_only_pure_black_or_white`
+    /// still passes unchanged.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_blend_
+    /// document` is what checks the resulting composite is actually right, and
+    /// the counter assertion inside it is what checks the GPU arm ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_hard_mix_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::HardMix) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level HardMix pixel layer must qualify for the GPU path as of 0.115.0"
+        );
+    }
+
+    /// The fifteenth blend-math mode's predicate arm (0.116.0).
+    ///
+    /// Kept for the same narrow reason the three siblings directly above give:
+    /// 0.112.0's
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` already pins the whole admitted set by *calling* the
+    /// predicate once per [`aurora_doc::BlendMode`] variant, so a mode missing
+    /// from the `matches!` fails there regardless. What this adds is a failure
+    /// message naming *this* mode and *this* round, so a bisect landing on a
+    /// reverted predicate arm reads "`PinLight`, 0.116.0" rather than a
+    /// set-difference dump.
+    ///
+    /// **This round closes the standing note three of those four siblings
+    /// carried.** 0.113.0, 0.114.0 and 0.115.0 each named `PinLight` as "the one
+    /// to watch" and each said the same thing about it: its branch form
+    /// delegates to two *admitted* modes (`Darken`/`Lighten`), so "both halves
+    /// reach admitted arms" was true of it and was **not** what admitted a mode
+    /// — what admits one is having a WGSL entry point, and `PinLight` had none.
+    /// It now does, `fs_composite_pin_light`, which is what those comments
+    /// demanded of any admission. They are deliberately left in the present
+    /// tense they were written in; this bullet is the correction.
+    ///
+    /// Deliberately `PinLight`, and deliberately none of its neighbours, each of
+    /// which must still stay disqualified:
+    ///
+    /// - `SoftLight`, now the **only** remaining member of the overlay family
+    ///   and the only separable mode of any kind still CPU-only that a round of
+    ///   this shape could plausibly take next. It is also the one with genuinely
+    ///   independent math (`soft_light_d`, a `sqrt` and a cubic), so nothing
+    ///   this round did brings it any closer — unlike every port since 0.110.0,
+    ///   this one reused two *arms* rather than two *helpers*, and `SoftLight`
+    ///   has neither to reuse;
+    /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, near-misses for other
+    ///   modes rather than this one;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as every
+    ///   round since 0.104.0 except `Screen`'s has — so both PLAN.md-tracked
+    ///   CPU-fallback benchmarks stay comparable across it and no fixture needed
+    ///   retargeting.
+    ///
+    /// Note `Darken` and `Lighten` — the two modes whose arms this one's two
+    /// branches *are* — are **not** in that list: both have been admitted since
+    /// 0.85.0 and 0.95.0. The hazard they pose is a wrong `fragment_entry` or a
+    /// wrong `composite_*` call, not one leaking onto the GPU path, and which
+    /// channels can see each is settled provably (a backdrop-wins channel agrees
+    /// with the matching one) rather than left to a fixture's luck — which is
+    /// why `NORMAL_MULTIPLY_PIN_LIGHT_STACK` carries a source-derived channel in
+    /// each branch.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_pin_light_blend_
+    /// document` is what checks the resulting composite is actually right, and
+    /// the counter assertion inside it is what checks the GPU arm ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_pin_light_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::PinLight) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level PinLight pixel layer must qualify for the GPU path as of 0.116.0"
+        );
+    }
+
+    /// `Dissolve` needs no GPU-side support to be admitted (0.84.1):
+    /// `resolve_tile` intercepts it on the CPU, applies `dissolve_gate`,
+    /// and hands back an already-gated buffer at `(opacity = 1.0,
+    /// blend_mode = Normal)` — so `begin_gpu_composite_tile` only ever
+    /// sees `Normal` for such a layer and reuses its existing arm. Pins
+    /// the third `matches!` arm headlessly; the GPU-vs-CPU differential
+    /// sibling below proves the composite is actually identical either
+    /// way on real hardware.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_dissolve_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Dissolve) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Dissolve pixel layer must qualify for the GPU path as of 0.84.1 -- \
+             resolve_tile has already reduced it to Normal by the time the GPU path dispatches"
+        );
+    }
+
+    /// **The disclosure this round owed** (0.84.1). 0.84.0's own PLAN.md
+    /// entry framed the widened predicate as something a user opts into
+    /// by setting a root-level layer to `Multiply`. It is not: the app's
+    /// own default startup fixture ([`demo_document`], used by
+    /// [`startup_document`]) already has a root-level `Multiply` pixel
+    /// layer — "Color balance", at opacity 0.8 — so admitting `Multiply`
+    /// put *every first launch, on every backend* onto the new ping-pong
+    /// GPU path with no user action at all.
+    ///
+    /// That is a real, deliberate scope fact rather than an accident, so
+    /// it gets an assertion instead of a footnote: this test is what
+    /// makes the transition reviewable, and what would make a future
+    /// change to either `demo_document`'s layer stack or the predicate's
+    /// admitted mode set show up as a failing test rather than a silent
+    /// change to what the first frame every user ever sees runs through.
+    /// Cheap and headless — no GPU, no tile store, just the predicate.
+    #[test]
+    fn the_default_startup_document_is_on_the_gpu_composite_path() {
+        let (layers, _history) = demo_document();
+        let multiply_roots = layers
+            .roots()
+            .iter()
+            .filter(|&&id| layers.blend_mode(id) == Some(aurora_doc::BlendMode::Multiply))
+            .count();
+        assert_eq!(
+            multiply_roots, 1,
+            "setup: demo_document is expected to carry exactly one root-level Multiply layer \
+             (\"Color balance\") -- if that changed, this test's own premise needs rewriting, \
+             not deleting"
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "the default startup document must be GPU-tractable as of 0.84.0 -- this is not an \
+             opt-in path: every user hits begin_gpu_composite_tile's Multiply arm on first \
+             launch, which is why the Metal/DX12 hardware gate applies to the first-run \
+             experience and not merely to a hand-built fixture"
         );
     }
 
@@ -23472,7 +29787,12 @@ mod tests {
     /// resolve first never mattered structurally. This is the specific
     /// case the streaming rewrite must get right: the *bottom* root has
     /// no content at this tile at all (never filled, so `resolve_tile`
-    /// returns `None` and the loop `continue`s past it), so the
+    /// returns `None` and the loop `continue`s past it — true as of
+    /// 0.87.0's `contains_tile` guard; when this test was written that
+    /// root in fact resolved to `Some(`all-zero texels`)` and *did*
+    /// create the destination texture, so the fixture only ever tested
+    /// the lazily-created reference surviving further iterations, not the
+    /// skip it describes), so the
     /// destination texture is only created on the *middle* root, the
     /// first one that actually has something to composite — not on the
     /// first root in iteration order. A bug that created the
@@ -23927,13 +30247,5916 @@ mod tests {
         }
     }
 
+    /// **0.84.0's headline proof**: a real document with a
+    /// `Multiply`-blend layer composites on the *GPU* path now, not just
+    /// the CPU one, and lands on the same pixels either way.
+    ///
+    /// Two root-level opaque mid-grey (`0.5`) pixel layers: `bottom` at
+    /// `Normal`, `top` at `Multiply`. The predicate assertion is what
+    /// makes this non-vacuous — before 0.84.0 this exact fixture routed
+    /// the whole document to the CPU fallback, so an identical test
+    /// would have been comparing the CPU path against itself. It now
+    /// asserts `document_qualifies_for_gpu_compositing` is `true`, so the
+    /// first run really does go through `begin_gpu_composite_tile`'s
+    /// `Multiply` arm and `composite_multiply_over_with_opacity`'s WGSL
+    /// math.
+    ///
+    /// Both a differential (GPU vs CPU) *and* an absolute check.
+    /// `Multiply(0.5, 0.5) = 0.25` over an opaque backdrop at full
+    /// opacity, so the hand-computed answer is `(0.25, 0.25, 0.25, 1.0)`
+    /// — the same worked case `aurora-render`'s own
+    /// `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`
+    /// pins for the CPU formula in isolation. A `Normal` composite of the
+    /// same two layers would give `0.5` instead, so a dispatch bug that
+    /// silently took the `Normal` arm fails here rather than passing.
+    ///
+    /// The tolerance loop is the same `2 * f16::EPSILON` the sibling
+    /// arbitrary-opacity test uses and documents; every value here is an
+    /// exact binary fraction, so no rounding latitude is actually in
+    /// play, but the shared tolerance keeps the comparison shape
+    /// identical across these tests rather than inventing a second one.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_multiply_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [0.5, 0.5, 0.5, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Multiply pixel layer must qualify for the GPU path as of 0.84.0 -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        // Run 1: the real GPU path, through the `Multiply` arm.
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        // Run 2: force the CPU path by passing no GPU/compositor at all.
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU Multiply path and the CPU path diverged by more \
+                 than {tolerance} ({gpu} vs {cpu}) -- that is a real finding to report, not a \
+                 reason to loosen this assertion. Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.25, 0.25, 1.0),
+            "Multiply(0.5, 0.5) = 0.25 must come out of the GPU path itself -- (0.5, 0.5, 0.5, \
+             1.0) would mean the Normal arm ran instead"
+        );
+    }
+
+    /// **The swap-direction test.** A two-layer `Multiply` fixture can
+    /// pass by accident: with only one swap, "read back whichever member
+    /// the fold ended on" and "read back the member `Multiply` wrote"
+    /// name the same texture. This one cannot be satisfied that way.
+    ///
+    /// Four root-level pixel layers, bottom to top, with the accumulator
+    /// pair written as A (the initially-`current` member) and B:
+    ///
+    /// | # | mode       | opacity | colour                | pass writes | `current` after |
+    /// |---|------------|---------|-----------------------|-------------|-----------------|
+    /// | 1 | `Normal`   | 1.0     | `(0.5, 0.75, 1.0, 1)` | A, in place | A               |
+    /// | 2 | `Multiply` | 1.0     | `(0.5, 0.5, 0.5, 1)`  | B (from A)  | **B**           |
+    /// | 3 | `Normal`   | 0.5     | `(0.0, 0.0, 1.0, 1)`  | B, in place | B               |
+    /// | 4 | `Multiply` | 0.5     | `(0.25, 1.0, 0.5, 1)` | A (from B)  | **A**           |
+    ///
+    /// So this forces two swaps *and* a `Normal` blend onto a post-swap
+    /// accumulator (layer 3, blending in place on B rather than on the
+    /// texture the fold started in). Three distinct ways to get the
+    /// ping-pong wrong all produce a different, silently plausible
+    /// composite here and fail:
+    ///
+    /// - never advancing `current` — layer 3 would blend onto A (stale,
+    ///   holding only layer 1) and layer 4 would multiply the wrong
+    ///   backdrop;
+    /// - advancing it on `Normal` instead of `Multiply` — every layer
+    ///   after the first lands on the wrong member;
+    /// - reading back a fixed member instead of `current` — here the
+    ///   fold ends on A, so an "always index 0" readback happens to be
+    ///   *right*, which is exactly why the table above is worth reading
+    ///   when this fails: the readback bug is caught by the
+    ///   `..._agree_on_a_multiply_blend_document` sibling (odd number of
+    ///   swaps), and this one catches the accumulate-direction bugs.
+    ///
+    /// Differential only, no hand-computed golden: the CPU reference is
+    /// independently proven by `aurora-render`'s own per-mode tests and
+    /// by this module's absolute-value siblings, and hand-computing four
+    /// chained composites would restate that arithmetic rather than test
+    /// it. The `assert_ne!` against transparent black is the setup guard
+    /// that keeps the differential from passing on two empty results.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing for something this test
+    /// never mentions** (recorded 0.105.3): it is the only reason the
+    /// `Multiply` *dispatch arm*'s `src`/`backdrop` argument order is
+    /// observable anywhere in the workspace. `Cb * Cs` is commutative, so
+    /// only the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, can ever see the two operands
+    /// swapped, and it cannot at `a = 1` — the dedicated
+    /// `..._agree_on_a_multiply_blend_document` sibling is all-opacity-`1.0`
+    /// and provably blind to that mutation. This fixture and the
+    /// `..._reads_back_the_right_member_after_an_odd_swap_count` one below
+    /// are the *two* tests PLAN.md's 0.105.2 kill matrix measured a
+    /// transposed `Multiply` arm dying on, and nothing else in the suite
+    /// caught it. Normalising this layer's opacity to `1.0` during some
+    /// later cleanup would silently reopen that gap: this test is
+    /// differential-only, so unlike its `Lighten`/`Screen`/`Difference`/
+    /// `LinearDodge` siblings it has no absolute golden that such an edit
+    /// would break. The fixture table therefore lives in
+    /// [`MIXED_NORMAL_AND_MULTIPLY_STACK`], which
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+    /// re-checks headlessly. (Moving it there also took the body from 101
+    /// lines to well under the 100-line `clippy::too_many_lines` limit,
+    /// which is why that allow and its note are gone.)
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, mode, opacity, rgba) in MIXED_NORMAL_AND_MULTIPLY_STACK {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply root stack must qualify for the GPU path -- otherwise this \
+             test would compare the CPU path against itself and prove nothing about the \
+             ping-pong"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // at the bottom reads is this run's dispatches and nothing else's.
+        // Retrofitted in 0.103.0: this arm had no dispatch proof at all
+        // for three rounds, which mattered more here than for any of the
+        // other four modes -- see `GpuBlendDispatches`.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        // Two = this stack's two `Multiply` layers (`l2` and `l4`),
+        // dispatched once each for the single tile they actually have
+        // content at. The 256x256 residency viewport marks four tiles
+        // visible at `TILE` = 256; the other three resolve nothing at all
+        // and take `begin_gpu_composite_tile`'s `current?` bail before any
+        // blend pass is recorded (0.87.0). The second, CPU-only run above
+        // adds none, which is itself part of what this pins. **A count of 0
+        // is the failure this assertion exists for**: it means no
+        // `Multiply` tile reached the GPU and the differential below is
+        // comparing the CPU path against itself. A non-zero count that is
+        // not 2 means the viewport or tile geometry moved under this
+        // fixture -- re-derive it rather than loosening the assertion.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply),
+            2,
+            "both Multiply layers must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: the fixture must really composite to something"
+        );
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU ping-pong and the CPU path diverged by more than \
+                 {tolerance} across a mixed Normal/Multiply stack ({gpu} vs {cpu}) -- read this \
+                 test's own doc-comment layer table to work out which pass wrote which member. \
+                 Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    /// Builds a document of root-level solid-colour pixel layers from
+    /// `entries` (bottom to top: name, blend mode, opacity, RGBA), each
+    /// filling the whole of tile `(0, 0)` on its own surface — the
+    /// fixture shape every ping-pong differential test below needs, so
+    /// the interesting part of each of those tests is its layer table
+    /// rather than twenty lines of `add_pixel_layer`/`set_blend_mode`
+    /// boilerplate. Deliberately a *new* helper used only by the tests
+    /// added in 0.84.1: the 0.84.0 tests above keep their own inline
+    /// setup untouched.
+    fn solid_root_stack(
+        store: &mut aurora_tile::TileStore,
+        entries: &[(&str, aurora_doc::BlendMode, f32, [f32; 4])],
+    ) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for &(name, mode, opacity, rgba) in entries {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(store, surface, aurora_tile::TileId { x: 0, y: 0 }, rgba);
+        }
+        layers
+    }
+
+    /// One [`solid_root_stack`] entry — `(layer name, blend mode,
+    /// opacity, solid RGBA)` — named once (0.105.3) so the fixture
+    /// constants below, the roster that walks them and the tests that
+    /// composite them all share a single spelling of the tuple.
+    type StackEntry = (&'static str, aurora_doc::BlendMode, f32, [f32; 4]);
+
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_
+    /// multiply_stack`'s own four-layer fixture, and one of exactly two
+    /// places a transposed `Multiply` dispatch arm is visible (via `l4`'s
+    /// opacity `0.5`). Hoisted out of that test in 0.105.3 so
+    /// [`TRANSPOSE_COVERAGE`]'s guard can read the same data the test
+    /// composites, rather than a copy of it that could drift. Read that
+    /// test's doc comment for the swap-direction table these values were
+    /// chosen for.
+    const MIXED_NORMAL_AND_MULTIPLY_STACK: [StackEntry; 4] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.5,
+            [0.0, 0.0, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Multiply,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+    ];
+
+    /// `recomposite_visible_tiles_gpu_path_reads_back_the_right_member_
+    /// after_an_odd_swap_count`'s five-layer fixture — three `Multiply`
+    /// layers, so three swaps — and the second of the two places a
+    /// transposed `Multiply` dispatch arm is visible (again `l4`'s
+    /// opacity `0.5`; `l2` and `l5` sit at `1.0`, where the swap cannot
+    /// be seen). Hoisted in 0.105.3, same reason as above.
+    const FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK: [StackEntry; 5] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.75,
+            [0.0, 0.25, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Multiply,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+        (
+            "l5",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.5, 0.25, 1.0],
+        ),
+    ];
+
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_
+    /// multiply_and_darken_stack`'s five-layer fixture, and the *only*
+    /// place a transposed `Darken` dispatch arm is visible (`l4`'s
+    /// opacity `0.5`). Hoisted in 0.105.3, same reason as above.
+    const MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK: [StackEntry; 5] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.5, 0.75, 1.0, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Normal,
+            0.75,
+            [0.0, 0.25, 1.0, 1.0],
+        ),
+        (
+            "l4",
+            aurora_doc::BlendMode::Darken,
+            0.5,
+            [0.25, 1.0, 0.5, 1.0],
+        ),
+        (
+            "l5",
+            aurora_doc::BlendMode::Darken,
+            1.0,
+            [0.75, 0.5, 0.25, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_lighten_blend_document`'s three-layer fixture
+    /// (0.95.0), with the `Lighten` layer at opacity `0.5` as of 0.105.2 —
+    /// deliberately, and the golden `(0.1875, 0.375, 0.5, 1.0)` is derived
+    /// from that value.
+    const NORMAL_MULTIPLY_LIGHTEN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Lighten,
+            0.5,
+            [0.25, 0.25, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_screen_blend_document`'s three-layer fixture
+    /// (0.102.0), `Screen` layer at opacity `0.5` as of 0.105.2; golden
+    /// `(0.234375, 0.453125, 0.53125, 1.0)`.
+    const NORMAL_MULTIPLY_SCREEN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Screen,
+            0.5,
+            [0.25, 0.25, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_difference_blend_document`'s three-layer fixture
+    /// (0.104.0), `Difference` layer at opacity `0.5` as of 0.105.2;
+    /// golden `(0.25, 0.3125, 0.375, 1.0)`. Its source colour is chosen so
+    /// `|Cb - Cs|` has three distinct magnitudes — see that test.
+    const NORMAL_MULTIPLY_DIFFERENCE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Difference,
+            0.5,
+            [0.5, 0.125, 0.75, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_linear_dodge_blend_document`'s three-layer fixture
+    /// (0.105.0), `LinearDodge` layer at opacity `0.5` as of 0.105.1 — the
+    /// round that discovered this whole class of gap, on this arm.
+    const NORMAL_MULTIPLY_LINEAR_DODGE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.25, 0.75, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::LinearDodge,
+            0.5,
+            [0.25, 0.875, 0.5, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_linear_burn_blend_document`'s three-layer fixture
+    /// (0.106.0), with the `LinearBurn` layer at opacity `0.5` **from its
+    /// first commit** — the first mode ported after 0.105.3's guard
+    /// existed, so the non-unit opacity was a precondition of the round
+    /// rather than a retrofit. Golden `(0.375, 0.25, 0.15625, 1.0)`.
+    ///
+    /// `l1`/`l2` differ from the `Lighten`/`Screen`/`Difference`/
+    /// `LinearDodge` fixtures' shared `(0.25, 0.75, 0.5)` base on purpose.
+    /// Those give `Cb = (0.125, 0.375, 0.25)` after the `Multiply` fold,
+    /// and against *any* source strictly inside `(0, 1)` that backdrop
+    /// leaves red under the `1.0` boundary — so a fixture reusing it could
+    /// not put red above the boundary at all, and this mode's suite-header
+    /// degeneracy 3 asks for channels on both sides of it. `(0.875, 0.75,
+    /// 0.625)` under the same `Multiply` gives `Cb = (0.4375, 0.375,
+    /// 0.3125)`, which does. See the test's own doc comment for the
+    /// per-channel derivation and for why no unclamped channel here carries
+    /// a `0.5` (degeneracy 5).
+    const NORMAL_MULTIPLY_LINEAR_BURN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.75, 0.625, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::LinearBurn,
+            0.5,
+            [0.875, 0.75, 0.25, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_color_burn_blend_document`'s three-layer fixture
+    /// (0.107.0). Golden `(0.34375, 0.4140625, 0.125, 1.0)`.
+    ///
+    /// The `ColorBurn` layer sits at opacity `0.5`, and for this mode that
+    /// is **sufficient but not necessary** — the first fixture in this
+    /// roster of which that is true. Every mode ported before this one has
+    /// a commutative blend term, so only the asymmetric fold could see a
+    /// transposed dispatch arm and non-unit opacity was strictly
+    /// necessary; `ColorBurn`'s blend term is itself asymmetric, so the
+    /// transpose is observable here at any opacity (measured at both `0.5`
+    /// and `1.0` in 0.107.0). The `0.5` is kept anyway, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// is deliberately not special-cased for one mode.
+    ///
+    /// `l1`/`l2` are chosen so the quotients `(1 - Cb) / Cs` are exact
+    /// binary fractions and straddle the clamp. After the `Multiply` fold
+    /// `Cb = (0.4375, 0.453125, 0.25)`, and against
+    /// `Cs = (0.75, 0.875, 0.5)` the quotients are
+    /// `(0.5625/0.75, 0.546875/0.875, 0.75/0.5) = (0.75, 0.625, 1.5)` —
+    /// red and green unclamped, blue past the boundary. See the test's own
+    /// doc comment for the per-channel derivation.
+    const NORMAL_MULTIPLY_COLOR_BURN_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.90625, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::ColorBurn,
+            0.5,
+            [0.75, 0.875, 0.5, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_color_dodge_blend_document`'s three-layer fixture
+    /// (0.108.0). Golden `(0.65625, 0.15625, 0.6875, 1.0)`.
+    ///
+    /// **The `ColorDodge` layer sits at opacity `0.5`, and that value is
+    /// load-bearing twice over — do not normalise it to `1.0`.** First,
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it, and is deliberately not special-cased for this mode.
+    /// Second, and specific to this fixture: at opacity `1.0` the composite
+    /// is `B` itself, whose blue channel is the *clamped* `1.0` — so the
+    /// golden would become `(0.875, 0.25, 1.0)` and blue would stop being
+    /// able to distinguish a dropped `min` clamp from a saturated correct
+    /// answer. The `0.5` fold is what keeps blue at `0.6875` against a
+    /// dropped clamp's `1.6875`. As with `ColorBurn`, non-unit opacity is
+    /// *sufficient but not necessary* for the transpose specifically, this
+    /// mode's blend term being asymmetric (measured at both `0.5` and `1.0`
+    /// in 0.108.0) — but it is necessary for the clamp assertion, which the
+    /// `ColorBurn` sibling cannot say.
+    ///
+    /// `l1`/`l2` are chosen so the quotients `Cb / (1 - Cs)` are exact
+    /// binary fractions and straddle the clamp. After the `Multiply` fold
+    /// `Cb = (0.4375, 0.0625, 0.375)`, and against
+    /// `Cs = (0.5, 0.75, 0.875)` — every one of which makes `1 - Cs` a power
+    /// of two, which is what makes the division terminate — the quotients
+    /// are `(0.4375/0.5, 0.0625/0.25, 0.375/0.125) = (0.875, 0.25, 3.0)`:
+    /// red and green unclamped, blue well past the boundary. No channel has
+    /// `Cb == Cs`, none has `Cb == Cs * (1 - Cs)` (which would make it
+    /// indistinguishable from `Normal`), and no operand is `0.0` or `1.0`,
+    /// so neither branch of the formula fires here. See the test's own doc
+    /// comment for the per-channel derivation.
+    const NORMAL_MULTIPLY_COLOR_DODGE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.125, 0.75, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.5, 0.5, 0.5, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::ColorDodge,
+            0.5,
+            [0.5, 0.75, 0.875, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_an_overlay_blend_document`'s three-layer fixture
+    /// (0.110.0). Golden `(0.5703125, 0.46875, 0.2578125, 1.0)`.
+    ///
+    /// **`l2` is a `Multiply` layer of `0.75` grey, not the `0.5` grey every
+    /// sibling fixture above uses, and that colour is the one thing about this
+    /// const not to "normalise".** (Its *opacity* is `1.0`, exactly as every
+    /// sibling's `l2` opacity is — the departure here is the colour, not the
+    /// opacity.) A `0.5`-grey `Multiply` halves the accumulator, which for
+    /// this mode is not a cosmetic change but a *structural* one, twice over:
+    ///
+    ///   1. `Overlay` branches on `Cb <= 0.5`, so a halved backdrop puts
+    ///      every channel on or below the boundary and the high
+    ///      (`Screen`-form) arm becomes **unreachable** — the fixture would
+    ///      exercise one of the two arms and silently pass a shader that
+    ///      got the other wrong.
+    ///   2. `Overlay(0.5, Cs) = Cs` exactly, so any channel landing on
+    ///      `0.5` is indistinguishable from `Normal`.
+    ///
+    /// So `l1`/`l2` are chosen to leave `Cb = (0.65625, 0.375, 0.1875)`
+    /// after the `Multiply` fold: red above the boundary (the `Screen` arm),
+    /// green and blue below it (the `Multiply` arm), **both arms live in one
+    /// draw**, and no channel at exactly `0.5`.
+    ///
+    /// **Every channel straddles `0.5`**, which is what makes a transposed
+    /// `src`/`backdrop` binding observable in the blend term at all: against
+    /// `Cs = (0.25, 0.75, 0.875)` the pairs are
+    /// `(0.65625 > 0.5 >= 0.25)`, `(0.375 <= 0.5 < 0.75)` and
+    /// `(0.1875 <= 0.5 < 0.875)`. Wherever the two operands *shared* a side
+    /// this mode is commutative, so a fixture without that property would
+    /// leave only the asymmetric fold to catch the transpose. **No source
+    /// channel is `0.5`** either — that value is this mode's total no-op
+    /// (`Overlay(Cb, 0.5) = Cb` for every `Cb`) — and no channel has
+    /// `Cb == Cs`.
+    ///
+    /// **The `Overlay` layer still sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode
+    /// either. For this fixture that is sufficient-but-not-necessary (the
+    /// straddling channels already catch the transpose at `1.0`, measured in
+    /// 0.110.0), but it is also what makes the golden differ from `B` and so
+    /// keeps the fold itself under test. See the test's own doc comment for
+    /// the per-channel derivation.
+    const NORMAL_MULTIPLY_OVERLAY_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Overlay,
+            0.5,
+            [0.25, 0.75, 0.875, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_hard_light_blend_document`'s three-layer fixture
+    /// (0.111.0). Golden `(0.4921875, 0.53125, 0.4921875, 1.0)`.
+    ///
+    /// **This fixture deliberately reuses
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s three colours verbatim** — the same
+    /// `l1`, the same unusual `0.75`-grey `l2`, the same `l3` colour and the
+    /// same `0.5` opacity — and that is the one thing about it not to
+    /// "normalise" by picking fresh values. `HardLight` and `Overlay` are exact
+    /// transposed twins, so sharing one operand pair makes the two fixtures'
+    /// goldens a direct read-out of the collision rule rather than two
+    /// unrelated numbers, and it makes each mode's vacuity guard the *other*
+    /// mode with no extra fixture to maintain. Everything that const's own doc
+    /// comment says about *why* those colours were chosen applies here
+    /// unchanged, with the branch side swapped:
+    ///
+    ///   1. `HardLight` branches on `Cs <= 0.5`, and `Cs = (0.25, 0.75, 0.875)`
+    ///      puts red on the `Multiply` arm with green and blue on the `Screen`
+    ///      arm — **both arms live in one draw**. (The sibling gets the same
+    ///      both-arms property from its *backdrop*, which is why the `0.75`-grey
+    ///      `l2` matters there and is merely inherited here.)
+    ///   2. `HardLight(Cb, 0.5) = Cb` exactly, so a *source* channel at `0.5`
+    ///      would be a total no-op — none is.
+    ///   3. `HardLight(0.5, Cs) = Cs` exactly, so a *backdrop* channel at `0.5`
+    ///      would be indistinguishable from `Normal`. After the `Multiply` fold
+    ///      `Cb = (0.65625, 0.375, 0.1875)`, none of it `0.5`. Note `l1`'s
+    ///      green *literal* is `0.5` and is harmless only because the fold
+    ///      carries it to `0.75 * 0.5 = 0.375` — the invariant is about the
+    ///      blend's operands, not the raw literals.
+    ///
+    /// **Every channel straddles `0.5`**, which is what makes a transposed
+    /// `src`/`backdrop` binding — and equally a branch on `cb`, or a
+    /// `fragment_entry` naming the sibling — observable in the blend term at
+    /// all: the pairs are `(0.65625 > 0.5 >= 0.25)`,
+    /// `(0.375 <= 0.5 < 0.75)` and `(0.1875 <= 0.5 < 0.875)`. Wherever the two
+    /// operands *shared* a side this mode is commutative *and* agrees with
+    /// `Overlay`, so a fixture without that property would leave only the
+    /// asymmetric fold to catch any of the three. No channel has `Cb == Cs`.
+    ///
+    /// **The `HardLight` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode either.
+    /// For this fixture that is sufficient-but-not-necessary (the straddling
+    /// channels already catch the transpose at `1.0`, measured in 0.111.0), but
+    /// it is also what makes the golden differ from `B` and so keeps the fold
+    /// itself under test. See the test's own doc comment for the per-channel
+    /// derivation.
+    const NORMAL_MULTIPLY_HARD_LIGHT_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::HardLight,
+            0.5,
+            [0.25, 0.75, 0.875, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_linear_light_blend_document`'s three-layer fixture
+    /// (0.113.0). Golden `(0.828125, 0.5, 0.09375, 1.0)`.
+    ///
+    /// **This fixture reuses [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s `l1` and `l2`
+    /// verbatim and picks a fresh `l3`**, which is a deliberate half-step away
+    /// from [`NORMAL_MULTIPLY_HARD_LIGHT_STACK`]'s full reuse. The `Overlay`
+    /// and `HardLight` fixtures share all three colours because those two modes
+    /// are exact transposed twins, so one shared operand pair makes their
+    /// goldens a read-out of the collision rule. `LinearLight` is not a twin of
+    /// either, so there is nothing to read out; what its `l3` has to do instead
+    /// is put the three channels into **three different clamp regimes**, and
+    /// the sibling's `l3` does not. Keeping `l1`/`l2` unchanged still means the
+    /// backdrop this mode blends against is the exact same
+    /// `Cb = (0.65625, 0.375, 0.1875)` the two sibling tests use, so any
+    /// disagreement between the three tests is attributable to `l3` alone.
+    ///
+    /// **The regimes, which are the whole point.** Against
+    /// `Cs = (0.75, 0.625, 0.125)`:
+    ///
+    ///   - red: `0.65625 + 1.5 - 1 = 1.15625` → clamped down to `1.0`, the
+    ///     **upper rail**;
+    ///   - green: `0.375 + 1.25 - 1 = 0.625`, **interior**;
+    ///   - blue: `0.1875 + 0.25 - 1 = -0.5625` → clamped up to `0.0`, the
+    ///     **lower rail**.
+    ///
+    /// So one fixture exercises both clamp bounds and the unclamped path at
+    /// once, and each is reached by a real margin (`0.15625` over the top,
+    /// `0.5625` under the bottom) rather than marginally.
+    ///
+    /// **Why all three regimes, and not just non-unit opacity.** This mode's
+    /// blend term is *unconditionally* asymmetric, yet the two ways a transpose
+    /// gets laundered are exactly complementary (see
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// and the test below): a **railed** channel is blind at effective alpha
+    /// `1.0` and an **interior** channel is blind at exactly `0.5`. A fixture
+    /// with only interior channels would therefore be blind to a transposed
+    /// dispatch arm *at the very opacity the standing guard demands*. Carrying
+    /// both kinds is what makes this fixture see one at both opacities —
+    /// measured in 0.113.0, in its two railed channels at `0.5` and in its one
+    /// interior channel at `1.0`.
+    ///
+    /// **And the interior channel is not only there for the `1.0` case** —
+    /// stated in 0.113.1 because the paragraph above motivated it solely by
+    /// mutation (h) at an opacity this fixture does not actually use. The
+    /// round ran *two* transpose mutations, and at this fixture's own `0.5`
+    /// they are caught by **disjoint** channel sets, so both kinds of channel
+    /// are load-bearing at the shipped opacity:
+    ///
+    ///   - **(h)**, transposing `src`/`backdrop` in the *dispatch arm*, swaps
+    ///     the fold's operands as well as the blend's, so at `0.5` only the two
+    ///     **railed** channels move — `(0.875, 0.5, 0.0625)` against the
+    ///     golden, interior green bit-identical;
+    ///   - **(g)**, transposing `cb`/`s.rgb` *inside the blend line* only,
+    ///     leaves the fold alone, so both rails give the same `B` either way
+    ///     and only the **interior** channel moves — `(0.828125, 0.375,
+    ///     0.09375)`, both rails bit-identical.
+    ///
+    /// So (g) needs green at `0.5` exactly as much as (h) needs red and blue
+    /// there, and neither mutation alone justifies all three regimes.
+    ///
+    /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
+    /// source-side total no-op), `0.0` or `1.0` (a black or white source
+    /// erases the backdrop), and no channel has `Cb == Cs`. `l1`'s green
+    /// literal is `0.5` and is harmless twice over: the `Multiply` fold carries
+    /// it to `0.375`, and a `0.5` *backdrop* is not degenerate for this mode
+    /// anyway (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)`), unlike for
+    /// `HardLight`. **One accepted coincidence belongs in this enumeration and
+    /// was only mentioned in passing in the rival-arm list before 0.113.1:**
+    /// green has `Cb + Cs = 0.375 + 0.625 = 1` exactly, so its `B` is `Cs`
+    /// itself and the fold gives `(1-a)*Cb + a*Cs` — the `Normal` arm's own
+    /// result. The interior channel therefore cannot separate this mode from
+    /// `Normal`; red (`0.828125` vs `0.703125`) and blue (`0.09375` vs
+    /// `0.15625`) do, which is why this is accepted rather than designed out.
+    /// It costs nothing against the two real near-misses either, both of which
+    /// green *does* separate (see the test's own rival table).
+    ///
+    /// **The `LinearLight` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode either.
+    /// See the test's own doc comment for the per-channel derivation.
+    const NORMAL_MULTIPLY_LINEAR_LIGHT_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::LinearLight,
+            0.5,
+            [0.75, 0.625, 0.125, 1.0],
+        ),
+    ];
+
+    /// `..._agree_on_a_vivid_light_blend_document`'s three-layer fixture
+    /// (0.114.0). Golden `(0.484375, 0.6875, 0.28125, 1.0)`.
+    ///
+    /// **`l1` and `l2` are [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s verbatim**, as
+    /// the `HardLight` and `LinearLight` fixtures' are, so the backdrop this
+    /// mode blends against is the exact same `Cb = (0.65625, 0.375, 0.1875)`
+    /// three sibling tests already use and any disagreement between the four is
+    /// attributable to `l3` alone. What this `l3` has to do that no sibling's
+    /// does is put the three channels across **both of this mode's branches**
+    /// while keeping at least one channel clamp-interior in *each* of them.
+    ///
+    /// **The branches and regimes, which are the whole point.** Against
+    /// `Cs = (0.25, 0.875, 0.75)`:
+    ///
+    ///   - red: `Cs = 0.25 <= 0.5`, the **burn** branch —
+    ///     `ColorBurn(0.65625, 0.5) = 1 - min(1, 0.34375 / 0.5) = 0.3125`,
+    ///     **clamp-interior** by `0.3125`;
+    ///   - green: `Cs = 0.875 > 0.5`, the **dodge** branch —
+    ///     `ColorDodge(0.375, 0.75) = min(1, 0.375 / 0.25)`, raw `1.5`, so the
+    ///     **upper rail** by a margin of `0.5` rather than marginally;
+    ///   - blue: `Cs = 0.75 > 0.5`, **dodge** —
+    ///     `ColorDodge(0.1875, 0.5) = min(1, 0.1875 / 0.5) = 0.375`,
+    ///     **clamp-interior** by `0.625`.
+    ///
+    /// So `B = (0.3125, 1.0, 0.375)`: one interior burn channel, one railed
+    /// dodge channel and one interior dodge channel, in one draw.
+    ///
+    /// **Why one channel of each kind is load-bearing, not decorative.** The
+    /// two near-misses are each blind in exactly one rail, provably:
+    ///
+    ///   - dropping the `2.0 *` in the burn branch computes
+    ///     `ColorBurn(Cb, Cs)`, and `Cb + 2*Cs <= 1` implies `Cb + Cs <= 1`, so
+    ///     a lower-railed burn channel is `0.0` for both — **only red can see
+    ///     that one here**, and it is the only burn channel;
+    ///   - feeding the dodge branch `2*Cs` instead of `2*Cs - 1` makes
+    ///     `color_dodge_channel`'s divisor `1 - 2*Cs`, **negative** across that
+    ///     branch's whole domain, so it emits negative colour wherever
+    ///     `Cb > 0` — **green and blue both see that one**, giving
+    ///     `(0.484375, -0.0625, -0.09375)`. (This round predicted the opposite
+    ///     and measured it wrong: the first analysis had the branch railing to
+    ///     a constant `1.0` through the `cs == 1.0` guard, which cannot fire
+    ///     above `Cs == 0.5`. The mutation is easier to kill than predicted,
+    ///     not harder, and the correction is recorded rather than papered
+    ///     over.)
+    ///
+    /// So red is the *only* channel that can see the dropped `2.0 *` — the one
+    /// mutation a clamp regime genuinely gates — and green's rail is what makes
+    /// the `min(1, ..)` clamp inside `color_dodge_channel` reachable from the
+    /// app path at all.
+    ///
+    /// **Transpose observability.** This mode's blend term is unconditionally
+    /// *and structurally* asymmetric (`B(Cb, Cs)` branches on `Cs`,
+    /// `B(Cs, Cb)` on `Cb`), and — unlike `LinearLight` — it is **not affine in
+    /// its operands**, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)` form has no
+    /// analogue.
+    ///
+    /// **That is not the same as having no blind opacity, and 0.114.0 wrote it
+    /// here as though it were.** The fold's transpose gap,
+    /// `out - out_transposed = (1 - a)*(Cb - Cs) + a*(B(Cb, Cs) - B(Cs, Cb))`,
+    /// is affine in `a` for *every* mode — `B`'s non-affinity is in its
+    /// operands, which that expression never varies — so with `D0 = Cb - Cs`
+    /// and `D1 = B(Cb, Cs) - B(Cs, Cb)` a channel is blind at
+    /// `a* = D0 / (D0 - D1)`, in `(0, 1)` whenever the two have opposite signs.
+    /// Being clamp-interior in both operand orders does **not** exempt a
+    /// channel: in the burn branch, blind at exactly `a = 0.5` is
+    /// `2*Cb*Cs + Cb + Cs == 1` (derived, then confirmed by exhaustive rational
+    /// search), and `Cb = 0.3`, `Cs = 0.4375` sits on it with both orders
+    /// burn-*interior* (`B = 0.2`, `B^T = 0.0625`).
+    ///
+    /// So two mechanisms launder a transpose here: rail agreement in the blend
+    /// term (both orders railing to `0`, `Cb + 2*Cs <= 1` **and**
+    /// `Cs + 2*Cb <= 1`, or both to `1`, `Cb + 2*Cs >= 2` **and**
+    /// `Cs + 2*Cb >= 2`), and that blind `a*`. **This fixture escapes both, and
+    /// the second only by measurement.** `B^T = (0.3636.., 0.8333.., 0.3333..)`,
+    /// all three interior and all three different from `B`, so no channel rails
+    /// in both orders (red and blue are interior in both; green is
+    /// upper-railed in the shipped order alone, which is itself enough for `B`
+    /// to differ). And each channel's blind `a*` — red `≈ 0.8882`
+    /// (`D0 = 0.40625`, `D1 = -0.051136`), green `0.75` (`-0.5`, `+0.166667`),
+    /// blue `≈ 0.9310` (`-0.5625`, `+0.0416667`) — is a real blind opacity in
+    /// `(0, 1)` that simply is not `0.5` or `1.0`. Measured in 0.114.0, the
+    /// transpose is therefore caught in **all three channels at `0.5` and all
+    /// three at `1.0`** — the first fixture in this roster for which that is
+    /// true of both opacities — and the standing guard's largest channel gap
+    /// here is blue's `0.2602539`, against a `2 * f16::EPSILON` tolerance.
+    ///
+    /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
+    /// source-side total no-op *and* its branch boundary), `0.0` or `1.0` (a
+    /// black or white source erases the backdrop, guard points excepted); no
+    /// **composited** `Cb` channel is `0.0` or `1.0` (which for this mode would
+    /// erase the *source* entirely — degeneracy 3, which no sibling mode has,
+    /// and which is checked against the real `Multiply` fold rather than
+    /// against `l1`'s literals); and no channel has `Cb == Cs`. `l1`'s green
+    /// literal is `0.5` and is harmless twice over: the `Multiply` fold carries
+    /// it to `0.375`, and a `0.5` *backdrop* is not degenerate for this mode
+    /// anyway.
+    ///
+    /// **No `Normal` coincidence anywhere**, which the `LinearLight` sibling
+    /// has to accept in its interior channel: `Normal` gives
+    /// `(0.453125, 0.625, 0.46875)` here, differing in all three. What does
+    /// coincide, and only in railed green, is every rival whose own answer is
+    /// also `1.0` there — `LinearDodge`, `ColorDodge`, `LinearLight` and
+    /// `HardMix` — which is the rail identity rather than a fixture weakness.
+    ///
+    /// **The `VividLight` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode either.
+    /// For this fixture that is sufficient-but-not-necessary (all three
+    /// channels catch the transpose at `1.0` too, measured), but it is also
+    /// what keeps the fold itself under test by making the golden differ from
+    /// `B`.
+    const NORMAL_MULTIPLY_VIVID_LIGHT_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::VividLight,
+            0.5,
+            [0.25, 0.875, 0.75, 1.0],
+        ),
+    ];
+
+    /// The `Normal`/`Multiply`/`HardMix` root stack
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_blend_document`
+    /// composites (0.115.0), the fourteenth mode ported.
+    ///
+    /// **Unlike every sibling fixture above, this one does *not* reuse the
+    /// shared `(0.875, 0.5, 0.25)` bottom layer**, and the reason is the whole
+    /// point of the round. `HardMix(Cb, Cs) = 1` iff `Cb + Cs >= 1` — a
+    /// **symmetric** rule — with exactly one exception: at
+    /// `(Cb, Cs) = (0, 1)` it is `0`, because `color_dodge_channel` tests
+    /// `cb == 0.0` before `cs == 1.0` and the first guard wins. Verified
+    /// exhaustively over the entire `f16`-representable domain in `[0, 1]`
+    /// (0.115.1; a `1/256` grid plus edge refinement first, 0.115.0): one
+    /// exception, and exactly two asymmetric pairs, `(0, 1)` and `(1, 0)`.
+    ///
+    /// So there is **no interior operand pair for which
+    /// `H(Cb, Cs) != H(Cs, Cb)`**. That corner is the only channel shape whose
+    /// *blend term* can tell this mode's own threshold logic apart from the bare
+    /// sum rule, or catch the two arguments swapped inside
+    /// `fs_composite_hard_mix`. This fixture therefore carries one: `l1`'s red
+    /// is `0.0` and `l3`'s red is `1.0`, and `l2`'s `Multiply` leaves the first
+    /// at `0.0`. **Do not "tidy" red to a nicer value** — several mutations this
+    /// round measured go undetected without it, including the sum-threshold
+    /// rewrite and a shader-internal argument transpose.
+    ///
+    /// **And "exactly" means exactly, with a silent failure mode on the other
+    /// side of it** (0.115.1). One `f16` step above zero — `2^-24`, the smallest
+    /// positive subnormal — is enough: `color_dodge_channel` tests `cb == 0.0`
+    /// *before* `cs == 1.0`, so a non-zero red backdrop skips the first guard,
+    /// fires the second, and returns `1.0` where the corner returns `0.0`. The
+    /// channel then obeys the symmetric `Cb + Cs >= 1` rule like any other, both
+    /// operand orders agree, and this row's `1.0` transpose gap collapses to the
+    /// `0.046875` green contributes on its own. Nothing goes red when that
+    /// happens — the goldens would simply be re-derived around the drifted value
+    /// and keep passing — which is why `aurora-render`'s two corner-carrying
+    /// fixtures each assert their accumulator's red exactly, with that
+    /// consequence spelled out in the failure message.
+    ///
+    /// After `l1` (`Normal`, `1.0`, `(0.0, 0.875, 0.5)`) and `l2` (`Multiply`,
+    /// `1.0`, `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.0, 0.65625, 0.375)` at alpha `1.0`. Against
+    /// `Cs = (1.0, 0.5625, 0.4375)`:
+    ///
+    /// - red: the corner, `B = 0`;
+    /// - green: dodge branch, `VividLight = 0.75` exactly, `B = 1`;
+    /// - blue: burn branch, `VividLight = 2/7 ≈ 0.2857`, `B = 0`.
+    ///
+    /// Both of this mode's rails are present, which degeneracy 2 in
+    /// `aurora-render`'s own suite header makes a requirement rather than a
+    /// nicety (every `B = 0` channel provably agrees with `ColorBurn`, every
+    /// `B = 1` channel with `ColorDodge`), and green's and blue's `VividLight`
+    /// values are off *that* mode's rails, which is what separates a dropped
+    /// threshold.
+    ///
+    /// **The `HardMix` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it. Here that is genuinely load-bearing in two of the three
+    /// channels rather than sufficient-but-not-necessary: green and blue are
+    /// blind to a transposed dispatch arm in the blend term (the rule is
+    /// symmetric there) and see it only through the fold's own
+    /// `(1 - a)*(Cb - Cs)`, which vanishes at `a = 1`. Red sees it either way,
+    /// being the corner.
+    const NORMAL_MULTIPLY_HARD_MIX_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.0, 0.875, 0.5, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::HardMix,
+            0.5,
+            [1.0, 0.5625, 0.4375, 1.0],
+        ),
+    ];
+
+    /// The `Normal`/`Multiply`/`PinLight` root stack
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_pin_light_blend_document`
+    /// composites (0.116.0), the fifteenth mode ported.
+    ///
+    /// Reuses the family's shared `(0.875, 0.5, 0.25)` bottom layer and
+    /// `0.75`-grey `Multiply`, so `Cb = (0.65625, 0.375, 0.1875)` at alpha
+    /// `1.0` — the same accumulator the `VividLight` sibling above uses, which
+    /// makes the two rounds' goldens directly comparable. Against
+    /// `Cs = (0.25, 0.8125, 0.5625)`:
+    ///
+    /// | ch | `Cs` vs `0.5` | branch | `B` | outcome |
+    /// |---|---|---|---|---|
+    /// | red | `0.25 <= 0.5` | low, `min(Cb, 2*Cs)` | `min(0.65625, 0.5) = 0.5` | source-derived |
+    /// | green | `0.8125 > 0.5` | high, `max(Cb, 2*Cs - 1)` | `max(0.375, 0.625) = 0.625` | source-derived |
+    /// | blue | `0.5625 > 0.5` | high | `max(0.1875, 0.125) = 0.1875` | **backdrop-wins** |
+    ///
+    /// Both branches, and a **source-derived channel in each** — which is a
+    /// requirement rather than a nicety: every backdrop-wins channel provably
+    /// agrees with `Darken` in the low branch and `Lighten` in the high branch,
+    /// both live GPU arms, so only a source-derived channel separates them. Blue
+    /// is the backdrop-wins one and does coincide with `Darken`; red and green
+    /// carry that claim.
+    ///
+    /// **Chosen against this mode's blind set explicitly, per channel**, which
+    /// is the whole reason the operands are not rounder numbers. The blend term
+    /// is symmetric — and so blind to a transposed dispatch arm at effective
+    /// alpha `1.0` — on exactly four classes (verified over a 129×129 rational
+    /// grid, with no members outside them). Per channel:
+    ///
+    /// | ch | `Cb` | `Cs` | `Cb == Cs`? | `|Cb - Cs|` | operand at `0`/`1`? |
+    /// |---|---|---|---|---|---|
+    /// | red | `0.65625` | `0.25` | no | `0.40625` | no |
+    /// | green | `0.375` | `0.8125` | no | `0.4375` | no |
+    /// | blue | `0.1875` | `0.5625` | no | `0.375` | no |
+    ///
+    /// **No channel has `|Cb - Cs| == 0.5`**, and that column is not
+    /// boilerplate: it is a hazard class **no previously ported mode has**, and
+    /// two of its members — `(0.25, 0.75)` and `(0.5, 1.0)` — are exactly the
+    /// operands a fixture reaches for by habit. Nor is any channel the
+    /// `(0, 1)`/`(1, 0)` corner, the only pair blind at `a = 0.5` specifically.
+    /// All three channels straddle `0.5`, and each one's blind alpha
+    /// `a* = D0/(D0 - D1)` lands **outside** `(0, 1)` altogether — red `≈ 1.857`
+    /// (`D0 = 0.40625`, `D1 = 0.1875`), green `1.4` (`-0.4375`, `-0.125`), blue
+    /// `2.0` (`-0.375`, `-0.1875`) — so unlike `VividLight`'s row this fixture
+    /// has no interior blind opacity at all. Measured: the transpose is caught in
+    /// all three channels at `0.5` **and** all three at `1.0`, with a largest
+    /// channel gap of `0.296875` in red.
+    ///
+    /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
+    /// source-side no-op, its branch boundary, and its one total `LinearLight`
+    /// collision), `0.0` or `1.0` (a black or white source erases the backdrop).
+    /// `l1`'s green literal is `0.5` and is harmless: a `0.5` *backdrop* is not
+    /// degenerate for this mode, and the `Multiply` fold carries it to `0.375`
+    /// anyway.
+    ///
+    /// **One rival coincidence, disclosed rather than designed out**: blue is a
+    /// backdrop-wins channel, so `Darken` gives `0.1875` there too and the
+    /// composite coincides in blue. That is the rail identity degeneracy 1
+    /// names, not a fixture weakness, and red and green separate `Darken` by
+    /// `0.125` and `0.21875`. `Normal` gives `(0.453125, 0.59375, 0.375)`,
+    /// differing in all three.
+    ///
+    /// **The `PinLight` layer sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode either.
+    /// For this fixture that is sufficient-but-not-necessary (all three channels
+    /// catch the transpose at `1.0` too, measured), but it is also what keeps
+    /// the fold itself under test by making the golden differ from `B`.
+    const NORMAL_MULTIPLY_PIN_LIGHT_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::PinLight,
+            0.5,
+            [0.25, 0.8125, 0.5625, 1.0],
+        ),
+    ];
+
+    /// **Which fixture makes which GPU blend-math dispatch arm's argument
+    /// order observable** (0.105.3) — `(mode, the test that composites
+    /// this fixture, the fixture itself)`, and the input to
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`].
+    ///
+    /// Every entry is a fixture some existing test already composites; no
+    /// row here adds coverage of its own. What the roster adds is a single
+    /// place that *names* the property, and a headless assertion that it
+    /// still holds, because it is invisible in the fixtures themselves: an
+    /// opacity of `0.5` on one layer reads like an arbitrary choice.
+    ///
+    /// Both `Multiply` rows are real and neither is redundant — PLAN.md's
+    /// 0.105.2 kill matrix measured a transposed `Multiply` arm killing
+    /// exactly those two tests.
+    const TRANSPOSE_COVERAGE: &[(aurora_doc::BlendMode, &str, &[StackEntry])] = &[
+        (
+            aurora_doc::BlendMode::Multiply,
+            "recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack",
+            &MIXED_NORMAL_AND_MULTIPLY_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Multiply,
+            "recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count",
+            &FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Darken,
+            "recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack",
+            &MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Lighten,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document",
+            &NORMAL_MULTIPLY_LIGHTEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Screen,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document",
+            &NORMAL_MULTIPLY_SCREEN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Difference,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document",
+            &NORMAL_MULTIPLY_DIFFERENCE_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::LinearDodge,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document",
+            &NORMAL_MULTIPLY_LINEAR_DODGE_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::LinearBurn,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_burn_blend_document",
+            &NORMAL_MULTIPLY_LINEAR_BURN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::ColorBurn,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_color_burn_blend_document",
+            &NORMAL_MULTIPLY_COLOR_BURN_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::ColorDodge,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_color_dodge_blend_document",
+            &NORMAL_MULTIPLY_COLOR_DODGE_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::Overlay,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_overlay_blend_document",
+            &NORMAL_MULTIPLY_OVERLAY_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::HardLight,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_light_blend_document",
+            &NORMAL_MULTIPLY_HARD_LIGHT_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::LinearLight,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_blend_document",
+            &NORMAL_MULTIPLY_LINEAR_LIGHT_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::VividLight,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_vivid_light_blend_document",
+            &NORMAL_MULTIPLY_VIVID_LIGHT_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::HardMix,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_blend_document",
+            &NORMAL_MULTIPLY_HARD_MIX_STACK,
+        ),
+        (
+            aurora_doc::BlendMode::PinLight,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_pin_light_blend_document",
+            &NORMAL_MULTIPLY_PIN_LIGHT_STACK,
+        ),
+    ];
+
+    /// The `aurora_doc` blend mode each [`GpuBlendDispatch`] counter is
+    /// counting. Written as an exhaustive `match` on purpose: a counter
+    /// variant added for a newly ported mode is a compile error here, which
+    /// is what forces the author past the guard below.
+    fn dispatch_arm_blend_mode(which: GpuBlendDispatch) -> aurora_doc::BlendMode {
+        match which {
+            GpuBlendDispatch::Multiply => aurora_doc::BlendMode::Multiply,
+            GpuBlendDispatch::Darken => aurora_doc::BlendMode::Darken,
+            GpuBlendDispatch::Lighten => aurora_doc::BlendMode::Lighten,
+            GpuBlendDispatch::Screen => aurora_doc::BlendMode::Screen,
+            GpuBlendDispatch::Difference => aurora_doc::BlendMode::Difference,
+            GpuBlendDispatch::LinearDodge => aurora_doc::BlendMode::LinearDodge,
+            GpuBlendDispatch::LinearBurn => aurora_doc::BlendMode::LinearBurn,
+            GpuBlendDispatch::ColorBurn => aurora_doc::BlendMode::ColorBurn,
+            GpuBlendDispatch::ColorDodge => aurora_doc::BlendMode::ColorDodge,
+            GpuBlendDispatch::Overlay => aurora_doc::BlendMode::Overlay,
+            GpuBlendDispatch::HardLight => aurora_doc::BlendMode::HardLight,
+            GpuBlendDispatch::LinearLight => aurora_doc::BlendMode::LinearLight,
+            GpuBlendDispatch::VividLight => aurora_doc::BlendMode::VividLight,
+            GpuBlendDispatch::HardMix => aurora_doc::BlendMode::HardMix,
+            GpuBlendDispatch::PinLight => aurora_doc::BlendMode::PinLight,
+            GpuBlendDispatch::Dissolve => aurora_doc::BlendMode::Dissolve,
+        }
+    }
+
+    /// The layer *tree* one of the fixture constants above describes, with
+    /// no tile store and no pixels — enough for
+    /// [`document_qualifies_for_gpu_compositing`], which reads a root
+    /// layer's kind, visibility and blend mode and nothing else. Keeps the
+    /// guard below headless: no temp directory, no GPU adapter, no
+    /// compositing.
+    fn root_stack_tree(entries: &[StackEntry]) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for &(name, mode, opacity, _) in entries {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_visible(id, true) {
+                unreachable!("{err:?}");
+            }
+        }
+        layers
+    }
+
+    /// The texel one of the fixture constants above composites to on the
+    /// **CPU**, folded one layer at a time through the real
+    /// [`aurora_render::composite_layer_into`] — and, when `transposed` names
+    /// a mode, with every layer at that mode folded with its two operands
+    /// **swapped** (0.113.1).
+    ///
+    /// This is the computational half of
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`],
+    /// and it exists because that guard's opacity rule is a *proxy* that
+    /// `LinearLight` proved can be satisfied by a fixture which is provably
+    /// blind anyway. Read that test's doc comment for the counterexample.
+    ///
+    /// **Why this is a faithful model of the mutation, and not an
+    /// approximation of it.** A transposed GPU dispatch arm passes the
+    /// accumulator's view where `src` belongs and the layer's where `backdrop`
+    /// belongs, and the `Opacity` uniform stays bound to whatever occupies the
+    /// `src` slot. `composite_layer_into(out, texels, opacity, mode)` has
+    /// exactly that shape — `out` is the premultiplied backdrop, `texels` the
+    /// straight source, `opacity` scales the *source's* alpha — so folding
+    /// `composite_layer_into(&mut layer, &accumulator, ..)` and keeping `layer`
+    /// as the new accumulator reproduces the transposed arm term for term,
+    /// including the alpha swap and `straight_backdrop`'s un-premultiply of
+    /// whichever side is now the backdrop. Cross-checked against real
+    /// hardware: for `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` this returns
+    /// `(0.875, 0.5, 0.0625, 1.0)`, which is what 0.113.0's mutation (h)
+    /// *measured* on an RTX 3090 with the arm actually transposed.
+    ///
+    /// Every layer at the named mode is transposed, not just the first: a
+    /// transposed arm is transposed for every dispatch that reaches it, and
+    /// two roster fixtures carry more than one layer at their mode.
+    ///
+    /// Headless and single-texel — `composite_layer_into`'s scalar tail
+    /// handles a four-sample buffer, and the fixtures are solid fills, so one
+    /// texel is the whole tile.
+    ///
+    /// This model's faithfulness depends on every roster row's mode-bearing
+    /// layer having texel alpha `1.0` (true of all sixteen today): swapping
+    /// which side is straight vs. premultiplied only reproduces the real
+    /// dispatch arm term for term when there is no partial coverage to
+    /// un-premultiply differently on each side. A future roster row with a
+    /// translucent texel at its tested mode would need this re-checked.
+    fn solid_stack_texel_cpu(
+        entries: &[StackEntry],
+        transposed: Option<aurora_doc::BlendMode>,
+    ) -> [f32; 4] {
+        let mut accumulator = [half::f16::from_f32(0.0); aurora_tile::CHANNELS];
+        for &(_, mode, opacity, rgba) in entries {
+            let layer = rgba.map(half::f16::from_f32);
+            let render_mode = translate_blend_mode(mode);
+            if transposed == Some(mode) {
+                // The transposed arm: the layer's texel plays the backdrop
+                // role and the accumulator the source's, opacity following
+                // the source slot as the uniform does.
+                let mut swapped = layer;
+                aurora_render::composite_layer_into(
+                    &mut swapped,
+                    &accumulator,
+                    opacity,
+                    render_mode,
+                );
+                accumulator = swapped;
+            } else {
+                aurora_render::composite_layer_into(&mut accumulator, &layer, opacity, render_mode);
+            }
+        }
+        accumulator.map(f32::from)
+    }
+
+    /// **The systemic guard against the gap 0.105.1 and 0.105.2 each had
+    /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
+    /// dispatch arm's `src`/`backdrop` arguments survived the entire test
+    /// suite, and both times the only thing that found it was a human
+    /// performing the mutation and re-running everything. Eleven modes
+    /// are still to be ported on the same template — twelve
+    /// `aurora_render::BlendMode` variants lack a blend-math WGSL entry
+    /// point, but `Normal` is among them and needs none, compositing through
+    /// a separate fixed-function path — so the class needs a
+    /// standing check rather than a third discovery. (It earned its keep
+    /// immediately: `LinearBurn`, 0.106.0, was the first mode ported
+    /// since, and this guard is what made its fixture's non-unit opacity a
+    /// precondition of the round instead of a third round of hand
+    /// discovery. `ColorBurn`, 0.107.0, is the second, `ColorDodge`,
+    /// 0.108.0, the third, `Overlay`, 0.110.0, the fourth, `HardLight`,
+    /// 0.111.0, the fifth, `LinearLight`, 0.113.0, the sixth, `VividLight`,
+    /// 0.114.0, the seventh, `HardMix`, 0.115.0, the eighth, and `PinLight`,
+    /// 0.116.0, the ninth — the middle
+    /// five being the modes for which the guard's stated premise does not
+    /// hold, two of them only *conditionally* and one in a way that
+    /// made this guard's demand actively *insufficient* — which is why 0.113.1
+    /// added the computational third assertion below, and why the demand is
+    /// now a diagnostic rather than the whole check. `VividLight` has blind
+    /// opacities of its own — 0.114.0 claimed it did
+    /// not; see that mode's paragraph below — and its fixture escapes them by
+    /// measurement rather than by construction, which makes the computational
+    /// assertion necessary for it too. `HardMix`, 0.115.0, is the sharpest case
+    /// yet *for* the demand: its blend term is symmetric in every channel but
+    /// the one `(0, 1)` corner, so two of its fixture's three channels see a
+    /// transposed arm **only** through the fold, i.e. only at non-unit alpha.
+    /// The ordinals in this parenthetical were off by one from 0.114.0 until
+    /// 0.115.0 corrected them — it credited `LinearLight` and `VividLight` as
+    /// "the sixth" apiece.)
+    ///
+    /// The property, in one line: the first seven blend-math formulas the
+    /// GPU path implemented (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
+    /// `|Cb - Cs|`, `min(Cb+Cs, 1)`, `max(Cb+Cs-1, 0)`) are all
+    /// **commutative** — the eighth and ninth, the guarded-division pair,
+    /// are not, the tenth and eleventh, `Overlay` and `HardLight`, are
+    /// commutative only in *some*
+    /// channels, the twelfth, `LinearLight`, is non-commutative
+    /// everywhere its clamp does not saturate, the thirteenth,
+    /// `VividLight`, is non-commutative *structurally* — it branches on the
+    /// source, so a transposed pair branches on the backdrop and can take a
+    /// different arm entirely — the fifteenth, `PinLight`, is symmetric on
+    /// exactly four classes of operand pair (`Cb == Cs`, `|Cb - Cs| == 0.5`, an
+    /// operand at `0` with the other `<= 0.5`, an operand at `1` with the other
+    /// `> 0.5`), all of measure zero, so a generic fixture does see its
+    /// transpose at `a = 1` — and the fourteenth, `HardMix`, goes almost all
+    /// the way back: `1[Cb + Cs >= 1]` is symmetric, and an exhaustive sweep
+    /// found its **only** asymmetric operand pairs to be `(0, 1)` and `(1, 0)`,
+    /// a guard-ordering artifact of the `VividLight` it thresholds;
+    /// see the paragraphs below — so the only thing
+    /// that can ever notice a swapped pair of operands is the asymmetric
+    /// fold around it, `out = (1 - a) * bd + a * blended`, and it notices
+    /// nothing at `a = 1`. A fixture whose layer at the mode under test is
+    /// fully opaque therefore cannot see a transposed dispatch arm, no
+    /// matter how many assertions it carries.
+    ///
+    /// **`ColorBurn` (0.107.0) was the first exception, `ColorDodge`
+    /// (0.108.0) the second, `Overlay` (0.110.0) the third, `HardLight`
+    /// (0.111.0) the fourth, `LinearLight` (0.113.0) the fifth,
+    /// `VividLight` (0.114.0) the sixth and `PinLight` (0.116.0) the seventh
+    /// — the last being asymmetric on all but a measure-zero set, so it joins
+    /// `ColorBurn`/`ColorDodge`/`LinearLight`/`VividLight` in the
+    /// "any generic fixture sees it at `a = 1`" group rather than
+    /// `Overlay`/`HardLight`'s straddle-conditional one — and this
+    /// guard is deliberately not special-cased for any of them. `HardMix`
+    /// (0.115.0) is deliberately **not** in that list: its blend term is
+    /// symmetric except at one corner point, so it is the rule rather than an
+    /// exception to it, and its fixture needs the non-unit opacity this guard
+    /// demands in two of its three channels.**
+    ///
+    /// **`HardMix`'s exclusion from that list and its own fixture catching a
+    /// transpose at alpha `1.0` are both true, because the list classifies
+    /// *modes* and that measurement is about one *channel*** (spelled out here
+    /// because the two statements read as contradictory and were left adjacent
+    /// and unreconciled by 0.115.0). The six listed modes are asymmetric on a
+    /// set of *positive measure* — an open region of the unit square for
+    /// `ColorBurn`/`ColorDodge`/`LinearLight`/`VividLight`, the straddling half
+    /// for `Overlay`/`HardLight` — so *any* generically chosen fixture catches
+    /// their transpose at `a = 1` through the blend term, and non-unit opacity
+    /// is genuinely unnecessary for the mode. `HardMix`'s asymmetric set is
+    /// `{(0, 1), (1, 0)}`: two points, measure zero, so a generically chosen
+    /// fixture catches nothing at `a = 1` and the mode-level claim "non-unit
+    /// opacity is necessary" is right. What is *also* right is that
+    /// [`NORMAL_MULTIPLY_HARD_MIX_STACK`] is not generically chosen — its red
+    /// channel is placed on that corner deliberately — so **that fixture** does
+    /// see a transpose at `a = 1`, in red only. Read the classification
+    /// per-channel where the prose above reads per-mode: red is an exception,
+    /// green and blue are the rule, and the guard's `0.5` is what covers the
+    /// latter two. Promoting the mode onto the list on red's evidence would be
+    /// the error, and not only pedantically: red's detection is destroyed by a
+    /// single `f16` step away from `0.0` (the "largest gap and most fragile"
+    /// paragraph below works that through), while the six listed modes' is not.
+    /// `1 - min(1, (1 - Cb) / Cs)` and
+    /// `min(1, Cb / (1 - Cs))` are each *not* symmetric in their two
+    /// operands, so each mode's own blend term
+    /// catches a transposed dispatch arm even at effective alpha `1.0` —
+    /// measured in both rounds at both `0.5` and `1.0`, not reasoned about.
+    /// `Overlay` is a *third kind* of exception rather than a third member
+    /// of the same one, and `HardLight` (0.111.0) is the second member of
+    /// *that* kind: their asymmetry is **conditional**, holding only in
+    /// channels where `Cb` and `Cs` straddle `0.5` (wherever they share a
+    /// side, `Overlay(Cb, Cs) == Overlay(Cs, Cb)` exactly, by the same
+    /// two-way collision rule that makes `Overlay` and `HardLight` agree
+    /// there — and the same holds with `HardLight` on both sides).
+    /// `NORMAL_MULTIPLY_OVERLAY_STACK` straddles in all three channels, so
+    /// 0.110.0 measured the transpose observable there at `1.0` as well as
+    /// at `0.5`, and 0.111.0 measured the same for
+    /// `NORMAL_MULTIPLY_HARD_LIGHT_STACK`, which shares its colours — but
+    /// that is a property of *those fixtures*, not of the modes,
+    /// which is exactly why the conservative rule is worth keeping here.
+    /// For those four modes non-unit opacity is therefore
+    /// sufficient-but-not-necessary, and this guard demanding it anyway is
+    /// a false alarm waiting to happen rather than a false all-clear. It
+    /// is left demanding it regardless: the roster is meant to be read and
+    /// extended by rounds that will not want to re-derive per-mode
+    /// symmetry arguments, an exemption list would be a second
+    /// hand-maintained thing to keep in step with the enum, and the cost
+    /// of the conservative rule is four fixtures carrying a `0.5` they do
+    /// not strictly need. (`NORMAL_MULTIPLY_COLOR_DODGE_STACK` needs its
+    /// `0.5` for an unrelated second reason anyway — see that const.)
+    ///
+    /// **`LinearLight` (0.113.0) is the fifth exception and a *different kind*
+    /// again — the first one for which this guard's demand is not merely
+    /// unnecessary but, on its own, **insufficient**. Read this before
+    /// extending the roster with another clamped mode.** Its blend term is
+    /// non-commutative *everywhere* (`B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` before
+    /// the clamp, so it is in `ColorBurn`'s and `ColorDodge`'s unconditional
+    /// class, not `Overlay`'s conditional one). But **two mechanisms launder a
+    /// transpose here and they are exactly complementary**, worked out
+    /// algebraically in that round and then measured:
+    ///
+    /// - a **railed** channel — one where both operand orders drive
+    ///   `Cb + 2*Cs - 1` past the *same* clamp bound — has an identical `B`
+    ///   either way, so only the fold's `(1-a)*Cb` vs `(1-a)*Cs` remains, and
+    ///   that vanishes at `a = 1`;
+    /// - a clamp-**interior** channel has
+    ///   `out - out_transposed = (Cb - Cs) * (1 - 2a)`, which is **zero at
+    ///   `a = 0.5`** — there `out = Cb + Cs - 0.5`, symmetric in its two
+    ///   operands outright.
+    ///
+    /// So for this mode the `0.5` this guard demands is precisely the value at
+    /// which an interior channel goes blind, and `a = 1.0` is precisely where a
+    /// railed one does. A fixture of only interior channels would satisfy this
+    /// guard and still be blind to a transposed dispatch arm.
+    /// `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` therefore carries **all three clamp
+    /// regimes** — upper rail, interior, lower rail — so the transpose is
+    /// observable at both opacities (measured: two channels at `0.5`, one at
+    /// `1.0`). That property is not something this guard can check, and it is
+    /// not claimed to; it is recorded on the fixture and in PLAN.md's 0.113.0
+    /// mutation matrix. **The lesson for the next clamped mode is that
+    /// "asymmetric blend term" does not imply "transpose observable", in either
+    /// direction.**
+    ///
+    /// **`VividLight` (0.114.0) is the sixth exception, and it is the mirror
+    /// image of the fifth — worth stating because the two look alike and are
+    /// not.** Its blend term is non-commutative *structurally*: `B(Cb, Cs)`
+    /// branches on `Cs` while `B(Cs, Cb)` branches on `Cb`, so a straddling
+    /// pair takes two different families under transposition rather than the
+    /// same formula with swapped arguments. Being a pair of guarded divisions it
+    /// is **not affine in its operands**, so `LinearLight`'s
+    /// `(Cb - Cs)*(1 - 2a)` form has no analogue.
+    ///
+    /// **0.114.0 read that as "no blind opacity at all". It is not, and this is
+    /// the most load-bearing correction in this comment, because the wrong
+    /// version reads as a licence to skip assertion (3).** Write
+    /// `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`. Over an opaque backdrop
+    /// at effective alpha `a`,
+    ///
+    /// ```text
+    /// out - out_transposed = (1 - a) * D0 + a * D1
+    /// ```
+    ///
+    /// which is **affine in `a` for every blend mode**, this one included: a
+    /// blend term that is not affine in its *operands* says nothing about that
+    /// expression, which never varies them. So a channel is blind at
+    /// `a* = D0 / (D0 - D1)`, and `a*` lands in `(0, 1)` whenever `D0` and `D1`
+    /// have opposite signs. **Being clamp-interior in both operand orders does
+    /// not exempt a channel** — which is exactly the heuristic 0.114.0 leaned
+    /// on. Inside the burn branch the algebra closes: for `Cb != Cs`,
+    /// `D0 + D1 == 0` (blind at exactly the `0.5` this guard demands) reduces to
+    /// `2*Cb*Cs + Cb + Cs == 1`, derived and then confirmed by exhaustive
+    /// rational search — and `Cb = 0.3`, `Cs = 0.4375` sits on it with **both**
+    /// orders burn-*interior* (`B = 0.2` against `B^T = 0.0625`). The dodge
+    /// branch carries the mirror locus in `1 - Cb` and `1 - Cs`.
+    ///
+    /// Two mechanisms therefore launder a transpose here, not one: *rail
+    /// agreement* — both orders driving the callee's own `min(1, ..)` past its
+    /// bound, i.e. `Cb + 2*Cs <= 1` and `Cs + 2*Cb <= 1` in the burn branch, or
+    /// `Cb + 2*Cs >= 2` and `Cs + 2*Cb >= 2` in the dodge branch — and that
+    /// blind `a*`. `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` escapes both: no channel
+    /// rails in both orders, and its three blind alphas are `≈ 0.8882`, `0.75`
+    /// and `≈ 0.9310`, none of them `0.5` or `1.0`. So its transpose is
+    /// observable in all three channels at `0.5` **and** all three at `1.0`
+    /// (measured) — the first roster row for which that holds at both opacities.
+    /// **What establishes that is assertion (3) below, not this mode's
+    /// asymmetry**: for `VividLight` the computational check is *necessary*,
+    /// exactly as it is for `LinearLight`, and this guard's `0.5` is neither
+    /// sufficient on its own nor the reason the fixture works.
+    ///
+    /// **So as of 0.113.1 this guard no longer rests on the proxy alone: it
+    /// asks the arithmetic.** A third assertion folds each roster fixture on
+    /// the CPU twice — once as written, once with every layer at the mode under
+    /// test folded with its two operands swapped, via
+    /// [`solid_stack_texel_cpu`] — and requires the two texels to differ by
+    /// more than the tolerance that fixture's own GPU-vs-CPU differential
+    /// allows. That is **mode-agnostic**: it needs no symmetry argument, no
+    /// per-mode exemption list, and no opacity value can satisfy it while being
+    /// blind, which is precisely what "effective alpha strictly inside `(0, 1)`"
+    /// cannot promise.
+    ///
+    /// The evidence it closes is a real constructed counterexample, not a
+    /// worry: an all-*interior* `LinearLight` fixture at exactly opacity `0.5`
+    /// satisfies both older assertions and, with the dispatch arm genuinely
+    /// transposed, leaves this crate's whole suite green — the guard included.
+    /// The new assertion fails it, mutation-tested for real in 0.113.1 (see
+    /// PLAN.md's entry for that round): it reports a largest channel gap of
+    /// exactly `0`, and assertions (1) and (2) pass it as they always did.
+    ///
+    /// **All sixteen live rows clear it with room to spare.** Thirteen of them
+    /// were measured in 0.113.1, the round that added the assertion; the
+    /// fourteenth is `VividLight`'s own row, which did not exist then and was
+    /// measured in 0.114.0 with the rest of that port (largest channel gap
+    /// `0.2602539`, in blue), and the fifteenth is `HardMix`'s, measured in
+    /// 0.115.0 with the rest of *that* port (largest channel gap a full
+    /// `1.0`, in red — `(0.0, 0.828125, 0.1875)` as written against
+    /// `(1.0, 0.78125, 0.21875)` transposed), and the sixteenth is `PinLight`'s,
+    /// measured in 0.116.0 with the rest of *that* port (largest channel gap
+    /// `0.296875`, in red — `(0.578125, 0.5, 0.1875)` as written against
+    /// `(0.28125, 0.78125, 0.46875)` transposed; and unusually for this roster
+    /// **every** channel clears it, none of the three having a blind alpha
+    /// inside `(0, 1)` at all). The smallest gap in the roster is
+    /// `LinearLight`'s own `0.046875`, about 24× the tolerance; the largest is
+    /// still `HardMix`'s `1.0`, which displaced `ColorDodge`'s `0.61865`. So the
+    /// check is not near a boundary for any current fixture. (Provenance
+    /// corrected in 0.114.1: 0.114.0 rewrote "all
+    /// thirteen" to "all fourteen" while leaving "measured in the same round",
+    /// which credited 0.113.1 with measuring a row that postdates it. 0.115.0
+    /// then left the count at fourteen against fifteen rows, and left
+    /// `ColorDodge` credited as the largest gap while adding a row with
+    /// nearly twice it; both corrected here.)
+    ///
+    /// **`HardMix`'s `1.0` is the roster's largest gap and its most fragile,
+    /// which is not a contradiction.** It comes from one channel — red, the
+    /// `(Cb, Cs) = (0, 1)` guard-ordering corner — and a corner is a single
+    /// point, not a region: unlike every other row, whose gap survives any
+    /// small perturbation of its operands, this one vanishes the moment red's
+    /// backdrop stops being *exactly* `0.0`, because
+    /// `color_dodge_channel`'s `cs == 1.0` guard then fires where its
+    /// `cb == 0.0` guard would have and both operand orders return `1`. The
+    /// row still clears the assertion in green and blue on their own (by
+    /// `0.046875` and `0.03125`), so the check is not resting on the corner
+    /// alone — but see [`NORMAL_MULTIPLY_HARD_MIX_STACK`]'s own comment for
+    /// why red must not be "tidied".
+    ///
+    /// **Why not simply also exclude `a = 0.5`,** which is what the algebra
+    /// above literally indicts? Because **all sixteen** roster rows carry
+    /// their non-unit opacity as exactly `0.5` — checked, not assumed — and
+    /// each one's golden is hand-derived from that value and measured on real
+    /// GPU hardware. Excluding `0.5` would fail every row at once and demand
+    /// sixteen goldens be re-derived and re-measured, to buy a rule that is
+    /// still a proxy —
+    /// blind to any *other* laundering value a future clamped or saturating
+    /// mode brings (`a = 0` for `HardMix`-shaped saturation, say). The
+    /// computational check is both cheaper and strictly stronger, so the
+    /// opacity rule is kept as the *diagnostic* — it names the likely cause in
+    /// its failure message — and the arithmetic is what actually decides.
+    ///
+    /// At
+    /// least four more asymmetric modes are still to
+    /// be ported (`Subtract`, `Divide`,
+    /// `SoftLight` and `PinLight`
+    /// among the separable ones — `Overlay` was on that list
+    /// until 0.110.0 ported it, `HardLight` until 0.111.0 did,
+    /// `LinearLight` until 0.113.0 did, and `VividLight` until 0.114.0 did);
+    /// if a later round wants the exemption, it should be a deliberate,
+    /// per-mode change to this test with its own measured justification,
+    /// not a quiet loosening.
+    ///
+    /// So, for every mode with a dispatch counter (`GpuBlendDispatch::ALL`,
+    /// itself pinned to the enum by an exhaustive `match` and by
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter`), except
+    /// `Dissolve`, which resolves to `Normal` before any blend math runs,
+    /// this asserts three things of every [`TRANSPOSE_COVERAGE`] row for that
+    /// mode — and that the roster names at least one:
+    ///
+    ///   1. the fixture has a layer at that mode whose effective alpha
+    ///      (`opacity * the layer's own alpha`) is strictly between `0` and
+    ///      `1`, unoccluded from above;
+    ///   2. the fixture still qualifies for the GPU path at all;
+    ///   3. **and, since 0.113.1, that it really does composite to a
+    ///      different texel with that mode's operands transposed** —
+    ///      [`solid_stack_texel_cpu`] folded both ways, compared at the
+    ///      tolerance the fixture's own differential uses.
+    ///
+    /// (1) and (2) are proxies and (3) is the property itself; all three are
+    /// kept because (1) and (2) name a *cause* in their failure messages,
+    /// which is what a round extending the roster needs, while (3) is what
+    /// cannot be satisfied vacuously.
+    ///
+    /// Non-unit opacity on the mode-bearing layer is not quite the whole
+    /// condition, which is why 0.106.1 added a second half: the fold is
+    /// also degenerate if a **fully opaque `Normal` layer sits above** that
+    /// layer, because `out = (1 - 1) * bd + 1 * Cs` throws the accumulator
+    /// away, and with it everything this arm folded into it. Such a
+    /// fixture would carry a perfectly good `0.5` and still be blind to the
+    /// transpose. No row has that shape today — every mode-bearing layer in
+    /// the roster is either the topmost layer or sits under a further layer
+    /// at its own mode, which composites rather than replaces — so this
+    /// half is pure latent-hole insurance, added because the roster is
+    /// meant to be extended by rounds that will read this guard's verdict
+    /// rather than re-derive its reasoning.
+    ///
+    /// **What it does not do, stated plainly.**
+    ///
+    /// - **It cannot detect a real transposed dispatch arm**, which its own
+    ///   name reads as though it could. Everything it does is static: it walks
+    ///   [`TRANSPOSE_COVERAGE`], builds throwaway layer trees, and folds
+    ///   [`solid_stack_texel_cpu`] both ways. It never calls
+    ///   [`begin_gpu_composite_tile`], never reaches a `composite_*_over_with_
+    ///   opacity` argument list, and never touches a GPU adapter — so the
+    ///   argument order actually shipped in that `match` is invisible to it.
+    ///   What it establishes is the *precondition*: that a fixture exists whose
+    ///   composited texel would move if the arm were transposed. Whether any
+    ///   test then notices that movement is a separate question, answered only
+    ///   by running the mutation. **Measured in 0.115.0, not reasoned about**:
+    ///   that round transposed `HardMix`'s real dispatch arm (mutation (i) of
+    ///   its matrix) and the *only* failure was the app-level differential
+    ///   `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_
+    ///   blend_document`. This test stayed green, having predicted the very
+    ///   mutation it could not see. Read the name as "…has a fixture that
+    ///   *could* see one", which is what it says and all it checks.
+    /// - It does not prove the fixture's *own assertions* would fail — only
+    ///   that its composited texel moves. Since 0.113.1 the "could see one"
+    ///   half is no longer a symmetry argument: assertion (3) folds the real
+    ///   arithmetic both ways and requires a difference larger than the
+    ///   differential's tolerance, so `Cb == Cs` in every channel (which
+    ///   hides a swap at any opacity) now fails here rather than passing.
+    ///   What is still outside its reach is a fixture whose texel moves and
+    ///   whose *assertions* are too loose or too few to notice — for that,
+    ///   running the mutation is still the only evidence, which is what
+    ///   PLAN.md's per-round kill matrices record.
+    /// - It does not check the fixture's assertions at all, only its layer
+    ///   table and the arithmetic that table implies.
+    /// - The occlusion half above reads that same table and nothing else,
+    ///   so it reasons about *declared* stacking, opacity and blend mode —
+    ///   not about which pixels a layer actually covers. Every roster
+    ///   fixture is a full-tile solid fill through
+    ///   [`solid_root_stack`], where "a fully opaque `Normal` layer above"
+    ///   really does replace everything; a future fixture whose occluding
+    ///   layer painted only part of the tile, or carried a mask, would be
+    ///   rejected here even though the uncovered pixels stay observable.
+    ///   That direction is the safe one (a false alarm this comment
+    ///   explains, not a false all-clear), and it is why the check tests
+    ///   `Normal` at effective alpha `1.0` specifically rather than trying
+    ///   to model coverage.
+    /// - Its roster is hand-maintained. A new mode ported *without* an
+    ///   entry fails here (that is the point), but a fixture added and
+    ///   never registered is invisible to it.
+    /// - It anchors on the counter enum, not directly on
+    ///   [`document_qualifies_for_gpu_compositing`]'s `matches!` set, so a
+    ///   mode admitted at the predicate with no counter variant slips past
+    ///   *this* test. **That gap is closed as of 0.112.0**, by
+    ///   `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_
+    ///   with_a_dispatch_counter`, which calls the real predicate once per
+    ///   `aurora_doc::BlendMode::ALL` variant and requires the admitted set
+    ///   to be this enum plus exactly `Normal` — measured, not assumed: that
+    ///   round's mutation C admitted `Subtract` at the predicate with no
+    ///   counter and it was the sole failure out of 407. (The justification
+    ///   this bullet used to give — that nothing enumerates the 27 variants
+    ///   at runtime, so closing it would mean a second hand-maintained list —
+    ///   stopped being true when `BlendMode::ALL` landed in the same round.)
+    ///   `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_
+    ///   across_every_expressible_mode`'s own mode loop is the other place
+    ///   that drift shows up, and it has caught it once already.
+    /// - It does have a **reverse direction**, easy to miss because it sits
+    ///   after the per-arm loop below rather than inside it: every
+    ///   [`TRANSPOSE_COVERAGE`] row must name a mode some
+    ///   `GpuBlendDispatch::ALL` variant maps to, so a row crediting a
+    ///   fixture with covering a mode that has no live counter fails here
+    ///   too. Measured rather than reasoned about: 0.112.0's mutation D
+    ///   dropped `Self::HardLight` from that enum and this test was the
+    ///   fourth failure, one its own round had not predicted — the roster row
+    ///   for `HardLight` was orphaned and this loop is what noticed. It is
+    ///   the guard working as designed, not a coincidental coupling to an
+    ///   unrelated test.
+    ///
+    /// Headless and cheap: no GPU adapter, no tile store, no compositing —
+    /// it reads layer tables and builds throwaway trees.
+    #[test]
+    fn every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument() {
+        for which in GpuBlendDispatch::ALL {
+            let mode = dispatch_arm_blend_mode(which);
+            if mode == aurora_doc::BlendMode::Dissolve {
+                continue;
+            }
+            let mut fixtures = 0_usize;
+            for &(roster_mode, test_name, stack) in TRANSPOSE_COVERAGE {
+                if roster_mode != mode {
+                    continue;
+                }
+                fixtures += 1;
+                let effective_alpha = |(_, _, opacity, rgba): StackEntry| {
+                    let [_, _, _, alpha] = rgba;
+                    opacity * alpha
+                };
+                // A fully opaque `Normal` layer *above* the mode-bearing
+                // one takes the fold to `out = (1 - 1) * bd + 1 * Cs`,
+                // i.e. it discards the accumulator this arm contributed
+                // to -- so its non-unit opacity stops being observable in
+                // the composited texel, exactly as if it had been at
+                // `1.0` itself. No current row has that shape; the check
+                // is here so a later round's fixture cannot acquire it
+                // while this guard still reports all clear.
+                let occluded_above = |index: usize| {
+                    stack.iter().skip(index + 1).any(|&entry| {
+                        entry.1 == aurora_doc::BlendMode::Normal && effective_alpha(entry) >= 1.0
+                    })
+                };
+                let observable = stack.iter().enumerate().any(|(index, &entry)| {
+                    let alpha = effective_alpha(entry);
+                    entry.1 == mode && alpha > 0.0 && alpha < 1.0 && !occluded_above(index)
+                });
+                assert!(
+                    observable,
+                    "{test_name}'s fixture has no {mode:?} layer at an effective alpha strictly \
+                     between 0 and 1 that is also unoccluded from above, so a dispatch arm that \
+                     transposed src and backdrop for {mode:?} would be invisible to it: every \
+                     formula on the GPU path except the guarded-division pair (ColorBurn, \
+                     ColorDodge) and LinearLight is commutative -- Overlay and HardLight \
+                     everywhere their two \
+                     operands share a side of 0.5, which is most of a typical channel pair, and \
+                     the two are each other's transpose so they also agree with each other \
+                     there; LinearLight is non-commutative wherever its clamp does not saturate, \
+                     but see this test's doc comment, because for that mode this very 0.5 is what \
+                     blinds a clamp-interior channel -- and the fold \
+                     (1 - a) * bd + a * blended around it collapses to `blended` at a = 1 -- and \
+                     a fully opaque Normal layer stacked above the mode-bearing one collapses it \
+                     the same way, by replacing the accumulator outright. Restore the non-unit \
+                     opacity (and its derived golden), or move the occluding layer below the one \
+                     under test, rather than deleting this row -- PLAN.md's 0.105.1 and 0.105.2 \
+                     entries record the measured mutations this property is what kills."
+                );
+                assert!(
+                    document_qualifies_for_gpu_compositing(&root_stack_tree(stack)),
+                    "{test_name}'s fixture must still qualify for the GPU path, or the arm it is \
+                     credited with covering never runs and the transpose is unobservable for a \
+                     second, different reason"
+                );
+
+                // The computational half (0.113.1): fold this fixture on the
+                // CPU twice, once normally and once with every layer at this
+                // mode folded with its two operands swapped, and require the
+                // two texels to differ by more than the tolerance the
+                // fixture's own GPU-vs-CPU differential allows. This is
+                // mode-agnostic -- it asks the arithmetic instead of
+                // reasoning about symmetry -- so no opacity value can dodge
+                // it, which is exactly what the two assertions above cannot
+                // promise. See this test's doc comment for the LinearLight
+                // counterexample that made the proxy's insufficiency real.
+                let correct = solid_stack_texel_cpu(stack, None);
+                let swapped = solid_stack_texel_cpu(stack, Some(mode));
+                let gap = correct
+                    .iter()
+                    .zip(swapped.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                // The same tolerance `assert_gpu_matches_cpu` uses: a
+                // difference at or under it is one the fixture's own
+                // differential would accept as agreement, so it is not
+                // observability.
+                let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+                assert!(
+                    gap > tolerance,
+                    "{test_name}'s fixture composites to the *same* texel whether {mode:?}'s \
+                     dispatch arm binds src/backdrop correctly or transposed ({correct:?} vs \
+                     {swapped:?}, largest channel gap {gap} <= {tolerance}), so it cannot see \
+                     that mutation no matter what its opacity is. This is the check the \
+                     non-unit-opacity assertion above only approximates: for a clamped mode a \
+                     perfectly good 0.5 can still be blind (LinearLight, 0.113.0 -- an \
+                     all-interior fixture at exactly 0.5 has \
+                     out - out_transposed = (Cb - Cs) * (1 - 2a) == 0 in every channel). Fix the \
+                     fixture's colours or its opacity and re-derive its golden; do not delete \
+                     this row."
+                );
+            }
+            assert!(
+                fixtures > 0,
+                "{mode:?} has a GPU dispatch counter, so it has a dispatch arm, so some fixture \
+                 must be able to see that arm's src/backdrop order transposed -- and none is \
+                 registered in TRANSPOSE_COVERAGE. If this fired because a mode was just ported: \
+                 give its fixture a non-unit opacity on its own layer, derive the golden from \
+                 that, and add the row. Read this test's doc comment first; the two rounds that \
+                 found this gap by hand are PLAN.md's 0.105.1 and 0.105.2."
+            );
+        }
+
+        for &(mode, test_name, _) in TRANSPOSE_COVERAGE {
+            assert!(
+                GpuBlendDispatch::ALL
+                    .iter()
+                    .any(|&which| dispatch_arm_blend_mode(which) == mode),
+                "TRANSPOSE_COVERAGE credits {test_name} with covering {mode:?}, which has no \
+                 GpuBlendDispatch counter -- so either the mode is not on the GPU path at all \
+                 (drop the row) or it was ported without a counter (add one, and see \
+                 GpuBlendDispatches for why a counter is what tells a real dispatch apart from a \
+                 silent CPU fallback computing the same pixels)"
+            );
+        }
+    }
+
+    /// **Derives the predicate's admitted-mode set by calling it, instead
+    /// of re-reading its `match` arms** (0.112.0).
+    ///
+    /// Six consecutive porting rounds each restated "the predicate admits
+    /// N modes" somewhere in prose, and nothing could check it: the only
+    /// existing coverage is one `document_qualifies_for_gpu_compositing_
+    /// admits_a_<mode>_blend_mode` test per mode, each of which passes
+    /// happily while the *set* has an extra member no counter exists for.
+    /// This test measures the set by feeding every
+    /// [`aurora_doc::BlendMode`] variant through the real predicate, so a
+    /// mode added to the predicate's `matches!` and nowhere else fails
+    /// here — the failure mode a per-mode positive test structurally
+    /// cannot produce.
+    ///
+    /// The invariant is `admitted == GpuBlendDispatch::ALL + 1`, and the
+    /// `+ 1` is exactly `Normal`: it is admitted and deliberately
+    /// uncounted, compositing through the fixed-function path with no
+    /// blend-math dispatch to count. `Dissolve` *is* counted despite
+    /// having no blend-math shader, because it resolves to `Normal` before
+    /// the dispatch and its counter proves the resolution happened.
+    ///
+    /// A count and a containment are not enough on their own, which is why
+    /// 0.112.1 added a third assertion: [`dispatch_arm_blend_mode`] must be
+    /// **injective**. Two counters mapped to one mode leaves some counted mode
+    /// with no mapping at all, and one extra admitted mode makes the
+    /// arithmetic come out right again — measured, not hypothesised: that
+    /// exact pair (`HardLight`'s counter pointed at `Overlay`, its
+    /// [`TRANSPOSE_COVERAGE`] row dropped) passed all 407 tests in this crate
+    /// before the distinctness loop existed, with `HardLight`'s counter dead
+    /// and every test reading it as dispatch proof silently vacuous.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter() {
+        let mut admitted = Vec::new();
+        for mode in aurora_doc::BlendMode::ALL {
+            let stack: [StackEntry; 1] = [("only", mode, 1.0, [0.25, 0.5, 0.75, 1.0])];
+            if document_qualifies_for_gpu_compositing(&root_stack_tree(&stack)) {
+                admitted.push(mode);
+            }
+        }
+
+        assert_eq!(
+            admitted.len(),
+            GpuBlendDispatch::ALL.len() + 1,
+            "the real predicate admits {admitted:?} ({} modes) but GpuBlendDispatch::ALL has {} \
+             variants; the two must differ by exactly one (Normal, deliberately uncounted). \
+             Measured by calling the real predicate once per BlendMode::ALL variant, not by \
+             re-reading its match arms -- so a mode added to the predicate without a dispatch \
+             counter, or a counter added without admitting the mode, lands here.",
+            admitted.len(),
+            GpuBlendDispatch::ALL.len()
+        );
+
+        assert!(
+            admitted.contains(&aurora_doc::BlendMode::Normal),
+            "Normal must be admitted -- it is the one uncounted admitted mode the +1 above \
+             accounts for, so if it is absent the count can still match while naming a different \
+             set entirely"
+        );
+        for which in GpuBlendDispatch::ALL {
+            let mode = dispatch_arm_blend_mode(which);
+            assert!(
+                admitted.contains(&mode),
+                "{which:?} has a dispatch counter for {mode:?}, but the predicate does not admit \
+                 a document whose only layer uses that mode -- the counter can never be \
+                 incremented, so every test that reads it as dispatch proof is vacuous"
+            );
+        }
+
+        // `dispatch_arm_blend_mode` must be injective (0.112.1). The
+        // containment loop above and the count assertion at the top are each
+        // satisfiable by a *pair* of faults that cancel: two counters mapped
+        // to one mode (leaving some mode with a counter and no mapping), plus
+        // one extra admitted mode to keep the arithmetic right, and every
+        // assertion so far still passes. Pairwise rather than sorted, since
+        // `aurora_doc::BlendMode` derives no ordering -- the same shape
+        // `every_gpu_blend_dispatch_mode_gets_its_own_counter` uses for its
+        // counter-address distinctness.
+        let mapped: Vec<aurora_doc::BlendMode> = GpuBlendDispatch::ALL
+            .iter()
+            .copied()
+            .map(dispatch_arm_blend_mode)
+            .collect();
+        for (index, &left) in mapped.iter().enumerate() {
+            for &right in mapped.iter().skip(index + 1) {
+                assert_ne!(
+                    left, right,
+                    "two GpuBlendDispatch variants both map to {left:?} in \
+                     dispatch_arm_blend_mode, so some other counted mode has no mapping at all -- \
+                     and this test's other assertions can be satisfied anyway by an extra admitted \
+                     mode making the count come out right, which is exactly the double fault this \
+                     check exists to refuse"
+                );
+            }
+        }
+    }
+
+    /// Cross-checks this crate's counted-mode list against
+    /// `aurora-render`'s own shader-derived blend-math pass count
+    /// (0.112.0) — the third of the three drifting numbers, and the only
+    /// one that spans a crate boundary.
+    ///
+    /// Neither crate could previously see the other's figure at all, which
+    /// is how 0.111.1 came to ship a doc comment reading `[Self; 11]`
+    /// above an array of twelve. `BLEND_MATH_PASS_COUNT` is
+    /// `ALL_BLEND_PASSES::len()` over there, itself checked against
+    /// `shaders/composite.wgsl`'s real `@fragment` entry points, so this
+    /// assertion chains a Rust list here to WGSL source in another crate.
+    #[test]
+    fn gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count() {
+        assert_eq!(
+            GpuBlendDispatch::ALL.len(),
+            aurora_render::BLEND_MATH_PASS_COUNT + 1,
+            "GpuBlendDispatch::ALL's length and aurora_render::BLEND_MATH_PASS_COUNT (+1 for \
+             Dissolve, the one counted mode with no blend-math shader, since it resolves to Normal \
+             before the dispatch) disagree. A mode was ported in one crate but not the other: \
+             either a BLEND_PASS_* const and its shader entry point exist with no counter here, or \
+             a counter exists here with no shader to dispatch."
+        );
+    }
+
+    /// One texel's own `(r, g, b, a)` channels — the shape
+    /// [`read_first_texel`] already returns, named here only so the
+    /// helper below can return a pair of them without tripping
+    /// `clippy::type_complexity`.
+    type Texel = (f32, f32, f32, f32);
+
+    /// Composites `layers` twice through [`recomposite_visible_tiles`] —
+    /// once with a real GPU context and compositor (the
+    /// [`begin_gpu_composite_tile`] path), once with neither (forcing
+    /// `composite_tile_cpu`) — and returns tile `(0, 0)`'s own first
+    /// texel from each, as `(gpu, cpu)`. Each run gets its own fresh
+    /// [`CompositeCache`], so the second is a real recomposite and not a
+    /// cache hit on the first's result.
+    fn gpu_and_cpu_first_texel(
+        context: &aurora_gpu::GpuContext,
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+    ) -> (Texel, Texel) {
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            layers,
+            None,
+            store,
+            &mut gpu_cache,
+            Some(context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, layers, None, store, &mut cpu_cache, None, None);
+        let cpu_result = read_first_texel(store, composite_surface_id(), tile_id);
+
+        (gpu_result, cpu_result)
+    }
+
+    /// [`gpu_and_cpu_first_texel`]'s whole-tile counterpart, for a
+    /// fixture where a single texel isn't representative of the whole
+    /// tile — `Dissolve`'s per-texel stochastic gate is the reason this
+    /// exists (0.84.2): a solid-fill layer still composites differently
+    /// texel to texel once a position-seeded gate decides which texels
+    /// show it, so comparing only texel `(0, 0)` would miss a real
+    /// divergence (a re-seeded noise function, say) everywhere except
+    /// wherever the gate happens to agree at that one position.
+    fn gpu_and_cpu_all_texels(
+        context: &aurora_gpu::GpuContext,
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            layers,
+            None,
+            store,
+            &mut gpu_cache,
+            Some(context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_all_texels(store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, layers, None, store, &mut cpu_cache, None, None);
+        let cpu_result = read_all_texels(store, composite_surface_id(), tile_id);
+
+        (gpu_result, cpu_result)
+    }
+
+    /// **Every [`GpuBlendDispatch`] variant addresses its own counter**
+    /// (0.103.0) — the one property of the merged, mode-indexed
+    /// dispatch-proof mechanism that the compiler does *not* check.
+    ///
+    /// [`GpuBlendDispatches::counter`]'s `match` is exhaustive, so the
+    /// compiler guarantees every variant has *an* arm and every field
+    /// exists. It does not guarantee the mapping is injective: two arms
+    /// can name the same field and the code still builds, still passes
+    /// `clippy`, and still produces correct pixels. What such a mis-wire
+    /// breaks is only the counters' *discrimination* — `Screen` ticking
+    /// `lighten` would make `Screen`'s own test pass on a `Lighten`
+    /// dispatch and vice versa. Each per-mode GPU test zeroes its own
+    /// counter and composites exactly one mode, so none of them can see
+    /// that; this test is the only assertion that can, and mutation #6 of
+    /// 0.103.0's set (swapping `counter`'s `Screen` arm to
+    /// `&self.lighten`) was performed for real to confirm it is.
+    ///
+    /// Deliberately on a **local** [`GpuBlendDispatches::new`] instance
+    /// rather than the [`GPU_BLEND_DISPATCHES`] global: no GPU adapter is
+    /// needed (so this runs everywhere, including a runner where every
+    /// GPU-gated test self-skips — precisely the configuration in which a
+    /// mis-wire would otherwise go unobserved), and it cannot land inside
+    /// another test's measurement window, since it never touches the
+    /// static the dispatch arms increment.
+    #[test]
+    fn every_gpu_blend_dispatch_mode_gets_its_own_counter() {
+        // Every variant, from `GpuBlendDispatch::ALL` rather than a second
+        // hand-written copy of the same list (0.104.1): the `match` in
+        // `counter` is what makes a *missing* variant a compile error, and
+        // `ALL` is what a new mode's author has to touch anyway, sitting
+        // directly under the enum definition they just edited.
+        let modes = GpuBlendDispatch::ALL;
+        // This literal is deliberately kept after 0.112.0, which added two
+        // *derived* checks on the same length
+        // (`gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count`
+        // against `aurora_render::BLEND_MATH_PASS_COUNT + 1`, and
+        // `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`
+        // against the real predicate). The redundancy is the point: this one
+        // states what a *human* expected, so a round that bumps the derived
+        // sources on both sides still has to acknowledge the change here.
+        assert_eq!(
+            modes.len(),
+            16,
+            "GpuBlendDispatch::ALL no longer has the sixteen variants this test was written \
+             against \
+             -- if a mode was added, that is expected: bump this literal. If a mode was added to \
+             the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
+             silently uncovered by the only test in this crate that can catch a counter mis-wire."
+        );
+        let dispatches = GpuBlendDispatches::new();
+
+        for &mode in &modes {
+            assert_eq!(
+                dispatches
+                    .counter(mode)
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "a freshly constructed GpuBlendDispatches must start every counter at zero -- \
+                 {mode:?} did not, so `new` is not zero-initialising the field this variant \
+                 addresses"
+            );
+        }
+
+        // Distinctness by address: every unordered pair of variants, once.
+        for (index, &left) in modes.iter().enumerate() {
+            for &right in modes.iter().skip(index + 1) {
+                assert!(
+                    !std::ptr::eq(dispatches.counter(left), dispatches.counter(right)),
+                    "{left:?} and {right:?} address the *same* AtomicU64 -- two arms of \
+                     GpuBlendDispatches::counter name one field, so each mode's dispatch proof \
+                     now also counts the other's and neither test can tell them apart"
+                );
+            }
+        }
+
+        // And behaviourally, which is the property the tests actually
+        // depend on: incrementing one mode's counter leaves *every* other
+        // one at zero. Strictly implied by the address check above, and
+        // asserted anyway because it is the failure a reader recognises.
+        // Deliberately count-free -- it said "the other five" from 0.103.0
+        // through 0.105.3, by which point there were seven, so the number
+        // was wrong in the one place a reader would trust it. The loop
+        // below has never needed it.
+        for &mode in &modes {
+            dispatches
+                .counter(mode)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for &other in &modes {
+                let expected = u64::from(other == mode);
+                assert_eq!(
+                    dispatches
+                        .counter(other)
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    expected,
+                    "after one {mode:?} dispatch, {other:?}'s counter must read {expected}"
+                );
+            }
+            dispatches
+                .counter(mode)
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Asserts the GPU and CPU composites of the same fixture agree
+    /// channel by channel, within the same `2 * f16::EPSILON` tolerance
+    /// (and with the same "this is a finding, not a reason to loosen the
+    /// assertion" framing) every hand-written differential above uses.
+    /// `what` names the fixture in the failure message.
+    fn assert_gpu_matches_cpu(gpu_result: Texel, cpu_result: Texel, what: &str) {
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: {what} must really composite to something -- two transparent-black results \
+             would agree vacuously"
+        );
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU and CPU paths diverged by more than {tolerance} on \
+                 {what} ({gpu} vs {cpu}) -- that is a real finding to report, not a reason to \
+                 loosen this assertion. Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    /// **The readback-index test, with the parity that actually matters**
+    /// (0.84.1). Whether `begin_gpu_composite_tile` reads back from the
+    /// right member of the ping-pong pair is decided by the *parity* of
+    /// the swap count, not by how many layers a fixture has — and before
+    /// this test, the whole invariant rested on exactly one fixture. The
+    /// four-layer sibling above has an **even** number of swaps (two), so
+    /// the fold ends where it started and a "always read back the first
+    /// member" bug passes it by coincidence; only the two-layer
+    /// `..._agree_on_a_multiply_blend_document` (one swap, odd) catches
+    /// that bug, and it is the simplest possible fixture — an edit to it
+    /// would silently take the coverage with it.
+    ///
+    /// Five root-level layers, three of them `Multiply`, so three swaps:
+    ///
+    /// | # | mode       | opacity | pass writes | `current` after |
+    /// |---|------------|---------|-------------|-----------------|
+    /// | 1 | `Normal`   | 1.0     | A, in place | A               |
+    /// | 2 | `Multiply` | 1.0     | B (from A)  | **B**           |
+    /// | 3 | `Normal`   | 0.75    | B, in place | B               |
+    /// | 4 | `Multiply` | 0.5     | A (from B)  | **A**           |
+    /// | 5 | `Multiply` | 1.0     | B (from A)  | **B**           |
+    ///
+    /// The fold therefore ends on B, the member that was *not* current
+    /// at the start, while still exercising more than one swap and a
+    /// `Normal` blend onto a post-swap accumulator (layer 3). A
+    /// fixed-index readback composites layers 1-4 and silently drops
+    /// layer 5's contribution; that is a plausible-looking image, not an
+    /// error, which is exactly why it needs an assertion rather than a
+    /// crash to catch it.
+    ///
+    /// Differential only, against the real `composite_tile_cpu`
+    /// reference the CPU path runs — deliberately not a hand-derived
+    /// golden, which for five chained composites would restate the
+    /// arithmetic under test rather than check it.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing beyond the swap table
+    /// above** (recorded 0.105.3): it is the second of only two places in
+    /// the workspace where a transposed `src`/`backdrop` in the
+    /// `Multiply` *dispatch arm* is observable at all — PLAN.md's 0.105.2
+    /// kill matrix measured that mutation killing exactly this test and
+    /// `..._composites_a_mixed_normal_and_multiply_stack`. Layers 2 and 5
+    /// sit at opacity `1.0`, where the commutative `Cb * Cs` and the
+    /// collapsed fold `out = blended` make the swap provably invisible.
+    /// The fixture therefore lives in
+    /// [`FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK`], where
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+    /// can re-check that property headlessly rather than trusting a later
+    /// round not to normalise it away.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(&mut store, &FIVE_LAYER_ODD_SWAP_MULTIPLY_STACK);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a five-layer Normal/Multiply root stack must qualify for the GPU path -- otherwise \
+             this test would compare the CPU path against itself and prove nothing about which \
+             accumulator the readback copies from"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a five-layer stack with three Multiply layers (an odd swap count, so the fold ends \
+             on the member it did not start on)",
+        );
+    }
+
+    /// **The all-`Multiply` document** (0.84.1): no `Normal` anchor layer
+    /// at all, so the very first layer composited is a `Multiply` over a
+    /// still-fully-transparent accumulator.
+    ///
+    /// 0.84.0's own commit message reasons about exactly this case at
+    /// length — `Multiply` over a transparent backdrop degenerates to
+    /// what `Normal` would produce, because
+    /// `composite_layer_into`'s straight-backdrop recovery is guarded on
+    /// `backdrop_alpha > 0.0`, so the general dispatch needs no
+    /// first-layer special case — but the only test that knew about that
+    /// degeneracy was an `aurora-render` primitive test, one crate down,
+    /// which knows nothing about this function's own accumulator
+    /// bookkeeping. This pins it at the app level: with two `Multiply`
+    /// layers the fold swaps twice, and the first swap happens with the
+    /// backdrop still empty.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "an all-Multiply root stack must qualify for the GPU path"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "an all-Multiply stack, whose first layer multiplies over a fully transparent \
+             backdrop",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.375, 0.5, 1.0),
+            "the bottom Multiply layer over a transparent backdrop must degenerate to Normal \
+             (leaving (0.5, 0.75, 1.0, 1.0)), and the second must then multiply it by 0.5 -- a \
+             different answer here means the first-layer-over-nothing case is not behaving the \
+             way 0.84.0 reasoned it would"
+        );
+    }
+
+    /// **`Darken` end to end through the app's own GPU path** (0.85.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_multiply_blend_document`.
+    /// `aurora-render`'s own `composite_darken_*` tests already prove
+    /// the shader math in isolation; what this adds is that setting
+    /// `BlendMode::Darken` on a real `LayerTree` layer actually reaches
+    /// `composite_darken_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// The two layers' colours are deliberately **asymmetric per
+    /// channel**: `(0.75, 0.25, 0.5)` under `(0.25, 0.75, 0.5)` takes
+    /// its minimum from the top layer in red, the bottom in green, and
+    /// either in blue, so the expected `(0.25, 0.25, 0.5)` is a value
+    /// neither of the other two wired arms produces — `Normal` would
+    /// leave `(0.25, 0.75, 0.5)` and `Multiply` `(0.1875, 0.1875,
+    /// 0.25)`. A dispatch that silently fell into the wrong arm fails
+    /// the absolute assertion here rather than passing.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_darken_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.75, 0.25, 0.5, 1.0],
+                ),
+                (
+                    "top",
+                    aurora_doc::BlendMode::Darken,
+                    1.0,
+                    [0.25, 0.75, 0.5, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Darken pixel layer must qualify for the GPU path as of 0.85.0 -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_gpu_matches_cpu(gpu_result, cpu_result, "a two-layer Darken document");
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.25, 0.5, 1.0),
+            "the per-channel minimum must come out of the GPU path itself -- (0.25, 0.75, 0.5, \
+             1.0) would mean the Normal arm ran, and (0.1875, 0.1875, 0.25, 1.0) the Multiply arm"
+        );
+    }
+
+    /// **`Lighten` end to end through the app's own GPU path** (0.95.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_darken_blend_document`
+    /// above and the third such test. `aurora-render`'s own
+    /// `composite_lighten_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::Lighten` on
+    /// a real `LayerTree` layer actually reaches
+    /// `composite_lighten_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`.**
+    /// That makes the `Lighten` layer sample a backdrop a *different*
+    /// blend-math pipeline last wrote, and renders it into the `spare`
+    /// accumulator that pipeline created — the same shared-ping-pong
+    /// property the `Darken` round's five-layer fixture pins, reached
+    /// here in the smallest stack that can reach it at all:
+    ///
+    /// | # | mode       | opacity | rgba                    | fold after             |
+    /// |---|------------|---------|-------------------------|------------------------|
+    /// | 1 | `Normal`   | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`    |
+    /// | 2 | `Multiply` | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)` |
+    /// | 3 | `Lighten`  | `0.5`   | `(0.25, 0.25, 0.75, 1)` | `(0.1875, 0.375, 0.5)` |
+    ///
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.95.0 until then, and with every
+    /// layer opaque the outer "over" collapsed to `out = B`, which left
+    /// the `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// backdrop's alpha is still `1.0` where the `Lighten` pass runs, so
+    /// `blended` reduces to `B` itself —
+    /// `B = max((0.125, 0.375, 0.25), (0.25, 0.25, 0.75)) =
+    /// (0.25, 0.375, 0.75)` — but the fold around it no longer collapses:
+    /// `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.1875, 0.375, 0.5)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden below is
+    /// still asserted absolutely and not merely differentially.
+    ///
+    /// The maximum is genuinely two-sided: red comes from the *source*
+    /// (`0.25` over `0.125`), green from the *backdrop* (`0.375` over
+    /// `0.25`), and blue from the source (`0.75` over `0.25`) — so
+    /// `Cb != Cs` in all three channels, which is the precondition for
+    /// the transpose below being visible at all, and neither layer's own
+    /// colour can produce this texel.
+    ///
+    /// One coincidence worth naming, because it is unchanged from the
+    /// opaque fixture and is not a regression: `Lighten` picks the
+    /// *source* in red and blue, so the `Normal` arm agrees with the
+    /// golden in exactly those two channels and differs only in green
+    /// (`0.3125` against `0.375`, the golden's green being `Cb` itself,
+    /// since `max` takes the backdrop there). Green is the single channel
+    /// that discriminates `Normal`; the pre-0.105.2 golden
+    /// `(0.25, 0.375, 0.75)` had the same one-channel margin against its
+    /// own `Normal` value `(0.25, 0.25, 0.75)`.
+    ///
+    /// **Four** independent guards — one more than the `Darken`
+    /// five-layer test above, whose own doc comment names *two* and
+    /// deliberately declines a hand-computed golden (hand-computing five
+    /// chained composites would restate the arithmetic under test).
+    /// Three layers fold to exact binary fractions, so this one can
+    /// carry that absolute golden as well:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::Lighten`] count, which is what distinguishes
+    ///   "the `Lighten` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels";
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `Lighten` replaced by `Darken` must composite to something
+    ///   *different* (`(0.125, 0.3125, 0.25)` against
+    ///   `(0.1875, 0.375, 0.5)` — all three channels differ). The
+    ///   substitute is composited at this fixture's own `0.5` opacity too,
+    ///   so the guard is still a comparison of two full folds, not of two
+    ///   bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `B = max(Cb, Cs)` is symmetric, so the transpose survives
+    /// inside `B`; what it cannot survive is the asymmetric fold around
+    /// it, `out = (1 - a) * bd + a * blended`, which weights the backdrop
+    /// and the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.25, 0.3125, 0.75, 1.0)` against the
+    /// golden `(0.1875, 0.375, 0.5, 1.0)` — all three channels — so both
+    /// the absolute golden and `assert_gpu_matches_cpu` fail (the CPU path
+    /// is unaffected by an app-side GPU dispatch arm, so the differential
+    /// genuinely diverges). Verified by really running the mutation, not
+    /// reasoned about: against the pre-0.105.2 opaque fixture it survived
+    /// with 396 passed / 0 failed, and against this one it fails — see
+    /// PLAN.md's 0.105.2 entry for both measurements and the adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_lighten_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this. It catches a transpose *inside* the wrapper or the shader, a
+    /// real and different mutation, but it calls the compositor method
+    /// directly with its own hand-passed arguments and never runs
+    /// `begin_gpu_composite_tile` at all — `aurora-render` cannot depend
+    /// on `aurora-app` (PRD §7.2 layering), so no test in that crate can
+    /// reach this dispatch arm.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_LIGHTEN_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Lighten root stack must qualify for the GPU path as of \
+             0.95.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Lighten);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Lighten` layer, dispatched once for
+        // the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all -- `resolve_tile` answers
+        // `None` for a visible layer with nothing *stored* at the tile
+        // (0.87.0), so those three take `begin_gpu_composite_tile`'s
+        // `current?` bail before any blend pass is recorded. The second,
+        // CPU-only run inside that helper adds none. **A count of 0 is the
+        // failure this assertion exists for**: it means no `Lighten` tile
+        // reached the GPU at all and every assertion below is being
+        // satisfied by the CPU fallback compared against itself. A count
+        // that is non-zero but not 1 means the viewport or tile geometry
+        // moved under this fixture -- re-derive it rather than loosening
+        // the assertion.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Lighten),
+            1,
+            "the Lighten layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Lighten document (the Lighten layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.1875, 0.375, 0.5, 1.0),
+            "0.5*Cb + 0.5*max(Cb, Cs) must come out of the GPU path itself -- B is \
+             (0.25, 0.375, 0.75), the two-sided maximum. (0.125, 0.3125, 0.25, 1.0) would mean \
+             the Darken arm ran, (0.1875, 0.3125, 0.5, 1.0) the Normal arm (agreeing in red and \
+             blue, where Lighten itself takes the source, so green is the one channel that \
+             separates them), (0.078125, 0.234375, 0.21875, 1.0) the Multiply arm, and a \
+             dispatch arm that transposed src and backdrop gives (0.25, 0.3125, 0.75, 1.0), \
+             differing in all three channels."
+        );
+
+        // The vacuity guard: the same stack with its `Lighten` layer
+        // turned into a `Darken` one, composited on the CPU path only. If
+        // that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Lighten {
+                entry.1 = aurora_doc::BlendMode::Darken;
+            }
+        }
+        let with_darken = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_darken,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_lighten_were_darken = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_lighten_were_darken,
+            "setup: this fixture must distinguish its Lighten layer from a Darken one, or the \
+             differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// **`Screen` end to end through the app's own GPU path** (0.102.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document`
+    /// above and the fourth such test. `aurora-render`'s own
+    /// `composite_screen_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::Screen` on
+    /// a real `LayerTree` layer actually reaches
+    /// `composite_screen_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `Lighten` sibling, and for the same reason:
+    /// it makes the `Screen` layer sample a backdrop a *different*
+    /// blend-math pipeline last wrote, and render into the `spare`
+    /// accumulator that pipeline created, which is the shared-ping-pong
+    /// property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode       | opacity | rgba                    | fold after                    |
+    /// |---|------------|---------|-------------------------|-------------------------------|
+    /// | 1 | `Normal`   | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`           |
+    /// | 2 | `Multiply` | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)`        |
+    /// | 3 | `Screen`   | `0.5`   | `(0.25, 0.25, 0.75, 1)` | `(0.234375, 0.453125, 0.53125)` |
+    ///
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.102.0 until then, and with every
+    /// layer opaque the whole "over" reduced to `out = B`, which left the
+    /// `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// accumulator's alpha is still `1.0` when the `Screen` pass runs, so
+    /// `blended` reduces to `B` itself —
+    /// `B = Screen((0.125, 0.375, 0.25), (0.25, 0.25, 0.75)) =
+    /// (0.34375, 0.53125, 0.8125)` — but the fold around it no longer
+    /// collapses: `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.234375, 0.453125, 0.53125)`, and
+    /// `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every intermediate is an exact
+    /// binary fraction, so the golden below is still asserted absolutely
+    /// and not merely differentially.
+    ///
+    /// Note the fixture's operands are the `Lighten` sibling's, unchanged,
+    /// and they suit `Screen` as they stand: no channel of either operand
+    /// is `0.0` or `1.0`, the two values at which `Screen` degenerates (to
+    /// `Normal` and to a constant `1.0`). Nothing saturates on the way out
+    /// either — every operand is strictly inside `(0, 1)` and the largest
+    /// channel of `B` is `0.8125` — and `Screen` has no branch, clamp or
+    /// division of its own, so the whole fold is *affine* in the opacity.
+    /// There is nothing special about that opacity being `0.5` rather than
+    /// any other value in `(0, 1)`: no channel changes which side of a
+    /// boundary it sits on as it moves.
+    ///
+    /// **Four** independent guards, the same four the `Lighten` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::Screen`] count, which is what distinguishes
+    ///   "the `Screen` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels" — the one
+    ///   mutation in this round's own set that nothing else caught;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `Screen` replaced by `Lighten` must composite to something
+    ///   *different* (`(0.1875, 0.375, 0.5)` against
+    ///   `(0.234375, 0.453125, 0.53125)` — all three channels differ).
+    ///   `Lighten` is chosen as the substitute deliberately: it is the
+    ///   entry point `fs_composite_screen` was written from, so it is the
+    ///   realistic copy-paste failure. The substitute is composited at
+    ///   this fixture's own `0.5` opacity too, so the guard is still a
+    ///   comparison of two full folds, not of two bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `B = Cb + Cs - Cb*Cs` is symmetric, so the transpose survives
+    /// inside `B`; what it cannot survive is the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, which weights the backdrop and
+    /// the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.296875, 0.390625, 0.78125, 1.0)`
+    /// against the golden `(0.234375, 0.453125, 0.53125, 1.0)` — all three
+    /// channels — so both the absolute golden and `assert_gpu_matches_cpu`
+    /// fail (the CPU path is unaffected by an app-side GPU dispatch arm, so
+    /// the differential genuinely diverges). Verified by really running the
+    /// mutation, not reasoned about: against the pre-0.105.2 opaque fixture
+    /// it survived with 396 passed / 0 failed, and against this one it
+    /// fails — see PLAN.md's 0.105.2 entry for both measurements and the
+    /// adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_screen_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this. It catches a transpose *inside* the wrapper or the shader, a
+    /// real and different mutation, but it calls the compositor method
+    /// directly with its own hand-passed arguments and never runs
+    /// `begin_gpu_composite_tile` at all — `aurora-render` cannot depend
+    /// on `aurora-app` (PRD §7.2 layering), so no test in that crate can
+    /// reach this dispatch arm.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_SCREEN_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Screen root stack must qualify for the GPU path as of \
+             0.102.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Screen);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Screen` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills
+        // only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.102.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Screen),
+            1,
+            "the Screen layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Screen document (the Screen layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.234_375, 0.453_125, 0.53125, 1.0),
+            "0.5*Cb + 0.5*(Cb + Cs - Cb*Cs) must come out of the GPU path itself -- B is \
+             (0.34375, 0.53125, 0.8125), no channel of which saturates. \
+             (0.1875, 0.375, 0.5, 1.0) would mean the Lighten arm ran, \
+             (0.125, 0.3125, 0.25, 1.0) the Darken arm, (0.1875, 0.3125, 0.5, 1.0) the Normal \
+             arm, (0.078125, 0.234375, 0.21875, 1.0) the Multiply arm, and a dispatch arm that \
+             transposed src and backdrop gives (0.296875, 0.390625, 0.78125, 1.0), differing in \
+             all three channels."
+        );
+
+        // The vacuity guard: the same stack with its `Screen` layer turned
+        // into a `Lighten` one, composited on the CPU path only. If that
+        // produced the same texel, every assertion above would hold just
+        // as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Screen {
+                entry.1 = aurora_doc::BlendMode::Lighten;
+            }
+        }
+        let with_lighten = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_lighten,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_screen_were_lighten = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_screen_were_lighten,
+            "setup: this fixture must distinguish its Screen layer from a Lighten one, or the \
+             differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// **`Difference` end to end through the app's own GPU path** (0.104.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document`
+    /// above and the fifth such test. `aurora-render`'s own
+    /// `composite_difference_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::Difference` on
+    /// a real `LayerTree` layer actually reaches
+    /// `composite_difference_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `Screen` sibling, and for the same reason:
+    /// it makes the `Difference` layer sample a backdrop a *different*
+    /// blend-math pipeline last wrote, and render into the `spare`
+    /// accumulator that pipeline created, which is the shared-ping-pong
+    /// property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode         | opacity | rgba                    | fold after               |
+    /// |---|--------------|---------|-------------------------|--------------------------|
+    /// | 1 | `Normal`     | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`      |
+    /// | 2 | `Multiply`   | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)`   |
+    /// | 3 | `Difference` | `0.5`   | `(0.5, 0.125, 0.75, 1)` | `(0.25, 0.3125, 0.375)`  |
+    ///
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.104.0 until then, and with every
+    /// layer opaque the whole "over" reduced to `out = B`, which left the
+    /// `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// accumulator's alpha is still `1.0` when the `Difference` pass runs,
+    /// so `blended` reduces to `B` itself —
+    /// `B = |(0.125, 0.375, 0.25) - (0.5, 0.125, 0.75)| =
+    /// (0.375, 0.25, 0.5)` — but the fold around it no longer collapses:
+    /// `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.25, 0.3125, 0.375)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden below is
+    /// still asserted absolutely and not merely differentially.
+    ///
+    /// **The `Screen` sibling's top layer could not be reused unchanged —
+    /// on *magnitude* grounds, not sign grounds.** (0.104.1 corrected this
+    /// paragraph; the original claimed a sign pattern that is false when
+    /// actually computed. No golden or assertion changed.) The `Screen`
+    /// source `(0.25, 0.25, 0.75)` against this backdrop
+    /// `(0.125, 0.375, 0.25)` gives `Cb < Cs` in red (`0.125 < 0.25`),
+    /// `Cb > Cs` in green (`0.375 > 0.25`) and `Cb < Cs` in blue
+    /// (`0.25 < 0.75`) — the *same* `(<, >, <)` pattern this layer's
+    /// `(0.5, 0.125, 0.75)` gives, so the inherited source is exactly as
+    /// mixed-sign as the chosen one and neither is better on that axis.
+    ///
+    /// What actually ruled it out is the fourth consideration
+    /// `aurora-render`'s `Difference` section header spells out: this
+    /// mode's blend term *is* the magnitude `|Cb - Cs|`, so two channels
+    /// sharing a magnitude blend to the same value from different
+    /// operands, and a swizzle between those two is invisible in `B`. The
+    /// `Screen` source's magnitudes against this backdrop are
+    /// `(0.125, 0.125, 0.5)` — red and green repeat. This one's are
+    /// `(0.375, 0.25, 0.5)`, three distinct values, which is the whole
+    /// advantage.
+    ///
+    /// **0.105.2's opacity change does not weaken that argument, and
+    /// mildly strengthens it.** The three magnitudes are a property of the
+    /// two operands alone, and neither operand changed, so `B` is still
+    /// `(0.375, 0.25, 0.5)` with all three values distinct. The fold then
+    /// adds a per-channel `0.5 * Cb = (0.0625, 0.1875, 0.125)` offset,
+    /// which is itself distinct in all three channels, so the folded
+    /// golden `(0.25, 0.3125, 0.375)` separates the channels twice over
+    /// rather than once.
+    ///
+    /// The wrong-arm consequences are the same for either source, and hold
+    /// for the one actually used: green is the single channel with
+    /// `Cb > Cs`, so it is the channel an `abs()`-less `Cb - Cs`
+    /// (`(-0.375, +0.25, -0.5)`) and `Subtract`'s `max(Cb - Cs, 0)`
+    /// (`(0.0, 0.25, 0.0)`) both still get right, and red and blue are the
+    /// two each of them gets wrong. That survives the fold: those two
+    /// blend terms fold to `(-0.125, 0.3125, -0.125)` and
+    /// `(0.0625, 0.3125, 0.125)`, each still agreeing with the golden in
+    /// green only.
+    ///
+    /// **Four** independent guards, the same four the `Screen` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::Difference`] count, which is what
+    ///   distinguishes "the `Difference` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `Difference` replaced by `Screen` must composite to something
+    ///   *different* (`(0.34375, 0.4140625, 0.53125)` against
+    ///   `(0.25, 0.3125, 0.375)` — all three channels differ). `Screen` is
+    ///   chosen as the substitute deliberately: it is the entry point
+    ///   `fs_composite_difference` was written from, so it is the realistic
+    ///   copy-paste failure. The substitute is composited at this
+    ///   fixture's own `0.5` opacity too, so the guard is still a
+    ///   comparison of two full folds, not of two bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `|Cb - Cs| = |Cs - Cb|`, so the transpose survives inside `B`
+    /// — the property `fs_composite_difference`'s own comment discloses;
+    /// what it cannot survive is the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, which weights the backdrop and
+    /// the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.4375, 0.1875, 0.625, 1.0)` against
+    /// the golden `(0.25, 0.3125, 0.375, 1.0)` — all three channels — so
+    /// both the absolute golden and `assert_gpu_matches_cpu` fail (the CPU
+    /// path is unaffected by an app-side GPU dispatch arm, so the
+    /// differential genuinely diverges). Verified by really running the
+    /// mutation, not reasoned about: against the pre-0.105.2 opaque fixture
+    /// it survived with 396 passed / 0 failed, and against this one it
+    /// fails — see PLAN.md's 0.105.2 entry for both measurements and the
+    /// adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_difference_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this — and that shader comment's pointer at it is about a transpose
+    /// *inside* the wrapper or the shader, which is a real and different
+    /// mutation. That test calls the compositor method directly with its
+    /// own hand-passed arguments and never runs `begin_gpu_composite_tile`
+    /// at all; `aurora-render` cannot depend on `aurora-app` (PRD §7.2
+    /// layering), so no test in that crate can reach this dispatch arm.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_DIFFERENCE_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Difference root stack must qualify for the GPU path as of \
+             0.104.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Difference);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Difference` layer, dispatched once for
+        // the one tile it actually has content at. `solid_root_stack` fills
+        // only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.104.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Difference),
+            1,
+            "the Difference layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Difference document (the Difference layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.3125, 0.375, 1.0),
+            "0.5*Cb + 0.5*|Cb - Cs| must come out of the GPU path itself -- B is \
+             (0.375, 0.25, 0.5), three distinct magnitudes. \
+             (0.34375, 0.4140625, 0.53125, 1.0) would mean the Screen arm ran, \
+             (0.3125, 0.375, 0.5, 1.0) the Lighten arm, (0.125, 0.25, 0.25, 1.0) the Darken arm, \
+             (0.3125, 0.25, 0.5, 1.0) the Normal arm, and \
+             (0.09375, 0.2109375, 0.21875, 1.0) the Multiply arm. A shader that dropped the \
+             abs() gives (-0.125, 0.3125, -0.125, 1.0) and one using Subtract's \
+             max(Cb - Cs, 0) gives (0.0625, 0.3125, 0.125, 1.0) -- both agreeing with the golden \
+             in green only, which is why this fixture straddles the sign change. A dispatch arm \
+             that transposed src and backdrop gives (0.4375, 0.1875, 0.625, 1.0), differing in \
+             all three channels."
+        );
+
+        // The vacuity guard: the same stack with its `Difference` layer
+        // turned into a `Screen` one, composited on the CPU path only. If
+        // that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Difference {
+                entry.1 = aurora_doc::BlendMode::Screen;
+            }
+        }
+        let with_screen = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_screen,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_difference_were_screen = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_difference_were_screen,
+            "setup: this fixture must distinguish its Difference layer from a Screen one, or the \
+             differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// **`LinearDodge` end to end through the app's own GPU path**
+    /// (0.105.0), the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document`
+    /// above and the sixth such test. `aurora-render`'s own
+    /// `composite_linear_dodge_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::LinearDodge`
+    /// on a real `LayerTree` layer actually reaches
+    /// `composite_linear_dodge_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `Difference` sibling, and for the same
+    /// reason: it makes the `LinearDodge` layer sample a backdrop a
+    /// *different* blend-math pipeline last wrote, and render into the
+    /// `spare` accumulator that pipeline created, which is the
+    /// shared-ping-pong property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode          | opacity | rgba                    | fold after             |
+    /// |---|---------------|---------|-------------------------|------------------------|
+    /// | 1 | `Normal`      | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`    |
+    /// | 2 | `Multiply`    | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)` |
+    /// | 3 | `LinearDodge` | `0.5`   | `(0.25, 0.875, 0.5, 1)` | `(0.25, 0.6875, 0.5)`  |
+    ///
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.1). The backdrop's alpha is still `1.0` where the
+    /// `LinearDodge` pass runs, so `blended` reduces to `B` itself —
+    /// `B = min((0.125, 0.375, 0.25) + (0.25, 0.875, 0.5), 1) =
+    /// (0.375, 1.0, 0.75)` — but the outer "over" no longer collapses to
+    /// `B`: `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.25, 0.6875, 0.5)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden is still
+    /// asserted absolutely and not merely differentially — and mixing a
+    /// non-opaque layer in is what makes the `opacity` uniform itself, and
+    /// the argument order of the dispatch arm's own call, observable at
+    /// all (see the transpose note at the bottom). This was the first of
+    /// the six blend-math fixtures written that way; the `Lighten`,
+    /// `Screen` and `Difference` siblings above had every layer at `1.0`
+    /// until 0.105.2 retrofitted the same `0.5` onto each of them for the
+    /// same reason.
+    ///
+    /// **The top layer straddles the clamp**, which is what the fixture
+    /// was chosen for. The per-channel sums inside `B` are
+    /// `(0.375, 1.25, 0.75)`: green is over the boundary and clamps to
+    /// `1.0`, red and blue stay strictly under it. So one channel
+    /// discriminates the *clamp* (a shader without it folds `1.25` into
+    /// green and writes `0.8125` there, well clear of `0.6875`, and
+    /// `read_first_texel` reads whatever is stored back unclamped — it is
+    /// a raw `f16::to_f32`, verified while writing this test, so the
+    /// mutation cannot hide behind a readback clamp the way it can in
+    /// `aurora-render`'s own 8-bit whole-tile test 6) and two discriminate
+    /// the *formula* against `Screen`, this mode's nearest arithmetic
+    /// neighbour. No channel has `Cb == Cs`, and none of the six operands
+    /// is `0.0` or `1.0`, so neither `LinearDodge(0, Cs) = Cs` nor
+    /// `LinearDodge(1, Cs) = 1` is in play.
+    ///
+    /// **Four** independent guards, the same four the `Difference` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::LinearDodge`] count, which is what
+    ///   distinguishes "the `LinearDodge` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `LinearDodge` replaced by `Screen` must composite to
+    ///   something *different* (`(0.234375, 0.6484375, 0.4375)` against
+    ///   `(0.25, 0.6875, 0.5)` — all three channels differ). `Screen` is
+    ///   chosen as the substitute deliberately: it is this mode's nearest
+    ///   arithmetic neighbour, the same sum with a correction term instead
+    ///   of a clamp, so it is the realistic wrong answer.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm**, and
+    /// exactly where it is and is not caught (rewritten in 0.105.1, and
+    /// the previous wording was wrong on both halves — see below):
+    ///
+    /// - **This test covers it**, and that is what the `0.5` opacity
+    ///   above buys. `B = min(Cb + Cs, 1)` is symmetric, so the transpose
+    ///   survives inside `B`; what it cannot survive is the asymmetric
+    ///   outer fold `out = (1 - a) * bd + a * blended`, which weights the
+    ///   backdrop and the source differently as soon as `a != 1`. Swapping
+    ///   the two arguments here yields `(0.3125, 0.9375, 0.625, 1.0)`
+    ///   against the golden `(0.25, 0.6875, 0.5, 1.0)` — all three
+    ///   channels — so both the golden and `assert_gpu_matches_cpu` fail
+    ///   (the CPU path is unaffected by an app-side GPU dispatch arm, so
+    ///   the differential genuinely diverges). Verified by really running
+    ///   the mutation, not reasoned about: see PLAN.md's 0.105.1 entry.
+    /// - **`aurora-render`'s own spatial per-texel differential,
+    ///   `composite_linear_dodge_over_with_opacity_matches_the_cpu_across_a_
+    ///   spatially_varying_tile`, does not and structurally cannot.** It
+    ///   catches a transpose *inside* the wrapper or the shader, which is
+    ///   a real and different mutation, but it calls the compositor method
+    ///   directly with its own hand-passed arguments and never runs
+    ///   `begin_gpu_composite_tile` at all — `aurora-render` cannot depend
+    ///   on `aurora-app` (PRD §7.2 layering), so no test in that crate can
+    ///   reach this dispatch arm. Until 0.105.1 this doc comment claimed
+    ///   that test covered the arm; it never did.
+    /// - **Every blend-math dispatch arm carries transpose coverage, and
+    ///   [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    ///   is the live authority on that** — deliberately count-free here, so
+    ///   this bullet does not go stale the next time a mode is ported (it
+    ///   did exactly that between 0.105.2, which said "all six", and
+    ///   0.106.0's `LinearBurn`). That guard fails if any counted mode
+    ///   lacks a registered fixture, so read it, not a number written down
+    ///   here. None of the arms gets its coverage from formula asymmetry:
+    ///   every formula the GPU path implements so far — `Cb*Cs`,
+    ///   `min(Cb,Cs)`, `max(Cb,Cs)`, `Cb + Cs - Cb*Cs`, `|Cb - Cs|`,
+    ///   `min(Cb + Cs, 1)`, `max(Cb + Cs - 1, 0)` — is commutative, so the
+    ///   surrounding "over" is the only thing that can ever notice the
+    ///   swap, and it only does so where some layer is not fully opaque.
+    ///   `Multiply` and `Darken` are covered **incidentally**, and not by
+    ///   either mode's own dedicated `..._agree_on_a_<mode>_blend_document`
+    ///   test — both of those build all-opacity-`1.0` fixtures, where the
+    ///   swap is provably invisible. The coverage comes from three
+    ///   *other*, mixed-stack fixtures, each of which happens to carry a
+    ///   layer at that mode (`l4`) at opacity `0.5` for reasons that
+    ///   predate this gap being noticed:
+    ///   `..._composites_a_mixed_normal_and_multiply_stack` and
+    ///   `..._reads_back_the_right_member_after_an_odd_swap_count` for
+    ///   `Multiply`, and `..._composites_a_mixed_normal_multiply_and_
+    ///   darken_stack` for `Darken` — exactly the three tests 0.105.2's
+    ///   kill matrix measured those two arms' transposes dying on, and
+    ///   nothing else. (Until 0.105.3 this bullet said "each of those two
+    ///   modes' own app-level fixture … on an unrelated layer", which was
+    ///   wrong twice: not their own fixtures, and `l4` is the
+    ///   mode-bearing layer rather than an unrelated one — it is *because*
+    ///   `l4` carries the mode under test that its non-unit opacity makes
+    ///   the swap observable at all.) `LinearDodge` (0.105.1, above)
+    ///   and then `Lighten`, `Screen` and `Difference` (0.105.2) are
+    ///   covered **deliberately**, all four by the same mechanism: set
+    ///   that mode's own layer to opacity `0.5` and re-derive the golden.
+    ///   The three later ones were test-fixture and doc-comment changes
+    ///   only — no shader, wrapper, dispatch-arm or predicate line moved,
+    ///   and no mode was admitted to the GPU path.
+    ///
+    ///   Measured, not assumed, in both rounds, by transposing one arm at
+    ///   a time and running `aurora-app`'s whole test binary on a real
+    ///   discrete GPU (Vulkan/NVIDIA — no other backend is claimed).
+    ///   0.105.1 killed `Multiply` (2 tests), `Darken` (1) and — after
+    ///   that round's own fixture change — `LinearDodge` (1), while
+    ///   `Lighten`, `Screen` and `Difference` each survived with 396
+    ///   passed, 0 failed. 0.105.2 re-measured all six against the fixed
+    ///   fixtures; each of those three now kills exactly its own test with
+    ///   the hand-derived transposed texel. PLAN.md's 0.105.2 entry has
+    ///   both tables in full.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_LINEAR_DODGE_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/LinearDodge root stack must qualify for the GPU path as of \
+             0.105.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearDodge);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `LinearDodge` layer, dispatched once
+        // for the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.105.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearDodge),
+            1,
+            "the LinearDodge layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/LinearDodge document (the LinearDodge layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.6875, 0.5, 1.0),
+            "0.5*Cb + 0.5*min(Cb + Cs, 1) must come out of the GPU path itself -- B is \
+             (0.375, 1.0, 0.75), whose pre-clamp sums are (0.375, 1.25, 0.75), so green clamps \
+             and red and blue do not. (0.234375, 0.6484375, 0.4375, 1.0) would mean the Screen \
+             arm ran, (0.1875, 0.625, 0.375, 1.0) the Normal or the Lighten arm (they coincide \
+             here, since Cs > Cb in every channel), (0.125, 0.375, 0.25, 1.0) the Darken arm, \
+             (0.078125, 0.3515625, 0.1875, 1.0) the Multiply arm and \
+             (0.125, 0.4375, 0.25, 1.0) the Difference arm. A shader that dropped the clamp \
+             gives (0.25, 0.8125, 0.5, 1.0) -- agreeing in red and blue, which is why this \
+             fixture needs a channel whose sum exceeds 1.0 -- one using LinearBurn's \
+             max(Cb + Cs - 1, 0) gives (0.0625, 0.3125, 0.125, 1.0), and a dispatch arm that \
+             transposed src and backdrop gives (0.3125, 0.9375, 0.625, 1.0), differing in all \
+             three channels."
+        );
+
+        // The vacuity guard: the same stack with its `LinearDodge` layer
+        // turned into a `Screen` one, composited on the CPU path only. If
+        // that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::LinearDodge {
+                entry.1 = aurora_doc::BlendMode::Screen;
+            }
+        }
+        let with_screen = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_screen,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_linear_dodge_were_screen = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_linear_dodge_were_screen,
+            "setup: this fixture must distinguish its LinearDodge layer from a Screen one, or \
+             the differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// **`LinearBurn` end to end through the app's own GPU path**
+    /// (0.106.0), the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document`
+    /// above and the seventh such test. `aurora-render`'s own
+    /// `composite_linear_burn_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::LinearBurn`
+    /// on a real `LayerTree` layer actually reaches
+    /// `composite_linear_burn_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `LinearDodge` sibling, and for the same
+    /// reason: it makes the `LinearBurn` layer sample a backdrop a
+    /// *different* blend-math pipeline last wrote, and render into the
+    /// `spare` accumulator that pipeline created, which is the
+    /// shared-ping-pong property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode         | opacity | rgba                       | fold after                |
+    /// |---|--------------|---------|----------------------------|---------------------------|
+    /// | 1 | `Normal`     | `1.0`   | `(0.875, 0.75, 0.625, 1)`  | `(0.875, 0.75, 0.625)`    |
+    /// | 2 | `Multiply`   | `1.0`   | `(0.5, 0.5, 0.5, 1)`       | `(0.4375, 0.375, 0.3125)` |
+    /// | 3 | `LinearBurn` | `0.5`   | `(0.875, 0.75, 0.25, 1)`   | `(0.375, 0.25, 0.15625)`  |
+    ///
+    /// **The top layer's opacity is `0.5`, and that is load-bearing — from
+    /// this fixture's first commit, not retrofitted.** The backdrop's alpha
+    /// is still `1.0` where the `LinearBurn` pass runs, so `blended`
+    /// reduces to `B` itself —
+    /// `B = max((0.4375, 0.375, 0.3125) + (0.875, 0.75, 0.25) - 1, 0) =
+    /// (0.3125, 0.125, 0.0)` — but the outer "over" no longer collapses to
+    /// `B`: `out.rgb = 0.5 * (0.4375, 0.375, 0.3125) + 0.5 * B =
+    /// (0.375, 0.25, 0.15625)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden is asserted
+    /// absolutely and not merely differentially. `LinearDodge` (0.105.1)
+    /// was the first of these fixtures written that way and `Lighten`,
+    /// `Screen` and `Difference` were retrofitted in 0.105.2; this one is
+    /// the first where 0.105.3's standing guard
+    /// (`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument`) made it a precondition of the round rather
+    /// than a discovery within it.
+    ///
+    /// **`l1` is not the base colour the other five fixtures share, and
+    /// that is deliberate.** `Lighten`/`Screen`/`Difference`/`LinearDodge`
+    /// all build on `(0.25, 0.75, 0.5)`, which after the `Multiply` fold
+    /// gives `Cb = (0.125, 0.375, 0.25)`. Against *any* source strictly
+    /// inside `(0, 1)` that backdrop leaves red's sum under `1.0`, so a
+    /// fixture reusing it could not put red above this mode's clamp
+    /// boundary at all — and `aurora-render`'s suite-header degeneracy 3
+    /// asks for channels on both sides of it. `(0.875, 0.75, 0.625)` gives
+    /// `Cb = (0.4375, 0.375, 0.3125)`, which does.
+    ///
+    /// **The top layer straddles the clamp**, which is what the fixture
+    /// was chosen for. The per-channel sums inside `B` are
+    /// `(1.3125, 1.125, 0.5625)`: red and green are over the boundary and
+    /// survive, blue falls under it and clamps to `0.0`. So one channel
+    /// discriminates the *clamp* (a shader without it folds `-0.4375` into
+    /// blue and writes `-0.0625` there, well clear of `0.15625`, and
+    /// `read_first_texel` reads whatever is stored back unclamped — it is
+    /// a raw `f16::to_f32`, so the mutation cannot hide behind a readback
+    /// clamp the way it can in `aurora-render`'s own 8-bit whole-tile
+    /// test 6) and two discriminate the *formula*.
+    ///
+    /// **No channel trips a degeneracy.** None of the six operands is
+    /// `0.0` or `1.0`, so neither `LinearBurn(0, Cs) = 0` nor
+    /// `LinearBurn(1, Cs) = Cs` is in play; no channel has `Cb == Cs`; and
+    /// — the constraint specific to this mode — **neither unclamped channel
+    /// has an operand at exactly `0.5`** (red is `0.4375 + 0.875`, green
+    /// `0.375 + 0.75`), which is what would make `Cb + Cs - 1` coincide
+    /// with `|Cb - Cs|` and leave the channel unable to distinguish this
+    /// mode from `Difference`. Red's `Difference` value is `0.4375` against
+    /// this mode's `0.3125`; they genuinely differ.
+    ///
+    /// **Four** independent guards, the same four the `LinearDodge` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::LinearBurn`] count, which is what
+    ///   distinguishes "the `LinearBurn` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `LinearBurn` replaced by **`LinearDodge`** must composite to
+    ///   something *different* (`(0.71875, 0.6875, 0.4375)` against
+    ///   `(0.375, 0.25, 0.15625)` — all three channels differ).
+    ///   `LinearDodge` is chosen as the substitute deliberately, and it is
+    ///   a different choice from the siblings' `Screen`: it is the entry
+    ///   point this shader was written *from*, this mode's exact mirror
+    ///   image, and the one wrong answer a copy-paste would actually
+    ///   produce.
+    ///
+    /// **Every plausible wrong arm, re-derived rather than inherited:**
+    /// `Normal` `(0.65625, 0.5625, 0.28125)`, `Lighten`
+    /// `(0.65625, 0.5625, 0.3125)`, `Darken` `(0.4375, 0.375, 0.28125)`,
+    /// `Multiply` `(0.41015625, 0.328125, 0.1953125)`, `Screen`
+    /// `(0.68359375, 0.609375, 0.3984375)`, `Difference`
+    /// `(0.4375, 0.375, 0.1875)`, `LinearDodge`
+    /// `(0.71875, 0.6875, 0.4375)`, a dropped clamp
+    /// `(0.375, 0.25, -0.0625)` (blue only — red and green are the
+    /// unclamped channels, so this is the one mutation this fixture sees in
+    /// a single channel), a reversed clamp `(0.21875, 0.1875, -0.0625)`, a
+    /// dropped `- 1.0` offset `(0.875, 0.75, 0.4375)`, and **a dispatch arm
+    /// that transposed `src` and `backdrop`** `(0.59375, 0.4375, 0.125)`,
+    /// differing in all three channels.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm** is
+    /// caught here, and only here, for the reason 0.105.1 and 0.105.2
+    /// established and 0.105.3 turned into a standing guard:
+    /// `B = max(Cb + Cs - 1, 0)` is symmetric, so the transpose survives
+    /// inside `B`; what it cannot survive is the asymmetric outer fold
+    /// `out = (1 - a) * bd + a * blended`, which weights the backdrop and
+    /// the source differently as soon as `a != 1`. `aurora-render`'s own
+    /// spatial per-texel differential catches a transpose *inside* the
+    /// wrapper or the shader — a real and different mutation — but it calls
+    /// the compositor method directly and never runs
+    /// `begin_gpu_composite_tile` at all, since `aurora-render` cannot
+    /// depend on `aurora-app` (PRD §7.2 layering). Measured, not reasoned
+    /// about: mutation (l) of this round's set, whose kill matrix is in
+    /// PLAN.md's 0.106.0 entry.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_linear_burn`.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_burn_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_LINEAR_BURN_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/LinearBurn root stack must qualify for the GPU path as of \
+             0.106.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearBurn);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `LinearBurn` layer, dispatched once
+        // for the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.106.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearBurn),
+            1,
+            "the LinearBurn layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/LinearBurn document (the LinearBurn layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.375, 0.25, 0.15625, 1.0),
+            "0.5*Cb + 0.5*max(Cb + Cs - 1, 0) must come out of the GPU path itself -- B is \
+             (0.3125, 0.125, 0.0), whose pre-clamp sums are (1.3125, 1.125, 0.5625), so blue \
+             clamps and red and green do not. (0.71875, 0.6875, 0.4375, 1.0) would mean the \
+             LinearDodge arm ran -- this mode's exact mirror image and the entry point its \
+             shader was written from -- (0.68359375, 0.609375, 0.3984375, 1.0) the Screen arm, \
+             (0.65625, 0.5625, 0.28125, 1.0) the Normal arm, \
+             (0.65625, 0.5625, 0.3125, 1.0) the Lighten arm, \
+             (0.4375, 0.375, 0.28125, 1.0) the Darken arm, \
+             (0.41015625, 0.328125, 0.1953125, 1.0) the Multiply arm and \
+             (0.4375, 0.375, 0.1875, 1.0) the Difference arm. A shader that dropped the clamp \
+             gives (0.375, 0.25, -0.0625, 1.0) -- agreeing in red and green, which is why this \
+             fixture needs a channel whose sum falls under 1.0 -- one that dropped the -1.0 \
+             offset gives (0.875, 0.75, 0.4375, 1.0), one that reversed the clamp \
+             (0.21875, 0.1875, -0.0625, 1.0), and a dispatch arm that transposed src and \
+             backdrop gives (0.59375, 0.4375, 0.125, 1.0), differing in all three channels."
+        );
+
+        // The vacuity guard: the same stack with its `LinearBurn` layer
+        // turned into a `LinearDodge` one, composited on the CPU path only.
+        // If that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched. `LinearDodge` rather
+        // than the siblings' `Screen`, because it is this mode's exact
+        // mirror image and the entry point this shader was derived from --
+        // the realistic wrong answer here.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::LinearBurn {
+                entry.1 = aurora_doc::BlendMode::LinearDodge;
+            }
+        }
+        let with_linear_dodge = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_linear_dodge,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_linear_burn_were_linear_dodge = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_linear_burn_were_linear_dodge,
+            "setup: this fixture must distinguish its LinearBurn layer from a LinearDodge one -- \
+             its exact mirror image -- or the differential above would pass with the wrong \
+             dispatch arm running"
+        );
+    }
+
+    /// The `ColorBurn` GPU-vs-CPU differential (0.107.0), the eighth
+    /// blend-math mode's own end-to-end test and the sibling of
+    /// `..._agree_on_a_linear_burn_blend_document` directly above.
+    ///
+    /// A three-layer `Normal`/`Multiply`/`ColorBurn` stack, so the
+    /// `ColorBurn` layer samples a backdrop a `Multiply` pass wrote and
+    /// reuses the spare accumulator that pass created — the same
+    /// ping-pong shape every mode's fixture here uses. Every intermediate
+    /// is an exact binary fraction, so the golden is asserted absolutely
+    /// and not merely differentially.
+    ///
+    /// **The derivation, per channel.** After `l1` the accumulator is
+    /// `(0.875, 0.90625, 0.5)`; `l2`'s opaque `Multiply` by `0.5` leaves
+    /// `Cb = (0.4375, 0.453125, 0.25)`. Against `Cs = (0.75, 0.875, 0.5)`
+    /// the quotients `(1 - Cb) / Cs` are
+    /// `(0.5625/0.75, 0.546875/0.875, 0.75/0.5) = (0.75, 0.625, 1.5)`, so
+    /// `B = 1 - min(1, q) = (0.25, 0.375, 0.0)` — **red and green
+    /// unclamped, blue past the boundary**. The fold at `a = 0.5` over an
+    /// opaque accumulator gives `0.5 * Cb + 0.5 * B =
+    /// (0.34375, 0.4140625, 0.125)` at alpha `1.0`.
+    ///
+    /// **Why those two quotients and not rounder ones.** This mode's
+    /// blend term is a *division*, so an exact-binary-fraction golden
+    /// needs a pair whose quotient terminates — most naive fixtures give a
+    /// repeating fraction and force a tolerance comparison, which would
+    /// weaken every wrong-arm claim below into an approximate one.
+    /// `0.5625/0.75` and `0.546875/0.875` were chosen for exactly that.
+    /// The exact `assert_eq!` is sound despite a GPU divide being
+    /// permitted 2.5 ULP of error, because the result round-trips through
+    /// `f16` tile storage, whose spacing at these magnitudes is orders of
+    /// magnitude coarser than an `f32` ULP.
+    ///
+    /// **No channel trips a degeneracy.** None of the six operands is
+    /// `0.0` or `1.0`, so neither branch of this mode's formula fires here
+    /// — `aurora-render`'s tests 7 and 8 are what cover those, and they
+    /// are the only tests in either crate that do. No channel has
+    /// `Cb == Cs`. One channel (blue) discriminates the `min` clamp: a
+    /// shader without it computes `1 - 1.5 = -0.5` and folds `-0.125`
+    /// there, well clear of `0.125`, and [`read_first_texel`] reads
+    /// whatever is stored back unclamped — it is a raw `f16::to_f32`, so
+    /// the mutation cannot hide behind a readback clamp the way it can in
+    /// `aurora-render`'s own 8-bit whole-tile test 6.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::ColorBurn`] count, which is what
+    ///   distinguishes "the `ColorBurn` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches, and 0.107.0's mutation (a) confirmed it
+    ///   again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `ColorBurn` replaced by **`LinearBurn`** must composite to
+    ///   something *different* (`(0.3125, 0.390625, 0.125)` against
+    ///   `(0.34375, 0.4140625, 0.125)` — red and green differ, blue does
+    ///   not, since both modes clamp there). `LinearBurn` is chosen as the
+    ///   substitute deliberately: it is the other burn-family mode and the
+    ///   *adjacent dispatch arm*, which is where this mode's realistic
+    ///   copy-paste hazard actually lives.
+    ///
+    /// **Every plausible wrong arm, re-derived rather than inherited**
+    /// (and five of these were wrong as first written — see 0.107.1;
+    /// the ones below are each `0.5 * Cb + 0.5 * B` for that mode's own
+    /// `B` against `Cb = (0.4375, 0.453125, 0.25)` and
+    /// `Cs = (0.75, 0.875, 0.5)`, recomputed in exact rationals):
+    /// `Normal` `(0.59375, 0.6640625, 0.375)`, `Multiply`
+    /// `(0.3828125, 0.4248046875, 0.1875)`, `Darken`
+    /// `(0.4375, 0.453125, 0.25)` — which is exactly `Cb`, since this
+    /// fixture has `Cb < Cs` in all three channels, so a `Darken` arm here
+    /// would return the accumulator untouched — `Lighten`
+    /// `(0.59375, 0.6640625, 0.375)` (the same as `Normal`, by the same
+    /// `Cb < Cs`), `Screen` `(0.6484375, 0.6923828125, 0.4375)`,
+    /// `Difference` `(0.375, 0.4375, 0.25)`, `LinearDodge`
+    /// `(0.71875, 0.7265625, 0.5)`, `LinearBurn` `(0.3125, 0.390625,
+    /// 0.125)`, a dropped `min` clamp `(0.34375, 0.4140625, -0.125)`
+    /// (blue only — red and green are the unclamped channels, so they
+    /// *must* equal the golden there, and that is the point of the row),
+    /// a dropped outer `1 -` `(0.59375, 0.5390625, 0.625)`, and **a
+    /// dispatch arm that transposed `src` and `backdrop`**, which lands
+    /// near `(0.589, 0.800, 0.25)`.
+    ///
+    /// Every one of those is distinct from the golden in at least one
+    /// channel, which is the only property the list has to have; the five
+    /// corrected values were wrong in the *arithmetic*, never in that
+    /// conclusion, so no assertion in this test changed with them.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here, and — for the first time in this roster — it would be
+    /// caught even at opacity `1.0`.** Every mode ported before this one
+    /// has a *commutative* blend term, so the transpose survives inside
+    /// `B` and only the asymmetric outer fold
+    /// `out = (1 - a) * bd + a * blended` can see it, which it cannot at
+    /// `a = 1`. `1 - min(1, (1 - Cb) / Cs)` is **not** symmetric, so this
+    /// mode's own blend term catches it. That was measured, not reasoned
+    /// about: 0.107.0's mutation (o) transposed this arm and ran it at
+    /// both `0.5` and `1.0`. The fixture keeps its `0.5` anyway, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// is deliberately not special-cased for one mode — see that test's
+    /// own doc comment.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_color_burn` — and for this mode that
+    /// gap is wider than for its predecessors, since the guarded division
+    /// its shader turns on is precisely a per-backend property. See
+    /// PLAN.md's 0.107.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_color_burn_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_COLOR_BURN_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/ColorBurn root stack must qualify for the GPU path as of \
+             0.107.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::ColorBurn);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `ColorBurn` layer, dispatched once for
+        // the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.107.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::ColorBurn),
+            1,
+            "the ColorBurn layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/ColorBurn document (the ColorBurn layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.414_062_5` is `0.4140625` -- `clippy::unreadable_literal`
+            // requires the separators at seven significant digits, and
+            // this mode's exact-binary-fraction quotients are the first in
+            // this file long enough to trip it. The doc comment above and
+            // the message below both spell it without separators, which is
+            // how a reader will actually see it.
+            (0.34375, 0.414_062_5, 0.125, 1.0),
+            "0.5*Cb + 0.5*(1 - min(1, (1 - Cb) / Cs)) must come out of the GPU path itself -- B \
+             is (0.25, 0.375, 0.0), whose quotients are (0.75, 0.625, 1.5), so blue clamps and \
+             red and green do not. (0.3125, 0.390625, 0.125, 1.0) would mean the LinearBurn arm \
+             ran -- the other burn-family mode and the adjacent dispatch arm, agreeing in blue \
+             where both clamp -- (0.6484375, 0.6923828125, 0.4375, 1.0) the Screen arm, \
+             (0.59375, 0.6640625, 0.375, 1.0) the Normal arm (and the Lighten arm, which agrees \
+             with it here), (0.4375, 0.453125, 0.25, 1.0) the Darken arm (which is Cb itself, \
+             this fixture having Cb < Cs in every channel), \
+             (0.3828125, 0.4248046875, 0.1875, 1.0) the Multiply arm, \
+             (0.375, 0.4375, 0.25, 1.0) the Difference arm and \
+             (0.71875, 0.7265625, 0.5, 1.0) the LinearDodge arm. A shader that dropped the min \
+             clamp gives (0.34375, 0.4140625, -0.125, 1.0) -- agreeing in red and green, which \
+             is why this fixture needs a channel whose quotient exceeds 1.0 -- and one that \
+             dropped the outer 1 - gives (0.59375, 0.5390625, 0.625, 1.0)."
+        );
+
+        // The vacuity guard: the same stack with its `ColorBurn` layer
+        // turned into a `LinearBurn` one, composited on the CPU path only.
+        // If that produced the same texel, every assertion above would
+        // hold just as well with the wrong arm dispatched. `LinearBurn`
+        // rather than the siblings' `Screen`, because it is the other
+        // burn-family mode and the adjacent dispatch arm -- the realistic
+        // wrong answer here, even though the two formulas have nothing in
+        // common.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::ColorBurn {
+                entry.1 = aurora_doc::BlendMode::LinearBurn;
+            }
+        }
+        let with_linear_burn = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_linear_burn,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_color_burn_were_linear_burn = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_color_burn_were_linear_burn,
+            "setup: this fixture must distinguish its ColorBurn layer from a LinearBurn one -- \
+             the other burn-family mode and the adjacent dispatch arm -- or the differential \
+             above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// The `ColorDodge` GPU-vs-CPU differential (0.108.0), the ninth
+    /// blend-math mode's own end-to-end test and the sibling of
+    /// `..._agree_on_a_color_burn_blend_document` directly above.
+    ///
+    /// A three-layer `Normal`/`Multiply`/`ColorDodge` stack, so the
+    /// `ColorDodge` layer samples a backdrop a `Multiply` pass wrote and
+    /// reuses the spare accumulator that pass created — the same ping-pong
+    /// shape every mode's fixture here uses. Every intermediate is an exact
+    /// binary fraction, so the golden is asserted absolutely and not merely
+    /// differentially.
+    ///
+    /// **The derivation, per channel.** After `l1` the accumulator is
+    /// `(0.875, 0.125, 0.75)`; `l2`'s opaque `Multiply` by `0.5` leaves
+    /// `Cb = (0.4375, 0.0625, 0.375)`. Against `Cs = (0.5, 0.75, 0.875)` the
+    /// quotients `Cb / (1 - Cs)` are
+    /// `(0.4375/0.5, 0.0625/0.25, 0.375/0.125) = (0.875, 0.25, 3.0)`, so
+    /// `B = min(1, q) = (0.875, 0.25, 1.0)` — **red and green unclamped,
+    /// blue well past the boundary**. The fold at `a = 0.5` over an opaque
+    /// accumulator gives `0.5 * Cb + 0.5 * B = (0.65625, 0.15625, 0.6875)`
+    /// at alpha `1.0`.
+    ///
+    /// **Why those three quotients and not rounder ones.** This mode's
+    /// blend term is a *division*, so an exact-binary-fraction golden needs
+    /// a pair whose quotient terminates — most naive fixtures give a
+    /// repeating fraction and force a tolerance comparison, which would
+    /// weaken every wrong-arm claim below into an approximate one. Here the
+    /// constraint has a clean closed form the `ColorBurn` sibling's does
+    /// not: the divisor is `1 - Cs`, so choosing every `Cs` from
+    /// `{0.5, 0.75, 0.875}` makes every divisor a power of two and every
+    /// quotient exact regardless of `Cb`. The exact `assert_eq!` is sound
+    /// despite a GPU divide being permitted 2.5 ULP of error, because the
+    /// result round-trips through `f16` tile storage, whose spacing at these
+    /// magnitudes is orders of magnitude coarser than an `f32` ULP.
+    ///
+    /// **No channel trips a degeneracy.** None of the six operands is `0.0`
+    /// or `1.0`, so neither branch of this mode's formula fires here —
+    /// `aurora-render`'s tests 7 and 8 are what cover those, and they are
+    /// the only tests in either crate that do. No channel has `Cb == Cs`.
+    /// And none has `Cb == Cs * (1 - Cs)`, the condition under which
+    /// `ColorDodge(Cb, Cs) == Cs` exactly and the channel becomes
+    /// indistinguishable from `Normal` — that product is
+    /// `(0.25, 0.1875, 0.109375)` here against
+    /// `Cb = (0.4375, 0.0625, 0.375)`, clear in every channel. One channel
+    /// (blue) discriminates the `min` clamp: a shader without it computes
+    /// `3.0` and folds `1.6875` there, well clear of `0.6875`, and
+    /// [`read_first_texel`] reads whatever is stored back unclamped — it is
+    /// a raw `f16::to_f32`, so the mutation cannot hide behind a readback
+    /// clamp the way it can in `aurora-render`'s own 8-bit whole-tile test
+    /// 6.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::ColorDodge`] count, which is what
+    ///   distinguishes "the `ColorDodge` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches, and 0.108.0's mutation (a) confirmed it
+    ///   again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `ColorDodge` replaced by **`LinearDodge`** must composite to
+    ///   something *different* (`(0.6875, 0.4375, 0.6875)` against
+    ///   `(0.65625, 0.15625, 0.6875)` — red and green differ, blue does
+    ///   not). `LinearDodge` is chosen as the substitute deliberately: it is
+    ///   the other dodge-family mode, and unlike the `ColorBurn` sibling's
+    ///   choice of its own adjacent arm, this pick is about a *degeneracy*
+    ///   rather than about adjacency. `min(1, Cb / (1 - Cs))` clamps exactly
+    ///   when `Cb + Cs >= 1`, which is exactly when `min(Cb + Cs, 1)`
+    ///   clamps, so **the two modes agree in every clamped channel by
+    ///   construction** — blue's agreement here is not this fixture's bad
+    ///   luck but a property of the pair, and it means the `assert_ne!` can
+    ///   never be a three-channel claim. Red and green are what carry it,
+    ///   which is why this fixture needs unclamped channels at all.
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`
+    /// against `Cb = (0.4375, 0.0625, 0.375)` and
+    /// `Cs = (0.5, 0.75, 0.875)`):
+    /// `Normal` `(0.46875, 0.40625, 0.625)`, `Lighten` the *same triple*
+    /// (`Cs > Cb` in all three channels), `Multiply`
+    /// `(0.328125, 0.0546875, 0.3515625)`, `Darken`
+    /// `(0.4375, 0.0625, 0.375)` — which is exactly `Cb`, since this fixture
+    /// has `Cb < Cs` in all three channels, so a `Darken` arm here would
+    /// return the accumulator untouched — `Screen`
+    /// `(0.578125, 0.4140625, 0.6484375)`, `Difference`
+    /// `(0.25, 0.375, 0.4375)`, `LinearDodge`
+    /// `(0.6875, 0.4375, 0.6875)`, `LinearBurn`
+    /// `(0.21875, 0.03125, 0.3125)`, `ColorBurn` — the adjacent dispatch arm
+    /// — roughly `(0.21875, 0.03125, 0.3303..)`, a dropped `min` clamp
+    /// `(0.65625, 0.15625, 1.6875)` (blue only — red and green are the
+    /// unclamped channels, so they *must* equal the golden there, and that
+    /// is the point of the row), and **a dispatch arm that transposed `src`
+    /// and `backdrop`**, which **measured**
+    /// `(0.69433594, 0.77490234, 0.9375, 1.0)` on real hardware — quoted
+    /// from the readback rather than predicted, and agreeing with an
+    /// independent exact-rational derivation to within `f16` spacing. Red
+    /// and green catch it; blue does not, both quotients clamping.
+    ///
+    /// Every one of those is distinct from the golden in at least one
+    /// channel, which is the only property the list has to have.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is caught
+    /// here, and — as with `ColorBurn` — it would be caught even at opacity
+    /// `1.0`.** Every mode ported before those two has a *commutative* blend
+    /// term, so the transpose survives inside `B` and only the asymmetric
+    /// outer fold `out = (1 - a) * bd + a * blended` can see it, which it
+    /// cannot at `a = 1`. `min(1, Cb / (1 - Cs))` is **not** symmetric, so
+    /// this mode's own blend term catches it. That was measured, not
+    /// reasoned about: 0.108.0's mutation (n) transposed this arm and ran it
+    /// at both `0.5` and `1.0`, and it was killed at both — at `1.0` the
+    /// transposed composite measured `(0.8886719, 0.7998047, 1.0, 1.0)`
+    /// against the correct `(0.875, 0.25, 1.0, 1.0)`, so red and green
+    /// caught it there with the fold contributing nothing at all. The
+    /// fixture keeps its `0.5` for two
+    /// independent reasons — the standing transpose guard demands it, and at
+    /// opacity `1.0` blue's golden would be the clamped `1.0` and would stop
+    /// discriminating a dropped `min`. See
+    /// [`NORMAL_MULTIPLY_COLOR_DODGE_STACK`].
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_color_dodge` — and for this mode that
+    /// gap is as wide as for `ColorBurn`, since the guarded division its
+    /// shader turns on is precisely a per-backend property. See PLAN.md's
+    /// 0.108.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_color_dodge_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_COLOR_DODGE_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/ColorDodge root stack must qualify for the GPU path as of \
+             0.108.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::ColorDodge);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `ColorDodge` layer, dispatched once for
+        // the one tile it actually has content at. `solid_root_stack` fills
+        // only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency
+        // viewport marks four tiles visible at `TILE` = 256, and the other
+        // three resolve nothing at all, taking `begin_gpu_composite_tile`'s
+        // `current?` bail before any blend pass is recorded. The second,
+        // CPU-only run inside that helper adds none. **A count of 0 is the
+        // failure this assertion exists for** -- see `GpuBlendDispatches`,
+        // and PLAN.md's 0.108.0 mutation-testing record, where deleting the
+        // dispatch arm left every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::ColorDodge),
+            1,
+            "the ColorDodge layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/ColorDodge document (the ColorDodge layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.65625, 0.15625, 0.6875, 1.0),
+            "0.5*Cb + 0.5*min(1, Cb / (1 - Cs)) must come out of the GPU path itself -- note no \
+             outer 1 -, that is ColorBurn's. B is (0.875, 0.25, 1.0), whose quotients are \
+             (0.875, 0.25, 3.0), so blue clamps and red and green do not. \
+             (0.6875, 0.4375, 0.6875, 1.0) would mean the LinearDodge arm ran -- the other \
+             dodge-family mode, agreeing in blue because the two modes' clamp boundaries are \
+             identical -- roughly (0.21875, 0.03125, 0.3303, 1.0) the ColorBurn arm (the \
+             adjacent dispatch arm), (0.578125, 0.4140625, 0.6484375, 1.0) the Screen arm, \
+             (0.46875, 0.40625, 0.625, 1.0) the Normal arm (and the Lighten arm, which agrees \
+             with it here), (0.4375, 0.0625, 0.375, 1.0) the Darken arm (which is Cb itself, \
+             this fixture having Cb < Cs in every channel), \
+             (0.328125, 0.0546875, 0.3515625, 1.0) the Multiply arm, \
+             (0.25, 0.375, 0.4375, 1.0) the Difference arm and \
+             (0.21875, 0.03125, 0.3125, 1.0) the LinearBurn arm. A shader that dropped the min \
+             clamp gives (0.65625, 0.15625, 1.6875, 1.0) -- agreeing in red and green, which is \
+             why this fixture needs a channel whose quotient exceeds 1.0 -- and a dispatch arm \
+             that transposed src and backdrop measured (0.69433594, 0.77490234, 0.9375, 1.0) on \
+             real hardware in 0.108.0."
+        );
+
+        // The vacuity guard: the same stack with its `ColorDodge` layer
+        // turned into a `LinearDodge` one, composited on the CPU path only.
+        // If that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched. `LinearDodge` rather
+        // than the siblings' `Screen`, because it is the other dodge-family
+        // mode -- and because it is the mode this one is *degenerately*
+        // close to: the two agree in every clamped channel by construction,
+        // so this guard is a two-channel claim and is documented as one.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::ColorDodge {
+                entry.1 = aurora_doc::BlendMode::LinearDodge;
+            }
+        }
+        let with_linear_dodge = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_linear_dodge,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_color_dodge_were_linear_dodge = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_color_dodge_were_linear_dodge,
+            "setup: this fixture must distinguish its ColorDodge layer from a LinearDodge one -- \
+             the other dodge-family mode, which agrees with it in every *clamped* channel by \
+             construction -- or the differential above would pass with the wrong dispatch arm \
+             running. Red and green are what carry this, never blue."
+        );
+    }
+
+    /// **`Overlay` end to end through the real caller** (0.110.0), the
+    /// tenth mode ported: a three-layer `Normal`/`Multiply`/`Overlay` root
+    /// stack ([`NORMAL_MULTIPLY_OVERLAY_STACK`]) composited on real
+    /// hardware, with the `Overlay` layer sampling a backdrop a `Multiply`
+    /// pass wrote into the accumulator and reusing the spare accumulator
+    /// that pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0`. Against
+    /// `Cs = (0.25, 0.75, 0.875)`, `Overlay` branches on `Cb`:
+    ///
+    /// - red: `Cb = 0.65625 > 0.5`, so `t = 0.3125` and
+    ///   `B = 0.25 + 0.3125 - 0.25*0.3125 = 0.484375` — the `Screen` arm;
+    /// - green: `Cb = 0.375 <= 0.5`, so `B = 0.75 * 0.75 = 0.5625` — the
+    ///   `Multiply` arm;
+    /// - blue: `Cb = 0.1875 <= 0.5`, so `B = 0.875 * 0.375 = 0.328125`.
+    ///
+    /// The `Overlay` layer's own opacity `0.5` folds that in as
+    /// `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.5703125, 0.46875, 0.2578125, 1.0)`.
+    ///
+    /// **Both arms fire in this one draw**, which is what
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s unusual `l2` *colour* of `0.75`
+    /// grey (not the `0.5` grey every sibling fixture uses; its opacity is
+    /// `1.0`, the same as every sibling's) is *for* — see that const. No
+    /// channel of either operand is `0.5`, this mode's own no-op value on the
+    /// source side and its `Normal`-degenerate value on the backdrop side;
+    /// no channel has `Cb == Cs`; and **all three channels straddle `0.5`**,
+    /// which is what makes a transposed binding observable in the blend term.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::Overlay`] count, which is what distinguishes
+    ///   "the `Overlay` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels" — historically the
+    ///   one mutation in a round like this that nothing else catches, and
+    ///   0.110.0's mutation (a) confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `Overlay` replaced by **`HardLight`** must composite to something
+    ///   *different*. `HardLight` rather than the siblings' `Screen` or
+    ///   `LinearBurn`, and the choice is not stylistic: `HardLight` is this
+    ///   mode with its two channel arguments swapped
+    ///   (`aurora_render`'s own arm is literally
+    ///   `blend_channel(HardLight, cs, cb)`), so it is precisely what a
+    ///   transposed dispatch arm, or a branch on the source instead of the
+    ///   backdrop, actually computes. It gives
+    ///   `(0.4921875, 0.53125, 0.4921875)` against the golden's
+    ///   `(0.5703125, 0.46875, 0.2578125)` — **differing in all three
+    ///   channels**, which is only true because all three straddle `0.5`;
+    ///   wherever the two operands share a side of `0.5` the two modes agree
+    ///   exactly (both `<=` gives `2*Cb*Cs` either way, both `>` gives
+    ///   `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way), so on a non-straddling
+    ///   fixture this guard would be vacuous.
+    ///
+    ///   **Corrected in 0.111.0.** This bullet used to add "`HardLight` is not
+    ///   admitted by [`document_qualifies_for_gpu_compositing`], so the
+    ///   substituted stack composites on the CPU path, which is what the guard
+    ///   wants anyway". `HardLight` *is* admitted now, so that substituted
+    ///   stack composites on the **GPU** path. The guard is unaffected — it
+    ///   only needs the two modes to produce *different* texels, and which path
+    ///   computes the `HardLight` one was never load-bearing — but the stated
+    ///   reason was, so it is restated rather than deleted. (One real
+    ///   consequence: the substituted run now ticks
+    ///   `GpuBlendDispatch::HardLight`. Nothing here reads that counter, and
+    ///   `real_gpu_context` zeroes every counter under its lock, so no sibling
+    ///   test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`):
+    /// `HardLight` `(0.4921875, 0.53125, 0.4921875)`, `Normal`
+    /// `(0.453125, 0.5625, 0.53125)`, `Multiply`
+    /// `(0.41015625, 0.328125, 0.17578125)` — which is the `Cb <= 0.5` arm
+    /// *without* its doubling, so it is what a `2.0 * cb → cb` mutation gives
+    /// in green and blue — `Screen` `(0.69921875, 0.609375, 0.54296875)`,
+    /// `Darken` `(0.453125, 0.375, 0.1875)`, `Lighten`
+    /// `(0.65625, 0.5625, 0.53125)`, `Difference` `(0.53125, 0.375, 0.4375)`,
+    /// `LinearDodge` `(0.78125, 0.6875, 0.59375)`, `LinearBurn`
+    /// `(0.328125, 0.25, 0.125)`, `ColorBurn` roughly
+    /// `(0.328125, 0.2708.., 0.1294..)`, `ColorDodge`
+    /// `(0.765625, 0.6875, 0.59375)`, and `Exclusion`
+    /// `(0.6171875, 0.46875, 0.4609375)` — whose **green coincides with the
+    /// golden exactly**, disclosed rather than counted as separation
+    /// (`Exclusion` is this crate's `CPU_ONLY_BLEND_MODE` stand-in, is not
+    /// admitted at the predicate, and has no WGSL entry point, so it is not
+    /// reachable by a wrong-arm dispatch at all; red and blue separate it
+    /// regardless).
+    ///
+    /// Every one of those is distinct from the golden in at least one
+    /// channel, which is the only property the list has to have.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is caught
+    /// here, and — measured, not reasoned about — at opacity `1.0` as well as
+    /// at `0.5`.** The seven modes ported before `ColorBurn` have
+    /// *commutative* blend terms, so a transpose survives inside `B` and only
+    /// the asymmetric outer fold can see it, which it cannot at `a = 1`.
+    /// `Overlay`'s asymmetry is real but **conditional** — present only where
+    /// the operands straddle `0.5` — and this fixture straddles in all three
+    /// channels, so the blend term catches it. 0.110.0's mutation (h)
+    /// transposed this arm and ran it at both opacities: at `0.5` the
+    /// transposed composite measured `(0.2890625, 0.71875, 0.8359375, 1.0)`
+    /// against the correct `(0.5703125, 0.46875, 0.2578125, 1.0)`, and at
+    /// `1.0` it measured `(0.328125, 0.6875, 0.796875, 1.0)` against the
+    /// correct `(0.484375, 0.5625, 0.328125, 1.0)` — all three channels
+    /// caught at both, with the fold contributing nothing at all in the
+    /// second. The fixture keeps its `0.5` regardless, because the standing
+    /// transpose guard demands it and is deliberately not special-cased for
+    /// any of the four asymmetric modes. See
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`].
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_overlay` — and for this mode that gap has
+    /// its own specific edge: `select()` on a `vec3<bool>` is a construct only
+    /// this entry point and its 0.111.0 transposed twin
+    /// `fs_composite_hard_light` use, so no round before 0.110.0 supplies
+    /// cross-backend evidence for it. See PLAN.md's 0.110.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_overlay_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_OVERLAY_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Overlay root stack must qualify for the GPU path as of \
+             0.110.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Overlay);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Overlay` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency
+        // viewport marks four tiles visible at `TILE` = 256, and the other
+        // three resolve nothing at all, taking `begin_gpu_composite_tile`'s
+        // `current?` bail before any blend pass is recorded. The second,
+        // CPU-only run inside that helper adds none. **A count of 0 is the
+        // failure this assertion exists for** -- see `GpuBlendDispatches`,
+        // and PLAN.md's 0.110.0 mutation-testing record, where deleting the
+        // dispatch arm left every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Overlay),
+            1,
+            "the Overlay layer must have dispatched a real GPU blend pass on the one visible tile \
+             that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Overlay document (the Overlay layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.570_312_5`/`0.257_812_5` are `0.5703125`/`0.2578125` --
+            // `clippy::unreadable_literal` again, the same convention the
+            // `ColorBurn` golden above already carries a note for. The doc
+            // comment and the message both spell them without separators.
+            (0.570_312_5, 0.46875, 0.257_812_5, 1.0),
+            "0.5*Cb + 0.5*Overlay(Cb, Cs) must come out of the GPU path itself, branching on the \
+             *backdrop*: Cb = (0.65625, 0.375, 0.1875) puts red on the Screen arm and green and \
+             blue on the Multiply arm, so B is (0.484375, 0.5625, 0.328125). \
+             (0.4921875, 0.53125, 0.4921875, 1.0) would mean HardLight ran -- this mode with its \
+             two channel arguments swapped, i.e. what a transposed binding or a branch on the \
+             source computes -- (0.453125, 0.5625, 0.53125, 1.0) the Normal arm, \
+             (0.41015625, 0.328125, 0.17578125, 1.0) the Multiply arm (the Cb <= 0.5 arm without \
+             its doubling), (0.69921875, 0.609375, 0.54296875, 1.0) the Screen arm, \
+             (0.453125, 0.375, 0.1875, 1.0) the Darken arm, \
+             (0.65625, 0.5625, 0.53125, 1.0) the Lighten arm, \
+             (0.53125, 0.375, 0.4375, 1.0) the Difference arm, \
+             (0.78125, 0.6875, 0.59375, 1.0) the LinearDodge arm, \
+             (0.328125, 0.25, 0.125, 1.0) the LinearBurn arm, roughly \
+             (0.328125, 0.2708, 0.1294, 1.0) the ColorBurn arm and \
+             (0.765625, 0.6875, 0.59375, 1.0) the ColorDodge arm. Exclusion gives \
+             (0.6171875, 0.46875, 0.4609375, 1.0), whose green coincides with the golden -- \
+             disclosed rather than counted as separation, and unreachable by dispatch anyway. A \
+             dispatch arm that transposed src and backdrop measured \
+             (0.2890625, 0.71875, 0.8359375, 1.0) on real hardware in 0.110.0."
+        );
+
+        // The vacuity guard: the same stack with its `Overlay` layer turned
+        // into a `HardLight` one. As of 0.111.0 that substituted stack
+        // composites on the *GPU* path, not the CPU path as this comment said
+        // at 0.110.0 -- `HardLight` is admitted at the predicate now. The
+        // guard does not care which path computes it; it needs only that the
+        // texel differ. If that produced the same texel, every assertion above
+        // would hold just as well with the wrong arm dispatched. `HardLight`
+        // rather than the siblings' `Screen` or `LinearBurn`, because it is
+        // *this mode with its two channel arguments swapped* -- what a
+        // transposed dispatch arm actually computes -- and because the two
+        // agree exactly wherever the operands share a side of 0.5, so this
+        // guard is a real three-channel claim only because every channel of
+        // this fixture straddles.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Overlay {
+                entry.1 = aurora_doc::BlendMode::HardLight;
+            }
+        }
+        let with_hard_light = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_hard_light,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_overlay_were_hard_light = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_overlay_were_hard_light,
+            "setup: this fixture must distinguish its Overlay layer from a HardLight one -- the \
+             same formula with its two channel arguments swapped, and therefore exactly what a \
+             transposed dispatch arm computes -- or the differential above would pass with the \
+             wrong arm running. This is a three-channel claim only because every channel of the \
+             fixture straddles 0.5; where the two operands share a side, the two modes agree \
+             exactly."
+        );
+    }
+
+    /// **`HardLight` end to end through the real caller** (0.111.0), the
+    /// eleventh mode ported: a three-layer `Normal`/`Multiply`/`HardLight` root
+    /// stack ([`NORMAL_MULTIPLY_HARD_LIGHT_STACK`]) composited on real
+    /// hardware, with the `HardLight` layer sampling a backdrop a `Multiply`
+    /// pass wrote into the accumulator and reusing the spare accumulator that
+    /// pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0`. Against
+    /// `Cs = (0.25, 0.75, 0.875)`, `HardLight` branches on **`Cs`**:
+    ///
+    /// - red: `Cs = 0.25 <= 0.5`, so `B = 0.65625 * 2*0.25 = 0.328125` — the
+    ///   `Multiply` arm;
+    /// - green: `Cs = 0.75 > 0.5`, so `t = 0.5` and
+    ///   `B = 0.375 + 0.5 - 0.375*0.5 = 0.6875` — the `Screen` arm;
+    /// - blue: `Cs = 0.875 > 0.5`, so `t = 0.75` and
+    ///   `B = 0.1875 + 0.75 - 0.1875*0.75 = 0.796875`.
+    ///
+    /// The `HardLight` layer's own opacity `0.5` folds that in as
+    /// `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.4921875, 0.53125, 0.4921875, 1.0)`. **Both arms fire in this one
+    /// draw**, with the arm assignment exactly *inverted* from the `Overlay`
+    /// sibling's on the identical fixture (one `Multiply` and two `Screen`
+    /// here; one `Screen` and two `Multiply` there), which is the collision
+    /// rule made visible.
+    ///
+    /// **REQUIRED DISCLOSURE: red and blue coincide in the golden**
+    /// (`0.4921875` both) — an arithmetic accident of this fixture, not a
+    /// property of the mode. It costs nothing against any rival arm listed
+    /// below (all twelve differ in all three channels), but a mutation that
+    /// swapped this test's red and blue channels would be invisible here.
+    /// `aurora_render`'s `composite_hard_light_over_with_opacity_at_half_
+    /// opacity_matches_the_cpu` has a three-distinct-channel golden and covers
+    /// that.
+    ///
+    /// [`NORMAL_MULTIPLY_HARD_LIGHT_STACK`] reuses
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s colours verbatim on purpose — see
+    /// that const for why, and for the `0.75`-grey `l2` those colours inherit.
+    /// No channel of either operand is `0.5` (this mode's total no-op on the
+    /// source side and its `Normal`-degenerate value on the backdrop side); no
+    /// channel has `Cb == Cs`; and **all three channels straddle `0.5`**, which
+    /// is what makes a transposed binding observable in the blend term.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::HardLight`] count, which is what distinguishes
+    ///   "the `HardLight` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels" — historically the
+    ///   one mutation in a round like this that nothing else catches, and
+    ///   0.111.0's mutation (a) confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `HardLight` replaced by **`Overlay`** must composite to something
+    ///   *different*. That choice is not stylistic, and it is stronger than the
+    ///   sibling's was: `Overlay` is this mode with its two channel arguments
+    ///   swapped, so it is precisely what a transposed dispatch arm, a branch
+    ///   on the backdrop, *or* a `fragment_entry` naming
+    ///   `fs_composite_overlay` computes — **and unlike 0.110.0's mirror image
+    ///   of this guard, the substitute is now itself a live GPU dispatch arm**,
+    ///   so the two modes this guard separates are both shipped. It gives
+    ///   `(0.5703125, 0.46875, 0.2578125)` against the golden's
+    ///   `(0.4921875, 0.53125, 0.4921875)` — **differing in all three
+    ///   channels**, which is only true because all three straddle `0.5`;
+    ///   wherever the two operands share a side the two modes agree exactly, so
+    ///   on a non-straddling fixture this guard would be vacuous. (The
+    ///   substituted run composites on the GPU path and therefore ticks
+    ///   `GpuBlendDispatch::Overlay`; nothing here reads that counter, and
+    ///   `real_gpu_context` zeroes every counter under its lock, so no sibling
+    ///   test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`, and
+    /// each is the same number the `Overlay` sibling's own list carries, since
+    /// the fixture is the same): `Overlay`
+    /// `(0.5703125, 0.46875, 0.2578125)`, `Normal`
+    /// `(0.453125, 0.5625, 0.53125)`, `Multiply`
+    /// `(0.41015625, 0.328125, 0.17578125)` — which is the `Cs <= 0.5` arm
+    /// *without* its doubling, so it is what a `2.0 * s.rgb → s.rgb` mutation
+    /// gives in **red** and red alone, green and blue being on the other arm —
+    /// `Screen` `(0.69921875, 0.609375, 0.54296875)`, `Darken`
+    /// `(0.453125, 0.375, 0.1875)`, `Lighten` `(0.65625, 0.5625, 0.53125)`,
+    /// `Difference` `(0.53125, 0.375, 0.4375)`, `LinearDodge`
+    /// `(0.78125, 0.6875, 0.59375)`, `LinearBurn` `(0.328125, 0.25, 0.125)`,
+    /// `ColorBurn` roughly `(0.328125, 0.2708.., 0.1294..)`, `ColorDodge`
+    /// `(0.765625, 0.6875, 0.59375)`, and `Exclusion`
+    /// `(0.6171875, 0.46875, 0.4609375)` — whose green coincided with the
+    /// *`Overlay`* golden on this fixture and coincides with nothing here.
+    ///
+    /// Every one of those is distinct from the golden **in all three
+    /// channels**, which is strictly better separation than the `Overlay`
+    /// sibling achieves on the identical fixture.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is caught
+    /// here, and — measured, not reasoned about — at opacity `1.0` as well as
+    /// at `0.5`.** The seven modes ported before `ColorBurn` have *commutative*
+    /// blend terms, so a transpose survives inside `B` and only the asymmetric
+    /// outer fold can see it, which it cannot at `a = 1`. This mode's
+    /// asymmetry, like `Overlay`'s, is real but **conditional** — present only
+    /// where the operands straddle `0.5` — and this fixture straddles in all
+    /// three channels, so the blend term catches it. 0.111.0's mutation (h)
+    /// transposed this arm and ran it at both opacities: at `0.5` the
+    /// transposed composite measured `(0.3671875, 0.65625, 0.6015625, 1.0)`
+    /// against the correct `(0.4921875, 0.53125, 0.4921875, 1.0)`, and at `1.0`
+    /// it measured `(0.484375, 0.5625, 0.328125, 1.0)` against the correct
+    /// `(0.328125, 0.6875, 0.796875, 1.0)` — all three channels caught at both,
+    /// with the fold contributing nothing at all in the second. **Note the
+    /// transposed value at `0.5` is not `Overlay`'s golden**, even though the
+    /// transposed *blend term* is `Overlay`'s `B`: the fold's own operands
+    /// transpose too, so `out` becomes `0.5 * Cs + 0.5 * B` rather than
+    /// `0.5 * Cb + 0.5 * B`. The fixture keeps its `0.5` regardless, because
+    /// the standing transpose guard demands it and is deliberately not
+    /// special-cased for any of the four asymmetric modes. See
+    /// [`NORMAL_MULTIPLY_HARD_LIGHT_STACK`].
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_hard_light`, and the sibling's specific
+    /// caveat applies verbatim: `select()` on a `vec3<bool>` is a construct
+    /// only these two entry points use, so no round before 0.110.0 supplies
+    /// cross-backend evidence for it. See PLAN.md's 0.111.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_light_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_HARD_LIGHT_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/HardLight root stack must qualify for the GPU path as of \
+             0.111.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::HardLight);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `HardLight` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport
+        // marks four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.111.0
+        // mutation-testing record, where deleting the dispatch arm left every
+        // other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::HardLight),
+            1,
+            "the HardLight layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/HardLight document (the HardLight layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.492_187_5` is `0.4921875` -- `clippy::unreadable_literal`
+            // again, the same convention the `Overlay` and `ColorBurn` goldens
+            // above already carry a note for. The doc comment and the message
+            // both spell it without separators.
+            (0.492_187_5, 0.53125, 0.492_187_5, 1.0),
+            "0.5*Cb + 0.5*HardLight(Cb, Cs) must come out of the GPU path itself, branching on \
+             the *source*: Cs = (0.25, 0.75, 0.875) puts red on the Multiply arm and green and \
+             blue on the Screen arm, so B is (0.328125, 0.6875, 0.796875). \
+             (0.5703125, 0.46875, 0.2578125, 1.0) would mean Overlay ran -- this mode with its \
+             two channel arguments swapped, i.e. what a transposed binding, a branch on the \
+             backdrop, or a fragment_entry of fs_composite_overlay computes, and itself a live \
+             GPU arm as of 0.110.0 -- (0.453125, 0.5625, 0.53125, 1.0) the Normal arm, \
+             (0.41015625, 0.328125, 0.17578125, 1.0) the Multiply arm (the Cs <= 0.5 arm without \
+             its doubling, so what a 2.0*s.rgb -> s.rgb mutation gives in red alone), \
+             (0.69921875, 0.609375, 0.54296875, 1.0) the Screen arm, \
+             (0.453125, 0.375, 0.1875, 1.0) the Darken arm, \
+             (0.65625, 0.5625, 0.53125, 1.0) the Lighten arm, \
+             (0.53125, 0.375, 0.4375, 1.0) the Difference arm, \
+             (0.78125, 0.6875, 0.59375, 1.0) the LinearDodge arm, \
+             (0.328125, 0.25, 0.125, 1.0) the LinearBurn arm, roughly \
+             (0.328125, 0.2708, 0.1294, 1.0) the ColorBurn arm and \
+             (0.765625, 0.6875, 0.59375, 1.0) the ColorDodge arm. Exclusion gives \
+             (0.6171875, 0.46875, 0.4609375, 1.0). Every one of those differs from the golden in \
+             all three channels. A dispatch arm that transposed src and backdrop measured \
+             (0.3671875, 0.65625, 0.6015625, 1.0) on real hardware in 0.111.0 -- note that is \
+             not Overlay's own golden, because the fold's operands transpose too."
+        );
+
+        // The vacuity guard: the same stack with its `HardLight` layer turned
+        // into an `Overlay` one. As of 0.110.0 that mode is admitted at the
+        // predicate, so the substituted stack composites on the *GPU* path --
+        // the mirror image of this guard in the Overlay sibling's own test ran
+        // on the CPU path when it was written, and its comment had to be
+        // corrected in this same commit. Either way the guard only needs the
+        // texel to differ: if it did not, every assertion above would hold just
+        // as well with the wrong arm dispatched. `Overlay` rather than the
+        // siblings' `Screen` or `LinearBurn`, because it is *this mode with its
+        // two channel arguments swapped* -- what a transposed dispatch arm, a
+        // branch on the backdrop, or the sibling's `fragment_entry` all compute
+        // -- and because the two agree exactly wherever the operands share a
+        // side of 0.5, so this guard is a real three-channel claim only because
+        // every channel of this fixture straddles.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::HardLight {
+                entry.1 = aurora_doc::BlendMode::Overlay;
+            }
+        }
+        let with_overlay = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_overlay,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_hard_light_were_overlay = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_hard_light_were_overlay,
+            "setup: this fixture must distinguish its HardLight layer from an Overlay one -- the \
+             same formula with its two channel arguments swapped, and therefore exactly what a \
+             transposed dispatch arm, a branch on the backdrop, or a fragment_entry naming \
+             fs_composite_overlay computes -- or the differential above would pass with the wrong \
+             arm running. This is a three-channel claim only because every channel of the fixture \
+             straddles 0.5; where the two operands share a side, the two modes agree exactly."
+        );
+    }
+
+    /// **`LinearLight` end to end through the real caller** (0.113.0), the
+    /// twelfth mode ported: a three-layer `Normal`/`Multiply`/`LinearLight`
+    /// root stack ([`NORMAL_MULTIPLY_LINEAR_LIGHT_STACK`]) composited on real
+    /// hardware, with the `LinearLight` layer sampling a backdrop a `Multiply`
+    /// pass wrote into the accumulator and reusing the spare accumulator that
+    /// pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0` — the same backdrop the
+    /// `Overlay` and `HardLight` siblings blend against, so the three tests
+    /// differ in `l3` alone. Against `Cs = (0.75, 0.625, 0.125)`,
+    /// `LinearLight` is one unconditional `clamp(Cb + 2*Cs - 1, 0, 1)` with no
+    /// branch to take:
+    ///
+    /// - red: `0.65625 + 1.5 - 1 = 1.15625` → clamped down to `1.0`, the
+    ///   **upper rail**;
+    /// - green: `0.375 + 1.25 - 1 = 0.625`, **interior**;
+    /// - blue: `0.1875 + 0.25 - 1 = -0.5625` → clamped up to `0.0`, the
+    ///   **lower rail**.
+    ///
+    /// The `LinearLight` layer's own opacity `0.5` folds that in as
+    /// `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.828125, 0.5, 0.09375, 1.0)`. **All three clamp regimes fire in this
+    /// one draw**, which is what this fixture exists for and what neither
+    /// sibling's does. All three golden channels are distinct.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::LinearLight`] count, which is what
+    ///   distinguishes "the `LinearLight` arm ran on the GPU" from "it silently
+    ///   fell back to the CPU, which computes the same correct pixels" —
+    ///   historically the one mutation in a round like this that nothing else
+    ///   catches, and 0.113.0's mutation (a) confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `LinearLight` replaced by **`LinearBurn`** must composite to something
+    ///   *different*. That choice is not stylistic and not the sibling rounds'
+    ///   "transposed twin" logic either — there is no twin here. `LinearBurn`
+    ///   is what **dropping the `2.0 *`** computes, exactly: the clamp's upper
+    ///   bound is unreachable for operands in `[0, 1]`, so
+    ///   `clamp(Cb + Cs - 1, 0, 1)` *is* `max(Cb + Cs - 1, 0)`. It is also a
+    ///   live GPU dispatch arm, so the substituted run composites on the GPU
+    ///   path too. It gives `(0.53125, 0.1875, 0.09375)` against the golden's
+    ///   `(0.828125, 0.5, 0.09375)` — differing in red and green and
+    ///   **coinciding in blue**, which is not a fixture weakness but the
+    ///   provable rail identity: `Cb + 2*Cs < 1` implies `Cb + Cs < 1`, so a
+    ///   lower-railed channel is `0.0` for both modes and no fixture can
+    ///   separate them there. (The substituted run ticks
+    ///   `GpuBlendDispatch::LinearBurn`; nothing here reads that counter, and
+    ///   `real_gpu_context` zeroes every counter under its lock, so no sibling
+    ///   test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`):
+    /// `LinearBurn` `(0.53125, 0.1875, 0.09375)` and `LinearDodge`
+    /// `(0.828125, 0.6875, 0.25)` — **the two near-misses, and they are caught
+    /// by disjoint channel sets**: `LinearBurn` in red and green, `LinearDodge`
+    /// in green and blue, each coinciding in the channel whose rail it shares.
+    /// Green, the interior channel, is the only one that catches both, which is
+    /// the concrete reason this fixture needs an interior channel at all. Then
+    /// `Normal` `(0.703125, 0.5, 0.15625)` and `Lighten`
+    /// `(0.703125, 0.5, 0.1875)`, both coinciding in green;
+    /// `Multiply` `(0.57421875, 0.3046875, 0.10546875)`, `Screen`
+    /// `(0.78515625, 0.5703125, 0.23828125)`, `Darken`
+    /// `(0.65625, 0.375, 0.15625)`, `Difference` `(0.375, 0.3125, 0.125)`,
+    /// `Exclusion` `(0.5390625, 0.453125, 0.2265625)`, `Overlay`
+    /// `(0.7421875, 0.421875, 0.1171875)`, `HardLight`
+    /// `(0.7421875, 0.453125, 0.1171875)` — all three channels each — and
+    /// `ColorBurn` roughly `(0.5989.., 0.1875, 0.09375)` / `ColorDodge`
+    /// `(0.828125, 0.6875, 0.2008..)`, coinciding where their linear namesakes
+    /// do.
+    ///
+    /// **A transposed `src`/`backdrop` binding is caught here at *both*
+    /// opacities, but by *different channels* — and that is this round's real
+    /// finding, measured after being derived rather than assumed.** This mode's
+    /// blend term is unconditionally asymmetric
+    /// (`B(Cb, Cs) - B(Cs, Cb) = Cs - Cb` pre-clamp), which makes it tempting
+    /// to say a transpose is always visible. It is not:
+    ///
+    /// - at opacity `0.5`, `out - out_transposed = (Cb - Cs) * (1 - 2a)` is
+    ///   **zero for a clamp-interior channel**, so green sees nothing; the two
+    ///   *railed* channels carry it. 0.113.0's mutation (h) measured
+    ///   `(0.875, 0.5, 0.0625, 1.0)` against the correct
+    ///   `(0.828125, 0.5, 0.09375, 1.0)` — red and blue caught, green
+    ///   identical;
+    /// - at opacity `1.0` the fold contributes nothing, so a *railed* channel's
+    ///   two orders agree outright and only the interior channel carries it.
+    ///   The same mutation measured `(1.0, 0.375, 0.0, 1.0)` against the
+    ///   correct `(1.0, 0.625, 0.0, 1.0)` — green alone.
+    ///
+    /// The two mechanisms are exactly complementary, which is why this fixture
+    /// carries all three regimes instead of only a non-unit opacity. Note that
+    /// **a fixture of purely interior channels would satisfy the standing
+    /// transpose guard and still be blind at `0.5`** — see
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`],
+    /// where this is now recorded as the first case in which that guard's
+    /// demand is insufficient on its own.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_linear_light`, and the construct at stake
+    /// is new to this round: it is the **first `clamp()` in
+    /// `shaders/composite.wgsl`**, and both this mode's arithmetic and its
+    /// (non-)detection of `straight_backdrop`'s guard rest on WGSL's specified
+    /// `clamp(e1, e2, e3) == min(max(e1, e2), e3)`. See PLAN.md's 0.113.0
+    /// entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_light_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_LINEAR_LIGHT_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/LinearLight root stack must qualify for the GPU path as of \
+             0.113.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearLight);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `LinearLight` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport
+        // marks four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.113.0
+        // mutation-testing record, where deleting the dispatch arm left every
+        // other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearLight),
+            1,
+            "the LinearLight layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/LinearLight document (the LinearLight layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.828_125` is `0.828125` -- `clippy::unreadable_literal`, the
+            // same convention the Overlay, HardLight and ColorBurn goldens
+            // above already carry a note for. The doc comment and the message
+            // both spell it without separators.
+            (0.828_125, 0.5, 0.09375, 1.0),
+            "0.5*Cb + 0.5*clamp(Cb + 2*Cs - 1, 0, 1) must come out of the GPU path itself, with \
+             no branch anywhere: Cb = (0.65625, 0.375, 0.1875) and Cs = (0.75, 0.625, 0.125) put \
+             red on the upper clamp rail (sum 1.15625 -> 1.0), green strictly inside it (0.625) \
+             and blue on the lower rail (sum -0.5625 -> 0.0), so B is (1.0, 0.625, 0.0) and all \
+             three clamp regimes fire in one draw. (0.53125, 0.1875, 0.09375, 1.0) would mean \
+             LinearBurn ran -- exactly what dropping the 2.0* computes, since the upper bound is \
+             unreachable for operands in [0, 1], and itself a live GPU arm -- and \
+             (0.828125, 0.6875, 0.25, 1.0) LinearDodge. Those two are caught by disjoint channels \
+             (red+green and green+blue), each coinciding on the rail it shares, so only green \
+             catches both. (0.703125, 0.5, 0.15625, 1.0) is the Normal arm, \
+             (0.57421875, 0.3046875, 0.10546875, 1.0) Multiply, \
+             (0.78515625, 0.5703125, 0.23828125, 1.0) Screen, \
+             (0.65625, 0.375, 0.15625, 1.0) Darken, (0.703125, 0.5, 0.1875, 1.0) Lighten, \
+             (0.375, 0.3125, 0.125, 1.0) Difference, (0.7421875, 0.421875, 0.1171875, 1.0) \
+             Overlay, (0.7421875, 0.453125, 0.1171875, 1.0) HardLight, roughly \
+             (0.5989, 0.1875, 0.09375, 1.0) ColorBurn and (0.828125, 0.6875, 0.2008, 1.0) \
+             ColorDodge. Exclusion gives (0.5390625, 0.453125, 0.2265625, 1.0). A dispatch arm \
+             that transposed src and backdrop measured (0.875, 0.5, 0.0625, 1.0) on real hardware \
+             during 0.113.0's own mutation testing, with that mutation since reverted -- the \
+             shipped arm binds src first and the accumulator second -- caught in the two railed \
+             channels and blind in interior green, because out - out_transposed is \
+             (Cb - Cs)*(1 - 2a), which is zero at a = 0.5."
+        );
+
+        // The vacuity guard: the same stack with its `LinearLight` layer turned
+        // into a `LinearBurn` one. `LinearBurn` rather than the siblings'
+        // transposed twin, because this mode has no twin -- what it has is a
+        // near-miss reachable by deleting three characters, and `LinearBurn` is
+        // *exactly* what `clamp(Cb + Cs - 1, 0, 1)` computes. It is admitted at
+        // the predicate too, so the substituted stack also composites on the
+        // GPU path. Either way the guard only needs the texel to differ: if it
+        // did not, every assertion above would hold just as well with the wrong
+        // arm dispatched. Blue coincides between the two modes by the rail
+        // identity, so this is a two-channel claim and deliberately not
+        // described as a three-channel one.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::LinearLight {
+                entry.1 = aurora_doc::BlendMode::LinearBurn;
+            }
+        }
+        let with_linear_burn = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_linear_burn,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_linear_light_were_linear_burn = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_linear_light_were_linear_burn,
+            "setup: this fixture must distinguish its LinearLight layer from a LinearBurn one -- \
+             the same expression with its doubling dropped, and therefore exactly what a \
+             `2.0 * s.rgb -> s.rgb` slip in the shader or a fragment_entry naming \
+             fs_composite_linear_burn computes -- or the differential above would pass with the \
+             wrong arm running. Red and green carry this claim; blue cannot, since a lower-railed \
+             channel is provably 0.0 for both modes."
+        );
+    }
+
+    /// **`VividLight` end to end through the real caller** (0.114.0), the
+    /// thirteenth mode ported: a three-layer
+    /// `Normal`/`Multiply`/`VividLight` root stack
+    /// ([`NORMAL_MULTIPLY_VIVID_LIGHT_STACK`]) composited on real hardware,
+    /// with the `VividLight` layer sampling a backdrop a `Multiply` pass wrote
+    /// into the accumulator and reusing the spare accumulator that pass
+    /// created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0` — the same backdrop the
+    /// `Overlay`, `HardLight` and `LinearLight` siblings blend against, so the
+    /// four tests differ in `l3` alone. Against `Cs = (0.25, 0.875, 0.75)`,
+    /// `VividLight` branches on the **source**:
+    ///
+    /// - red (`Cs <= 0.5`, **burn**): `ColorBurn(0.65625, 0.5)` is
+    ///   `1 - min(1, 0.34375 / 0.5) = 0.3125`, **clamp-interior**;
+    /// - green (`Cs > 0.5`, **dodge**): `ColorDodge(0.375, 0.75)` is
+    ///   `min(1, 0.375 / 0.25)`, raw `1.5`, so the **upper rail**, `1.0`;
+    /// - blue (**dodge**): `ColorDodge(0.1875, 0.5) = min(1, 0.375) = 0.375`,
+    ///   **clamp-interior**.
+    ///
+    /// `B = (0.3125, 1.0, 0.375)`, and the `VividLight` layer's own opacity
+    /// `0.5` folds that in as `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.484375, 0.6875, 0.28125, 1.0)`. **Both branches fire in this one
+    /// draw, and each carries one clamp-interior channel**, which is what this
+    /// fixture exists for and what no sibling's does.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::VividLight`] count, which is what
+    ///   distinguishes "the `VividLight` arm ran on the GPU" from "it silently
+    ///   fell back to the CPU, which computes the same correct pixels" —
+    ///   historically the one mutation in a round like this that nothing else
+    ///   catches, and 0.114.0's own matrix confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `VividLight` replaced by **`ColorDodge`** must composite to something
+    ///   *different*. That choice is neither stylistic nor the earlier rounds'
+    ///   "transposed twin" logic — there is no twin here. `ColorDodge` is one
+    ///   of the two entry points this mode's own shader *calls*, so it is what
+    ///   a mistyped `fragment_entry`, or the wrong `composite_*` method at the
+    ///   dispatch site, actually computes; and it is the *harder* of the two to
+    ///   separate on this fixture, two of whose three channels take the dodge
+    ///   branch. It is also a live GPU dispatch arm, so the substituted run
+    ///   composites on the GPU path too. It gives
+    ///   `(0.765625, 0.6875, 0.46875)` against the golden's
+    ///   `(0.484375, 0.6875, 0.28125)` — differing in red and blue and
+    ///   **coinciding in green**, which is not a fixture weakness but a
+    ///   provable rail implication: `ColorDodge(Cb, 2*Cs - 1)` reaching its
+    ///   rail means `Cb + 2*Cs >= 2`, and since `Cs <= 1` that forces
+    ///   `Cb + Cs >= 1`, which is exactly `ColorDodge(Cb, Cs)`'s own rail
+    ///   condition. An upper-railed dodge channel is therefore `1.0` for both
+    ///   modes and no fixture can separate them there. (The substituted run
+    ///   ticks `GpuBlendDispatch::ColorDodge`; nothing here reads that counter,
+    ///   and `real_gpu_context` zeroes every counter under its lock, so no
+    ///   sibling test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`). The
+    /// two *mutation* rivals first, since they are the dangerous ones:
+    /// **dropping the `2.0 *` in the burn branch** gives
+    /// `(0.328125, 0.6875, 0.28125)` — red alone, red being the only burn
+    /// channel; **feeding the dodge branch `2*Cs`** instead of `2*Cs - 1` gives
+    /// `(0.484375, -0.0625, -0.09375)` — green *and* blue, both driven negative
+    /// because that substitution makes the divisor `1 - 2*Cs` negative rather
+    /// than (as this round first predicted) railing the branch to `1.0`. Then the two live callees: `ColorBurn` roughly
+    /// `(0.328125, 0.3304.., 0.09375)` (all three) and `ColorDodge`
+    /// `(0.765625, 0.6875, 0.46875)` (red and blue). Then the rest: `Normal`
+    /// `(0.453125, 0.625, 0.46875)`, `Multiply`
+    /// `(0.41015625, 0.3515625, 0.1640625)`, `Screen`
+    /// `(0.69921875, 0.6484375, 0.4921875)`, `Darken`
+    /// `(0.453125, 0.375, 0.1875)`, `Lighten` `(0.65625, 0.625, 0.46875)`,
+    /// `Difference` `(0.53125, 0.4375, 0.375)`, `Exclusion`
+    /// `(0.6171875, 0.484375, 0.421875)`, `LinearBurn`
+    /// `(0.328125, 0.3125, 0.09375)`, `Overlay`
+    /// `(0.5703125, 0.515625, 0.234375)`, `HardLight`
+    /// `(0.4921875, 0.609375, 0.390625)` and `PinLight`
+    /// `(0.578125, 0.5625, 0.34375)` — all three channels each; and
+    /// `LinearDodge` `(0.78125, 0.6875, 0.5625)`, `LinearLight`
+    /// `(0.40625, 0.6875, 0.4375)` and `HardMix`
+    /// `(0.328125, 0.6875, 0.09375)`, each coinciding **only** in railed green.
+    /// So no rival, real or mutated, survives all three channels.
+    ///
+    /// **A transposed `src`/`backdrop` binding is caught in all three channels
+    /// at *both* opacities, and this mode is the first in the roster for which
+    /// that is true.** Its blend term is unconditionally *and structurally*
+    /// asymmetric — `B(Cb, Cs)` branches on `Cs`, `B(Cs, Cb)` on `Cb` — and
+    /// unlike `LinearLight` it is **not affine in its operands**, so that mode's
+    /// `out - out_transposed = (Cb - Cs)*(1 - 2a)` form has no analogue here.
+    /// **It does still have blind opacities, contrary to what 0.114.0 wrote
+    /// here**: the fold's gap `(1 - a)*D0 + a*D1`, with `D0 = Cb - Cs` and
+    /// `D1 = B(Cb, Cs) - B(Cs, Cb)`, is affine in `a` for every mode, so a
+    /// channel is blind at `a* = D0/(D0 - D1)` whenever the two have opposite
+    /// signs — and all three of this fixture's channels do (red `≈ 0.8882`,
+    /// green `0.75`, blue `≈ 0.9310`). None of those is `0.5` or `1.0`, which is
+    /// why both opacities work; being clamp-interior in both operand orders is
+    /// *not* what buys it. The other laundering mechanism, rail agreement in the
+    /// blend term, this fixture also escapes: no channel rails in *both* operand
+    /// orders — red and blue are interior in both, green is upper-railed in the
+    /// shipped order alone —
+    /// `B^T = (0.3636.., 0.8333.., 0.3333..)`. Measured on real hardware in
+    /// 0.114.0, not derived: the transposed arm read back
+    /// `(0.30664063, 0.8540039, 0.5415039, 1.0)` against the golden
+    /// `(0.484375, 0.6875, 0.28125, 1.0)` — all three channels, and each by
+    /// more than a tenth, against a `2 * f16::EPSILON` tolerance. (The exact
+    /// rationals are `(0.3068.., 0.8542.., 0.5417..)`; the readback is their
+    /// `f16` images.)
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_vivid_light`, and this mode carries the
+    /// sharpest form of that gap yet: it inherits **both** of the
+    /// guarded-division modes' portability guards
+    /// (`color_burn_channel`'s `cs == 0.0` and `color_dodge_channel`'s
+    /// `cs == 1.0`), each of which is arithmetically redundant only because this
+    /// adapter divides by zero to `+inf` where WGSL promises an indeterminate
+    /// value. See PLAN.md's 0.114.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_vivid_light_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_VIVID_LIGHT_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/VividLight root stack must qualify for the GPU path as of \
+             0.114.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::VividLight);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `VividLight` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport
+        // marks four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.114.0
+        // mutation-testing record, where deleting the dispatch arm left every
+        // other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::VividLight),
+            1,
+            "the VividLight layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/VividLight document (the VividLight layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.484_375` is `0.484375` -- `clippy::unreadable_literal`, the
+            // same convention the Overlay, HardLight, LinearLight and ColorBurn
+            // goldens above already carry a note for. The doc comment and the
+            // message both spell it without separators.
+            (0.484_375, 0.6875, 0.28125, 1.0),
+            "0.5*Cb + 0.5*VividLight(Cb, Cs) must come out of the GPU path itself, branching on \
+             the SOURCE: Cb = (0.65625, 0.375, 0.1875) and Cs = (0.25, 0.875, 0.75) put red on \
+             the burn branch (ColorBurn(Cb, 2*Cs) = 0.3125, clamp-interior) and green and blue on \
+             the dodge branch (ColorDodge(Cb, 2*Cs - 1): green's raw 1.5 rails to 1.0, blue's is \
+             0.375 and interior), so B is (0.3125, 1.0, 0.375). \
+             (0.328125, 0.6875, 0.28125, 1.0) would mean the burn branch lost its 2.0*, computing \
+             ColorBurn(Cb, Cs) -- seen by red alone, the only burn channel -- and \
+             (0.484375, -0.0625, -0.09375, 1.0) that the dodge branch got 2*Cs instead of \
+             2*Cs - 1, whose divisor 1 - 2*Cs is negative across that branch's whole domain, seen \
+             by green and blue together. \
+             (0.765625, 0.6875, 0.46875, 1.0) is ColorDodge, one of the two entry points this \
+             mode's shader calls, coinciding in railed green by a provable rail implication; \
+             roughly (0.328125, 0.3304, 0.09375, 1.0) is ColorBurn, the other. \
+             (0.453125, 0.625, 0.46875, 1.0) is the Normal arm, \
+             (0.41015625, 0.3515625, 0.1640625, 1.0) Multiply, \
+             (0.69921875, 0.6484375, 0.4921875, 1.0) Screen, (0.453125, 0.375, 0.1875, 1.0) \
+             Darken, (0.65625, 0.625, 0.46875, 1.0) Lighten, (0.53125, 0.4375, 0.375, 1.0) \
+             Difference, (0.6171875, 0.484375, 0.421875, 1.0) Exclusion, \
+             (0.78125, 0.6875, 0.5625, 1.0) LinearDodge, (0.328125, 0.3125, 0.09375, 1.0) \
+             LinearBurn, (0.40625, 0.6875, 0.4375, 1.0) LinearLight, \
+             (0.5703125, 0.515625, 0.234375, 1.0) Overlay, \
+             (0.4921875, 0.609375, 0.390625, 1.0) HardLight, \
+             (0.578125, 0.5625, 0.34375, 1.0) PinLight and (0.328125, 0.6875, 0.09375, 1.0) \
+             HardMix. A dispatch arm that transposed src and backdrop measured \
+             (0.30664063, 0.8540039, 0.5415039, 1.0) on real hardware during 0.114.0's own \
+             mutation \
+             testing, with that mutation since reverted -- the shipped arm binds src first and \
+             the accumulator second -- caught in all three channels, none of whose own blind \
+             opacity (~0.8882, 0.75, ~0.9310) is 0.5 or 1.0."
+        );
+
+        // The vacuity guard: the same stack with its `VividLight` layer turned
+        // into a `ColorDodge` one. `ColorDodge` rather than a transposed twin,
+        // because this mode has no twin -- what it has is two *callees*, and
+        // `ColorDodge` is the one this fixture separates least easily, two of
+        // its three channels taking the dodge branch. It is admitted at the
+        // predicate too, so the substituted stack also composites on the GPU
+        // path. Either way the guard only needs the texel to differ: if it did
+        // not, every assertion above would hold just as well with the wrong arm
+        // dispatched. Green coincides between the two modes by the rail
+        // implication (`Cb + 2*Cs >= 2` forces `Cb + Cs >= 1`), so this is a
+        // two-channel claim and deliberately not described as a three-channel
+        // one.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::VividLight {
+                entry.1 = aurora_doc::BlendMode::ColorDodge;
+            }
+        }
+        let with_color_dodge = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_color_dodge,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_vivid_light_were_color_dodge = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_vivid_light_were_color_dodge,
+            "setup: this fixture must distinguish its VividLight layer from a ColorDodge one -- \
+             one of the two entry points this mode's own shader calls, and therefore exactly what \
+             a fragment_entry naming fs_composite_color_dodge, or the wrong composite_* method at \
+             the dispatch site, computes -- or the differential above would pass with the wrong \
+             arm running. Red and blue carry this claim; green cannot, since an upper-railed dodge \
+             channel is provably 1.0 for both modes."
+        );
+    }
+
+    /// **`HardMix` end to end through the real caller** (0.115.0), the
+    /// fourteenth mode ported: a three-layer `Normal`/`Multiply`/`HardMix` root
+    /// stack ([`NORMAL_MULTIPLY_HARD_MIX_STACK`]) composited on real hardware,
+    /// with the `HardMix` layer sampling a backdrop a `Multiply` pass wrote into
+    /// the accumulator and reusing the spare accumulator that pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.0, 0.875, 0.5)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is `Cb = (0.0, 0.65625, 0.375)` at
+    /// alpha `1.0`. **This is the first mode's fixture not to reuse the shared
+    /// `(0.875, 0.5, 0.25)` bottom layer** — see
+    /// [`NORMAL_MULTIPLY_HARD_MIX_STACK`] for why red must be exactly `0.0`.
+    /// Against `Cs = (1.0, 0.5625, 0.4375)`, `HardMix` thresholds `VividLight`
+    /// at `0.5`:
+    ///
+    /// - red is `(Cb, Cs) = (0, 1)`, **the guard-ordering corner**: `Cs > 0.5`
+    ///   selects `color_dodge_channel`, whose `cb == 0.0` guard is tested before
+    ///   its `cs == 1.0` one and returns `0`, so `VividLight = 0` and `B = 0` —
+    ///   where the `Cb + Cs >= 1` closed form alone would predict `1`;
+    /// - green (`Cs > 0.5`, **dodge**):
+    ///   `ColorDodge(0.65625, 0.125) = min(1, 0.65625/0.875) = 0.75` exactly, so
+    ///   `B = 1` — and `0.75` is off both of `VividLight`'s rails;
+    /// - blue (`Cs <= 0.5`, **burn**): `1 - min(1, 0.625/0.875) = 2/7 ≈ 0.2857`,
+    ///   so `B = 0` — interior, and below `0.5` where green's is above.
+    ///
+    /// `B = (0.0, 1.0, 0.0)`, and the `HardMix` layer's own opacity `0.5` folds
+    /// that in as `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.0, 0.828125, 0.1875, 1.0)`. Both of this mode's rails fire in one
+    /// draw and both of `VividLight`'s branches are taken, which is what this
+    /// fixture exists for.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::HardMix`] count, which is what distinguishes
+    ///   "the `HardMix` arm ran on the GPU" from "it silently fell back to the
+    ///   CPU, which computes the same correct pixels" — historically the one
+    ///   mutation in a round like this that nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `HardMix` replaced by **`VividLight`** must composite to something
+    ///   *different*. `VividLight` is not an arbitrary choice and not a
+    ///   "transposed twin" — there is none. It is the mode this one's shader
+    ///   *thresholds*, so dropping the threshold, or a `fragment_entry` naming
+    ///   `fs_composite_vivid_light`, or the wrong `composite_*` method at the
+    ///   dispatch site all compute exactly it; and it is a live GPU dispatch
+    ///   arm, so the substituted run composites on the GPU path too. It gives
+    ///   `(0.0, 0.703125, 0.3303..)` against the golden's
+    ///   `(0.0, 0.828125, 0.1875)` — differing in green and blue and
+    ///   **coinciding in red**, which is not a fixture weakness but the corner's
+    ///   own arithmetic: `VividLight(0, 1) = 0`, which already equals red's
+    ///   `B`. (The substituted run ticks `GpuBlendDispatch::VividLight`; nothing
+    ///   here reads that counter, and `real_gpu_context` zeroes every counter
+    ///   under its lock, so no sibling test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`). The
+    /// two mutations unique to this mode first, because only red can see either:
+    /// **the two operands transposed inside the shader** and **the body
+    /// rewritten as a componentwise `select(0.0, 1.0, cb + s >= 1.0)`** both
+    /// give `(0.5, 0.828125, 0.1875)`, identical to each other because both
+    /// differ from the truth only at the corner. Then the three live arms this
+    /// mode's shader reaches: `VividLight` `(0.0, 0.703125, 0.3303..)` (green
+    /// and blue), `ColorBurn` `(0.0, 0.5225.., 0.1875)` (green alone — every
+    /// `B = 0` channel provably agrees with it) and `ColorDodge`
+    /// `(0.0, 0.828125, 0.5208..)` (blue alone — the mirror). Then the rest:
+    /// `Normal` `(0.5, 0.609375, 0.40625)`, `Multiply`
+    /// `(0.0, 0.51269531, 0.26953125)`, `Screen`
+    /// `(0.5, 0.75292969, 0.51171875)`, `Darken` `(0.0, 0.609375, 0.375)`,
+    /// `Lighten` `(0.5, 0.65625, 0.40625)`, `Difference`
+    /// `(0.5, 0.375, 0.21875)`, `Exclusion` `(0.5, 0.56835938, 0.4296875)`,
+    /// `LinearDodge` `(0.5, 0.828125, 0.59375)`, `LinearBurn`
+    /// `(0.0, 0.4375, 0.1875)`, `Overlay` `(0.0, 0.67773438, 0.3515625)`,
+    /// `HardLight` `(0.5, 0.67773438, 0.3515625)`, `LinearLight`
+    /// `(0.5, 0.71875, 0.3125)` and `PinLight` `(0.5, 0.65625, 0.375)` — none
+    /// coinciding in more than one channel.
+    ///
+    /// **A transposed `src`/`backdrop` dispatch arm is caught in all three
+    /// channels, but only two of the three see it through the blend term's own
+    /// asymmetry — and that is the round's headline.** `HardMix`'s blend term is
+    /// `1[Cb + Cs >= 1]`, which is **symmetric**, with exactly one exception at
+    /// `(0, 1)` (and its transpose `(1, 0)`); an exhaustive sweep found no
+    /// interior asymmetric pair at all. So green and blue are blind to the
+    /// transpose *in `B`* and see it only through the fold's own
+    /// `(1 - a)*(Cb - Cs)` term, which vanishes at `a = 1`. Red, being the
+    /// corner, sees it in `B` too — `B^T = 1` against `B = 0`, a full `1.0`
+    /// apart, the largest single-channel gap any roster fixture has.
+    /// [`solid_stack_texel_cpu`] folded both ways gives
+    /// `(0.0, 0.828125, 0.1875, 1.0)` against
+    /// `(1.0, 0.78125, 0.21875, 1.0)`, which is what
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument`'s third assertion measures.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_hard_mix`. This mode inherits both of the
+    /// guarded-division modes' portability guards through `vivid_light_channel`,
+    /// but here the threshold **masks** them — it maps `0.0`, `1.0` and `+inf`
+    /// alike onto a `0.0` or `1.0` — so a backend whose division-by-zero
+    /// differs would show up in `VividLight`'s tests, not this mode's. See
+    /// PLAN.md's 0.115.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_HARD_MIX_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/HardMix root stack must qualify for the GPU path as of \
+             0.115.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::HardMix);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `HardMix` layer, dispatched once for the one
+        // tile it actually has content at. `solid_root_stack` fills only tile
+        // `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport marks
+        // four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.115.0
+        // mutation-testing record.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::HardMix),
+            1,
+            "the HardMix layer must have dispatched a real GPU blend pass on the one visible tile \
+             that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/HardMix document (the HardMix layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.828_125` is `0.828125` -- `clippy::unreadable_literal`, the
+            // same convention the Overlay, HardLight, LinearLight, VividLight
+            // and ColorBurn goldens above already carry a note for. The doc
+            // comment and the message both spell it without separators.
+            (0.0, 0.828_125, 0.1875, 1.0),
+            "0.5*Cb + 0.5*HardMix(Cb, Cs) must come out of the GPU path itself: \
+             Cb = (0.0, 0.65625, 0.375) and Cs = (1.0, 0.5625, 0.4375) give VividLight \
+             (0.0, 0.75, 0.2857) and so B = (0.0, 1.0, 0.0). Red is the (0, 1) \
+             guard-ordering corner -- color_dodge_channel's cb == 0.0 guard fires before its \
+             cs == 1.0 one and returns 0, the ONE point at which HardMix departs from its own \
+             Cb + Cs >= 1 closed form. (0.5, 0.828125, 0.1875, 1.0) is what BOTH a \
+             shader-internal operand transpose and a componentwise \
+             select(0.0, 1.0, cb + s >= 1.0) compute, and red alone can see either. \
+             (0.0, 0.703125, 0.3303.., 1.0) is VividLight, i.e. what dropping the threshold or a \
+             fragment_entry naming fs_composite_vivid_light computes -- green and blue see that, \
+             red cannot, VividLight(0, 1) already being 0. (0.0, 0.5225.., 0.1875, 1.0) is \
+             ColorBurn, coinciding in every B = 0 channel by a provable implication, and \
+             (0.0, 0.828125, 0.5208.., 1.0) ColorDodge, the mirror. \
+             (0.5, 0.609375, 0.40625, 1.0) is the Normal arm, \
+             (0.0, 0.51269531, 0.26953125, 1.0) Multiply, \
+             (0.5, 0.75292969, 0.51171875, 1.0) Screen, (0.0, 0.609375, 0.375, 1.0) Darken, \
+             (0.5, 0.65625, 0.40625, 1.0) Lighten, (0.5, 0.375, 0.21875, 1.0) Difference, \
+             (0.5, 0.56835938, 0.4296875, 1.0) Exclusion, (0.5, 0.828125, 0.59375, 1.0) \
+             LinearDodge, (0.0, 0.4375, 0.1875, 1.0) LinearBurn, \
+             (0.0, 0.67773438, 0.3515625, 1.0) Overlay, (0.5, 0.67773438, 0.3515625, 1.0) \
+             HardLight, (0.5, 0.71875, 0.3125, 1.0) LinearLight and \
+             (0.5, 0.65625, 0.375, 1.0) PinLight. A dispatch arm that transposed src and backdrop \
+             folds on the CPU to (1.0, 0.78125, 0.21875, 1.0) -- all three channels, but only red \
+             through the blend term itself; green and blue see it only through the fold's own \
+             (1 - a)*(Cb - Cs), which is why this fixture's 0.5 opacity is load-bearing."
+        );
+
+        // The vacuity guard: the same stack with its `HardMix` layer turned into
+        // a `VividLight` one. `VividLight` rather than a transposed twin,
+        // because this mode has no twin -- what it has is a *callee it
+        // thresholds*, and dropping the threshold is exactly `VividLight`. It is
+        // admitted at the predicate too, so the substituted stack also
+        // composites on the GPU path. Green and blue carry the claim; red
+        // coincides, `VividLight(0, 1)` being `0` like its own `B`.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::HardMix {
+                entry.1 = aurora_doc::BlendMode::VividLight;
+            }
+        }
+        let with_vivid_light = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_vivid_light,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_hard_mix_were_vivid_light = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_hard_mix_were_vivid_light,
+            "setup: this fixture must distinguish its HardMix layer from a VividLight one -- the \
+             mode this one's shader thresholds, and therefore exactly what dropping the \
+             threshold, a fragment_entry naming fs_composite_vivid_light, or the wrong \
+             composite_* method at the dispatch site computes -- or the differential above would \
+             pass with the wrong arm running. Green and blue carry this claim; red cannot, since \
+             VividLight(0, 1) is 0, which already equals HardMix's own answer at that corner."
+        );
+    }
+
+    /// **`PinLight` end to end through the real caller** (0.116.0), the
+    /// fifteenth mode ported: a three-layer `Normal`/`Multiply`/`PinLight` root
+    /// stack ([`NORMAL_MULTIPLY_PIN_LIGHT_STACK`]) composited on real hardware,
+    /// with the `PinLight` layer sampling a backdrop a `Multiply` pass wrote into
+    /// the accumulator and reusing the spare accumulator that pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is `Cb = (0.65625, 0.375, 0.1875)`
+    /// at alpha `1.0` — the same accumulator the `VividLight` sibling uses.
+    /// Against `Cs = (0.25, 0.8125, 0.5625)`, `PinLight` branches on the
+    /// **source**:
+    ///
+    /// - red (`Cs = 0.25 <= 0.5`, **low**): `min(0.65625, 0.5) = 0.5` —
+    ///   source-derived;
+    /// - green (`Cs = 0.8125 > 0.5`, **high**): `max(0.375, 0.625) = 0.625` —
+    ///   source-derived;
+    /// - blue (`Cs = 0.5625 > 0.5`, **high**): `max(0.1875, 0.125) = 0.1875` —
+    ///   **backdrop-wins**, a no-op channel.
+    ///
+    /// `B = (0.5, 0.625, 0.1875)`, and the `PinLight` layer's own opacity `0.5`
+    /// folds that in as `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.578125, 0.5, 0.1875, 1.0)`. Both branches fire in one draw and each
+    /// carries a source-derived channel, which is what this fixture exists for.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::PinLight`] count, which is what distinguishes
+    ///   "the `PinLight` arm ran on the GPU" from "it silently fell back to the
+    ///   CPU, which computes the same correct pixels" — historically the one
+    ///   mutation in a round like this that nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `PinLight` replaced by **`Darken`** must composite to something
+    ///   *different*. `Darken` is not an arbitrary choice: it is literally this
+    ///   mode's low branch, it is what a dropped `2.0 *` there computes, and
+    ///   **every backdrop-wins channel of this mode provably agrees with it** —
+    ///   so it is the rival most likely to pass unnoticed. It is a live GPU
+    ///   dispatch arm, so the substituted run composites on the GPU path too. It
+    ///   gives `(0.453125, 0.375, 0.1875)` against the golden's
+    ///   `(0.578125, 0.5, 0.1875)` — differing in red and green and
+    ///   **coinciding in blue**, which is not a fixture weakness but that
+    ///   provable agreement: blue is the backdrop-wins channel. (The substituted
+    ///   run ticks `GpuBlendDispatch::Darken`; nothing here reads that counter,
+    ///   and `real_gpu_context` zeroes every counter under its lock, so no
+    ///   sibling test can see it either.)
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`). The two
+    /// arms this mode's branches *are*, first: `Darken`
+    /// `(0.453125, 0.375, 0.1875)` (red and green see it; blue provably cannot)
+    /// and `Lighten` `(0.65625, 0.59375, 0.375)` (all three). Then the rest:
+    /// `Normal` `(0.453125, 0.59375, 0.375)`, `Multiply`
+    /// `(0.41015625, 0.33984375, 0.14648438)`, `Screen`
+    /// `(0.69921875, 0.62890625, 0.41601562)`, `Overlay`
+    /// `(0.5703125, 0.4921875, 0.19921875)`, `HardLight`
+    /// `(0.4921875, 0.5703125, 0.23828125)`, `ColorBurn`
+    /// `(0.328125, 0.30288.., 0.09375)`, `ColorDodge`
+    /// `(0.765625, 0.6875, 0.30803..)`, `Difference`
+    /// `(0.53125, 0.40625, 0.28125)`, `Exclusion`
+    /// `(0.6171875, 0.4765625, 0.36328125)`, `LinearBurn`
+    /// `(0.328125, 0.28125, 0.09375)`, `LinearDodge`
+    /// `(0.78125, 0.6875, 0.46875)`, `LinearLight`
+    /// `(0.40625, 0.6875, 0.25)`, `VividLight`
+    /// `(0.484375, 0.6875, 0.20089..)` and `HardMix`
+    /// `(0.328125, 0.6875, 0.09375)` — **none coinciding in any channel**, so
+    /// `Darken`'s single blue coincidence is the only one in the whole list and
+    /// it is the provable one.
+    ///
+    /// **A transposed `src`/`backdrop` dispatch arm is caught in all three
+    /// channels at *both* opacities, and that is a property of this fixture
+    /// rather than of the mode.** `PinLight`'s blend term is symmetric on
+    /// exactly four classes — `Cb == Cs`, **`|Cb - Cs| == 0.5`**, an operand at
+    /// `0` with the other `<= 0.5`, an operand at `1` with the other `> 0.5`
+    /// (verified over a 129×129 rational grid, no members outside them) — and
+    /// blind at `a = 0.5` specifically only at `(0, 1)`/`(1, 0)`. This fixture
+    /// sits off all five, and each channel's blind alpha lands outside `(0, 1)`
+    /// entirely (red `≈ 1.857`, green `1.4`, blue `2.0`), so it has no interior
+    /// blind opacity at all. [`solid_stack_texel_cpu`] folded both ways gives
+    /// `(0.578125, 0.5, 0.1875, 1.0)` against `(0.28125, 0.78125, 0.46875, 1.0)`
+    /// — a largest channel gap of `0.296875` in red — which is what
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    /// transposed_argument`'s third assertion measures.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_pin_light`. This mode divides nowhere and
+    /// has no guarded arm, so it inherits none of the guarded-division modes'
+    /// portability gaps; what it *does* rest on for one disclosure is this
+    /// adapter's `min`/`max` laundering a `NaN`, which WGSL leaves undefined —
+    /// see PLAN.md's 0.116.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_pin_light_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_PIN_LIGHT_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/PinLight root stack must qualify for the GPU path as of \
+             0.116.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::PinLight);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `PinLight` layer, dispatched once for the one
+        // tile it actually has content at. `solid_root_stack` fills only tile
+        // `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport marks
+        // four tiles visible at `TILE` = 256, and the other three resolve
+        // nothing at all, taking `begin_gpu_composite_tile`'s `current?` bail
+        // before any blend pass is recorded. The second, CPU-only run inside
+        // that helper adds none. **A count of 0 is the failure this assertion
+        // exists for** -- see `GpuBlendDispatches`, and PLAN.md's 0.116.0
+        // mutation-testing record.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::PinLight),
+            1,
+            "the PinLight layer must have dispatched a real GPU blend pass on the one visible tile \
+             that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/PinLight document (the PinLight layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.578_125` is `0.578125` -- `clippy::unreadable_literal`, the
+            // same convention the Overlay, HardLight, LinearLight, VividLight,
+            // HardMix and ColorBurn goldens above already carry a note for. The
+            // doc comment and the message both spell it without separators.
+            (0.578_125, 0.5, 0.1875, 1.0),
+            "0.5*Cb + 0.5*PinLight(Cb, Cs) must come out of the GPU path itself: \
+             Cb = (0.65625, 0.375, 0.1875) and Cs = (0.25, 0.8125, 0.5625), and PinLight branches \
+             on the SOURCE -- red takes the low branch (min(0.65625, 2*0.25) = 0.5, \
+             source-derived), green the high branch (max(0.375, 2*0.8125 - 1) = 0.625, \
+             source-derived) and blue the high branch backdrop-wins \
+             (max(0.1875, 0.125) = 0.1875) -- so B = (0.5, 0.625, 0.1875). Darken gives \
+             (0.453125, 0.375, 0.1875, 1.0): it IS this mode's low branch, it is what a dropped \
+             2.0* there computes, and every backdrop-wins channel provably agrees with it, so blue \
+             coincides and red and green carry the claim. Lighten gives \
+             (0.65625, 0.59375, 0.375, 1.0), separated in all three. \
+             (0.453125, 0.59375, 0.375, 1.0) is the Normal arm, \
+             (0.41015625, 0.33984375, 0.14648438, 1.0) Multiply, \
+             (0.69921875, 0.62890625, 0.41601562, 1.0) Screen, \
+             (0.5703125, 0.4921875, 0.19921875, 1.0) Overlay, \
+             (0.4921875, 0.5703125, 0.23828125, 1.0) HardLight, \
+             (0.328125, 0.30288, 0.09375, 1.0) ColorBurn, (0.765625, 0.6875, 0.30804, 1.0) \
+             ColorDodge, (0.53125, 0.40625, 0.28125, 1.0) Difference, \
+             (0.6171875, 0.4765625, 0.36328125, 1.0) Exclusion, \
+             (0.328125, 0.28125, 0.09375, 1.0) LinearBurn, (0.78125, 0.6875, 0.46875, 1.0) \
+             LinearDodge, (0.40625, 0.6875, 0.25, 1.0) LinearLight, \
+             (0.484375, 0.6875, 0.20089, 1.0) VividLight and (0.328125, 0.6875, 0.09375, 1.0) \
+             HardMix -- none coinciding in any channel. A dispatch arm that transposed src and \
+             backdrop folds on the CPU to (0.28125, 0.78125, 0.46875, 1.0) -- all three channels, \
+             at this opacity and at 1.0 alike, this fixture sitting off all four of the mode's \
+             blind classes (including |Cb - Cs| == 0.5, which is new to this mode) and off the \
+             (0, 1) corner."
+        );
+
+        // The vacuity guard: the same stack with its `PinLight` layer turned
+        // into a `Darken` one. `Darken` rather than a lexical near-name, because
+        // this mode's low branch *is* `Darken` and every backdrop-wins channel
+        // provably agrees with it -- so it is the rival most likely to pass
+        // unnoticed. It is admitted at the predicate too, so the substituted
+        // stack also composites on the GPU path. Red and green carry the claim;
+        // blue coincides, being the backdrop-wins channel.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::PinLight {
+                entry.1 = aurora_doc::BlendMode::Darken;
+            }
+        }
+        let with_darken = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_darken,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_pin_light_were_darken = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_pin_light_were_darken,
+            "setup: this fixture must distinguish its PinLight layer from a Darken one -- the mode \
+             this one's low branch IS, and therefore exactly what a dropped 2.0* there, a \
+             fragment_entry naming fs_composite_darken, or the wrong composite_* method at the \
+             dispatch site computes -- or the differential above would pass with the wrong arm \
+             running. Red and green carry this claim; blue cannot, being the backdrop-wins channel, \
+             which provably agrees with Darken."
+        );
+    }
+
+    /// **The test this whole round exists to make possible** (0.85.0):
+    /// three *different* expressible modes in one stack, proving the
+    /// ping-pong mechanism generalises past a single blend mode.
+    ///
+    /// **What this test proves, precisely** (corrected in 0.85.1 — see
+    /// the note at the bottom for what it used to claim). Two different
+    /// blend-math *pipelines* — `fs_composite_multiply` and
+    /// `fs_composite_darken`, built from one `PipelineCache` against one
+    /// bind-group layout — each dispatch correctly within a single
+    /// document, in a single pass over one tile's layer stack, including
+    /// the case where a `Darken` layer's write-target and sampled
+    /// backdrop were both produced by an earlier `Multiply` layer. That
+    /// is a real write-after-read hazard across two pipelines, and it is
+    /// what every fixture before this one (at most one non-`Normal` mode
+    /// each) could not reach.
+    ///
+    /// Five root-level layers, with the pair written as A (the
+    /// initially-`current` member) and B:
+    ///
+    /// | # | mode       | opacity | pass writes | `current` after |
+    /// |---|------------|---------|-------------|-----------------|
+    /// | 1 | `Normal`   | 1.0     | A, in place | A               |
+    /// | 2 | `Multiply` | 1.0     | B (from A)  | **B**           |
+    /// | 3 | `Normal`   | 0.75    | B, in place | B               |
+    /// | 4 | `Darken`   | 0.5     | A (from B)  | **A**           |
+    /// | 5 | `Darken`   | 1.0     | B (from A)  | **B**           |
+    ///
+    /// Three properties at once, none of which any prior fixture has:
+    ///
+    /// - **Layer 4 is a `Darken` sampling a backdrop three layers deep**
+    ///   that a `Multiply` pass, not a `Normal` one, last wrote. Its
+    ///   `spare` write-target is likewise one layer 2's `Multiply`
+    ///   created, never `Darken`'s own first use.
+    /// - **Three swaps, an odd count**, so the fold ends on the member it
+    ///   did *not* start on and a fixed-index readback silently drops
+    ///   layer 5.
+    /// - **A `Normal` blend onto a post-swap accumulator** (layer 3),
+    ///   which catches an arm that advances `current` on the wrong pass.
+    ///
+    /// Differential against the real `composite_tile_cpu` reference —
+    /// hand-computing five chained composites would restate the
+    /// arithmetic under test rather than check it. Two separate guards
+    /// keep that differential from being vacuous:
+    ///
+    /// - The CPU-only run at the end: the same stack with both `Darken`
+    ///   layers replaced by `Multiply` must composite to something
+    ///   *different*, so an arm dispatching the wrong formula cannot
+    ///   pass.
+    /// - The [`GpuBlendDispatch::Darken`] assertion (0.85.1): the `Darken`
+    ///   arm must actually have run on the GPU. Without it, deleting the
+    ///   arm outright routes every `Darken` tile to the CPU fallback,
+    ///   which produces the same correct texel — so the differential
+    ///   above would be comparing the CPU path against itself and would
+    ///   still pass. See that static for the mutation, and for the note
+    ///   that `Multiply` and `Dissolve` still carry the same gap.
+    ///
+    /// **What this test does *not* prove, and cannot** (0.85.1). Its
+    /// original doc comment and 0.85.0's commit message both claimed it
+    /// distinguished "one shared `spare` accumulator" from "one `spare`
+    /// per mode", the specific counterfactual being that a per-mode
+    /// spare would make layer 4 "render into a texture holding layers
+    /// 1-2 rather than 1-3". That is wrong twice over, and review proved
+    /// it by giving `Darken` its own private accumulator and watching
+    /// the whole suite — this test included — stay green.
+    ///
+    /// The confusion was between the render *target* and the sampled
+    /// *backdrop*. Layer 4 renders into `spare` and samples `current`;
+    /// only `current` carries the prior fold, and it is passed
+    /// explicitly, so it holds layers 1-3 whether or not `spare` is
+    /// shared. And every blend-math pass opens with
+    /// `LoadOp::Clear(TRANSPARENT)` before drawing a fullscreen
+    /// triangle, so its target's prior contents are never read at all.
+    /// Shared-versus-per-mode is therefore a pure memory-footprint
+    /// property with no pixel-observable consequence, and **no
+    /// differential test can distinguish it.** What actually holds the
+    /// property is `create_composite_accumulator`'s single
+    /// `get_or_insert_with` on one `spare` binding, plus that
+    /// function's own doc comment; making it *checkable* would need an
+    /// allocation counter, not a fixture.
+    ///
+    /// **Layer 4's opacity `0.5` is load-bearing for a fourth property**
+    /// (recorded 0.105.3): it is the *only* reason a transposed
+    /// `src`/`backdrop` in the `Darken` dispatch arm is observable
+    /// anywhere in the workspace — `min(Cb, Cs)` is commutative, so only
+    /// the asymmetric fold `out = (1 - a) * bd + a * blended` can see the
+    /// swap, and at layer 5's opacity `1.0` it collapses to
+    /// `out = blended` and cannot. PLAN.md's 0.105.2 kill matrix measured
+    /// that mutation killing exactly this one test out of the whole
+    /// `aurora-app` binary; the dedicated
+    /// `..._agree_on_a_darken_blend_document` sibling is all-opacity-`1.0`
+    /// and blind to it. This test is differential-only, so normalising
+    /// that opacity would reopen the gap with nothing going red — hence
+    /// the table lives in [`MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK`],
+    /// re-checked by
+    /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = MIXED_NORMAL_MULTIPLY_AND_DARKEN_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Darken root stack must qualify for the GPU path -- \
+             otherwise this test would compare the CPU path against itself and prove nothing \
+             about either blend-math pipeline dispatching"
+        );
+
+        // Zero the counter inside `real_gpu_context`'s lock, so what the
+        // assertion below reads is this run's dispatches and nothing
+        // else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // Two = this stack's two `Darken` layers, dispatched once each for
+        // the single tile they actually have content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // as of 0.87.0 the other three resolve nothing at all --
+        // `resolve_tile` answers `None` for a visible layer with nothing
+        // *stored* at the tile, so those three take
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. **This count was 8 until 0.87.0**, and the
+        // six that went away were exactly the wasted work that change
+        // removes: three tiles' worth of upload, blend and readback to
+        // composite transparency. The second, CPU-only run inside that
+        // helper adds none, which is itself part of what this pins. **A
+        // count of 0 is the failure this assertion exists for**: it means
+        // no `Darken` tile reached the GPU at all and every assertion
+        // below is being satisfied by the CPU fallback compared against
+        // itself. A count that is non-zero but not 2 means the viewport or
+        // tile geometry moved under this fixture -- re-derive it rather
+        // than loosening the assertion.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken),
+            2,
+            "both Darken layers must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a five-layer stack mixing Normal, Multiply and Darken (three swaps, and a Darken \
+             layer reusing the spare accumulator a Multiply layer created)",
+        );
+
+        // The vacuity guard: the same stack with both `Darken` layers
+        // turned into `Multiply` ones, composited on the CPU path only.
+        // If that produced the same texel, every assertion above would
+        // hold just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Darken {
+                entry.1 = aurora_doc::BlendMode::Multiply;
+            }
+        }
+        let all_multiply = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &all_multiply,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_darken_were_multiply = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_darken_were_multiply,
+            "setup: this fixture must distinguish its two Darken layers from Multiply ones, or \
+             the differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
+    /// **One `queue.submit` for one composite tile** (0.86.0) — the
+    /// batching this round exists to produce, asserted as a number
+    /// rather than left as a claim in a doc comment.
+    ///
+    /// The fixture is the same five-layer mixed
+    /// `Normal`/`Multiply`/`Normal`/`Darken`/`Darken` root stack the
+    /// test directly above uses, and it is deliberately the *worst* case
+    /// this path currently has: it creates both accumulators and runs
+    /// five blend passes. [`begin_gpu_composite_tile`] is called
+    /// directly, on one tile, so the count is unambiguous — the count is
+    /// per tile, and going through `recomposite_visible_tiles` would
+    /// multiply it by however many tiles that call's residency grid
+    /// happens to mark visible.
+    ///
+    /// **Pre-change number for this exact fixture: eight.** Every step
+    /// below created and submitted its own command buffer before this
+    /// round:
+    ///
+    /// - 1 — `current`'s clear pass, created by layer 1 (`Normal`);
+    /// - 1 — `spare`'s clear pass, created by layer 2 (`Multiply`), the
+    ///   first blend-math layer to reach this tile;
+    /// - 5 — one per layer, since each of
+    ///   `composite_over_with_opacity`,
+    ///   `composite_multiply_over_with_opacity` and
+    ///   `composite_darken_over_with_opacity` ended in a `queue.submit`
+    ///   of its own;
+    /// - 1 — the readback's `copy_texture_to_buffer`.
+    ///
+    /// It is **one** now. The simplest real case — a single-layer
+    /// `Normal` document, which is every plain imported PNG/JPEG/TIFF
+    /// and the app's own default startup document — went from three to
+    /// one by the same arithmetic.
+    ///
+    /// **What this cannot see**, stated the way [`GPU_COMPOSITE_SUBMITS`]
+    /// states it: a `queue.submit` reintroduced *inside* one of
+    /// `aurora_render::TileCompositor`'s methods would leave this count
+    /// at 1 and this test green. `aurora-render`'s own
+    /// `composite_over_with_opacity_records_into_the_encoder_without_submitting_it`
+    /// is what covers that half.
+    #[test]
+    fn begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Normal,
+                    0.75,
+                    [0.0, 0.25, 1.0, 1.0],
+                ),
+                (
+                    "l4",
+                    aurora_doc::BlendMode::Darken,
+                    0.5,
+                    [0.25, 1.0, 0.5, 1.0],
+                ),
+                (
+                    "l5",
+                    aurora_doc::BlendMode::Darken,
+                    1.0,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: this stack must qualify for the GPU path, or the call below would be \
+             measuring a case the real caller never takes"
+        );
+
+        // Zero the counter inside `real_gpu_context`'s lock, so what is
+        // read below is this call's submits and nothing else's.
+        let _ = take_gpu_composite_submit_count();
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_some(),
+            "setup: this tile must really composite on the GPU -- a None here would make the \
+             submit count below vacuously low for the wrong reason (a bailed tile issues zero \
+             submits, which is correct behaviour but not what this test is measuring)"
+        );
+
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "one composite tile must cost exactly one queue.submit, however many accumulators \
+             it creates and however many layers it folds -- this same five-layer fixture cost \
+             eight before 0.86.0 (two accumulator clears + five layer passes + one readback), \
+             and a count above 1 means a per-pass submit came back"
+        );
+    }
+
+    /// **`Dissolve` on the GPU path** (0.84.1, ISSUE-7's outcome).
+    /// `Dissolve` is admitted by `document_qualifies_for_gpu_compositing`
+    /// without a line of new WGSL, because it never reaches the GPU as
+    /// `Dissolve` at all: [`resolve_tile`] intercepts it, runs
+    /// [`dissolve_gate`], and returns an already-gated buffer at
+    /// `(opacity = 1.0, blend_mode = Normal)`, so the existing `Normal`
+    /// arm composites it.
+    ///
+    /// The differential is what makes that argument checkable rather
+    /// than merely plausible. `dissolve_gate`'s noise is a pure function
+    /// of a texel's absolute document-space position — no RNG state, no
+    /// layer identity — and both paths call the same `resolve_tile` with
+    /// the same `doc_origin`, so the two runs must agree *bit for bit*,
+    /// not merely within tolerance. A layer at opacity 0.5 is used
+    /// deliberately: it makes the gate a real, partly-on/partly-off
+    /// decision rather than a pass-everything one, so a path that
+    /// re-applied opacity, reseeded the noise, or skipped the gate
+    /// entirely would diverge somewhere in the tile.
+    ///
+    /// **Whole tile, not one texel (0.84.2).** Both fill layers are
+    /// solid, but the gate is position-seeded, so the composite still
+    /// varies texel to texel: some show the dissolved red, the rest show
+    /// the blue-ish bottom layer through. Reading only texel `(0, 0)`
+    /// would have only ever exercised whichever branch that one position
+    /// happens to take, on this exact fixture, forever — a re-seeded
+    /// noise function could diverge everywhere else and this test would
+    /// never notice.
+    // `too_many_lines`: 103, against a 100 limit — crossed in 0.103.1 by
+    // the control half's `document_qualifies_for_gpu_compositing`
+    // assertion, without which that half's zero `Dissolve` count is
+    // vacuous (a CPU fallback would read zero too). The same allow
+    // several sibling tests in this module already carry.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.25, 0.5, 0.75, 1.0],
+                ),
+                (
+                    "dissolved",
+                    aurora_doc::BlendMode::Dissolve,
+                    0.5,
+                    [1.0, 0.0, 0.0, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Dissolve pixel layer must qualify for the GPU path as of 0.84.1 -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the two
+        // assertions below read is this test's own dispatches (0.103.0).
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve);
+
+        let (gpu_texels, cpu_texels) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+        // One = this stack's single `Dissolve` layer, on the one tile it
+        // has content at (the 256x256 viewport's other three resolve
+        // nothing).
+        //
+        // **The exact `1` is what pins the counter's *site*, and that was
+        // measured, not reasoned** (0.103.0). `Dissolve` reaches
+        // `begin_gpu_composite_tile`'s `match` as `Normal`, so the count is
+        // taken in that function's per-layer loop from the layer's raw
+        // `aurora_doc` blend mode -- see the call site's own comment for
+        // why neither `resolve_tile` nor the shared `Normal` arm would do.
+        // Moving this counter into `resolve_tile`'s own `Dissolve`
+        // interception was performed for real as 0.103.0's eighth
+        // mutation, and this assertion killed it with `left: 2, right: 1`:
+        // `gpu_and_cpu_all_texels` runs the document through the GPU path
+        // *and* then the CPU path, `resolve_tile` is shared by both, so a
+        // counter there double-counts. A `> 0` assertion would have
+        // survived that mutation; the exact count is the whole proof.
+        //
+        // Stated honestly, because the reverse is easy to assume: this
+        // assertion is **not** what catches `Dissolve` being dropped from
+        // `document_qualifies_for_gpu_compositing` (0.103.0's seventh
+        // mutation). This test's own `document_qualifies` assertion above
+        // fires first and that mutation never reaches here. What this
+        // assertion uniquely covers is the site and the multiplicity.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve),
+            1,
+            "the Dissolve layer must have taken the GPU path on the one visible tile that has \
+             stored content -- 0 means the document was routed to the CPU path entirely and the \
+             bit-exact agreement below is the CPU path compared against itself"
+        );
+        assert_eq!(
+            gpu_texels, cpu_texels,
+            "Dissolve is decided entirely on the CPU inside resolve_tile, from a \
+             position-seeded hash with no RNG state, so the GPU and CPU paths must agree \
+             bit-exactly across the whole tile -- not merely within a float tolerance, and not \
+             merely at one texel. A divergence here means the gate is being applied \
+             differently (or twice, or not at all) on one of the paths"
+        );
+        assert!(
+            gpu_texels.iter().any(|&s| s != 0.0),
+            "setup: the fixture must really composite to something"
+        );
+        // The gate must be a real, partly-on/partly-off decision on this
+        // fixture -- both red (dissolved, gated on) and the bottom
+        // layer's blue-ish colour (gated off) must genuinely appear,
+        // or this test would only ever prove agreement on a
+        // pass-everything or fail-everything gate.
+        let mut saw_dissolved = false;
+        let mut saw_bottom_only = false;
+        for chunk in gpu_texels.chunks_exact(4) {
+            let &[r, g, _b, _a] = chunk else {
+                unreachable!("a real tile's texel count is a multiple of 4");
+            };
+            if r > 0.9 && g < 0.1 {
+                saw_dissolved = true;
+            } else if g > 0.4 {
+                saw_bottom_only = true;
+            }
+        }
+        assert!(
+            saw_dissolved && saw_bottom_only,
+            "setup: the gate must show through at some texels and be blocked at others, or \
+             this fixture cannot tell a real gate from a pass-everything/fail-everything one"
+        );
+
+        // **The control half** (0.103.0), and the reason the `Dissolve`
+        // count is not taken in `begin_gpu_composite_tile`'s `Normal` arm.
+        // The *same* GPU path, the same helper, the same viewport, on a
+        // fixture whose every layer is genuinely `Normal`: it dispatches
+        // real `Normal` blend passes, and the `Dissolve` counter must
+        // still read zero. A count taken in the shared `Normal` arm --
+        // which is where `Dissolve` layers actually land, `resolve_tile`
+        // having already reduced them -- would read 2 here and make the
+        // assertion above unable to distinguish "a Dissolve layer
+        // dispatched" from "some Normal layer dispatched". A separate
+        // store, so this cannot perturb the fixture above.
+        let (_control_dir, mut control_store) = real_tile_store();
+        let control = solid_root_stack(
+            &mut control_store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.25, 0.5, 0.75, 1.0],
+                ),
+                (
+                    "top",
+                    aurora_doc::BlendMode::Normal,
+                    0.5,
+                    [1.0, 0.0, 0.0, 1.0],
+                ),
+            ],
+        );
+        // The control's zero Dissolve count only means anything if the
+        // control really took the GPU path -- a CPU fallback would record
+        // zero too, and vacuously (0.103.1). The primary half above
+        // asserts exactly this about its own fixture; the control half
+        // shipped without it, and a non-blank-pixels check does not
+        // substitute, since the CPU path produces non-blank pixels
+        // identically.
+        assert!(
+            document_qualifies_for_gpu_compositing(&control),
+            "the all-Normal control must itself qualify for the GPU path, or its zero Dissolve \
+             count is vacuous -- it would read zero from never having reached \
+             begin_gpu_composite_tile at all, rather than from the counter correctly declining to \
+             count a Normal layer"
+        );
+        let (control_gpu, _control_cpu) =
+            gpu_and_cpu_all_texels(&context, &mut control_store, &control);
+        assert!(
+            control_gpu.iter().any(|&s| s != 0.0),
+            "setup: the control fixture must really composite to something, or it exercises no \
+             dispatch at all"
+        );
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Dissolve),
+            0,
+            "an all-Normal document must record no Dissolve dispatches -- a non-zero count here \
+             means the counter is being taken somewhere shared with the Normal path, so it can \
+             no longer prove a Dissolve layer specifically reached the GPU"
+        );
+    }
+
+    /// **The defensive `_` arm, actually executed** (0.84.1). The last
+    /// arm of `begin_gpu_composite_tile`'s blend dispatch exists for a
+    /// blend mode `document_qualifies_for_gpu_compositing` should already
+    /// have excluded: it logs and returns `None`, falling that one tile
+    /// back to the CPU path rather than compositing the wrong formula
+    /// silently. Through the real caller it is unreachable, which is
+    /// precisely why it had no coverage — and unreachable-but-uncovered
+    /// code is what a future regression breaks without anything going
+    /// red.
+    ///
+    /// So call the private function directly, bypassing the gate the
+    /// same way a drifted predicate one day might: a two-layer document
+    /// whose top layer is at [`CPU_ONLY_BLEND_MODE`], which the predicate
+    /// rejects (asserted here, so this test fails loudly if that mode is
+    /// ever admitted and this fixture stops probing the arm it is named
+    /// for — which is exactly what happened to its previous literal
+    /// `Screen` in 0.102.0). The assertion is that this fails *safe* —
+    /// `None`, not a panic, not a partial composite of the wrong formula.
+    #[test]
+    fn begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "inexpressible",
+                    CPU_ONLY_BLEND_MODE,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "setup: {CPU_ONLY_BLEND_MODE:?} must still disqualify the document -- if it is ever \
+             admitted, this test needs a different mode, not deleting: its whole point is to \
+             reach the arm the real caller cannot"
+        );
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_none(),
+            "a blend mode the GPU path cannot express must fall this tile back to the CPU path \
+             (None), not composite it with the wrong formula and not panic"
+        );
+    }
+
     /// The batched-poll restructuring's own correctness proof: the
     /// sibling test above (`..._gpu_and_cpu_paths_agree_on_a_real_multi_
     /// layer_document`) uses a 256×256 viewport over a 10×10-px layer, so
     /// only its single `(0, 0)` tile ever has real layer content — every
     /// other visible tile in its 2×2 grid has none, so
     /// `begin_gpu_composite_tile` returns `None` for them and they never
-    /// reach `pending_gpu` at all. That test alone would pass even if
+    /// reach `pending_gpu` at all. (That last claim is true only as of
+    /// 0.87.0, which is when `resolve_tile` started answering `None` for a
+    /// visible layer with nothing *stored* at a tile; when this comment was
+    /// written those tiles did reach `pending_gpu`, each paying a full
+    /// upload/blend/submit/readback to composite transparency, and the
+    /// argument below — that this fixture cannot detect a tile-identity
+    /// mixup — held for a different reason: all three of those tiles
+    /// composited to identical transparent black.) That test alone would
+    /// pass even if
     /// phase 3's drain mixed up which decoded result belongs to which
     /// tile (a real risk this restructuring introduces: `PendingGpuReadback`
     /// now travels through a `Vec` between issue and resolve, so a bug
@@ -23949,9 +36172,9 @@ mod tests {
     /// `device.poll` — exactly the batching this round's fix introduces.
     /// The remaining five visible tiles (row/column index 2) fall
     /// entirely outside the 512×512 layer bounds, so they still exercise
-    /// the immediate-CPU-fallback branch of phase 1 (no visible layers to
-    /// batch) in the same call, confirming the two branches coexist
-    /// correctly.
+    /// the immediate-CPU-fallback branch of phase 1 (nothing stored at
+    /// those tiles, so nothing to batch) in the same call, confirming the
+    /// two branches coexist correctly.
     ///
     /// Each of the four populated tiles is checked against its own
     /// distinct expected colour (not just "some tile has some colour"),
@@ -24060,14 +36283,31 @@ mod tests {
     }
 
     /// The fallback's own correctness proof, not just that it was taken:
-    /// a document with one `Multiply`-blend layer (a case the GPU path
-    /// structurally cannot express — `composite_over_with_opacity`'s own
-    /// fixed-function blend unit only ever computes `Normal`'s "source
-    /// over") must still composite to `Multiply`'s own real result, not to
+    /// a document with one layer at [`CPU_ONLY_BLEND_MODE`] (one of the 16
+    /// modes the GPU path still cannot express — `Normal`, `Multiply`,
+    /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
+    /// `LinearBurn`, `ColorBurn`, `ColorDodge` and
+    /// `Dissolve` are the eleven admitted as of 0.108.0) must still
+    /// composite to that mode's own real result, not to
     /// whatever `Normal` would have produced for the same inputs — which
     /// would be a different, wrong value here, so this genuinely
     /// distinguishes "fell back and composited correctly" from "silently
-    /// used the GPU's own Normal-only math anyway."
+    /// used one of the GPU's own formulas anyway."
+    ///
+    /// This used `Multiply` until 0.84.0 wired that mode onto the GPU
+    /// path, at which point the fixture would have stopped exercising
+    /// the fallback at all; then `Screen` until 0.102.0 did the same to
+    /// that one. It now names [`CPU_ONLY_BLEND_MODE`] instead, so the
+    /// next such move is one edit rather than an audit.
+    ///
+    /// **The fixture's two colours changed with that retarget** (0.102.0),
+    /// and had to. It used two mid-greys, which suited `Screen`
+    /// (`Screen(0.5, 0.5) = 0.75`) but degenerates completely for
+    /// `Exclusion`: `Exclusion(0.5, cs) = 0.5 + cs - cs = 0.5` for *any*
+    /// `cs`, so a mid-grey backdrop makes the mode indistinguishable from
+    /// several others and the "not vacuous against the GPU's own
+    /// formulas" argument below would have been false. `0.25`/`0.75`
+    /// separates every candidate — see the body's own enumeration.
     #[test]
     fn recomposite_visible_tiles_falls_back_to_the_cpu_path_for_a_non_normal_blend_mode() {
         let Some(context) = real_gpu_context() else {
@@ -24090,23 +36330,66 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Multiply) {
+        if let Err(err) = layers.set_blend_mode(top, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         assert!(
             !document_qualifies_for_gpu_compositing(&layers),
-            "a Multiply-blend layer must disqualify the document"
+            "a {CPU_ONLY_BLEND_MODE:?}-blend layer must disqualify the document"
         );
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
-        // Two mid-greys: Multiply(0.5, 0.5) = 0.25, the same worked case
-        // `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`
-        // (aurora-render) already proves for the CPU formula in isolation
-        // -- if the GPU path were mistakenly used here anyway (treating
-        // `Multiply` as `Normal`, opaque top over opaque bottom at full
-        // opacity), the result would be the top layer's own colour
-        // unchanged, (0.5, 0.5, 0.5, 1.0), not (0.25, 0.25, 0.25, 1.0).
-        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [0.5, 0.5, 0.5, 1.0])] {
+        // `cb = 0.25` (bottom) and `cs = 0.75` (top), both exact binary
+        // fractions, so no rounding latitude is in play anywhere in this
+        // fixture. `Exclusion(0.25, 0.75) = 0.25 + 0.75 - 2*0.25*0.75 =
+        // 0.625`, likewise exact.
+        //
+        // **The non-vacuity enumeration**, which is the whole reason these
+        // two numbers are not both `0.5`. If the GPU path were mistakenly
+        // taken here anyway, the layer's mode would have to be composited
+        // by one of the formulas that path *can* express, and every one of
+        // them gives a different answer than 0.625:
+        //
+        //   Normal   -> 0.75    (opaque over opaque at full opacity is
+        //                        just the top layer's own colour)
+        //   Multiply -> 0.1875
+        //   Darken   -> 0.25
+        //   Lighten  -> 0.75
+        //   Screen   -> 0.8125  (admitted to the GPU path in 0.102.0 --
+        //                        newly a wrong answer this fixture must
+        //                        be able to distinguish, which the old
+        //                        two-mid-grey fixture could not have,
+        //                        since `Exclusion(0.5, x) = 0.5` for
+        //                        every `x`)
+        //   Difference -> 0.5   (|0.25 - 0.75|; admitted to the GPU path
+        //                        in 0.104.0, so newly a wrong answer this
+        //                        fixture must distinguish -- and it does,
+        //                        0.5 against Exclusion's own 0.625. Note
+        //                        the same two-mid-grey fixture would have
+        //                        collapsed here too: `Difference(0.5, 0.5)
+        //                        = 0` and `Exclusion(0.5, 0.5) = 0.5` do
+        //                        differ, but `Difference` is the mode
+        //                        `Exclusion` is the textbook "softer"
+        //                        variant *of*, so keeping them separated
+        //                        by exact fractions matters most here)
+        //   LinearDodge -> 1.0  (min(0.25 + 0.75, 1) -- exactly at the
+        //                        clamp boundary, admitted to the GPU path
+        //                        in 0.105.0 and so newly a wrong answer
+        //                        this fixture must distinguish, which it
+        //                        does: 1.0 against Exclusion's own 0.625.
+        //                        Landing exactly *on* the boundary is
+        //                        harmless here -- this row only has to
+        //                        differ from 0.625, and it does whether
+        //                        the clamp fires or not, since an
+        //                        unclamped Cb + Cs is also 1.0)
+        //
+        // `Dissolve`, the eighth admitted mode, never reaches a blend
+        // formula at all (`resolve_tile` reduces it to `Normal`), so it is
+        // covered by the `Normal` row.
+        for (id, rgba) in [
+            (bottom, [0.25, 0.25, 0.25, 1.0]),
+            (top, [0.75, 0.75, 0.75, 1.0]),
+        ] {
             let Some(surface) = layers.surface_id(id) else {
                 unreachable!("just created as a pixel layer");
             };
@@ -24135,8 +36418,9 @@ mod tests {
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
             result,
-            (0.25, 0.25, 0.25, 1.0),
-            "Multiply's own real math must run via the CPU fallback, not Normal's"
+            (0.625, 0.625, 0.625, 1.0),
+            "{CPU_ONLY_BLEND_MODE:?}'s own real math must run via the CPU fallback, not the \
+             formula of any mode the GPU path can express (see the enumeration above)"
         );
     }
 
@@ -24159,8 +36443,15 @@ mod tests {
     /// can set up its own `layers`/`store` (GPU-qualifying or not) without
     /// duplicating this frame loop. Returns one measured frame time in
     /// milliseconds per iteration, in order.
+    // `too_many_lines` joined this list in 0.93.0: the body was 100 lines
+    // exactly, and passing one more diagnostic series to `push_frame` put
+    // it at 101. The alternative -- carving a piece out of the *timed*
+    // loop -- would move code across a measured interval boundary for a
+    // lint's sake, which this diagnostic round deliberately will not do.
+    // The allow is well precedented in this file and crate.
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation
     )]
@@ -24174,7 +36465,7 @@ mod tests {
         frames: u32,
         start: (u32, u32),
         pan_step_px: (u32, u32),
-    ) -> Vec<f64> {
+    ) -> FrameStages {
         let device = gpu.device();
         let queue = gpu.queue();
         let mut residency = aurora_gpu::TileResidency::new(device, queue, viewport);
@@ -24182,23 +36473,11 @@ mod tests {
         let mut compositor = aurora_render::TileCompositor::new(device);
         let mut cache = CompositeCache::default();
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frame-timing-target"),
-            size: wgpu::Extent3d {
-                width: viewport.0,
-                height: viewport.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+        let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut timings = Vec::with_capacity(frames as usize);
+        let mut stages = FrameStages::with_capacity(frames as usize);
+        zero_frame_counters();
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
             let y = start.1 + step * pan_step_px.1;
@@ -24206,6 +36485,7 @@ mod tests {
 
             #[allow(clippy::cast_precision_loss)]
             residency.set_origin(queue, (x as f32, y as f32), viewport, 1.0);
+            let t_set_origin = std::time::Instant::now();
 
             // A `TileError` here (observed in practice under this
             // helper's own tight `real_tile_store()` budget: a page-in
@@ -24238,6 +36518,7 @@ mod tests {
                 );
             }
             cache.bump();
+            let t_stamp_dab = std::time::Instant::now();
 
             recomposite_visible_tiles(
                 &residency,
@@ -24248,7 +36529,17 @@ mod tests {
                 Some(gpu),
                 Some(&mut compositor),
             );
-            let _ = residency.sync(queue, store, composite_surface_id(), false, usize::MAX);
+            let t_recomposite = std::time::Instant::now();
+            // `SyncStats` is already computed by `sync` itself, and 0.88.0
+            // threw it away with a `let _`. Capturing it is free and it is
+            // the only direct evidence of *what* the `upload_sync` stage
+            // spent its time on: how many tiles were serialized and
+            // re-uploaded this frame, and how many bytes. Both numbers turn
+            // out to be fixed and content-independent here -- see
+            // [`report_frame_stages`].
+            let sync_stats =
+                residency.sync(queue, store, composite_surface_id(), false, usize::MAX);
+            let t_upload_sync = std::time::Instant::now();
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-timing"),
@@ -24276,15 +36567,357 @@ mod tests {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
+            let t_record_pass = std::time::Instant::now();
             queue.submit(std::iter::once(encoder.finish()));
             let _ = device.poll(wgpu::PollType::Wait {
                 submission_index: None,
                 timeout: None,
             });
+            let t_submit_poll = std::time::Instant::now();
 
-            timings.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // `total` keeps its pre-instrumentation definition byte for
+            // byte -- `t0.elapsed()`, read here before anything else is
+            // recorded -- so the two callers' budget assertions see
+            // exactly the number they saw before the split existed.
+            // Everything else is additive and asserted on by nothing.
+            stages.push_frame(
+                t0.elapsed().as_secs_f64() * 1000.0,
+                [
+                    t0,
+                    t_set_origin,
+                    t_stamp_dab,
+                    t_recomposite,
+                    t_upload_sync,
+                    t_record_pass,
+                    t_submit_poll,
+                ],
+                take_gpu_composite_submit_count(),
+                take_recomposite_phase_ms(),
+                take_recomposite_tile_cost_ms(),
+                take_recomposite_mark_imbalance(),
+                sync_stats,
+                take_composite_write_outcomes(),
+            );
         }
-        timings
+        stages
+    }
+
+    /// Zeroes every process-global test counter
+    /// [`measure_pan_and_paint_frames`] reports, once before its loop, so
+    /// the numbers describe only that loop's own work and not whatever GPU
+    /// test ran earlier in the same binary -- the exact precedent
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
+    /// sets at its own call site. Extracted from the loop's preamble in
+    /// 0.90.0 only to keep that function under `clippy::too_many_lines`
+    /// once a third counter joined it.
+    ///
+    /// Zeroes, in order: `GPU_COMPOSITE_SUBMITS`,
+    /// [`RECOMPOSITE_PHASE_NANOS`], [`RECOMPOSITE_TILE_COST_NANOS`]
+    /// (0.93.0's five-way phase-1 split), [`RECOMPOSITE_MARK_IMBALANCE`]
+    /// (0.93.1's real bookkeeping check on that split),
+    /// [`COMPOSITE_WRITE_OUTCOMES`] and [`RECOMPOSITE_FOLD_COUNTS`]
+    /// (0.97.1's fold census).
+    fn zero_frame_counters() {
+        let _ = take_gpu_composite_submit_count();
+        let _ = take_recomposite_phase_ms();
+        let _ = take_recomposite_tile_cost_ms();
+        let _ = take_recomposite_mark_imbalance();
+        let _ = take_composite_write_outcomes();
+        let _ = take_recomposite_fold_counts();
+    }
+
+    /// Per-frame, per-stage timings collected by
+    /// [`measure_pan_and_paint_frames`]. Every vector is `frames` long
+    /// and indexed by frame.
+    ///
+    /// **Diagnostic only.** Nothing in this file asserts on any of these
+    /// numbers. `total` is defined exactly as it always was --
+    /// `t0.elapsed()` across the whole frame body -- so introducing the
+    /// per-stage split cannot move either caller's CI-safety budget
+    /// assertion.
+    ///
+    /// **How exactly the stages sum to `total`** (0.88.1 corrected an
+    /// earlier, vaguer claim here that they differ by "well under a
+    /// percent"): the marks are taken between statements, so the
+    /// microseconds spent in the pushes and in `Instant::now` itself land
+    /// nowhere, and `total` is read before the pushes happen -- but
+    /// measured, the residual is **a single clock read, tens of
+    /// nanoseconds**: on a real 40-frame run the per-frame
+    /// `total - sum(stages)` gap was 0.0000 ms for 39 frames and
+    /// 0.0001 ms for one, i.e. on the order of 0.0001%, not 0.1-1%. Any
+    /// larger-looking gap in a *range* table (PLAN.md's own, for one) is
+    /// an artifact of quoting each stage's min and max across several
+    /// different runs, not an unmeasured slice of frame time.
+    ///
+    /// Added 0.88.0 for a single purpose: three consecutive earlier rounds
+    /// each optimized one plausible-sounding stage of this frame without
+    /// anyone measuring which stage actually dominates. This measures it.
+    #[derive(Debug)]
+    struct FrameStages {
+        /// Whole-frame time, the pre-existing definition and the only
+        /// series either caller asserts on.
+        total: Vec<f64>,
+        /// `TileResidency::set_origin` -- pan bookkeeping plus its
+        /// uniform write.
+        set_origin: Vec<f64>,
+        /// `aurora_brush::stamp_dab` plus `CompositeCache::bump`.
+        stamp_dab: Vec<f64>,
+        /// `recomposite_visible_tiles` in full; `recomposite_phases`
+        /// breaks this one down further.
+        recomposite: Vec<f64>,
+        /// `TileResidency::sync` -- **CPU-side preparation for the GPU
+        /// upload, not the GPU upload itself.** 0.88.0 labelled this
+        /// stage "the GPU texture upload" and PLAN.md called it "GPU
+        /// upload bandwidth"; both were wrong, and 0.88.1 corrected them
+        /// against finer probes placed inside `sync` itself. The measured
+        /// breakdown of this interval:
+        ///
+        /// - **87.1%** `aurora_gpu::residency`'s
+        ///   `serialize_premultiplied_le_bytes` -- an
+        ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
+        ///   every texel of every dirty tile. That loop was
+        ///   single-threaded with no `rayon` when this was probed, and
+        ///   **is single-threaded on this path again as of 0.96.2**. 0.96.0
+        ///   drove it in parallel across fixed-size blocks of one tile (64
+        ///   work items for a whole tile); that won ~0.5 ms of whole-frame
+        ///   mean on an idle machine and *lost* the 16.7 ms budget under
+        ///   ordinary CPU contention (whole-frame mean ~34-37 ms against
+        ///   ~15-18 ms sequential), so 0.96.2 routed `sync` back to the
+        ///   sequential core and left the splitter for `upload_mip` and for
+        ///   a future load-sensing design. (The probe named
+        ///   `extend_premultiplied_le_bytes`, which *was* this path's entry
+        ///   point at the time; 0.96.0 moved `sync` off it and 0.96.1
+        ///   corrected the name here, since that wrapper is no longer what
+        ///   runs in the measured interval.) See PLAN.md's 0.96.0 entry for
+        ///   what the parallelism bought on an idle machine, its 0.96.1
+        ///   entry for what it costs on a contended one, and its 0.96.2
+        ///   entry for the resulting decision.
+        /// - **12.7%** `queue.write_texture`'s own CPU-side staging
+        ///   `memcpy`.
+        /// - **~0%** `TileStore::get` (the tile-store read).
+        ///
+        /// **Those percentages were probed against the pre-0.89.0 loop**,
+        /// which issued four separate 2-byte appends per texel; 0.89.0
+        /// batched them into one 8-byte append and **no fresh internal
+        /// probe has been re-taken since**. Treat the split as
+        /// approximate rather than current: 0.89.0 bought only ~1-5% off
+        /// this stage's p50 and nothing at p99, because the per-texel
+        /// `f16 -> f32 -> multiply -> f16` arithmetic — not the append
+        /// bookkeeping it removed — was always the larger share of the
+        /// 87.1%.
+        ///
+        /// **Then 0.92.0 vectorized exactly that arithmetic, so the split
+        /// is now stale in a known direction.** This text said "scalar"
+        /// and "no SIMD" through 0.92.0; both were false from 0.92.0
+        /// onward, and the words are corrected above. The loop converts
+        /// through `half::slice::HalfFloatSliceExt`, eight lanes per F16C
+        /// instruction, and 0.92.0 measured that as a genuine, externally
+        /// reproduced ~2.4x cut to this stage — so its share of the
+        /// interval fell substantially and `write_texture`'s `memcpy`
+        /// share rose correspondingly. **Do not quote 87.1%/12.7%
+        /// forward.** PLAN.md's 0.92.0 entry carries the current
+        /// before/after table for this stage; no fresh *internal* split
+        /// has been probed since.
+        ///
+        /// The actual GPU DMA copy does **not** execute in this interval:
+        /// `write_texture` only records it, and it runs at the later
+        /// `queue.submit`, which lands in [`Self::submit_poll`] -- where
+        /// 0.51-0.61 ms for 10 MB works out to ~17 GB/s, consistent with
+        /// real PCIe/GPU bandwidth. So "`upload_sync` dominates the
+        /// frame" is true as an *interval*, but it is not an upload-
+        /// bandwidth finding: it is a CPU serialization loop (a scalar
+        /// one when this was written; vectorized since 0.92.0). Whether
+        /// it's *still* the stage's largest single share is inferred,
+        /// not re-measured -- it follows arithmetically from the
+        /// `memcpy` share being unchanged while the serializer's own
+        /// time fell, but no fresh internal probe split has actually
+        /// been taken since 0.92.0.
+        upload_sync: Vec<f64>,
+        /// Building the command encoder, bind group, pipeline and the
+        /// one render pass. Records commands; runs nothing.
+        record_pass: Vec<f64>,
+        /// `queue.submit` plus the blocking `device.poll(Wait)` -- the
+        /// closest thing here to "the GPU actually ran", though it is
+        /// still wall-clock stall, not a timestamp query. **This is also
+        /// where the frame's real GPU texture DMA executes**, since
+        /// `queue.write_texture` during [`Self::upload_sync`] only stages
+        /// and records it.
+        submit_poll: Vec<f64>,
+        /// `begin_gpu_composite_tile`'s own submit count for this frame,
+        /// i.e. how many tiles genuinely took the GPU compositing path.
+        /// Zero on a frame that fell back to the CPU for every tile --
+        /// which is the whole point of reporting it: it is what separates
+        /// "the GPU path ran and was fast" from "the GPU path silently
+        /// declined and the CPU computed the same pixels".
+        gpu_tiles: Vec<u64>,
+        /// `[phase 1, phase 2, phase 3]` milliseconds inside
+        /// `recomposite_visible_tiles` -- see
+        /// [`RECOMPOSITE_PHASE_NANOS`], and note that phase 2 is
+        /// wall-clock stall on the poll rather than GPU execution time.
+        recomposite_phases: Vec<[f64; 3]>,
+        /// `[gpu_issue_ok, gpu_issue_declined, cpu_fallback_empty,
+        /// cpu_fallback_real, other]` milliseconds — phase 1 above split
+        /// by *which branch of its per-tile loop* the time went to
+        /// (0.93.0). These five sum to
+        /// [`Self::recomposite_phases`]'s first element by construction,
+        /// and `report_recomposite_tile_costs` prints the residual —
+        /// which, being a consequence of that construction, catches only an
+        /// interval *nothing* credits and **not** a mark landing in the
+        /// wrong slot; [`Self::mark_imbalance`] is the real check.
+        ///
+        /// See [`RECOMPOSITE_TILE_COST_NANOS`] for what each slot means.
+        /// `gpu_issue_declined` is 0.87.1's disclosed double root walk
+        /// measured on its own for the first time, and it came out *small*;
+        /// `cpu_fallback_empty` is a composite interval whose largest part
+        /// is an unconditional un-premultiply pass, not the root walk.
+        recomposite_tile_costs: Vec<[f64; 5]>,
+        /// [`RECOMPOSITE_MARK_IMBALANCE`] for this frame (0.93.1). **Every
+        /// entry must be `0`**: it counts phase-1 classifying marks that
+        /// did not line up one-to-one with the tiles that entered the
+        /// loop body, which is the misplaced/dropped-mark failure the
+        /// timing residual above cannot see.
+        mark_imbalance: Vec<u64>,
+        /// Tiles `TileResidency::sync` actually serialized and uploaded
+        /// this frame, from the `SyncStats` `sync` already returns and
+        /// 0.88.0 discarded. Reported because it is what makes
+        /// [`Self::upload_sync`]'s cost interpretable.
+        ///
+        /// **This stopped being a fixed floor in 0.90.0, and this comment
+        /// used to say it was.** Until then it was: this loop calls
+        /// `CompositeCache::bump()` every frame, which invalidates the
+        /// *whole* grid, and `write_composited` re-dirtied every tile it
+        /// recomputed, so `min` equalled `max` on both benchmarks (20/20
+        /// tiles on the GPU path, 9/9 on the CPU fallback). 0.90.0's
+        /// unchanged-tile skip makes the number genuinely
+        /// content-dependent: measured on an RTX 3090 the GPU path now
+        /// reports mean 6.8 (min 2, max 20) and the CPU fallback mean 4.9
+        /// (min 2, max 9). A `bump()` still invalidates the whole grid —
+        /// what changed is that recomputing a tile no longer implies
+        /// re-uploading it.
+        uploaded: Vec<u32>,
+        /// Bytes uploaded this frame, same source as [`Self::uploaded`].
+        /// Independently checkable against `spike/FINDINGS.md`'s own
+        /// "~18 MB per screenful" upload-bandwidth figure.
+        bytes_uploaded: Vec<u64>,
+        /// `write_composited`'s own per-frame decisions,
+        /// `[skipped, changed, not_resident]`, from
+        /// [`COMPOSITE_WRITE_OUTCOMES`] (0.90.0).
+        ///
+        /// **Not an upload count.** Bucket 0 is an upper bound on the
+        /// uploads the unchanged-tile skip removes; [`Self::uploaded`] and
+        /// [`Self::bytes_uploaded`] are the realized figures, decided at a
+        /// *different* skip point one layer down inside
+        /// `TileResidency::sync`. Reported side by side so the two can be
+        /// compared, never conflated.
+        composite_writes: Vec<[u64; 3]>,
+    }
+
+    impl FrameStages {
+        fn with_capacity(frames: usize) -> Self {
+            Self {
+                total: Vec::with_capacity(frames),
+                set_origin: Vec::with_capacity(frames),
+                stamp_dab: Vec::with_capacity(frames),
+                recomposite: Vec::with_capacity(frames),
+                upload_sync: Vec::with_capacity(frames),
+                record_pass: Vec::with_capacity(frames),
+                submit_poll: Vec::with_capacity(frames),
+                gpu_tiles: Vec::with_capacity(frames),
+                recomposite_phases: Vec::with_capacity(frames),
+                recomposite_tile_costs: Vec::with_capacity(frames),
+                mark_imbalance: Vec::with_capacity(frames),
+                uploaded: Vec::with_capacity(frames),
+                bytes_uploaded: Vec::with_capacity(frames),
+                composite_writes: Vec::with_capacity(frames),
+            }
+        }
+
+        /// Records one frame. `marks` are the seven `Instant`s bounding
+        /// the six stages, in frame order: frame start, then one after
+        /// each of `set_origin`, the dab, `recomposite_visible_tiles`,
+        /// `residency.sync`, the render-pass scope, and
+        /// `submit` + `poll`.
+        ///
+        /// Consecutive pairs are differenced with
+        /// `Duration::duration_since`, never `Instant - Instant`: `Sub`
+        /// for `Instant` panics on an inverted pair, and this workspace
+        /// denies `panic`. Destructuring the array (rather than indexing
+        /// it) likewise keeps the denied `indexing_slicing` out of it.
+        // Nine arguments, two past clippy's default threshold of seven,
+        // once 0.93.0's five-way phase-1 split and 0.93.1's mark-balance
+        // check joined the list. Same precedent as
+        // `measure_pan_and_paint_frames`, which already carries this allow
+        // for the same reason: these are per-frame diagnostic series with
+        // no meaningful grouping between them.
+        #[allow(clippy::too_many_arguments)]
+        fn push_frame(
+            &mut self,
+            total_ms: f64,
+            marks: [std::time::Instant; 7],
+            gpu_tiles: u64,
+            recomposite_phases: [f64; 3],
+            recomposite_tile_costs: [f64; 5],
+            mark_imbalance: u64,
+            sync_stats: aurora_gpu::SyncStats,
+            composite_writes: [u64; 3],
+        ) {
+            let [
+                t0,
+                set_origin,
+                stamp_dab,
+                recomposite,
+                upload_sync,
+                record_pass,
+                submit_poll,
+            ] = marks;
+            self.total.push(total_ms);
+            self.set_origin.push(ms(set_origin.duration_since(t0)));
+            self.stamp_dab
+                .push(ms(stamp_dab.duration_since(set_origin)));
+            self.recomposite
+                .push(ms(recomposite.duration_since(stamp_dab)));
+            self.upload_sync
+                .push(ms(upload_sync.duration_since(recomposite)));
+            self.record_pass
+                .push(ms(record_pass.duration_since(upload_sync)));
+            self.submit_poll
+                .push(ms(submit_poll.duration_since(record_pass)));
+            self.gpu_tiles.push(gpu_tiles);
+            self.recomposite_phases.push(recomposite_phases);
+            self.recomposite_tile_costs.push(recomposite_tile_costs);
+            self.mark_imbalance.push(mark_imbalance);
+            self.uploaded.push(sync_stats.uploaded);
+            self.bytes_uploaded.push(sync_stats.bytes_uploaded);
+            self.composite_writes.push(composite_writes);
+        }
+    }
+
+    /// A `Duration` as milliseconds, the unit every number in
+    /// [`FrameStages`] and [`ms_stats`] is expressed in.
+    fn ms(span: std::time::Duration) -> f64 {
+        span.as_secs_f64() * 1000.0
+    }
+
+    /// The offscreen render target [`measure_pan_and_paint_frames`]
+    /// presents into -- the same headless technique
+    /// `spike/vertical-slice`'s own `headless_bench` uses, never a real
+    /// swapchain. Split out of that function only to keep it under
+    /// `clippy::too_many_lines`; the descriptor is unchanged.
+    fn frame_timing_target(device: &wgpu::Device, viewport: (u32, u32)) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frame-timing-target"),
+            size: wgpu::Extent3d {
+                width: viewport.0,
+                height: viewport.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
     }
 
     /// Mean, p50, p99, and max of `values` (sorted in place) -- the same
@@ -24314,6 +36947,397 @@ mod tests {
             unreachable!("caller always passes a non-empty slice")
         };
         (mean, p50, p99, max)
+    }
+
+    /// Prints [`FrameStages`]'s per-stage breakdown under `--nocapture`.
+    /// Asserts nothing, by design: this is a diagnostic, and 0.88.0
+    /// deliberately lands measurement without also landing a threshold
+    /// nobody has evidence for yet.
+    ///
+    /// Three things are reported, in this order:
+    ///
+    /// 1. **The single worst-total frame's own breakdown.** Found *before*
+    ///    any sorting, because [`ms_stats`] sorts its slice in place --
+    ///    after that call the frame indices no longer line up across
+    ///    stages.
+    /// 2. **mean / p50 / p99 / max per stage**, plus each stage's share of
+    ///    the mean total. Read the shares as an attribution of the
+    ///    *average* frame. The per-stage **p99s are independent order
+    ///    statistics** -- stage A's p99 and stage B's p99 need not come
+    ///    from the same frame, and they will not generally add up to the
+    ///    total's own p99. That is exactly why item 1 above is reported
+    ///    separately: it is the one row where every number is from one
+    ///    real frame.
+    /// 3. **GPU tiles composited per frame** (`gpu_tiles`, mean plus min
+    ///    and max), and the `recomposite_visible_tiles` sub-phase means. A
+    ///    GPU-path test reporting `gpu_tiles mean=0.0` would mean the path
+    ///    under test never ran and every number above describes the CPU
+    ///    fallback -- a finding, not a footnote. The min and max are
+    ///    0.88.1's addition: 0.88.0 printed the mean alone, which was then
+    ///    read as "a steady 3.0 per frame" -- a claim a mean cannot
+    ///    support and that the worst-frame row above already contradicted.
+    /// 4. **What `upload_sync` actually moved**: tiles and MB uploaded per
+    ///    frame, mean/min/max, taken straight from the `SyncStats`
+    ///    `TileResidency::sync` already returns (0.88.0 discarded it with
+    ///    a `let _`). This is what turns "`upload_sync` dominates" into a
+    ///    checkable figure, and it is how the fixed, content-independent
+    ///    upload floor in these fixtures was found: min equals max, so
+    ///    the volume does not depend on what was painted at all.
+    ///
+    /// **Returns** the fold census pair
+    /// `[folds, real_fold_tiles]` — [`take_recomposite_fold_counts`]'s own
+    /// value, relayed up unchanged from
+    /// [`report_recomposite_fold_census`] (0.100.0) so a caller can assert
+    /// on which `composite_layer_into` arm its fixture actually reached
+    /// instead of reading the printed line by eye. Not `#[must_use]`, on
+    /// purpose: the two older whole-frame tests call this as a bare
+    /// statement and nothing about their behaviour changed.
+    fn report_frame_stages(label: &str, stages: &mut FrameStages) -> [u64; 2] {
+        let frames = stages.total.len();
+        if frames == 0 {
+            println!("{label}: no frames measured");
+            // Nothing was measured, so there is no census to relay. The
+            // zero pair is deliberately *not* a "no folds happened"
+            // claim -- a caller reaching this arm has a zero-frame
+            // `FrameStages`, which is its own, louder problem.
+            return [0, 0];
+        }
+
+        // Before `ms_stats` sorts anything: which frame was worst overall?
+        let mut worst_index = 0_usize;
+        let mut worst_total = f64::NEG_INFINITY;
+        for (index, &total) in stages.total.iter().enumerate() {
+            if total > worst_total {
+                worst_total = total;
+                worst_index = index;
+            }
+        }
+        let at = |series: &[f64]| series.get(worst_index).copied().unwrap_or(f64::NAN);
+        println!(
+            "{label}: worst frame (#{worst_index} of {frames}) total={worst_total:.2}ms = \
+             set_origin {:.2} + stamp_dab {:.2} + recomposite {:.2} + upload_sync {:.2} + \
+             record_pass {:.2} + submit_poll {:.2} (ms; gpu_tiles={})",
+            at(&stages.set_origin),
+            at(&stages.stamp_dab),
+            at(&stages.recomposite),
+            at(&stages.upload_sync),
+            at(&stages.record_pass),
+            at(&stages.submit_poll),
+            stages
+                .gpu_tiles
+                .get(worst_index)
+                .map_or_else(|| "?".to_owned(), u64::to_string),
+        );
+
+        // `mean_total` from an unsorted copy: `ms_stats` sorts in place,
+        // and `stages.total` is the caller's own series -- it still owns
+        // it and still feeds it to its own `ms_stats` call afterwards.
+        #[allow(clippy::cast_precision_loss)]
+        let mean_total = stages.total.iter().sum::<f64>() / frames as f64;
+
+        // (name, series) pairs, walked in real frame order. `total` first
+        // so every share below is read against a number already printed.
+        let mut series: [(&str, &mut Vec<f64>); 7] = [
+            ("total      ", &mut stages.total),
+            ("set_origin ", &mut stages.set_origin),
+            ("stamp_dab  ", &mut stages.stamp_dab),
+            ("recomposite", &mut stages.recomposite),
+            ("upload_sync", &mut stages.upload_sync),
+            ("record_pass", &mut stages.record_pass),
+            ("submit_poll", &mut stages.submit_poll),
+        ];
+        for (name, values) in &mut series {
+            let (mean, p50, p99, max) = ms_stats(values);
+            let share = if mean_total > 0.0 {
+                mean / mean_total * 100.0
+            } else {
+                f64::NAN
+            };
+            println!(
+                "{label}:   {name} mean={mean:8.2}ms p50={p50:8.2}ms p99={p99:8.2}ms \
+                 max={max:8.2}ms share_of_mean_total={share:5.1}%"
+            );
+        }
+
+        report_frame_counters(label, stages, frames)
+    }
+
+    /// The per-frame *counter* half of [`report_frame_stages`]'s output:
+    /// `gpu_tiles` (mean/min/max), the `recomposite_visible_tiles`
+    /// sub-phase means, and what `TileResidency::sync` actually uploaded
+    /// (tiles and MB per frame, mean/min/max).
+    ///
+    /// It also prints, via [`report_recomposite_tile_costs`], the
+    /// `phase1 split (mean ms/frame): ...` line — phase 1 broken down by
+    /// which branch of its per-tile loop the time went to, with the
+    /// reconciliation residual against phase 1's own mark (0.93.0).
+    ///
+    /// Split out of [`report_frame_stages`] in 0.88.1 purely to keep that
+    /// function under `clippy::too_many_lines` once the `SyncStats` line
+    /// was added -- no behaviour of either differs from inlining it, and
+    /// it is still called unconditionally at the end of that function.
+    /// `frames` is passed rather than recomputed so both halves divide by
+    /// the same denominator.
+    ///
+    /// Relays [`report_recomposite_tile_costs`]'s
+    /// `[folds, real_fold_tiles]` pair back to
+    /// [`report_frame_stages`] (0.100.0). Nothing about what is printed,
+    /// or in what order, changed with it.
+    fn report_frame_counters(label: &str, stages: &FrameStages, frames: usize) -> [u64; 2] {
+        #[allow(clippy::cast_precision_loss)]
+        let gpu_tiles_mean = stages.gpu_tiles.iter().copied().sum::<u64>() as f64 / frames as f64;
+        // min/max as well as the mean (0.88.1). 0.88.0 printed the mean
+        // alone, and PLAN.md then described "a steady 3.0 GPU-composited
+        // tiles per frame" -- a claim the mean cannot support, and which
+        // the one per-frame sample that *was* printed (the worst-total
+        // frame, `gpu_tiles=1`) contradicted outright. Measured on a real
+        // 40-frame RTX 3090 run: mean 3.0, but min 1 and max 5.
+        let gpu_tiles_min = stages.gpu_tiles.iter().copied().min().unwrap_or_default();
+        let gpu_tiles_max = stages.gpu_tiles.iter().copied().max().unwrap_or_default();
+        let mut phase_means = [0.0_f64; 3];
+        for phases in &stages.recomposite_phases {
+            for (src, dest) in phases.iter().zip(phase_means.iter_mut()) {
+                *dest += *src;
+            }
+        }
+        for dest in &mut phase_means {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest /= frames as f64;
+            }
+        }
+        let [phase1, phase2, phase3] = phase_means;
+        println!(
+            "{label}:   gpu_tiles mean={gpu_tiles_mean:.1}/frame min={gpu_tiles_min} \
+             max={gpu_tiles_max} (0 would mean the GPU compositing path never ran; a min \
+             below the mean means it is not steady); recomposite sub-phase means: phase1 \
+             issue/cpu-composite={phase1:.2}ms phase2 poll-wait={phase2:.2}ms phase3 \
+             readback+write={phase3:.2}ms (phase2 is wall-clock stall, not GPU execution time \
+             -- no timestamp queries)"
+        );
+
+        let fold_counts = report_recomposite_tile_costs(label, stages, frames);
+
+        // What `upload_sync` actually moved, from the `SyncStats` `sync`
+        // already returns. Reported next to `gpu_tiles` because the two
+        // together are what make the `upload_sync` stage interpretable:
+        // this loop bumps the whole composite cache every frame, so if
+        // `uploaded` never varies, the stage's cost is a fixed floor and
+        // not a function of what the brush actually painted.
+        #[allow(clippy::cast_precision_loss)]
+        let uploaded_mean = f64::from(stages.uploaded.iter().copied().sum::<u32>()) / frames as f64;
+        let uploaded_min = stages.uploaded.iter().copied().min().unwrap_or_default();
+        let uploaded_max = stages.uploaded.iter().copied().max().unwrap_or_default();
+        #[allow(clippy::cast_precision_loss)]
+        let mb_mean =
+            stages.bytes_uploaded.iter().copied().sum::<u64>() as f64 / frames as f64 / 1_048_576.0;
+        let bytes_min = stages
+            .bytes_uploaded
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or_default();
+        let bytes_max = stages
+            .bytes_uploaded
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        println!(
+            "{label}:   upload_sync moved mean={uploaded_mean:.1} tiles/frame \
+             (min={uploaded_min} max={uploaded_max}), mean={mb_mean:.2} MB/frame \
+             (min={bytes_min}B max={bytes_max}B) -- compare spike/FINDINGS.md's ~18 MB per \
+             screenful. A min equal to the max means this is a content-independent floor: \
+             CompositeCache::bump() invalidates the whole grid every frame here, unlike \
+             App::paint_dab, which invalidates only the tiles the dab actually painted"
+        );
+
+        report_composite_write_outcomes(label, stages, frames);
+
+        fold_counts
+    }
+
+    /// The 0.90.0 `write_composited` bucket line, split out of
+    /// [`report_frame_counters`] only to keep it under
+    /// `clippy::too_many_lines`.
+    ///
+    /// Prints per-frame mean/min/max of each of the three buckets, and
+    /// states in the output itself what the numbers do and do not mean:
+    /// **bucket 0 is an upper bound on the uploads the skip removes**,
+    /// because `TileResidency::sync` is a second, independent skip point
+    /// that declines a tile only when it is *also* already resident in the
+    /// atlas. The realized change is the `upload_sync moved ...` line
+    /// above (`SyncStats`'s `uploaded` / `bytes_uploaded`). Quoting bucket
+    /// 0 as an upload saving would be wrong.
+    fn report_composite_write_outcomes(label: &str, stages: &FrameStages, frames: usize) {
+        let bucket = |slot: usize| -> (f64, u64, u64) {
+            let values = stages
+                .composite_writes
+                .iter()
+                .filter_map(|frame| frame.get(slot).copied());
+            let (sum, min, max) = values.fold((0_u64, u64::MAX, 0_u64), |(sum, min, max), v| {
+                (
+                    sum.saturating_add(v),
+                    std::cmp::min(min, v),
+                    std::cmp::max(max, v),
+                )
+            });
+            #[allow(clippy::cast_precision_loss)]
+            let mean = sum as f64 / frames as f64;
+            (mean, if min == u64::MAX { 0 } else { min }, max)
+        };
+        let (skipped_mean, skipped_min, skipped_max) = bucket(0);
+        let (changed_mean, changed_min, changed_max) = bucket(1);
+        let (absent_mean, absent_min, absent_max) = bucket(2);
+        println!(
+            "{label}:   composite writes/frame: skipped mean={skipped_mean:.1} \
+             (min={skipped_min} max={skipped_max}) changed mean={changed_mean:.1} \
+             (min={changed_min} max={changed_max}) not_resident mean={absent_mean:.1} \
+             (min={absent_min} max={absent_max}) -- these are write_composited's own \
+             decisions, NOT uploads: `skipped` is an UPPER BOUND on the uploads 0.90.0's \
+             unchanged-tile skip removes, because TileResidency::sync is a second, \
+             independent skip point that declines a tile only when it is also already \
+             resident in the atlas. The realized number is the `upload_sync moved ...` line \
+             above (SyncStats uploaded/bytes_uploaded). A large `not_resident` bucket means \
+             this fixture's TileStore budget is smaller than its per-frame working set, so \
+             composite tiles are evicted and re-paged between frames and the guard \
+             correctly refuses to compare them"
+        );
+    }
+
+    /// The 0.93.0 five-way split of phase 1, split out of
+    /// [`report_frame_counters`] for exactly the reason
+    /// [`report_composite_write_outcomes`] above was: to keep that function
+    /// under `clippy::too_many_lines`. Nothing about either differs from
+    /// inlining it, and `frames` is passed rather than recomputed so every
+    /// part of the report divides by the same denominator.
+    ///
+    /// Prints the per-frame mean of each of the five slots, the **timing
+    /// residual** against phase 1's own single mark, and the **mark
+    /// imbalance** total.
+    ///
+    /// The two are separate checks with very different reach, and 0.93.0
+    /// conflated them. The timing residual only detects an interval that
+    /// *no* slot credits — the head/tail gaps outside the first and last
+    /// mark — because the five slots sum to the same span however the
+    /// intervals are distributed among them; deleting a classifying mark
+    /// leaves it bit-for-bit unchanged. The mark imbalance
+    /// ([`RECOMPOSITE_MARK_IMBALANCE`]) is the one that detects that, and it
+    /// must print `0`. Neither is asserted on here — the trip-wire test
+    /// asserts the imbalance; this function only reports.
+    ///
+    /// Returns [`report_recomposite_fold_census`]'s own
+    /// `[folds, real_fold_tiles]` pair verbatim (0.100.0) — see that
+    /// function for why the pair travels back to the caller at all.
+    fn report_recomposite_tile_costs(label: &str, stages: &FrameStages, frames: usize) -> [u64; 2] {
+        let mut means = [0.0_f64; 5];
+        for costs in &stages.recomposite_tile_costs {
+            for (src, dest) in costs.iter().zip(means.iter_mut()) {
+                *dest += *src;
+            }
+        }
+        let mut phase1_total = 0.0_f64;
+        for phases in &stages.recomposite_phases {
+            phase1_total += phases.first().copied().unwrap_or_default();
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let denominator = frames as f64;
+        for dest in &mut means {
+            *dest /= denominator;
+        }
+        let phase1_mean = phase1_total / denominator;
+        let [gpu_ok, gpu_declined, cpu_empty, cpu_real, other] = means;
+        let sum = gpu_ok + gpu_declined + cpu_empty + cpu_real + other;
+        let residual = phase1_mean - sum;
+        let imbalance: u64 = stages
+            .mark_imbalance
+            .iter()
+            .fold(0_u64, |acc, n| acc.saturating_add(*n));
+        println!(
+            "{label}:   phase1 split (mean ms/frame): gpu_issue_ok={gpu_ok:.2} \
+             gpu_issue_declined={gpu_declined:.2} cpu_fallback_empty={cpu_empty:.2} \
+             cpu_fallback_real={cpu_real:.2} other={other:.2} | sum={sum:.2} vs phase1 \
+             mark={phase1_mean:.2} residual={residual:.4}ms mark_imbalance={imbalance} -- \
+             mark_imbalance MUST be 0 and is the real bookkeeping check: it counts phase-1 \
+             classifying marks that did not line up one-to-one with the tiles that entered the \
+             loop body. The timing residual is much weaker than 0.93.0 claimed -- the five slots \
+             sum to the same span no matter which slot receives which interval, so it detects \
+             only an interval nothing credits at all (the head/tail gaps outside the first and \
+             last mark) and NOT a misplaced, swapped, or deleted interior mark. \
+             gpu_issue_declined is 0.87.1's disclosed double root walk isolated on its own: the \
+             GPU arm was reachable but begin_gpu_composite_tile returned None, so the same root \
+             stack was walked again on the CPU -- measured small (~0.03 ms), so it is a real \
+             residual but not where phase 1's time goes. cpu_fallback_empty is a COMPOSITE \
+             interval, not one cost: transparent_tile's allocate-and-zero, the declining root \
+             walk, and write_composited's residency check plus full-tile bitwise compare. As of \
+             0.94.0 it no longer contains un_premultiply_in_place at all -- that pass is skipped \
+             for exactly the zero-fold tiles this slot times (output-identical; see \
+             composite_roots_into_tile), and it was the largest part, ~6.5 ms by 0.93.1's \
+             hand-split, so this slot's own before/after value is the measurement of that \
+             change. Both gpu_issue_* slots read ~0 on a document that never \
+             qualifies for GPU compositing at all (the CPU-fallback benchmark), because no GPU \
+             arm was ever entered -- that is correct, not a missing measurement. \
+             cpu_fallback_empty vs cpu_fallback_real is decided by the fold count \
+             composite_roots_into_tile returns, never by inspecting the resulting texels"
+        );
+
+        report_recomposite_fold_census(label, frames)
+    }
+
+    /// The 0.97.1 fold census line, printed right after the `phase1 split`
+    /// line it interprets. Split into its own function only to keep
+    /// [`report_recomposite_tile_costs`] under `clippy::too_many_lines`.
+    ///
+    /// **What this line exists to make checkable.** 0.97.0's PLAN.md entry
+    /// quoted a folds-per-frame figure obtained from a throwaway
+    /// `eprintln!` that was reverted before committing, and then read its
+    /// per-call cost off the wrong benchmark column. Both halves of that
+    /// are re-derivable from this line: `folds/frame` replaces the reverted
+    /// print, and the `first`/`later` split says which column applies.
+    /// `first` folds take [`aurora_render::composite_layer_into`]'s cheap
+    /// `backdrop_alpha == 0.0` arm (benchmark condition
+    /// `fold_onto_transparent`), `later` folds take the arm that pays three
+    /// divisions (`fold_onto_opaque`). A single-root document has
+    /// `later=0` by construction, because
+    /// [`composite_roots_into_tile`] always starts from
+    /// [`aurora_render::transparent_tile`].
+    ///
+    /// Diagnostic only as far as *printing* goes; nothing here asserts on
+    /// it. **It does return the raw pair now** (0.100.0), unchanged from
+    /// [`take_recomposite_fold_counts`], relayed up through
+    /// [`report_recomposite_tile_costs`] →
+    /// [`report_frame_counters`] → [`report_frame_stages`] so a caller can
+    /// *assert* on the census rather than eyeballing the printed line.
+    /// `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+    /// is the reason: that fixture exists specifically to reach the
+    /// `later`-fold arm, and a fixture that silently stopped reaching it
+    /// would keep passing while measuring the wrong thing.
+    ///
+    /// Deliberately **not** `#[must_use]`: the two older whole-frame tests
+    /// call `report_frame_stages` as a bare statement and have no use for
+    /// the pair, and making them opt out of a lint would be a change to
+    /// their text for no gain.
+    fn report_recomposite_fold_census(label: &str, frames: usize) -> [u64; 2] {
+        let counts = take_recomposite_fold_counts();
+        let [folds, real_fold_tiles] = counts;
+        let later = folds.saturating_sub(real_fold_tiles);
+        #[allow(clippy::cast_precision_loss)]
+        let per_frame = folds as f64 / frames as f64;
+        println!(
+            "{label}:   fold census: {folds} roots folded over {real_fold_tiles} real-fold \
+             tiles in {frames} frames = {per_frame:.3} folds/frame, of which \
+             first-fold(onto-the-transparent-seed)={real_fold_tiles} and \
+             later-fold(onto-a-non-empty-accumulator)={later} -- read the blend-math \
+             per-call cost off benches/composite.rs's fold_onto_transparent column for the \
+             first group and fold_onto_opaque for the second, noting (0.100.1) that this is a \
+             STRUCTURAL count: fold_texel picks its arm per texel on backdrop_alpha > 0.0 \
+             inside aurora-render, so `later` is an upper bound on dividing-arm folds and is \
+             exact only where the already-folded layers left alpha behind. later=0 is the \
+             correct, expected value for a single-root document and is not a missing \
+             measurement: composite_roots_into_tile always seeds its accumulator with \
+             transparent_tile, so every root's first fold takes the backdrop_alpha == 0.0 arm"
+        );
+        counts
     }
 
     /// Real, headless, GPU-gated end-to-end frame-timing measurement of
@@ -24348,22 +37372,31 @@ mod tests {
     /// **Real path exercised, per frame, end to end**: see
     /// [`measure_pan_and_paint_frames`]'s own doc comment.
     ///
-    /// **Compositing path taken: GPU.** The document is a single, visible,
-    /// `Normal`-blend, full-bounds `Pixel` layer -- confirmed directly
-    /// below via `document_qualifies_for_gpu_compositing`, not assumed --
-    /// so every tile recomposited here goes through the batched GPU path
-    /// (`begin_gpu_composite_tile`/`finish_tile_readback`).
-    /// The CPU fallback is exercised separately, by
+    /// **Compositing path taken: GPU, at the document level -- but only
+    /// for a minority of tiles.** The document is a single, visible,
+    /// `Normal`-blend, full-bounds `Pixel` layer, so it *qualifies* for
+    /// the batched GPU path -- confirmed directly below via
+    /// `document_qualifies_for_gpu_compositing`, not assumed. Per tile,
+    /// though, qualifying is not the same as taking it: only tiles with
+    /// actual stored content reach
+    /// `begin_gpu_composite_tile`/`finish_tile_readback`; the rest hit
+    /// 0.87.0's never-stored bail and are composited on the CPU. Measured
+    /// on this fixture (0.88.0's own `gpu_tiles` counter, corrected here in
+    /// 0.88.1 -- the sentence this replaces claimed "every tile", wrong by
+    /// roughly 7x): a mean of **3.0 of ~20 visible tiles per frame** take
+    /// the GPU path, and it is *not* steady at 3 -- the min/max this run
+    /// now prints came back **min=1, max=5** on a real 40-frame run. The
+    /// CPU fallback is exercised separately *as a
+    /// whole-document control*, by
     /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]
     /// below.
     ///
-    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally (this
-    /// sandbox's real Vulkan adapter -- Mesa llvmpipe, software
-    /// rendering, confirmed via `GpuContext::adapter_info()`; an earlier
-    /// pass through this comment and PLAN.md mislabeled this "NVIDIA RTX
-    /// 3090," corrected once actually checked rather than assumed --
-    /// release build): mean 34.60 ms, p50 35.44 ms, p99
-    /// 98.75 ms, max 98.75 ms (n=40) -- well over the 16.7 ms budget**,
+    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally
+    /// (release build, `AURORA_REQUIRE_GPU=1`, on this sandbox's real
+    /// adapter as printed by `aurora_gpu::test_support::
+    /// real_context_or_skip` on the run itself: `NVIDIA GeForce RTX 3090
+    /// (Vulkan, DiscreteGpu)`): mean 53.30 ms, p50 53.26 ms, p99
+    /// 59.29 ms (n=40) -- well over the 16.7 ms budget**,
     /// an honest, real finding, not a rounded-up pass: this is the exact
     /// "pan while painting" scenario `spike/FINDINGS.md`'s "Third run"
     /// section already found marginal/over budget for panning alone
@@ -24373,7 +37406,7 @@ mod tests {
     /// through `aurora-app`'s own real path, at a larger 800x600 viewport
     /// than the spike's panning figures used alone. The assertion below
     /// uses 3000 ms -- roughly 3.4x the worst p99 (889ms) real GitHub
-    /// Actions CI runs actually produced (2026-08-12), not the ~99ms this
+    /// Actions CI runs actually produced (2026-08-12), not the ~60ms this
     /// local sandbox measures -- as the CI-safety threshold. The original
     /// 350ms figure (~3.5x this sandbox's own local p99) caused real CI
     /// failures: GitHub's own runner turned out to be far slower/noisier
@@ -24385,6 +37418,60 @@ mod tests {
     /// real trip-wire against a multiples-worse algorithmic regression.
     /// See PLAN.md's M1.10 section for this same number recorded with an
     /// honest verdict (over budget, not passing).
+    ///
+    /// **Those 53.30/53.26/59.29 figures are 0.86.0-era and no longer
+    /// reproduce; the cause is confirmed, not guessed.** Fresh runs on
+    /// 2026-09-03, same adapter, give roughly half. 0.88.0 called
+    /// 0.87.0's blank-tile skip "the plausible but unconfirmed cause";
+    /// 0.88.1 confirmed it by actually bisecting, building and running
+    /// each commit in a disposable `git worktree` on the same hardware
+    /// (mean whole-frame time, this test):
+    ///
+    /// | commit | version | this test | CPU-fallback sibling |
+    /// |---|---|---|---|
+    /// | `033bbe7` | 0.86.0 | 54.26 ms | ~31 ms |
+    /// | `83f7a84` | 0.86.2 | 54.48 ms | ~31 ms |
+    /// | `8f3ff5d` | 0.87.0 | **27.93 ms** | **~18 ms** |
+    /// | HEAD | 0.88.0 | 27.53 ms | ~18 ms |
+    ///
+    /// The drop lands exactly on 0.87.0 and nowhere else, and diffing
+    /// `Cargo.lock` across the whole range shows only Aurora's own version
+    /// bumps -- zero third-party dependency changes -- so it is not a
+    /// toolchain or dependency effect. The CPU-fallback sibling halves in
+    /// the same step because `resolve_tile`, where the skip lives, is
+    /// shared by both compositing paths.
+    ///
+    /// **0.86.0's per-tile submit batching did not move this number.**
+    /// This is the benchmark that change was measured against, and the
+    /// honest result is *no measurable improvement*. Three release runs
+    /// each, same adapter, same session:
+    ///
+    /// | | mean | p50 | p99 |
+    /// |---|---|---|---|
+    /// | before | 55.82 / 53.54 / 53.39 | 53.48 / 53.35 / 53.14 | 78.42 / 64.71 / 66.35 |
+    /// | after | 52.91 / 54.84 / 53.30 | 52.67 / 53.58 / 53.26 | 62.13 / 64.16 / 59.29 |
+    /// | control (stashed, rebuilt) | 53.12 | 52.76 | 66.01 |
+    ///
+    /// The spread within each group is as large as the difference
+    /// between them, and a post-change re-measurement of the *unchanged*
+    /// code (the control row, produced by stashing the diff and
+    /// rebuilding) lands squarely inside both — so nothing here supports
+    /// a claim of improvement. The one visibly high figure, the 78.42 ms
+    /// "before" p99, was the first run of a cold session and is best read
+    /// as warm-up, not as a cost the change removed.
+    ///
+    /// Why that is unsurprising rather than a failure of the change:
+    /// **this benchmark's document is a single `Normal` layer**, so its
+    /// per-tile submit count went from three (accumulator clear, one
+    /// layer pass, readback copy) to one. Three submits per tile is real
+    /// overhead, but it is small against a ~53 ms frame dominated by tile
+    /// paging, the brush dab, the GPU→CPU→GPU readback round trip, and
+    /// atlas upload bandwidth — the costs `spike/FINDINGS.md` already
+    /// named. The saving scales with layer count (an N-layer tile went
+    /// from N + 2 or N + 3 submits to one), which is exactly the case
+    /// this fixture does not exercise. The change is justified by the
+    /// submit count `begin_gpu_composite_tile_issues_exactly_one_submit_
+    /// for_a_mixed_blend_tile` asserts, not by this number.
     ///
     /// **A store-budget confound an independent review caught and this
     /// fixed**: the first version of this test used the shared
@@ -24431,10 +37518,80 @@ mod tests {
     /// same headless technique `spike/vertical-slice`'s own
     /// `headless_bench` already validated, never a real swapchain); no
     /// CPU-fallback path in *this* test (the sibling test below covers
-    /// that); no real GPU hardware has been confirmed for this test at
-    /// all yet, only this sandbox's software Vulkan adapter (see the
-    /// budget paragraph above); and this is one adapter, one platform
-    /// (Linux) -- not cross-platform evidence.
+    /// that); and this is one adapter, one platform (Linux) -- not
+    /// cross-platform evidence. The adapter itself IS confirmed real,
+    /// not software: `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`,
+    /// printed verbatim by every `AURORA_REQUIRE_GPU=1` run and quoted
+    /// in the budget paragraph above -- an older draft of this comment
+    /// claimed the opposite (a leftover from when this sandbox really
+    /// did have only Mesa llvmpipe, corrected once already elsewhere in
+    /// this file); the one-adapter/one-platform caveat above is the
+    /// real, narrower limitation.
+    ///
+    /// **0.88.0 added a per-stage breakdown** via
+    /// [`report_frame_stages`], printed under `--nocapture` and asserted
+    /// on by nothing — `BUDGET_MS` and the assertion below are
+    /// untouched, and `total` keeps its exact pre-existing definition
+    /// (`t0.elapsed()`), so the split cannot move this test's verdict.
+    /// The finding for this test: no single stage is a majority, but
+    /// `upload_sync` (`TileResidency::sync`, 54.5–55.5% of the mean
+    /// frame) and `recomposite` (41.3–42.0%) hold 95.8–97.0% of it
+    /// between them; everything else is under 4.5% combined. Inside
+    /// `recomposite_visible_tiles` the poll-wait sub-phase is
+    /// 0.03–0.04 ms, i.e. this path does not stall on the GPU, and
+    /// `gpu_tiles` averages 3.0/frame (min 1, max 5) against ~20 visible
+    /// tiles.
+    ///
+    /// **0.88.1 corrected how those numbers were read**, without changing
+    /// them. Three things that entry got wrong and that matter for
+    /// picking the next optimization target:
+    ///
+    /// - `upload_sync` is **not** GPU upload bandwidth. It is ~87%
+    ///   `aurora_gpu::residency`'s
+    ///   `serialize_premultiplied_le_bytes` loop (the probe named its
+    ///   then-entry-point `extend_premultiplied_le_bytes`; renamed here in
+    ///   0.96.1 to the function that actually runs) -- single-threaded
+    ///   when probed, driven in parallel across blocks of one tile in
+    ///   0.96.0/0.96.1, and single-threaded on this path again since
+    ///   0.96.2 (the parallel arm regressed the whole frame under CPU
+    ///   contention; see `TileResidency::sync`'s call site) -- and ~13%
+    ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
+    ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
+    ///   own `upload_sync` field doc. Those two shares were probed
+    ///   against the pre-0.89.0 four-append loop and have **not** been
+    ///   re-probed since 0.89.0 batched the appends, so read them as
+    ///   approximate: that change bought only ~1-5% off the stage
+    ///   precisely because the per-texel conversion arithmetic, not the
+    ///   appends it removed, was always the bulk of the ~87%.
+    ///
+    ///   **Stale in a known direction since 0.92.0.** This bullet called
+    ///   that loop "scalar" through 0.92.0; it is not, and has not been
+    ///   since 0.92.0 vectorized the conversion through
+    ///   `half::slice::HalfFloatSliceExt` for a measured, independently
+    ///   reproduced ~2.4x cut to this stage. The loop's share of the
+    ///   interval therefore fell substantially and the `memcpy`'s rose;
+    ///   read PLAN.md's 0.92.0 before/after table as the current number
+    ///   rather than the ~87%/~13% split, which no fresh internal probe
+    ///   has re-taken.
+    /// - The ~17 tiles per frame that do *not* take the GPU path are not
+    ///   cheap and are not skipped: each is materialized as a full
+    ///   transparent tile, written back, marked fully dirty, and then
+    ///   re-serialized and re-uploaded. This run prints the volume
+    ///   directly now (`upload_sync moved ... tiles/frame ... MB/frame`):
+    ///   20 tiles / 10 MB every frame, min equal to max.
+    /// - That volume is **fixed by this fixture**, not by the workload:
+    ///   [`measure_pan_and_paint_frames`] calls `CompositeCache::bump()`
+    ///   every frame, invalidating the whole grid, where the real
+    ///   `App::paint_dab` invalidates only `outcome.painted()`. So the
+    ///   54%/42% split is a property of this benchmark and should not be
+    ///   assumed to carry over to a real, mostly-painted document.
+    ///
+    /// See PLAN.md's M1.10 "Per-stage frame breakdown" addendum for the
+    /// full tables, the fresh whole-frame numbers (which no longer match
+    /// the 0.86.0-era figures quoted elsewhere in this file, for a cause
+    /// now confirmed by bisect rather than hypothesized), and the
+    /// disclosed limitations — chiefly that the poll-wait number is
+    /// wall-clock stall, not GPU execution time.
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
         // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 889ms --
@@ -24498,7 +37655,7 @@ mod tests {
             "a single Normal-blend, full-bounds pixel layer must qualify for the GPU path"
         );
 
-        let mut timings = measure_pan_and_paint_frames(
+        let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
             layer_id,
@@ -24509,7 +37666,12 @@ mod tests {
             (100_000, 100_000),
             (200, 120),
         );
-        let (mean, p50, p99, max) = ms_stats(&mut timings);
+        report_frame_stages(
+            "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
+            &mut stages,
+        );
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
         println!(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint): n={} \
              mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms (nominal budget \
@@ -24527,7 +37689,11 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// `Multiply`, not `Normal`), so every tile in this loop goes through
+    /// [`CPU_ONLY_BLEND_MODE`], one of the 15 modes the GPU path still
+    /// cannot express; it was `Multiply` until 0.84.0 wired that mode onto
+    /// the GPU path, then `Screen` until 0.102.0 did the same, either of
+    /// which would have quietly turned this into a second GPU-path
+    /// measurement), so every tile in this loop goes through
     /// `resolve_tile`/`aurora_render::composite_tile_cpu`, not
     /// `begin_gpu_composite_tile`. Otherwise the same shape as
     /// [`recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`]
@@ -24539,11 +37705,48 @@ mod tests {
     /// second time. Same "generous CI-safe budget" reasoning and the same
     /// four NOT-covered caveats as the sibling test above apply here too.
     ///
-    /// **Measured locally (this sandbox's real Vulkan adapter -- Mesa
-    /// llvmpipe, software rendering, not the "NVIDIA RTX 3090" this
-    /// comment originally and wrongly said, see the sibling test's own
-    /// budget paragraph above for how that was found -- release build):
-    /// mean 25.08 ms, p50 22.57 ms, p99 54.10 ms, max 54.10 ms (n=12) -- also
+    /// **0.88.0 added a per-stage breakdown** via
+    /// [`report_frame_stages`], printed under `--nocapture` and asserted
+    /// on by nothing — `BUDGET_MS` and the assertion below are
+    /// untouched, and `total` keeps its exact pre-existing definition.
+    /// The finding for this test: `recomposite` (51.8–53.9% of the mean
+    /// frame) and `upload_sync` (39.8–41.8%) hold 93.6–95.7% of it
+    /// between them, with `gpu_tiles` 0/frame on every frame (min and max
+    /// both 0, printed since 0.88.1) — which is the intended control,
+    /// confirming this test genuinely never enters
+    /// `begin_gpu_composite_tile`. Note that this is a *document-level*
+    /// control: the claim it supports is "this document never qualifies
+    /// for the GPU path", and it says nothing about the sibling test,
+    /// where qualifying at the document level still leaves most tiles on
+    /// the CPU. As in the sibling test, `upload_sync` here is CPU-side
+    /// premultiply/serialize/staging work rather than GPU upload
+    /// bandwidth — see [`FrameStages`]'s own `upload_sync` field doc — and
+    /// its volume is fixed by this fixture's `CompositeCache::bump()`
+    /// every frame, not by what was painted: measured **9 tiles /
+    /// 4,718,592 bytes uploaded on every single frame**, min equal to max
+    /// (the 512x512 viewport's whole 3x3 grid). See PLAN.md's M1.10
+    /// "Per-stage frame breakdown" addendum for the full tables and
+    /// limitations.
+    ///
+    /// **The 30.34/29.98/32.95 figures quoted just below are 0.86.0-era
+    /// and no longer reproduce**: three fresh runs on 2026-09-03, same
+    /// adapter, gave mean 16.10–16.89 ms, p50 16.01–16.51 ms, p99
+    /// 18.44–23.14 ms. 0.88.0 called 0.87.0's blank-tile skip "the
+    /// plausible but unconfirmed cause"; **0.88.1 confirmed it by
+    /// bisect** — building and running 0.86.0 (`033bbe7`), 0.86.2
+    /// (`83f7a84`), 0.87.0 (`8f3ff5d`) and HEAD in disposable
+    /// `git worktree`s on the same hardware. This test's mean goes
+    /// ~31 ms → ~31 ms → **~18 ms** → ~18 ms, stepping exactly at
+    /// 0.87.0, with `Cargo.lock` showing no third-party dependency change
+    /// across the range. It halves alongside the GPU-path sibling because
+    /// `resolve_tile`, where the skip lives, is shared by both paths. The
+    /// stale figures are left in place below rather than silently
+    /// overwritten; see the sibling test's own doc for the full table.
+    ///
+    /// **Measured locally (release build, `AURORA_REQUIRE_GPU=1`, on
+    /// this sandbox's real adapter as printed by the run itself:
+    /// `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`):
+    /// mean 30.34 ms, p50 29.98 ms, p99 32.95 ms (n=12) -- also
     /// over the 16.7 ms nominal budget**, reported honestly, not rounded
     /// up (the same figures recorded in PLAN.md's M1.10 section --
     /// reconciled to one canonical run rather than two separately-quoted
@@ -24553,6 +37756,33 @@ mod tests {
     /// than the CPU fallback itself being cheaper than the GPU path in
     /// general -- the two tests use different viewport sizes on purpose
     /// (see above) and are not a controlled GPU-vs-CPU comparison.
+    ///
+    /// **The fixture's blend mode changed in 0.102.0, so the figures above
+    /// are not comparable across that boundary.** It was a literal
+    /// `Screen` layer; porting `Screen` to the GPU path would have turned
+    /// this control into a second GPU-path measurement, so it now uses
+    /// [`CPU_ONLY_BLEND_MODE`] (`Exclusion`) instead. Both are separable,
+    /// branch-free per-channel formulas of the same shape, and both sets
+    /// of numbers land in the same range — measured on this box
+    /// immediately before and after the retarget, three runs each:
+    /// `Screen` mean 9.37–10.82 / p50 9.10–10.25 / p99 12.17–16.74, then
+    /// `Exclusion` mean 8.95–9.65 / p50 8.63–9.26 / p99 12.32–16.00. But
+    /// the *quantity being measured* changed, so do not read a delta
+    /// against a pre-0.102.0 number as a performance result. PLAN.md's
+    /// 0.102.0 entry states both sets and this caveat.
+    ///
+    /// **This test is an unmoved control for 0.86.0's per-tile submit
+    /// batching, not a second measurement of it.** Its document is
+    /// deliberately at a blend mode the GPU path cannot express, so every
+    /// tile here goes through `composite_tile_cpu` and *never enters*
+    /// `begin_gpu_composite_tile` — the only function that change
+    /// touched. Its numbers before and after that change (mean
+    /// 29.81–30.02 / p50 29.52–29.90 / p99 32.23–32.72 before; mean
+    /// 30.34–31.57 / p50 29.98–31.46 / p99 32.95–35.84 after, three runs
+    /// each) are therefore run-to-run noise on an untouched path, and
+    /// exist to bound how much of the GPU-path comparison is sandbox
+    /// drift rather than the change.
+    ///
     /// Budget below: 1500 ms, roughly 3.7x the worst p99 (409ms) real
     /// GitHub Actions CI runs actually produced (2026-08-12) -- the
     /// original 180ms figure (~3.3x this sandbox's own local p99) caused
@@ -24583,7 +37813,14 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(layer_id, aurora_doc::BlendMode::Multiply) {
+        // [`CPU_ONLY_BLEND_MODE`], not a literal mode name: this
+        // benchmark's entire subject is the CPU fallback path, so it must
+        // stay on a mode the GPU predicate rejects. It read `Screen`
+        // literally until 0.102.0 ported that mode to the GPU, at which
+        // point the `assert!` below is what stopped this from silently
+        // becoming a *second* measurement of the GPU path while still
+        // calling itself the fallback control.
+        if let Err(err) = layers.set_blend_mode(layer_id, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         let Some(surface) = layers.surface_id(layer_id) else {
@@ -24591,10 +37828,12 @@ mod tests {
         };
         assert!(
             !document_qualifies_for_gpu_compositing(&layers),
-            "a Multiply-blend root layer must disqualify the document from the GPU path"
+            "a {CPU_ONLY_BLEND_MODE:?}-blend root layer must disqualify the document from the \
+             GPU path -- the `gpu_tiles mean=0.0` line this test reports is the other half of \
+             the same claim"
         );
 
-        let mut timings = measure_pan_and_paint_frames(
+        let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
             layer_id,
@@ -24605,7 +37844,12 @@ mod tests {
             (50_000, 50_000),
             (200, 120),
         );
-        let (mean, p50, p99, max) = ms_stats(&mut timings);
+        report_frame_stages(
+            "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint)",
+            &mut stages,
+        );
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
         println!(
             "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint): \
              n={} mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms (nominal budget \
@@ -24617,6 +37861,645 @@ mod tests {
             p99 < BUDGET_MS,
             "p99 frame time {p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms CI-safety budget \
              (mean {mean:.2}ms, p50 {p50:.2}ms, max {max:.2}ms)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 0.100.0: the two-root CPU-fallback whole-frame fixture — the thing
+    // PLAN.md's 0.99.0 entry named as missing ("a fixture with two or more
+    // real root layers per tile, so at least one fold per tile reaches
+    // `fold_onto_opaque`. No such fixture exists in this benchmark suite
+    // today"). Everything from here to
+    // `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+    // exists to build exactly that and nothing else; the timed loop itself
+    // is `measure_pan_and_paint_frames`, reused byte for byte, so this
+    // fixture cannot move either older whole-frame test's numbers.
+    // ------------------------------------------------------------------
+
+    /// The pan this fixture measures, held in constants because the
+    /// pre-seeding step below has to know *exactly* which tiles the timed
+    /// loop will visit and there must be one definition of that.
+    ///
+    /// Deliberately identical to
+    /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]'s
+    /// own arguments — same 512x512 viewport, same 12 frames, same
+    /// `(50_000, 50_000)` start, same `(200, 120)` px/frame step — so the
+    /// only differences between the two fixtures are the ones this round is
+    /// about: **two** root layers instead of one, both with real stored
+    /// content at every visited tile, and a bigger `TileStore` budget
+    /// (below). That is a deliberate choice over a "nicer" pan: the whole
+    /// value of the comparison is that the shape is held fixed.
+    ///
+    /// **Not comparable to the 40-frame GPU-path sibling**, which uses a
+    /// larger viewport on purpose. And note `ms_stats`' own p99 is the
+    /// `round((n-1) * 0.99)`-th order statistic, which for any `n` in this
+    /// file's range *is* the maximum — see PLAN.md's 0.94.1 entry. Read
+    /// mean and p50 as the primary figures here; `p99` and `max` are the
+    /// same single sample under two names.
+    const TWO_ROOT_VIEWPORT: (u32, u32) = (512, 512);
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_FRAMES: u32 = 12;
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_START: (u32, u32) = (50_000, 50_000);
+    /// See [`TWO_ROOT_VIEWPORT`].
+    const TWO_ROOT_PAN_STEP: (u32, u32) = (200, 120);
+
+    /// This fixture's own `TileStore` budget, in tiles.
+    ///
+    /// **Deliberately not the shared `real_tile_store()` helper (16
+    /// tiles), and deliberately larger than the 32 the GPU-path sibling
+    /// uses.** Three live surfaces are in play here, not two — the
+    /// backdrop layer, the active canvas layer, and the composite surface
+    /// — so one frame's own working set is `3 * 9 = 27` tiles for a 3x3
+    /// visible grid, and the pre-seeding step below writes real content
+    /// into every tile the whole 12-frame pan will visit on *both* layer
+    /// surfaces (measured: 64 tiles per surface, so 128 pre-seeded).
+    ///
+    /// The GPU-path sibling's own doc comment sets the precedent this
+    /// follows: a budget below one frame's working set produces an
+    /// *intra*-frame self-evict-and-reload pathology rather than the
+    /// realistic cross-frame paging pressure a pan is supposed to
+    /// exercise. Here that would be worse than merely unrealistic — it
+    /// would confound the measurement this fixture exists to take, since
+    /// the extra paging is proportional to exactly the thing being added
+    /// (a second surface with content everywhere). 256 holds the whole
+    /// fixture (128 layer tiles + at most ~64 composite tiles) with room
+    /// to spare, i.e. this fixture measures compositing arithmetic and
+    /// deliberately **not** tile paging.
+    ///
+    /// **Peak resident cost, corrected (0.100.1, Critic G-04).** One such
+    /// store is bounded by `256 * 512 KiB = 128 MiB`, but the test builds
+    /// **two** fixtures — main arm and control — and the main arm's is
+    /// still alive when the control's is created, so the real bound for the
+    /// test is **~256 MiB**, not 128. The original comment quoted the
+    /// per-store figure as if it were the test's peak. The main arm is
+    /// deliberately *not* dropped early: that would put a store teardown
+    /// (writer-thread shutdown plus scratch-directory removal) between the
+    /// two timed arms whose difference is the entire point of the
+    /// comparison, and would no longer be the configuration PLAN.md's
+    /// 0.100.0 numbers were taken under. Either way both stores are
+    /// allocated only after `real_gpu_context()` has already confirmed a
+    /// real adapter, so a no-GPU CI runner never pays either 128 MiB.
+    const TWO_ROOT_STORE_BUDGET: usize = 256;
+
+    /// Every tile [`measure_pan_and_paint_frames`] can ask
+    /// `TileResidency::visible_tiles` for over the pan described by
+    /// [`TWO_ROOT_VIEWPORT`] and friends, as a **generous superset**: one
+    /// extra tile of margin on each axis beyond
+    /// `aurora_gpu::residency`'s own `grid_for`
+    /// (`viewport.div_ceil(TILE) + 1` per axis).
+    ///
+    /// The margin is the point. `grid_for` is private to `aurora-gpu`, so
+    /// this is a *replica* of its arithmetic and replicas drift; a
+    /// superset makes drift in the safe direction (a few pre-seeded tiles
+    /// nothing ever reads) instead of the unsafe one (a visited tile with
+    /// no backdrop content, which would silently drop that tile's second
+    /// fold and weaken the very measurement this fixture takes). The test
+    /// still asserts on the fold census rather than trusting this
+    /// function, so a drift big enough to matter fails loudly anyway.
+    ///
+    /// Returns the union across frames, deduplicated, in first-visited
+    /// order. `Vec::contains` is a linear scan, which is fine on the ~64
+    /// tiles this produces and keeps the order deterministic for the
+    /// pre-seed walk.
+    fn panned_tile_superset(
+        viewport: (u32, u32),
+        frames: u32,
+        start: (u32, u32),
+        step: (u32, u32),
+    ) -> Vec<aurora_tile::TileId> {
+        let grid = (
+            viewport.0.div_ceil(aurora_tile::TILE).saturating_add(2),
+            viewport.1.div_ceil(aurora_tile::TILE).saturating_add(2),
+        );
+        let mut tiles: Vec<aurora_tile::TileId> = Vec::new();
+        for frame in 0..frames {
+            let x = start.0.saturating_add(frame.saturating_mul(step.0));
+            let y = start.1.saturating_add(frame.saturating_mul(step.1));
+            let origin = aurora_tile::TileId {
+                x: x / aurora_tile::TILE,
+                y: y / aurora_tile::TILE,
+            };
+            for gy in 0..grid.1 {
+                for gx in 0..grid.0 {
+                    let id = aurora_tile::TileId {
+                        x: origin.x.saturating_add(gx),
+                        y: origin.y.saturating_add(gy),
+                    };
+                    if !tiles.contains(&id) {
+                        tiles.push(id);
+                    }
+                }
+            }
+        }
+        tiles
+    }
+
+    /// Fills every one of `tiles` on `surface` with `premultiplied`,
+    /// whole-tile, and marks it fully dirty — a **direct tile fill, not a
+    /// brush dab**, and that distinction is the whole reason this function
+    /// exists.
+    ///
+    /// `aurora_render::composite_layer_into`'s two arms are chosen
+    /// **per texel**, on `backdrop_alpha > 0.0`. A brush-dab-sized second
+    /// layer would put a few thousand of a tile's 65,536 texels on the
+    /// dividing (`fold_onto_opaque`) arm and leave the rest on the cheap
+    /// one — reaching the arm technically, measuring it barely. Seeding the
+    /// first-folded layer opaque across the *whole* tile is what makes the
+    /// second fold take the dividing arm at every texel of every visited
+    /// tile, which is the condition
+    /// `aurora-render/benches/composite.rs`'s own `fold_onto_opaque`
+    /// column measures per call.
+    ///
+    /// Values are **premultiplied**, matching what the tile store holds
+    /// everywhere else (`un_premultiply_in_place` runs on the finished
+    /// composite, not on layer content), so callers must pass
+    /// `rgb <= a`.
+    ///
+    /// **What the caller can and cannot check afterwards (0.100.1,
+    /// Red-team RT-100-01).** That the stored alpha really came out `1.0`
+    /// at every texel of a pre-seeded tile *is* checkable, and the caller
+    /// now checks it by reading the tile back rather than trusting this
+    /// write. Which per-texel arm `fold_texel` then took is **not**
+    /// checkable from this crate: the branch lives inside `aurora-render`
+    /// and no counter here can see it. The chain is "verified stored
+    /// precondition + `fold_texel`'s documented `backdrop_alpha > 0.0`
+    /// predicate", not a runtime branch-taken proof.
+    ///
+    /// Runs entirely *before* the timed loop, so its own cost — and the
+    /// evictions it causes if it ever outgrows
+    /// [`TWO_ROOT_STORE_BUDGET`] — is not in any reported number.
+    ///
+    /// **A thin loop over [`fill_solid`] (0.100.1, Critic G-03)**, which
+    /// already did exactly this for one tile: same whole-tile write, same
+    /// channel order, same full-tile `mark_dirty`. The first cut here
+    /// hand-rolled a second copy of that body; this function is now only
+    /// the multi-tile wrapper plus the doc comment above, which is the
+    /// part that carries information `fill_solid`'s own name does not.
+    fn preseed_full_tiles(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tiles: &[aurora_tile::TileId],
+        premultiplied: [f32; aurora_tile::CHANNELS],
+    ) {
+        for &tile_id in tiles {
+            fill_solid(store, surface, tile_id, premultiplied);
+        }
+    }
+
+    /// Everything
+    /// [`recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`]
+    /// needs to run one arm of its measurement. The `TempDir` is held
+    /// (not `_`-bound at the call site and dropped) because dropping it
+    /// deletes the scratch directory out from under the still-live
+    /// `TileStore`.
+    struct TwoRootFixture {
+        _dir: tempfile::TempDir,
+        store: aurora_tile::TileStore,
+        layers: aurora_doc::LayerTree,
+        /// Folds **first**, onto the transparent accumulator. Pre-seeded
+        /// full-tile opaque, which is what puts the *second* fold on the
+        /// `fold_onto_opaque` arm.
+        backdrop: aurora_doc::LayerId,
+        /// The backdrop's own surface, carried out of the builder (0.100.1)
+        /// so the test can read the pre-seeded content back and *verify*
+        /// the opaque-backdrop precondition instead of assuming the write
+        /// stuck — see [`preseed_full_tiles`]' own note on what that does
+        /// and does not establish.
+        backdrop_surface: aurora_tile::SurfaceId,
+        /// Every tile both layers were pre-seeded on, in first-visited
+        /// order — [`panned_tile_superset`]'s own return value. Carried out
+        /// (0.100.1) for the same readback check: element 0 is frame 0's
+        /// own top-left visible tile, so it is certainly walked by the
+        /// timed loop.
+        preseeded: Vec<aurora_tile::TileId>,
+        /// Folds **second**, onto the now-opaque accumulator, and is the
+        /// active layer the timed loop stamps its per-frame dab into.
+        canvas: aurora_doc::LayerId,
+        canvas_surface: aurora_tile::SurfaceId,
+    }
+
+    /// Builds the two-root fixture: two root-level pixel layers at
+    /// **identical** bounds (`0, 0, 300_000, 300_000`, the Phase 0
+    /// ceiling), both with real stored content at every tile the pan will
+    /// visit, on a document that cannot take the GPU compositing path.
+    ///
+    /// Four things here are load-bearing, and each one is a way the
+    /// fixture could silently measure something else:
+    ///
+    /// 1. **Identical bounds.** `resolve_tile`'s cheap arm is gated on
+    ///    `origin == reference_origin`, and `reference_origin` is the
+    ///    *active* layer's own origin (`composite_reference_origin`). A
+    ///    backdrop at any other origin would route through
+    ///    `read_layer_window` instead — a different, slower path whose
+    ///    cost would be confounded with the fold arithmetic being
+    ///    measured.
+    /// 2. **Insertion order.** `LayerTree::add_pixel_layer` inserts each
+    ///    new layer as the *topmost* sibling (`siblings.insert(0, id)`),
+    ///    and `composite_roots_into_tile` folds `roots().iter().rev()` —
+    ///    so the layer added *first* folds first. The backdrop is
+    ///    therefore added first. The test asserts this via
+    ///    `roots().last()` rather than trusting the comment.
+    /// 3. **[`CPU_ONLY_BLEND_MODE`] on the active layer.** One of the 16
+    ///    blend modes the GPU path still cannot express, so
+    ///    `document_qualifies_for_gpu_compositing` is `false` and every
+    ///    tile goes through `composite_roots_into_tile` — the same lever,
+    ///    and for the same reason, as the single-root CPU-fallback
+    ///    sibling. The backdrop stays `Normal`: it is the accumulator's
+    ///    first fold and its mode is not what this measures.
+    ///
+    ///    This read a literal `Screen` until 0.102.0 ported that mode to
+    ///    the GPU path. Left literal, this fixture would have kept
+    ///    reporting timings under the name "CPU fallback" while actually
+    ///    measuring the GPU path — the worst shape of failure available to
+    ///    a benchmark, since nothing about it looks red. The caller's own
+    ///    `assert!(!document_qualifies_for_gpu_compositing(...))` is what
+    ///    made it fail loudly instead; the const is what keeps the next
+    ///    ported mode from re-running that experiment.
+    /// 4. **Both layers pre-seeded, both arms.** `backdrop_visible`
+    ///    controls *only* `set_visible`. The control arm has byte-identical
+    ///    store contents and differs from the main arm in exactly one
+    ///    document flag, so the two arms' difference is folds-per-tile and
+    ///    nothing else. (The canvas layer is pre-seeded too, not left to
+    ///    the per-frame dab: a dab covers a handful of tiles, and a tile
+    ///    where the *second* layer resolves nothing folds once and
+    ///    contributes no `later` fold at all.)
+    fn two_root_cpu_fallback_fixture(backdrop_visible: bool) -> TwoRootFixture {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(TWO_ROOT_STORE_BUDGET) else {
+            unreachable!("TWO_ROOT_STORE_BUDGET is a non-zero literal");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300_000,
+            height: 300_000,
+        };
+        // Added first => topmost-inserted last => `roots().last()` =>
+        // folded first. See this function's own point 2.
+        let backdrop = match layers.add_pixel_layer("backdrop", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let canvas = match layers.add_pixel_layer("canvas", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(canvas, CPU_ONLY_BLEND_MODE) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_visible(backdrop, backdrop_visible) {
+            unreachable!("{err:?}");
+        }
+        let Some(backdrop_surface) = layers.surface_id(backdrop) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let Some(canvas_surface) = layers.surface_id(canvas) else {
+            unreachable!("just created as a pixel layer");
+        };
+
+        let tiles = panned_tile_superset(
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        // Fully opaque (`a = 1.0`), so the accumulator's alpha after the
+        // first fold is `1.0` at every texel and the second fold takes
+        // `fold_onto_opaque` everywhere.
+        preseed_full_tiles(
+            &mut store,
+            backdrop_surface,
+            &tiles,
+            [0.20, 0.35, 0.55, 1.0],
+        );
+        // Translucent, premultiplied (`rgb = straight * 0.75`): a real
+        // paint layer over a real backdrop, and it keeps the second fold
+        // off any degenerate all-opaque shortcut a future implementation
+        // might add.
+        preseed_full_tiles(
+            &mut store,
+            canvas_surface,
+            &tiles,
+            [0.675, 0.45, 0.1875, 0.75],
+        );
+
+        TwoRootFixture {
+            _dir: dir,
+            store,
+            layers,
+            backdrop,
+            backdrop_surface,
+            preseeded: tiles,
+            canvas,
+            canvas_surface,
+        }
+    }
+
+    /// The whole-frame measurement PLAN.md's 0.99.0 entry said this suite
+    /// could not take: **two real, overlapping root pixel layers on the
+    /// CPU-fallback compositing path, with a second fold onto an
+    /// already-opaque accumulator at every visited tile of every frame.**
+    ///
+    /// **What that last clause rests on, stated precisely (0.100.1
+    /// correction, Red-team RT-100-01).** The first cut of this test said
+    /// `fold_onto_opaque` was "genuinely reached — proven by the 0.97.1
+    /// fold census, not inferred". That overclaimed, and the demonstration
+    /// was concrete: setting the pre-seeded backdrop's alpha to `0.0`
+    /// produces a byte-identical census and still passes, because the
+    /// census counts folds *structurally* and has no visibility into which
+    /// per-texel arm `aurora_render`'s own `fold_texel` took. Three
+    /// separate things, kept separate:
+    ///
+    /// 1. **A second fold really happened** at every visited tile of every
+    ///    frame — this the census does prove, and the assertion below is
+    ///    exact about it (`later == first`).
+    /// 2. **The backdrop this fold lands on really is stored opaque** —
+    ///    verified in-test by reading a pre-seeded tile back and checking
+    ///    every texel's alpha, not by trusting the write.
+    /// 3. **That this fold therefore takes `fold_texel`'s dividing arm**
+    ///    follows from 1 + 2 plus that function's documented
+    ///    `backdrop_alpha > 0.0` predicate. It is *not* independently
+    ///    observed here. Proving it would need branch-taken instrumentation
+    ///    inside `aurora-render` itself, the same shape as
+    ///    `GpuBlendDispatches`; deliberately not built in this round,
+    ///    and named as possible future strengthening in PLAN.md's 0.100.1
+    ///    correction.
+    ///
+    /// Two arms, same store budget, same pan, same blend modes, same
+    /// pre-seeded store contents, differing in exactly one document flag:
+    ///
+    /// - **main**: backdrop visible. Two roots fold at every visited tile,
+    ///   so every tile contributes one `first` fold (onto the transparent
+    ///   accumulator) *and* one `later` fold (onto the now-opaque one).
+    /// - **control**: backdrop hidden. `resolve_tile` declines it on
+    ///   visibility, one root folds per tile, and `later` folds are zero
+    ///   *by construction*.
+    ///
+    /// **The control's `later == 0` is reported, not asserted**, and the
+    /// reason is worth stating: `RECOMPOSITE_FOLD_COUNTS` is
+    /// process-global, so nothing structurally stops another test's folds
+    /// landing in this test's window. In practice the only increment site
+    /// is `RecompositeTileCosts::mark_cpu_fallback`, reached only from
+    /// `recomposite_visible_tiles`, which needs an `aurora_gpu`
+    /// `TileResidency` and therefore a `GpuContext` — and `real_gpu_context`
+    /// is the only way to get one here, so every increment happens under
+    /// `GPU_TEST_LOCK`, which this test holds for its whole body. That is
+    /// what makes the main arm's *equality* assertion sound (0.100.1; it
+    /// was a `>= frames` floor with 9× slack before, see below). The
+    /// control arm stays reported-only anyway: it asserts nothing that a
+    /// future CPU-only increment site could not silently invalidate, and a
+    /// zero is the wrong thing to build a flake on.
+    ///
+    /// **What is asserted**: that the document really does fail
+    /// `document_qualifies_for_gpu_compositing` (AC: CPU fallback, not the
+    /// GPU path), that the backdrop really is the root that folds first
+    /// (`roots().last()`, since `composite_roots_into_tile` walks
+    /// `.rev()`), that a pre-seeded backdrop tile really did come back
+    /// fully opaque at every texel, that the main arm's `later` fold count
+    /// is **exactly** its `first` count (0.100.1, Critic G-02 /
+    /// Red-team RT-100-03: every real-fold tile here folds exactly twice by
+    /// construction, so the honest assertion is an equality, and the
+    /// original `later >= TWO_ROOT_FRAMES` floor of 12 against a real,
+    /// every-run value of 108 let an 89 % coverage collapse pass silently),
+    /// and the same generous CI-safety frame budget the two older
+    /// whole-frame tests use. Nothing asserts a *magnitude* on any
+    /// timing — this is a diagnostic, exactly as its two siblings are.
+    ///
+    /// **Measured, real hardware (`NVIDIA GeForce RTX 3090, Vulkan,
+    /// DiscreteGpu`), `AURORA_REQUIRE_GPU=1`, `--release`, idle machine.**
+    /// Whole-frame mean over 6 runs: **40.30–42.51 ms** for the two-root
+    /// arm (`later = 108`) and **24.72–26.17 ms** for the single-fold
+    /// control — both far over the 16.7 ms budget, and both much larger
+    /// than the single-root CPU-fallback sibling's own ~9 ms because this
+    /// fixture composites two full-content layers per tile on a store big
+    /// enough not to page. `p99` at `n = 12` *is* the maximum (see
+    /// [`TWO_ROOT_VIEWPORT`]); read mean and p50.
+    ///
+    /// **And the cross-version answer 0.99.0 could not give**: with
+    /// `composite_layer_into`'s body swapped for its verbatim pre-0.98.0
+    /// scalar text in a throwaway worktree, the same two-root arm measured
+    /// a run-median **45.26 ms against this tree's 40.53 ms** — ~4.7 ms of
+    /// a ~45 ms frame, a real whole-frame win.
+    ///
+    /// **Two corrections to how that was first written up (0.100.1,
+    /// Red-team RT-100-02/04/05), because they change what a reader should
+    /// take from it:**
+    ///
+    /// - **The n=6 "ranges do not overlap" claim did not survive
+    ///   re-measurement.** Twelve consecutive reruns are bimodal, with
+    ///   2/12 vectorized runs above the originally-quoted vectorized
+    ///   maximum and within ~1 ms of the quoted scalar floor. Read the
+    ///   medians and the direction, which are stable; do not read clean
+    ///   separability. The control arm's original "no win, ranges overlap"
+    ///   verdict did not survive either — on reruns it shows a small but
+    ///   consistent win of its own (median 24.85 vs 25.83 ms).
+    /// - **The mechanism is not "the three divisions".** A vectorized ×
+    ///   scalar by opaque × transparent-backdrop cross puts the
+    ///   divide-arm's own share at ~0.25 ms vectorized vs ~2.55 ms scalar,
+    ///   and of the ~4.2 ms delta with the arm active, ~1.9 ms remains
+    ///   without it. So the win scales with **total folds and therefore
+    ///   total converted samples**, and the larger part of the
+    ///   arm-specific delta is the redundant per-sample `f16` <-> `f32`
+    ///   conversions the old scalar loop repeated — not division cost. A
+    ///   second fold's worth of conversions is most of what this fixture
+    ///   added.
+    ///
+    /// PLAN.md's 0.100.0 entry and its 0.100.1 correction have the full
+    /// tables, the derived-and-flagged per-fold figures, the A/B's own
+    /// substitution recipe, and every caveat (one adapter, idle only,
+    /// absolute numbers not comparable to 0.99.0's rows).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path() {
+        // Same generous CI-safety budget, and the same reasoning, as
+        // `recomposite_and_present_loop_exercises_the_cpu_fallback_path`:
+        // it exists so a real regression fails rather than to assert 60
+        // FPS, which this path does not meet. See that test's own comment.
+        const BUDGET_MS: f64 = 1500.0;
+        // 0.100.1: "fold_onto_opaque reached" used to sit in this label as
+        // a flat claim. It is now stated as what the census can actually
+        // establish -- a second fold onto a verified-opaque backdrop --
+        // per this test's own doc comment and Red-team RT-100-01.
+        const MAIN_LABEL: &str = "recomposite_and_present_loop (CPU fallback, TWO overlapping \
+                                  roots, 2nd fold onto a verified-opaque backdrop, 300,000px \
+                                  ceiling, pan+paint)";
+        const CONTROL_LABEL: &str = "recomposite_and_present_loop (CPU fallback, control: same \
+                                     fixture, backdrop hidden, single fold, 300,000px ceiling, \
+                                     pan+paint)";
+
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+
+        let mut fixture = two_root_cpu_fallback_fixture(true);
+        assert!(
+            !document_qualifies_for_gpu_compositing(&fixture.layers),
+            "a {CPU_ONLY_BLEND_MODE:?}-blend root must disqualify the document from the GPU path, so \
+             that every visible tile goes through composite_roots_into_tile"
+        );
+        assert_eq!(
+            fixture.layers.roots().last().copied(),
+            Some(fixture.backdrop),
+            "composite_roots_into_tile folds roots().iter().rev(), so the LAST root folds FIRST, \
+             onto the transparent accumulator. The pre-seeded full-tile-opaque backdrop must be \
+             that layer, or the opaque tile ends up on top and the fold that pays three \
+             divisions never happens"
+        );
+        assert_eq!(
+            fixture.layers.roots().first().copied(),
+            Some(fixture.canvas),
+            "and the active, {CPU_ONLY_BLEND_MODE:?}-blend canvas layer must be the one that folds \
+             second, onto the now-opaque accumulator: that second fold is what this fixture \
+             exists to reach"
+        );
+
+        // The precondition `fold_texel`'s dividing arm is selected on,
+        // *verified* rather than assumed (0.100.1, Red-team RT-100-01):
+        // read one pre-seeded backdrop tile back out of the store and
+        // check every texel's alpha, before a single frame is timed.
+        // Element 0 of `preseeded` is frame 0's own top-left visible tile,
+        // so it is certainly one of the tiles the loop below composites.
+        //
+        // This does NOT observe the branch -- that lives inside
+        // `aurora-render` -- it closes the smaller, real gap Red-team
+        // demonstrated: with the backdrop's alpha set to 0.0 the first cut
+        // of this test produced a byte-identical census and still passed,
+        // i.e. it never checked its own premise at all.
+        let Some(&probe_tile) = fixture.preseeded.first() else {
+            unreachable!("panned_tile_superset always yields at least frame 0's own grid");
+        };
+        let mut min_backdrop_alpha = f32::INFINITY;
+        for texel in read_all_texels(&mut fixture.store, fixture.backdrop_surface, probe_tile)
+            .chunks_exact(aurora_tile::CHANNELS)
+        {
+            let [_, _, _, a] = texel else { continue };
+            min_backdrop_alpha = min_backdrop_alpha.min(*a);
+        }
+        assert!(
+            min_backdrop_alpha >= 1.0,
+            "the pre-seeded backdrop tile {probe_tile:?} must read back FULLY opaque at every one \
+             of its texels, or the second fold lands on a transparent-in-places accumulator and \
+             fold_texel takes its cheap arm exactly where this fixture claims it does not: \
+             minimum alpha read back was {min_backdrop_alpha}. fold_texel's own predicate is \
+             backdrop_alpha > 0.0, so this check is deliberately stricter than the branch needs -- \
+             it is the whole-tile coverage claim being checked, not just non-emptiness"
+        );
+
+        let mut stages = measure_pan_and_paint_frames(
+            &context,
+            &fixture.layers,
+            fixture.canvas,
+            fixture.canvas_surface,
+            &mut fixture.store,
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        // `report_frame_stages` returns the census it prints (0.100.0)
+        // precisely so this assertion can exist. Slot 1 is
+        // `real_fold_tiles` -- the count of *tiles* that folded at least
+        // once, which is therefore also the count of folds onto a
+        // transparent accumulator, hence the local name `first_folds`
+        // (0.100.1, Critic G-07: same slot, two names, said once here) --
+        // and `later = folds - first_folds`; see
+        // `RECOMPOSITE_FOLD_COUNTS`' own doc comment for why that
+        // subtraction is exact rather than an estimate.
+        let [folds, first_folds] = report_frame_stages(MAIN_LABEL, &mut stages);
+        let later_folds = folds.saturating_sub(first_folds);
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
+        println!(
+            "{MAIN_LABEL}: n={} mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms \
+             (nominal budget 16.7ms) | fold census: folds={folds} first={first_folds} \
+             later={later_folds} -- `later` counts folds onto an already-non-empty accumulator; \
+             that they take composite_layer_into's dividing arm follows from the verified-opaque \
+             backdrop above plus fold_texel's documented backdrop_alpha > 0.0 predicate, and is \
+             NOT observed here (no branch-taken counter exists inside aurora-render). A run with \
+             later=0 measured the wrong thing however good its timings look",
+            timings.len()
+        );
+
+        // Exact, not a floor (0.100.1, Critic G-02 / Red-team RT-100-03).
+        // Every tile this fixture composites has real content on BOTH
+        // roots, so a tile that folds at all folds exactly twice: one
+        // first fold, one later fold. `later == first` is therefore the
+        // fixture's own construction restated, not a tolerance -- and it
+        // is what the previous `later >= TWO_ROOT_FRAMES` floor of 12
+        // failed to say, with the real value 108 on every run. Red-team
+        // demonstrated that slack passing a fixture whose backdrop was
+        // pre-seeded on 8 tiles instead of all ~64, i.e. mostly measuring
+        // single folds while the assertion stayed green.
+        assert_eq!(
+            later_folds, first_folds,
+            "every tile this fixture composites has content on BOTH roots, so it must fold \
+             exactly twice: one fold onto the transparent accumulator and one onto the opaque \
+             one. The census says otherwise (folds={folds} first={first_folds} \
+             later={later_folds}), which means some tiles folded once -- the fixture is measuring \
+             single folds where it claims double ones. Check, in this order: both layers' \
+             bounds/origins still identical (resolve_tile's cheap arm is gated on \
+             origin == reference_origin); the backdrop still the LAST root and still visible; the \
+             pre-seeded tile superset still covering what visible_tiles actually walks; the store \
+             budget still above the fixture's working set"
+        );
+        assert!(
+            p99 < BUDGET_MS,
+            "p99 frame time {p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms CI-safety budget \
+             (mean {mean:.2}ms, p50 {p50:.2}ms, max {max:.2}ms)"
+        );
+
+        // The control arm. Identical in every respect except that the
+        // backdrop is hidden, which is what makes the pair a same-fixture
+        // double-fold-vs-single-fold comparison rather than two
+        // differently-shaped benchmarks.
+        let mut control = two_root_cpu_fallback_fixture(false);
+        assert!(
+            !document_qualifies_for_gpu_compositing(&control.layers),
+            "hiding the backdrop must not accidentally re-qualify the document for the GPU \
+             path -- the active layer is still {CPU_ONLY_BLEND_MODE:?}-blended"
+        );
+        let mut control_stages = measure_pan_and_paint_frames(
+            &context,
+            &control.layers,
+            control.canvas,
+            control.canvas_surface,
+            &mut control.store,
+            TWO_ROOT_VIEWPORT,
+            TWO_ROOT_FRAMES,
+            TWO_ROOT_START,
+            TWO_ROOT_PAN_STEP,
+        );
+        let [control_folds, control_first] =
+            report_frame_stages(CONTROL_LABEL, &mut control_stages);
+        let control_later = control_folds.saturating_sub(control_first);
+        let control_timings = &mut control_stages.total;
+        let (c_mean, c_p50, c_p99, c_max) = ms_stats(control_timings);
+        println!(
+            "{CONTROL_LABEL}: n={} mean={c_mean:.2}ms p50={c_p50:.2}ms p99={c_p99:.2}ms \
+             max={c_max:.2}ms (nominal budget 16.7ms) | fold census: folds={control_folds} \
+             first={control_first} later={control_later} -- later is 0 by construction here \
+             (one visible root, and composite_roots_into_tile always seeds a transparent \
+             accumulator); reported, NOT asserted, because RECOMPOSITE_FOLD_COUNTS is \
+             process-global and asserting a zero on it would be the one shape a future \
+             lock-free increment site could silently turn into a flake",
+            control_timings.len()
+        );
+        assert!(
+            c_p99 < BUDGET_MS,
+            "control p99 frame time {c_p99:.2}ms exceeded the generous {BUDGET_MS:.0}ms \
+             CI-safety budget (mean {c_mean:.2}ms, p50 {c_p50:.2}ms, max {c_max:.2}ms)"
         );
     }
 
@@ -24646,12 +38529,27 @@ mod tests {
     }
 
     #[test]
-    fn sample_pixel_of_an_untouched_surface_reads_transparent() {
+    /// A never-written tile reads as "nothing to pick" *without being
+    /// materialized* (0.90.1). Before that it returned
+    /// `Some([0.0; 4])` — the same answer as far as
+    /// `eyedropper_sample`'s own `a > 0.0` test is concerned, since a
+    /// blank is fully transparent, but it got there by allocating a
+    /// whole tile and making it resident. On the composite surface that
+    /// side effect was a live stale-pixel bug; see `sample_pixel`'s own
+    /// doc comment. The store-side half of the contract is asserted
+    /// here, not just the return value.
+    fn sample_pixel_of_an_untouched_surface_reads_nothing_without_materializing_a_tile() {
         let (_dir, mut store) = real_tile_store();
         let surface = aurora_tile::SurfaceId::from_raw(0);
-        assert_eq!(
-            sample_pixel(&mut store, surface, (5.0, 5.0)),
-            Some([0.0, 0.0, 0.0, 0.0])
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        assert_eq!(sample_pixel(&mut store, surface, (5.0, 5.0)), None);
+        assert!(
+            !store.contains_tile(surface, tile),
+            "the sample must not have materialized the tile it looked at"
+        );
+        assert!(
+            !store.is_resident(surface, tile),
+            "nor made one resident, which is the half write_composited's residency guard reads"
         );
     }
 
@@ -25647,8 +39545,38 @@ mod tests {
         assert_eq!(dialog, None);
     }
 
+    /// Click routing against the dialog's **real** geometry, not
+    /// fabricated bounds. Through `0.77.5` both this test and its
+    /// outside-click sibling below set `Rect`s by hand with
+    /// `WidgetTree::set_bounds` because no real `compute_layout` was
+    /// involved -- which meant they proved `handle_dialog_pointer`'s
+    /// own dispatch logic and nothing about whether a user's click
+    /// would ever actually land on a button. It did not: the dialog
+    /// laid out as a 32 px-wide, full-height sliver at `x: 968` on a
+    /// 1000x800 window. `0.77.6` fixed the layout; these two now run
+    /// against what `compute_layout` really produces.
+    ///
+    /// **What that does and does not buy, stated exactly** (0.77.7,
+    /// after review found the first version of this comment overclaimed).
+    /// What it verifies is real: `handle_dialog_pointer` dispatches
+    /// correctly against geometry a real `compute_layout` produced,
+    /// rather than against a `Rect` the test invented. On its own, a
+    /// click derived from the button's own computed bounds is *not* a
+    /// regression test for the centring bug -- it passes identically
+    /// whether the button is centred or stranded in the old `x: 968`
+    /// sliver, since the click always lands wherever the button actually
+    /// is. That is why this test also carries the window-relative
+    /// assertion below, anchored to the window and the rail rather than
+    /// to the button: it is what the old sliver actually violates, and
+    /// it is what makes this test catch the regression too, not just
+    /// `an_open_dialog_does_not_take_any_width_from_the_canvas`,
+    /// `the_open_dialog_is_centered_over_the_workspace_under_real_layout`
+    /// and `each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay`.
+    /// Proven by mutation: reverting `root_style` to `Style::default()`
+    /// now fails this test and its sibling too, on that assertion,
+    /// alongside all three of the above.
     #[test]
-    fn clicking_the_dialogs_action_button_closes_it() {
+    fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -25663,30 +39591,48 @@ mod tests {
         let Some(button) = handle.first_action() else {
             unreachable!("the crash recovery dialog always has one action");
         };
-        // `hit_test` requires every ancestor along the path, not just
-        // the button itself, to actually contain the point -- no real
-        // `compute_layout` has run in this test, so every node defaults
-        // to zero-size bounds; set all three explicitly, the same
-        // isolated-geometry shape `hit_test`'s own unit tests in
-        // `aurora-widgets` already use.
-        let big = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 1000,
-            height: 1000,
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(bounds) = workspace.tree.bounds(button) else {
+            unreachable!("just laid out");
         };
-        for id in [workspace.root, handle.root, button] {
-            if let Err(err) = workspace.tree.set_bounds(id, big) {
-                unreachable!("{err:?}");
-            }
-        }
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+
+        // The one assertion here that is anchored to the *window*
+        // rather than to the widget under test, and therefore the one
+        // that is bug-specific rather than dispatch-specific: the point
+        // we are about to click must lie in the middle third of a
+        // 1000 px-wide window, and must not lie inside the rail. The
+        // pre-0.77.6 layout put this button at `x: 968, width: 32`,
+        // over the rail and hard against the window's right edge, which
+        // fails both halves.
+        let Some(rail) = workspace.tree.bounds(workspace.rail) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            center.0 > 1000.0 / 3.0 && center.0 < 2.0 * 1000.0 / 3.0,
+            "the action a user has to click must sit in the middle third \
+             of the window, not stranded at one edge: {center:?} in a \
+             1000x800 window"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let rail_left = rail.x as f32;
+        assert!(
+            center.0 < rail_left,
+            "the action must not sit inside the rail's own column \
+             (x >= {rail_left}): {center:?}"
+        );
 
         let opened = handle_dialog_pointer(
             &mut workspace,
             &mut focus,
             &mut dialog,
             PointerButton::Primary,
-            (10.0, 10.0),
+            center,
         );
 
         assert!(opened, "a dialog was open to route the click to");
@@ -25694,8 +39640,320 @@ mod tests {
         assert!(!workspace.tree.contains(handle.root));
     }
 
+    /// The outside-click half of the pair above, and it carries the same
+    /// caveat: the probe point is derived from the dialog's own computed
+    /// bounds, so what it proves is that `handle_dialog_pointer`
+    /// swallows a click that misses every action button -- not that the
+    /// dialog is anywhere in particular. The centring is the geometry
+    /// tests' job (named in the sibling's own doc comment).
+    ///
+    /// The exception, again, is one window-relative assertion: the
+    /// "outside" point has to be a point that exists *in the window*.
+    /// Under the pre-0.77.6 layout the dialog was full height
+    /// (`y: 0, height: 800` in an 800 px-tall window), so one pixel past
+    /// its bottom edge was `y: 801` -- off the window entirely, i.e. a
+    /// click no user could make. That assertion does fail on the old
+    /// layout.
     #[test]
-    fn clicking_elsewhere_while_the_dialog_is_open_swallows_the_click_without_closing_it() {
+    fn clicking_outside_the_dialog_under_real_layout_is_swallowed_without_closing_it() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        // Derived from the dialog's own real bounds rather than
+        // guessed: one pixel past its bottom edge, on its own vertical
+        // centre line, is outside it whatever the layout resolves to.
+        let Some(bounds) = workspace.tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let outside = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            (bounds.y + i64::from(bounds.height)) as f32 + 1.0,
+        );
+        assert!(
+            outside.1 >= 0.0 && outside.1 < 800.0,
+            "the point just past the dialog's bottom edge must still be \
+             inside the 1000x800 window -- a dialog that reaches the \
+             window's own bottom edge (which the pre-0.77.6 full-height \
+             layout did) leaves no reachable outside at all: {outside:?} \
+             from {bounds:?}"
+        );
+
+        let opened = handle_dialog_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            PointerButton::Primary,
+            outside,
+        );
+
+        assert!(opened, "a dialog was open, so the click must be swallowed");
+        assert_eq!(
+            dialog,
+            Some(handle),
+            "clicking outside the dialog's own buttons must not close it"
+        );
+    }
+
+    /// All **four** dialogs this crate can actually open, under real
+    /// layout -- driven through the shared free `open_dialog` with each
+    /// one's own real title/message/actions, the same split
+    /// `the_export_refused_dialog_opens_through_the_shared_helper` and
+    /// `the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing`
+    /// already use, because the `&mut self` `App` methods that wrap
+    /// them need a live window, a GPU device and an event-loop proxy,
+    /// none of which exist headlessly.
+    ///
+    /// **Four, not three** (corrected in `0.77.7`). The first version of
+    /// this test and its own comment both said "all three" and left out
+    /// `App::open_skipped_tiles_dialog` ("This Document Is Missing
+    /// Content"), which is a real opening path like the other three. It
+    /// is also the only one whose message is **file-controlled** -- it
+    /// embeds a `SkippedTileRecord::reason` read straight out of the
+    /// `.aur` container being opened -- so it is the case where a
+    /// hostile file gets the closest to this layout. That text is
+    /// sanitised on the way in (`skipped_tiles_message` runs it through
+    /// `aurora_doc::sanitize_display_name`) and nothing here measures
+    /// text anyway, so it produces no layout pathology; the case is
+    /// present because the claim of full coverage has to be true, not
+    /// because a live hole was found.
+    ///
+    /// The four cases are the ones this crate constructs. What this test
+    /// therefore cannot see is any field that only a *multi*-action
+    /// dialog exercises -- every real dialog here has exactly one action
+    /// -- which is why `root_style`'s `FlexDirection::Column` is held by
+    /// an `aurora-widgets` test instead. That crate's own `root_style`
+    /// doc comment names the gap.
+    #[test]
+    // A table-driven scenario: four real dialogs' own content, then one
+    // shared block of assertions applied to each. Splitting it would
+    // either duplicate the assertions per dialog or split the table from
+    // what it is checked against, and both are worse than the length.
+    #[allow(clippy::too_many_lines)]
+    fn each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let export_message = incomplete_composite_message(1, "boom");
+        // The real read-side constructor, with a real record: this is
+        // the shape `open_aur_file` hands `open_skipped_tiles_dialog`.
+        let skipped = aurora_io::SkippedTiles::from_parts(
+            3,
+            vec![aurora_io::SkippedTileRecord {
+                surface: 1,
+                tile_x: 0,
+                tile_y: 0,
+                reason: "the scratch file could not be read".to_owned(),
+            }],
+        );
+        let skipped_message = skipped_tiles_message(&skipped);
+        let cases: [(&str, &str, Vec<super::DialogAction>); 4] = [
+            (
+                "Aurora Didn't Close Properly",
+                crash_recovery_dialog_message(true),
+                crash_recovery_dialog_actions(),
+            ),
+            (
+                "Couldn't Export This Document",
+                &export_message,
+                export_refused_dialog_actions(),
+            ),
+            (
+                "Can't Move This Layer Further",
+                move_refused_message(),
+                move_refused_dialog_actions(),
+            ),
+            (
+                "This Document Is Missing Content",
+                &skipped_message,
+                skipped_tiles_dialog_actions(),
+            ),
+        ];
+
+        for (title, message, actions) in cases {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut dialog = None;
+            assert!(
+                open_dialog(
+                    &mut workspace,
+                    &mut focus,
+                    &mut dialog,
+                    &scales,
+                    title,
+                    message,
+                    actions,
+                ),
+                "{title} must open"
+            );
+            let Some(handle) = dialog.clone() else {
+                unreachable!("just opened");
+            };
+            workspace.tree.compute_layout(1000.0, 800.0);
+
+            let Some(bounds) = workspace.tree.bounds(handle.root) else {
+                unreachable!("just laid out");
+            };
+            // `<= 1`, not exact equality: `apply_taffy_layout` truncates
+            // an `f32` origin to an `i64`, so a window whose free space
+            // on an axis is odd centres to two gaps that differ by one
+            // pixel. That is correct, and the exact-equality form this
+            // replaced only held because 1000 and 800 both happen to
+            // leave even free space here.
+            let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
+            assert!(
+                (bounds.x - right_gap).abs() <= 1,
+                "{title} must be horizontally centred: {bounds:?}"
+            );
+            assert!(
+                bounds.y > 0 && bounds.y + i64::from(bounds.height) < 800,
+                "{title} must be a content-height overlay, not full height: {bounds:?}"
+            );
+
+            let Some(message_bounds) = workspace.tree.bounds(handle.message) else {
+                unreachable!("just laid out");
+            };
+            assert!(
+                message_bounds.width > 0 && message_bounds.height > 0,
+                "{title}'s message must be a real box: {message_bounds:?}"
+            );
+
+            let Some(rail) = workspace.tree.bounds(workspace.rail) else {
+                unreachable!("just laid out");
+            };
+            for (action, button) in &handle.actions {
+                let Some(button_bounds) = workspace.tree.bounds(*button) else {
+                    unreachable!("just laid out");
+                };
+                assert!(
+                    button_bounds.width > 0 && button_bounds.height > 0,
+                    "{title}'s {action} button must be hit-testable: {button_bounds:?}"
+                );
+                #[allow(clippy::cast_precision_loss)]
+                let center = (
+                    button_bounds.x as f32 + button_bounds.width as f32 / 2.0,
+                    button_bounds.y as f32 + button_bounds.height as f32 / 2.0,
+                );
+                // Window-anchored, deliberately. The `hit_test` check
+                // below derives its probe from the button's own bounds,
+                // so on its own it passes wherever the button ends up --
+                // including the pre-0.77.6 `x: 968, width: 32` sliver
+                // over the rail. These two are the ones that pin the
+                // button to somewhere a user would actually look and
+                // that the sliver fails.
+                assert!(
+                    center.0 > 1000.0 / 3.0 && center.0 < 2.0 * 1000.0 / 3.0,
+                    "{title}'s {action} button must sit in the middle third of \
+                     the 1000x800 window: {center:?} from {button_bounds:?}"
+                );
+                #[allow(clippy::cast_precision_loss)]
+                let rail_left = rail.x as f32;
+                assert!(
+                    center.0 < rail_left,
+                    "{title}'s {action} button must be over the document, not \
+                     inside the rail's own column (x >= {rail_left}): {center:?}"
+                );
+                assert!(
+                    center.1 >= 0.0 && center.1 < 800.0,
+                    "{title}'s {action} button's centre must be a point inside \
+                     the window at all: {center:?}"
+                );
+                assert_eq!(
+                    workspace.tree.hit_test(center),
+                    Some(*button),
+                    "a click at the centre of {title}'s {action} button must \
+                     actually reach it"
+                );
+            }
+        }
+    }
+
+    /// The app-level half of `0.77.7`'s small-window fix, against the
+    /// real workspace tree rather than `aurora-widgets`'s own test root.
+    ///
+    /// Red-team's finding: below roughly 72 logical pixels of window
+    /// height the dialog's action button fell past `workspace.root`'s own
+    /// bottom edge, `WidgetTree::hit_test_from` refused to descend into a
+    /// parent that doesn't contain the point, and `handle_dialog_pointer`
+    /// went on swallowing every click in the window -- so the app became
+    /// entirely mouse-dead while a dialog was open, with only Escape and
+    /// Enter left. `winit` sets no `min_inner_size` on Aurora's window,
+    /// so this is reachable on most platforms.
+    ///
+    /// This drives the whole real path: `open_crash_recovery_dialog`,
+    /// a real `compute_layout` at the small size, then a real
+    /// `handle_dialog_pointer` press at the button's own centre, which
+    /// must actually close the dialog.
+    #[test]
+    fn a_dialogs_action_is_still_clickable_in_a_very_short_window() {
+        for height in [58.0_f32, 72.0, 90.0] {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut dialog = None;
+            let scales = match load_scales() {
+                Ok(scales) => scales,
+                Err(err) => unreachable!("{err}"),
+            };
+            open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+            let Some(handle) = dialog.clone() else {
+                unreachable!("just opened");
+            };
+            let Some(button) = handle.first_action() else {
+                unreachable!("the crash recovery dialog always has one action");
+            };
+            workspace.tree.compute_layout(1000.0, height);
+
+            let Some(bounds) = workspace.tree.bounds(button) else {
+                unreachable!("just laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let center = (
+                bounds.x as f32 + bounds.width as f32 / 2.0,
+                bounds.y as f32 + bounds.height as f32 / 2.0,
+            );
+            assert!(
+                center.1 >= 0.0 && center.1 < height,
+                "in a 1000x{height} window the action's own centre must be a \
+                 point the mouse can reach: {center:?} from {bounds:?}"
+            );
+
+            let opened = handle_dialog_pointer(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                PointerButton::Primary,
+                center,
+            );
+            assert!(opened, "a dialog was open to route the click to");
+            assert_eq!(
+                dialog, None,
+                "in a 1000x{height} window the action must still be clickable, \
+                 or the app is mouse-dead for as long as the dialog is open"
+            );
+        }
+    }
+
+    /// `MIN_WINDOW_WIDTH`/`MIN_WINDOW_HEIGHT` are the guard the round above
+    /// disclosed but didn't add: a floor on the real window itself, so the
+    /// sub-~34px case `0.77.7`'s own module doc names as still-unfixable
+    /// (no scrolling, no text measurement) is unreachable through the real
+    /// window rather than merely documented. Proves the floor is
+    /// comfortably safe for the same real dialog every other test in this
+    /// file drives -- not just "bigger than the threshold," but bigger by
+    /// the margin `MIN_WINDOW_HEIGHT`'s own doc comment claims.
+    #[test]
+    fn the_windows_own_minimum_size_keeps_every_real_dialog_clickable() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -25710,60 +39968,156 @@ mod tests {
         let Some(button) = handle.first_action() else {
             unreachable!("the crash recovery dialog always has one action");
         };
-        // Root and the dialog's own root are real and hit-testable
-        // (same reasoning as `clicking_the_dialogs_action_button_closes_it`),
-        // but the button itself sits in just one corner -- so a click
-        // inside the dialog, but outside the button, hits the dialog's
-        // own root instead, which has no `action_id` of its own.
-        if let Err(err) = workspace.tree.set_bounds(
-            workspace.root,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 1000,
-                height: 1000,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = workspace.tree.set_bounds(
-            handle.root,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 1000,
-                height: 1000,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = workspace.tree.set_bounds(
-            button,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 20,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
+        #[allow(clippy::cast_possible_truncation)]
+        workspace
+            .tree
+            .compute_layout(MIN_WINDOW_WIDTH as f32, MIN_WINDOW_HEIGHT as f32);
 
-        // Inside the dialog's own root, but past the button's own
-        // bottom-right corner.
+        let Some(bounds) = workspace.tree.bounds(button) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let min_height = MIN_WINDOW_HEIGHT as f32;
+        assert!(
+            center.1 >= 0.0 && center.1 < min_height,
+            "at the window's own minimum size ({MIN_WINDOW_WIDTH}x{MIN_WINDOW_HEIGHT}) \
+             the action's own centre must be a point the mouse can reach: \
+             {center:?} from {bounds:?}"
+        );
+
         let opened = handle_dialog_pointer(
             &mut workspace,
             &mut focus,
             &mut dialog,
             PointerButton::Primary,
-            (500.0, 500.0),
+            center,
+        );
+        assert!(opened, "a dialog was open to route the click to");
+        assert_eq!(
+            dialog, None,
+            "at the window's own minimum size the action must still be \
+             clickable -- this is the floor `resumed` actually sets, not \
+             just a size this test happens to try"
+        );
+    }
+
+    // Test-only: `load_theme` itself stays Dark-only (the app has no
+    // theme switching yet), so both TOML sources are loaded directly in
+    // the helper below rather than widening that production function's
+    // scope.
+    const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
+
+    /// A real dialog in the **real workspace tree** actually reaches
+    /// paint, and paints something that is not the panel chrome behind
+    /// it.
+    ///
+    /// `aurora-widgets`' own gallery proves `paint_widget` in isolation,
+    /// on a tree built for the purpose; nothing proved that this crate's
+    /// own path -- `open_crash_recovery_dialog` into
+    /// `aurora_ui::build_workspace`'s tree, `compute_layout`, then
+    /// `WidgetTree::paint_order` -- ever visits the dialog's root at all.
+    /// A dialog inserted under a node `paint_order` never reaches, or
+    /// one whose bounds `clip_to_clipping_ancestors` clips to nothing,
+    /// would paint exactly zero shapes and every existing test here
+    /// would still pass, because they are all about hit-testing and
+    /// focus.
+    ///
+    /// This walks the same order [`collect_widget_paints`] does and
+    /// calls the same `paint_widget`, but never touches a GPU: that
+    /// function's only extra work is `GpuMesh::upload` plus
+    /// [`linearize_paint_color`], neither of which can turn a non-empty
+    /// mesh list into an empty one. Laid out at the enforced minimum
+    /// window size, which is the smallest real window a user can
+    /// actually produce and the size at which the dialog overlaps the
+    /// most chrome.
+    #[test]
+    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree() {
+        a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for("Dark");
+        // Dark alone would leave this test blind to the exact bug
+        // 0.79.1 fixed: `paint_dialog`'s doc comment on its own
+        // "chromatic no-op in Dark" paragraph notes the unconditional
+        // border draws nothing visible there, so Dark's pass proves
+        // only fill-vs-panel contrast, the same mechanism
+        // `paint_command_palette` already relied on. Light is where the
+        // border is load-bearing.
+        a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for("Light");
+    }
+
+    // Both sides come from the same `Color::to_srgb_f32` call on the
+    // same underlying `u8` channels -- bit-exact, not accumulated float
+    // noise, the same precedent `paint.rs`'s own colour assertions
+    // already allow this lint for.
+    #[allow(clippy::float_cmp)]
+    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for(theme_name: &str) {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = themes.register(LIGHT_THEME_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match themes.resolve(theme_name, &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        workspace
+            .tree
+            .compute_layout(MIN_WINDOW_WIDTH as f32, MIN_WINDOW_HEIGHT as f32);
+
+        let order = workspace.tree.paint_order();
+        assert!(
+            order.contains(&handle.root),
+            "the real paint order must reach the dialog's own root at all"
         );
 
-        assert!(opened, "a dialog was open, so the click must be swallowed");
-        assert_eq!(
-            dialog,
-            Some(handle),
-            "clicking outside the dialog's own buttons must not close it"
+        let paints = match aurora_widgets::paint_widget(
+            &workspace.tree,
+            handle.root,
+            &theme,
+            &scales,
+            1.0,
+        ) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            !paints.is_empty(),
+            "a dialog open in the real workspace must paint at least one shape"
+        );
+        for (mesh, _) in &paints {
+            assert!(
+                !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+                "every shape must tessellate to real geometry, not an empty mesh \
+                 clipped away by an ancestor: {paints:?}"
+            );
+        }
+        let [r, g, b] = theme.surface.panel.to_srgb_f32();
+        assert!(
+            paints.iter().any(|(_, color)| *color != [r, g, b, 1.0]),
+            "and at least one of them must not be the panel colour behind it -- \
+             which is the whole Light-theme bug 0.79.1 fixed, restated against the \
+             real tree: {paints:?}"
         );
     }
 
@@ -25779,6 +40133,86 @@ mod tests {
             PointerButton::Primary,
             (0.0, 0.0),
         ));
+    }
+
+    /// A modal dialog is an *overlay*: it must not participate in
+    /// `workspace.root`'s own `Row` flow beside the canvas, the divider
+    /// and the rail, because every pixel it takes there is a pixel the
+    /// canvas loses while the dialog is open.
+    #[test]
+    fn an_open_dialog_does_not_take_any_width_from_the_canvas() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+
+        workspace.tree.compute_layout(1000.0, 800.0);
+        let Some(baseline) = workspace.tree.bounds(workspace.canvas_area) else {
+            unreachable!("just laid out");
+        };
+
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(with_dialog) = workspace.tree.bounds(workspace.canvas_area) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            with_dialog, baseline,
+            "an open dialog must be an overlay, not a fourth in-flow sibling \
+             stealing width from the canvas"
+        );
+    }
+
+    #[test]
+    fn the_open_dialog_is_centered_over_the_workspace_under_real_layout() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(bounds) = workspace.tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            bounds.width > 0 && bounds.height > 0,
+            "the dialog must have a real box: {bounds:?}"
+        );
+        // `<= 1`, not exact equality: `apply_taffy_layout` truncates an
+        // `f32` origin to an `i64`, so a window whose free space on an
+        // axis is odd centres to two gaps a pixel apart. Correct, and
+        // the exact form this replaced held only because 1000 and 800
+        // happen to leave even free space on both axes here.
+        let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
+        assert!(
+            (bounds.x - right_gap).abs() <= 1,
+            "the dialog must be horizontally centred over the window: {bounds:?}"
+        );
+        let bottom_gap = 800 - (bounds.y + i64::from(bounds.height));
+        assert!(
+            (bounds.y - bottom_gap).abs() <= 1,
+            "and vertically centred too, which is what keeps its buttons on \
+             screen in a short window: {bounds:?}"
+        );
+        assert!(
+            bounds.y > 0,
+            "the dialog must sit below the window's own top edge: {bounds:?}"
+        );
+        assert!(
+            bounds.y + i64::from(bounds.height) < 800,
+            "the dialog must not stretch to the window's full height: {bounds:?}"
+        );
     }
 
     /// The whole point of 0.74.0, exercised end to end on a real file
@@ -29787,6 +44221,778 @@ mod tests {
         assert!(
             fed_back.x > real_bounds.x && fed_back.y > real_bounds.y,
             "and it diverges by running away from the pointer: {fed_back:?} vs {real_bounds:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 0.87.0: a visible layer with nothing *stored* at a tile resolves
+    // to `None`, so no composite work is paid for it.
+    // ---------------------------------------------------------------
+
+    /// A tile coordinate no fixture below ever paints. Every fixture here
+    /// fills tile `(0, 0)` only, and a layer's window is at most one tile
+    /// wide, so nothing on any surface can overlap this one.
+    const UNPAINTED_TILE: aurora_tile::TileId = aurora_tile::TileId { x: 5, y: 5 };
+
+    /// [`UNPAINTED_TILE`]'s own document-space origin, derived from
+    /// `aurora_tile::TILE` rather than written out as a pixel constant —
+    /// what [`resolve_tile`]/[`begin_gpu_composite_tile`] want as
+    /// `doc_origin` for that tile.
+    fn unpainted_tile_origin() -> (i64, i64) {
+        let tile = i64::from(aurora_tile::TILE);
+        (
+            i64::from(UNPAINTED_TILE.x) * tile,
+            i64::from(UNPAINTED_TILE.y) * tile,
+        )
+    }
+
+    /// The 10×10 rect at the document origin every fixture here uses for
+    /// a layer that shares the composite's own reference origin, matching
+    /// [`solid_root_stack`]'s own.
+    fn origin_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    /// The same rect displaced half a tile to the right, so a layer using
+    /// it has an origin *different* from the composite's reference origin
+    /// and therefore takes [`resolve_tile`]'s windowed branch (and lands
+    /// on a fractional tile boundary, so the window really does straddle
+    /// two of the surface's own tile columns).
+    fn half_tile_offset_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: i64::from(aurora_tile::TILE) / 2,
+            ..origin_bounds()
+        }
+    }
+
+    /// Adds a root-level pixel layer at `bounds` and returns
+    /// `(id, surface)`, leaving its surface completely unwritten — the
+    /// "never painted" half of every fixture below.
+    fn add_unpainted_root(
+        layers: &mut aurora_doc::LayerTree,
+        name: &str,
+        bounds: aurora_core::Rect,
+    ) -> (aurora_doc::LayerId, aurora_tile::SurfaceId) {
+        let id = match layers.add_pixel_layer(name, bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        (id, surface)
+    }
+
+    /// Both of [`resolve_tile`]'s own `Pixel` branches, at a tile their
+    /// layer has never stored anything at (0.87.0).
+    ///
+    /// Before this, both asked the store for texels unconditionally and
+    /// got `Some(`all-zero texels`)` back — the tile store's lazy paging
+    /// *materializes* a tile for any coordinate ever asked for rather
+    /// than signalling absence — so every caller then paid a full
+    /// contributor's worth of compositing work to add nothing. Each
+    /// branch now checks first: `aurora_tile::TileStore::contains_tile`
+    /// for the same-origin one, [`LayerWindow::is_blank`] for the
+    /// windowed one.
+    ///
+    /// Both directions are asserted per branch, because "returns `None`"
+    /// is trivially satisfiable by a guard that fires always: each layer
+    /// is also queried at the tile it *does* have content at, and must
+    /// still resolve there. The `contains_tile` assertions at the end are
+    /// the other half of the point — the guard must *avoid the work*, not
+    /// merely discard its result, and a `TileStore::get` would have left
+    /// the tile behind as resident.
+    #[test]
+    fn resolve_tile_returns_none_for_a_visible_layer_with_nothing_stored_at_the_tile() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let painted_tile = aurora_tile::TileId { x: 0, y: 0 };
+
+        let (same_origin, same_surface) =
+            add_unpainted_root(&mut layers, "same-origin", origin_bounds());
+        fill_solid(&mut store, same_surface, painted_tile, [1.0, 0.0, 0.0, 1.0]);
+        let (windowed, windowed_surface) =
+            add_unpainted_root(&mut layers, "windowed", half_tile_offset_bounds());
+        fill_solid(
+            &mut store,
+            windowed_surface,
+            painted_tile,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        // A fresh budget per call: `CompositeBudget::for_pass` sizes its
+        // node allowance to the document, and four calls against one
+        // budget would exhaust it and start returning `None` for the
+        // wrong reason entirely.
+        let resolve = |store: &mut aurora_tile::TileStore,
+                       id: aurora_doc::LayerId,
+                       tile_id: aurora_tile::TileId,
+                       doc_origin: (i64, i64)| {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            resolve_tile(
+                id,
+                &layers,
+                store,
+                tile_id,
+                doc_origin,
+                (0, 0),
+                1,
+                &mut budget,
+            )
+        };
+
+        // --- the same-origin branch (`origin == reference_origin`) ---
+        assert!(
+            resolve(&mut store, same_origin, painted_tile, (0, 0)).is_some(),
+            "setup: the same-origin layer must still resolve at the tile it really was painted \
+             at -- without this the `None` below would be satisfied by a guard that fires \
+             unconditionally"
+        );
+        assert!(
+            resolve(
+                &mut store,
+                same_origin,
+                UNPAINTED_TILE,
+                unpainted_tile_origin()
+            )
+            .is_none(),
+            "a visible layer with nothing stored at this tile must resolve to None, not to a \
+             tile-sized buffer of zeros the caller then composites for real"
+        );
+
+        // --- the windowed branch (`origin != reference_origin`) ---
+        assert!(
+            resolve(&mut store, windowed, painted_tile, (0, 0)).is_some(),
+            "setup: the moved layer's window over composite tile (0, 0) really does overlap its \
+             own stored source tile, so this must resolve -- the same non-vacuity guard as above"
+        );
+        assert!(
+            resolve(
+                &mut store,
+                windowed,
+                UNPAINTED_TILE,
+                unpainted_tile_origin()
+            )
+            .is_none(),
+            "a moved layer whose window overlaps no stored source tile at all must resolve to \
+             None (LayerWindow::is_blank), not materialize the all-zero buffer into_texels would"
+        );
+
+        // Nothing above may have *created* a tile to learn it was blank.
+        // The unpainted composite tile's own coordinate for the
+        // same-origin layer, and all four source tiles its window can
+        // straddle for the moved one.
+        assert!(
+            !store.contains_tile(same_surface, UNPAINTED_TILE),
+            "the guard must skip the read, not discard its result: TileStore::get would have \
+             allocated this tile, made it resident and possibly evicted a real one"
+        );
+        for (x, y) in [
+            (UNPAINTED_TILE.x - 1, UNPAINTED_TILE.y),
+            (UNPAINTED_TILE.x, UNPAINTED_TILE.y),
+            (UNPAINTED_TILE.x - 1, UNPAINTED_TILE.y + 1),
+            (UNPAINTED_TILE.x, UNPAINTED_TILE.y + 1),
+        ] {
+            let tile_id = aurora_tile::TileId { x, y };
+            assert!(
+                !store.contains_tile(windowed_surface, tile_id),
+                "read_layer_window must not have materialized source tile {tile_id:?} either"
+            );
+        }
+    }
+
+    /// The distinction the guard above is only safe *because* of: "never
+    /// stored" is not "stored, and fully transparent."
+    ///
+    /// A tile painted and then erased to `(0, 0, 0, 0)` is real content —
+    /// it is what an eraser stroke produces — and
+    /// `aurora_tile::TileStore::contains_tile` reports it as present,
+    /// because it consults residency (`resident`/`pending`/`paged_out`)
+    /// and never tile *contents*. So it must keep going through the whole
+    /// ordinary path. A guard written against texel values instead of
+    /// residency would pass every other test in this group and fail this
+    /// one.
+    #[test]
+    fn resolve_tile_still_resolves_a_tile_written_to_full_transparency() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let (erased, surface) = add_unpainted_root(&mut layers, "erased", origin_bounds());
+        fill_solid(&mut store, surface, tile_id, [0.0, 0.0, 0.0, 0.0]);
+
+        assert!(
+            store.contains_tile(surface, tile_id),
+            "setup: a tile written to full transparency is stored content -- if contains_tile \
+             ever stops saying so, this whole round's guard changes meaning"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let resolved = resolve_tile(
+            erased,
+            &layers,
+            &mut store,
+            tile_id,
+            (0, 0),
+            (0, 0),
+            1,
+            &mut budget,
+        );
+        let Some((texels, _, _)) = resolved else {
+            unreachable!("an erased tile is stored content and must still resolve");
+        };
+        assert_eq!(
+            texels.len(),
+            aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS,
+            "a resolved tile is always a full tile-sized buffer"
+        );
+        assert!(
+            texels.iter().all(|sample| sample.to_f32() <= 0.0),
+            "and its texels really are the fully transparent ones that were written"
+        );
+    }
+
+    /// Every `aurora_doc::BlendMode` there is, in the order
+    /// `aurora-doc` declares them — all 27, so no mode can be added
+    /// without deciding whether it belongs in the exhaustive
+    /// differential test below.
+    const EVERY_BLEND_MODE: [aurora_doc::BlendMode; 27] = [
+        aurora_doc::BlendMode::Normal,
+        aurora_doc::BlendMode::Dissolve,
+        aurora_doc::BlendMode::Darken,
+        aurora_doc::BlendMode::Multiply,
+        aurora_doc::BlendMode::ColorBurn,
+        aurora_doc::BlendMode::LinearBurn,
+        aurora_doc::BlendMode::DarkerColor,
+        aurora_doc::BlendMode::Lighten,
+        aurora_doc::BlendMode::Screen,
+        aurora_doc::BlendMode::ColorDodge,
+        aurora_doc::BlendMode::LinearDodge,
+        aurora_doc::BlendMode::LighterColor,
+        aurora_doc::BlendMode::Overlay,
+        aurora_doc::BlendMode::SoftLight,
+        aurora_doc::BlendMode::HardLight,
+        aurora_doc::BlendMode::VividLight,
+        aurora_doc::BlendMode::LinearLight,
+        aurora_doc::BlendMode::PinLight,
+        aurora_doc::BlendMode::HardMix,
+        aurora_doc::BlendMode::Difference,
+        aurora_doc::BlendMode::Exclusion,
+        aurora_doc::BlendMode::Subtract,
+        aurora_doc::BlendMode::Divide,
+        aurora_doc::BlendMode::Hue,
+        aurora_doc::BlendMode::Saturation,
+        aurora_doc::BlendMode::Color,
+        aurora_doc::BlendMode::Luminosity,
+    ];
+
+    /// Why `None` is a *bit-identical* substitute for
+    /// `Some(`all-zero texels`)` rather than merely a close one, checked
+    /// rather than argued — and checked against **both** kinds of blank
+    /// layer, because only one of them takes the 0.87.0 shortcut:
+    ///
+    /// - a **never-painted** layer, which [`resolve_tile`] now skips
+    ///   outright, and
+    /// - an **erased** layer, painted and then written to
+    ///   `(0, 0, 0, 0)`, which deliberately still goes down the full
+    ///   path and really does run every mode's blend math over blank
+    ///   texels.
+    ///
+    /// Both must leave the baseline composite untouched, and the second
+    /// is what makes the first's justification testable rather than
+    /// merely asserted: it is the arm that actually evaluates the per-mode
+    /// formula the skip is claimed to be equivalent to.
+    ///
+    /// `aurora_render::composite_layer_into` scales the whole per-mode
+    /// blend result by `as = src_a * opacity`, which is zero throughout a
+    /// blank tile, so the fold reduces to `Co = Cb` and
+    /// `result_a = dst_a`. That is a property of the fold rather than of
+    /// any one formula — **given a finite blend result**, which is the
+    /// real precondition and was not universally true before 0.87.1:
+    /// `0.0 * NaN` is NaN, not `0.0`, so a mode that can return NaN
+    /// corrupts the destination instead of leaving it alone. 0.87.0's
+    /// own version of this test looped over five modes and a single
+    /// in-`[0,1]` backdrop, and missed exactly that. It now covers
+    /// [`EVERY_BLEND_MODE`] against three backdrops, including an
+    /// achromatic **HDR** one (channels at `4.0`, a legitimate unclamped
+    /// float-TIFF import under invariant §7.3.1b) — the fixture the NaN
+    /// in `aurora_render`'s `clip_color` needed, which made
+    /// `Hue`/`Saturation`/`Color` fail the erased arm below until that
+    /// bug was fixed in the same commit as this comment.
+    ///
+    /// `assert_eq!` on the raw `half::f16` buffers, not a tolerance: the
+    /// claim is that adding the layer changes *nothing*, and a tolerance
+    /// would hide a real one-bit difference. NaN would also make
+    /// `assert_eq!` fail all by itself (`NaN != NaN`), but the finiteness
+    /// of the *baseline* is asserted separately so a NaN backdrop cannot
+    /// make the comparison fail for the wrong reason.
+    #[test]
+    fn a_never_painted_visible_layer_changes_no_composited_texel_whatever_its_blend_mode() {
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+
+        for backdrop in [
+            // An ordinary in-gamut, translucent backdrop.
+            [0.25, 0.5, 0.75, 0.8],
+            // Achromatic and out of `[0,1]`: the pair of properties the
+            // non-separable modes' `clip_color` NaN needed.
+            [4.0, 4.0, 4.0, 1.0],
+            // Chromatic and out of `[0,1]`, so `set_sat` does not
+            // collapse and the HDR range is still exercised.
+            [2.0, 3.0, 4.0, 1.0],
+        ] {
+            // `ghost_is_erased == false` is the never-painted layer
+            // 0.87.0's guard skips; `true` writes it to full
+            // transparency first, so `contains_tile` reports it present
+            // and it takes the ordinary path through the real blend
+            // math instead.
+            //
+            // **A fresh `TileStore` per case, deliberately.** A layer's
+            // `SurfaceId` is derived from its `LayerId`, and `LayerId`s
+            // restart per `LayerTree`, so the erased case's write would
+            // otherwise still be sitting on the *next* tree's ghost
+            // surface and quietly turn the never-painted case into a
+            // second erased one. Caught by this test's own
+            // `contains_tile` setup assertion below when the store was
+            // shared -- a live demonstration of the derived-surface-id
+            // aliasing recorded as a follow-on in PLAN.md's M1.10
+            // "Empty-tile GPU composite work" residuals.
+            for ghost_is_erased in [false, true] {
+                let (_dir, mut store) = real_tile_store();
+                let painted_only = solid_root_stack(
+                    &mut store,
+                    &[("painted", aurora_doc::BlendMode::Normal, 1.0, backdrop)],
+                );
+                let mut budget = CompositeBudget::for_pass(&painted_only);
+                let (baseline, _folded) = composite_roots_into_tile(
+                    &painted_only,
+                    &mut store,
+                    tile_id,
+                    (0, 0),
+                    (0, 0),
+                    &mut budget,
+                );
+                assert!(
+                    baseline.iter().any(|sample| sample.to_f32() > 0.0),
+                    "setup: the {backdrop:?} baseline must composite to something -- two \
+                     all-zero buffers would agree vacuously"
+                );
+                assert!(
+                    baseline.iter().all(|sample| sample.to_f32().is_finite()),
+                    "setup: the {backdrop:?} baseline itself must be finite, or every \
+                     comparison below fails for the wrong reason"
+                );
+
+                let mut layers = solid_root_stack(
+                    &mut store,
+                    &[("painted", aurora_doc::BlendMode::Normal, 1.0, backdrop)],
+                );
+                // Added last, so it is composited last: on top of the
+                // painted layer, where a stray contribution would be
+                // most visible.
+                let (ghost, ghost_surface) =
+                    add_unpainted_root(&mut layers, "blank", origin_bounds());
+                if ghost_is_erased {
+                    fill_solid(&mut store, ghost_surface, tile_id, [0.0, 0.0, 0.0, 0.0]);
+                }
+                assert_eq!(
+                    store.contains_tile(ghost_surface, tile_id),
+                    ghost_is_erased,
+                    "setup: only the erased ghost may be stored content, or this loop is \
+                     testing the same path twice"
+                );
+
+                for mode in EVERY_BLEND_MODE {
+                    if let Err(err) = layers.set_blend_mode(ghost, mode) {
+                        unreachable!("{err:?}");
+                    }
+                    let mut budget = CompositeBudget::for_pass(&layers);
+                    let (with_ghost, _folded) = composite_roots_into_tile(
+                        &layers,
+                        &mut store,
+                        tile_id,
+                        (0, 0),
+                        (0, 0),
+                        &mut budget,
+                    );
+                    assert_eq!(
+                        with_ghost, baseline,
+                        "adding a blank layer (erased: {ghost_is_erased}) at {mode:?} over a \
+                         {backdrop:?} backdrop changed the composite -- a fully transparent \
+                         contributor has to leave every texel exactly as it was, whether it is \
+                         skipped (0.87.0's guard) or actually composited"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The GPU half of the same claim, and the one that measures the
+    /// *work* rather than the pixels: a tile no visible layer has ever
+    /// painted must cost zero `queue.submit` calls and create no per-layer
+    /// source texture, even though every layer's declared `bounds`
+    /// overlaps it (all three are 10×10 at the document origin, which the
+    /// tile at [`UNPAINTED_TILE`] does not contain — and `bounds` is a
+    /// position hint the compositing path deliberately does not treat as
+    /// a clip, so it is `contains_tile` and nothing else that makes this
+    /// bail fire).
+    ///
+    /// Both counters, because they fail differently: a submit count above
+    /// zero means the encoder was finished and real GPU work executed,
+    /// while the `Darken` dispatch count is the one signal that
+    /// distinguishes "the blend arm ran" from "it silently fell back",
+    /// which is the gap `GpuBlendDispatches` exists for.
+    #[test]
+    fn begin_gpu_composite_tile_issues_no_submit_for_a_tile_no_visible_layer_has_ever_painted() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Darken,
+                    1.0,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: this stack must qualify for the GPU path, or this would be measuring a case \
+             the real caller never takes"
+        );
+
+        // Zeroed inside `real_gpu_context`'s own lock, so what is read
+        // below is this call's work and nothing else's.
+        let _ = take_gpu_composite_submit_count();
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken);
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            UNPAINTED_TILE,
+            unpainted_tile_origin(),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_none(),
+            "no layer has stored content at this tile, so no accumulator may be created and the \
+             caller must fall this one tile back to the CPU path"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            0,
+            "a tile nobody has painted must cost zero queue.submit calls -- before 0.87.0 it \
+             cost one, having uploaded, blended and read back a whole tile of transparency per \
+             visible layer"
+        );
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Darken),
+            0,
+            "and no blend pass may be recorded for it either -- the Darken layer's own arm is \
+             the one that can be observed directly"
+        );
+    }
+
+    /// The windowed branch's own work assertion, structured to prove
+    /// itself non-vacuous: the *same* moved layer is composited twice,
+    /// first at the composite tile its window really does overlap stored
+    /// content at (one submit, real work), then at one where it overlaps
+    /// none (no submit at all). A guard that bailed unconditionally would
+    /// fail the first half; the pre-0.87.0 behaviour fails the second.
+    #[test]
+    fn begin_gpu_composite_tile_issues_no_submit_for_a_moved_layer_whose_window_is_unstored() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let (_moved, surface) = add_unpainted_root(&mut layers, "moved", half_tile_offset_bounds());
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.25, 0.5, 0.75, 1.0],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: one Normal-blend pixel layer must qualify for the GPU path"
+        );
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let _ = take_gpu_composite_submit_count();
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let overlapping = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            overlapping.is_some(),
+            "setup: this composite tile's window really does overlap the layer's own stored \
+             source tile, so it must composite for real"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "setup: and that costs exactly one submit -- without this half, the zero below would \
+             be satisfied by a guard that never lets anything through"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let unstored = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            UNPAINTED_TILE,
+            unpainted_tile_origin(),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            unstored.is_none(),
+            "a window overlapping no stored source tile must bail before any GPU work"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            0,
+            "and cost zero queue.submit calls"
+        );
+    }
+
+    /// End to end through the real caller, on real hardware: a
+    /// never-painted layer must be invisible to the *composited output*
+    /// too, on the GPU path as well as the CPU one, at every blend mode
+    /// `document_qualifies_for_gpu_compositing` admits.
+    ///
+    /// Three comparisons per mode, each catching something different:
+    /// the two paths must agree with each other (bit for bit — both fold
+    /// the same single opaque layer, so there is no arithmetic to differ
+    /// on), and each must agree with the *painted layer composited
+    /// alone*, which is what "the ghost contributes nothing" actually
+    /// means.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let rgba = [0.5, 0.75, 0.25, 1.0];
+
+        let painted_only = solid_root_stack(
+            &mut store,
+            &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+        );
+        let (alone_gpu, alone_cpu) = gpu_and_cpu_all_texels(&context, &mut store, &painted_only);
+        assert_eq!(
+            alone_gpu, alone_cpu,
+            "setup: the painted layer alone must composite identically on both paths"
+        );
+        assert!(
+            alone_gpu.iter().any(|channel| *channel > 0.0),
+            "setup: and to something non-zero -- otherwise every comparison below is vacuous"
+        );
+
+        // **All seventeen modes `document_qualifies_for_gpu_compositing`
+        // admits, and this list has to keep pace with it** -- the test's
+        // own name says "every expressible mode", so a mode ported to the
+        // GPU path but not added here turns that name into a false claim
+        // without anything going red. `Screen` was added in 0.102.0, the
+        // round that ported it.
+        //
+        // **`Difference` is the mode 0.104.0 admitted at the predicate
+        // without adding here**, which is exactly the drift the paragraph
+        // above exists to prevent, and it went unnoticed for a full round:
+        // between 0.104.0 and 0.105.0 this loop's name claimed seven modes
+        // and covered six -- seven, not eight, because the predicate
+        // admitted exactly seven in that window (`LinearDodge` is what
+        // made it eight, and 0.105.0 is the round that added it). 0.105.0
+        // added both `Difference` and its own `LinearDodge`. Neither
+        // addition surfaced a failure -- the never-painted-layer property
+        // genuinely does hold for both -- so the cost of the drift was a
+        // round of false coverage, not a bug in the shipped path. Add a
+        // mode here in the same commit that admits it at the predicate.
+        //
+        // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge`
+        // (0.108.0), `Overlay` (0.110.0), `HardLight` (0.111.0) and
+        // `LinearLight` (0.113.0) were each
+        // added in exactly that same commit, which is the convention
+        // working rather than six more data points
+        // for the drift.
+        //
+        // **Then it drifted a second time, for two rounds running, and this
+        // is the round that caught it.** `VividLight` (0.114.0) and
+        // `HardMix` (0.115.0) were both admitted at the predicate without
+        // being added here, so this list stood at fourteen entries against
+        // a sixteen-mode predicate. Neither omission is symmetric with the
+        // other in provenance and both are stated rather than blurred:
+        // `VividLight`'s **predates this fix by a full round** -- 0.114.0
+        // took the predicate to fifteen and left both this array and the
+        // "All fourteen" count above untouched, and 0.114.1, whose whole
+        // subject was eight stale counts elsewhere in this crate, did not
+        // find it either -- while `HardMix`'s was introduced by 0.115.0
+        // itself, whose own count-sweep re-verified `ALL_BLEND_PASSES`,
+        // `GpuBlendDispatch::ALL`, `GpuBlendDispatches` and the predicate's
+        // own header sentence and never reached this array. So the drift
+        // 0.104.0 demonstrated once is now a *recurring* failure of the
+        // convention, not a one-off: the header above is the only thing
+        // guarding this array and it was read past three times. As in
+        // 0.104.0, adding the two modes surfaced no failure -- the
+        // never-painted-layer property genuinely holds for both -- so the
+        // cost was two rounds of false coverage, not a bug in the shipped
+        // path.
+        //
+        // **`PinLight` (0.116.0) was added in the same commit that admitted
+        // it at the predicate, which is the convention working -- and this
+        // round is the first in which the array's own header count was
+        // updated in that same edit.** 0.115.1's fix left the header reading
+        // "All sixteen" against sixteen entries, correct at the time; the
+        // failure mode both drifts shared was that the count and the array
+        // are two separate literals a round can update independently. They
+        // are updated together here, and a round adding an entry should
+        // treat the sentence above as part of the same edit rather than as
+        // prose to read past.
+        //
+        // Nothing in this crate makes the omission a
+        // compile error -- `every_gpu_blend_math_dispatch_arm_has_a_
+        // fixture_that_could_see_a_transposed_argument` anchors on the
+        // counter enum, not on this list, and says so in its own "what it
+        // does not do" section -- so this stays a hand-maintained list
+        // whose only guard is the comment above it. **Measured in 0.116.0,
+        // not assumed**: that round deleted its own new entry from the array
+        // below and the whole workspace stayed green, so the guard really is
+        // the comment and nothing else.
+        for mode in [
+            aurora_doc::BlendMode::Normal,
+            aurora_doc::BlendMode::Multiply,
+            aurora_doc::BlendMode::Darken,
+            aurora_doc::BlendMode::Lighten,
+            aurora_doc::BlendMode::Screen,
+            aurora_doc::BlendMode::Difference,
+            aurora_doc::BlendMode::LinearDodge,
+            aurora_doc::BlendMode::LinearBurn,
+            aurora_doc::BlendMode::ColorBurn,
+            aurora_doc::BlendMode::ColorDodge,
+            aurora_doc::BlendMode::Overlay,
+            aurora_doc::BlendMode::HardLight,
+            aurora_doc::BlendMode::LinearLight,
+            aurora_doc::BlendMode::VividLight,
+            aurora_doc::BlendMode::HardMix,
+            aurora_doc::BlendMode::PinLight,
+            aurora_doc::BlendMode::Dissolve,
+        ] {
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+            );
+            let (ghost, _) = add_unpainted_root(&mut layers, "never-painted", origin_bounds());
+            if let Err(err) = layers.set_blend_mode(ghost, mode) {
+                unreachable!("{err:?}");
+            }
+            assert!(
+                document_qualifies_for_gpu_compositing(&layers),
+                "setup: a painted Normal layer under a never-painted {mode:?} one must still \
+                 qualify for the GPU path"
+            );
+
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(
+                gpu, cpu,
+                "the GPU and CPU paths disagreed with a never-painted {mode:?} layer in the stack"
+            );
+            assert_eq!(
+                gpu, alone_gpu,
+                "a never-painted {mode:?} layer changed the GPU path's composited output -- it \
+                 must contribute exactly nothing"
+            );
+            assert_eq!(
+                cpu, alone_cpu,
+                "a never-painted {mode:?} layer changed the CPU path's composited output"
+            );
+        }
+    }
+
+    /// [`resolve_tile_still_resolves_a_tile_written_to_full_transparency`]'s
+    /// GPU counterpart, and the one that pins the *cost* side of that
+    /// distinction: an erased tile is real content, so it must still be
+    /// uploaded, blended, submitted and read back. One submit, not zero.
+    #[test]
+    fn begin_gpu_composite_tile_still_composites_a_tile_written_to_full_transparency() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let layers = solid_root_stack(
+            &mut store,
+            &[(
+                "erased",
+                aurora_doc::BlendMode::Normal,
+                1.0,
+                [0.0, 0.0, 0.0, 0.0],
+            )],
+        );
+        let Some(surface) = layers.roots().first().and_then(|&id| layers.surface_id(id)) else {
+            unreachable!("the fixture has exactly one root pixel layer");
+        };
+        assert!(
+            store.contains_tile(surface, tile_id),
+            "setup: the erased tile must be stored content -- that is the whole premise"
+        );
+
+        let _ = take_gpu_composite_submit_count();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            tile_id,
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_some(),
+            "a tile written to full transparency is real content and must still composite -- \
+             skipping it would silently change what an eraser stroke means"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "and it must cost the ordinary one submit, exactly like any other stored tile"
         );
     }
 }

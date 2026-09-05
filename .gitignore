@@ -32,6 +32,11 @@ criterion/
 .env
 .env.local
 *.local.toml
+# Session-scratch project-state summary, regenerated locally and never a
+# source of truth (PLAN.md is). Accidentally committed in 0.94.0,
+# untracked, then accidentally committed again in 0.95.0 -- hence the
+# ignore, added in 0.95.1 so it cannot come back a third time.
+/report.md
 
 # Editors & IDEs
 .idea/

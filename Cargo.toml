@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.75.1"
+version = "0.116.1"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -103,6 +103,14 @@ unicode-segmentation = "1"
 # picks 3.0 and neither compiles.
 tempfile = "3.20"
 criterion = "0.5"
+# PRD §8's own pre-decided crate for CPU tile parallelism ("rayon for CPU
+# tile parallelism") -- 0.96.0 is its first real use: `aurora_gpu::
+# residency`'s premultiply/serialize loop, split across fixed-size blocks
+# of one tile. Already in `Cargo.lock` as a transitive *dev*-dependency of
+# `criterion`; this promotes it to a genuine runtime dependency of exactly
+# one crate. rayon/rayon-core/crossbeam-deque/-epoch/-utils/either are all
+# MIT OR Apache-2.0, already on deny.toml's allow list -- no new exception.
+rayon = "1"
 # PRD §8.5's "image-diff golden tests for render correctness" (aurora-testkit):
 # encode/decode for golden/actual/diff PNGs. image-rs's own PNG-only crate --
 # lighter than the full `image` crate, which this doesn't need.

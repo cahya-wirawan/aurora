@@ -100,6 +100,49 @@ pub(crate) struct RemovedSubtree {
     pub(crate) entries: Vec<(LayerId, LayerEntry)>,
 }
 
+impl RemovedSubtree {
+    /// Every `aurora_tile::SurfaceId` the captured entries address —
+    /// the detached counterpart of [`LayerTree::all_surfaces`], for a
+    /// subtree that is no longer in any tree and so cannot be asked.
+    ///
+    /// **This deliberately mirrors [`LayerTree::surface_id`] and
+    /// [`LayerTree::mask_surface_id`] by hand**, because their real
+    /// bodies need a live tree to look an entry's kind up in and there
+    /// isn't one here. The two guards reproduced below are theirs,
+    /// exactly:
+    ///
+    /// - a content surface only for [`LayerKind::Pixel`], and only for
+    ///   an id below [`crate::MASK_SURFACE_BIT`] (an id with that bit
+    ///   set would address some other layer's *mask* storage);
+    /// - a mask surface for any kind, groups included, but only for an
+    ///   id below `MASK_SURFACE_BIT - 1` (the single id whose masked
+    ///   form is `u64::MAX`, `aurora-app`'s reserved composite
+    ///   surface).
+    ///
+    /// If these ever diverge from the two functions they copy, this
+    /// returns a surface id some *other* owner holds — freeing the
+    /// wrong layer's pixels, or sweeping the composite surface — so
+    /// change all three together or none.
+    pub(crate) fn surfaces(&self) -> Vec<aurora_tile::SurfaceId> {
+        // Two per entry, not one: a pixel layer contributes both a
+        // content and a mask surface below.
+        let mut out = Vec::with_capacity(self.entries.len().saturating_mul(2));
+        for (id, entry) in &self.entries {
+            if id.to_raw() < crate::MASK_SURFACE_BIT
+                && matches!(entry.kind, LayerKind::Pixel { .. })
+            {
+                out.push(aurora_tile::SurfaceId::from_raw(id.to_raw()));
+            }
+            if id.to_raw() < crate::MASK_SURFACE_BIT - 1 {
+                out.push(aurora_tile::SurfaceId::from_raw(
+                    id.to_raw() | crate::MASK_SURFACE_BIT,
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// A forest of layers: pixel layers and groups, nested to any depth.
 ///
 /// **Ordering convention, used throughout this crate**: sibling lists
@@ -1737,6 +1780,39 @@ impl LayerTree {
         ))
     }
 
+    /// Every `aurora_tile::SurfaceId` this tree's layers currently
+    /// address — each pixel layer's own content surface
+    /// ([`Self::surface_id`]) and every layer's mask surface
+    /// ([`Self::mask_surface_id`]), for every entry the tree holds.
+    ///
+    /// Crate-private on purpose: this module owns the two derivation
+    /// rules, so the enumeration of their results belongs beside them
+    /// rather than in a caller that would have to re-derive the guards.
+    /// [`crate::forget_document_surfaces`] is the one consumer.
+    ///
+    /// Walks `layers` itself rather than recursing from
+    /// [`Self::roots`], because the point is exhaustiveness: an entry
+    /// unreachable from any root still owns tiles in the store, and
+    /// `LayerTreeRepr`'s own `validate_shape` only guarantees
+    /// reachability for a tree that came in through deserialization.
+    ///
+    /// A mask surface is emitted whether or not the layer currently
+    /// carries a [`crate::LayerMask`] — deliberately. `remove_mask`
+    /// drops only the struct, leaving whatever coverage was painted
+    /// under that derived surface behind (see [`crate::mask`]'s own
+    /// lifecycle notes), so gating on `mask.is_some()` would leave
+    /// exactly the residue this enumeration exists to find.
+    pub(crate) fn all_surfaces(&self) -> Vec<aurora_tile::SurfaceId> {
+        // Two per layer, not one: a pixel layer contributes both a
+        // content and a mask surface below.
+        let mut out = Vec::with_capacity(self.layers.len().saturating_mul(2));
+        for id in self.layers.keys() {
+            out.extend(self.surface_id(*id));
+            out.extend(self.mask_surface_id(*id));
+        }
+        out
+    }
+
     #[must_use]
     pub fn name(&self, id: LayerId) -> Option<&str> {
         self.layers.get(&id).map(|entry| entry.name.as_str())
@@ -1917,6 +1993,21 @@ impl LayerTree {
     /// every save and every crash-recovery autosave for the rest of the
     /// session. A rectangle no writer will accept has no business
     /// entering the tree, so it is refused where it is created.
+    ///
+    /// # This does not clear residual coverage
+    ///
+    /// A mask surface id is derived from the layer's own id
+    /// ([`Self::mask_surface_id`]), so a mask added here lands on the
+    /// same surface any *previous* mask on this layer painted into, and
+    /// inherits its pixels. This function holds no
+    /// `aurora_tile::TileStore` handle and so cannot do anything about
+    /// that; keeping [`LayerTree`] free of the store is deliberate.
+    ///
+    /// **[`crate::History::add_mask`] is the caller that closes the
+    /// gap**, and is what any new caller should use. One reaching this
+    /// directly must call [`crate::mask::forget_mask_coverage`] itself.
+    /// See [`crate::mask`]'s lifecycle notes for the full account of
+    /// this bypass and why the seam sits where it does.
     pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         if entry.mask.is_some() {
@@ -5894,5 +5985,134 @@ mod tests {
         };
         assert_eq!(one.len(), 1);
         assert_eq!(one.roots().len(), 1);
+    }
+
+    // ---- `RemovedSubtree::surfaces` guard mirroring ----------------
+
+    /// The raw layer ids where `RemovedSubtree::surfaces`'s two
+    /// hand-copied guards can go wrong: both sides of
+    /// `MASK_SURFACE_BIT` and of `MASK_SURFACE_BIT - 1` (the single id
+    /// whose masked form is `aurora-app`'s reserved `u64::MAX`
+    /// composite surface), an ordinary id with the mask bit set, and
+    /// the very top of the range.
+    fn surface_guard_boundary_ids() -> Vec<u64> {
+        vec![
+            0,
+            1,
+            5,
+            crate::MASK_SURFACE_BIT - 2,
+            crate::MASK_SURFACE_BIT - 1,
+            crate::MASK_SURFACE_BIT,
+            crate::MASK_SURFACE_BIT + 1,
+            crate::MASK_SURFACE_BIT | 5,
+            u64::MAX - 1,
+            u64::MAX,
+        ]
+    }
+
+    /// A one-entry `RemovedSubtree` rooted at `raw`, of either kind.
+    fn boundary_subtree(raw: u64, pixel: bool) -> super::RemovedSubtree {
+        let id = super::LayerId::from_raw(raw);
+        let entry = if pixel {
+            pixel_entry("boundary", None)
+        } else {
+            group_entry("boundary", None, Vec::new())
+        };
+        super::RemovedSubtree {
+            root: id,
+            parent: None,
+            index: 0,
+            entries: vec![(id, entry)],
+        }
+    }
+
+    /// What `RemovedSubtree::surfaces` must return for `raw`, derived
+    /// independently of both it and the two `LayerTree` methods it
+    /// mirrors: phrased in terms of *which half of the id space* the id
+    /// sits in and whether its masked form collides with the reserved
+    /// composite surface, rather than by the numeric `< BIT` / `< BIT -
+    /// 1` thresholds all three of those use. Equivalent, differently
+    /// written — so a threshold edited in all three at once still fails
+    /// here.
+    fn expected_boundary_surfaces(raw: u64, pixel: bool) -> Vec<aurora_tile::SurfaceId> {
+        let in_mask_half = (raw & crate::MASK_SURFACE_BIT) != 0;
+        let masked_form = raw | crate::MASK_SURFACE_BIT;
+        let masked_form_is_the_composite_sentinel = masked_form == u64::MAX;
+        let mut out = Vec::new();
+        if pixel && !in_mask_half {
+            out.push(aurora_tile::SurfaceId::from_raw(raw));
+        }
+        if !in_mask_half && !masked_form_is_the_composite_sentinel {
+            out.push(aurora_tile::SurfaceId::from_raw(masked_form));
+        }
+        out
+    }
+
+    #[test]
+    /// The differential test the mirroring has been missing.
+    ///
+    /// `RemovedSubtree::surfaces` reproduces `LayerTree::surface_id`
+    /// and `LayerTree::mask_surface_id`'s guards **by hand**, because a
+    /// detached subtree has no tree to ask — and its own doc comment
+    /// says what divergence would cost (freeing another layer's pixels,
+    /// or sweeping the reserved composite surface). This splices the
+    /// very same subtree into a real `LayerTree` and holds the detached
+    /// answer against the live one, at every boundary id and for both
+    /// layer kinds. `restore` deliberately does not run
+    /// `validate_layer_id_range`, which is what makes even the
+    /// out-of-range ids comparable here.
+    fn removed_subtree_surfaces_mirrors_the_live_trees_own_two_derivations() {
+        for raw in surface_guard_boundary_ids() {
+            for pixel in [true, false] {
+                let id = super::LayerId::from_raw(raw);
+                let detached = boundary_subtree(raw, pixel).surfaces();
+
+                let mut tree = LayerTree::new();
+                if let Err(err) = tree.restore(boundary_subtree(raw, pixel)) {
+                    unreachable!("a one-entry root subtree must restore: {err:?}");
+                }
+                let mut live: Vec<aurora_tile::SurfaceId> = Vec::new();
+                live.extend(tree.surface_id(id));
+                live.extend(tree.mask_surface_id(id));
+
+                assert_eq!(
+                    detached, live,
+                    "detached and live answers diverged at raw {raw:#x} (pixel: {pixel})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    /// The same boundary sweep against an independently written
+    /// reference, so the two mirrored implementations cannot drift
+    /// together and stay green.
+    fn removed_subtree_surfaces_matches_an_independent_reference_at_every_boundary() {
+        for raw in surface_guard_boundary_ids() {
+            for pixel in [true, false] {
+                assert_eq!(
+                    boundary_subtree(raw, pixel).surfaces(),
+                    expected_boundary_surfaces(raw, pixel),
+                    "raw {raw:#x} (pixel: {pixel})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    /// `aurora-app` reserves `SurfaceId::from_raw(u64::MAX)` for the
+    /// composite. A `RemovedSubtree` carrying a crafted or foreign id
+    /// must never make a sweep name it — that would delete the live
+    /// composite out from under the app.
+    fn removed_subtree_surfaces_never_emits_the_reserved_composite_surface() {
+        let composite = aurora_tile::SurfaceId::from_raw(u64::MAX);
+        for raw in surface_guard_boundary_ids() {
+            for pixel in [true, false] {
+                assert!(
+                    !boundary_subtree(raw, pixel).surfaces().contains(&composite),
+                    "raw {raw:#x} (pixel: {pixel}) emitted the reserved composite surface"
+                );
+            }
+        }
     }
 }

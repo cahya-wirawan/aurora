@@ -250,12 +250,17 @@
   <section>
     <h2>Not yet in this skeleton</h2>
     <p style="color:var(--text-secondary); font-size: var(--type-size-sm);">
-      Tree, menu, curve editor — need more structural design work than a
+      Menu and curve editor — need more structural design work than a
       states grid before a static mockup is meaningful. Left for the next
-      pass rather than stubbed badly. (Scrollbar has since landed in
-      `aurora-widgets` with its own real component-gallery coverage —
-      this static mockup skeleton hasn't been extended to match yet,
-      the same gap it already has for `TextField`/`CommandPalette`.)
+      pass rather than stubbed badly. (Scrollbar and tree have since
+      landed in `aurora-widgets`, each with its own real
+      component-gallery coverage in all five built-in themes — this
+      static mockup skeleton hasn't been extended to match either of
+      them yet, the same gap it already has for
+      `TextField`/`CommandPalette`. The tree's own rendered gallery is
+      two cells, expanded and collapsed; it draws selection highlights
+      and indentation only — no disclosure triangle and no row text,
+      since that crate draws no glyphs at all.)
     </p>
   </section>
 </main>
