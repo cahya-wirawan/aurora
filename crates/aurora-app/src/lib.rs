@@ -15529,9 +15529,10 @@ mod tests {
         resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
         skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
         take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
+        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -30462,13 +30463,40 @@ mod tests {
     /// measured in 0.113.0, in its two railed channels at `0.5` and in its one
     /// interior channel at `1.0`.
     ///
+    /// **And the interior channel is not only there for the `1.0` case** —
+    /// stated in 0.113.1 because the paragraph above motivated it solely by
+    /// mutation (h) at an opacity this fixture does not actually use. The
+    /// round ran *two* transpose mutations, and at this fixture's own `0.5`
+    /// they are caught by **disjoint** channel sets, so both kinds of channel
+    /// are load-bearing at the shipped opacity:
+    ///
+    ///   - **(h)**, transposing `src`/`backdrop` in the *dispatch arm*, swaps
+    ///     the fold's operands as well as the blend's, so at `0.5` only the two
+    ///     **railed** channels move — `(0.875, 0.5, 0.0625)` against the
+    ///     golden, interior green bit-identical;
+    ///   - **(g)**, transposing `cb`/`s.rgb` *inside the blend line* only,
+    ///     leaves the fold alone, so both rails give the same `B` either way
+    ///     and only the **interior** channel moves — `(0.828125, 0.375,
+    ///     0.09375)`, both rails bit-identical.
+    ///
+    /// So (g) needs green at `0.5` exactly as much as (h) needs red and blue
+    /// there, and neither mutation alone justifies all three regimes.
+    ///
     /// **No degenerate operand.** No `Cs` channel is `0.5` (this mode's
     /// source-side total no-op), `0.0` or `1.0` (a black or white source
     /// erases the backdrop), and no channel has `Cb == Cs`. `l1`'s green
     /// literal is `0.5` and is harmless twice over: the `Multiply` fold carries
     /// it to `0.375`, and a `0.5` *backdrop* is not degenerate for this mode
     /// anyway (`LinearLight(0.5, Cs) = clamp(2*Cs - 0.5, 0, 1)`), unlike for
-    /// `HardLight`.
+    /// `HardLight`. **One accepted coincidence belongs in this enumeration and
+    /// was only mentioned in passing in the rival-arm list before 0.113.1:**
+    /// green has `Cb + Cs = 0.375 + 0.625 = 1` exactly, so its `B` is `Cs`
+    /// itself and the fold gives `(1-a)*Cb + a*Cs` — the `Normal` arm's own
+    /// result. The interior channel therefore cannot separate this mode from
+    /// `Normal`; red (`0.828125` vs `0.703125`) and blue (`0.09375` vs
+    /// `0.15625`) do, which is why this is accepted rather than designed out.
+    /// It costs nothing against the two real near-misses either, both of which
+    /// green *does* separate (see the test's own rival table).
     ///
     /// **The `LinearLight` layer sits at opacity `0.5`**, because
     /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
@@ -30631,6 +30659,67 @@ mod tests {
         layers
     }
 
+    /// The texel one of the fixture constants above composites to on the
+    /// **CPU**, folded one layer at a time through the real
+    /// [`aurora_render::composite_layer_into`] — and, when `transposed` names
+    /// a mode, with every layer at that mode folded with its two operands
+    /// **swapped** (0.113.1).
+    ///
+    /// This is the computational half of
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`],
+    /// and it exists because that guard's opacity rule is a *proxy* that
+    /// `LinearLight` proved can be satisfied by a fixture which is provably
+    /// blind anyway. Read that test's doc comment for the counterexample.
+    ///
+    /// **Why this is a faithful model of the mutation, and not an
+    /// approximation of it.** A transposed GPU dispatch arm passes the
+    /// accumulator's view where `src` belongs and the layer's where `backdrop`
+    /// belongs, and the `Opacity` uniform stays bound to whatever occupies the
+    /// `src` slot. `composite_layer_into(out, texels, opacity, mode)` has
+    /// exactly that shape — `out` is the premultiplied backdrop, `texels` the
+    /// straight source, `opacity` scales the *source's* alpha — so folding
+    /// `composite_layer_into(&mut layer, &accumulator, ..)` and keeping `layer`
+    /// as the new accumulator reproduces the transposed arm term for term,
+    /// including the alpha swap and `straight_backdrop`'s un-premultiply of
+    /// whichever side is now the backdrop. Cross-checked against real
+    /// hardware: for `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` this returns
+    /// `(0.875, 0.5, 0.0625, 1.0)`, which is what 0.113.0's mutation (h)
+    /// *measured* on an RTX 3090 with the arm actually transposed.
+    ///
+    /// Every layer at the named mode is transposed, not just the first: a
+    /// transposed arm is transposed for every dispatch that reaches it, and
+    /// two roster fixtures carry more than one layer at their mode.
+    ///
+    /// Headless and single-texel — `composite_layer_into`'s scalar tail
+    /// handles a four-sample buffer, and the fixtures are solid fills, so one
+    /// texel is the whole tile.
+    fn solid_stack_texel_cpu(
+        entries: &[StackEntry],
+        transposed: Option<aurora_doc::BlendMode>,
+    ) -> [f32; 4] {
+        let mut accumulator = [half::f16::from_f32(0.0); aurora_tile::CHANNELS];
+        for &(_, mode, opacity, rgba) in entries {
+            let layer = rgba.map(half::f16::from_f32);
+            let render_mode = translate_blend_mode(mode);
+            if transposed == Some(mode) {
+                // The transposed arm: the layer's texel plays the backdrop
+                // role and the accumulator the source's, opacity following
+                // the source slot as the uniform does.
+                let mut swapped = layer;
+                aurora_render::composite_layer_into(
+                    &mut swapped,
+                    &accumulator,
+                    opacity,
+                    render_mode,
+                );
+                accumulator = swapped;
+            } else {
+                aurora_render::composite_layer_into(&mut accumulator, &layer, opacity, render_mode);
+            }
+        }
+        accumulator.map(f32::from)
+    }
+
     /// **The systemic guard against the gap 0.105.1 and 0.105.2 each had
     /// to find by hand** (0.105.3). Twice in a row, transposing one GPU
     /// dispatch arm's `src`/`backdrop` arguments survived the entire test
@@ -30649,7 +30738,9 @@ mod tests {
     /// 0.111.0, the fifth, and `LinearLight`, 0.113.0, the sixth — the latter
     /// five being the modes for which the guard's stated premise does not
     /// hold, two of them only *conditionally* and the last one in a way that
-    /// makes this guard's demand actively *insufficient*; see below.)
+    /// made this guard's demand actively *insufficient* — which is why 0.113.1
+    /// added the computational third assertion below, and why the demand is
+    /// now a diagnostic rather than the whole check.)
     ///
     /// The property, in one line: the first seven blend-math formulas the
     /// GPU path implemented (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
@@ -30731,6 +30822,43 @@ mod tests {
     /// "asymmetric blend term" does not imply "transpose observable", in either
     /// direction.**
     ///
+    /// **So as of 0.113.1 this guard no longer rests on the proxy alone: it
+    /// asks the arithmetic.** A third assertion folds each roster fixture on
+    /// the CPU twice — once as written, once with every layer at the mode under
+    /// test folded with its two operands swapped, via
+    /// [`solid_stack_texel_cpu`] — and requires the two texels to differ by
+    /// more than the tolerance that fixture's own GPU-vs-CPU differential
+    /// allows. That is **mode-agnostic**: it needs no symmetry argument, no
+    /// per-mode exemption list, and no opacity value can satisfy it while being
+    /// blind, which is precisely what "effective alpha strictly inside `(0, 1)`"
+    /// cannot promise.
+    ///
+    /// The evidence it closes is a real constructed counterexample, not a
+    /// worry: an all-*interior* `LinearLight` fixture at exactly opacity `0.5`
+    /// satisfies both older assertions and, with the dispatch arm genuinely
+    /// transposed, leaves this crate's whole suite green — the guard included.
+    /// The new assertion fails it, mutation-tested for real in 0.113.1 (see
+    /// PLAN.md's entry for that round): it reports a largest channel gap of
+    /// exactly `0`, and assertions (1) and (2) pass it as they always did.
+    ///
+    /// **All thirteen live rows clear it with room to spare**, measured in the
+    /// same round: the smallest gap in the roster is `LinearLight`'s own
+    /// `0.046875`, about 24× the tolerance, and the largest is `ColorDodge`'s
+    /// `0.61865`. So the check is not near a boundary for any current fixture.
+    ///
+    /// **Why not simply also exclude `a = 0.5`,** which is what the algebra
+    /// above literally indicts? Because **all thirteen** roster rows carry
+    /// their non-unit opacity as exactly `0.5` — checked, not assumed — and
+    /// each one's golden is hand-derived from that value and measured on real
+    /// GPU hardware. Excluding `0.5` would fail every row at once and demand
+    /// thirteen goldens be re-derived and re-measured, to buy a rule that is
+    /// still a proxy —
+    /// blind to any *other* laundering value a future clamped or saturating
+    /// mode brings (`a = 0` for `HardMix`-shaped saturation, say). The
+    /// computational check is both cheaper and strictly stronger, so the
+    /// opacity rule is kept as the *diagnostic* — it names the likely cause in
+    /// its failure message — and the arithmetic is what actually decides.
+    ///
     /// At
     /// least five more asymmetric modes are still to
     /// be ported (`Subtract`, `Divide`,
@@ -30746,10 +30874,22 @@ mod tests {
     /// itself pinned to the enum by an exhaustive `match` and by
     /// `every_gpu_blend_dispatch_mode_gets_its_own_counter`), except
     /// `Dissolve`, which resolves to `Normal` before any blend math runs,
-    /// this asserts that [`TRANSPOSE_COVERAGE`] names at least one fixture
-    /// with a layer at that mode whose effective alpha (`opacity * the
-    /// layer's own alpha`) is strictly between `0` and `1`, and that the
-    /// fixture still qualifies for the GPU path at all.
+    /// this asserts three things of every [`TRANSPOSE_COVERAGE`] row for that
+    /// mode — and that the roster names at least one:
+    ///
+    ///   1. the fixture has a layer at that mode whose effective alpha
+    ///      (`opacity * the layer's own alpha`) is strictly between `0` and
+    ///      `1`, unoccluded from above;
+    ///   2. the fixture still qualifies for the GPU path at all;
+    ///   3. **and, since 0.113.1, that it really does composite to a
+    ///      different texel with that mode's operands transposed** —
+    ///      [`solid_stack_texel_cpu`] folded both ways, compared at the
+    ///      tolerance the fixture's own differential uses.
+    ///
+    /// (1) and (2) are proxies and (3) is the property itself; all three are
+    /// kept because (1) and (2) name a *cause* in their failure messages,
+    /// which is what a round extending the roster needs, while (3) is what
+    /// cannot be satisfied vacuously.
     ///
     /// Non-unit opacity on the mode-bearing layer is not quite the whole
     /// condition, which is why 0.106.1 added a second half: the fold is
@@ -30766,15 +30906,18 @@ mod tests {
     ///
     /// **What it does not do, stated plainly.**
     ///
-    /// - It does not prove a transpose *is* detected. That takes running
-    ///   the mutation, which is what PLAN.md's 0.105.1/0.105.2 kill
-    ///   matrices record; non-unit opacity is necessary, not sufficient
-    ///   (`Cb == Cs` in every channel would hide a swap at any opacity, as
-    ///   would assertions too loose to see the difference). This guard's
-    ///   real job is to keep the *necessary* condition from being
-    ///   optimised away by a later, unrelated cleanup.
+    /// - It does not prove the fixture's *own assertions* would fail — only
+    ///   that its composited texel moves. Since 0.113.1 the "could see one"
+    ///   half is no longer a symmetry argument: assertion (3) folds the real
+    ///   arithmetic both ways and requires a difference larger than the
+    ///   differential's tolerance, so `Cb == Cs` in every channel (which
+    ///   hides a swap at any opacity) now fails here rather than passing.
+    ///   What is still outside its reach is a fixture whose texel moves and
+    ///   whose *assertions* are too loose or too few to notice — for that,
+    ///   running the mutation is still the only evidence, which is what
+    ///   PLAN.md's per-round kill matrices record.
     /// - It does not check the fixture's assertions at all, only its layer
-    ///   table.
+    ///   table and the arithmetic that table implies.
     /// - The occlusion half above reads that same table and nothing else,
     ///   so it reasons about *declared* stacking, opacity and blend mode —
     ///   not about which pixels a layer actually covers. Every roster
@@ -30879,6 +31022,42 @@ mod tests {
                     "{test_name}'s fixture must still qualify for the GPU path, or the arm it is \
                      credited with covering never runs and the transpose is unobservable for a \
                      second, different reason"
+                );
+
+                // The computational half (0.113.1): fold this fixture on the
+                // CPU twice, once normally and once with every layer at this
+                // mode folded with its two operands swapped, and require the
+                // two texels to differ by more than the tolerance the
+                // fixture's own GPU-vs-CPU differential allows. This is
+                // mode-agnostic -- it asks the arithmetic instead of
+                // reasoning about symmetry -- so no opacity value can dodge
+                // it, which is exactly what the two assertions above cannot
+                // promise. See this test's doc comment for the LinearLight
+                // counterexample that made the proxy's insufficiency real.
+                let correct = solid_stack_texel_cpu(stack, None);
+                let swapped = solid_stack_texel_cpu(stack, Some(mode));
+                let gap = correct
+                    .iter()
+                    .zip(swapped.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                // The same tolerance `assert_gpu_matches_cpu` uses: a
+                // difference at or under it is one the fixture's own
+                // differential would accept as agreement, so it is not
+                // observability.
+                let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+                assert!(
+                    gap > tolerance,
+                    "{test_name}'s fixture composites to the *same* texel whether {mode:?}'s \
+                     dispatch arm binds src/backdrop correctly or transposed ({correct:?} vs \
+                     {swapped:?}, largest channel gap {gap} <= {tolerance}), so it cannot see \
+                     that mutation no matter what its opacity is. This is the check the \
+                     non-unit-opacity assertion above only approximates: for a clamped mode a \
+                     perfectly good 0.5 can still be blind (LinearLight, 0.113.0 -- an \
+                     all-interior fixture at exactly 0.5 has \
+                     out - out_transposed = (Cb - Cs) * (1 - 2a) == 0 in every channel). Fix the \
+                     fixture's colours or its opacity and re-derive its golden; do not delete \
+                     this row."
                 );
             }
             assert!(
@@ -33576,8 +33755,10 @@ mod tests {
              (0.5989, 0.1875, 0.09375, 1.0) ColorBurn and (0.828125, 0.6875, 0.2008, 1.0) \
              ColorDodge. Exclusion gives (0.5390625, 0.453125, 0.2265625, 1.0). A dispatch arm \
              that transposed src and backdrop measured (0.875, 0.5, 0.0625, 1.0) on real hardware \
-             in 0.113.0 -- caught in the two railed channels and blind in interior green, because \
-             out - out_transposed is (Cb - Cs)*(1 - 2a), which is zero at a = 0.5."
+             during 0.113.0's own mutation testing, with that mutation since reverted -- the \
+             shipped arm binds src first and the accumulator second -- caught in the two railed \
+             channels and blind in interior green, because out - out_transposed is \
+             (Cb - Cs)*(1 - 2a), which is zero at a = 0.5."
         );
 
         // The vacuity guard: the same stack with its `LinearLight` layer turned

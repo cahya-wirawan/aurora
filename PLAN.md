@@ -26091,6 +26091,128 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.113.1) — the standing transpose guard now asks the
+arithmetic instead of trusting a proxy, and four prose errors 0.113.0 shipped
+are corrected. No mode ported, no shader, formula, dispatch arm, predicate arm,
+`BlendPass`, counter or fixture value touched.** Independent Critic and Red-team
+passes reproduced the previous round on real hardware. Counts unmoved (14-of-27
+admitted, 12 blend-math entry points, 13 counters); totals unmoved at **1,746
+passed / 0 failed / 10 ignored** (`aurora-render` 206, `aurora-app` 409), since
+the one real change is a third assertion inside an existing test.
+
+**One Critic finding was rejected as a false positive, with evidence.** It
+claimed the shipped `LinearLight` dispatch arm has `src`/`backdrop` transposed
+and called it critical. It does not: the arm reads `&src_view` then
+`&current_accumulator.1`, structurally identical to the `HardLight` arm above
+it, and the `(0.875, 0.5, 0.0625, 1.0)` the finding cited as current behaviour
+is 0.113.0's *own recorded measurement of mutation (h)*, since reverted —
+Red-team reproduced that value by re-applying the mutation themselves. The
+golden `(0.828125, 0.5, 0.09375, 1.0)` the shipped test asserts on real
+hardware is the correct order's result and would fail if the arm were
+transposed. The assertion message that quoted the mutation's number now says
+"during 0.113.0's own mutation testing, with that mutation since reverted"
+outright, so a third reader cannot make the same misreading.
+
+**The real finding, and it is a methodology one: 0.105.3's
+`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_
+argument` could be satisfied by a fixture that is *provably* blind.** Red-team
+built the counterexample rather than arguing it — an all-clamp-interior
+`LinearLight` fixture at exactly opacity `0.5`, which satisfies the guard's
+"effective alpha strictly inside `(0, 1)`" demand and, with the dispatch arm
+genuinely transposed, left all 409 `aurora-app` tests green including the guard
+and the app-level GPU-vs-CPU differential. The mechanism is 0.113.0's own
+algebra: `out - out_transposed = (Cb - Cs) * (1 - 2a)` is zero at `a = 0.5` for
+any unclamped channel. This round's shipped fixture is *not* vulnerable (its two
+railed channels catch the transpose at `0.5` by a different mechanism), so
+nothing shipped was wrong — but the guard was weaker than its own purpose, and a
+future mode whose asymmetric term is a plain linear difference could ship a
+fixture satisfying its letter and blind in fact.
+
+**Fixed, not deferred, and by the stronger of the two options.** The guard now
+carries a third, **computational** assertion: `solid_stack_texel_cpu` folds each
+`TRANSPOSE_COVERAGE` fixture through the real
+`aurora_render::composite_layer_into` twice — once as written, once with every
+layer at the mode under test folded with its two operands swapped — and requires
+the two texels to differ by more than the tolerance that fixture's own
+differential allows (`2 * f16::EPSILON`). It is mode-agnostic, needs no symmetry
+argument or exemption list, and no opacity value can satisfy it vacuously.
+
+- **The model is faithful, cross-checked against real hardware rather than
+  asserted.** A transposed arm binds the accumulator where `src` belongs and the
+  layer where `backdrop` belongs, with the `Opacity` uniform following the `src`
+  slot — which is exactly `composite_layer_into(&mut layer, &accumulator,
+  opacity, mode)`, alpha swap and `straight_backdrop` un-premultiply included.
+  For `NORMAL_MULTIPLY_LINEAR_LIGHT_STACK` it returns
+  `(0.875, 0.5, 0.0625, 1.0)` — bit-identical to what mutation (h) *measured* on
+  the RTX 3090 in 0.113.0.
+- **Mutation-tested for real, both directions.** With Red-team's all-interior
+  fixture substituted, the new assertion fails and reports a largest channel gap
+  of exactly `0` while assertions (1) and (2) pass it as they always did;
+  reverted, all thirteen live rows pass. Smallest real gap in the roster is
+  `LinearLight`'s own `0.046875` (≈24× the tolerance), largest `ColorDodge`'s
+  `0.61865`, so no current fixture sits near the boundary.
+- **Why not the cheaper "also exclude `a = 0.5`" fix.** All thirteen roster rows
+  carry their non-unit opacity as exactly `0.5` — checked, not assumed — and each
+  golden is hand-derived from that value and measured on real hardware.
+  Excluding `0.5` fails every row at once and demands thirteen goldens be
+  re-derived, to buy a rule that is still a proxy, blind to whatever *other*
+  laundering value the next clamped or saturating mode brings. The opacity and
+  occlusion assertions are kept as **diagnostics** — they name a likely cause in
+  their failure messages, which is what a round extending the roster needs — and
+  the arithmetic is what decides.
+
+**Four prose corrections, each re-derived independently before being written**
+(no assertion value changed):
+
+1. **`composite_render`'s `LinearLight` test 1 stated the wrong transposed
+   value** — `(0.6875, 0.625, 0.0625)`, which is *test 4's* transposed result,
+   copy-pasted. Test 1's is `(0.9375, 0.75, 0.125)`: caught in red and green,
+   blind in blue. Test 1 is not an instance of the suite header's equal-`a`
+   identity at all, because transposing its two views swaps their alphas too
+   (source `0.5`, accumulator opaque), so `a` becomes `1.0` and `cb` is the
+   un-premultiplied `(0.75, 1.25, 0.25)`, railing red and green *upward*.
+2. **The suite header's channel attribution was wrong for test 1** in the same
+   way — it credited "test 1's and test 4's railed channels" with seeing a
+   transpose at `a = 0.5`. That is test 4's property (both its textures opaque,
+   so `a` survives the swap and the identity applies: interior green
+   bit-identical, blue differing by `0.5*(Cb - Cs)`, red changing regime). Test
+   1 is the mirror image and is now written as a third case.
+3. **Test 6's "the one fixture here whose effective alpha is `1.0`" was false** —
+   test 2 reaches `a = 1.0` too, with the translucent side as the *accumulator*.
+   Narrowed to "at effective alpha `1.0` over an opaque backdrop", the property
+   actually being claimed.
+4. **`NORMAL_MULTIPLY_LINEAR_LIGHT_STACK`'s constraint enumeration omitted a
+   `Normal` coincidence** its rival list mentioned only in passing: green has
+   `Cb + Cs = 1` exactly, so `B = Cs` and the fold is `Normal`'s own result.
+   Accepted, because red and blue separate `Normal` — now stated where the other
+   degeneracy checks are.
+
+**One incomplete justification completed.** The fixture's three clamp regimes
+were motivated only by mutation (h) at an opacity the fixture does not use.
+Red-team showed — and this round re-derived — that mutation (g), the
+blend-line-only transpose, needs the **interior** channel at the fixture's own
+real `0.5`, by a disjoint mechanism: (g) leaves the fold's operands alone, so
+both rails give the same `B` and only green moves (`(0.828125, 0.375,
+0.09375)`), while (h) at `0.5` moves only the rails. Both kinds of channel are
+therefore load-bearing at the shipped opacity, and the fixture's doc comment now
+says so.
+
+**Full local gate green** in CI's own order: `cargo fmt --all --check`,
+`scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+`cargo check --workspace --locked` (`Cargo.lock` regenerated for the bump),
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` (**zero
+warnings**), `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`
+(**1,746 passed / 0 failed / 10 ignored**), `cargo test --workspace --doc`,
+`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features
+--document-private-items` (the workflow's real invocation, not CLAUDE.md's
+weaker documented one), `cargo deny check all`. `/home` at 90% used, **41G
+free**, checked before starting per 0.104.1's precondition.
+
+**Named follow-on (deferred, not dismissed):** the roster's own coverage is
+still hand-maintained — a fixture added and never registered in
+`TRANSPOSE_COVERAGE` stays invisible to the guard. That gap is unchanged by this
+round and is the remaining one of its class.
+
 **Addendum 2026-09-05 (0.113.0) — `LinearLight` on the GPU: the twelfth
 blend-math mode, and the first port whose shader is structurally *simpler*
 than the last two.**
@@ -26121,6 +26243,11 @@ decreasing order of how likely they are to change what a later round *does*:
    later round porting `Subtract`, `Divide`, `VividLight`, `PinLight` or
    `HardMix` — every one of which clamps or saturates — should check this
    before trusting a non-unit opacity to make a transpose visible.**
+   *(0.113.1 closed this at the guard itself: a third, computational assertion
+   folds each roster fixture both ways and requires the texels to differ, so the
+   opacity rule is now a diagnostic rather than the whole check. Red-team's
+   provably-blind all-interior fixture at `0.5` is the mutation test. See that
+   round's addendum.)*
 2. **0.110.0's guard-detector rule predicted a *non*-detection for the first
    time, and was right.** WGSL specifies float `clamp(e1, e2, e3)` as
    `min(max(e1, e2), e3)`, so this mode's single `clamp` launders a NaN exactly

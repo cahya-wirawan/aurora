@@ -17484,11 +17484,21 @@ mod tests {
     // channel's two orders give the same `B` so only `(1-a)*Cb` vs `(1-a)*Cs`
     // survives -- nothing at `a = 1`; while an interior channel gives
     // `out - out_transposed = (Cb - Cs)*(1 - 2a)`, which is **zero at
-    // `a = 0.5`**, where `out = Cb + Cs - 0.5` outright. So test 1's and test
-    // 4's railed channels are what see a transpose at their `a = 0.5`, and
-    // test 6's interior channels are what see one at `a = 1`. Stated because
-    // the natural assumption -- that an unconditionally asymmetric formula is
-    // always caught -- is false here in both directions.
+    // `a = 0.5`**, where `out = Cb + Cs - 0.5` outright. So **test 4's**
+    // railed channels are what see a transpose at its `a = 0.5` -- both its
+    // textures are opaque, so swapping them leaves `a` at `0.5` and the
+    // identity above applies as written: blue is lower-railed in both orders
+    // and differs by `0.5*(Cb - Cs)`, red changes clamp regime outright, and
+    // interior green is bit-identical -- while **test 6's** interior channels
+    // are what see one at `a = 1`. **Test 1 is a third case and an instance of
+    // neither** (this sentence claimed it was the first through 0.113.0;
+    // corrected in 0.113.1): its source alpha is `0.5` against an opaque
+    // accumulator, so transposing the two views swaps those alphas as well,
+    // `a` becomes `1.0`, the translucent side is un-premultiplied as the
+    // backdrop, and it is caught in its two *interior* channels while blind in
+    // its railed one -- the mirror image of test 4's attribution. Stated
+    // because the natural assumption -- that an unconditionally asymmetric
+    // formula is always caught -- is false here in both directions.
     //
     // **What is not confused with what.** `LinearDodge` and `LinearBurn` are
     // the arithmetic near-misses above, both live. `Overlay` and `HardLight`
@@ -17565,11 +17575,23 @@ mod tests {
     ///   in blue, for the same reason `LinearBurn` does.
     ///
     /// **A transposed `src`/`backdrop` binding gives
-    /// `(0.6875, 0.625, 0.0625)` here — caught in red and blue, and *not* in
-    /// green.** Green is the interior channel at effective alpha exactly
-    /// `0.5`, which is where the suite header's `(Cb - Cs)*(1 - 2a)` identity
-    /// is zero. Red is caught because the transposed order rails upward where
-    /// the correct one is interior.
+    /// `(0.9375, 0.75, 0.125)` here — caught in red and green, and *not* in
+    /// blue** (corrected in 0.113.1; the value this paragraph carried through
+    /// 0.113.0, `(0.6875, 0.625, 0.0625)`, is test 4's transposed result, not
+    /// this fixture's). **This fixture is not an instance of the suite
+    /// header's `(Cb - Cs)*(1 - 2a)` identity**, which assumes the same
+    /// effective alpha in both orders: transposing the two *views* swaps their
+    /// alphas too, so the source's `0.5` becomes the *backdrop's*, `a` becomes
+    /// `1.0`, and `straight_backdrop` un-premultiplies the now-translucent
+    /// side to `cb = (0.375, 0.625, 0.125)/0.5 = (0.75, 1.25, 0.25)`. That
+    /// drives red and green off the *top* (`clamp(1.5)` and `clamp(1.25)`,
+    /// both `1.0`) where the correct order leaves them interior, so both are
+    /// caught, by `0.1875` and `0.125`. Blue is blind: it is lower-railed in
+    /// both orders and the surviving fold terms happen to be equal
+    /// (`0.5*0.25 + 0.5*0.0` either way), so it reads `0.125` regardless.
+    /// Test 4, whose two textures are *both* opaque, is the fixture where the
+    /// header's equal-`a` identity applies as written — and there the
+    /// attribution is the other way round.
     ///
     /// The golden is asserted *and* cross-checked against the real
     /// [`composite_tile_cpu`] for the same two layers, so a stale literal
@@ -17667,8 +17689,10 @@ mod tests {
              (0.734375, 0.5, 0.28125), Overlay (0.859375, 0.5625, 0.15625), HardLight \
              (0.765625, 0.5625, 0.15625), ColorBurn roughly (0.7708, 0.35, 0.125) -- also \
              coinciding in blue -- and ColorDodge roughly (0.9375, 0.75, 0.2678). A transposed \
-             src/backdrop binding gives (0.6875, 0.625, 0.0625): caught in red and blue, and \
-             blind in green, which is the interior channel at effective alpha exactly 0.5."
+             src/backdrop binding gives (0.9375, 0.75, 0.125): caught in red and green, and \
+             blind in blue, which is lower-railed in both binding orders. Transposing the views \
+             here swaps their alphas too, so this fixture is not an instance of the suite \
+             header's equal-alpha (Cb - Cs)*(1 - 2a) identity -- see the doc comment."
         );
     }
 
@@ -18292,8 +18316,13 @@ mod tests {
     /// function of `Cs`, so blue discriminates normally. All three channels
     /// are live.
     ///
-    /// **This is also the one fixture here whose effective alpha is `1.0`, so
-    /// it is what catches a transposed binding in an *interior* channel** —
+    /// **This is also the one fixture here at effective alpha `1.0` over an
+    /// *opaque* backdrop, so it is what catches a transposed binding in an
+    /// *interior* channel** (narrowed in 0.113.1: this claimed to be the only
+    /// fixture at `a = 1.0` at all, and test 2 reaches `a = 1.0` too — its
+    /// accumulator is the translucent one, which is the whole point of that
+    /// test and is why the clean rail/interior attribution below is this
+    /// fixture's and not shared with it) —
     /// see the suite header: at `a = 0.5` an interior channel is blind to a
     /// transpose, and at `a = 1.0` a railed one is. A transpose gives
     /// `(0.875, 0.25, 0.125)` in the opaque half, differing in all three.
