@@ -6962,9 +6962,13 @@ fn composite_roots_into_tile(
 ///   is **admitted here too as of 0.108.0** (the bullet below), in the
 ///   dispatch arm directly after this one's. (Until 0.108.0 this sentence
 ///   printed that formula with a spurious outer `1 -`, i.e. *this* mode's
-///   shape wearing the other's operands; it was one of five sites that
-///   made the same slip, all corrected in that round. The distinction it
-///   drew — the branch conditions — was always right.) And not
+///   shape wearing the other's operands; it was one of six sites that
+///   made the same slip, all corrected in that round — though 0.108.0's
+///   own commit message and PLAN.md entry said *five*, having left the
+///   sixth, the `ColorBurn` dispatch-arm comment in
+///   `begin_gpu_composite_tile`, out of a count it had already fixed;
+///   0.108.1 corrected the figure. The distinction this sentence drew —
+///   the branch conditions — was always right.) And not
 ///   `max(Cb + Cs - 1, 0)`, which is
 ///   `LinearBurn`, the bullet directly above. **It is also the first
 ///   admitted mode whose blend term is not symmetric in `Cb`/`Cs`**: the
@@ -9293,8 +9297,12 @@ fn begin_gpu_composite_tile(
             // `LinearBurn` one above). Its branch conditions are `Cb == 0`
             // and `Cs == 1`, this one's are `Cb == 1` and `Cs == 0`. (Until
             // 0.108.0 this comment printed that formula with a spurious
-            // outer `1 -` -- one of five sites that made the same slip,
-            // all corrected then.) Instrumented from its first
+            // outer `1 -` -- one of six sites that made the same slip,
+            // all corrected then. **This arm's comment is the site
+            // 0.108.0's own count missed**, which is why that round said
+            // "five"; 0.108.1 corrected the count everywhere it appeared,
+            // without touching any of the already-correct fixes.)
+            // Instrumented from its first
             // round -- see `GpuBlendDispatches`.
             //
             // `&src_view` first, `&current_accumulator.1` second: the
@@ -28046,8 +28054,8 @@ mod tests {
     /// headlessly — the GPU-vs-CPU differential test below proves the
     /// resulting composite is actually right.
     ///
-    /// Deliberately `LinearDodge`. Of its three neighbours, two must stay
-    /// disqualified and one no longer does:
+    /// Deliberately `LinearDodge`. Of its three neighbours, one must stay
+    /// disqualified and two no longer do:
     ///
     /// - `LinearBurn` (`max(Cb + Cs - 1, 0)`), this mode's exact mirror
     ///   image and the realistic copy-paste hazard, **is admitted as of
@@ -28057,16 +28065,34 @@ mod tests {
     ///   must stay disqualified, which is why this bullet is called out
     ///   rather than quietly deleted: nothing about *this* test changed,
     ///   only what is true of that mode;
-    /// - `ColorDodge` (`Cb / (1 - Cs)`), the *other* dodge-family mode,
-    ///   which shares half a name with this one and nothing else;
+    /// - `ColorDodge` (`min(1, Cb / (1 - Cs))`), the *other* dodge-family
+    ///   mode, **is admitted as of 0.108.0** and likewise has its own
+    ///   sibling test below
+    ///   (`document_qualifies_for_gpu_compositing_admits_a_color_dodge_
+    ///   blend_mode`). This bullet listed it as a mode that must stay
+    ///   disqualified until that round, and is called out for the same
+    ///   reason the `LinearBurn` one above is: nothing about *this* test
+    ///   changed, only what is true of that mode. Its hazard has moved
+    ///   rather than gone away. It is no longer "shares half a name with
+    ///   this one and nothing else" — it is the two *adjacent
+    ///   guarded-division dispatch arms* (`ColorBurn` and `ColorDodge`)
+    ///   being confused with each other, which is where 0.107.0 and
+    ///   0.108.0 both put it. And the resemblance to *this* mode is now
+    ///   substantive rather than nominal: `min(1, Cb / (1 - Cs))` clamps
+    ///   exactly when `Cb + Cs >= 1`, which is exactly when
+    ///   `min(Cb + Cs, 1)` clamps, so a clamped channel cannot separate
+    ///   the two at all — the degeneracy `aurora-render`'s own
+    ///   `composite_color_dodge_*` suite header records as its fourth;
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
     ///   already pinned on the rejected side by
     ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
     ///   blend_mode`. This round deliberately left that const alone, as
-    ///   0.104.0 did.
+    ///   0.104.0 did — and every round from 0.105.0 through 0.108.0 has
+    ///   left it alone since, which is why it is the one neighbour here
+    ///   still on the rejected side.
     ///
-    /// Nothing here asserts `ColorDodge` directly — that general case is
-    /// what [`CPU_ONLY_BLEND_MODE`]'s own test covers.
+    /// Nothing here asserts `ColorDodge` directly; the sibling test named
+    /// in its bullet is what pins that mode's own predicate arm.
     #[test]
     fn document_qualifies_for_gpu_compositing_admits_a_linear_dodge_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -28164,8 +28190,11 @@ mod tests {
     /// 0.108.0**, which admitted it, and the sibling
     /// `document_qualifies_for_gpu_compositing_admits_a_color_dodge_blend_mode`
     /// directly below now asserts the opposite. (That bullet also printed
-    /// the formula with a spurious outer `1 -`, one of five sites that made
-    /// the same slip; all five were corrected in the same round.) What
+    /// the formula with a spurious outer `1 -`, one of six sites that made
+    /// the same slip; all six were corrected in the same round, though that
+    /// round's own count said five — it missed the `ColorBurn` dispatch-arm
+    /// comment in `begin_gpu_composite_tile`, which was fixed but not
+    /// counted. 0.108.1 corrected the count.) What
     /// remains true is the *shape* of the relationship: `ColorDodge` is the
     /// other guarded-division mode and the nearest thing in the whole enum
     /// to this one's — same two-guard structure, same clamped quotient,

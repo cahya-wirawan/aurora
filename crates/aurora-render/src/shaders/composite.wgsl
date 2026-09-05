@@ -154,11 +154,15 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // across every blend-math entry point in this file, each of which differs
 // from this one in its single `let b = ...` line and nothing else (the
 // bodies are 13 lines each; 12 are shared verbatim, measured, not
-// eyeballed). **One exception as of 0.107.0**, and it does not change the
-// plan: `fs_composite_color_burn`'s `let b = ...` spans five lines rather
-// than one, because its formula is three calls to `color_burn_channel`
-// rather than one componentwise expression -- the *other* 12 lines are
-// still byte-identical there, which is the property this note is about.
+// eyeballed). **Two exceptions as of 0.108.0**, and they do not change the
+// plan: in `fs_composite_color_burn` and `fs_composite_color_dodge` the
+// `let b = ...` spans five lines rather than one, because each formula is
+// three calls to a per-channel helper (`color_burn_channel`,
+// `color_dodge_channel`) rather than one componentwise expression. Stated
+// mode-agnostically so the next port does not have to re-sweep this note:
+// *every guarded-division entry point's `let b = ...` spans five lines*,
+// and that is the whole of the exception -- the *other* 12 lines are still
+// byte-identical in both, which is the property this note is about.
 // Extracting shared
 // `straight_backdrop()` and `fold_over()` WGSL functions would mirror the
 // Rust-side collapse 0.85.1 already made in `composite.rs`, and it is
@@ -619,8 +623,11 @@ fn color_burn_channel(cb: f32, cs: f32) -> f32 {
 // outer `1 -`, i.e. as *this* mode's shape with `ColorDodge`'s operands.
 // The distinction it drew was still the right one -- the branch
 // conditions and the operand order -- but the formula it printed was
-// wrong, and it was wrong identically at five sites; 0.108.0 corrected
-// all five.) And not `max(cb + cs - 1, 0)`, which is `LinearBurn`
+// wrong, and it was wrong identically at six sites; 0.108.0 corrected
+// all six, though its own count said five -- it missed `aurora-app`'s
+// `begin_gpu_composite_tile` `ColorBurn` dispatch-arm comment, which was
+// fixed but not counted, and 0.108.1 corrected the count.) And not
+// `max(cb + cs - 1, 0)`, which is `LinearBurn`
 // (`fs_composite_linear_burn` directly above, on the GPU since 0.106.0):
 // the two share half a name and nothing about the arithmetic is close, but
 // the *dispatch arms* are adjacent, which is where that hazard actually
@@ -691,10 +698,20 @@ fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
 // `1.0` the guard would have returned -- again the same answer, *if* the
 // backend divides like IEEE. WGSL does not promise that: division by zero
 // yields an indeterminate value, which may be `NaN`. And `NaN` here is not
-// harmless, because the `ab == 0` half of a tile multiplies `b` by zero
-// and `0.0 * NaN` is `NaN`. The guards are what make this entry point
-// defined rather than merely correct on one adapter. Measured, not
-// reasoned about: deleting the *first* guard is killed deterministically,
+// harmless -- but for a *different* reason than in `color_burn_channel`
+// above, which is why this paragraph is written out rather than inherited
+// from the sibling. A `NaN` can arise here only when `cb != 0.0`, because
+// `cb == 0.0` returns from the *first* guard before any division is
+// reached; and `cb != 0.0` requires `ab > 0`, since
+// `fs_composite_color_dodge` forces `cb` to exactly `vec3(0.0, 0.0, 0.0)`
+// on the `ab == 0` half. So the `NaN` reaches the output through `ab * b`
+// with `ab` **strictly positive**, propagating directly. It is *not* the
+// "a zero fails to absorb it" question `color_burn_channel`'s own note
+// describes -- there the first guard is `cb == 1.0`, which does not fire
+// at `cb == 0`, so on that mode's `ab == 0` half the division really is
+// reached and really is multiplied by zero. The guards are what make this
+// entry point defined rather than merely correct on one adapter. Measured,
+// not reasoned about: deleting the *first* guard is killed deterministically,
 // while deleting the *second* survives every test in this crate on
 // Vulkan/NVIDIA, which is exactly the adapter-dependence this comment
 // claims. See PLAN.md's 0.108.0 entry for both real results.

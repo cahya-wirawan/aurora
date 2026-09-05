@@ -2660,7 +2660,10 @@ impl TileCompositor {
     /// outer `1 -`, which is *this* mode's shape rather than
     /// `ColorDodge`'s. The distinction it drew — the branch conditions and
     /// the operand order — was right; the formula was not, and was wrong
-    /// identically at five sites, all five corrected in that round.) And
+    /// identically at six sites, all six corrected in that round — though
+    /// that round's own count said five, having missed `aurora-app`'s
+    /// `begin_gpu_composite_tile` `ColorBurn` dispatch-arm comment, which
+    /// was fixed but not counted; 0.108.1 corrected the count.) And
     /// not `max(Cb + Cs - 1, 0)`, which is
     /// [`Self::composite_linear_burn_over_with_opacity`] directly above —
     /// the two share half a name and nothing about the arithmetic is
@@ -2761,9 +2764,19 @@ impl TileCompositor {
     /// exactly that. Drop the `Cs == 1` guard and `Cb / 0` is `+inf`,
     /// `min(1, inf)` is `1`, again the same answer — *if* the backend
     /// divides like IEEE. **WGSL does not promise that**: division by zero
-    /// yields an indeterminate value, which may be `NaN`, and a `NaN` is
-    /// not absorbed here because the `ab == 0` half of a tile multiplies
-    /// `b` by zero and `0.0 * NaN` is `NaN`. So the second guard makes this
+    /// yields an indeterminate value, which may be `NaN` — and that `NaN`
+    /// reaches the output, though by a *different* route than in
+    /// `ColorBurn`'s otherwise-identical note above. Here a `NaN` can only
+    /// arise when `Cb != 0`, since `Cb == 0` returns from the *first* guard
+    /// before any division is reached; and `Cb != 0` requires `ab > 0`,
+    /// because the shader forces `cb` to exactly `vec3(0, 0, 0)` on the
+    /// `ab == 0` half. So it propagates through `ab * b` with `ab`
+    /// **strictly positive**, directly. It is *not* the
+    /// zero-fails-to-absorb-it argument `ColorBurn` makes: that mode's
+    /// first guard is `Cb == 1`, which does not fire at `Cb == 0`, so on
+    /// its `ab == 0` half the division is genuinely reached and genuinely
+    /// multiplied by zero. The conclusion is the same either way — the
+    /// second guard makes this
     /// entry point *defined* rather than merely correct on one adapter, and
     /// 0.108.0 measured its deletion surviving every test in this crate on
     /// Vulkan/NVIDIA — the disclosed, expected result of a portability
@@ -11235,8 +11248,11 @@ mod tests {
     // has its own suite (`composite_color_dodge_*`) and its own entry
     // point as of 0.108.0 rather than being CPU-only. (This comment
     // printed that formula with a spurious outer `1 -` until then -- this
-    // mode's shape wearing the other's operands -- one of five sites that
-    // made the same slip, all corrected in that round. The distinction it
+    // mode's shape wearing the other's operands -- one of six sites that
+    // made the same slip, all corrected in that round, though that round's
+    // own count said five: it missed `aurora-app`'s
+    // `begin_gpu_composite_tile` `ColorBurn` dispatch-arm comment, fixed
+    // but uncounted, and 0.108.1 corrected the count. The distinction it
     // drew was always the right one; the formula was not.)
     // `max(Cb + Cs - 1, 0)` is `LinearBurn`, the other
     // burn-family mode, whose suite is directly above and whose
@@ -12521,9 +12537,11 @@ mod tests {
     //
     // and `color_dodge_channel` in `shaders/composite.wgsl` is that,
     // branch for branch, called once per channel. Note there is **no outer
-    // `1 -`** -- that belongs to `ColorBurn`, and five doc comments in this
+    // `1 -`** -- that belongs to `ColorBurn`, and six doc comments in this
     // workspace wrote `ColorDodge`'s formula with one until 0.108.0
-    // corrected them.
+    // corrected them. (0.108.0 fixed all six but counted only five,
+    // omitting `aurora-app`'s `begin_gpu_composite_tile` `ColorBurn`
+    // dispatch-arm comment; 0.108.1 corrected the count, not the fixes.)
     //
     // **Both guards are arithmetically redundant under IEEE-754, both are
     // still required, and the two are redundant for different reasons** --
@@ -12542,8 +12560,17 @@ mod tests {
     // hardware, not a hole in this suite: WGSL specifies division by zero
     // as yielding an indeterminate value, not `+inf`, so on a backend that
     // produces `NaN` instead the guard is what keeps the entry point
-    // defined -- and a `NaN` is not absorbed here, because the `ab == 0`
-    // half of a tile multiplies `b` by zero and `0.0 * NaN` is `NaN`. No
+    // defined -- and that `NaN` does reach the output, though by a
+    // *different* route than the `ColorBurn` suite header's note describes.
+    // Here a `NaN` can only arise when `cb != 0`, since `cb == 0` returns
+    // from the *first* guard before any division; and `cb != 0` requires
+    // `ab > 0`, because `fs_composite_color_dodge` forces `cb` to exactly
+    // zero on the `ab == 0` half. It therefore propagates through `ab * b`
+    // with `ab` strictly positive, not by surviving a multiplication by
+    // zero. (`ColorBurn`'s first guard is `cb == 1`, which does not fire at
+    // `cb == 0`, so *that* mode's `ab == 0` half really does reach the
+    // division and really does multiply the result by zero -- which is why
+    // its note is written the way it is and this one is not.) No
     // test in this crate can distinguish the two, because no test can make
     // this adapter divide differently. Both results were measured, not
     // predicted; see PLAN.md's 0.108.0 entry.
@@ -13135,9 +13162,12 @@ mod tests {
     /// discriminator, blue coinciding because both quotients clamp.
     ///
     /// Every one of those differs from the golden in at least two channels
-    /// except the three that sit exactly at two — `LinearDodge`, the
-    /// dropped `min` and the transposed quotient — each of which is
-    /// disclosed as such above rather than counted as three.
+    /// except the **dropped `min` clamp, which differs in blue alone** —
+    /// red and green are the unclamped channels and agree under that
+    /// mutation, exactly as disclosed two paragraphs above. `LinearDodge`
+    /// and the transposed quotient sit at exactly two, each coinciding in
+    /// blue where both clamp. All three are disclosed above rather than
+    /// counted as a fuller separation than they are.
     fn composite_color_dodge_over_with_opacity_at_half_opacity_matches_the_cpu() {
         let Some(context) = real_context() else {
             return;
@@ -13793,8 +13823,13 @@ mod tests {
     /// guard, not a correctness one on this adapter: WGSL specifies division
     /// by zero as yielding an indeterminate value, so a backend producing
     /// `NaN` instead would propagate it (`min(1.0, NaN)` is
-    /// implementation-defined, and the `ab == 0` half of a tile multiplies
-    /// `b` by zero, where `0.0 * NaN` is `NaN`). **No test in this crate can
+    /// implementation-defined, and this fixture's red channel has
+    /// `Cb = 0.75` under a full-alpha backdrop, so `ab * b` scales that
+    /// `NaN` by a *strictly positive* `ab` and it lands in the output
+    /// directly. Note this is not `ColorBurn`'s zero-absorption argument
+    /// wearing new operands: for `ColorDodge` the `ab == 0` half forces
+    /// `cb` to zero, which the *first* guard catches before any division,
+    /// so no `NaN` can originate there at all). **No test in this crate can
     /// distinguish the guarded shader from the unguarded one, because no
     /// test can make this adapter divide differently** — stated here rather
     /// than papered over with an assertion that would not mean what it

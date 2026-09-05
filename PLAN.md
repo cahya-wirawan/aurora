@@ -19630,15 +19630,23 @@ severity choice.
   comparable across this round — as in 0.104.0 through 0.107.0, and unlike
   `Screen`'s.
 
-  **A pre-existing defect fixed in the same round: five sites transcribed
+  **A pre-existing defect fixed in the same round: six sites transcribed
   `ColorDodge`'s formula with a spurious outer `1 -`.** Every one wrote
   `1 - min(1, Cb / (1 - Cs))` — which is *`ColorBurn`'s* shape wearing
   `ColorDodge`'s operands — where the real arm is `min(1, Cb / (1 - Cs))`.
   The sites were `shaders/composite.wgsl`'s `fs_composite_color_burn`
   comment, `composite.rs`'s `composite_color_burn_over_with_opacity` doc and
   its `ColorBurn` test-suite header, and `aurora-app`'s
-  `document_qualifies_for_gpu_compositing` `ColorBurn` bullet and its
-  `..._admits_a_color_burn_blend_mode` doc. All five were "deliberately not
+  `document_qualifies_for_gpu_compositing` `ColorBurn` bullet, its
+  `begin_gpu_composite_tile` `ColorBurn` **dispatch-arm comment**, and its
+  `..._admits_a_color_burn_blend_mode` doc. **This entry, and 0.108.0's own
+  commit message, originally said "five" and omitted the dispatch-arm
+  comment** — that site was really fixed in 0.108.0 (`git grep` for either
+  spelling of the wrong formula returns nothing at `57d8c56`), so the error
+  was a miscount in the prose describing the sweep, not an unfixed site.
+  Corrected in 0.108.1 here and at the seven in-code comments that repeated
+  the figure; the commit message of 0.108.0 cannot be corrected in place and
+  is superseded by this paragraph. All six were "deliberately not
   X" contrast notes, so the *distinction* each drew (branch conditions,
   operand order) was correct and no code or assertion depended on the wrong
   formula — but a reader deriving this round's shader from any of them would
@@ -25126,12 +25134,20 @@ mutation matrix.
    patterned spatial fixture collides unavoidably in one column in four and
    discloses it.
 
-4. **Five pre-existing doc sites had `ColorDodge`'s formula wrong, and this
-   round found them by reading rather than by review.** All five wrote
+4. **Six pre-existing doc sites had `ColorDodge`'s formula wrong, and this
+   round found them by reading rather than by review.** All six wrote
    `1 - min(1, Cb / (1 - Cs))` — `ColorBurn`'s shape with `ColorDodge`'s
    operands — in "deliberately not X" contrast notes across
    `composite.wgsl`, `composite.rs` (twice) and `aurora-app/src/lib.rs`
-   (twice). No code or assertion depended on them, but a reader deriving
+   (**three times**: the `document_qualifies_for_gpu_compositing` bullet,
+   the `..._admits_a_color_burn_blend_mode` doc, and the
+   `begin_gpu_composite_tile` `ColorBurn` dispatch-arm comment). **This
+   list said "five" and "twice" for `aurora-app` until 0.108.1**, omitting
+   the dispatch-arm comment; that site was genuinely fixed in 0.108.0, so
+   only the count was wrong — a sweep that fixed more than it could
+   count is a milder failure than the reverse, but it is the same
+   read-every-hit discipline that would have caught either.
+   No code or assertion depended on them, but a reader deriving
    this round's shader from any one of them would have written the wrong
    function. Fixed, with each site now stating the correction and dropping
    its now-false "still CPU-only" claim. This is the same class 0.107.1 had
