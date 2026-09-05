@@ -30430,14 +30430,32 @@ mod tests {
     ///   entry fails here (that is the point), but a fixture added and
     ///   never registered is invisible to it.
     /// - It anchors on the counter enum, not directly on
-    ///   [`document_qualifies_for_gpu_compositing`]'s `matches!` set: a
-    ///   mode admitted at the predicate with no counter variant would slip
-    ///   past. Nothing enumerates `aurora_doc::BlendMode`'s 27 variants at
-    ///   runtime, so closing that would mean adding a second
-    ///   hand-maintained list — the very thing this exists to reduce.
+    ///   [`document_qualifies_for_gpu_compositing`]'s `matches!` set, so a
+    ///   mode admitted at the predicate with no counter variant slips past
+    ///   *this* test. **That gap is closed as of 0.112.0**, by
+    ///   `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_
+    ///   with_a_dispatch_counter`, which calls the real predicate once per
+    ///   `aurora_doc::BlendMode::ALL` variant and requires the admitted set
+    ///   to be this enum plus exactly `Normal` — measured, not assumed: that
+    ///   round's mutation C admitted `Subtract` at the predicate with no
+    ///   counter and it was the sole failure out of 407. (The justification
+    ///   this bullet used to give — that nothing enumerates the 27 variants
+    ///   at runtime, so closing it would mean a second hand-maintained list —
+    ///   stopped being true when `BlendMode::ALL` landed in the same round.)
     ///   `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_
     ///   across_every_expressible_mode`'s own mode loop is the other place
     ///   that drift shows up, and it has caught it once already.
+    /// - It does have a **reverse direction**, easy to miss because it sits
+    ///   after the per-arm loop below rather than inside it: every
+    ///   [`TRANSPOSE_COVERAGE`] row must name a mode some
+    ///   `GpuBlendDispatch::ALL` variant maps to, so a row crediting a
+    ///   fixture with covering a mode that has no live counter fails here
+    ///   too. Measured rather than reasoned about: 0.112.0's mutation D
+    ///   dropped `Self::HardLight` from that enum and this test was the
+    ///   fourth failure, one its own round had not predicted — the roster row
+    ///   for `HardLight` was orphaned and this loop is what noticed. It is
+    ///   the guard working as designed, not a coincidental coupling to an
+    ///   unrelated test.
     ///
     /// Headless and cheap: no GPU adapter, no tile store, no compositing —
     /// it reads layer tables and builds throwaway trees.
@@ -30544,6 +30562,16 @@ mod tests {
     /// blend-math dispatch to count. `Dissolve` *is* counted despite
     /// having no blend-math shader, because it resolves to `Normal` before
     /// the dispatch and its counter proves the resolution happened.
+    ///
+    /// A count and a containment are not enough on their own, which is why
+    /// 0.112.1 added a third assertion: [`dispatch_arm_blend_mode`] must be
+    /// **injective**. Two counters mapped to one mode leaves some counted mode
+    /// with no mapping at all, and one extra admitted mode makes the
+    /// arithmetic come out right again — measured, not hypothesised: that
+    /// exact pair (`HardLight`'s counter pointed at `Overlay`, its
+    /// [`TRANSPOSE_COVERAGE`] row dropped) passed all 407 tests in this crate
+    /// before the distinctness loop existed, with `HardLight`'s counter dead
+    /// and every test reading it as dispatch proof silently vacuous.
     #[test]
     fn document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter() {
         let mut admitted = Vec::new();
@@ -30580,6 +30608,33 @@ mod tests {
                  a document whose only layer uses that mode -- the counter can never be \
                  incremented, so every test that reads it as dispatch proof is vacuous"
             );
+        }
+
+        // `dispatch_arm_blend_mode` must be injective (0.112.1). The
+        // containment loop above and the count assertion at the top are each
+        // satisfiable by a *pair* of faults that cancel: two counters mapped
+        // to one mode (leaving some mode with a counter and no mapping), plus
+        // one extra admitted mode to keep the arithmetic right, and every
+        // assertion so far still passes. Pairwise rather than sorted, since
+        // `aurora_doc::BlendMode` derives no ordering -- the same shape
+        // `every_gpu_blend_dispatch_mode_gets_its_own_counter` uses for its
+        // counter-address distinctness.
+        let mapped: Vec<aurora_doc::BlendMode> = GpuBlendDispatch::ALL
+            .iter()
+            .copied()
+            .map(dispatch_arm_blend_mode)
+            .collect();
+        for (index, &left) in mapped.iter().enumerate() {
+            for &right in mapped.iter().skip(index + 1) {
+                assert_ne!(
+                    left, right,
+                    "two GpuBlendDispatch variants both map to {left:?} in \
+                     dispatch_arm_blend_mode, so some other counted mode has no mapping at all -- \
+                     and this test's other assertions can be satisfied anyway by an extra admitted \
+                     mode making the count come out right, which is exactly the double fault this \
+                     check exists to refuse"
+                );
+            }
         }
     }
 
@@ -30718,6 +30773,14 @@ mod tests {
         // `ALL` is what a new mode's author has to touch anyway, sitting
         // directly under the enum definition they just edited.
         let modes = GpuBlendDispatch::ALL;
+        // This literal is deliberately kept after 0.112.0, which added two
+        // *derived* checks on the same length
+        // (`gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count`
+        // against `aurora_render::BLEND_MATH_PASS_COUNT + 1`, and
+        // `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`
+        // against the real predicate). The redundancy is the point: this one
+        // states what a *human* expected, so a round that bumps the derived
+        // sources on both sides still has to acknowledge the change here.
         assert_eq!(
             modes.len(),
             12,

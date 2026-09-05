@@ -19764,6 +19764,162 @@ severity choice.
   CLAUDE.md is deliberately **not** touched, following 0.110.1's convention of
   leaving that to a separate sync commit.
 
+- [x] **0.112.0's own review findings fixed — three real gaps in the new
+  mechanism, five prose corrections, no mode ported — done 2026-09-05
+  (0.112.1).** Independent Critic and Red-team passes both reproduced 0.112.0
+  on real hardware and confirmed the shipped mechanism sound (byte-exact diff
+  against the parent: **no** blend-mode logic, shader entry point, `BlendPass`
+  const, `GpuBlendDispatch` variant, dispatch arm, predicate arm or fixture was
+  touched, then or now; `CPU_ONLY_BLEND_MODE` stays `Exclusion`, both tracked
+  CPU-fallback benchmarks stay comparable, and counts are unmoved at 13-of-27
+  admitted / 11 blend-math entry points / 12 counters). What they found were
+  three genuine holes *in the new test infrastructure* and five wrong or stale
+  statements about it. Test totals are unchanged by construction — **1737
+  passed / 0 failed / 10 ignored**, same as 0.112.0 — because all three code
+  fixes are assertions and compile-time checks added to existing tests, not new
+  tests.
+
+  **Three real fixes, each mutation-tested rather than argued.**
+
+  1. **The WGSL parser's own contract was unenforced, and its doc comment said
+     the opposite.** `shader_fragment_entry_points` reads the two-line
+     `@fragment` / `fn <name>(` pattern and claimed a one-line
+     `@fragment fn fs_x(…)` would cause "a loud, correct failure rather than a
+     silent undercount". **Measured false**: Red-team added
+     `@fragment fn fs_composite_bogus_dead(in: VsOut) -> @location(0)
+     vec4<f32> { … }` to `composite.wgsl` and the whole test *passed*, because
+     the missed entry point is absent from the parsed names **and** from
+     `ALL_BLEND_PASSES` (nothing registered it), so both sides of the count
+     assertion were wrong by one and agreed. The two sources were never
+     independent. Fixed with `shader_fragment_attribute_count`, which counts the
+     `@fragment` token itself (any position, `//` tails stripped) and is
+     asserted equal to the number of names the parser extracted. **Mutation:**
+     re-added Red-team's exact one-line entry point → the new assertion fails
+     first, "contains 14 `@fragment` attributes but only 13 … in the two-line
+     form", and passes again on revert. WGSL block comments would defeat the
+     comment stripping; the file has none, and such a case would over-count
+     (false alarm), never under-count (silent pass).
+  2. **`BlendMode::ALL`'s exhaustiveness guard did not catch the exact drift it
+     existed for.** The completeness test compared `ALL`'s mapped indices
+     against a hardcoded `(0..27)`, so a twenty-eighth *enum* variant added and
+     not listed in `ALL` passed: the exhaustive `variant_index` `match` forced a
+     new **arm**, but the arm's author picks the index, and `=> 27` left a
+     self-consistent 27-entry list. **Measured, both directions**: a real
+     twenty-eighth variant (`MutationBogus`, in the enum and *not* in `ALL`)
+     with a plain `=> 27` arm → `blend_mode_all_lists_every_variant_exactly_once`
+     **passed**, confirming the hole; the same variant with the arm written the
+     new way → **build fails**, `error[E0080]: evaluation panicked … while
+     instantiating fn variant_index_in_range::<27>`, naming the arm. Fixed by
+     routing every arm through `variant_index_in_range::<N>()`, whose bound is
+     `BlendMode::ALL.len()` and lives in an associated const of a generic type,
+     so it is evaluated per instantiation at build time whether or not the arm
+     ever runs. The hardcoded `27` is gone from the test with it: the expected
+     range now derives from `ALL.len()`, which is only sound *because* of the
+     bound — **second mutation**: deleting the highest-indexed entry
+     (`Luminosity`) from `ALL` and shrinking its declared length to 26, the case
+     a derived range would otherwise wave through, is also a build error
+     (`instantiating fn variant_index_in_range::<26>`). **Which gate step
+     catches it, measured:** `cargo check --all-targets` and `cargo clippy` both
+     pass (post-monomorphization consts need codegen); `cargo test` is what
+     fails. **Not closed, and documented at the site:** a twenty-eighth variant
+     whose arm *reuses* an index another variant already holds compiles and
+     stays invisible — no runtime check can see a variant `ALL` does not name,
+     since obtaining a value of it needs a hand-written mention. That last case
+     wants a `strum`-style derive, not a test.
+  3. **The new predicate/counter cross-check had an identity hole.**
+     `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`
+     asserted a count and a containment, neither of which sees
+     `dispatch_arm_blend_mode` mapping two `GpuBlendDispatch` variants to one
+     `BlendMode`. **Measured as a genuine double fault**: mis-mapping
+     `GpuBlendDispatch::HardLight` to `BlendMode::Overlay` *and* dropping
+     `HardLight`'s `TRANSPOSE_COVERAGE` row passed the **entire** `aurora-app`
+     lib suite — **407 passed, 0 failed** — leaving `HardLight`'s counter dead
+     and every test reading it as dispatch proof vacuous. (The mis-map *alone*
+     is caught, but by a different test: the transpose guard's reverse loop,
+     item 2 below.) Fixed with a pairwise distinctness loop — pairwise, not
+     sorted, because `aurora_doc::BlendMode` derives no ordering — the same
+     shape `every_gpu_blend_dispatch_mode_gets_its_own_counter` already uses for
+     counter addresses. **Mutation:** with both faults in place the fixed test
+     fails alone, 406 passed / 1 failed, naming the collision.
+
+  **Five prose corrections, all of them things the round asserted and could not
+  support.**
+
+  1. **The test hardware was misidentified in the commit message and in this
+     file.** 0.112.0 explained mutation B1's corrected result — 8 render tests
+     failing, not 1 — by "this box has llvmpipe". **That is false.**
+     `nvidia-smi -L` reports `NVIDIA GeForce RTX 3090`, and
+     `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render` passes **199 passed / 0
+     failed** while printing `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan,
+     DiscreteGpu)` — impossible on llvmpipe, since `aurora_gpu::test_support`
+     hard-fails a `DeviceType::Cpu` adapter under that variable. Every GPU test
+     that ran during B1 ran on a **real adapter**; the corrected *conclusion*
+     (the new test is a sole detector only on a runner with **no** adapter,
+     where those 7 self-skip) stands, only its stated cause was wrong. Both
+     sites now say so. **And the adapterless figure is now measured rather than
+     imagined**, which no prior round on this box appears to have done: with
+     every Vulkan/GL driver hidden (`VK_ICD_FILENAMES`, `VK_DRIVER_FILES`,
+     `LIBGL_DRIVERS_PATH`, `__EGL_VENDOR_LIBRARY_FILENAMES` all pointed at
+     nonexistent files), **88 of `aurora-render`'s 199 tests self-skip** — that
+     is how much of this crate goes dark on an adapterless CI runner, and the
+     suite still reports 199 passed while doing it.
+  2. **Mutation D's mechanism was described as an accident, and it is a
+     designed invariant.** 0.112.0 said `TRANSPOSE_COVERAGE` "apparently still
+     references `HardLight`'s counter" — implying a dangling reference. Nothing
+     dangles: the roster stores `aurora_doc::BlendMode` values, not counters,
+     and `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+     ends with a deliberate **reverse-direction loop** requiring every roster
+     row's mode to have some live `GpuBlendDispatch` mapping — verbatim,
+     "TRANSPOSE_COVERAGE credits … with covering HardLight, which has no
+     GpuBlendDispatch counter". Deleting that counter orphans the row and the
+     loop says so. Restated here and in that test's doc comment as
+     working-as-designed; the "apparently"/"unrelated" framing is gone.
+  3. **Two "what it does not do" bullets on that guard had gone false.** It
+     said a mode admitted at the predicate with no counter "would slip past",
+     justified by "nothing enumerates `aurora_doc::BlendMode`'s 27 variants at
+     runtime". `BlendMode::ALL` now does, and 0.112.0's own new predicate test
+     closes exactly that gap — its mutation C is the proof. Bullet rewritten to
+     say the gap is closed and by what; the stale justification dropped.
+  4. **That same list never mentioned the reverse-direction loop** mutation D
+     revealed. Added as its own bullet, naming what it catches and citing D as
+     the measurement.
+  5. **README.md still claimed 1,717 tests** — the exact drift class this round
+     exists to close, shipped inside the round itself. Now 1,737, the real
+     aggregate of `cargo test --workspace`.
+
+  **Also touched, deliberately small.** A comment on
+  `every_gpu_blend_dispatch_mode_gets_its_own_counter`'s literal `12` recording
+  that its redundancy with the two derived checks is intentional (it states what
+  a *human* expected). Nothing else: the hardcoded literal stays.
+
+  **Deferred, not skipped silently.** Red-team suggested adding CI's real
+  rustdoc invocation (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+  --no-deps --all-features --document-private-items --keep-going`) to CLAUDE.md's
+  "full CI gate locally" block, since the documented shorter command cannot see
+  the `rustdoc::private_intra_doc_links` error 0.112.0 hit. The gap is real and
+  worth fixing; it is left to the same separate CLAUDE.md sync commit 0.110.1's
+  convention reserves for that file, and is a **named follow-on** rather than a
+  judgement that it does not matter.
+
+  **Gate, all green:** `cargo fmt --all --check`, `check_layering.py` (20
+  crates), `check_no_hardcoded_style.py` (28 files), `cargo check --workspace
+  --locked` (`Cargo.lock` regenerated for the version bump first), `cargo clippy
+  --workspace --all-targets --all-features -D warnings` (clean, no new allows),
+  `cargo test --workspace` **1737 passed / 0 failed / 10 ignored**, `cargo test
+  --workspace --doc`, and the workflow's own `RUSTDOCFLAGS=-D warnings cargo doc
+  … --document-private-items --keep-going` (exit 0). `cargo nextest` is not
+  installed here, so `cargo test` stood in per CLAUDE.md. `/home`: **52G free**,
+  no incremental-cache cleanup needed. `git diff` confirmed clean of every
+  mutation before committing.
+
+  **Not claimed.** No pixel evidence and no backend coverage: this round ran no
+  GPU work a prior round had not, and the one new GPU-adjacent measurement (88
+  self-skips) is about *test bookkeeping*, not about any mode's arithmetic. Two
+  residual holes are stated at their sites rather than papered over — a
+  duplicate-index twenty-eighth variant (fix 2 above) and `GpuBlendDispatch::ALL`
+  still being hand-written, its length pinned from three directions but a missing
+  variant still not a compile error.
+
 - [x] **The blend-mode counts are now derived and cross-checked instead of
   restated — done 2026-09-05 (0.112.0).** Pure test infrastructure: **no mode
   was ported**, no shader, `BlendPass`, `GpuBlendDispatch` variant, dispatch
@@ -19789,6 +19945,12 @@ severity choice.
     rather than copying a list. Guarded by
     `blend_mode_all_lists_every_variant_exactly_once`, whose exhaustive
     `variant_index` `match` makes a 28th variant a compile error there.
+    *Overclaimed, and corrected in 0.112.1:* that compile error only forced a
+    new **arm**, not a new `ALL` entry — the arm's author picks the index, and
+    `=> 27` left a self-consistent 27-entry `ALL` passing a test that compared
+    against a hardcoded `0..27`. 0.112.1 routes every arm through a
+    const-generic bound derived from `ALL.len()`, so the natural edit does not
+    build until `ALL` grows.
   - `aurora-render`'s `ALL_BLEND_PASSES` (`[&BlendPass; 11]`) and the public
     `BLEND_MATH_PASS_COUNT` = its `len()`, so that figure cannot be stated
     wrongly.
@@ -19824,10 +19986,10 @@ severity choice.
   |---|---|---|---|
   | A | `BlendMode::ALL`'s last entry → a duplicate `Self::Color` | `blend_mode_all_lists_every_variant_exactly_once` fails | **exactly that** — sorted indices `[…24, 25, 25]` against `[…24, 25, 26]` |
   | A' | delete an entry outright (`[Self; 26]`) | compile error, not a test failure | **exactly that** — `E0308`, "expected an array with a size of 27, found one with a size of 26". This is the half of the guard the declared length provides; A is the half it cannot |
-  | B1 | rename shader `fn fs_composite_hard_light` → `…_x` | `all_blend_passes_…` fails on set equality | **fails on set equality as predicted, but is _not_ the sole detector**: 8 of 199 render tests fail — the new one plus 7 pre-existing GPU `composite_hard_light_*` tests, which run here because this box has llvmpipe. **The new test's distinct value is that it needs no GPU adapter at all**, so on a runner where every GPU test self-skips it *would* be the only detector. The count assertion passed (11 either side) — set equality is what caught it |
+  | B1 | rename shader `fn fs_composite_hard_light` → `…_x` | `all_blend_passes_…` fails on set equality | **fails on set equality as predicted, but is _not_ the sole detector**: 8 of 199 render tests fail — the new one plus 7 pre-existing GPU `composite_hard_light_*` tests, which run rather than self-skip because **this box has a real Vulkan/NVIDIA adapter** (`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`). *Corrected in 0.112.1: this row originally said "because this box has llvmpipe", which is false — see that round's entry for the measurement.* **The new test's distinct value is that it needs no GPU adapter at all**, so on a runner where every GPU test self-skips it *would* be the only detector. The count assertion passed (11 either side) — set equality is what caught it |
   | B2 | drop `&BLEND_PASS_HARD_LIGHT`, `[&BlendPass; 11]`→`10` | both the render test and the app cross-check fail | **exactly that** — render: "declares 13 @fragment entry points, but ALL_BLEND_PASSES has 10 entries plus the 2 fixed-function ones"; app: `12` vs `11` |
   | C | add `\| BlendMode::Subtract` to the real predicate | exactly one test fails | **exactly that, verified against the whole binary rather than a filter**: 406 passed, **1 failed** — `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`. The **sole-detector claim holds**, and it is worth naming why the eleven existing per-mode `admits_a_<mode>_blend_mode` tests cannot see this: each asserts a positive, so an *extra* member of the admitted set is invisible to all of them |
-  | D | drop `Self::HardLight` from `GpuBlendDispatch::ALL`, `[Self; 12]`→`11` | **three** tests fail | **four**, not three — the two new tests, the pre-existing literal-`12` `every_gpu_blend_dispatch_mode_gets_its_own_counter`, **and** 0.105.3's `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, which the plan did not anticipate: its `TRANSPOSE_COVERAGE` row for `HardLight` now credits a mode with no counter. A pre-existing guard doing more than its own round claimed |
+  | D | drop `Self::HardLight` from `GpuBlendDispatch::ALL`, `[Self; 12]`→`11` | **three** tests fail | **four**, not three — the two new tests, the pre-existing literal-`12` `every_gpu_blend_dispatch_mode_gets_its_own_counter`, **and** 0.105.3's `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, which the plan did not anticipate. *Mechanism corrected in 0.112.1:* that guard ends with a deliberate **reverse-direction loop** asserting every `TRANSPOSE_COVERAGE` row names a mode some live `GpuBlendDispatch` variant maps to, so dropping `HardLight`'s counter orphans its roster row and the loop reports it verbatim ("TRANSPOSE_COVERAGE credits … with covering HardLight, which has no GpuBlendDispatch counter"). Nothing dangles — the roster stores `aurora_doc::BlendMode` values, not counters — and nothing is coincidental: the guard is bidirectional by design, and only its own prose failed to say so |
 
   **A real CI failure was caught that the documented local command hides.**
   CLAUDE.md's `cargo doc --workspace --no-deps` emits a *warning* for a public
@@ -25720,6 +25882,50 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.112.1) — 0.112.0's mechanism reviewed, three real
+holes in it closed, five statements about it corrected. No mode ported.**
+Independent Critic and Red-team passes reproduced the previous round on real
+hardware and found the shipped mechanism sound; the fixes are all *inside the new
+test infrastructure*, and no blend-mode logic, shader, `BlendPass`,
+`GpuBlendDispatch` variant, dispatch arm, predicate arm or fixture was touched.
+Counts unmoved (13-of-27 admitted, 11 blend-math entry points, 12 counters);
+totals unmoved at **1737 passed / 0 failed / 10 ignored**, since all three fixes
+are assertions and compile-time checks on existing tests.
+
+- **The WGSL parser's promise is now true.** A one-line `@fragment fn fs_x(…)`
+  used to pass silently — the missed entry point vanished from *both* sides of
+  the count assertion. An independent `@fragment`-token count now makes it a
+  loud failure (mutation-tested with Red-team's exact case).
+- **`BlendMode::ALL` now really does force a twenty-eighth variant into the
+  list.** The exhaustive `match` only forced a new *arm*; `=> 27` passed a test
+  comparing against a hardcoded `0..27`. Every arm now goes through a
+  const-generic bound derived from `ALL.len()`, so the natural edit is
+  `error[E0080]` at build time — measured in both directions, including the
+  formerly-passing case. `cargo check`/`clippy` cannot see it; `cargo test`
+  can, and does.
+- **The predicate/counter cross-check now checks identity.** A mis-mapped
+  counter plus a dropped roster row passed all 407 `aurora-app` lib tests; a
+  pairwise distinctness loop now fails on it.
+- **The hardware claim was wrong.** Mutation B1's 8 failures were *not* because
+  "this box has llvmpipe": `nvidia-smi -L` shows an RTX 3090 and
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render` passes 199/199 while
+  printing `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`. GPU-gated tests
+  **execute** here. The conclusion (sole detector only on an adapterless runner)
+  survives; the cause did not. Newly measured with every Vulkan/GL driver hidden:
+  **88 of `aurora-render`'s 199 tests self-skip** on an adapterless runner.
+- **Mutation D's fourth failure is a designed bidirectional invariant**, not a
+  dangling reference — the transpose guard's own reverse loop requires every
+  `TRANSPOSE_COVERAGE` row to name a mode with a live counter.
+- Two now-false bullets on that guard corrected, the reverse loop documented,
+  and **README.md's stale "1,717 tests" fixed to 1,737** — the same drift class,
+  found shipped inside the round that existed to close it.
+
+**Named follow-on (deferred, not dismissed):** CLAUDE.md's documented "full CI
+gate locally" block still omits the workflow's real rustdoc invocation
+(`--document-private-items` under `RUSTDOCFLAGS=-D warnings`), the one 0.112.0
+proved can fail while the documented command only warns. Left to the separate
+CLAUDE.md sync commit 0.110.1's convention reserves.
+
 **Addendum 2026-09-05 (0.112.0) — the recurring count drift is now a test
 failure, not a review habit. No mode ported.** This round is pure test
 infrastructure and deliberately changed **no** blend-mode logic: no WGSL entry
@@ -25738,7 +25944,9 @@ patch," having recurred across 0.105.1, 0.107.1, 0.108.1, 0.109.1, 0.110.1 and
    Rust does not provide, so a predicate can be asked a question per mode
    instead of a list being copied. `blend_mode_all_lists_every_variant_exactly_once`
    catches a duplicated entry; an exhaustive `match` makes a 28th variant a
-   compile error, and a *deleted* entry one too.
+   compile error, and a *deleted* entry one too. (**The 28th-variant claim was
+   too strong** — it forced a new match *arm*, not a new `ALL` entry; closed for
+   real in 0.112.1, and the third mutation-tested fix of that round.)
 2. **`aurora-render`'s `ALL_BLEND_PASSES` + public `BLEND_MATH_PASS_COUNT`** —
    the latter is the former's `len()`, so it cannot be misstated.
 3. **`all_blend_passes_matches_the_shaders_own_blend_math_entry_points`** —
@@ -25767,14 +25975,20 @@ plan** (`git diff` confirmed empty after each revert):
 
 Both corrections matter and neither is cosmetic. **B1 is not a sole detector on
 this box**: 7 pre-existing GPU `composite_hard_light_*` tests fail alongside the
-new one, because this machine has llvmpipe and therefore runs the GPU tests in
-software. The honest claim is narrower than the plan's — the new test is the
-only detector *on a runner with no GPU adapter*, where all seven self-skip. **D
-fails four tests, not three**: 0.105.3's
+new one, because **this box has a real Vulkan/NVIDIA adapter**, so GPU-gated
+tests execute rather than self-skip. *(This paragraph originally attributed that
+to "llvmpipe … in software" — false, corrected in 0.112.1, which measured the
+adapter and the skip count directly.)* The honest claim is narrower than the
+plan's — the new test is the only detector *on a runner with no GPU adapter*,
+where all seven self-skip. **D fails four tests, not three**: 0.105.3's
 `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
-also fires, since its `TRANSPOSE_COVERAGE` row then credits `HardLight` with a
-counter that no longer exists — a pre-existing guard covering more than its own
-round claimed.
+also fires, and the mechanism is that guard's own **reverse-direction loop**
+(`crates/aurora-app/src/lib.rs`, after its per-arm loop), which requires every
+`TRANSPOSE_COVERAGE` row to name a mode some live `GpuBlendDispatch` variant
+maps to. Dropping `HardLight`'s counter orphans its roster row, and that loop
+says so by name. It is the guard doing exactly what it was designed to do —
+covering more than *its own round's prose* claimed, not coupling accidentally to
+an unrelated test.
 
 **A real CI failure surfaced that CLAUDE.md's documented command hides.**
 `cargo doc --workspace --no-deps` merely *warns* when a public item links to a

@@ -3509,10 +3509,20 @@ mod tests {
     /// `color_burn_channel` and `color_dodge_channel` (preceded by
     /// nothing). Counting substring occurrences of `"fs_composite"` would
     /// be wrong instead of merely fragile: that string appears many times
-    /// in the shader's *comments*. If a future entry point is written with
-    /// its attribute and signature on one line, this stops seeing it and
-    /// the test below fails — a loud, correct failure rather than a silent
-    /// undercount, since the totals would then disagree.
+    /// in the shader's *comments*.
+    ///
+    /// **What happens when the contract is broken** (corrected in 0.112.1;
+    /// the claim here was previously wrong and was measured to be wrong).
+    /// An entry point written with its attribute and signature on *one*
+    /// line — `@fragment fn fs_x(…)` — is invisible to this parser. Until
+    /// 0.112.1 that was silent rather than loud: adding such an entry point
+    /// left it out of both sides of the count assertion below (the shader's
+    /// parsed names *and*, since no `BlendPass` names an entry point nobody
+    /// registered, the expected total), so the two stayed in agreement by
+    /// both being wrong. [`shader_fragment_attribute_count`] closes that: it
+    /// counts the `@fragment` token itself, in any position, and the test
+    /// asserts the two agree — so a form this parser cannot read fails
+    /// loudly instead of vanishing.
     fn shader_fragment_entry_points() -> Vec<&'static str> {
         let mut names = Vec::new();
         let mut previous_is_fragment = false;
@@ -3524,6 +3534,39 @@ mod tests {
             previous_is_fragment = trimmed == "@fragment";
         }
         names
+    }
+
+    /// How many times the `@fragment` attribute appears in
+    /// [`COMPOSITE_SHADER`]'s *code*, counted as a bare token rather than by
+    /// the two-line pattern [`shader_fragment_entry_points`] reads — the
+    /// independent second opinion that turns a broken parsing contract into
+    /// a test failure (0.112.1).
+    ///
+    /// Why a second count at all: the name parser and the registry it is
+    /// compared against are not independent. An entry point in a form the
+    /// parser cannot read is missing from the parsed names *and* absent from
+    /// `ALL_BLEND_PASSES` (nothing registered it), so both sides of the
+    /// count assertion shrink together and the disagreement the parser's own
+    /// doc comment promised never materialises. Measured, not assumed: a
+    /// one-line `@fragment fn fs_composite_bogus_dead(…)` added to the
+    /// shader passed the whole test before this existed.
+    ///
+    /// This counts occurrences of the substring `@fragment`, per line, after
+    /// dropping any `//` comment tail — so the count is blind to a mention
+    /// in a line comment (there are none today) but sees the attribute
+    /// wherever real code puts it: on its own line, ahead of `fn` on the
+    /// same line, or twice on one line. WGSL block comments would defeat
+    /// the comment stripping; `composite.wgsl` contains none, and a future
+    /// one would show up here as a *false alarm* (an over-count failing the
+    /// assertion), never as a silent pass.
+    fn shader_fragment_attribute_count() -> usize {
+        COMPOSITE_SHADER
+            .lines()
+            .map(|line| {
+                let code = line.split("//").next().unwrap_or_default();
+                code.matches("@fragment").count()
+            })
+            .sum()
     }
 
     /// **Derives one of the three drifting blend-mode counts from source
@@ -3544,6 +3587,27 @@ mod tests {
     #[test]
     fn all_blend_passes_matches_the_shaders_own_blend_math_entry_points() {
         let declared = shader_fragment_entry_points();
+
+        // The parser's own contract, checked before anything derived from it
+        // (0.112.1). Without this, an entry point written in a form
+        // `shader_fragment_entry_points` cannot read is missing from both
+        // sides of the count assertion below -- it is absent from `declared`
+        // *and* from `ALL_BLEND_PASSES`, since nothing registered it -- so
+        // the two agree by both being wrong and the undercount is silent.
+        // Measured: a one-line `@fragment fn fs_composite_bogus_dead(...)`
+        // passed this whole test before this assertion existed.
+        assert_eq!(
+            declared.len(),
+            shader_fragment_attribute_count(),
+            "shaders/composite.wgsl contains {} `@fragment` attributes but only {} of them are in \
+             the two-line `@fragment` / `fn <name>(` form this test's parser reads, so at least \
+             one entry point's name was never extracted: {declared:?}. Everything below derives \
+             from that name list, and an entry point missing from it is also missing from \
+             ALL_BLEND_PASSES, so the counts would otherwise agree by both being wrong. Put the \
+             attribute back on its own line, or teach shader_fragment_entry_points the new form.",
+            shader_fragment_attribute_count(),
+            declared.len()
+        );
 
         for name in FIXED_FUNCTION_ENTRY_POINTS {
             assert!(
