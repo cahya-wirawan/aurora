@@ -19811,6 +19811,102 @@ severity choice.
   is `clamp()` on a `vec3<f32>` — the file's first — on which *both* the mode's
   arithmetic and mutation (m)'s laundering result depend.
 
+- [x] **`VividLight` ported to WGSL, admitted at the predicate, and wired
+  through the real dispatch arm — done 2026-09-05 (0.114.0).** The
+  **thirteenth** real blend-math mode on the GPU, and the first whose blend term
+  is built entirely out of two *other ported modes*: the WGSL helper
+  `vivid_light_channel` computes nothing but the `2*cs` / `2*cs - 1`
+  substitutions and delegates to `color_burn_channel` and
+  `color_dodge_channel`. Deliberately three calls rather than a componentwise
+  `select()` — both callees' guards are early returns keeping a division out of
+  the lanes where its divisor is zero, and a `select()` evaluates both arms
+  everywhere. One WGSL entry point, one helper, one `BlendPass` const, four
+  labels, one one-line wrapper, one predicate arm, one dispatch arm, one counter
+  variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+  `TRANSPOSE_COVERAGE` row, one fixture const, **seven** render-level GPU tests,
+  one exhaustive CPU boundary test, one headless predicate test and one
+  app-level integration test. `composite_blend_over_with_opacity` was not
+  touched — an **eleventh** consecutive caller added with no line of change to
+  it, now across four distinct shader shapes. `CPU_ONLY_BLEND_MODE` stays
+  `Exclusion`; no fixture anywhere was retargeted, so both PLAN.md-tracked
+  CPU-fallback benchmarks stay comparable across this round.
+
+  **Counts, recomputed against source rather than incremented.**
+  `ALL_BLEND_PASSES` is `[&BlendPass; 13]`; `GpuBlendDispatch::ALL` is
+  `[Self; 14]`; `GpuBlendDispatches` has 14 fields; the predicate admits **15 of
+  27**, leaving **12 of 27** CPU-only there; 13 of `aurora_render::BlendMode`'s
+  26 variants still lack a blend-math entry point, `Normal` among them and
+  needing none. Tests: `aurora-render` 206 → **214**, `aurora-app` 409 → **411**.
+
+  **The fixture, and the one degeneracy no sibling mode has.**
+  `NORMAL_MULTIPLY_VIVID_LIGHT_STACK` reuses the family's `l1`/`l2`, giving
+  `Cb = (0.65625, 0.375, 0.1875)`, and picks `Cs = (0.25, 0.875, 0.75)` at
+  opacity `0.5`: red burn/clamp-interior, green dodge/upper-rail, blue
+  dodge/clamp-interior. `B = (0.3125, 1.0, 0.375)`, golden
+  **`(0.484375, 0.6875, 0.28125, 1.0)`**, returned bit-exactly by real hardware
+  on the first run. Degeneracy 3 — `VividLight(0, Cs) = 0` and
+  `VividLight(1, Cs) = 1`, a black or white **backdrop** channel erasing the
+  *source* — constrains the composited accumulator rather than a layer literal,
+  and every fixture was checked against the real `Multiply` fold.
+
+  **Three findings carried forward.** (1) The `<=` at the branch boundary is
+  **unkillable in principle** — both arms give `Cb` at `Cs == 0.5`, guard points
+  included — the third such case after `Overlay` and `HardLight`; the new
+  `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`
+  proves the arm-equality over all **15,362** `f16` values in `[0, 1]` rather
+  than at three points. (2) This mode is **not** a sixth detector of
+  `straight_backdrop`'s guard — predicted from 0.110.0's rule, then measured;
+  both arms end in a `min()`, so the count stays at five, now of thirteen. (3)
+  It is the **first mode to inherit both guarded-division portability gaps at
+  once**: `color_burn_channel`'s `cs == 0.0` and `color_dodge_channel`'s
+  `cs == 1.0` guards each survive every test here, because this adapter divides
+  by zero to `+inf` where WGSL specifies an indeterminate value.
+
+  **Asymmetry: unconditional and *structural*, the fourth of that kind**, and
+  the reverse of `LinearLight`'s case. `B(Cb, Cs)` branches on `Cs`,
+  `B(Cs, Cb)` on `Cb`; the mode is **not affine**, so there is no blind opacity
+  and the only launderer is rail agreement in both operand orders. No channel of
+  the fixture does that, so its transpose is caught in all three channels at
+  `0.5` **and** all three at `1.0` — the first roster row true at both. The
+  standing transpose guard's non-unit-opacity demand is therefore merely
+  redundant here, where for `LinearLight` it was insufficient; left
+  un-special-cased either way.
+
+  **Mutation matrix — all twelve run for real** on
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`,
+  reverted from an out-of-repo `cp` backup between rows. Full table with
+  measured readbacks in the 0.114.0 addendum under "Next action"; the four
+  load-bearing rows: (d) `<=` → `<` **survives** (214/214, 411/411), as
+  predicted; (k) deleting `straight_backdrop`'s guard leaves this mode's own
+  transparent-backdrop test **green** while failing exactly the same five as
+  before, as predicted; (e) a transposed dispatch arm is killed by exactly one
+  test, reading back `(0.30664063, 0.8540039, 0.5415039, 1.0)` against the
+  golden in all three channels; and (h) deleting the dispatch arm is killed by
+  **the counter assertion alone** — proved by re-running with that assertion
+  also removed, which left the test green.
+
+  **One wrong prediction, corrected in the code rather than dropped.** The plan
+  had mutation (b) — `2.0 * cs` where the dodge branch needs `2.0 * cs - 1.0` —
+  collapsing that branch to a constant `1.0` via `color_dodge_channel`'s
+  `cs == 1.0` guard, and therefore detectable only by a clamp-interior dodge
+  channel. Measuring it showed the opposite: `2*Cs` is **not** clamped, so the
+  divisor `1 - 2*Cs` is *negative* across the branch's whole domain, the branch
+  emits negative colour, and every dodge channel kills it. Every affected
+  comment in `composite.wgsl`, `composite.rs` and `aurora-app/src/lib.rs` was
+  corrected, including a "REQUIRED DISCLOSURE" in the source-alpha-above-one
+  test that had claimed a blindness the fixture does not have.
+
+  **Regression coverage explicitly re-run:** `HardMix`'s existing CPU tests pass
+  unchanged, which matters this round because `blend_channel` implements
+  `HardMix` as a hard threshold on **`VividLight`'s own result** — so this port
+  makes `HardMix` the one CPU-only mode delegating to a *ported* mode's arm. No
+  `blend_channel` arm was touched.
+
+  **Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are
+  unverified for `fs_composite_vivid_light`, and this is the sharpest form of
+  that gap so far: two inherited division-by-zero guards, each redundant only
+  under this adapter's `+inf` behaviour.
+
 - [x] **`HardLight` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.111.0).** The **eleventh**
   real blend-math mode on the GPU, and the first round in which the mode being
@@ -26090,6 +26186,138 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.114.0) — `VividLight` ported to the GPU compositing
+path.** The **thirteenth** real blend-math mode, and the first whose blend term
+is built entirely out of two *other ported modes*: its WGSL helper
+`vivid_light_channel` computes nothing but the `2*cs` / `2*cs - 1` substitutions
+and delegates to `color_burn_channel` and `color_dodge_channel`. Cost on the
+Rust side was the usual one `BlendPass` const, four labels, one one-line
+wrapper, one predicate arm, one dispatch arm, one counter
+variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+`TRANSPOSE_COVERAGE` row and one fixture const — a fourth distinct shader shape
+added without changing `composite_blend_over_with_opacity`, an **eleventh**
+consecutive caller added with no line of change to it. `CPU_ONLY_BLEND_MODE`
+stays `Exclusion` and **no fixture anywhere was retargeted**, so both
+PLAN.md-tracked CPU-fallback benchmarks stay comparable across this round.
+
+**Counts after the round, each verified against source rather than restated
+from the previous entry.** `ALL_BLEND_PASSES` is `[&BlendPass; 13]`, so
+`BLEND_MATH_PASS_COUNT` is 13; `GpuBlendDispatch::ALL` is `[Self; 14]`
+(13 + `Dissolve`); `GpuBlendDispatches` has 14 fields; the app predicate admits
+**15 of 27** (13 blend-math + `Normal` + `Dissolve`), leaving **12 of 27**
+CPU-only at the predicate; and 13 of `aurora_render::BlendMode`'s 26 variants
+still have no blend-math WGSL entry point, `Normal` among them and needing none.
+`all_blend_passes_matches_the_shaders_own_blend_math_entry_points` ties the
+first of those to the shader by set equality, and
+`gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count` ties
+the app's list to it across the crate boundary.
+
+**Tests: 206 -> 214 in `aurora-render` (+8) and 409 -> 411 in `aurora-app`
+(+2).** The eight are seven GPU tests
+(`composite_vivid_light_over_with_opacity_*`: both-branches golden, translucent
+accumulator, spatially-varying tile, half opacity, source alpha above one,
+transparent-backdrop-is-source-alone, branch-boundary agreement) plus one CPU
+test, `vivid_light_at_its_branch_boundary_is_the_backdrop_for_every_f16_value`,
+which sweeps all **15,362** `f16` bit patterns landing in `[0, 1]`. The two are
+the app-level differential and a headless predicate test.
+
+**The app-level fixture, hand-derived first and then measured.**
+`NORMAL_MULTIPLY_VIVID_LIGHT_STACK` reuses the `Overlay`/`HardLight`/
+`LinearLight` family's `l1`/`l2` verbatim, so the composited backdrop is the
+same `Cb = (0.65625, 0.375, 0.1875)` those three blend against, and picks
+`Cs = (0.25, 0.875, 0.75)` at opacity `0.5`. Red takes the burn branch
+(`ColorBurn(0.65625, 0.5) = 0.3125`, clamp-interior); green the dodge branch on
+its **upper rail** (`0.375 / 0.25` raw `1.5`); blue the dodge branch
+clamp-interior (`0.1875 / 0.5 = 0.375`). `B = (0.3125, 1.0, 0.375)` and the fold
+gives the golden **`(0.484375, 0.6875, 0.28125, 1.0)`**, which real hardware
+returned bit-exactly on the first run.
+
+**Degeneracy 3 is new to this mode and constrains the *composited* backdrop, not
+a layer literal**: `VividLight(0, Cs) = 0` and `VividLight(1, Cs) = 1`, so a
+black or white backdrop channel erases the source entirely. Every fixture was
+checked against the real `Multiply` fold, not against `l1`'s values.
+
+**Two disclosures carried forward, both predicted and then measured.**
+
+1. **The `<=` at the branch boundary is unkillable in principle** — the third
+   such case, after `Overlay` (0.110.0) and `HardLight` (0.111.0). At
+   `Cs == 0.5` the burn arm is `ColorBurn(Cb, 1) = Cb` and the dodge arm is
+   `ColorDodge(Cb, 0) = Cb`, guard points included, so `<=` and `<` compute the
+   same function. Mutation (d) below confirms it survives every test in both
+   crates, and the new exhaustive CPU sweep turns the argument into a
+   measurement over all 15,362 `f16` values rather than three sample points.
+2. **This mode is *not* a sixth detector of `straight_backdrop`'s `ab > 0.0`
+   guard**, predicted from the rule 0.110.0 wrote down and then measured — the
+   second time that rule has correctly predicted a *non*-detection, after
+   `LinearLight`'s. Both arms end in a `min()` inherited from the two callees,
+   so a `NaN` `cb` is laundered to a finite `0.0` or `1.0`. The detector count
+   stays at **five** (`Multiply`, `Screen`, `Difference`, `Overlay`,
+   `HardLight`) — now of thirteen.
+
+**Both guarded-division modes' portability gaps now reach one mode at once, and
+this is the first time that has happened.** `2.0 * cs` and `2.0 * cs - 1.0` are
+bit-exact for operands in `[0, 1]` (power-of-two scale, then a subtraction of
+same-sign magnitudes at most one exponent apart), so all four inner guards stay
+reachable: `color_burn_channel`'s `cb == 1.0` fires at `Cs <= 0.5, Cb == 1` and
+`color_dodge_channel`'s `cb == 0.0` at `Cs > 0.5, Cb == 0`, both killed
+deterministically in earlier rounds; while `color_burn_channel`'s `cs == 0.0`
+(reachable only at `Cs == 0.0`) and `color_dodge_channel`'s `cs == 1.0` (only at
+`Cs == 1.0`) **survive every test on this adapter**, because Vulkan/NVIDIA
+divides by zero to `+inf` where WGSL specifies an indeterminate value. Metal and
+DX12 remain unverified, and for this mode an unverified backend could differ in
+a *value* twice over rather than once.
+
+**Asymmetry class: unconditional and *structural*, and the fourth of that
+kind** after `ColorBurn`, `ColorDodge` and `LinearLight`. `B(Cb, Cs)` branches
+on `Cs` while `B(Cs, Cb)` branches on `Cb`, so a straddling pair takes two
+different families under transposition rather than the same formula with swapped
+arguments. Being a pair of guarded divisions it is **not affine**, so
+`LinearLight`'s `(Cb - Cs)*(1 - 2a)` cancellation at `a = 0.5` has no analogue
+and there is **no blind opacity at all**: the only launderer is *rail agreement*
+(`Cb + 2*Cs <= 1` **and** `Cs + 2*Cb <= 1` in the burn branch, or
+`Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2` in the dodge branch). No channel of
+the app fixture rails in both orders, so its transpose is observable in all
+three channels at `0.5` *and* all three at `1.0` — the first roster row for
+which that holds at both opacities. For this mode the standing guard's non-unit
+opacity demand is therefore simply redundant, the reverse of `LinearLight`,
+where it was *insufficient*. The guard is left un-special-cased either way.
+
+### Mutation matrix — every one run for real, RTX 3090 / Vulkan / DiscreteGpu, `AURORA_REQUIRE_GPU=1`
+
+Baseline for every row: `aurora-render` 214 passed, `aurora-app` 411 passed.
+Reverted from an out-of-repo `cp` backup between rows, never `git checkout`.
+
+| # | mutation | result |
+|---|---|---|
+| a | burn branch loses its `2.0 *` (computes `ColorBurn(Cb, Cs)` there) | **killed** — all 7 `composite_vivid_light_*` render tests + the app differential. Not the single-channel affair predicted for every fixture: only T4's green, T5's blue and T1's blue carry it in their own fixtures, but every fixture has such a channel |
+| b | dodge branch gets `2.0 * cs` instead of `2.0 * cs - 1.0` | **killed** — all 7 render tests + the app differential. **This round's prediction was wrong and is corrected in the code comments rather than quietly dropped**: the divisor becomes `1 - 2*Cs`, *negative* across the branch's whole domain, so the branch emits negative colour and every dodge channel sees it. The prediction had it railing to a constant `1.0` via the `cs == 1.0` guard, which cannot fire above `Cs == 0.5` because `2*Cs` is not clamped |
+| c | the two branches swapped | **killed** — all 7 render tests + the app differential |
+| d | `<=` -> `<` at the branch boundary | **SURVIVES, as predicted** — 214/214 and 411/411 still green. Unkillable in principle; see disclosure 1 |
+| e | dispatch arm transposes `src`/`backdrop` | **killed by exactly one test**, `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_vivid_light_blend_document`, on its GPU-vs-CPU differential. Measured readback `(0.30664063, 0.8540039, 0.5415039, 1.0)` against the golden `(0.484375, 0.6875, 0.28125, 1.0)` — **all three channels**, each by more than `0.1` |
+| f1 | `fragment_entry` -> `"fs_composite_color_burn"` | **killed by 8** — the 7 mode tests **plus** `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`, 0.112.0's derived registry guard, which sees the duplicated entry-point name by set equality |
+| f2 | `fragment_entry` -> `"fs_composite_color_dodge"` | **killed by the same 8**, for the same two reasons |
+| g | branch on `cb` instead of `s.rgb` | **killed** — all 7 render tests + the app differential |
+| h | dispatch arm deleted entirely | **killed by exactly one assertion, and it is the counter** — the app differential fails at `take_gpu_blend_dispatch_count(GpuBlendDispatch::VividLight)` with `left: 0, right: 1`. Proved rather than inferred: re-running with the arm gone **and that assertion also removed** left the test **green**, so the differential, the absolute golden and the `ColorDodge` vacuity guard are all satisfied by the silent CPU fallback. Third mode in a row for which the counter is the sole detector |
+| i | `counter()`'s `VividLight` arm returns `self.color_dodge` | **killed by exactly one test**, `every_gpu_blend_dispatch_mode_gets_its_own_counter` — still the only assertion in either crate that can see a counter mis-wire |
+| j | predicate arm deleted | **killed by 4** — `document_qualifies_for_gpu_compositing_admits_a_vivid_light_blend_mode`, the derived `..._admits_exactly_the_modes_with_a_dispatch_counter`, `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, and the app differential |
+| k | `straight_backdrop`'s `ab > 0.0` guard deleted | **SURVIVES for this mode, as predicted** — exactly 5 render tests fail (`multiply`, `screen`, `difference`, `overlay`, `hard_light`) and `composite_vivid_light_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent` stays **green**. Detector count unchanged at 5, now of 13 |
+
+**Regression coverage explicitly re-run:** `HardMix`'s existing CPU tests pass
+unchanged. That matters more this round than usual, because `blend_channel`
+implements `HardMix` as a hard threshold on **`VividLight`'s own result**, so
+this port makes `HardMix` the one CPU-only mode that now delegates to a *ported*
+mode's arm. No `blend_channel` arm was touched, which is why nothing moved.
+
+**What this round did *not* do, and one honest limit.** No group support, no
+`CPU_ONLY_BLEND_MODE` change, no benchmark re-measurement — none of this moves
+the 60 FPS gate, which stays missed (see 0.96.2 for the current real-hardware
+record). And the round shipped one wrong prediction, caught only by actually
+running mutation (b) rather than by reasoning about it: the analysis of what a
+`2*cs`-for-`2*cs - 1` slip computes was wrong in a way that made the mutation
+look *harder* to kill than it is. Every affected comment in all three files was
+corrected, and the correction is recorded here rather than presented as the
+original plan.
 
 **Addendum 2026-09-05 (0.113.1) — the standing transpose guard now asks the
 arithmetic instead of trusting a proxy, and four prose errors 0.113.0 shipped

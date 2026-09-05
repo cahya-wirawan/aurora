@@ -73,8 +73,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // fs_composite_screen, fs_composite_difference,
 // fs_composite_linear_dodge, fs_composite_linear_burn,
 // fs_composite_color_burn, fs_composite_color_dodge,
-// fs_composite_overlay, fs_composite_hard_light and
-// fs_composite_linear_light -- use it,
+// fs_composite_overlay, fs_composite_hard_light,
+// fs_composite_linear_light and fs_composite_vivid_light -- use it,
 // through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
@@ -82,11 +82,11 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // -- the `backdrop` of every `TileCompositor::composite_*_over_with_
-// opacity` blend-math method (as of 0.113.0
+// opacity` blend-math method (as of 0.114.0
 // `composite_multiply_over_with_opacity` and its
 // `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`
-// siblings, named
+// `color_burn`/`color_dodge`/`overlay`/`hard_light`/`linear_light`/
+// `vivid_light` siblings, named
 // as a family rather than relisted, since one more joins them every time
 // a mode is ported) --
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
@@ -99,7 +99,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
 // (0.102.0), `Difference` (0.104.0), `LinearDodge` (0.105.0),
 // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge` (0.108.0),
-// `Overlay` (0.110.0) and `HardLight` (0.111.0) have
+// `Overlay` (0.110.0), `HardLight` (0.111.0), `LinearLight` (0.113.0) and
+// `VividLight` (0.114.0) have
 // since landed, and the live numbers live in `TileCompositor`'s own doc
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
@@ -130,21 +131,22 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
 // once per entry point.
 //
-// **What actually protects this guard is five tests, not twelve (measured,
+// **What actually protects this guard is five tests, not thirteen (measured,
 // 0.109.0 for the first three, 0.110.0 for the fourth and 0.111.0 for the
 // fifth; explained, 0.109.1).** Deleting the guard -- or replacing it with a
 // `select()`, which evaluates both arms -- fails
-// exactly five of the twelve per-mode transparent-backdrop tests:
+// exactly five of the thirteen per-mode transparent-backdrop tests:
 // `multiply`'s, `screen`'s, `difference`'s, `overlay`'s and
 // `hard_light`'s. (Two naming
 // shapes are in play: `multiply`'s and `darken`'s are
 // `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
-// the other ten are
+// the other eleven are
 // `composite_<mode>_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.)
-// The other seven -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
-// `color_burn`, `color_dodge`, `linear_light` -- pass with the guard gone, and not
+// The other eight -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
+// `color_burn`, `color_dodge`, `linear_light`, `vivid_light` -- pass with the
+// guard gone, and not
 // because their fixtures are weak: on this backend `min()`/`max()`
-// *launder* a NaN operand into the finite one, so those six formulas
+// *launder* a NaN operand into the finite one, so those formulas
 // turn the NaN into a finite `b` before `fold_over` ever sees it -- and
 // `fold_over`'s own `ab == 0.0` would have erased that finite `b` anyway.
 // That makes the guard's removal genuinely **output-equivalent**
@@ -177,7 +179,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // back literally `(NaN, NaN, NaN, 1.0)`, failing both that test's finiteness
 // check and its value check. See PLAN.md's 0.111.0 entry.
 //
-// **`LinearLight` (0.113.0) is *not* a sixth detector, and the same rule is
+// **Neither `LinearLight` (0.113.0) nor `VividLight` (0.114.0) is a sixth
+// detector, and the same rule is
 // what predicted that too — the first time the rule predicted a *non*-detection
 // for a newly ported mode, and it was then measured rather than assumed.** Its
 // blend term is a single `clamp()`, and WGSL specifies float `clamp(e1, e2, e3)`
@@ -188,7 +191,13 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // the_backdrop_is_transparent` stays **green**. That is the same
 // output-equivalence the six min/max modes have, not a weak fixture — and it is
 // why the rule is worth stating as "no NaN-laundering intrinsic on the path from
-// `cb` to `b`" rather than as a list of tokens to grep for.
+// `cb` to `b`" rather than as a list of tokens to grep for. **`VividLight`
+// (0.114.0) is the second such prediction and it held too**: both of its arms
+// end in a `min()` -- inherited from `color_burn_channel` and
+// `color_dodge_channel` -- so a `NaN` `cb` is laundered into a finite `0.0` or
+// `1.0` before `fold_over` ever sees it. Measured in 0.114.0: with the guard
+// deleted, `composite_vivid_light_over_with_opacity_is_the_source_alone_where_
+// the_backdrop_is_transparent` stays green.
 fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
     let ab = bd.a;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
@@ -269,7 +278,7 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 //      justify keeping a per-mode transparent-backdrop test by listing
 //      "its own separately-compiled `ab > 0.0` guard" among the things
 //      that test uniquely exercises. That is no longer true: the guard is
-//      written once and shared by all eleven entry points. (A backend is
+//      written once and shared by all thirteen entry points. (A backend is
 //      still free to inline it per call site, so per-entry-point *machine
 //      code* is not ruled out -- but the source-level independence the
 //      comments leaned on is gone, and the measured 5-of-11 kill above is
@@ -278,7 +287,7 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 // Those suite-header comments in `composite.rs` were corrected in 0.109.1
 // and carry the specific sites; the per-test doc comments there carry a
 // one-line back-reference to here rather than repeating this. Only 5 of
-// the 11 kept transparent-backdrop tests can currently detect the guard's
+// the 13 kept transparent-backdrop tests can currently detect the guard's
 // removal at all -- see the `straight_backdrop()` comment above, and
 // PLAN.md's 0.109.0 entry for why.
 //
@@ -1250,5 +1259,195 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
     // branch form collapses to this. Dropping the `2.0 *` here is
     // fs_composite_linear_burn exactly.
     let b = clamp(cb + 2.0 * s.rgb - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    return fold_over(s, bd, b);
+}
+
+// `blend_channel`'s own `BlendMode::VividLight` arm (src/composite.rs), one
+// channel at a time -- the third per-channel blend helper in this file, and
+// the first that computes no arithmetic of its own: it is a branch and two
+// delegations, exactly as the Rust arm is.
+//
+//     BlendMode::VividLight => if cs <= 0.5 { ColorBurn(cb, 2*cs) }
+//                             else          { ColorDodge(cb, 2*cs - 1) }
+//
+// **Why three calls to this and not one componentwise `select()`.**
+// `fs_composite_overlay` and `fs_composite_hard_light` are branches written as
+// `select()`, which is legitimate *there* because neither arm divides, so
+// evaluating the discarded one costs nothing. Here both arms are
+// `color_burn_channel`/`color_dodge_channel`, whose guards are **early
+// returns**: they exist precisely so a division is never reached in the lanes
+// where its divisor is zero. A `select()` would evaluate both arms in every
+// lane, which reinstates exactly the division-by-zero the guards were written
+// to avoid. Worth stating precisely, because the weaker argument is the one
+// that first comes to mind and it is not the argument being made: the
+// *discarded* arm here is not itself unsafe -- it is guarded too, and would
+// return its guard's value rather than divide. What a `select()` costs is the
+// early-return structure, not correctness of the branch taken; and since the
+// guards are the file's only defence against WGSL's indeterminate
+// division-by-zero, giving that structure up to save two lines is not a trade
+// worth making. Three calls is the honest shape, for the same reason
+// `color_burn_channel`'s own comment gives.
+//
+// **The `2.0 * cs` and `2.0 * cs - 1.0` substitutions are bit-faithful.**
+// Multiplying by two and subtracting one are exact in IEEE-754 binary for
+// operands in `[0, 1]` (a power-of-two scale, then a subtraction of same-sign
+// magnitudes at most one exponent apart), so nothing here rounds and all four
+// of the callees' guards stay reachable through this substitution:
+//
+//   | guard | fires when | deleting it |
+//   |---|---|---|
+//   | `color_burn_channel`'s `cb == 1.0` | `Cs <= 0.5` and `Cb == 1` | killed deterministically (the `cs == 0` guard then fires in its place and returns `0.0` where `1.0` is correct) |
+//   | `color_burn_channel`'s `cs == 0.0` | `Cs == 0.0` exactly (`2*Cs` is `0` only there) | **survives on this adapter** -- `(1-Cb)/0` is `+inf` here and `1 - min(1, inf)` is the `0.0` the guard returns |
+//   | `color_dodge_channel`'s `cb == 0.0` | `Cs > 0.5` and `Cb == 0` | killed deterministically |
+//   | `color_dodge_channel`'s `cs == 1.0` | `Cs == 1.0` exactly (`2*Cs - 1` is `1` only there) | **survives on this adapter** -- `Cb/0` is `+inf` here and `min(1, inf)` is the `1.0` the guard returns |
+//
+// Both survivals are *inherited*, not new: they are `ColorBurn`'s (0.107.0)
+// and `ColorDodge`'s (0.108.0) own disclosed portability gaps, reaching this
+// mode through the two helpers it shares with them. WGSL specifies an
+// indeterminate value for division by zero, not `+inf`, so those two guards
+// are portability guards that no test on this hardware can exercise -- and
+// this mode now propagates *both* of them at once, where each sibling
+// propagates one.
+//
+// **The `ab == 0` half of a tile reaches the two branches differently**, and
+// the two arguments are genuinely distinct rather than one argument stated
+// twice. There `straight_backdrop` forces `cb` to exactly `0.0`. In the
+// **dodge** branch that hits `cb == 0.0` and returns before any division, so
+// `ColorDodge`'s own NaN-safety argument carries over verbatim. In the
+// **burn** branch `cb == 0.0` does *not* match `cb == 1.0`, so the division is
+// reached; if `Cs == 0.0` as well, an unguarded form would compute `0.0/0.0`
+// and `fold_over`'s `ab * b` would then be `0.0 * NaN`, which is `NaN`, not
+// `0.0` -- `ColorBurn`'s hazard shape, governing branch 1, where
+// `ColorDodge`'s governs branch 2. Note also that the two `cb` guards test
+// **different constants** (`cb == 1` in burn, `cb == 0` in dodge), so there is
+// no single "the `cb` guard" for this mode.
+//
+// **Asymmetry: UNCONDITIONAL, and structurally so.** `B(Cb, Cs)` branches on
+// `Cs` while `B(Cs, Cb)` branches on `Cb`, so a pair straddling `0.5` takes
+// two different *families* under transposition -- this is `ColorBurn`'s and
+// `ColorDodge`'s class, not `Overlay`'s and `HardLight`'s straddle-conditional
+// one. It is **not** affine, so `LinearLight`'s `(Cb - Cs)*(1 - 2a)`
+// cancellation at `a = 0.5` has no analogue here. What launders a transpose
+// instead is *rail agreement*, in two regimes:
+//
+//   - burn branch (`Cs <= 0.5`): `B` rails to `0` when `Cb + 2*Cs <= 1`. Both
+//     operand orders rail when `Cb + 2*Cs <= 1` **and** `Cs + 2*Cb <= 1`, and
+//     the blend term is blind to a transpose there.
+//   - dodge branch (`Cs > 0.5`): `B` rails to `1` when `Cb + 2*Cs >= 2`. Both
+//     orders rail when `Cb + 2*Cs >= 2` **and** `Cs + 2*Cb >= 2`.
+//   - and universally, `Cb == Cs` hides one.
+//
+// So a fixture needs at least one channel that is clamp-*interior in both
+// operand orders*; such a channel then stays observable at **every** alpha,
+// including the `0.5` at which `LinearLight`'s interior channels go blind.
+// Measured in 0.114.0 rather than argued: the app-level fixture's transpose is
+// caught in all three channels at `0.5` and all three at `1.0`.
+//
+// **Five degeneracies, all verified algebraically, and they constrain every
+// fixture in this crate's `composite_vivid_light_*` tests:**
+//
+//   1. `VividLight(Cb, 0.5) = Cb` for every `Cb` -- a **source** channel at
+//      exactly `0.5` is a total no-op. This is also the branch boundary; see
+//      below.
+//   2. `VividLight(Cb, 0) = 0` except `VividLight(1, 0) = 1`, and
+//      `VividLight(Cb, 1) = 1` except `VividLight(0, 1) = 0` -- a black or
+//      white **source** channel erases the backdrop, the two guard points
+//      excepted.
+//   3. `VividLight(0, Cs) = 0` and `VividLight(1, Cs) = 1` for every `Cs` --
+//      a black or white **backdrop** channel erases the *source* entirely.
+//      Unlike the sibling modes this makes the *composited* backdrop a
+//      constraint, not just the bottom layer's own literal.
+//   4. A `0.5` **backdrop** channel is *not* degenerate
+//      (`VividLight(0.5, Cs)` is `1 - 1/(4*Cs)` below the boundary and
+//      `1/(4 - 4*Cs)` above it, clamped), like `LinearLight` and unlike
+//      `HardLight`.
+//   5. `Cb == Cs` in a channel hides a transposed operand pair.
+//
+// **The branch boundary is continuous, and the `<=` there is provably
+// unkillable** -- the third such disclosure, after `Overlay` (0.110.0) and
+// `HardLight` (0.111.0). At `Cs == 0.5` the burn arm computes
+// `ColorBurn(Cb, 1.0)`, which is `1 - min(1, (1 - Cb)/1) = Cb`, and the dodge
+// arm computes `ColorDodge(Cb, 0.0)`, which is `min(1, Cb/1) = Cb`. That
+// includes both arms' guard points (`Cb == 1` gives `1`, `Cb == 0` gives `0`,
+// from the guards and from the arithmetic alike). The two arms are therefore
+// identical on **every** input at the boundary, so `<=` against `<` computes
+// the same function and no test can distinguish them.
+// `composite_vivid_light_over_with_opacity_agrees_across_its_own_branch_boundary`
+// pins the *value* at the boundary and deliberately does not claim to test the
+// comparison's direction.
+//
+// **Not a sixth detector of `straight_backdrop`'s guard removal -- predicted,
+// then measured** (the second time the rule 0.110.0 wrote down has been used
+// to predict a *non*-detection, after `LinearLight`'s). With the guard gone
+// `cb` is `0.0/0.0`, a `NaN`. The burn arm computes
+// `1 - min(1, (1 - NaN)/cs)`, and `min(1, NaN)` returns `1.0` on this backend,
+// so `b` is a finite `0.0`; the dodge arm computes `min(1, NaN/(1 - cs))`,
+// likewise a finite `1.0`. **Both arms launder**, so the detector count stays
+// at five (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`).
+//
+// **Near misses, in decreasing order of how easy the slip is:**
+//
+//   - **Dropping the `2.0 *` in the burn branch computes `ColorBurn(Cb, Cs)`
+//     there** -- and `ColorBurn` is a live GPU entry point and a live dispatch
+//     arm. Detectable only in a burn channel that is clamp-*interior*, since
+//     `Cb + 2*Cs <= 1` implies `Cb + Cs <= 1`: a lower-railed burn channel is
+//     `0.0` for both.
+//   - **Passing `2.0 * cs` where the dodge branch needs `2.0 * cs - 1.0`**
+//     makes `color_dodge_channel`'s divisor `1 - 2*Cs`, which is **negative**
+//     for every `Cs > 0.5` -- the whole domain of that branch. So
+//     `min(1, Cb / negative)` is that negative quotient, and the branch emits
+//     out-of-range negative colour in every channel with `Cb > 0`. **Corrected
+//     in this round from a wrong prediction, which is worth recording:** the
+//     first analysis had this collapsing to a constant `1.0` via the
+//     `cs == 1.0` guard, on the assumption that `2*Cs` would be clamped. It is
+//     not clamped, and that guard can only fire at `Cs == 0.5`, which belongs
+//     to the *other* branch. The consequence is that this mutation is far
+//     easier to kill than predicted -- **every** dodge channel sees it, railed
+//     or interior -- and every fixture below did kill it, measured.
+//   - **Swapping the two branches**, or **branching on `cb` instead of
+//     `s.rgb`** -- the latter is `fs_composite_overlay`'s relationship to
+//     `fs_composite_hard_light` reappearing here, except that the mode a
+//     `cb`-branch computes is not itself a named PSD mode, so it degrades to
+//     nonsense rather than to another shipped formula.
+//   - **A `fragment_entry` naming `fs_composite_color_burn` or
+//     `fs_composite_color_dodge`** -- the two entry points this one *calls*,
+//     both live. Detectable in every channel whose branch differs from the
+//     named mode's own answer; see the suite header for which fixture covers
+//     which.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the twelve entry points
+// above; no new binding, no new layout.
+fn vivid_light_channel(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) {
+        return color_burn_channel(cb, 2.0 * cs);
+    }
+    return color_dodge_channel(cb, 2.0 * cs - 1.0);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs) exactly,
+// for `BlendMode::VividLight` only -- the **thirteenth** blend mode ported to
+// the GPU (0.114.0), and the first whose blend term is built entirely out of
+// two *other ported modes'* helpers rather than out of arithmetic.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of the
+// surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` block below differs. Read
+// `vivid_light_channel` directly above for this mode's own formula, its four
+// inherited guard-reachability results, its asymmetry class, its five
+// degeneracies, its unkillable boundary mutation and its near-miss table.
+@fragment
+fn fs_composite_vivid_light(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    // blend_channel(VividLight, cb, cs): ColorBurn(cb, 2*cs) where cs <= 0.5,
+    // else ColorDodge(cb, 2*cs - 1). The branch tests the SOURCE. Three calls
+    // rather than a select(), because both callees' guards are early returns.
+    let b = vec3<f32>(
+        vivid_light_channel(cb.r, s.r),
+        vivid_light_channel(cb.g, s.g),
+        vivid_light_channel(cb.b, s.b),
+    );
     return fold_over(s, bd, b);
 }
