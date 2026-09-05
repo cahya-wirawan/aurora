@@ -805,11 +805,11 @@ impl TileStore {
     /// already in flight for this key is left to complete in its own
     /// time — but its eventual result is not left to reconcile as an
     /// ordinary success. **A key still in `pending` at this moment is
-    /// recorded in [`Self::forgotten_while_pending`] before its `pending`
+    /// recorded in `forgotten_while_pending` before its `pending`
     /// entry is dropped**, so when that write's result later drains into
-    /// `reconcile_pending`/[`Self::flush`], [`Self::discard_if_forgotten_while_pending`]
+    /// `reconcile_pending`/[`Self::flush`], `discard_if_forgotten_while_pending`
     /// deletes the file it just produced instead of letting it sit
-    /// unreferenced. (Before 0.116.1 that file was genuinely orphaned —
+    /// unreferenced. (Before 0.115.2 that file was genuinely orphaned —
     /// no key in any map could name it, so no read could reach it, but
     /// nothing deleted it either until the whole scratch directory was
     /// swept at session end. See
@@ -976,8 +976,8 @@ impl TileStore {
     /// writes, if any failed.
     ///
     /// **A forgotten tile's result is handled the same way
-    /// `reconcile_pending` does** (0.116.1): dropped from this loop by
-    /// [`Self::discard_if_forgotten_while_pending`], which deletes the
+    /// `reconcile_pending` does** (0.115.2): dropped from this loop by
+    /// `discard_if_forgotten_while_pending`, which deletes the
     /// file it produced rather than treating it as an ordinary success
     /// or a reportable failure. This is in fact the only place that
     /// path is exercised deterministically — `flush` blocks until the
@@ -1203,7 +1203,7 @@ impl TileStore {
     /// [`Stats::superseded_writes`] for the counter.
     ///
     /// **A forgotten tile's result is dropped too, but deletes rather
-    /// than ignores** (0.116.1) — see
+    /// than ignores** (0.115.2) — see
     /// [`Self::discard_if_forgotten_while_pending`], the second shared
     /// prologue, run immediately after the one above.
     fn reconcile_pending(&mut self) {
@@ -1295,7 +1295,7 @@ impl TileStore {
     /// the key it tombstones here — so the two checks are looking at
     /// disjoint keys in practice, but keeping them as two small,
     /// separately-named methods (rather than one that tries to explain
-    /// both reasons a result might be moot) is what let 0.116.1 add this
+    /// both reasons a result might be moot) is what let 0.115.2 add this
     /// one without touching `is_superseded`'s own, already-tested
     /// contract for the *other* absent-key case: see
     /// `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`,
@@ -1929,7 +1929,7 @@ mod tests {
             // Without this, the `evict_and_flush == false` pass's
             // `!path.exists()` assertions below raced a background write
             // still in flight for a doomed tile at the moment of the
-            // sweep — CI caught the race 0.116.1 closed
+            // sweep — CI caught the race 0.115.2 closed
             // (`forget_surface_drops_every_tile_of_that_surface_from_
             // every_place_it_can_live` failing on a runner slow enough
             // for the write to land *after* `forget_surface` returned).
@@ -1975,7 +1975,7 @@ mod tests {
     // `flush()`: forces a tile's write to still be genuinely in flight —
     // no eviction, no background thread, no timing — at the exact moment
     // it is forgotten, so this cannot pass by accident the way the timing-
-    // dependent version above could before 0.116.1.
+    // dependent version above could before 0.115.2.
     fn forget_tile_deletes_the_file_a_write_still_in_flight_at_forget_time_later_produces() {
         let (_dir, mut store) = store(4);
         let s = surface();
