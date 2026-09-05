@@ -7380,9 +7380,14 @@ fn composite_roots_into_tile(
 ///   reason. `NORMAL_MULTIPLY_PIN_LIGHT_STACK` sits off all five sets, and its
 ///   transpose is measured caught in all three channels at `0.5` **and** at
 ///   `1.0`. Its degeneracies are `Darken`'s and `Lighten`'s: **every
-///   backdrop-wins channel (`B == Cb`) provably agrees with `Darken` in the low
-///   branch and `Lighten` in the high branch**, both live GPU arms, so
-///   separating them needs a *source-derived* channel per branch. Its
+///   backdrop-wins channel (`B == Cb`) agrees with exactly one of `Darken` and
+///   `Lighten`, and `sign(Cb - Cs)` decides which** — `Darken` iff `Cb <= Cs`,
+///   `Lighten` iff `Cb >= Cs`, which follows from `B == Cb` alone and is **not**
+///   keyed to the branch (0.116.0 said it was; corrected in 0.116.2, the
+///   `composite_pin_light_*` suite holding two counterexamples of its own).
+///   Both rivals are live GPU arms, so such a channel hides one and separates
+///   the other, and separating both needs a *source-derived* channel per
+///   branch. Its
 ///   `<= 0.5` branch comparison is the **second on this path whose direction is
 ///   killable** (after `HardMix`) and the first whose kill needs an
 ///   out-of-gamut backdrop to exist: the two arms agree for every `Cb` in
@@ -7854,7 +7859,7 @@ fn accumulator_or_create<'slot>(
 /// lets one call site serve both builds without a `#[cfg]` at the call
 /// site itself.
 ///
-/// The variants are exactly the fifteen modes
+/// The variants are exactly the sixteen modes
 /// [`document_qualifies_for_gpu_compositing`] admits *other than*
 /// `Normal`, which is deliberately absent: the `Normal` arm is shared by
 /// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
@@ -7863,7 +7868,7 @@ fn accumulator_or_create<'slot>(
 /// call site and why it is where it is.
 ///
 /// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
-/// consequence of 0.103.1 rather than an inconsistency.** The other thirteen
+/// consequence of 0.103.1 rather than an inconsistency.** The other fifteen
 /// are named by real dispatch arms that exist in both builds, so they are
 /// constructed in both. `Dissolve` has no arm; the only thing that ever
 /// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
@@ -9866,13 +9871,15 @@ fn begin_gpu_composite_tile(
             // carries `0.5` on its `ColorDodge` layer, because
             // `TRANSPOSE_COVERAGE`'s guard is deliberately not
             // special-cased for either asymmetric mode: non-unit opacity
-            // is now sufficient-but-not-necessary for six of the fifteen
+            // is now sufficient-but-not-necessary for seven of the sixteen
             // non-`Normal` admitted modes
             // (`Overlay`, 0.110.0, and `HardLight`, 0.111.0, joined them
             // conditionally; `LinearLight`, 0.113.0, and `VividLight`,
             // 0.114.0, unconditionally; `HardMix`, 0.115.0, moved the
             // denominator to fifteen without joining the six -- its blend
-            // term is symmetric away from one corner point),
+            // term is symmetric away from one corner point; `PinLight`,
+            // 0.116.0, moved it to sixteen *and* joined them as the seventh,
+            // its blend term being symmetric only on a measure-zero set),
             // and a conservative guard that still demands it costs
             // nothing.
             aurora_render::BlendMode::ColorDodge => {
@@ -9936,10 +9943,11 @@ fn begin_gpu_composite_tile(
             // confirmed the transpose is observable there at effective
             // alpha `1.0` as well as at `0.5`. That fixture still carries
             // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
-            // guard is deliberately not special-cased for any of the six
+            // guard is deliberately not special-cased for any of the seven
             // asymmetric modes: non-unit opacity is now
-            // sufficient-but-not-necessary for six of the fifteen
-            // non-`Normal` admitted modes, and a
+            // sufficient-but-not-necessary for seven of the sixteen
+            // non-`Normal` admitted modes (`PinLight`, 0.116.0, being the
+            // seventh and the sixteenth), and a
             // conservative guard that still demands it costs nothing.
             aurora_render::BlendMode::Overlay => {
                 let spare_accumulator = accumulator_or_create(
@@ -10245,9 +10253,11 @@ fn begin_gpu_composite_tile(
             // whose names differ from this one by a word. Arithmetically, the
             // arms at risk are `composite_darken_over_with_opacity` and
             // `composite_lighten_over_with_opacity`, which share no word with
-            // this mode's name but *are* its two branches -- and which it
-            // **provably** agrees with in every backdrop-wins channel (`Darken`
-            // in the low branch, `Lighten` in the high one). So separating them
+            // this mode's name but *are* its two branches -- and *one of* which
+            // it agrees with in every backdrop-wins channel: `Darken` where
+            // `Cb <= Cs`, `Lighten` where `Cb >= Cs`. The branch does not decide
+            // which (0.116.0 claimed it did; corrected in 0.116.2). So
+            // separating both
             // needs a *source-derived* channel per branch, which
             // `NORMAL_MULTIPLY_PIN_LIGHT_STACK` carries.
             // Instrumented from its first round -- see `GpuBlendDispatches`.
@@ -28702,12 +28712,12 @@ mod tests {
         );
     }
 
-    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 11 modes the GPU
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 10 modes the GPU
     /// path still cannot express" (27 `aurora_doc::BlendMode` variants
-    /// minus the sixteen admitted as of 0.115.0: `Normal`, `Multiply`,
+    /// minus the seventeen admitted as of 0.116.0: `Normal`, `Multiply`,
     /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
     /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`, `HardLight`,
-    /// `LinearLight`, `VividLight`, `HardMix` and `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
+    /// `LinearLight`, `VividLight`, `HardMix`, `PinLight` and `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
     /// `Multiply`, which 0.84.0 moved to the *admitted* side, and then
@@ -28725,7 +28735,13 @@ mod tests {
     /// by the time 0.107.1 corrected it. Nothing derives it from
     /// [`document_qualifies_for_gpu_compositing`]'s own admitted set, and
     /// nothing fails when it is wrong — see PLAN.md's 0.107.1 entry for
-    /// the named follow-on that would.
+    /// the named follow-on that would. **It drifted again in 0.116.0**,
+    /// which admitted `PinLight` at the predicate and left this sentence
+    /// reading "11 … the sixteen admitted as of 0.115.0"; 0.116.2 corrected
+    /// it to 10 of 27 against seventeen admitted, matching the predicate's
+    /// own doc. That is the second time this exact sentence has gone stale
+    /// behind a port, which is the argument for the derived assertion the
+    /// 0.107.1 entry names rather than for a third round of hand-editing.
     #[test]
     fn document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -29523,8 +29539,10 @@ mod tests {
     /// branches *are* — are **not** in that list: both have been admitted since
     /// 0.85.0 and 0.95.0. The hazard they pose is a wrong `fragment_entry` or a
     /// wrong `composite_*` call, not one leaking onto the GPU path, and which
-    /// channels can see each is settled provably (a backdrop-wins channel agrees
-    /// with the matching one) rather than left to a fixture's luck — which is
+    /// channels can see each is settled provably (a backdrop-wins channel hides
+    /// whichever of the two `sign(Cb - Cs)` picks — `Darken` where `Cb <= Cs`,
+    /// `Lighten` where `Cb >= Cs` — and separates the other) rather than left
+    /// to a fixture's luck — which is
     /// why `NORMAL_MULTIPLY_PIN_LIGHT_STACK` carries a source-derived channel in
     /// each branch.
     ///
@@ -31383,11 +31401,15 @@ mod tests {
     /// | blue | `0.5625 > 0.5` | high | `max(0.1875, 0.125) = 0.1875` | **backdrop-wins** |
     ///
     /// Both branches, and a **source-derived channel in each** — which is a
-    /// requirement rather than a nicety: every backdrop-wins channel provably
-    /// agrees with `Darken` in the low branch and `Lighten` in the high branch,
-    /// both live GPU arms, so only a source-derived channel separates them. Blue
-    /// is the backdrop-wins one and does coincide with `Darken`; red and green
-    /// carry that claim.
+    /// requirement rather than a nicety: every backdrop-wins channel agrees with
+    /// exactly one of `Darken` and `Lighten`, the one `sign(Cb - Cs)` picks
+    /// (`Darken` iff `Cb <= Cs`, `Lighten` iff `Cb >= Cs`; **not** the one the
+    /// branch picks — 0.116.0 said branch, 0.116.2 corrected it), and both are
+    /// live GPU arms, so only a source-derived channel separates the hidden one.
+    /// Blue is the backdrop-wins channel here and does coincide with `Darken`,
+    /// its `Cb = 0.1875` being below its `Cs = 0.5625` — note that is the
+    /// **high** branch, so the branch-keyed rule would have named the wrong
+    /// rival for this very fixture. Red and green carry that claim.
     ///
     /// **Chosen against this mode's blind set explicitly, per channel**, which
     /// is the whole reason the operands are not rounder numbers. The blend term
@@ -35410,13 +35432,20 @@ mod tests {
     ///   `PinLight` replaced by **`Darken`** must composite to something
     ///   *different*. `Darken` is not an arbitrary choice: it is literally this
     ///   mode's low branch, it is what a dropped `2.0 *` there computes, and
-    ///   **every backdrop-wins channel of this mode provably agrees with it** —
-    ///   so it is the rival most likely to pass unnoticed. It is a live GPU
+    ///   **every backdrop-wins channel whose `Cb <= Cs` agrees with it** — so it
+    ///   is the rival most likely to pass unnoticed. (0.116.0 wrote that without
+    ///   the `Cb <= Cs`, i.e. claimed *every* backdrop-wins channel agrees with
+    ///   `Darken`; that is false — such a channel agrees with `Darken` iff
+    ///   `Cb <= Cs` and with `Lighten` iff `Cb >= Cs`, and `aurora-render`'s own
+    ///   `composite_pin_light_over_with_opacity_does_not_clamp_a_source_alpha_
+    ///   above_one` carries a backdrop-wins channel of the second kind.
+    ///   Corrected in 0.116.2.) It is a live GPU
     ///   dispatch arm, so the substituted run composites on the GPU path too. It
     ///   gives `(0.453125, 0.375, 0.1875)` against the golden's
     ///   `(0.578125, 0.5, 0.1875)` — differing in red and green and
     ///   **coinciding in blue**, which is not a fixture weakness but that
-    ///   provable agreement: blue is the backdrop-wins channel. (The substituted
+    ///   agreement: blue is backdrop-wins with `Cb = 0.1875 <= Cs = 0.5625`.
+    ///   (The substituted
     ///   run ticks `GpuBlendDispatch::Darken`; nothing here reads that counter,
     ///   and `real_gpu_context` zeroes every counter under its lock, so no
     ///   sibling test can see it either.)
@@ -35518,8 +35547,10 @@ mod tests {
              source-derived) and blue the high branch backdrop-wins \
              (max(0.1875, 0.125) = 0.1875) -- so B = (0.5, 0.625, 0.1875). Darken gives \
              (0.453125, 0.375, 0.1875, 1.0): it IS this mode's low branch, it is what a dropped \
-             2.0* there computes, and every backdrop-wins channel provably agrees with it, so blue \
-             coincides and red and green carry the claim. Lighten gives \
+             2.0* there computes, and a backdrop-wins channel agrees with it whenever Cb <= Cs \
+             (with Lighten instead whenever Cb >= Cs; the branch does not decide which), so blue \
+             coincides -- Cb = 0.1875 <= Cs = 0.5625 -- and red and green carry the claim. \
+             Lighten gives \
              (0.65625, 0.59375, 0.375, 1.0), separated in all three. \
              (0.453125, 0.59375, 0.375, 1.0) is the Normal arm, \
              (0.41015625, 0.33984375, 0.14648438, 1.0) Multiply, \
@@ -35541,11 +35572,13 @@ mod tests {
 
         // The vacuity guard: the same stack with its `PinLight` layer turned
         // into a `Darken` one. `Darken` rather than a lexical near-name, because
-        // this mode's low branch *is* `Darken` and every backdrop-wins channel
-        // provably agrees with it -- so it is the rival most likely to pass
-        // unnoticed. It is admitted at the predicate too, so the substituted
-        // stack also composites on the GPU path. Red and green carry the claim;
-        // blue coincides, being the backdrop-wins channel.
+        // this mode's low branch *is* `Darken` and a backdrop-wins channel
+        // agrees with it whenever `Cb <= Cs` (whenever `Cb >= Cs` it is
+        // `Lighten` that agrees instead -- the branch does not decide which,
+        // 0.116.2 correcting 0.116.0 on that) -- so it is the rival most likely
+        // to pass unnoticed. It is admitted at the predicate too, so the
+        // substituted stack also composites on the GPU path. Red and green carry
+        // the claim; blue coincides, being backdrop-wins with `Cb <= Cs`.
         let mut substituted = stack;
         for entry in &mut substituted {
             if entry.1 == aurora_doc::BlendMode::PinLight {
@@ -35576,8 +35609,9 @@ mod tests {
              this one's low branch IS, and therefore exactly what a dropped 2.0* there, a \
              fragment_entry naming fs_composite_darken, or the wrong composite_* method at the \
              dispatch site computes -- or the differential above would pass with the wrong arm \
-             running. Red and green carry this claim; blue cannot, being the backdrop-wins channel, \
-             which provably agrees with Darken."
+             running. Red and green carry this claim; blue cannot, being a backdrop-wins channel \
+             whose Cb (0.1875) is below its Cs (0.5625), which is what makes Darken the rival it \
+             agrees with."
         );
     }
 

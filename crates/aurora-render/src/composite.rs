@@ -277,8 +277,10 @@ const LABEL_HARD_MIX_PASS: &str = "composite.hard_mix.pass";
 /// situation a truncated label ruins. The *formula* risk is different again and
 /// points at two labels that share no word with this one at all:
 /// `"composite.darken"` and `"composite.lighten"`, whose arms this mode's two
-/// branches are literally built from, and which it provably agrees with in any
-/// backdrop-wins channel (see `fs_composite_pin_light`'s own comment). Spelled
+/// branches are literally built from, and one of which it agrees with in any
+/// backdrop-wins channel — `Darken` where `Cb <= Cs`, `Lighten` where
+/// `Cb >= Cs`, never keyed to which branch fired (see
+/// `fs_composite_pin_light`'s own comment). Spelled
 /// in full (`pin_light`, never `pin` or `p_light`) for the reason every pair
 /// above is.
 const LABEL_PIN_LIGHT: &str = "composite.pin_light";
@@ -581,9 +583,11 @@ const BLEND_PASS_HARD_MIX: BlendPass = BlendPass {
 /// `"fs_composite_vivid_light"`, three live entry points sharing this one's
 /// `_light` suffix. The *formula* one is `"fs_composite_darken"` and
 /// `"fs_composite_lighten"`, which share no word with this name but are exactly
-/// what this mode's two branches reduce to — and which it provably agrees with
-/// in every backdrop-wins channel, so separating them needs a *source-derived*
-/// channel in each branch. Those are mutations (i) and (j) of this round's set,
+/// what this mode's two branches reduce to — and *one of* which it agrees with
+/// in every backdrop-wins channel (`Darken` where `Cb <= Cs`, `Lighten` where
+/// `Cb >= Cs`; the branch does not decide it), so such a channel hides one
+/// rival and separates the other, and separating both needs a
+/// *source-derived* channel. Those are mutations (i) and (j) of this round's set,
 /// and every `composite_pin_light_*` fixture carries at least one
 /// source-derived channel per branch it reaches for exactly that reason.
 const BLEND_PASS_PIN_LIGHT: BlendPass = BlendPass {
@@ -3190,9 +3194,16 @@ impl TileCompositor {
     /// `aurora-app`'s standing `every_gpu_blend_math_dispatch_arm_has_a_
     /// fixture_that_could_see_a_transposed_argument` guard is deliberately
     /// *not* special-cased for either mode: non-unit opacity is now
-    /// sufficient-but-not-necessary for six of the thirteen (`Overlay`, 0.110.0,
+    /// sufficient-but-not-necessary for seven of the fifteen blend-math
+    /// dispatch arms (`Overlay`, 0.110.0,
     /// and `HardLight`, 0.111.0, joined them, both conditionally; `LinearLight`,
-    /// 0.113.0, and `VividLight`, 0.114.0, unconditionally), and a conservative
+    /// 0.113.0, and `VividLight`, 0.114.0, unconditionally; `PinLight`, 0.116.0,
+    /// unconditionally too, its blend term being symmetric only on a
+    /// measure-zero set. `HardMix`, 0.115.0, moved the denominator without
+    /// joining them. The figure was left at "six of the thirteen" by both of
+    /// those rounds and re-derived in 0.116.2; `aurora-app`'s own copies of it
+    /// count the sixteen non-`Normal` *admitted* modes instead, `Dissolve`
+    /// included, so they read "seven of the sixteen" for the same seven), and a conservative
     /// guard that still demands it costs nothing and keeps the rule
     /// uniform.
     ///
@@ -3965,8 +3976,11 @@ impl TileCompositor {
     /// which WGSL leaves undefined, so it is not a portability guarantee.
     ///
     /// **Degeneracy that governs the fixtures: every backdrop-wins channel
-    /// (`B == Cb`) agrees with `Darken` in the low branch and `Lighten` in the
-    /// high branch**, both live GPU arms — so separating them needs a
+    /// (`B == Cb`) agrees with exactly one of `Darken` and `Lighten`, and
+    /// `sign(Cb - Cs)` decides which — `Darken` where `Cb <= Cs`, `Lighten`
+    /// where `Cb >= Cs`.** The branch does not decide it (0.116.0 claimed it
+    /// did; corrected in 0.116.2). Both are live GPU arms, so such a channel
+    /// hides one rival and separates the other, and separating both needs a
     /// *source-derived* channel in each branch, which every
     /// `composite_pin_light_*` fixture carries. A `0.5` **source** channel is a
     /// no-op and is also this mode's one `LinearLight` collision
@@ -9634,16 +9648,20 @@ mod tests {
     /// **That reasoning was confirmed by measurement in 0.109.0.** The
     /// guard now lives once in `composite.wgsl`'s shared
     /// `straight_backdrop()`, and deleting it fails exactly **five of the
-    /// thirteen** per-mode versions of this test — `multiply`'s, this one,
+    /// fifteen** per-mode versions of this test — `multiply`'s, this one,
     /// `difference`'s, `overlay`'s (0.110.0) and `hard_light`'s (0.111.0)
     /// — precisely because those five propagate the `NaN`
-    /// while the other eight launder it through a `min`/`max`. (This
+    /// while the other ten launder it through a `min`/`max`. (This
     /// sentence read "four of the ten … the other six" from 0.110.0 until
     /// 0.113.0, which was the live figure then; `hard_light` made it five,
     /// and `linear_light` — whose single `clamp()` is `min(max(..))` by
     /// WGSL's own definition, so it launders too — made the denominator
     /// twelve, and `vivid_light` (0.114.0), whose two arms both end in a
-    /// `min()` inherited from `ColorBurn`/`ColorDodge`, made it thirteen.) So
+    /// `min()` inherited from `ColorBurn`/`ColorDodge`, made it thirteen;
+    /// `hard_mix` (0.115.0) fourteen and `pin_light` (0.116.0) fifteen, both
+    /// launderers too — the denominator was left at thirteen by both of those
+    /// rounds and re-derived in 0.116.2, `composite.wgsl`'s own copy having
+    /// stayed current.) So
     /// this test
     /// is one of the five that genuinely protects the shared guard. See
     /// `composite.wgsl`'s disclosure beside `straight_backdrop()`.
@@ -10552,9 +10570,11 @@ mod tests {
     /// `multiply`'s, `screen`'s, this one, `overlay`'s (0.110.0) and
     /// `hard_light`'s (0.111.0) —
     /// for exactly that reason,
-    /// while the other eight launder the `NaN` through a `min`/`max` —
+    /// while the other ten launder the `NaN` through a `min`/`max` —
     /// `linear_light` (0.113.0) among them, its single `clamp()` being
-    /// `min(max(..))` by WGSL's own definition. So this
+    /// `min(max(..))` by WGSL's own definition, and `hard_mix` (0.115.0) and
+    /// `pin_light` (0.116.0) the two that took the count from eight to ten
+    /// (re-derived in 0.116.2). So this
     /// test is one of the five that genuinely protects the shared guard.
     /// See `composite.wgsl`'s disclosure beside `straight_backdrop()`.
     ///
@@ -21491,12 +21511,23 @@ mod tests {
     //
     // **Degeneracies, and what each fixture must therefore carry.**
     //
-    //   1. **Every backdrop-wins channel provably agrees with `Darken` in the
-    //      low branch and with `Lighten` in the high branch.** Both are live
-    //      entry points and live dispatch arms, so a `fragment_entry` naming
-    //      either is separated only by a *source-derived* channel in the
-    //      matching branch. Every fixture here carries at least one
-    //      source-derived channel per branch it reaches.
+    //   1. **Every backdrop-wins channel agrees with exactly one of `Darken`
+    //      and `Lighten`, and `sign(Cb - Cs)` decides which** -- `Darken` iff
+    //      `Cb <= Cs`, `Lighten` iff `Cb >= Cs`, both only where `Cb == Cs`.
+    //      It follows from `B == Cb` alone: one of `min(Cb, Cs)`/`max(Cb, Cs)`
+    //      is always `Cb`. **The branch does not decide it.** 0.116.0 shipped a
+    //      branch-keyed version of this rule ("`Darken` in the low branch,
+    //      `Lighten` in the high") and it is false in about half of the square;
+    //      0.116.2 corrected it, and two of the fixtures below were already the
+    //      counterexamples. Test 1's blue is a *high*-branch backdrop-wins
+    //      channel that agrees with `Darken` (`Cb = 0.1875 < Cs = 0.5625`), and
+    //      test 5's green is a *low*-branch one that agrees with `Lighten`
+    //      (`Cb = 0.5625 > Cs = 0.4375`) -- each the opposite rival from what
+    //      the branch rule predicted. Both rivals are live entry points and
+    //      live dispatch arms, so a backdrop-wins channel hides exactly one of
+    //      them and separates the other; a `fragment_entry` naming *either* is
+    //      separated only by a *source-derived* channel. Every fixture here
+    //      carries at least one source-derived channel per branch it reaches.
     //   2. `PinLight(Cb, 0) = 0` and `PinLight(Cb, 1) = 1` -- a black or white
     //      **source** channel erases the backdrop.
     //   3. `PinLight(Cb, 0.5) = Cb` for in-gamut `Cb` -- a **source** channel at
@@ -21601,8 +21632,11 @@ mod tests {
     /// - **`Darken` `(0.453125, 0.375, 0.1875)`** — a live GPU arm, and what a
     ///   dropped `2.0 *` in the low arm computes there. **REQUIRED DISCLOSURE:
     ///   blue coincides**, which is not a fixture weakness but degeneracy 1 —
-    ///   blue is a backdrop-wins high channel and
-    ///   `Darken(0.1875, 0.5625) = 0.1875 = B`. Red and green carry the claim.
+    ///   blue is backdrop-wins with `Cb = 0.1875 <= Cs = 0.5625`, so `Darken`
+    ///   is the rival it hides: `Darken(0.1875, 0.5625) = 0.1875 = B`. Note
+    ///   this is a **high**-branch channel, and it is one of the two fixtures
+    ///   that disprove 0.116.0's branch-keyed version of degeneracy 1, which
+    ///   would have predicted `Lighten` here. Red and green carry the claim.
     /// - **`Lighten` `(0.65625, 0.59375, 0.375)`** — also live; all three
     ///   channels separate it.
     /// - `Normal` `(0.453125, 0.59375, 0.375)`, `Multiply`
@@ -21703,8 +21737,9 @@ mod tests {
              and blue the high branch backdrop-wins (max(0.1875, 0.125) = 0.1875), so B is \
              (0.5, 0.625, 0.1875) and 0.5*Cb + 0.5*B is (0.578125, 0.5, 0.1875). Darken gives \
              (0.453125, 0.375, 0.1875) -- a live arm, and what a dropped 2.0* in the low arm \
-             computes; red and green see it, blue cannot, being a backdrop-wins high channel that \
-             provably agrees with Darken (degeneracy 1). Lighten gives (0.65625, 0.59375, 0.375), \
+             computes; red and green see it, blue cannot, being a backdrop-wins channel whose \
+             Cb <= Cs makes Darken the rival it hides (degeneracy 1 -- keyed to sign(Cb - Cs), \
+             not to the branch). Lighten gives (0.65625, 0.59375, 0.375), \
              separated in all three. An in-shader operand transpose gives \
              (0.484375, 0.5625, 0.28125) -- all three, this fixture sitting off every blind class. \
              The Normal arm gives (0.453125, 0.59375, 0.375), Multiply \
@@ -21944,8 +21979,9 @@ mod tests {
     /// `0.5` against a source alpha of `1.0`:
     ///
     /// - red: **low**, `min(0.375, 0.875) = 0.375` — **backdrop-wins**, the
-    ///   regime this fixture exists for; it provably agrees with `Darken` here
-    ///   (degeneracy 1) and says nothing about that rival;
+    ///   regime this fixture exists for; `Cb = 0.375 <= Cs = 0.4375`, so by
+    ///   degeneracy 1 `Darken` is the rival it hides, and it says nothing
+    ///   about that rival;
     /// - green: **high**, `max(0.8125, 0.875) = 0.875` — source-derived;
     /// - blue: **low**, `min(0.5625, 0.5) = 0.5` — source-derived, so the low
     ///   branch still has a `Darken`-separating channel.
@@ -21963,10 +21999,12 @@ mod tests {
     ///
     /// Rival arms, re-derived in exact rationals: **`Darken`
     /// `(0.375, 0.8125, 0.40625)`** — red coincides, by degeneracy 1; green and
-    /// blue separate it. **`Lighten` `(0.40625, 0.875, 0.5625)`** — green
-    /// coincides (a source-derived high channel whose `max` happens to pick the
-    /// same operand `Lighten` would, `0.875 > 0.8125`), red and blue separate
-    /// it. Then `Normal` `(0.40625, 0.875, 0.40625)`, `Multiply`
+    /// blue separate it. **`Lighten` `(0.40625, 0.875, 0.5625)`** — **no
+    /// channel coincides**, green included: `Lighten`'s `max` picks `Cs`
+    /// (`0.9375`) where this mode's high arm picks `2*Cs - 1` (`0.875`), so
+    /// green reads `0.875` against the golden's `0.84375`. (0.116.0's own text
+    /// here said green coincided, and its own rival row disproves it; corrected
+    /// in 0.116.2.) Then `Normal` `(0.40625, 0.875, 0.40625)`, `Multiply`
     /// `(0.26953125, 0.78710938, 0.3515625)`, `Screen`
     /// `(0.51171875, 0.90039062, 0.6171875)`, `Overlay`
     /// `(0.3515625, 0.89453125, 0.453125)`, `HardLight`
@@ -22052,8 +22090,10 @@ mod tests {
              (0.375, 0.875, 0.5) -- red low-branch backdrop-wins, green high-branch \
              source-derived, blue low-branch source-derived -- so 0.5*Cb + 0.5*B is \
              (0.375, 0.84375, 0.53125). Darken gives (0.375, 0.8125, 0.40625), coinciding in red \
-             alone by degeneracy 1, and Lighten (0.40625, 0.875, 0.5625), coinciding in green \
-             alone. The Normal arm gives (0.40625, 0.875, 0.40625), Multiply \
+             alone -- red is backdrop-wins with Cb (0.375) <= Cs (0.4375), which is what \
+             degeneracy 1 keys on -- and Lighten (0.40625, 0.875, 0.5625), coinciding NOWHERE: \
+             its max picks Cs (0.9375) in green where this mode's high arm picks 2*Cs - 1 \
+             (0.875). The Normal arm gives (0.40625, 0.875, 0.40625), Multiply \
              (0.26953125, 0.78710938, 0.3515625), Screen (0.51171875, 0.90039062, 0.6171875), \
              Overlay (0.3515625, 0.89453125, 0.453125), HardLight \
              (0.3515625, 0.89453125, 0.421875), ColorBurn (0.1875, 0.80625, 0.28125), ColorDodge \
@@ -22102,10 +22142,16 @@ mod tests {
     /// nothing about the `<=`-vs-`<` boundary mutation — that needs `Cb > 1`
     /// *and* a source channel at exactly `0.5`, and test 7 is where both live.
     ///
-    /// `Lighten` `(1.5, 0.5625, 0.875)` coincides in green, by degeneracy 1
-    /// (green is a backdrop-wins **low** channel, and `Lighten` agreeing there
-    /// is coincidence rather than the provable rail — `max(0.5625, 0.4375)` is
-    /// `Cb` too). `Darken` `(0.25, 0.3125, -0.5)` coincides nowhere.
+    /// `Lighten` `(1.5, 0.5625, 0.875)` coincides in green, and that *is*
+    /// degeneracy 1's rail rather than a coincidence: green is backdrop-wins
+    /// with `Cb = 0.5625 >= Cs = 0.4375`, so `Lighten` is the rival it hides
+    /// (`max(0.5625, 0.4375) = Cb`). It being a **low**-branch channel is
+    /// irrelevant — this is the second of the two fixtures that disprove
+    /// 0.116.0's branch-keyed version of degeneracy 1, which predicted `Darken`
+    /// here. (0.116.0's own text called this "coincidence rather than the
+    /// provable rail", already noticing that its rule did not explain its own
+    /// result; 0.116.2 fixed the rule instead.) `Darken`
+    /// `(0.25, 0.3125, -0.5)` coincides nowhere.
     fn composite_pin_light_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
         let Some(context) = real_context() else {
             return;
@@ -22233,7 +22279,9 @@ mod tests {
     ///
     /// Both branches, a source-derived channel in each, and all three golden
     /// channels distinct. `Darken` gives `(0.3125, 0.25, 0.5)` — blue coincides,
-    /// by degeneracy 1; `Lighten` `(0.75, 0.6875, 0.5625)` — nothing coincides.
+    /// by degeneracy 1: blue is backdrop-wins with `Cb = 0.5 <= Cs = 0.5625`,
+    /// so `Darken` is the rival it hides, its **high** branch notwithstanding.
+    /// `Lighten` `(0.75, 0.6875, 0.5625)` — nothing coincides.
     /// **REQUIRED DISCLOSURE: `Exclusion` also coincides in blue**
     /// (`(0.59375, 0.59375, 0.5)`), which is arithmetic coincidence rather than
     /// a provable agreement, and `Exclusion` is `CPU_ONLY_BLEND_MODE` and not a
@@ -22499,6 +22547,151 @@ mod tests {
              (0.75, 0.4375, 0.234375), Screen (1.25, 0.9375, 0.828125), Exclusion \
              (0.5, 0.5, 0.59375), ColorBurn (2, 0.75, 0.08333) and Normal (0.5, 0.5, 0.75) \
              coincide nowhere."
+        );
+    }
+
+    #[test]
+    /// **`straight_backdrop()` must not clamp, pinned directly** (0.116.2).
+    ///
+    /// The sibling above —
+    /// `composite_pin_light_over_with_opacity_agrees_across_its_own_branch_boundary`
+    /// — is the only kill in this file that *depends* on
+    /// `composite.wgsl`'s `straight_backdrop()` returning `bd.rgb / bd.a`
+    /// unclamped, because at `Cs == 0.5` `PinLight`'s two arms are `min(Cb, 1)`
+    /// and `max(Cb, 0)` and those agree for every `Cb` in `[0, 1]`. **But it
+    /// does not detect a clamp being added there**, which 0.116.2 measured
+    /// rather than argued: with
+    /// `cb = clamp(bd.rgb / ab, vec3(0.0), vec3(1.0))` in the helper, that test
+    /// stayed green, as did every other test in this crate and all 415 in
+    /// `aurora-app` — this one was the only failure in either. Two things hide
+    /// the clamp from the boundary test — its
+    /// setup assertion checks the *accumulator* (`1.5`), which a clamp inside
+    /// the shader does not touch, and its out-of-gamut channel's golden is
+    /// `min(1.5, 1) = 1.0`, numerically identical to what a clamped `Cb = 1.0`
+    /// would give. So the round's own boundary proof could be silently disarmed
+    /// by a plausible "defensive" edit with nothing going red.
+    ///
+    /// This test exists to go red instead, and it is deliberately **not** a
+    /// second boundary test: it puts the out-of-gamut backdrop where the
+    /// *golden itself* changes under a clamp.
+    ///
+    /// `l0` is `(1.5, 2.5, 0.625)` at alpha `1.0` composited `Normal` at
+    /// opacity `0.5`, so the accumulator is premultiplied `(0.75, 1.25, 0.3125)`
+    /// at alpha `0.5` and the helper has a real division to do — two channels of
+    /// which come back **above `1.0`**, and at two different magnitudes, so this
+    /// pins the quotient rather than merely "something exceeded one". Under
+    /// `Cs = (0.75, 0.875, 0.9375)` at alpha and opacity `1.0`, every channel
+    /// takes the **high** branch (`Cs > 0.5`), where `B = max(Cb, 2*Cs - 1)`,
+    /// and the fold at `ab = 0.5, a = 1.0` is `0.5 * Cs + 0.5 * B`:
+    ///
+    /// - red: `Cb = 1.5`, `max(1.5, 0.5) = 1.5` → `1.125`. Clamped, `Cb` would
+    ///   be `1.0`, `max(1.0, 0.5) = 1.0` → `0.875`;
+    /// - green: `Cb = 2.5`, `max(2.5, 0.75) = 2.5` → `1.6875`. Clamped:
+    ///   `max(1.0, 0.75) = 1.0` → `0.9375`;
+    /// - blue: `Cb = 0.625` is **in gamut**, `max(0.625, 0.875) = 0.875` →
+    ///   `0.90625`, and a clamp leaves it alone. It is the control channel: a
+    ///   failure in red and green with blue intact says "the helper clamped",
+    ///   not "the fixture broke".
+    ///
+    /// Golden `(1.125, 1.6875, 0.90625, 1.0)`; a clamping helper reads
+    /// `(0.875, 0.9375, 0.90625, 1.0)`, which 0.116.2 confirmed by applying that
+    /// mutation for real and watching this test fail in two channels while the
+    /// boundary test above stayed green. All four values are exact in `f16`.
+    ///
+    /// It goes through `PinLight`'s high arm because that is the entry point
+    /// whose proof is at stake, but the property is the **shared** helper's —
+    /// every blend-math entry point in `composite.wgsl` calls it — so a clamp
+    /// added for any mode's sake fails here. Asserted both ways, against
+    /// [`composite_tile_cpu`], whose [`composite_layer_into`] divides without
+    /// clamping too, and as an absolute literal.
+    fn straight_backdrop_does_not_clamp_an_out_of_gamut_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Red and green are deliberately out of `[0, 1]` once un-premultiplied,
+        // and at two different magnitudes; blue is in gamut and is the control.
+        let bottom_rgba = [1.5, 2.5, 0.625, 1.0];
+        let top_rgba = [0.75, 0.875, 0.9375, 1.0];
+        let backdrop_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                backdrop_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_pin_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.75, 1.25, 0.3125, 0.5),
+            "setup: the accumulator must arrive premultiplied at alpha 0.5 with red and green \
+             whose quotients exceed 1.0, or the helper has no out-of-gamut division to do and \
+             this test cannot see a clamp at all"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, backdrop_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::PinLight),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (1.125, 1.6875, 0.90625, 1.0),
+            "setup: composite_layer_into must divide without clamping too, or the golden below is \
+             not a shared claim about both paths"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (1.125, 1.6875, 0.90625, 1.0),
+            "straight_backdrop must return bd.rgb/bd.a UNCLAMPED. Cb recovers as \
+             (1.5, 2.5, 0.625) from a (0.75, 1.25, 0.3125) accumulator at alpha 0.5; every \
+             channel takes PinLight's high branch, so B = (max(1.5, 0.5), max(2.5, 0.75), \
+             max(0.625, 0.875)) = (1.5, 2.5, 0.875) and 0.5*Cs + 0.5*B is \
+             (1.125, 1.6875, 0.90625). A helper clamping Cb to [0, 1] reads \
+             (0.875, 0.9375, 0.90625, 1.0) -- red and green move, blue (in gamut) does not. Cb > 1 \
+             is legal content under invariant 7.3.1b, and PinLight's <=-vs-< boundary mutation is \
+             killable ONLY because this division is unclamped, so a clamp here would silently \
+             disarm that proof; this assertion is what stops it. Full texel: {gpu_result:?}"
         );
     }
 
