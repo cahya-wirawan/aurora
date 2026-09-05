@@ -19602,6 +19602,206 @@ severity choice.
   `aurora-render` error, and fixing it would put a shader file into a diff
   that is otherwise comment-and-test-only in `aurora-app`.
 
+- [x] **`ColorDodge` ported to WGSL, admitted at the predicate, and wired
+  through the real dispatch arm — done 2026-09-05 (0.108.0).** The ninth
+  real blend-math mode on the GPU, and the second whose formula is not a
+  single componentwise expression: one WGSL entry point *plus one helper
+  function*, one `BlendPass` const, one one-line wrapper, one predicate arm,
+  one dispatch arm, one counter variant/field/`counter()` arm, one
+  `TRANSPOSE_COVERAGE` row. The shared
+  `composite_blend_over_with_opacity` was not touched — a seventh
+  consecutive caller added without a line of change to it. No other mode's
+  shader, const, wrapper, dispatch arm, predicate entry or fixture moved;
+  `blend_channel`'s `ColorDodge` arm and `VividLight`'s delegation to it are
+  byte-identical to before.
+
+  **Mode counts, recomputed rather than incremented.**
+  `document_qualifies_for_gpu_compositing` now admits **eleven** modes
+  (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+  `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`, `Dissolve`), so
+  **16 of 27** blend modes are still CPU-only there.
+  `shaders/composite.wgsl` now has **nine** blend-math entry points, so
+  **17 of 26** `aurora_render::BlendMode` variants have none — and `Normal`
+  is one of those 17 while not being CPU-only, which is exactly the one mode
+  between the two figures. Ten tests added (1,707 → **1,717**;
+  `aurora-render` 176 → **184**, `aurora-app` 401 → **403**).
+  `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so **no fixture needed
+  retargeting** and both PLAN.md-tracked CPU-fallback benchmarks stay
+  comparable across this round — as in 0.104.0 through 0.107.0, and unlike
+  `Screen`'s.
+
+  **A pre-existing defect fixed in the same round: five sites transcribed
+  `ColorDodge`'s formula with a spurious outer `1 -`.** Every one wrote
+  `1 - min(1, Cb / (1 - Cs))` — which is *`ColorBurn`'s* shape wearing
+  `ColorDodge`'s operands — where the real arm is `min(1, Cb / (1 - Cs))`.
+  The sites were `shaders/composite.wgsl`'s `fs_composite_color_burn`
+  comment, `composite.rs`'s `composite_color_burn_over_with_opacity` doc and
+  its `ColorBurn` test-suite header, and `aurora-app`'s
+  `document_qualifies_for_gpu_compositing` `ColorBurn` bullet and its
+  `..._admits_a_color_burn_blend_mode` doc. All five were "deliberately not
+  X" contrast notes, so the *distinction* each drew (branch conditions,
+  operand order) was correct and no code or assertion depended on the wrong
+  formula — but a reader deriving this round's shader from any of them would
+  have written the wrong function. Each site now also states the correction
+  and drops its "still CPU-only" claim about `ColorDodge`, which this round
+  makes false. This is exactly the class 0.107.1 had to clean up after
+  0.107.0 (18 wrong illustrative values, a self-contradictory count, a
+  missing bullet); finding these while *reading* the sibling round's output
+  rather than after review is the improvement.
+
+  **Guard disposition, measured per guard rather than assumed uniform —
+  and the two split differently from `ColorBurn`'s.** Both of
+  `ColorDodge`'s guards are arithmetically redundant under IEEE-754, but for
+  *different reasons*, which is a genuinely new finding rather than a
+  restatement of 0.107.0's:
+
+  - Deleting `cb == 0.0 -> 0.0` (mutation d) is killed **deterministically**
+    and **backend-independently**, and the reason is stronger than
+    `ColorBurn`'s equivalent. Without it, `0 / (1 - cs)` is a real,
+    well-defined `+0` for every `cs < 1` — *not* a `0/0` — so
+    `min(1, 0) = 0` is the same answer with no division-by-zero semantics
+    anywhere on the surviving path. It changes the result only where
+    `cb == 0 && cs == 1`, and there the *second* guard fires in its place
+    and returns `1.0`. Killed by exactly one test,
+    `..._yields_zero_where_the_backdrop_is_zero`'s green channel.
+  - Deleting `cs == 1.0 -> 1.0` (mutation e) **survived all 184
+    `aurora-render` and 403 `aurora-app` tests** on Vulkan/NVIDIA, because
+    this adapter divides by zero to `+inf` and `min(1, inf)` is exactly the
+    `1.0` the guard returns. WGSL specifies an *indeterminate value* there,
+    not `+inf`, so this is a portability guard and **no test on this
+    hardware can distinguish the two shaders**. Disclosed in the WGSL
+    comment, the wrapper doc, the suite header and test 8 rather than
+    papered over. Predicted, then confirmed by running it.
+
+  So the pair is asymmetric in testability in a way `ColorBurn`'s is not:
+  *both* of `ColorBurn`'s guards are redundant through arithmetic that at
+  least touches the `0/0`-vs-`+inf` question, while `ColorDodge`'s first
+  guard is redundant through ordinary, exactly-defined arithmetic. That is
+  worth carrying to the next guarded-division port (`Divide`, whose single
+  guard is `Cs == 0 -> 1`).
+
+  **Golden derivation, and two degeneracies that are new to this mode.**
+  Every fixture was worked in exact rationals with Python's `Fraction` and
+  then cross-checked against the real `composite_tile_cpu`, and every rival
+  "wrong arm" value quoted in a doc comment or assertion message was
+  computed the same way rather than copied from the `ColorBurn` sibling —
+  which is the direct lesson of 0.107.1, where 18 illustrative values were
+  wrong and four of them were one slip copied between two sibling tests.
+  Divisor choice has a clean closed form here that `ColorBurn`'s lacks: the
+  divisor is `1 - Cs`, so drawing every `Cs` from `{0.5, 0.75, 0.875}`
+  makes every quotient terminate regardless of `Cb`. Two degeneracies had to
+  be designed against:
+
+  1. **`ColorDodge(Cb, Cs) == Cs` exactly when `Cb == Cs * (1 - Cs)`**, so
+     such a channel is indistinguishable from `Normal`. Every channel of
+     every solid-colour fixture was checked against this and none collides.
+     The patterned spatial fixture *does* collide, unavoidably, at
+     `x % 4 == 1` (`Cb = 0.25`, `Cs = 0.5`, `Cs * (1 - Cs) = 0.25`), and
+     that test's doc comment discloses it along with the three columns that
+     still discriminate.
+  2. **`ColorDodge` clamps exactly when `Cb + Cs >= 1`, which is exactly
+     when `LinearDodge` clamps** — so a clamped channel can *never*
+     distinguish the two dodge-family modes. This is unavoidable rather than
+     a fixture flaw, and it bounds every `ColorDodge`-vs-`LinearDodge` claim
+     in this round to **at most two channels**. The app-level `assert_ne!`
+     vacuity guard against `LinearDodge` is therefore documented as a
+     two-channel claim (red and green; blue agrees by construction), not
+     three. Stated in the suite header, the wrapper doc, the predicate
+     bullet, the dispatch-arm comment and the fixture const.
+
+  **One fixture value chosen specifically to beat a coverage gap the
+  `ColorBurn` sibling has to disclose.** Render test 2 (translucent
+  accumulator) checks the un-premultiply branch, and for `ColorBurn` blue is
+  *structurally* blind to a missing un-premultiply: halving `cb` raises
+  `(1 - cb) / cs` and pushes an already-clamped channel further past the
+  boundary, where the clamp erases the difference. Here the numerator *is*
+  `cb`, so halving it **lowers** the quotient and a clamped channel can
+  become unclamped and therefore visible — but only if its correct quotient
+  is under `2.0` at `ab = 0.5`. Blue's was set to `1.5` for exactly that, so
+  a missing un-premultiply fails in **all three colour channels** here
+  against the sibling's two. Derived for this round rather than inherited.
+
+  **Fixture opacity is load-bearing twice over.**
+  `NORMAL_MULTIPLY_COLOR_DODGE_STACK`'s `ColorDodge` layer sits at `0.5`.
+  The standing transpose guard demands it; separately, at opacity `1.0` the
+  composite is `B` itself, whose blue is the *clamped* `1.0`, so blue would
+  stop distinguishing a dropped `min` from a saturated correct answer. That
+  second reason is specific to this fixture and is recorded on the const —
+  the `ColorBurn` sibling cannot say it. Mutation (o) confirms both halves:
+  raising the opacity to `1.0` fails the standing guard *and* the app
+  golden.
+
+  **The transpose-guard wording was updated at every site, not one.**
+  `ColorBurn` was the first admitted mode with an asymmetric blend term and
+  0.107.0 wrote that up as "the first exception". With a second such mode
+  the phrasing had to become a class rather than a special case, so a grep
+  for every mention was done and all of them changed together: the standing
+  guard test's doc ("`ColorBurn` (0.107.0) was the first exception and
+  `ColorDodge` (0.108.0) is the second, and this guard is deliberately not
+  special-cased for either"), its "Seventeen modes are still to be ported"
+  → sixteen, its "at least nine more asymmetric modes" → eight with
+  `ColorDodge` removed from the list, its own commutativity premise
+  sentence, **and its assertion message**, which asserted flatly that
+  "every formula on the GPU path is commutative" and would have printed a
+  false statement on failure. `GpuBlendDispatches`' per-mode history gained
+  a `ColorDodge` bullet noting the class now has two members. (An unrelated
+  "first exception" in `App`'s `active_layer` doc — about view-moving
+  setters — was checked and correctly left alone.)
+
+  **Mutation matrix: 15 mutations, every one applied to the committed
+  baseline and really run under `AURORA_REQUIRE_GPU=1` with
+  `--no-fail-fast`, not reasoned about.** Adapter: NVIDIA GeForce RTX 3090,
+  Vulkan, `DiscreteGpu`. Each was reverted from a byte-exact backup and the
+  restore confirmed by `md5sum -c` before the next.
+
+  | # | mutation | predicted | actual |
+  |---|---|---|---|
+  | a | delete the whole dispatch arm | killed by the counter alone | **killed, by exactly 1 test** — the `GpuBlendDispatch::ColorDodge` count in `..._agree_on_a_color_dodge_blend_document`. Every other assertion in that test, including the absolute golden and the GPU-vs-CPU differential, stayed green: the third mode in a row to confirm the counter is the *sole* detector |
+  | b | transpose the quotient (`cs / (1 - cb)`) | killed | **killed, 9 tests** (all 8 render + the app differential) |
+  | c | drop the `min(1.0, …)` clamp | killed | **killed, 6 tests** — render 1, 2, 3, 4, 5 and the app golden. Render 6, 7 and 8 stayed green, exactly as their own doc comments disclose |
+  | d | delete the `cb == 0.0` guard | killed deterministically | **killed, 1 test** — render 7's green channel, as predicted |
+  | e | delete the `cs == 1.0` guard | **survives** (portability-only) | **survived all 184 render + 403 app tests**, as predicted |
+  | f | swap the two guards' order | killed | **killed, 1 test** — render 7's green channel only |
+  | g | `cb == 0.0` branch returns `1.0` | killed by render 7 | **killed, 2 tests** — render 7 *and* render 3 (the spatial fixture reaches `cb == 0` in one column/row in four, which the prediction had not credited) |
+  | h | `cs == 1.0` branch returns `0.0` | killed by render 8 | **killed, 1 test** — render 8's red channel only, as predicted |
+  | i | `fragment_entry` points at `fs_composite_color_burn` | killed | **killed, 9 tests** |
+  | j | wrapper delegates to `BLEND_PASS_COLOR_BURN` | killed | **killed, 9 tests** |
+  | k | remove `ColorDodge` from the predicate's `matches!` | killed | **killed, 4 tests** — the admission test, the app differential, the standing transpose guard and the every-expressible-mode loop |
+  | l | `counter()`'s `ColorDodge` arm returns `color_burn` | killed | **killed, 1 test** — `every_gpu_blend_dispatch_mode_gets_its_own_counter`, still the only assertion in the crate that can see a counter mis-wire |
+  | m | remove `ColorDodge` from `GpuBlendDispatch::ALL` | killed | **killed, 1 test** — the standing transpose guard (the `ALL`-length assertion was edited down with it, which is what the fixed length is for) |
+  | n | transpose `src`/`backdrop` in the dispatch arm, at the fixture's real opacity `0.5` | killed | **killed, 1 test** — measured `(0.69433594, 0.77490234, 0.9375, 1.0)` against the golden `(0.65625, 0.15625, 0.6875, 1.0)` |
+  | n′ | the same transpose at opacity `1.0` | killed anyway (asymmetric term) | **killed, 2 tests** — measured `(0.8886719, 0.7998047, 1.0, 1.0)` against `(0.875, 0.25, 1.0, 1.0)`. Confirms the asymmetry claim for a second mode: red and green catch it with the fold contributing nothing |
+  | o | fixture `l3` opacity `0.5` → `1.0` | killed | **killed, 2 tests** — the standing transpose guard and the app golden |
+
+  Fourteen of fifteen killed; the one survivor is (e), predicted and
+  disclosed. Two predictions were beaten rather than merely met — (g) is
+  caught by a second test the plan had not credited, and the measured
+  transposed-arm values match the independent exact-rational derivation to
+  within `f16` spacing.
+
+  **What is still not verified.** Vulkan/NVIDIA only. Metal and DX12 remain
+  unverified for `fs_composite_color_dodge`, and for this mode that gap is
+  as wide as for `ColorBurn` for the same reason: the `cs == 1.0` guard
+  exists to defend against a division-by-zero semantic that is precisely a
+  per-backend property, and mutation (e) proves no test here can see the
+  difference. Nothing in this round was verified interactively in the
+  running app; `ColorDodge` is still reachable only by setting a layer's
+  blend mode programmatically, since no blend-mode UI exists. Disk:
+  **48G free before the round, 42G after**, checked per 0.104.1's
+  precondition and never near the 25G floor.
+
+  **A process failure worth recording, because it cost real work.** Midway
+  through the mutation matrix the first revert used
+  `git checkout <file>`, which restores from the index — i.e. from `HEAD`,
+  not from the uncommitted working state — and silently discarded every
+  `aurora-app` edit this round had made. All of it was scripted and was
+  replayed exactly, and the final state was re-verified from scratch (full
+  gate, full suite, whole matrix re-run), so nothing shipped from the lost
+  copy. The fix adopted for the rest of the matrix, and recommended for
+  every future one: back the files up outside the repo and restore by `cp`,
+  with `md5sum -c` after each revert. **Never use `git checkout` to revert a
+  mutation while the round's own work is uncommitted.**
+
 - [x] **`ColorBurn` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.107.0).** The
   eighth real blend-math mode on the GPU, and the **first whose formula is
@@ -24879,6 +25079,74 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.108.0) — `ColorDodge` is the ninth real blend-math
+mode on the GPU, the second guarded-division one, and the second
+non-commutative one.** One WGSL entry point *plus a `color_dodge_channel`
+helper* (this file's shaders' second non-entry-point function), one
+`BlendPass` const, one one-line wrapper, one predicate arm, one dispatch arm,
+one counter, one `TRANSPOSE_COVERAGE` row — `composite_blend_over_with_opacity`
+untouched for a seventh consecutive caller. **16 of 27** blend modes are now
+still CPU-only at the app's GPU predicate; **17 of 26**
+`aurora_render::BlendMode` variants still have no blend-math WGSL entry point
+(`Normal` is one of those 17 and is not CPU-only — the single mode between the
+two figures). 1,707 → **1,717** tests. `CPU_ONLY_BLEND_MODE` stays
+`Exclusion`, so both tracked CPU-fallback benchmarks stay comparable.
+
+Four findings worth carrying forward, each measured rather than reasoned
+about; the tracked M1.10 checkbox above has the full account and the 15-row
+mutation matrix.
+
+1. **A guarded division's two guards can be redundant for *different*
+   reasons, and only one of them is testable.** 0.107.0 found that
+   `ColorBurn`'s first guard is killable and its second is not. `ColorDodge`
+   splits the same way but on a sharper argument: deleting `cb == 0 -> 0`
+   leaves `0 / (1 - cs)`, a well-defined `+0` for every `cs < 1` and **not**
+   a `0/0`, so its redundancy does not touch division-by-zero semantics at
+   all and the kill is backend-independent by construction rather than by
+   luck. Deleting `cs == 1 -> 1` **survived all 184 `aurora-render` and 403
+   `aurora-app` tests**, because this adapter divides by zero to `+inf` and
+   `min(1, inf)` is exactly the `1.0` the guard returns. Disclosed in the
+   WGSL comment, the wrapper doc, the suite header and test 8. Carry to
+   `Divide`, the third and last guarded division (`Cs == 0 -> 1`).
+
+2. **Two modes on the GPU path now share a clamp boundary exactly, and no
+   test can ever separate them in a clamped channel.** `min(1, Cb/(1-Cs))`
+   clamps iff `Cb + Cs >= 1`, iff `min(Cb + Cs, 1)` clamps — so `ColorDodge`
+   and `LinearDodge` agree in every clamped channel *by construction*. This
+   bounds every discrimination claim between them to two channels, and the
+   app-level `assert_ne!` vacuity guard is documented as a two-channel claim
+   rather than the three a reader would assume. It is the first *structural*
+   (as opposed to fixture-specific) indistinguishability between two
+   admitted modes, and the shape to look for as more modes land.
+
+3. **A second, milder degeneracy: `ColorDodge(Cb, Cs) == Cs` exactly when
+   `Cb == Cs * (1 - Cs)`**, making such a channel indistinguishable from
+   `Normal`. Every solid-colour fixture was checked against it; the
+   patterned spatial fixture collides unavoidably in one column in four and
+   discloses it.
+
+4. **Five pre-existing doc sites had `ColorDodge`'s formula wrong, and this
+   round found them by reading rather than by review.** All five wrote
+   `1 - min(1, Cb / (1 - Cs))` — `ColorBurn`'s shape with `ColorDodge`'s
+   operands — in "deliberately not X" contrast notes across
+   `composite.wgsl`, `composite.rs` (twice) and `aurora-app/src/lib.rs`
+   (twice). No code or assertion depended on them, but a reader deriving
+   this round's shader from any one of them would have written the wrong
+   function. Fixed, with each site now stating the correction and dropping
+   its now-false "still CPU-only" claim. This is the same class 0.107.1 had
+   to clean up after 0.107.0; catching it inside the porting round is the
+   improvement, and the discipline that produced it — recompute every
+   illustrative value in exact rationals instead of copying the sibling
+   round's — is what the next port should inherit.
+
+One process failure is recorded honestly in the tracked entry above:
+`git checkout <file>` was used for the first mutation revert and discarded
+this round's uncommitted `aurora-app` work, because it restores from the
+index rather than the working tree. Everything was scripted, replayed and
+re-verified from scratch, so nothing shipped from the lost copy — but the
+rule for every future matrix is to back files up outside the repo and revert
+by `cp` with `md5sum -c`.
 
 **Addendum 2026-09-05 (0.107.1) — 0.107.0's review follow-ups: stale mode
 counts and eighteen wrong illustrative numbers, all in prose.** Independent

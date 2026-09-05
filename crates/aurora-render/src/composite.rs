@@ -137,6 +137,25 @@ const LABEL_COLOR_BURN_BIND_GROUP: &str = "composite.color_burn.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_COLOR_BURN_PASS: &str = "composite.color_burn.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_color_dodge_over_with_opacity`] (0.108.0)
+/// — the same four-label set the eight modes above each carry, for the
+/// same reason: nine blend-math pipelines sharing one `"composite"` label
+/// would leave a `wgpu` validation message or a frame capture unable to
+/// say which blend mode is at fault. `"color_dodge"` against
+/// `"color_burn"` is spelled out in full for the reason `"linear_burn"`
+/// against `"linear_dodge"` already is, and here the argument is stronger
+/// than a shared word: the two are the *guarded-division* pair, their
+/// `aurora-app` dispatch arms are adjacent, and a capture naming only
+/// `"color"` would point at both.
+const LABEL_COLOR_DODGE: &str = "composite.color_dodge";
+/// That method's own per-call uniform buffer.
+const LABEL_COLOR_DODGE_UNIFORM: &str = "composite.color_dodge.opacity";
+/// That method's own per-call bind group.
+const LABEL_COLOR_DODGE_BIND_GROUP: &str = "composite.color_dodge.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_COLOR_DODGE_PASS: &str = "composite.color_dodge.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -147,7 +166,7 @@ const LABEL_COLOR_BURN_PASS: &str = "composite.color_burn.pass";
 /// [`TileCompositor`]'s blend-math `composite_*_over_with_opacity`
 /// methods — `composite_multiply_over_with_opacity` and its
 /// `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-/// `color_burn`
+/// `color_burn`/`color_dodge`
 /// siblings,
 /// deliberately named as a family rather than relisted here, since the
 /// list grows by one every time a mode is ported — five
@@ -159,12 +178,14 @@ const LABEL_COLOR_BURN_PASS: &str = "composite.color_burn.pass";
 /// `Screen`, the fourth, in 0.102.0 as exactly the same two additions,
 /// `Difference`, the fifth, in 0.104.0 likewise, `LinearDodge`, the
 /// sixth, in 0.105.0 likewise again, `LinearBurn`, the seventh, in
-/// 0.106.0, and `ColorBurn`, the eighth, in 0.107.0 — which is what the
+/// 0.106.0, `ColorBurn`, the eighth, in 0.107.0, and `ColorDodge`, the
+/// ninth, in 0.108.0 — which is what the
 /// collapse was
 /// betting on. `ColorBurn` is the first whose *shader* needed more than
 /// one changed line, its formula being three calls to a helper rather
 /// than one componentwise expression; the Rust side was still exactly one
-/// `BlendPass` const, one wrapper and four labels.)
+/// `BlendPass` const, one wrapper and four labels. `ColorDodge` is the
+/// second of that shape, and cost the Rust side exactly the same.)
 ///
 /// There is deliberately **no encoder label here any more** (0.86.0).
 /// These methods no longer create a `wgpu::CommandEncoder` at all — the
@@ -281,6 +302,21 @@ const BLEND_PASS_COLOR_BURN: BlendPass = BlendPass {
     uniform: LABEL_COLOR_BURN_UNIFORM,
     bind_group: LABEL_COLOR_BURN_BIND_GROUP,
     pass: LABEL_COLOR_BURN_PASS,
+};
+
+/// [`BlendMode::ColorDodge`]'s, likewise (0.108.0). Every field differs
+/// from [`BLEND_PASS_COLOR_BURN`]'s directly above — the two are the
+/// guarded-division pair, structural mirror images of each other, and
+/// their `aurora-app` dispatch arms are adjacent, so a `fragment_entry`
+/// copied rather than written would silently run the *other* guarded
+/// division through this mode's labels. That is mutation (i) of this
+/// round's set, and it is killed by every `composite_color_dodge_*` test.
+const BLEND_PASS_COLOR_DODGE: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_color_dodge",
+    pipeline: LABEL_COLOR_DODGE,
+    uniform: LABEL_COLOR_DODGE_UNIFORM,
+    bind_group: LABEL_COLOR_DODGE_BIND_GROUP,
+    pass: LABEL_COLOR_DODGE_PASS,
 };
 
 /// The byte size of `composite_over_with_opacity`'s own uniform buffer —
@@ -1490,31 +1526,34 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// [`Self::composite_difference_over_with_opacity`] (0.104.0) the fifth,
 /// [`Self::composite_linear_dodge_over_with_opacity`] (0.105.0) the
 /// sixth, [`Self::composite_linear_burn_over_with_opacity`] (0.106.0)
-/// the seventh, and
+/// the seventh,
 /// [`Self::composite_color_burn_over_with_opacity`] (0.107.0) the eighth,
+/// and [`Self::composite_color_dodge_over_with_opacity`] (0.108.0) the
+/// ninth,
 /// each built to exactly the same shape.
-/// The remaining 18 modes have no dedicated blend-math WGSL entry point
+/// The remaining 17 modes have no dedicated blend-math WGSL entry point
 /// of their own, and wait on one — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
-/// 18 is "26 minus the eight, `Multiply`, `Darken`, `Lighten`, `Screen`,
-/// `Difference`, `LinearDodge`, `LinearBurn` and `ColorBurn`, done so
+/// 17 is "26 minus the nine, `Multiply`, `Darken`, `Lighten`, `Screen`,
+/// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn` and
+/// `ColorDodge`, done so
 /// far."
 ///
-/// **`Normal` is one of those 18 and is *not* CPU-only**, so read the
+/// **`Normal` is one of those 17 and is *not* CPU-only**, so read the
 /// figure as "no blend-math shader", never as "no GPU path":
 /// [`Self::composite_over_with_opacity`]'s fixed-function
 /// `Blend::AlphaBlending` unit already expresses `Normal` on the GPU,
 /// which is exactly why it needs no formula in
 /// `shaders/composite.wgsl`. The modes genuinely left to
-/// `composite_tile_cpu` are therefore the other **17**, and that is
+/// `composite_tile_cpu` are therefore the other **16**, and that is
 /// precisely `aurora-app`'s own count of what its GPU predicate
-/// rejects: 27 real `aurora_doc::BlendMode` variants minus the ten it
+/// rejects: 27 real `aurora_doc::BlendMode` variants minus the eleven it
 /// admits (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`,
-/// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn` and
-/// `Dissolve`). The two
-/// figures — 18
-/// here, 17 there —
+/// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`
+/// and `Dissolve`). The two
+/// figures — 17
+/// here, 16 there —
 /// count different
 /// things, and the one mode between them is `Normal`. `Dissolve` is in
 /// neither set: absent from this crate's enum altogether, and *admitted*
@@ -2407,7 +2446,15 @@ impl TileCompositor {
     /// being CPU-only — so the copy-paste hazard between the two now runs
     /// in both directions. It is also not `Cb + Cs - Cb*Cs`, which is `Screen`, its
     /// nearest arithmetic neighbour, nor `ColorDodge`, the other
-    /// dodge-family mode (`Cb / (1 - Cs)`, likewise still CPU-only). See
+    /// dodge-family mode (`min(1, Cb / (1 - Cs))`) — which as of 0.108.0
+    /// likewise has its own GPU entry point
+    /// ([`Self::composite_color_dodge_over_with_opacity`]) rather than
+    /// being CPU-only, so that hazard now runs in both directions too. And
+    /// the resemblance between *those* two is more than a shared word:
+    /// `ColorDodge` clamps exactly when `Cb + Cs >= 1`, which is exactly
+    /// when this mode clamps, so **no clamped channel can ever tell them
+    /// apart** — a fixture meant to discriminate the two needs an
+    /// unclamped channel. See
     /// the entry point's own comment, and the `composite_linear_dodge_*`
     /// fixtures below, every one of which has at least one channel whose
     /// sum stays strictly under `1.0` and at least one whose sum exceeds
@@ -2602,11 +2649,19 @@ impl TileCompositor {
     /// under a fully black source — both conditions true at once, and an
     /// ordinary pixel, not a contrived one — yields `1.0` and not `0.0`.
     ///
-    /// **Deliberately not `1 - min(1, Cb / (1 - Cs))`**, which is
+    /// **Deliberately not `min(1, Cb / (1 - Cs))`**, which is
     /// `ColorDodge`, the *other* guarded-division mode: its branch
     /// conditions are `Cb == 0` and `Cs == 1` rather than this one's
-    /// `Cb == 1` and `Cs == 0`, and it is still CPU-only. And not
-    /// `max(Cb + Cs - 1, 0)`, which is
+    /// `Cb == 1` and `Cs == 0`, and as of 0.108.0 it has its own GPU entry
+    /// point ([`Self::composite_color_dodge_over_with_opacity`], the
+    /// method directly below) rather than being CPU-only — so this hazard
+    /// now runs in both directions between two adjacent dispatch arms.
+    /// (Until 0.108.0 this sentence printed that formula with a spurious
+    /// outer `1 -`, which is *this* mode's shape rather than
+    /// `ColorDodge`'s. The distinction it drew — the branch conditions and
+    /// the operand order — was right; the formula was not, and was wrong
+    /// identically at five sites, all five corrected in that round.) And
+    /// not `max(Cb + Cs - 1, 0)`, which is
     /// [`Self::composite_linear_burn_over_with_opacity`] directly above —
     /// the two share half a name and nothing about the arithmetic is
     /// close, but their `aurora-app` dispatch arms are adjacent, which is
@@ -2664,6 +2719,130 @@ impl TileCompositor {
         );
     }
 
+    /// Composites `src` over `backdrop` with **`BlendMode::ColorDodge`**
+    /// math computed in the shader, writing the finished result into
+    /// `dst` — a *different* view from `backdrop`.
+    ///
+    /// The ninth blend mode ported to the GPU, and built to exactly the
+    /// shape of the eight above: same `bind_group_layout_blend`, same
+    /// `Blend::None` replace, same `Opacity` uniform, same
+    /// `(src, backdrop, dst)` parameter order, same clamp, same
+    /// caller-supplied encoder. Read
+    /// [`Self::composite_multiply_over_with_opacity`]'s doc comment for
+    /// all of the shared "why" — the aliasing rule, why the accumulator
+    /// must arrive as a sampled texture, and why the `sa * opacity`
+    /// product is deliberately left unclamped while `opacity` itself is
+    /// clamped. None of it is mode-specific.
+    ///
+    /// **What is specific to this method.** `blend_rgb(ColorDodge, Cb, Cs)`
+    /// is `blend_channel`'s own three-branch arm per channel:
+    ///
+    /// ```text
+    /// if Cb == 0 { 0 } else if Cs == 1 { 1 }
+    /// else { min(1, Cb / (1 - Cs)) }
+    /// ```
+    ///
+    /// Two of those three branches are per-channel *conditions* rather
+    /// than arithmetic, so — as with `ColorBurn`, and unlike the seven
+    /// modes ported before that one — this cannot be one componentwise
+    /// expression on `vec3<f32>`. The shader factors the arm into a
+    /// `color_dodge_channel(cb, cs)` helper (that file's shaders' second
+    /// non-entry-point function) and calls it three times to build `b`.
+    ///
+    /// **Both guards are arithmetically redundant under IEEE-754, both are
+    /// still required, and — unlike `ColorBurn`'s — they are redundant for
+    /// two *different* reasons.** Drop the `Cb == 0` guard and
+    /// `0 / (1 - Cs)` is a real, well-defined `+0` for every `Cs < 1`, so
+    /// `min(1, 0) = 0` is the same answer with no division-by-zero
+    /// semantics involved anywhere; it changes the result only at
+    /// `Cs == 1`, where the *second* guard then fires in its place and
+    /// returns `1.0` instead of `0.0`. That makes deleting the first guard
+    /// killable deterministically on every backend, and 0.108.0 measured
+    /// exactly that. Drop the `Cs == 1` guard and `Cb / 0` is `+inf`,
+    /// `min(1, inf)` is `1`, again the same answer — *if* the backend
+    /// divides like IEEE. **WGSL does not promise that**: division by zero
+    /// yields an indeterminate value, which may be `NaN`, and a `NaN` is
+    /// not absorbed here because the `ab == 0` half of a tile multiplies
+    /// `b` by zero and `0.0 * NaN` is `NaN`. So the second guard makes this
+    /// entry point *defined* rather than merely correct on one adapter, and
+    /// 0.108.0 measured its deletion surviving every test in this crate on
+    /// Vulkan/NVIDIA — the disclosed, expected result of a portability
+    /// guard on IEEE hardware, not a missing test. See PLAN.md's 0.108.0
+    /// entry.
+    ///
+    /// **Branch order is load-bearing**, and it is the *mirror* of
+    /// `ColorBurn`'s rather than the same. `Cb == 0` is tested first, so a
+    /// fully black backdrop under a fully white source — both conditions
+    /// true at once, and an ordinary pixel, not a contrived one — yields
+    /// `0.0` and not `1.0`.
+    ///
+    /// **Deliberately not `1 - min(1, (1 - Cb) / Cs)`**, which is
+    /// [`Self::composite_color_burn_over_with_opacity`] directly above:
+    /// the two are the guarded-division pair, structural mirror images,
+    /// and their `aurora-app` dispatch arms are *adjacent*, which is where
+    /// that hazard actually lives. This method's shader was therefore
+    /// derived from `blend_channel`'s own Rust arm rather than copied from
+    /// `fs_composite_color_burn` and edited. And not `min(Cb + Cs, 1)`,
+    /// which is `LinearDodge`, the other dodge-family mode — likewise on
+    /// the GPU. That resemblance is worth a second sentence, because it is
+    /// more than a shared name: `min(1, Cb / (1 - Cs))` clamps exactly when
+    /// `Cb + Cs >= 1`, which is exactly when `min(Cb + Cs, 1)` clamps, so
+    /// **a clamped channel can never distinguish the two**. Every claim
+    /// below about discriminating this mode from `LinearDodge` is therefore
+    /// a claim about at most two channels, never three.
+    ///
+    /// **`ColorDodge` is *not* symmetric in `Cb`/`Cs`, and it is the second
+    /// ported mode that is not** (`ColorBurn`, 0.107.0, was the first).
+    /// `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+    /// `LinearDodge` and `LinearBurn` each disclose the opposite: their
+    /// blend term cannot see a transposed `src`/`backdrop` binding at all,
+    /// leaving only the asymmetric "over" to catch it. Here the blend term
+    /// itself catches it — `B(Cb, Cs) != B(Cs, Cb)` in general — so a
+    /// transpose is observable even at effective alpha `1.0`, which 0.108.0
+    /// confirmed by running that mutation for real at both `0.5` and `1.0`.
+    /// `aurora-app`'s standing `every_gpu_blend_math_dispatch_arm_has_a_
+    /// fixture_that_could_see_a_transposed_argument` guard is deliberately
+    /// *not* special-cased for either mode: non-unit opacity is now
+    /// sufficient-but-not-necessary for two of the nine, and a conservative
+    /// guard that still demands it costs nothing and keeps the rule
+    /// uniform.
+    ///
+    /// **The application calls this** (0.108.0): `aurora-app`'s
+    /// `document_qualifies_for_gpu_compositing` admits `ColorDodge` and
+    /// `begin_gpu_composite_tile` dispatches to this method for every
+    /// `ColorDodge` root layer, through the *same* single ping-pong spare
+    /// accumulator any other blend-math layer would use. Its dispatch arm
+    /// was instrumented from day one (`GpuBlendDispatch::ColorDodge` in
+    /// that crate), so no test here can be satisfied by a silent CPU
+    /// fallback.
+    ///
+    /// All three views must be `Rgba16Float` and the same size; `dst`'s
+    /// owning texture must include `RENDER_ATTACHMENT` usage, and both
+    /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
+    /// `opacity` is clamped to `0.0..=1.0`.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — see
+    /// [`Self::composite_over_with_opacity`] for the full account.
+    pub fn composite_color_dodge_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_COLOR_DODGE,
+        );
+    }
+
     /// The one body behind every shader-computed blend mode: build (or
     /// reuse) `pass.fragment_entry`'s pipeline, upload the clamped
     /// opacity, bind `src`/backdrop/uniform, and draw one fullscreen
@@ -2694,8 +2873,9 @@ impl TileCompositor {
     /// the fourth), `composite_difference_over_with_opacity` (0.104.0,
     /// the fifth), `composite_linear_dodge_over_with_opacity` (0.105.0,
     /// the sixth), `composite_linear_burn_over_with_opacity` (0.106.0,
-    /// the seventh) and `composite_color_burn_over_with_opacity` (0.107.0,
-    /// the eighth) without a line of change, which is the bet that
+    /// the seventh), `composite_color_burn_over_with_opacity` (0.107.0,
+    /// the eighth) and `composite_color_dodge_over_with_opacity` (0.108.0,
+    /// the ninth) without a line of change, which is the bet that
     /// extraction was making — the
     /// same discipline, and the same "no existing test needed to change"
     /// bar, 0.83.1 used when it extracted [`composite_pipeline`] and
@@ -2703,7 +2883,8 @@ impl TileCompositor {
     /// `composite_multiply_*`, `composite_darken_*`,
     /// `composite_lighten_*`, `composite_screen_*`,
     /// `composite_difference_*`, `composite_linear_dodge_*`,
-    /// `composite_linear_burn_*` and `composite_color_burn_*`
+    /// `composite_linear_burn_*`, `composite_color_burn_*` and
+    /// `composite_color_dodge_*`
     /// differentials in
     /// this module's tests, each checking the shader's output against
     /// [`composite_tile_cpu`]'s own on real hardware, are what makes that
@@ -11048,10 +11229,16 @@ mod tests {
     // it too, at any opacity.
     //
     // **What is not confused with what.** `1 - min(1, (1 - Cb) / Cs)` is
-    // this mode. `1 - min(1, Cb / (1 - Cs))` is `ColorDodge`, the *other*
+    // this mode. `min(1, Cb / (1 - Cs))` is `ColorDodge`, the *other*
     // guarded-division mode, whose branch conditions are `Cb == 0` and
     // `Cs == 1` rather than this one's `Cb == 1` and `Cs == 0`, and which
-    // is still CPU-only. `max(Cb + Cs - 1, 0)` is `LinearBurn`, the other
+    // has its own suite (`composite_color_dodge_*`) and its own entry
+    // point as of 0.108.0 rather than being CPU-only. (This comment
+    // printed that formula with a spurious outer `1 -` until then -- this
+    // mode's shape wearing the other's operands -- one of five sites that
+    // made the same slip, all corrected in that round. The distinction it
+    // drew was always the right one; the formula was not.)
+    // `max(Cb + Cs - 1, 0)` is `LinearBurn`, the other
     // burn-family mode, whose suite is directly above and whose
     // `aurora-app` dispatch arm is directly adjacent -- which is where
     // that hazard actually lives, since nothing about the two blend lines
@@ -12299,6 +12486,1425 @@ mod tests {
              (0.4296875, 0.33984375), Darken (0.625, 0.375), Screen (0.8828125, 0.94140625), \
              Lighten (0.6875, 0.90625), Difference (0.0625, 0.53125), and both LinearDodge and \
              ColorDodge (1.0, 1.0)."
+        );
+    }
+
+    // -- Real in-shader blend-mode math on the GPU, slice 9 of the
+    // blend-mode port: `ColorDodge`, via
+    // `TileCompositor::composite_color_dodge_over_with_opacity` and the
+    // `fs_composite_color_dodge` entry point (0.108.0).
+    //
+    // **Eight tests, the same eight the `ColorBurn` suite directly above
+    // carries and for the same reason**: this mode's formula has
+    // *branches*, so it has two edge cases no amount of varying magnitudes
+    // reaches. Six cover this mode's own arithmetic and its `min` clamp,
+    // its own un-premultiply branch, its own spatial addressing, its own
+    // opacity-scaled fold, its own unclamped `s.a * opacity` product, and
+    // its own separately-compiled `ab > 0.0` guard. Tests 7 and 8 cover the
+    // `Cb == 0` and `Cs == 1` branches respectively, which nothing else
+    // here reaches.
+    //
+    // The same one every suite since `Darken` omits is omitted again: an
+    // out-of-range-*opacity* case, which since 0.85.1's merge lives in a
+    // single shared Rust line (`composite_blend_over_with_opacity`'s own
+    // `let opacity = opacity.clamp(0.0, 1.0)`) that the `Multiply` and
+    // `Darken` suites already pin on real hardware. That is a disclosed
+    // reduction in coverage, not an equivalence claim. The unclamped
+    // *source-alpha* case is emphatically **not** omitted, for the reason
+    // the `Lighten` section header gives.
+    //
+    // **The formula.** `blend_channel`'s own arm is
+    //
+    //     if cb == 0.0 { 0.0 }
+    //     else if cs == 1.0 { 1.0 }
+    //     else { (cb / (1.0 - cs)).min(1.0) }
+    //
+    // and `color_dodge_channel` in `shaders/composite.wgsl` is that,
+    // branch for branch, called once per channel. Note there is **no outer
+    // `1 -`** -- that belongs to `ColorBurn`, and five doc comments in this
+    // workspace wrote `ColorDodge`'s formula with one until 0.108.0
+    // corrected them.
+    //
+    // **Both guards are arithmetically redundant under IEEE-754, both are
+    // still required, and the two are redundant for different reasons** --
+    // which is the substantive difference from the `ColorBurn` sibling,
+    // whose guards are both redundant *through* division-by-zero
+    // semantics. Deleting the `cb == 0.0` guard is killed deterministically
+    // by test 7's green channel, and **no division by zero is involved on
+    // the surviving path at all**: `0 / (1 - cs)` is a real, well-defined
+    // `+0` for every `cs < 1`, so `min(1, 0)` is the `0.0` the guard would
+    // have returned. It changes the answer only at `cs == 1`, where the
+    // *second* guard fires in its place and returns `1.0`. Deleting the
+    // `cs == 1.0` guard **survives every test in this crate** on
+    // Vulkan/NVIDIA, because `cb / 0` is `+inf` there and `min(1, inf)` is
+    // the `1.0` the guard would have returned. That survival is the
+    // *disclosed, expected* result of a portability guard on IEEE
+    // hardware, not a hole in this suite: WGSL specifies division by zero
+    // as yielding an indeterminate value, not `+inf`, so on a backend that
+    // produces `NaN` instead the guard is what keeps the entry point
+    // defined -- and a `NaN` is not absorbed here, because the `ab == 0`
+    // half of a tile multiplies `b` by zero and `0.0 * NaN` is `NaN`. No
+    // test in this crate can distinguish the two, because no test can make
+    // this adapter divide differently. Both results were measured, not
+    // predicted; see PLAN.md's 0.108.0 entry.
+    //
+    // **Branch order is load-bearing, and it is the mirror of
+    // `ColorBurn`'s.** `cb == 0.0` is tested first, so the one input where
+    // both conditions hold -- a fully black backdrop under a fully white
+    // source, an ordinary pixel -- yields `0.0`. Test 7's green channel is
+    // the only assertion in this crate that sees the two swapped.
+    //
+    // **Fixture values are chosen against `ColorDodge`'s own
+    // degeneracies:**
+    //
+    //   1. `ColorDodge(0, Cs) = 0` and `ColorDodge(Cb, 1) = 1` are the two
+    //      branch results, and each agrees with a whole family of other
+    //      modes (see tests 7 and 8, which disclose exactly which). So the
+    //      *arithmetic* fixtures -- tests 1, 2, 4, 5 -- keep every operand
+    //      strictly inside `(0, 1)`, and tests 7 and 8 put the edge case in
+    //      **one** channel and leave the other two as the real
+    //      discriminators.
+    //   2. A channel whose quotient `Cb / (1 - Cs)` reaches or exceeds
+    //      `1.0` is **clamped** to a blend of `1.0`, so its output carries
+    //      no information about how far past the boundary the operands
+    //      were. Every solid-colour fixture below therefore has at least
+    //      one clamped channel (which discriminates the clamp from its
+    //      absence) and at least one unclamped one (which discriminates the
+    //      operands).
+    //   3. **New for this mode, and checked against every channel of every
+    //      fixture here:** `ColorDodge(Cb, Cs) == Cs` exactly when
+    //      `Cb == Cs * (1 - Cs)`, so such a channel is indistinguishable
+    //      from `Normal`. No solid-colour fixture below has one. Test 3's
+    //      patterned fixture *does*, unavoidably, at `x % 4 == 1` -- see
+    //      that test's own disclosure.
+    //   4. **Unavoidable, and stated once here rather than argued per
+    //      test:** this mode clamps exactly when `Cb + Cs >= 1`, which is
+    //      exactly when `LinearDodge`'s `min(Cb + Cs, 1)` clamps. A clamped
+    //      channel therefore can **never** distinguish `ColorDodge` from
+    //      `LinearDodge`. Every claim below about separating the two is a
+    //      claim about at most two channels, never three.
+    //   5. No channel has `Cb == Cs` in the solid-colour fixtures.
+    //   6. The quotient must be an exact binary fraction for the golden to
+    //      be assertable with `assert_eq!`, which constrains the fixtures
+    //      hard: `Cb / (1 - Cs)` is a *division*, so `1 - Cs` is a power of
+    //      two in every solid-colour fixture below -- `Cs` is drawn from
+    //      `{0.5, 0.75, 0.875}` throughout, giving divisors
+    //      `{0.5, 0.25, 0.125}`. Every such fixture was hand-derived in
+    //      exact rationals and then cross-checked against the real
+    //      [`composite_tile_cpu`], so a stale literal cannot outlive a
+    //      change to either implementation.
+    //
+    // **Asymmetry.** `B(Cb, Cs) != B(Cs, Cb)`, so -- as with `ColorBurn`,
+    // and unlike `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+    // `LinearDodge` and `LinearBurn`, every one of whose suite headers
+    // discloses the opposite -- a transposed src/backdrop binding is caught
+    // by this mode's *blend term itself*, not only by the asymmetric "over"
+    // around it. Test 3's per-texel spatial differential still exists and
+    // still catches it (along with a V-flip, a transposed axis and a
+    // half-texel UV offset); what changes is that the solid-colour
+    // fixtures catch it too, at any opacity.
+    //
+    // **What is not confused with what.** `min(1, Cb / (1 - Cs))` is this
+    // mode. `1 - min(1, (1 - Cb) / Cs)` is `ColorBurn`, the *other*
+    // guarded-division mode, whose suite is directly above, whose branch
+    // conditions are the mirror of this one's, and whose `aurora-app`
+    // dispatch arm is directly adjacent -- which is where that hazard
+    // actually lives. `min(Cb + Cs, 1)` is `LinearDodge`, the other
+    // dodge-family mode, whose clamp boundary this mode's coincides with
+    // exactly (degeneracy 4 above). Every doc comment below names the wrong
+    // answers each of those would give for its own fixture.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`,
+    // NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu). That is one backend
+    // on one vendor: Metal and DX12 remain unverified for
+    // `fs_composite_color_dodge` -- and for this mode that gap is as wide
+    // as for `ColorBurn`, because the division-by-zero semantics the
+    // `cs == 1.0` guard exists to defend against are precisely a
+    // per-backend property. See PLAN.md's 0.108.0 entry.
+
+    #[test]
+    /// The plain-arithmetic case, and the `ColorDodge` counterpart of
+    /// `composite_color_burn_over_with_opacity_burns_and_clamps_per_channel`.
+    ///
+    /// An opaque `(0.375, 0.0625, 0.1875)` accumulator under a
+    /// `(0.5, 0.75, 0.875)` source at its own `0.5` alpha. The per-channel
+    /// quotients `Cb / (1 - Cs)` are
+    /// `(0.375/0.5, 0.0625/0.25, 0.1875/0.125) = (0.75, 0.25, 1.5)`, so
+    /// `B = min(1, q) = (0.75, 0.25, 1.0)` — red and green under the clamp
+    /// boundary, blue past it — and the "over" then folds that in at the
+    /// source's effective alpha: `0.5 * Cb + 0.5 * B` per channel, giving
+    /// `(0.5625, 0.15625, 0.59375)` at alpha `1.0`.
+    ///
+    /// **The fixture straddles the clamp in both directions**, which is
+    /// what makes the two closest wrong shaders observable at once: red and
+    /// green are where a wrong *formula* shows up as a real difference, and
+    /// blue (`q = 1.5`) is where a **dropped `min`** shows up — folding to
+    /// `0.09375 + 0.75 = 0.84375` against the golden `0.59375`.
+    ///
+    /// **Blue's quotient is `1.5` rather than a rounder `2.0` on purpose**,
+    /// and this is the one place this suite's fixtures differ from the
+    /// `ColorBurn` sibling's beyond the formula. Test 2 reuses these exact
+    /// colours against a *half-opacity* accumulator, which halves `cb` and
+    /// therefore halves the quotient; at `1.5` the halved quotient is
+    /// `0.75`, comfortably unclamped, so blue can see a missing
+    /// un-premultiply. At `2.0` the halved quotient would be exactly `1.0`,
+    /// still clamping, and blue would have been blind to it — which is
+    /// precisely the structural blindness the `ColorBurn` sibling has to
+    /// disclose. Here it does not, and the difference is one fixture value.
+    ///
+    /// **Every plausible wrong answer is a different value here**, which is
+    /// why the colours are per-channel distinct, none of the six operands
+    /// is `0.0` or `1.0` (so neither branch of this mode's formula fires —
+    /// that is tests 7 and 8's job), no channel has `Cb == Cs`, no channel
+    /// has `Cb == Cs * (1 - Cs)` (suite-header degeneracy 3), and the
+    /// source's alpha is `0.5` rather than `1.0`:
+    ///
+    /// - the `Normal` arm dispatched by mistake: `(0.4375, 0.40625, 0.53125)`
+    ///   — and the `Lighten` arm gives *exactly the same triple* here,
+    ///   since `Cs > Cb` in all three channels;
+    /// - `ColorBurn`'s `1 - min(1, (1 - Cb) / Cs)` — the other
+    ///   guarded-division mode and the adjacent dispatch arm:
+    ///   `q = (1.25, 1.25, 0.9285..)`, so `B = (0.0, 0.0, 0.0714..)` and
+    ///   roughly `(0.1875, 0.03125, 0.1294..)`;
+    /// - `LinearDodge`'s `min(Cb + Cs, 1)` — the other dodge-family mode:
+    ///   `(0.625, 0.4375, 0.59375)`. **Blue agrees exactly**, and by
+    ///   suite-header degeneracy 4 it always will in a clamped channel.
+    ///   Red and green are what separate the two dodges here;
+    /// - the `Multiply` arm: `(0.28125, 0.0546875, 0.17578125)`;
+    /// - the `Darken` arm: `(0.375, 0.0625, 0.1875)` — which is exactly
+    ///   `Cb`, this fixture having `Cb < Cs` everywhere;
+    /// - the `Screen` arm: `(0.53125, 0.4140625, 0.54296875)`;
+    /// - the `Difference` arm: `(0.25, 0.375, 0.4375)`;
+    /// - `LinearBurn`'s `max(Cb + Cs - 1, 0)`: `(0.1875, 0.03125, 0.125)`;
+    /// - a dropped `min` clamp: `(0.5625, 0.15625, 0.84375)` — note red and
+    ///   green *agree*, which is exactly why the fixture needs a clamped
+    ///   channel as well as unclamped ones;
+    /// - the quotient transposed (`Cs / (1 - Cb)`):
+    ///   `q = (0.5/0.625, 0.75/0.9375, 0.875/0.8125) =
+    ///   (0.8, 0.8, 1.0769..)`, so `B = (0.8, 0.8, 1.0)` and
+    ///   `(0.5875, 0.43125, 0.59375)` — **caught in red and green; blue
+    ///   does not catch it**, since the transposed `1.0769..` and the
+    ///   correct `1.5` both exceed the boundary and blue lands on exactly
+    ///   the golden. A two-channel discriminator, stated as such rather
+    ///   than claimed as three.
+    ///
+    /// The golden is asserted *and* cross-checked against the real
+    /// [`composite_tile_cpu`] for the same two layers, so a stale literal
+    /// cannot outlive a change to either implementation. Every value is an
+    /// exact binary fraction — the three quotients terminate by
+    /// construction (see suite-header degeneracy 6) — so both are bit-exact
+    /// `assert_eq!`s rather than tolerance comparisons. That is sound
+    /// despite a GPU divide being permitted 2.5 ULP of error, because the
+    /// result round-trips through `f16` tile storage, whose spacing at
+    /// these magnitudes is orders of magnitude coarser than an `f32` ULP:
+    /// an exactly-representable quotient cannot be perturbed far enough to
+    /// land on a different `f16`.
+    ///
+    /// `dst` is seeded opaque red first, so a pass that silently wrote
+    /// nothing would fail rather than accidentally read as a pass.
+    fn composite_color_dodge_over_with_opacity_dodges_and_clamps_per_channel() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.375, 0.0625, 0.1875, 1.0];
+        let top_rgba = [0.5, 0.75, 0.875, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.375, 0.0625, 0.1875, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass \
+             then samples"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.5625, 0.15625, 0.59375, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself \
+             computes for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.5625, 0.15625, 0.59375, 1.0),
+            "ColorDodge(Cb, Cs) = min(1, Cb / (1 - Cs)) per channel -- no outer 1 -, that is \
+             ColorBurn's: quotients (0.75, 0.25, 1.5) give B = (0.75, 0.25, 1.0), folded in at \
+             the source's own 0.5 alpha. The Normal arm would give (0.4375, 0.40625, 0.53125) \
+             (and so would Lighten, Cs exceeding Cb everywhere here), ColorBurn's \
+             1 - min(1, (1 - Cb) / Cs) -- the other guarded division and the adjacent dispatch \
+             arm -- roughly (0.1875, 0.03125, 0.1294), LinearDodge's min(Cb + Cs, 1) \
+             (0.625, 0.4375, 0.59375) (agreeing in blue, where both clamp -- they always do, \
+             the two clamp boundaries being identical), the Multiply arm \
+             (0.28125, 0.0546875, 0.17578125), the Darken arm (0.375, 0.0625, 0.1875) (which is \
+             Cb itself), the Screen arm (0.53125, 0.4140625, 0.54296875), the Difference arm \
+             (0.25, 0.375, 0.4375), LinearBurn's max(Cb + Cs - 1, 0) (0.1875, 0.03125, 0.125), \
+             a dropped min clamp (0.5625, 0.15625, 0.84375) and a transposed quotient \
+             (0.5875, 0.43125, 0.59375)."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case: the `ColorDodge` counterpart
+    /// of
+    /// `composite_color_burn_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator`,
+    /// exercising this entry point's own backdrop-recovery branch
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`).
+    ///
+    /// The backdrop is `(0.375, 0.0625, 0.1875)` at half opacity and the
+    /// source `(0.5, 0.75, 0.875)` at its own alpha `1.0` — the same two
+    /// colours as test 1, deliberately, so the *only* thing that differs
+    /// between the two tests is which of the shader's own lines is
+    /// exercised. Per-channel distinct on both sides, no operand at `0.0`
+    /// or `1.0`, no channel with `Cb == Cs` or `Cb == Cs * (1 - Cs)`, and
+    /// the quotients `(0.75, 0.25, 1.5)` straddle the clamp.
+    ///
+    /// **REQUIRED DISCLOSURE, and it is the *opposite* of the `ColorBurn`
+    /// sibling's — this test's own derivation, not that one's inherited.** A
+    /// missing un-premultiply fails in **all three channels** here. The raw
+    /// premultiplied accumulator is `(0.1875, 0.03125, 0.09375)`, and
+    /// dividing against *that* rather than the recovered straight
+    /// `(0.375, 0.0625, 0.1875)` halves every quotient — because `1 - Cs` is
+    /// untouched and `cb` is halved — giving
+    /// `(0.375, 0.125, 0.75)` where the correct quotients are
+    /// `(0.75, 0.25, 1.5)`. So `B` becomes `(0.375, 0.125, 0.75)` against
+    /// the correct `(0.75, 0.25, 1.0)`, and `blended = 0.5 * Cs + 0.5 * B`
+    /// comes out `(0.4375, 0.4375, 0.8125)` against `(0.625, 0.5, 0.9375)`.
+    ///
+    /// **Why the direction is opposite, and why it is not luck.** For
+    /// `ColorBurn` the numerator is `1 - cb`, so halving `cb` *raises* the
+    /// quotient and pushes an already-clamped channel further past the
+    /// boundary — its clamp then erases the difference, which is what makes
+    /// that sibling's blue structurally blind. Here the numerator *is* `cb`,
+    /// so halving it *lowers* the quotient, and a clamped channel can become
+    /// **unclamped** and therefore visible. That is a property of the
+    /// formula, but it is not automatic: at `ab = 0.5` a channel stays blind
+    /// exactly when its correct quotient is at least `2.0`. Blue's is `1.5`,
+    /// chosen for that reason (see test 1's own note), so `0.75` lands well
+    /// clear of the boundary and blue does real work here.
+    ///
+    /// The expected value is **not hand-derived**: it comes from calling
+    /// the real [`composite_tile_cpu`] with the same two layers. Compared
+    /// within `2 * f16::EPSILON`, the same tolerance and the same reasoning
+    /// the `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
+    /// `LinearBurn` and `ColorBurn` siblings document. (For the record it is
+    /// `(0.625, 0.5, 0.9375, 1.0)`, since `ab_inv * Cs + ab * B` at
+    /// `ab = 0.5` is `0.5 * (0.5, 0.75, 0.875) + 0.5 * (0.75, 0.25, 1.0)`,
+    /// and the source's own `a = 1.0` makes `inv = 0.0` — but the assertion
+    /// goes through the CPU reference, not through that literal.)
+    fn composite_color_dodge_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.375, 0.0625, 0.1875, 1.0];
+        let top_rgba = [0.5, 0.75, 0.875, 1.0];
+        let bottom_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        // A half-opacity bottom layer leaves a *premultiplied*
+        // accumulator whose alpha is 0.5 -- exactly the state whose raw
+        // colour is not its straight colour.
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_accumulator = first_texel(&composite_tile_cpu(&[(
+            &bottom_texels,
+            bottom_opacity,
+            BlendMode::Normal,
+        )]));
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, bottom_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]));
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator, cpu_accumulator,
+            "setup: the accumulator the second pass samples must be the premultiplied, \
+             fractional-alpha state the CPU path also reaches"
+        );
+        assert!(
+            gpu_accumulator.3 > 0.0 && gpu_accumulator.3 < 1.0,
+            "setup: this test is only meaningful with a fractional accumulator alpha, got \
+             {gpu_accumulator:?}"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader ColorDodge path and composite_tile_cpu \
+                 diverged by more than {tolerance} against a translucent accumulator ({gpu} vs \
+                 {cpu}) -- that is a real finding to report, not a reason to loosen this \
+                 assertion. A missing un-premultiply gives (0.4375, 0.4375, 0.8125) here, which \
+                 differs in *all three* colour channels -- unlike the ColorBurn sibling, where \
+                 blue is structurally blind; see this test's doc comment for why the direction \
+                 is opposite for this mode. Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **The spatial-addressing test for the `ColorDodge` entry point**,
+    /// the counterpart of
+    /// `composite_color_burn_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile`
+    /// and the only `ColorDodge` test here that can catch a V-flip, a
+    /// transposed axis or a half-texel UV offset: every other one
+    /// composites uniform tiles and reads back texel 0.
+    ///
+    /// Both layers are [`patterned_texels`] with *different* seeds, and the
+    /// result genuinely varies texel to texel. The accumulator is built by a
+    /// real `composite_over_with_opacity` render pass rather than seeded,
+    /// and the **whole** `TILE`x`TILE` result is compared against
+    /// [`composite_tile_cpu`]'s own output via [`read_rgba8`] and its CPU
+    /// twin [`rgba8_of`].
+    ///
+    /// The top layer's alpha is `0.75`, so `a = 0.75` and `inv = 0.25`:
+    /// **both** terms of `out = inv * d.rgb + a * B` are live.
+    ///
+    /// **Four disclosures specific to this fixture, every one of them
+    /// derived from the real pattern rather than assumed:**
+    ///
+    /// 1. **It reaches this mode's `cb == 0.0` branch but *not* its
+    ///    `cs == 1.0` branch.** [`patterned_texels`] emits only
+    ///    `0.0`/`0.25`/`0.5`/`0.75`, so a source channel is never `1.0` and
+    ///    the second branch is unreachable here — test 8 is the only thing
+    ///    in this crate that exercises it. A backdrop channel *is* `0.0` in
+    ///    one red column in four (`x % 4 == 0`), one green row in four, and
+    ///    the whole top-left blue quadrant, so the first branch runs for
+    ///    real, on a spatially-varying tile, alongside the arithmetic branch
+    ///    elsewhere. **And because `cs` is never `1.0` here, no `0 / 0` is
+    ///    ever evaluated even with the first guard deleted** — which is
+    ///    exactly why deleting it survives this test and is killed only by
+    ///    test 7.
+    /// 2. **Exactly one red column in four clamps**, which is the reverse
+    ///    proportion of the `ColorBurn` sibling's and worth stating rather
+    ///    than inheriting. The per-`x % 4` red quotients `Cb / (1 - Cs)` are
+    ///    `cb == 0` (the guard), `0.25/0.5 = 0.5`, `0.5/0.25 = 2.0` and
+    ///    `0.75/1.0 = 0.75` — so two of the four are unclamped, one is
+    ///    clamped and one takes the guard. Green does the same in `y`. Blue
+    ///    is seed-independent (a pure function of the quadrant, so the two
+    ///    layers' blue channels are *equal* at every texel and blue's blend
+    ///    term is `min(1, Cb / (1 - Cb))`): `0` in the top-left (the guard),
+    ///    `0.25/0.75 = 0.333` unclamped in the bottom-left, exactly `1.0` in
+    ///    the top-right and `3.0` in the bottom-right.
+    /// 3. **A zero operand does occur here**, in every channel — the
+    ///    suite header's degeneracy 1, which the solid-colour fixtures avoid
+    ///    absolutely and this one cannot.
+    /// 4. **Degeneracy 3 fires here, in one column in four.** At
+    ///    `x % 4 == 1` the operands are `Cb = 0.25, Cs = 0.5`, and
+    ///    `Cs * (1 - Cs) = 0.25 == Cb` — so `ColorDodge` returns exactly
+    ///    `Cs` there and that column is indistinguishable from `Normal`
+    ///    (both fold to `0.4375`). This is the only fixture in the suite
+    ///    where that happens, it is unavoidable in a pattern drawn from
+    ///    quarters, and the other three columns discriminate: at
+    ///    `x % 4 == 2` the correct fold is `0.875` against `Normal`'s
+    ///    `0.6875`, and at `x % 4 == 3` it is `0.75` against `0.1875`.
+    ///
+    /// **What this test kills, measured rather than asserted:** it is where
+    /// mutation (b) of this round's set (transposing the quotient's
+    /// operands) and mutation (c) (dropping the `min`) were both confirmed
+    /// killed. Both are worth spelling out in 8-bit terms, because the naive
+    /// expectation is that a quantised whole-tile comparison cannot see
+    /// either. The dropped `min` shows at `x % 4 == 2`: the correct fold is
+    /// `0.25 * 0.5 + 0.75 * 1.0 = 0.875` → `223`, while an unclamped
+    /// `q = 2.0` folds to `1.625`, which [`read_rgba8`] clamps to `255`. The
+    /// transposed quotient shows in three of the four red columns —
+    /// `0 → 48` at `x % 4 == 0`, `112 → 143` at `1`, `191 → 48` at `3`.
+    ///
+    /// Tolerance is `1` out of 255, the same reasoning
+    /// `composite_over_matches_the_golden_image` documents.
+    fn composite_color_dodge_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // The accumulator itself must have survived its render pass
+        // texel-for-texel first, or a spatial failure downstream would
+        // be ambiguous between the two passes.
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the ColorDodge comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader ColorDodge path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel \
+             bug (V-flip, transpose, UV offset, transposed binding), not precision.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `ColorDodge` path, exercising the
+    /// `s.a * opacity.value` scale the shader relies on the Rust caller to
+    /// have clamped. The counterpart of
+    /// `composite_color_burn_over_with_opacity_at_half_opacity_matches_the_cpu`.
+    ///
+    /// The expected value comes from the real [`composite_tile_cpu`] with
+    /// the same two layers and the same `0.5`, and is also asserted as an
+    /// absolute golden: `Cb = (0.4375, 0.125, 0.375)`,
+    /// `Cs = (0.5, 0.75, 0.875)`, so the quotients `Cb / (1 - Cs)` are
+    /// `(0.4375/0.5, 0.125/0.25, 0.375/0.125) = (0.875, 0.5, 3.0)`,
+    /// `B = min(1, q) = (0.875, 0.5, 1.0)`, and the fold at `a = 0.5` over
+    /// an opaque accumulator gives
+    /// `0.5 * Cb + 0.5 * B = (0.65625, 0.3125, 0.6875)` at alpha `1.0`.
+    /// Non-grey, per-channel-distinct colours are used so a channel
+    /// swizzle anywhere in the path fails here too.
+    ///
+    /// **A second fixture that straddles the clamp, and deliberately not at
+    /// the same distance from the boundary as test 1's.** Blue's quotient
+    /// here is `3.0` against test 1's `1.5`, so a dropped `min` gives
+    /// `0.5 * 0.375 + 0.5 * 3.0 = 1.6875` — a different wrong value from
+    /// test 1's `0.84375`, which means a shader that clamped to some *other*
+    /// bound than `1.0` (say `2.0`) could not agree with both tests at once.
+    /// Red and green are the unclamped channels and agree under that
+    /// mutation, which is why the fixture needs blue.
+    ///
+    /// **Red's quotient is `0.875`, deliberately just under the boundary.**
+    /// Test 1's unclamped channels sit at `0.75` and `0.25`; putting one at
+    /// `0.875` means a shader that clamped at some value slightly below
+    /// `1.0` would be caught here and nowhere else in the suite.
+    ///
+    /// No channel has `Cb == Cs` or `Cb == Cs * (1 - Cs)` (`Cs * (1 - Cs)`
+    /// is `(0.25, 0.1875, 0.109375)` against
+    /// `Cb = (0.4375, 0.125, 0.375)`), and no operand is `0.0` or `1.0`.
+    ///
+    /// Rival arms, re-derived in exact rationals for this fixture:
+    /// `Normal` `(0.46875, 0.4375, 0.625)` (and `Lighten` gives the same,
+    /// `Cs` exceeding `Cb` everywhere), `ColorBurn`'s
+    /// `1 - min(1, (1 - Cb) / Cs)` roughly `(0.21875, 0.0625, 0.3303..)`,
+    /// `LinearDodge`'s `min(Cb + Cs, 1)` `(0.6875, 0.5, 0.6875)` (agreeing
+    /// in blue, where both clamp — they always do; suite-header degeneracy
+    /// 4), `Multiply` `(0.328125, 0.109375, 0.3515625)`, `Screen`
+    /// `(0.578125, 0.453125, 0.6484375)`, `Darken`
+    /// `(0.4375, 0.125, 0.375)` (which is `Cb`), `Difference`
+    /// `(0.25, 0.375, 0.4375)`, `LinearBurn`'s `max(Cb + Cs - 1, 0)`
+    /// `(0.21875, 0.0625, 0.3125)`, a dropped `min` clamp
+    /// `(0.65625, 0.3125, 1.6875)`, and the quotient transposed
+    /// (`Cs / (1 - Cb)`, whose `q` is `(0.888.., 0.857.., 1.4)`)
+    /// roughly `(0.6631.., 0.4910.., 0.6875)` — a **two-channel**
+    /// discriminator, blue coinciding because both quotients clamp.
+    ///
+    /// Every one of those differs from the golden in at least two channels
+    /// except the three that sit exactly at two — `LinearDodge`, the
+    /// dropped `min` and the transposed quotient — each of which is
+    /// disclosed as such above rather than counted as three.
+    fn composite_color_dodge_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.4375, 0.125, 0.375, 1.0];
+        let top_rgba = [0.5, 0.75, 0.875, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::ColorDodge),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.65625, 0.3125, 0.6875, 1.0),
+            "setup: the golden named in this test's doc comment must be what composite_tile_cpu \
+             itself computes -- if this fails, the literal is stale, not the GPU"
+        );
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.65625, 0.3125, 0.6875, 1.0),
+            "min(1, Cb / (1 - Cs)) at opacity 0.5: a dropped min clamp gives \
+             (0.65625, 0.3125, 1.6875), LinearDodge's min(Cb + Cs, 1) gives \
+             (0.6875, 0.5, 0.6875) (agreeing in blue, where both clamp), ColorBurn's \
+             1 - min(1, (1 - Cb) / Cs) roughly (0.21875, 0.0625, 0.3303), the Normal arm \
+             (0.46875, 0.4375, 0.625) (and Lighten the same), Multiply \
+             (0.328125, 0.109375, 0.3515625), Screen (0.578125, 0.453125, 0.6484375), Darken \
+             (0.4375, 0.125, 0.375), Difference (0.25, 0.375, 0.4375), and LinearBurn's \
+             max(Cb + Cs - 1, 0) (0.21875, 0.0625, 0.3125)."
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader ColorDodge path and composite_tile_cpu \
+                 diverged by more than {tolerance} at opacity {opacity} ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **`fs_composite_color_dodge` deliberately does not clamp
+    /// `s.a * opacity.value`** — only `opacity` itself is clamped, and it is
+    /// clamped Rust-side in `composite_blend_over_with_opacity`, mirroring
+    /// `composite_layer_into`'s own `let opacity = opacity.clamp(0.0, 1.0)`
+    /// followed by an unclamped `sa * opacity`. `f16` can legally hold a
+    /// source alpha above `1.0` (invariant §7.3.1b), so this is a real
+    /// input, not a synthetic one. The counterpart of
+    /// `composite_color_burn_over_with_opacity_does_not_clamp_a_source_alpha_above_one`,
+    /// kept for the reason 0.95.1 had to restore the `Lighten` one: this
+    /// asserts a line *inside this entry point*, and each WGSL fragment
+    /// function is separately compiled, so no other mode's suite covers it.
+    ///
+    /// **The source alpha is `2.0` and the `opacity` argument is `1.0`, not
+    /// the other way round.** Passing `opacity = 2.0` would prove nothing:
+    /// `composite_blend_over_with_opacity` clamps that argument to `1.0`
+    /// before it ever reaches the uniform, so `a` would come out as `1.0`
+    /// and this test would assert the *clamped* answer. The unclamped
+    /// product is only reachable through a source alpha the tile itself
+    /// carries.
+    ///
+    /// **Why the fixture separates all three channels.** With a source alpha
+    /// of `2.0` the fold's `inv = 1.0 - a` goes negative, so the clamped and
+    /// unclamped answers differ by exactly `b - cb` per channel — which
+    /// vanishes only where `B == Cb`. Test 1's colours are reused
+    /// (`Cb = (0.375, 0.0625, 0.1875)`, `Cs = (0.5, 0.75, 0.875)`,
+    /// `B = (0.75, 0.25, 1.0)`), and `B != Cb` in all three:
+    ///
+    /// - unclamped (`a = 2.0`, `inv = -1.0`):
+    ///   `-cb + 2B = (1.125, 0.4375, 1.8125)` at alpha `2.0 - 1.0 = 1.0`;
+    /// - clamped-alpha counterfactual (`a = 1.0`, `inv = 0.0`):
+    ///   `B = (0.75, 0.25, 1.0)`, at the same alpha `1.0` — so **alpha alone
+    ///   cannot catch this**, and the colour channels are what the assertion
+    ///   rests on.
+    ///
+    /// **Two of the unclamped golden's channels are above `1.0`**
+    /// (`1.125` and `1.8125`), and that is the point rather than an
+    /// accident — and it is the *mirror* of the `ColorBurn` sibling, whose
+    /// equivalent fixture undershoots below `0.0` instead. This mode's
+    /// *blend term* is bounded to `[0, 1]` by construction (the `min` bounds
+    /// it above, and a quotient of non-negative operands cannot go below
+    /// `0`), but the *fold* around it is not, and with `inv` negative a
+    /// dodge — whose `B` exceeds `Cb` wherever it brightens — overshoots.
+    /// Neither `composite_layer_into` nor `fs_composite_color_dodge` clamps
+    /// its output, `Rgba16Float` stores `1.125` and `1.8125` exactly, and
+    /// [`read_first_texel`] does not clamp on the way back — so the GPU and
+    /// CPU are expected to agree on them. A disagreement here would be a
+    /// real finding about one of those three, not a reason to move the
+    /// fixture. (Confirmed empirically on first run, following the
+    /// `Difference`, `LinearDodge`, `LinearBurn` and `ColorBurn` rounds' own
+    /// precedent.)
+    ///
+    /// A dropped *`min`* clamp is also visible here, in blue:
+    /// `B = (0.75, 0.25, 1.5)` would fold to `(1.125, 0.4375, 2.8125)`
+    /// rather than `(1.125, 0.4375, 1.8125)`. Red and green are the
+    /// unclamped channels and agree.
+    ///
+    /// Every value is an exact binary fraction, and the absolute golden is
+    /// asserted alongside the [`composite_tile_cpu`] differential so a clamp
+    /// added to *both* implementations could not pass either.
+    fn composite_color_dodge_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.375, 0.0625, 0.1875, 1.0];
+        let top_rgba = [0.5, 0.75, 0.875, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::ColorDodge),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's \
+                 own formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). \
+                 Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        // The absolute golden, hand-derived in the doc comment above.
+        // A `min(s.a * opacity.value, 1.0)` in `fs_composite_color_dodge`
+        // yields (0.75, 0.25, 1.0, 1.0) instead -- alpha agrees, which is
+        // why this is asserted per channel rather than as a single texel
+        // comparison whose message would not say where. Red and blue are
+        // deliberately above 1.0; see the doc comment.
+        for (gpu, expected, channel) in [
+            (gr, 1.125, "r"),
+            (gg, 0.4375, "g"),
+            (gb, 1.8125, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold; got {gpu}. \
+                 (0.75, 0.25, 1.0, 1.0) would mean fs_composite_color_dodge clamped the \
+                 s.a * opacity product, a 1.0 in red or blue would mean something clamped the \
+                 *output* to [0, 1], and 2.8125 in blue would mean the min clamp inside the \
+                 blend was dropped. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The `if (ab > 0.0)` guard's **untaken** branch in
+    /// `fs_composite_color_dodge`, on real hardware — the counterpart of
+    /// `composite_color_burn_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.
+    ///
+    /// Whether a shader compiler flattens that branch and evaluates the
+    /// `0.0 / 0.0` on both sides is a property of the *backend*, not of the
+    /// entry point, so proving it for `fs_composite_color_burn` does not
+    /// prove it here: this is a ninth, separately-compiled function. And
+    /// this mode has **two** divisions inside it rather than one — the
+    /// backdrop-recovery `bd.rgb / ab` that the guard protects, and
+    /// `color_dodge_channel`'s own `cb / (1 - cs)` downstream of it — so a
+    /// `NaN` produced by a flattened guard would then be fed straight into a
+    /// second division and a `min`, where `min(1.0, NaN)` is itself
+    /// implementation-defined. That makes this mode's version of this test
+    /// strictly more load-bearing than its commutative siblings', not a
+    /// formality copied across.
+    ///
+    /// Where `ab == 0.0` the whole composite reduces to the source alone, so
+    /// that half of the tile is asserted to be exactly that — a `NaN`
+    /// leaking out of the untaken divide would fail both the finiteness
+    /// check and the value check, and (`NaN != NaN`) could not be mistaken
+    /// for a pass.
+    ///
+    /// **The backdrop is deliberately half transparent, not uniformly so** —
+    /// the reason 0.95.1 gives for the `Lighten` sibling applies verbatim:
+    /// with `ab == 0` everywhere, the mode-dependent term `b` is multiplied
+    /// by zero in every texel, so a uniform fixture cannot distinguish this
+    /// entry point's formula from any other's. With
+    /// [`half_transparent_texels`]'s opaque half at `(0.75, 0.25, 0.5)` and
+    /// a `(0.125, 0.625, 0.875)` source:
+    ///
+    /// - left half (`ab == 0`): `blended = Cs`, `out = Cs` — the untaken
+    ///   branch, `(0.125, 0.625, 0.875, 1.0)`;
+    /// - right half (`ab == 1`): the quotients `Cb / (1 - Cs)` are
+    ///   `(0.75/0.875, 0.25/0.375, 0.5/0.125) = (0.857.., 0.666.., 4.0)`, so
+    ///   `out = B = (0.857.., 0.666.., 1.0)`, where `Normal` gives
+    ///   `(0.125, 0.625, 0.875)`, `ColorBurn` `(0.0, 0.0, 0.428..)`,
+    ///   `LinearDodge` `(0.875, 0.875, 1.0)` (agreeing in blue, where both
+    ///   clamp), `Multiply` `(0.09375, 0.15625, 0.4375)`, `Screen`
+    ///   `(0.78125, 0.71875, 0.9375)`, `Darken` `(0.125, 0.25, 0.5)`,
+    ///   `Lighten` `(0.75, 0.625, 0.875)`, `Difference`
+    ///   `(0.625, 0.375, 0.375)` and `LinearBurn` `(0.0, 0.0, 0.375)`.
+    ///
+    /// **The source's red is `0.125`, not a mid value, and that is
+    /// deliberate.** The opaque half's `Cb` is fixed by
+    /// [`half_transparent_texels`], so the only way to give this fixture an
+    /// *unclamped* channel is to pick a source channel small enough that
+    /// `1 - Cs` exceeds `Cb`. `Cs = 0.125` puts red at `0.857..` and
+    /// `Cs = 0.625` puts green at `0.666..`, leaving only blue clamped — two
+    /// unclamped channels against the `ColorBurn` sibling's one.
+    ///
+    /// **Neither half's values are exact binary fractions in red and green**
+    /// (`6/7` and `2/3`), which is why the right half is checked only through
+    /// the 8-bit whole-tile differential against [`composite_tile_cpu`] and
+    /// never as a literal. Texel 0, in the transparent half, *is* exact and
+    /// is asserted with `assert_eq!`.
+    ///
+    /// **REQUIRED DISCLOSURE: this test cannot detect a dropped `min`
+    /// clamp.** Blue's quotient is `4.0`, so an unclamped shader writes
+    /// `4.0` where the correct answer is `1.0` — but both sides of this
+    /// test's whole-tile comparison quantise through a `[0, 1]` clamp
+    /// ([`read_rgba8`]'s on the GPU side, [`rgba8_of`]'s on the CPU
+    /// reference's), so `4.0` and `1.0` both land on `255` and the
+    /// difference is invisible here. Red and green are the *unclamped*
+    /// channels, where the mutation is a no-op by definition. The
+    /// `read_first_texel` assertion is no help either: texel 0 is in the
+    /// *transparent* half, where `b` is multiplied by zero. This is a real,
+    /// accepted coverage gap in this one test, stated rather than papered
+    /// over — tests 1, 3, 4 and 5 in this suite all kill that mutation, and
+    /// so does `aurora-app`'s own app-level golden, which reads unclamped
+    /// `f16` back. Widening this test to catch it would mean giving up
+    /// either the whole-tile 8-bit comparison or the transparent-half `NaN`
+    /// check, both of which are what this test is *for*. It is the mirror of
+    /// the `ColorBurn`, `LinearBurn` and `LinearDodge` siblings' own
+    /// disclosures — with the one difference that this mode's unclamped
+    /// value overshoots `1.0` rather than undershooting `0.0`, and the
+    /// quantiser erases both.
+    ///
+    /// **Neither of this mode's two branches fires anywhere in this
+    /// fixture**, which is also disclosed rather than left implied: no
+    /// backdrop channel is `0.0` in the opaque half and no source channel is
+    /// `1.0`. Tests 7 and 8 are what cover those.
+    ///
+    /// A `NaN` in the left half is still caught by the whole-tile comparison
+    /// as well as by the explicit finiteness check on texel 0:
+    /// [`read_rgba8`]'s `clamp` maps `NaN` to `0`, which cannot match the
+    /// CPU reference's real value there.
+    ///
+    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader
+    /// compilers are unverified for this specific branch.
+    fn composite_color_dodge_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
+     {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Deliberately non-symmetric across channels, so a contaminated
+        // channel cannot hide behind an equal one, strictly inside (0, 1)
+        // so neither branch of the formula fires here, and leaving two
+        // channels unclamped and one clamped in the opaque half.
+        let top_rgba = [0.125, 0.625, 0.875, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        // A real render pass builds the accumulator, rather than seeding
+        // it: the zero-alpha half is produced by the same mechanism under
+        // test, not written directly.
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // Texel 0 is in the transparent half, and `f16` equality pins its
+        // alpha at exactly zero -- something the 8-bit whole-tile
+        // comparison below cannot do, since a tiny non-zero alpha would
+        // quantise to 0 there.
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. That is a \
+             real finding about this backend's shader compiler, not a reason to relax this test."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.125, 0.625, 0.875, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader ColorDodge path and composite_tile_cpu disagree across a \
+             half-transparent backdrop. In the opaque half a wrong blend formula shows up here \
+             (except a dropped min clamp -- see this test's doc comment); in the transparent \
+             half a NaN out of the untaken `ab > 0.0` branch does.",
+        );
+    }
+
+    #[test]
+    /// **The `cb == 0.0` branch, and the only test in either crate that
+    /// reaches it** (0.108.0). `ColorDodge`'s formula tests `Cb == 0`
+    /// *first*, before `Cs == 1`, so a zero backdrop channel yields `0.0`
+    /// regardless of the source — including where the source is `1.0` and
+    /// the second branch would have said `1.0`. This test's **green** channel
+    /// is that exact input: `Cb = 0.0`, `Cs = 1.0`, both conditions true at
+    /// once.
+    ///
+    /// **The accumulator must be fully opaque, and that is a requirement
+    /// rather than a convenience.** The shader recovers `cb` as
+    /// `bd.rgb / ab`, and the branch is a bit-exact `== 0.0`. A fractional
+    /// `ab` would make blue's own quotient depend on that division landing
+    /// exactly, which would make this test silently measure something other
+    /// than the branch it exists for. (Red and green would survive it — `0`
+    /// divided by anything positive is still `0` — but blue is this
+    /// fixture's only formula discriminator, so the whole test rests on it.)
+    /// The translucent-accumulator case is test 2's job.
+    ///
+    /// Backdrop `(0.0, 0.0, 0.375)` opaque under a `(0.5, 1.0, 0.25)` source
+    /// at opacity `1.0`, so `a = 1.0`, `inv = 0.0` and the whole result is
+    /// `B`:
+    ///
+    /// - red: `Cb == 0`, so `0.0` (and the arithmetic branch would agree —
+    ///   `0 / 0.5 = 0`, `min(1, 0) = 0`, which is *why* the first guard is
+    ///   arithmetically redundant, and note this is a perfectly ordinary
+    ///   division rather than a `0/0`);
+    /// - green: `Cb == 0` **and** `Cs == 1`, so branch order decides:
+    ///   `0.0`, not `1.0`;
+    /// - blue: neither, so `min(1, 0.375/0.75) = 0.5`.
+    ///
+    /// Golden `(0.0, 0.0, 0.5, 1.0)`, every value an exact binary fraction.
+    ///
+    /// **REQUIRED DISCLOSURE: red and green agree with a whole family of
+    /// other modes here, and blue is the real discriminator of the
+    /// *formula*.** `Multiply`, `Darken`, `LinearBurn` and `ColorBurn` all
+    /// give `0.0` in a channel with a zero backdrop, so this fixture on its
+    /// own cannot say this is `ColorDodge` rather than any of them — blue
+    /// does that (`0.5` against `Normal`'s `0.25`, `Darken`'s `0.25`,
+    /// `Lighten`'s `0.375`, `Screen`'s `0.53125`, `Multiply`'s `0.09375`,
+    /// `Difference`'s `0.125`, `LinearDodge`'s `0.625`, and both
+    /// `LinearBurn`'s and `ColorBurn`'s `0.0`). Note blue is deliberately
+    /// *unclamped* here (`Cb + Cs = 0.625 < 1`), which is the only way it
+    /// could separate `ColorDodge` from `LinearDodge` at all — suite-header
+    /// degeneracy 4. What red and green *are* for is the branch structure,
+    /// which no other test reaches:
+    ///
+    /// - green kills a **swapped branch order** (`Cs == 1` tested first
+    ///   would give `1.0`) — the only assertion in either crate that does;
+    /// - green also kills the **`cb == 0.0` branch deleted outright**, for
+    ///   the same reason and by the same value: the `cs == 1.0` guard then
+    ///   fires in its place. Note this is *not* a division-by-zero question
+    ///   — no `0/0` is ever evaluated on that path, since `1 - cs` is
+    ///   non-zero in every channel the deleted guard used to catch — so
+    ///   unlike the `cs == 1.0` guard, deleting the first guard is killed
+    ///   deterministically on every backend, which 0.108.0 confirmed by
+    ///   running the mutation for real;
+    /// - red and green together kill the **`cb == 0.0` branch returning
+    ///   `1.0`** instead of `0.0`.
+    ///
+    /// **Green is also the one channel in this suite where degeneracy 3's
+    /// test (`Cb == Cs * (1 - Cs)`) is satisfied and does *not* mean what it
+    /// usually means**: `Cs * (1 - Cs) = 1 * 0 = 0 = Cb`, but that
+    /// identity characterises the *arithmetic* branch, and green never
+    /// reaches it. `ColorDodge(0, 1)` is `0.0` while `Normal` gives `1.0`, so
+    /// green discriminates the two perfectly well. Stated here so a later
+    /// reader auditing the degeneracy does not treat this channel as a hole.
+    ///
+    /// A dropped `min` clamp is *not* visible here: no channel's quotient
+    /// exceeds `1.0` (red's is `0.0`, green's never evaluated, blue's is
+    /// `0.5`). Tests 1, 3, 4 and 5 cover that.
+    ///
+    /// The golden is cross-checked against the real [`composite_tile_cpu`],
+    /// whose `blend_channel` arm this branch order is copied from, and a
+    /// finiteness check runs first.
+    fn composite_color_dodge_over_with_opacity_yields_zero_where_the_backdrop_is_zero() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Fully opaque -- see the doc comment: only ab == 1.0 makes the
+        // shader's own `bd.rgb / ab` recovery exact, which blue's quotient
+        // (this fixture's only formula discriminator) depends on.
+        let bottom_rgba = [0.0, 0.0, 0.375, 1.0];
+        let top_rgba = [0.5, 1.0, 0.25, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.0, 0.0, 0.375, 1.0),
+            "setup: the accumulator must be exactly zero in red and green AND fully opaque, or \
+             the shader's own `bd.rgb / ab` recovery need not land on exactly 0.375 in blue -- \
+             the one channel that discriminates this mode's formula here"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.0, 0.0, 0.5, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own three-branch \
+             blend_channel arm computes -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the ColorDodge branches: {gpu_result:?}. Green's operands \
+             are Cb = 0.0 and Cs = 1.0, which is a 0/0 in the arithmetic branch -- reaching it \
+             at all means both guards are gone."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.0, 0.0, 0.5, 1.0),
+            "a zero backdrop channel must dodge to 0.0, and green (Cb = 0.0 AND Cs = 1.0) must \
+             take the *first* branch: (0.0, 1.0, 0.5, 1.0) would mean the two branches were \
+             tested in the wrong order or the cb == 0.0 branch was deleted, and \
+             (1.0, 1.0, 0.5, 1.0) that the cb == 0.0 branch returns 1.0. Blue is what \
+             discriminates the formula: Normal gives 0.25 there, Darken 0.25, Lighten 0.375, \
+             Screen 0.53125, Multiply 0.09375, Difference 0.125, LinearDodge 0.625, and both \
+             LinearBurn and ColorBurn 0.0 -- while red and green agree with several of those, \
+             which is why this fixture is about branch structure and blue is about arithmetic."
+        );
+    }
+
+    #[test]
+    /// **The `cs == 1.0` branch** (0.108.0): a saturated source channel
+    /// dodges the backdrop to `1.0`, regardless of how dark the backdrop was
+    /// — provided the backdrop is not itself zero, which is what makes this
+    /// test's fixture the complement of test 7's rather than a variation on
+    /// it.
+    ///
+    /// Backdrop `(0.75, 0.125, 0.375)` opaque under a `(1.0, 0.75, 0.5)`
+    /// source at opacity `1.0`, so `a = 1.0`, `inv = 0.0` and the whole
+    /// result is `B`:
+    ///
+    /// - red: `Cs == 1` and `Cb != 0`, so `1.0` — the branch this test
+    ///   exists for;
+    /// - green: `min(1, 0.125/0.25) = 0.5`;
+    /// - blue: `min(1, 0.375/0.5) = 0.75`.
+    ///
+    /// Golden `(1.0, 0.5, 0.75, 1.0)`, every value an exact binary fraction.
+    ///
+    /// **REQUIRED DISCLOSURE: red agrees with a whole family of other modes
+    /// here, and green and blue are the real discriminators.** `Normal`,
+    /// `Lighten`, `Screen` and `LinearDodge` all give `1.0` in a channel with
+    /// a saturated source, so this fixture's red channel on its own cannot
+    /// say this is `ColorDodge`. Green and blue do (`(0.5, 0.75)` against
+    /// `Normal`'s and `Lighten`'s `(0.75, 0.5)`, `Screen`'s
+    /// `(0.78125, 0.6875)`, `Multiply`'s `(0.09375, 0.1875)`, `Darken`'s
+    /// `(0.125, 0.375)`, `Difference`'s `(0.625, 0.125)`, `LinearDodge`'s
+    /// `(0.875, 0.875)`, and both `LinearBurn`'s and `ColorBurn`'s
+    /// `(0.0, 0.0)`). Both are unclamped, which is what lets them separate
+    /// this mode from `LinearDodge` at all — suite-header degeneracy 4.
+    ///
+    /// **What red is for is the branch, and specifically the mutation where
+    /// it returns `0.0` instead of `1.0`** — mutation (h) of this round's
+    /// set, which this test's red channel is the only assertion in either
+    /// crate to kill.
+    ///
+    /// **What red is *not* able to do, and this is the round's headline
+    /// disclosure.** Deleting the `cs == 1.0` guard **entirely** leaves this
+    /// test green on Vulkan/NVIDIA, because `0.75 / 0.0` is `+inf` there and
+    /// `min(1.0, inf)` is exactly the `1.0` the guard would have returned.
+    /// That was run for real, not predicted. The guard is a **portability**
+    /// guard, not a correctness one on this adapter: WGSL specifies division
+    /// by zero as yielding an indeterminate value, so a backend producing
+    /// `NaN` instead would propagate it (`min(1.0, NaN)` is
+    /// implementation-defined, and the `ab == 0` half of a tile multiplies
+    /// `b` by zero, where `0.0 * NaN` is `NaN`). **No test in this crate can
+    /// distinguish the guarded shader from the unguarded one, because no
+    /// test can make this adapter divide differently** — stated here rather
+    /// than papered over with an assertion that would not mean what it
+    /// claimed. Note the asymmetry with test 7: *that* guard's deletion is
+    /// killed deterministically, because its redundancy does not route
+    /// through a division by zero at all. See PLAN.md's 0.108.0 entry.
+    ///
+    /// Red's backdrop is deliberately `0.75` rather than `0.0`: with a
+    /// saturated source channel, a zero backdrop would take the *first*
+    /// branch and yield `0.0`, which is test 7's green channel.
+    ///
+    /// A dropped `min` clamp is not visible here either: no channel's
+    /// quotient exceeds `1.0` (red's is never evaluated, green's is `0.5`,
+    /// blue's `0.75`). Tests 1, 3, 4 and 5 cover that.
+    ///
+    /// The golden is cross-checked against the real [`composite_tile_cpu`],
+    /// and a finiteness check runs first.
+    fn composite_color_dodge_over_with_opacity_yields_one_where_the_source_is_saturated() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Red's backdrop is deliberately *not* 0.0: with a saturated source
+        // channel, a zero backdrop would take the *first* branch and yield
+        // 0.0, which is test 7's green channel. This test is about the
+        // second branch, so it needs Cb != 0 in the channel where Cs == 1.
+        let bottom_rgba = [0.75, 0.125, 0.375, 1.0];
+        let top_rgba = [1.0, 0.75, 0.5, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_color_dodge_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.75, 0.125, 0.375, 1.0),
+            "setup: red's backdrop must be strictly above 0.0, or the cb == 0.0 branch would \
+             fire there instead and this test would be a duplicate of test 7"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::ColorDodge),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (1.0, 0.5, 0.75, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own three-branch \
+             blend_channel arm computes -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the ColorDodge branches: {gpu_result:?}. Red's Cs is 1.0, \
+             so an unguarded arithmetic branch divides 0.75 by zero there -- which this adapter \
+             resolves to +inf and thence to the correct 1.0, but another need not."
+        );
+        assert_eq!(
+            gpu_result,
+            (1.0, 0.5, 0.75, 1.0),
+            "a saturated source channel over a non-zero backdrop must dodge to 1.0: \
+             (0.0, 0.5, 0.75, 1.0) would mean the cs == 1.0 branch returns 0.0. Green and blue \
+             are what discriminate the formula, since Normal, Lighten, Screen and LinearDodge \
+             all give 1.0 in red too: Normal and Lighten give (0.75, 0.5) there, Screen \
+             (0.78125, 0.6875), Multiply (0.09375, 0.1875), Darken (0.125, 0.375), Difference \
+             (0.625, 0.125), LinearDodge (0.875, 0.875), and both LinearBurn and ColorBurn \
+             (0.0, 0.0)."
         );
     }
 

@@ -71,8 +71,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // (2) declared above; only the real blend-math entry points below --
 // fs_composite_multiply, fs_composite_darken, fs_composite_lighten,
 // fs_composite_screen, fs_composite_difference,
-// fs_composite_linear_dodge, fs_composite_linear_burn and
-// fs_composite_color_burn -- use it,
+// fs_composite_linear_dodge, fs_composite_linear_burn,
+// fs_composite_color_burn and fs_composite_color_dodge -- use it,
 // through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
@@ -80,10 +80,10 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // -- the `backdrop` of every `TileCompositor::composite_*_over_with_
-// opacity` blend-math method (as of 0.107.0
+// opacity` blend-math method (as of 0.108.0
 // `composite_multiply_over_with_opacity` and its
 // `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`/
-// `color_burn`
+// `color_burn`/`color_dodge`
 // siblings, named
 // as a family rather than relisted, since one more joins them every time
 // a mode is ported) --
@@ -96,7 +96,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // written against this file. That "25" is the 0.83.1 count and is not
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
 // (0.102.0), `Difference` (0.104.0), `LinearDodge` (0.105.0),
-// `LinearBurn` (0.106.0) and `ColorBurn` (0.107.0) have
+// `LinearBurn` (0.106.0), `ColorBurn` (0.107.0) and `ColorDodge`
+// (0.108.0) have
 // since landed, and the live numbers live in `TileCompositor`'s own doc
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
@@ -610,10 +611,16 @@ fn color_burn_channel(cb: f32, cs: f32) -> f32 {
 // the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
 // blend-mode-independent.
 //
-// **Deliberately not `1 - min(1, cb / (1 - cs))`** -- that is `ColorDodge`,
+// **Deliberately not `min(1, cb / (1 - cs))`** -- that is `ColorDodge`,
 // the other guarded-division mode, whose branch conditions are `cb == 0`
 // and `cs == 1` rather than this one's `cb == 1` and `cs == 0`, and which
-// is still CPU-only. And not `max(cb + cs - 1, 0)`, which is `LinearBurn`
+// has its own entry point (`fs_composite_color_dodge`, below) as of
+// 0.108.0. (Until then this comment wrote that formula with a spurious
+// outer `1 -`, i.e. as *this* mode's shape with `ColorDodge`'s operands.
+// The distinction it drew was still the right one -- the branch
+// conditions and the operand order -- but the formula it printed was
+// wrong, and it was wrong identically at five sites; 0.108.0 corrected
+// all five.) And not `max(cb + cs - 1, 0)`, which is `LinearBurn`
 // (`fs_composite_linear_burn` directly above, on the GPU since 0.106.0):
 // the two share half a name and nothing about the arithmetic is close, but
 // the *dispatch arms* are adjacent, which is where that hazard actually
@@ -645,6 +652,111 @@ fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
         color_burn_channel(cb.r, s.r),
         color_burn_channel(cb.g, s.g),
         color_burn_channel(cb.b, s.b),
+    );
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// `blend_channel`'s own `BlendMode::ColorDodge` arm (src/composite.rs), one
+// channel at a time -- this file's shaders' second non-entry-point
+// function, and the exact structural sibling of `color_burn_channel`
+// above: two of its three branches are per-channel *conditions* rather
+// than arithmetic, so a componentwise `vec3` form would need per-lane
+// selects over a division that is undefined in the very lanes the
+// conditions exist to exclude. Three calls to this is the honest shape,
+// for the same reason.
+//
+// **The literal 0/1 comparisons are the W3C Compositing and Blending
+// spec's own boundary conditions**, exactly as `blend_channel`'s Rust arm
+// documents under its `#[allow(clippy::float_cmp)]`: `cb`/`cs` arrive from
+// `f16` storage, where `0.0` and `1.0` round-trip bit-exact, and the spec
+// requires these two literals rather than an epsilon band.
+//
+// **Branch order is load-bearing**, and it is the *mirror* of
+// `color_burn_channel`'s rather than the same. `cb == 0.0` is tested
+// first, so the one input where both conditions hold -- a fully black
+// backdrop under a fully white source, an ordinary pixel -- yields `0.0`,
+// not `1.0`. Swapping the two is a real mutation, killed only by
+// `composite_color_dodge_over_with_opacity_yields_zero_where_the_backdrop_
+// is_zero`'s green channel.
+//
+// **Both guards are arithmetically redundant under IEEE-754 and are still
+// required, and the two are redundant for *different* reasons.** Without
+// the first, `0 / (1 - cs)` is a real, well-defined `+0` for every
+// `cs < 1` -- not a `0/0` -- so `min(1, 0)` is the `0.0` the guard would
+// have returned, and there is no division-by-zero semantics involved at
+// all. It changes the result only at `cs == 1`, where the *second* guard
+// then fires in its place and returns `1.0` instead of `0.0`. Without the
+// second, `cb / 0` is `+inf`, `min(1, inf)` is `1`, and the result is the
+// `1.0` the guard would have returned -- again the same answer, *if* the
+// backend divides like IEEE. WGSL does not promise that: division by zero
+// yields an indeterminate value, which may be `NaN`. And `NaN` here is not
+// harmless, because the `ab == 0` half of a tile multiplies `b` by zero
+// and `0.0 * NaN` is `NaN`. The guards are what make this entry point
+// defined rather than merely correct on one adapter. Measured, not
+// reasoned about: deleting the *first* guard is killed deterministically,
+// while deleting the *second* survives every test in this crate on
+// Vulkan/NVIDIA, which is exactly the adapter-dependence this comment
+// claims. See PLAN.md's 0.108.0 entry for both real results.
+fn color_dodge_channel(cb: f32, cs: f32) -> f32 {
+    if (cb == 0.0) {
+        return 0.0;
+    }
+    if (cs == 1.0) {
+        return 1.0;
+    }
+    return min(1.0, cb / (1.0 - cs));
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::ColorDodge` only -- the ninth blend mode ported
+// to the GPU. Structurally identical to `fs_composite_color_burn` directly
+// above: its `b` is a three-call `vec3` construction rather than one
+// componentwise expression, for the reason `color_dodge_channel` gives.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of
+// the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent.
+//
+// **Deliberately not `1 - min(1, (1 - cb) / cs)`** -- that is `ColorBurn`,
+// the other guarded-division mode (`fs_composite_color_burn` directly
+// above, on the GPU since 0.107.0), whose branch conditions are `cb == 1`
+// and `cs == 0` rather than this one's `cb == 0` and `cs == 1`. The two
+// are structural mirror images and their *dispatch arms in `aurora-app`
+// are adjacent*, which is where that hazard actually lives; this entry
+// point's body was therefore derived from `blend_channel`'s own Rust arm
+// rather than copied from its sibling and edited. And not
+// `min(cb + cs, 1)`, which is `LinearDodge` -- the other dodge-family
+// mode, likewise on the GPU. That one is worth a second sentence, because
+// the two are *not* merely similar names: `min(1, cb / (1 - cs))` clamps
+// exactly when `cb + cs >= 1`, which is exactly when `min(cb + cs, 1)`
+// clamps, so **a clamped channel can never tell the two apart**. Any
+// fixture meant to discriminate them needs an unclamped channel.
+//
+// **Asymmetry**: `B(Cb, Cs) != B(Cs, Cb)`, so -- as with `ColorBurn`, and
+// unlike the seven commutative modes before it -- a transposed
+// src/backdrop binding is caught by the blend term itself, not only by the
+// asymmetric "over" around it.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the eight entry points
+// above; no new binding, no new layout.
+@fragment
+fn fs_composite_color_dodge(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = vec3<f32>(
+        color_dodge_channel(cb.r, s.r),
+        color_dodge_channel(cb.g, s.g),
+        color_dodge_channel(cb.b, s.b),
     );
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
