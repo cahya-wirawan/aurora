@@ -1593,6 +1593,65 @@ fn fs_composite_vivid_light(in: VsOut) -> @location(0) vec4<f32> {
 // this suite uses. `<` is the shipped direction because it mirrors
 // `blend_channel`'s own arm; `<=` would give `0.0` where `1.0` is correct.
 //
+// **REQUIRED DISCLOSURE (0.115.1): "exact in IEEE-754" is a fact about
+// IEEE-754, and WGSL does not promise IEEE-754 division.** WGSL specifies `+`,
+// `-` and `*` on `f32` as correctly rounded, but `/` only to within **2.5 ULP**
+// for divisors in `[2^-126, 2^126]`. The quotient above is therefore the one
+// operation in the whole boundary computation that a conforming backend may
+// return inexactly: `2*Cs`, `2*Cs - 1`, `1 - Cb` and the final `1 - x` are all
+// exact here, and `min` is a selection. So a backend is free to hand back
+// `0.5 * (1 +- eps)` with `eps` up to `2.5 * 2^-24 ~= 1.5e-7` where this
+// adapter (and the Rust `blend_channel` arm, which is correctly rounded)
+// return exactly `0.5` -- and because the two arms of this function are the
+// *constants* `0.0` and `1.0`, that sub-ULP difference does not perturb a
+// channel, it **flips** it.
+//
+// **This is the first ported mode for which that matters, and the reason is
+// structural.** Every mode before this one is continuous in its quotient, so a
+// `<= 2.5`-ULP `f32` perturbation is absorbed by the `Rgba16Float` tile store
+// on the way out -- an `f16` ULP near `0.5` is `2^-11 ~= 4.9e-4`, some 3,000x
+// coarser than `1.5e-7` -- unless the exact result happens to sit within that
+// `1.5e-7` of an `f16` rounding midpoint. This mode is the first whose *branch
+// predicate reads a division result* rather than an input operand, so there is
+// no continuity left to absorb anything.
+//
+// Two consequences, and they are different in kind:
+//
+//   - **The boundary test's kill-evidence is this adapter's, not every
+//     backend's.** `composite_hard_mix_over_with_opacity_flips_at_its_own_
+//     threshold` reads `(1, 1, 0)` here and `(0, 0, 0)` under the `<=` mutant.
+//     Both of its probes route through *literally the same quotient*,
+//     `0.25 / 0.5`, so any given backend rounds it identically for both -- and
+//     they react to the two error directions **oppositely**: red is
+//     `1 - q`, so it flips only if `q` errs high; green is `q` itself, so it
+//     flips only if `q` errs low. A signed divide error therefore flips
+//     exactly one of the two, never both and never neither. That is the good
+//     case: such a backend reads `(0, 1, 0)` or `(1, 0, 0)`, which is
+//     distinguishable from the mutant's `(0, 0, 0)`, so the test fails loudly
+//     rather than passing a mutant or silently agreeing with one. What cannot
+//     be claimed is that the mutation is *killed* on Metal or DX12 -- only
+//     that a divide-rounding difference there surfaces as its own, differently
+//     shaped failure. Blue is not exposed at all: its `VividLight` is `0.375`,
+//     `0.125` from the threshold and around a million ULP clear of it.
+//   - **A real GPU-vs-CPU divergence for near-boundary content, disclosed and
+//     not closed.** Any channel a tile can actually hold with
+//     `Cb + Cs` exactly `1` reaches this quotient in the shipped app. On a
+//     divide-erring backend the GPU path would return `0.0` where
+//     `composite_tile_cpu`'s fallback returns `1.0` for the same document -- a
+//     full-range disagreement in that channel, depending only on which path
+//     ran. No test on this adapter can exercise it, exactly as with the two
+//     division-by-zero portability guards this mode inherits; it is recorded
+//     here for the backend that eventually runs it.
+//
+// None of this touches the closed form itself, which is *stronger* than a
+// sample: the algebra above is a derivation, its four guard points are
+// enumerated exhaustively, and the result was re-checked pairwise over the
+// entire `f16` domain in `[0, 1]` -- all 15,361 distinct values, i.e. every
+// operand pair a tile can hold, not the `1/256` grid -- finding exactly the
+// one exception `(0, 1)` and exactly the two asymmetric pairs `(0, 1)` and
+// `(1, 0)` claimed above. The grid sweep was a sample; that one is a proof
+// over the domain that matters, and the risk here is confined to the divide.
+//
 // **A total launderer of `straight_backdrop`'s `NaN`, and the argument is
 // stronger than any prior mode's** -- so this is **not** a sixth detector of
 // that guard's removal, and the detector count stays at five (`Multiply`,

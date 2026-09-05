@@ -3795,6 +3795,28 @@ impl TileCompositor {
     /// `composite_hard_mix_over_with_opacity_flips_at_its_own_threshold`
     /// carries one of each branch.
     ///
+    /// **REQUIRED DISCLOSURE (0.115.1): "exact in binary" holds under IEEE-754
+    /// division, which WGSL does not promise** — it allows `f32` `/` **2.5 ULP**
+    /// of error while requiring `+`, `-` and `*` to be correctly rounded, and
+    /// the quotient is the only inexact-capable step in that computation. Since
+    /// the two arms of the threshold are the constants `0.0` and `1.0`, a
+    /// sub-ULP divide difference flips a whole channel rather than nudging it,
+    /// and **this is the first mode ported for which that is possible**: every
+    /// earlier one is continuous in its quotient, so its worst-case divide
+    /// error is absorbed by the `Rgba16Float` tile store, whose ULP near `0.5`
+    /// is some 3,000× coarser. Two consequences, both disclosed rather than
+    /// closed, because no test on this adapter can reach either: the boundary
+    /// test's kill is Vulkan/NVIDIA evidence and does not generalize to
+    /// Metal/DX12 as a *kill* (it would fail there in its own distinguishable
+    /// shape — see that test's own comment for the derivation), and in the
+    /// shipped app a channel with `Cb + Cs` exactly `1` could compose to `0.0`
+    /// on such a backend's GPU path where `composite_tile_cpu`'s fallback gives
+    /// `1.0`. The closed form itself is *not* in question and is stronger than
+    /// the grid sweep it was first checked on: it was re-verified pairwise over
+    /// all 15,361 `f16` values in `[0, 1]` — every operand pair a tile can hold
+    /// — finding exactly the one `(0, 1)` exception and exactly two asymmetric
+    /// pairs.
+    ///
     /// **Not a sixth detector of `straight_backdrop`'s guard removal, and the
     /// argument is stronger than any prior mode's**: it is a *total* launderer
     /// twice over — the inherited `min()` in both of `VividLight`'s arms
@@ -15540,14 +15562,22 @@ mod tests {
     // backdrop, so a fixture that only ever took one arm could not
     // distinguish `Overlay` from a plain `Multiply`/`Screen` with the wrong
     // operand scale. Every solid-colour fixture below therefore takes
-    // **both** arms across its three channels. `SoftLight`, `VividLight`,
-    // `PinLight` and `HardMix` are the rest of the overlay-and-light family
-    // and all remain CPU-only, so none of them is reachable by a wrong
-    // `fragment_entry`. **`LinearLight` was on that list until 0.113.0 ported
-    // it**, and it is now live -- but it is not a plausible confusion with
-    // this mode: it is a single clamped sum with no branch at all, so no
-    // `fragment_entry` slip between the two is a near-miss in either
-    // direction. Its own near-misses are `LinearDodge` and `LinearBurn`.
+    // **both** arms across its three channels. `SoftLight` and `PinLight` are
+    // the rest of the overlay-and-light family still CPU-only. **`LinearLight`
+    // was on that list until 0.113.0 ported it, `VividLight` until 0.114.0 and
+    // `HardMix` until 0.115.0** (this sentence claimed all four were still
+    // CPU-only through 0.115.0; corrected in 0.115.1). None of the three is a
+    // plausible confusion with this mode -- `LinearLight` is a single clamped
+    // sum with no branch at all, and `VividLight`/`HardMix` branch on the
+    // *source* against a `0.5` threshold on a scaled operand, not on the
+    // backdrop against a bare one -- but "not plausible" is now the whole
+    // claim, since "not reachable" no longer holds for them. The argument
+    // that does not depend on which modes are ported is
+    // `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`,
+    // which compares the shader's `@fragment` name set against
+    // `ALL_BLEND_PASSES`'s `fragment_entry` set; see the `LinearLight` suite
+    // header below for the full account and the measurement behind it. This
+    // mode's own near-misses stay `Multiply` and `Screen`, above.
     //
     // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
     // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
@@ -16727,15 +16757,24 @@ mod tests {
     // ever took one arm could not distinguish `HardLight` from a plain
     // `Multiply`/`Screen` with the wrong operand scale. Every solid-colour
     // fixture below therefore takes **both** arms across its three channels.
-    // `SoftLight`, `VividLight`, `PinLight` and `HardMix` are
-    // the rest of the overlay-and-light family and all remain CPU-only, so
-    // none is reachable by a wrong `fragment_entry`. **`LinearLight` was on
-    // that list until 0.113.0 ported it** and is now live below; it is not a
-    // near-miss for this mode either way, being one unconditional clamped sum
-    // with no branch to get the operand of wrong. Note in particular that
-    // none of `VividLight`, `PinLight` or `HardMix` delegates to `HardLight`
-    // in `blend_channel` (they go to `ColorBurn`/`ColorDodge`,
-    // `Darken`/`Lighten`, and `VividLight` respectively) -- the only CPU arm
+    // `SoftLight` and `PinLight` are
+    // the rest of the overlay-and-light family still CPU-only. **`LinearLight`
+    // was on that list until 0.113.0 ported it, `VividLight` until 0.114.0 and
+    // `HardMix` until 0.115.0** (this sentence claimed all four were still
+    // CPU-only through 0.115.0; corrected in 0.115.1), so "no wrong
+    // `fragment_entry` reaches them" is no longer the argument for those
+    // three -- `all_blend_passes_matches_the_shaders_own_blend_math_entry_
+    // points`, which compares the shader's `@fragment` name set against
+    // `ALL_BLEND_PASSES`'s `fragment_entry` set, is; the `LinearLight` suite
+    // header below carries the full account. None of the three is a plausible
+    // *confusion* with this mode: `LinearLight` is one unconditional clamped
+    // sum with no branch to get the operand of wrong, and `VividLight` and
+    // `HardMix` branch on their scaled source rather than on a bare operand.
+    // Note in particular that of the family's remaining CPU-only pair neither
+    // delegates to `HardLight` in `blend_channel` -- `PinLight` goes to
+    // `Darken`/`Lighten` and `SoftLight` computes its own `soft_light_d` --
+    // and neither does the now-live `VividLight` (`ColorBurn`/`ColorDodge`) or
+    // `HardMix` (`VividLight`); the only CPU arm
     // that delegates here is `Overlay`'s, and this round left it untouched.
     //
     // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
@@ -17916,14 +17955,46 @@ mod tests {
     // the arithmetic near-misses above, both live. `Overlay` and `HardLight`
     // are the overlay-and-light family's other live members and are *not*
     // near-misses in either direction: they branch, this mode does not, and no
-    // `fragment_entry` slip between them is a plausible typo. `SoftLight`,
-    // `VividLight`, `PinLight` and `HardMix` remain CPU-only, so no wrong
-    // `fragment_entry` reaches them. Note also that **no CPU-only mode
-    // delegates to `LinearLight`** in `blend_channel` -- `VividLight` goes to
-    // `ColorBurn`/`ColorDodge`, `PinLight` to `Darken`/`Lighten`, `HardMix` to
-    // `VividLight` -- so this round changed no other mode's arm, and left
+    // `fragment_entry` slip between them is a plausible typo.
+    //
+    // **Correction (0.115.1), and it retires this paragraph's own safety
+    // argument rather than relabelling it.** As written in 0.113.0 the next
+    // sentence read "`SoftLight`, `VividLight`, `PinLight` and `HardMix`
+    // remain CPU-only, so no wrong `fragment_entry` reaches them" -- an
+    // argument from *non-existence*, and non-existence is exactly what
+    // 0.114.0 and 0.115.0 removed. `fs_composite_vivid_light` and
+    // `fs_composite_hard_mix` are both live entry points in
+    // `shaders/composite.wgsl` now, so `BLEND_PASS_LINEAR_LIGHT`'s
+    // `fragment_entry` naming either one is a *reachable* mutation that
+    // silently composites a different mode. `fs_composite_vivid_light` is the
+    // plausible one: `linear_light` and `vivid_light` differ in one word, sit
+    // one entry point apart in the shader file, and both belong to the
+    // overlay-and-light family, so the slip is lexical rather than a reasoning
+    // error -- the same shape as the `hard_mix`/`hard_light` warning
+    // `LABEL_HARD_MIX` carries.
+    //
+    // What replaces the retired argument is a real test rather than a fact
+    // about which modes are ported: `all_blend_passes_matches_the_shaders_own_
+    // blend_math_entry_points` compares the *set* of `@fragment` names parsed
+    // out of the shader against the set of `ALL_BLEND_PASSES`
+    // `fragment_entry` values, so any such slip leaves one name duplicated and
+    // another absent and fails there -- independently of which fixtures happen
+    // to discriminate the two formulas. That is measured, not assumed:
+    // PLAN.md's 0.115.0 matrix rows (g) and (h) each pointed one
+    // `fragment_entry` at another live entry point and that test was among the
+    // failures both times. It is also why the argument now holds for
+    // `SoftLight` and `PinLight` too *without* depending on their staying
+    // CPU-only.
+    //
+    // Note also that **no CPU-only mode
+    // delegates to `LinearLight`** in `blend_channel` -- `PinLight` goes to
+    // `Darken`/`Lighten`, and `SoftLight` computes its own `soft_light_d` --
+    // so this round changed no other mode's arm, and left
     // `blend_channel`'s own `LinearLight` arm and its two existing CPU tests
-    // untouched.
+    // untouched. (`VividLight` -> `ColorBurn`/`ColorDodge` and `HardMix` ->
+    // `VividLight` were listed here as CPU-only delegations through 0.115.0;
+    // both are now GPU arms in their own right, and neither reaches this
+    // mode's.)
     //
     // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
     // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
@@ -20070,7 +20141,20 @@ mod tests {
     // input with `VividLight(Cb, Cs)` exactly `0.5` flips the channel outright;
     // and `Cb + Cs == 1` with binary-exact operands gives exactly that, the
     // burn arm computing `1 - Cs/(2*Cs)` and the dodge arm `Cb/(2*Cb)`, both
-    // exact in IEEE-754. Test 7 carries one of each branch.
+    // exact in IEEE-754. Test 7 carries one of each branch. **IEEE-754 is the
+    // load-bearing word and WGSL is looser** -- it allows `f32` `/` 2.5 ULP of
+    // error, and a step function turns a sub-ULP divide difference into a
+    // full-channel flip, so this mode is the first whose boundary kill is
+    // adapter-specific rather than arithmetic. Disclosed in full in test 7's
+    // own header and in `hard_mix_channel`'s comment; the closed form is
+    // unaffected and was re-verified pairwise over the whole `f16` domain
+    // (0.115.1).
+    //
+    // **The closed form's own evidence was upgraded in 0.115.1** from the
+    // `1/256` grid above to an exhaustive pairwise sweep of all 15,361 `f16`
+    // values in `[0, 1]` -- every operand pair a tile can actually hold --
+    // returning the same one exception `(0, 1)` and the same two asymmetric
+    // pairs. The grid was a sample; that is a proof over the storage domain.
     //
     // **Not a sixth detector of `straight_backdrop`'s guard removal** -- and
     // the argument is stronger than any prior non-detector's, because it does
@@ -20220,7 +20304,17 @@ mod tests {
             (0.0, 0.65625, 0.375, 1.0),
             "setup: the first pass must really have produced the accumulator the second pass then \
              samples -- red's 0.0 is deliberate and is this fixture's corner channel (degeneracy \
-             1 for the formula, and the only channel shape that can see the operands transposed)"
+             1 for the formula, and the only channel shape that can see the operands transposed). \
+             It must be EXACTLY 0.0, and the consequence of its not being is silent rather than \
+             loud: at even one f16 step above zero (2^-24) color_dodge_channel's `cb == 0.0` guard \
+             stops firing, its `cs == 1.0` guard fires in its place and returns 1.0 instead of \
+             0.0, so this channel rejoins the symmetric Cb + Cs >= 1 sum rule and BOTH operand \
+             orders give B = 1. This fixture and the guard-ordering-corner one are the only two in \
+             the suite that kill an in-shader operand transpose or a componentwise \
+             select(0.0, 1.0, cb + s >= 1.0) rewrite (measured: PLAN.md's 0.115.0 rows (e) and \
+             (f), where the other six fixtures all stayed green), so if red drifts here BOTH \
+             mutations become undetectable by the whole suite while every test still passes. This \
+             assertion is what turns that into a failure."
         );
 
         let bottom_texels = solid_texels(bottom_rgba);
@@ -20932,7 +21026,38 @@ mod tests {
     /// reads `(0.0, 0.0, 0.0, 1.0)`** — red and green both flip by the full
     /// range, and the exactness above is what makes that a real kill rather
     /// than a tolerance question. `0.25/0.5` and `1 - 0.5` are both exact for
-    /// these operands, so nothing here depends on rounding.
+    /// these operands, so nothing here depends on rounding **under IEEE-754**.
+    ///
+    /// **REQUIRED DISCLOSURE (0.115.1): that last clause is doing more work
+    /// than it looks, and it is this test's one cross-backend limitation.**
+    /// WGSL specifies `f32` `/` only to within **2.5 ULP**, not as correctly
+    /// rounded (`+`, `-` and `*` *are* correctly rounded, and every other step
+    /// here — `2*Cs`, `2*Cs - 1`, `1 - Cb`, the final `1 - x` — is exact), so
+    /// the shared quotient `0.25 / 0.5` may legally come back as
+    /// `0.5 * (1 ± ~1.5e-7)` on a backend this repo has never run. Because
+    /// `hard_mix_channel`'s two arms are the *constants* `0.0` and `1.0`, that
+    /// does not perturb a channel, it flips it — and this is the first ported
+    /// mode where that is possible, every earlier mode being continuous in its
+    /// quotient and so having its worst-case divide error absorbed by the
+    /// `Rgba16Float` tile store (an `f16` ULP near `0.5` is `2^-11 ≈ 4.9e-4`,
+    /// ~3,000× the `f32` slack).
+    ///
+    /// What follows for *this* test, derived rather than hedged: red and green
+    /// route through **the same quotient**, so any one backend rounds it
+    /// identically for both, and they respond to the two error directions
+    /// **oppositely** — red is `1 - q` and flips only if `q` errs high, green is
+    /// `q` and flips only if `q` errs low. So a divide-erring backend reads
+    /// `(0, 1, 0)` or `(1, 0, 0)`, never `(0, 0, 0)`: this test fails there
+    /// *distinguishably from the `<=` mutant* rather than passing it or being
+    /// fooled by it. That is the honest ceiling on the kill — the `<=`
+    /// mutation is measured dead on Vulkan/NVIDIA and would surface as its own
+    /// differently-shaped failure on Metal/DX12, which is not the same as
+    /// "killed there". Blue is not exposed: its `VividLight` is `0.375`, a full
+    /// `0.125` from the threshold. The separate, untestable-here consequence
+    /// for real content — a GPU-vs-CPU-fallback divergence for any channel with
+    /// `Cb + Cs` exactly `1` — is disclosed in `hard_mix_channel`'s own comment
+    /// in `shaders/composite.wgsl`, next to the two division-by-zero
+    /// portability guards this mode inherits for the same class of reason.
     ///
     /// Two boundary probes rather than one, because they reach the `0.5`
     /// through *different* arms of `vivid_light_channel` — a mutation confined
@@ -21159,7 +21284,14 @@ mod tests {
             accumulator,
             (0.0, 1.0, 0.375, 1.0),
             "setup: red's backdrop must be exactly 0.0 and green's exactly 1.0, or neither corner \
-             is reached and this test degenerates into a duplicate of test 1"
+             is reached and this test degenerates into a duplicate of test 1. The failure mode \
+             this pins is silent, not loud: one f16 step off (2^-24 for red, 1 - 2^-11 for green) \
+             and color_dodge_channel's `cb == 0.0` / color_burn_channel's `cb == 1.0` guards stop \
+             firing, the channel rejoins the symmetric Cb + Cs >= 1 sum rule, and both operand \
+             orders agree -- so the in-shader operand transpose and the componentwise \
+             select(0.0, 1.0, cb + s >= 1.0) rewrite that ONLY this test and test 1 can kill \
+             (measured: PLAN.md's 0.115.0 rows (e) and (f)) would both go undetected by the entire \
+             suite with every test still green"
         );
 
         let bottom_texels = solid_texels(bottom_rgba);

@@ -26333,6 +26333,124 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.115.1) — one real coverage regression and six
+disclosure defects from the `HardMix` round, all found by independent review.**
+No WGSL formula, dispatch arm, predicate, golden or assertion *value* changed;
+the one behavioural change is two enum variants added to an existing test's mode
+loop. Both reviewers re-ran every headline mutation claim of 0.115.0
+(transpose, dispatch-arm transpose, NaN-laundering, corner-necessity, closed-form
+derivation) and all of them held.
+
+**The regression, and it is the same class 0.104.0 already demonstrated once.**
+`recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_
+expressible_mode` iterates a hand-maintained mode array whose own header says
+"**All fourteen modes `document_qualifies_for_gpu_compositing` admits, and this
+list has to keep pace with it**". The array had fourteen entries against a
+**sixteen**-mode predicate: `VividLight` and `HardMix` were both missing. The two
+omissions have different provenance and both are now stated in the comment rather
+than blurred together — **`VividLight`'s predates this fix by a full round**
+(0.114.0 took the predicate to fifteen and touched neither the array nor the
+count word; 0.114.1, whose whole subject was eight stale counts in this crate,
+did not find it), while **`HardMix`'s was introduced by 0.115.0 itself**, whose
+count-sweep re-verified `ALL_BLEND_PASSES`, `GpuBlendDispatch::ALL`,
+`GpuBlendDispatches` and the predicate's own header sentence and never reached
+this array. So the header above it was read past three times, which makes this a
+*recurring* failure of the convention rather than a one-off. As in 0.104.0,
+adding both modes surfaced no failure — the never-painted-layer property genuinely
+holds for both — so the cost was two rounds of false coverage, not a bug in the
+shipped path.
+
+**The closed form's evidence was upgraded, not weakened.** 0.115.0 verified
+`HardMix(Cb, Cs) = 1[Cb + Cs >= 1]` except at `(0, 1)` on the `1/256` grid plus an
+edge refinement. Re-run pairwise over the **entire `f16` domain in `[0, 1]` — all
+15,361 distinct values, every operand pair a tile can actually hold** — it returns
+exactly the same one exception `(0, 1)` and exactly the same two asymmetric pairs
+`(0, 1)`/`(1, 0)`. The grid was a sample; that is a proof over the storage domain,
+and the comments now say so.
+
+**The one genuinely new risk, disclosed and not closed: WGSL permits `f32`
+division 2.5 ULP of error, and `HardMix` is the first ported mode whose branch
+predicate reads a division result.** `+`, `-` and `*` are correctly rounded in
+WGSL and every other step in the boundary computation is exact, so the shared
+quotient `0.25 / 0.5` is the only loose operation — and since
+`hard_mix_channel`'s two arms are the *constants* `0.0` and `1.0`, a sub-ULP
+difference does not perturb a channel, it **flips** it. Every earlier mode is
+continuous in its quotient, so its worst-case `~1.5e-7` divide error is absorbed
+by the `Rgba16Float` tile store (an `f16` ULP near `0.5` is `2^-11 ≈ 4.9e-4`,
+~3,000× coarser). Two consequences, derived rather than hedged:
+
+- **the boundary test's kill is this adapter's, not every backend's.** Red and
+  green route through *literally the same quotient*, so any one backend rounds it
+  identically for both, and they respond to the two error directions
+  **oppositely** — red is `1 - q` and flips only if `q` errs high, green is `q` and
+  flips only if `q` errs low. A divide-erring backend therefore reads `(0, 1, 0)`
+  or `(1, 0, 0)`, **never** the `<=` mutant's `(0, 0, 0)`: the test fails there
+  distinguishably rather than passing a mutant. So `<=`-vs-`<` is measured dead on
+  Vulkan/NVIDIA and is *not* claimed killed on Metal/DX12. Blue is unexposed, its
+  `VividLight` being `0.375`;
+- **a real GPU-vs-CPU divergence for near-boundary content.** Any channel a tile
+  can hold with `Cb + Cs` exactly `1` reaches that quotient in the shipped app; on
+  such a backend the GPU path would give `0.0` where `composite_tile_cpu`'s
+  fallback gives `1.0` — a full-range disagreement in that channel depending only
+  on which path ran. Untestable on this adapter, exactly like the two
+  division-by-zero portability guards this mode inherits.
+
+**Also corrected.** (1) The transpose guard's roster counts: `TRANSPOSE_COVERAGE`
+has **fifteen** rows and three sites still said fourteen; `HardMix`'s own measured
+gap (a full **`1.0`** in red, `(0.0, 0.828125, 0.1875)` against
+`(1.0, 0.78125, 0.21875)` transposed) is added to the provenance sentence, and it
+**displaces `ColorDodge`'s `0.61865` as the roster's largest** — which 0.115.0 also
+left stale. (2) The `six of the fourteen` denominator in two dispatch-arm comments,
+now `six of the fifteen non-`Normal` admitted modes` and disambiguated at all three
+sites. (3) A classification conflict 0.115.0 left adjacent and unreconciled: the
+guard's doc excludes `HardMix` from the "non-unit opacity sufficient-but-not-
+necessary" set while the fixture doc says red "sees it either way". **Both are
+right, because the list classifies *modes* and the measurement is about one
+*channel*** — the six listed modes are asymmetric on a set of *positive measure*,
+so any generic fixture catches them at `a = 1`; `HardMix`'s asymmetric set is two
+points, so only a fixture deliberately placed on the corner does. Classify
+per-channel where the prose reads per-mode: red is the exception, green and blue
+are the rule, and the guard's `0.5` is what covers those two. (4) Three
+`fragment_entry` **safety arguments** in `aurora-render` argued from
+non-existence — "`SoftLight`, `VividLight`, `PinLight` and `HardMix` remain
+CPU-only, so no wrong `fragment_entry` reaches them" — and non-existence is
+exactly what 0.114.0 and 0.115.0 removed. `fs_composite_vivid_light` and
+`fs_composite_hard_mix` are live entry points, and `vivid_light`/`linear_light`
+is a one-word lexical near-miss. What replaces the retired argument is a real
+test rather than a fact about which modes are ported:
+`all_blend_passes_matches_the_shaders_own_blend_math_entry_points` compares the
+shader's `@fragment` name set against `ALL_BLEND_PASSES`'s `fragment_entry` set,
+so any such slip leaves one name duplicated and another absent — measured, being
+among the failures of 0.115.0's rows (g) and (h). (5) Two `aurora-app` predicate
+test-doc bullet lists are now marked historical in place (`as of 0.113.0` /
+`0.114.0`) rather than rewritten, so the record of what each round could claim
+survives.
+
+**Two limitations the round's own measurements exposed, now stated in-code.**
+(a) `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_
+argument`'s "what it does not do" list gained the bullet its own name most needs:
+**it cannot detect a real transposed dispatch arm**, because it never calls
+`begin_gpu_composite_tile` — 0.115.0's mutation (i) transposed that arm for real
+and the *only* failure was the app-level differential, this guard staying green
+while having predicted the very mutation it could not see. (b) `HardMix`'s corner
+probe is the roster's largest gap *and* its most fragile, which is not a
+contradiction: one `f16` step above zero (`2^-24`) makes `color_dodge_channel`'s
+`cs == 1.0` guard fire where `cb == 0.0` would have, both operand orders return
+`1`, and the `1.0` gap collapses to green's `0.046875`. **Nothing goes red when
+that happens** — the goldens would be re-derived around the drifted value and keep
+passing — and mutations (e) and (f), which only the two corner-carrying fixtures
+kill, would become undetectable by the whole suite. Both fixtures' accumulator
+setup assertions now name that consequence explicitly.
+
+**Tests: unchanged at 222 / 413, workspace 1766** — deliberately, and worth stating
+because it reads like a regression fix that added no test. `rustc` counts `#[test]`
+functions, and the fix adds two *iterations* to an existing loop (six more
+assertions, three per mode), not a new function. Gate green on real hardware:
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`, `AURORA_REQUIRE_GPU=1`, plus
+`fmt --check`, both layering/style scripts, `check --workspace --locked`,
+`clippy --all-targets --all-features -D warnings`, 19 doctest targets and
+`doc --document-private-items --keep-going` clean.
+
 **Addendum 2026-09-05 (0.115.0) — `HardMix` ported to the GPU compositing
 path.** The **fourteenth** real blend-math mode, and the first whose blend term
 is one *whole other ported mode's* per-channel helper plus a comparison:

@@ -7110,8 +7110,12 @@ fn composite_roots_into_tile(
 ///   **all three** channels, and 0.110.0 confirmed by real measurement that
 ///   a transposed binding is observable there at effective alpha `1.0` as
 ///   well as at `0.5`. Non-unit fixture opacity is therefore
-///   sufficient-but-not-necessary for six of the fifteen modes as of
-///   0.115.0 (the sixth being `VividLight`, whose asymmetry is
+///   sufficient-but-not-necessary for six of the fifteen non-`Normal`
+///   admitted modes as of
+///   0.115.0, that round's own `HardMix` having moved the denominator from
+///   fourteen to fifteen without joining the six — its blend term is
+///   symmetric away from one corner point, so it is the rule the six are
+///   exceptions to (the sixth being `VividLight`, whose asymmetry is
 ///   unconditional *and* structural — it branches on the source, so a
 ///   transposed pair branches on the backdrop — and whose own fixture
 ///   catches a transpose at `1.0` in all three channels, measured; note
@@ -9809,10 +9813,13 @@ fn begin_gpu_composite_tile(
             // carries `0.5` on its `ColorDodge` layer, because
             // `TRANSPOSE_COVERAGE`'s guard is deliberately not
             // special-cased for either asymmetric mode: non-unit opacity
-            // is now sufficient-but-not-necessary for six of the fourteen
+            // is now sufficient-but-not-necessary for six of the fifteen
+            // non-`Normal` admitted modes
             // (`Overlay`, 0.110.0, and `HardLight`, 0.111.0, joined them
             // conditionally; `LinearLight`, 0.113.0, and `VividLight`,
-            // 0.114.0, unconditionally),
+            // 0.114.0, unconditionally; `HardMix`, 0.115.0, moved the
+            // denominator to fifteen without joining the six -- its blend
+            // term is symmetric away from one corner point),
             // and a conservative guard that still demands it costs
             // nothing.
             aurora_render::BlendMode::ColorDodge => {
@@ -9878,7 +9885,8 @@ fn begin_gpu_composite_tile(
             // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
             // guard is deliberately not special-cased for any of the six
             // asymmetric modes: non-unit opacity is now
-            // sufficient-but-not-necessary for six of the fourteen, and a
+            // sufficient-but-not-necessary for six of the fifteen
+            // non-`Normal` admitted modes, and a
             // conservative guard that still demands it costs nothing.
             aurora_render::BlendMode::Overlay => {
                 let spare_accumulator = accumulator_or_create(
@@ -29126,10 +29134,22 @@ mod tests {
     /// rather than by omission, and say so.
     ///
     /// Deliberately `LinearLight`, and deliberately none of its neighbours,
-    /// each of which must still stay disqualified:
+    /// each of which must still stay disqualified. **The bullet list below is
+    /// historical as of 0.113.0 and is deliberately left in the present tense
+    /// it was written in, with this sentence as the correction** (0.115.1):
+    /// `VividLight` was admitted in 0.114.0 and `HardMix` in 0.115.0, so two of
+    /// the modes it calls disqualified now qualify. Rewriting the bullets would
+    /// destroy the record of what this round could actually claim; the modes
+    /// this test *asserts* anything about are only the ones its own body names,
+    /// and its body names `LinearLight` alone. `PinLight` and `SoftLight` are
+    /// the only two of the family still CPU-only, and
+    /// `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_
+    /// dispatch_counter` is what actually pins the whole admitted set at any
+    /// given commit — read that, not this list, for the current one.
     ///
     /// - `VividLight` and `PinLight`, the two remaining branch-on-the-source
-    ///   overlay-family modes. `PinLight` is the one to watch: like this mode
+    ///   overlay-family modes (`VividLight` **as of 0.113.0 only**). `PinLight`
+    ///   is the one to watch: like this mode
     ///   its branch form delegates to a pair of *admitted* modes
     ///   (`Darken`/`Lighten`, where this mode's form uses
     ///   `LinearBurn`/`LinearDodge`), so "both halves reach admitted arms" is
@@ -29138,7 +29158,8 @@ mod tests {
     ///   mode its branch form does *not* collapse to a single expression —
     ///   `min`/`max` do not telescope the way the two clamps do;
     /// - `SoftLight` and `HardMix`, the rest of that family, both still
-    ///   CPU-only;
+    ///   CPU-only **as of 0.113.0** — `HardMix` was ported in 0.115.0 and only
+    ///   `SoftLight` is still CPU-only of the two;
     /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, which are near-misses for
     ///   other modes rather than this one;
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
@@ -29217,7 +29238,11 @@ mod tests {
     ///   *ported* mode's arm. That is a reason to check `HardMix`'s existing CPU
     ///   tests still pass unchanged (they do — this round changed no
     ///   `blend_channel` arm), not a reason to admit it: it has no entry point
-    ///   either;
+    ///   either. **All of which was true only of 0.114.0** (marked in 0.115.1):
+    ///   0.115.0 gave `HardMix` its own `fs_composite_hard_mix` and admitted it,
+    ///   which is what that bullet demanded of any admission and is recorded in
+    ///   `document_qualifies_for_gpu_compositing_admits_a_hard_mix_blend_mode`
+    ///   below. `SoftLight` alone is still CPU-only of the two;
     /// - `Subtract` and `Divide`, near-misses for other modes rather than this
     ///   one;
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
@@ -31090,6 +31115,19 @@ mod tests {
     /// round measured go undetected without it, including the sum-threshold
     /// rewrite and a shader-internal argument transpose.
     ///
+    /// **And "exactly" means exactly, with a silent failure mode on the other
+    /// side of it** (0.115.1). One `f16` step above zero — `2^-24`, the smallest
+    /// positive subnormal — is enough: `color_dodge_channel` tests `cb == 0.0`
+    /// *before* `cs == 1.0`, so a non-zero red backdrop skips the first guard,
+    /// fires the second, and returns `1.0` where the corner returns `0.0`. The
+    /// channel then obeys the symmetric `Cb + Cs >= 1` rule like any other, both
+    /// operand orders agree, and this row's `1.0` transpose gap collapses to the
+    /// `0.046875` green contributes on its own. Nothing goes red when that
+    /// happens — the goldens would simply be re-derived around the drifted value
+    /// and keep passing — which is why `aurora-render`'s two corner-carrying
+    /// fixtures each assert their accumulator's red exactly, with that
+    /// consequence spelled out in the failure message.
+    ///
     /// After `l1` (`Normal`, `1.0`, `(0.0, 0.875, 0.5)`) and `l2` (`Multiply`,
     /// `1.0`, `(0.75, 0.75, 0.75)`) the accumulator is
     /// `Cb = (0.0, 0.65625, 0.375)` at alpha `1.0`. Against
@@ -31319,7 +31357,7 @@ mod tests {
     /// texel is the whole tile.
     ///
     /// This model's faithfulness depends on every roster row's mode-bearing
-    /// layer having texel alpha `1.0` (true of all fourteen today): swapping
+    /// layer having texel alpha `1.0` (true of all fifteen today): swapping
     /// which side is straight vs. premultiplied only reproduces the real
     /// dispatch arm term for term when there is no partial coverage to
     /// un-premultiply differently on each side. A future roster row with a
@@ -31414,6 +31452,29 @@ mod tests {
     /// symmetric except at one corner point, so it is the rule rather than an
     /// exception to it, and its fixture needs the non-unit opacity this guard
     /// demands in two of its three channels.**
+    ///
+    /// **`HardMix`'s exclusion from that list and its own fixture catching a
+    /// transpose at alpha `1.0` are both true, because the list classifies
+    /// *modes* and that measurement is about one *channel*** (spelled out here
+    /// because the two statements read as contradictory and were left adjacent
+    /// and unreconciled by 0.115.0). The six listed modes are asymmetric on a
+    /// set of *positive measure* — an open region of the unit square for
+    /// `ColorBurn`/`ColorDodge`/`LinearLight`/`VividLight`, the straddling half
+    /// for `Overlay`/`HardLight` — so *any* generically chosen fixture catches
+    /// their transpose at `a = 1` through the blend term, and non-unit opacity
+    /// is genuinely unnecessary for the mode. `HardMix`'s asymmetric set is
+    /// `{(0, 1), (1, 0)}`: two points, measure zero, so a generically chosen
+    /// fixture catches nothing at `a = 1` and the mode-level claim "non-unit
+    /// opacity is necessary" is right. What is *also* right is that
+    /// [`NORMAL_MULTIPLY_HARD_MIX_STACK`] is not generically chosen — its red
+    /// channel is placed on that corner deliberately — so **that fixture** does
+    /// see a transpose at `a = 1`, in red only. Read the classification
+    /// per-channel where the prose above reads per-mode: red is an exception,
+    /// green and blue are the rule, and the guard's `0.5` is what covers the
+    /// latter two. Promoting the mode onto the list on red's evidence would be
+    /// the error, and not only pedantically: red's detection is destroyed by a
+    /// single `f16` step away from `0.0` (the "largest gap and most fragile"
+    /// paragraph below works that through), while the six listed modes' is not.
     /// `1 - min(1, (1 - Cb) / Cs)` and
     /// `min(1, Cb / (1 - Cs))` are each *not* symmetric in their two
     /// operands, so each mode's own blend term
@@ -31540,23 +31601,43 @@ mod tests {
     /// PLAN.md's entry for that round): it reports a largest channel gap of
     /// exactly `0`, and assertions (1) and (2) pass it as they always did.
     ///
-    /// **All fourteen live rows clear it with room to spare.** Thirteen of them
+    /// **All fifteen live rows clear it with room to spare.** Thirteen of them
     /// were measured in 0.113.1, the round that added the assertion; the
     /// fourteenth is `VividLight`'s own row, which did not exist then and was
     /// measured in 0.114.0 with the rest of that port (largest channel gap
-    /// `0.2602539`, in blue). The smallest gap in the roster is `LinearLight`'s
-    /// own `0.046875`, about 24× the tolerance, and the largest is
-    /// `ColorDodge`'s `0.61865`. So the check is not near a boundary for any
-    /// current fixture. (Provenance corrected in 0.114.1: 0.114.0 rewrote "all
+    /// `0.2602539`, in blue), and the fifteenth is `HardMix`'s, measured in
+    /// 0.115.0 with the rest of *that* port (largest channel gap a full
+    /// `1.0`, in red — `(0.0, 0.828125, 0.1875)` as written against
+    /// `(1.0, 0.78125, 0.21875)` transposed). The smallest gap in the roster is
+    /// `LinearLight`'s own `0.046875`, about 24× the tolerance; the largest is
+    /// now `HardMix`'s `1.0`, which displaces `ColorDodge`'s `0.61865`. So the
+    /// check is not near a boundary for any current fixture. (Provenance
+    /// corrected in 0.114.1: 0.114.0 rewrote "all
     /// thirteen" to "all fourteen" while leaving "measured in the same round",
-    /// which credited 0.113.1 with measuring a row that postdates it.)
+    /// which credited 0.113.1 with measuring a row that postdates it. 0.115.0
+    /// then left the count at fourteen against fifteen rows, and left
+    /// `ColorDodge` credited as the largest gap while adding a row with
+    /// nearly twice it; both corrected here.)
+    ///
+    /// **`HardMix`'s `1.0` is the roster's largest gap and its most fragile,
+    /// which is not a contradiction.** It comes from one channel — red, the
+    /// `(Cb, Cs) = (0, 1)` guard-ordering corner — and a corner is a single
+    /// point, not a region: unlike every other row, whose gap survives any
+    /// small perturbation of its operands, this one vanishes the moment red's
+    /// backdrop stops being *exactly* `0.0`, because
+    /// `color_dodge_channel`'s `cs == 1.0` guard then fires where its
+    /// `cb == 0.0` guard would have and both operand orders return `1`. The
+    /// row still clears the assertion in green and blue on their own (by
+    /// `0.046875` and `0.03125`), so the check is not resting on the corner
+    /// alone — but see [`NORMAL_MULTIPLY_HARD_MIX_STACK`]'s own comment for
+    /// why red must not be "tidied".
     ///
     /// **Why not simply also exclude `a = 0.5`,** which is what the algebra
-    /// above literally indicts? Because **all fourteen** roster rows carry
+    /// above literally indicts? Because **all fifteen** roster rows carry
     /// their non-unit opacity as exactly `0.5` — checked, not assumed — and
     /// each one's golden is hand-derived from that value and measured on real
     /// GPU hardware. Excluding `0.5` would fail every row at once and demand
-    /// fourteen goldens be re-derived and re-measured, to buy a rule that is
+    /// fifteen goldens be re-derived and re-measured, to buy a rule that is
     /// still a proxy —
     /// blind to any *other* laundering value a future clamped or saturating
     /// mode brings (`a = 0` for `HardMix`-shaped saturation, say). The
@@ -31611,6 +31692,23 @@ mod tests {
     ///
     /// **What it does not do, stated plainly.**
     ///
+    /// - **It cannot detect a real transposed dispatch arm**, which its own
+    ///   name reads as though it could. Everything it does is static: it walks
+    ///   [`TRANSPOSE_COVERAGE`], builds throwaway layer trees, and folds
+    ///   [`solid_stack_texel_cpu`] both ways. It never calls
+    ///   [`begin_gpu_composite_tile`], never reaches a `composite_*_over_with_
+    ///   opacity` argument list, and never touches a GPU adapter — so the
+    ///   argument order actually shipped in that `match` is invisible to it.
+    ///   What it establishes is the *precondition*: that a fixture exists whose
+    ///   composited texel would move if the arm were transposed. Whether any
+    ///   test then notices that movement is a separate question, answered only
+    ///   by running the mutation. **Measured in 0.115.0, not reasoned about**:
+    ///   that round transposed `HardMix`'s real dispatch arm (mutation (i) of
+    ///   its matrix) and the *only* failure was the app-level differential
+    ///   `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_
+    ///   blend_document`. This test stayed green, having predicted the very
+    ///   mutation it could not see. Read the name as "…has a fixture that
+    ///   *could* see one", which is what it says and all it checks.
     /// - It does not prove the fixture's *own assertions* would fail — only
     ///   that its composited texel moves. Since 0.113.1 the "could see one"
     ///   half is no longer a symmetry argument: assertion (3) folds the real
@@ -44216,7 +44314,7 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
-        // **All fourteen modes `document_qualifies_for_gpu_compositing`
+        // **All sixteen modes `document_qualifies_for_gpu_compositing`
         // admits, and this list has to keep pace with it** -- the test's
         // own name says "every expressible mode", so a mode ported to the
         // GPU path but not added here turns that name into a false claim
@@ -44241,7 +44339,31 @@ mod tests {
         // `LinearLight` (0.113.0) were each
         // added in exactly that same commit, which is the convention
         // working rather than six more data points
-        // for the drift. Nothing in this crate makes the omission a
+        // for the drift.
+        //
+        // **Then it drifted a second time, for two rounds running, and this
+        // is the round that caught it.** `VividLight` (0.114.0) and
+        // `HardMix` (0.115.0) were both admitted at the predicate without
+        // being added here, so this list stood at fourteen entries against
+        // a sixteen-mode predicate. Neither omission is symmetric with the
+        // other in provenance and both are stated rather than blurred:
+        // `VividLight`'s **predates this fix by a full round** -- 0.114.0
+        // took the predicate to fifteen and left both this array and the
+        // "All fourteen" count above untouched, and 0.114.1, whose whole
+        // subject was eight stale counts elsewhere in this crate, did not
+        // find it either -- while `HardMix`'s was introduced by 0.115.0
+        // itself, whose own count-sweep re-verified `ALL_BLEND_PASSES`,
+        // `GpuBlendDispatch::ALL`, `GpuBlendDispatches` and the predicate's
+        // own header sentence and never reached this array. So the drift
+        // 0.104.0 demonstrated once is now a *recurring* failure of the
+        // convention, not a one-off: the header above is the only thing
+        // guarding this array and it was read past three times. As in
+        // 0.104.0, adding the two modes surfaced no failure -- the
+        // never-painted-layer property genuinely holds for both -- so the
+        // cost was two rounds of false coverage, not a bug in the shipped
+        // path.
+        //
+        // Nothing in this crate makes the omission a
         // compile error -- `every_gpu_blend_math_dispatch_arm_has_a_
         // fixture_that_could_see_a_transposed_argument` anchors on the
         // counter enum, not on this list, and says so in its own "what it
@@ -44261,6 +44383,8 @@ mod tests {
             aurora_doc::BlendMode::Overlay,
             aurora_doc::BlendMode::HardLight,
             aurora_doc::BlendMode::LinearLight,
+            aurora_doc::BlendMode::VividLight,
+            aurora_doc::BlendMode::HardMix,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(
