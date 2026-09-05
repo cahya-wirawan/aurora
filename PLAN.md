@@ -19602,6 +19602,269 @@ severity choice.
   `aurora-render` error, and fixing it would put a shader file into a diff
   that is otherwise comment-and-test-only in `aurora-app`.
 
+- [x] **`Overlay` ported to WGSL, admitted at the predicate, and wired
+  through the real dispatch arm — done 2026-09-05 (0.110.0).** The tenth
+  real blend-math mode on the GPU, and a **third shader shape**: not one
+  componentwise expression (`Multiply` through `LinearBurn`), not a
+  per-channel helper function (`ColorBurn`, `ColorDodge`), but a real
+  *branch* written as one componentwise `select()` — four shader lines. One
+  WGSL entry point, one `BlendPass` const, four labels, one one-line
+  wrapper, one predicate arm, one dispatch arm, one counter
+  variant/field/`counter()` arm, one `TRANSPOSE_COVERAGE` row, one fixture
+  const. The shared `composite_blend_over_with_opacity` was not touched — an
+  eighth consecutive caller added without a line of change to it — and
+  0.109.0's shared `straight_backdrop()`/`fold_over()` were not touched
+  either, so this is the first port to actually collect that refactor's
+  dividend: the whole new entry point is two `textureSample` lines, one
+  `straight_backdrop()` call, **four lines of its own blend math**, and one
+  `fold_over()` call. No other mode's shader, const, wrapper, dispatch arm,
+  predicate entry or fixture moved; `blend_channel`'s `Overlay` arm and
+  `HardLight`'s own arm are byte-identical to before.
+
+  **RESOLVED, and it was the round's one open design question: WGSL
+  `select()` is viable here, and the fallback was not needed.** The concern
+  was that a per-channel `overlay_channel()` helper might be forced, as it
+  was for `ColorBurn`/`ColorDodge`. It is not, and the *rule* is what
+  matters rather than the outcome: those two need a helper because a
+  `select()` evaluates **both** arms and their discarded arm holds a
+  division undefined in exactly the lanes the branch exists to exclude.
+  `Overlay`'s two arms are pure finite multiply/add on operands already in
+  `[0, 1]`, so evaluating both is harmless. The entry point compiled on the
+  first attempt (`naga`, Vulkan/NVIDIA) and all seven render tests passed on
+  the first run. One WGSL asymmetry had to be respected: `cb <= 0.5` does
+  **not** type-check (comparison operators have no scalar/vector mixed
+  overload) while `2.0 * cb - 1.0` does (arithmetic broadcasts), so the
+  condition is `cb <= vec3<f32>(0.5)` — the same asymmetry
+  `fs_composite_linear_burn` already documents for `max(... - 1.0,
+  vec3<f32>(0.0))`.
+
+  **The formula was derived from `blend_channel`'s own arm, not from the
+  spec.** That arm is literally
+  `BlendMode::Overlay => blend_channel(BlendMode::HardLight, cs, cb)` —
+  `HardLight` with the two channel arguments *swapped* — which substitutes
+  out to `Multiply(Cs, 2*Cb)` where `Cb <= 0.5` and `Screen(Cs, 2*Cb - 1)`
+  otherwise. **The branch tests the backdrop, not the source**, and each
+  expression is written in the Rust arm's own evaluation order
+  (`s.rgb * (2.0 * cb)`, `s.rgb + t - s.rgb * t`) rather than an
+  algebraically equivalent rearrangement, because the CPU differentials
+  assert exact equality and float addition is not associative.
+
+  **Mode counts, recomputed rather than incremented.**
+  `document_qualifies_for_gpu_compositing` now admits **twelve** modes
+  (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+  `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`,
+  `Dissolve`), so **15 of 27** blend modes are still CPU-only there.
+  `shaders/composite.wgsl` now has **ten** blend-math entry points, so
+  **16 of 26** `aurora_render::BlendMode` variants have none — and `Normal`
+  is one of those 16 while not being CPU-only, which is exactly the one mode
+  between the two figures. Eight tests added (1,717 → **1,725**;
+  `aurora-render` 184 → **191**, `aurora-app` 403 → **404**).
+  `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so **no fixture needed
+  retargeting** and both PLAN.md-tracked CPU-fallback benchmarks stay
+  comparable across this round — as in 0.104.0 through 0.108.0, and unlike
+  `Screen`'s.
+
+  **A pre-existing stale count fixed in the same round.**
+  `recomposite_visible_tiles`' own doc comment still said "the other **18**
+  blend modes … 27 minus the **nine** the predicate admits … the remaining
+  **19** blend formulas". Those were the 0.105.x figures (last touched at
+  `02ff479`); `ColorBurn` and `ColorDodge` had already made them stale by
+  two before this round touched anything. Recomputed to 15 / twelve / 16.
+  Nothing depended on them — they are prose — but they are exactly the class
+  0.107.1 and 0.108.1 had to clean up after their own rounds, and finding
+  this one by sweeping *before* committing rather than after review is the
+  improvement.
+
+  **Four degeneracies, every one verified algebraically against the two arms
+  before being written into a comment** (0.106.0's `LinearBurn` round is the
+  precedent for treating a degeneracy claim as something to prove, not
+  assert):
+
+  1. `Overlay(0.5, Cs) = Cs` — a *backdrop* channel at exactly `0.5` is
+     indistinguishable from `Normal`.
+  2. **`Overlay(Cb, 0.5) = Cb` for every `Cb`** — a *source* channel at
+     exactly `0.5` makes the mode a **total no-op**. Both arms give it:
+     `0.5 * 2*Cb = Cb`, and `0.5 + t - 0.5*t = 0.5 + 0.5*(2*Cb - 1) = Cb`.
+     This is the one that actually changed a fixture (below).
+  3. `Overlay(0, Cs) = 0` and `Overlay(1, Cs) = 1`.
+  4. `Cb == Cs` hides a transposed operand pair.
+
+  **The `HardLight` collision rule, worked out symbolically rather than
+  asserted.** `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two modes agree
+  **exactly** wherever `Cb` and `Cs` fall on the same side of `0.5`: both
+  `<=` gives `2*Cb*Cs` either way (and bit-identically, `2*x` being exact
+  and each form one rounding of the same product), and both `>` gives
+  `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way (algebraically equal, reached by
+  different expression sequences, so only usually bit-identical). They differ
+  **only** where the operands straddle `0.5`.
+
+  **A new finding, and the first of its kind on the GPU path: conditional
+  asymmetry.** `ColorBurn` (0.107.0) and `ColorDodge` (0.108.0) are
+  asymmetric *everywhere*, and the seven modes before them commutative
+  *everywhere*. `Overlay` is neither — by the collision rule with `Overlay`
+  on both sides, `B(Cb, Cs) == B(Cs, Cb)` in every channel whose operands
+  share a side of `0.5`, and differs only in a straddling channel. So
+  "asymmetric mode" stopped being a two-member class and became a class with
+  two *kinds*. Consequences, all real rather than notional:
+
+  - **Every fixture in the round straddles `0.5` in all three channels**,
+    chosen for that reason and not incidentally. A fixture sitting entirely
+    below `0.5` would have left only the asymmetric fold to catch a
+    transpose, at any opacity.
+  - The standing transpose guard's **assertion message** asserted flatly
+    that "every formula on the GPU path except the guarded-division pair
+    (ColorBurn, ColorDodge) is commutative". That is load-bearing test code,
+    not a comment, and it became false — it would have printed a false
+    statement on failure. Corrected, along with the guard's premise
+    sentence, its "first exception / second" history, its "at least eight
+    more asymmetric modes still to be ported" (→ seven, `Overlay` removed
+    from the list), and its "two fixtures carrying a `0.5` they do not
+    strictly need" (→ three). `GpuBlendDispatches`' per-mode history gained
+    an `Overlay` bullet stating the new kind. This is the same sweep
+    0.108.0 had to do and for the same reason; that it was anticipated this
+    time rather than discovered is the only difference.
+
+  **One fixture broke the pattern every sibling follows, and that is the
+  round's most consequential single decision.**
+  `NORMAL_MULTIPLY_OVERLAY_STACK`'s `l2` is a `Multiply` layer at opacity
+  **`1.0`**, where `NORMAL_MULTIPLY_{LIGHTEN,SCREEN,DIFFERENCE,LINEAR_*,
+  COLOR_*}_STACK` all use `0.5`. Copying the sibling would have been wrong
+  twice over: halving the accumulator drives every backdrop channel to or
+  below `0.5`, which (a) makes the high (`Screen`-form) arm **unreachable**,
+  so the fixture would exercise one arm and silently pass a shader that got
+  the other wrong, and (b) lands on degeneracy 1, the `Normal`-degenerate
+  value. The chosen `l1`/`l2` leave `Cb = (0.65625, 0.375, 0.1875)`: red
+  above the boundary, green and blue below it, **both arms live in one
+  draw**, no channel at `0.5`, and all three straddling. The `Overlay` layer
+  still carries `0.5` because the standing guard demands it. Recorded on the
+  const, the dispatch-arm comment, the predicate bullet and the test.
+
+  **Golden derivation.** Every fixture was worked in exact rationals with
+  Python's `Fraction`, cross-checked against the real `composite_tile_cpu`
+  through an independent script, *and* asserted against `composite_tile_cpu`
+  inside the test itself, so a stale literal cannot outlive a change to
+  either implementation. Every rival "wrong arm" value quoted in a doc
+  comment or assertion message was computed the same way — the direct lesson
+  of 0.107.1, where 18 illustrative values were wrong. One coincidence found
+  and disclosed rather than hidden: in render test 1 and the app fixture,
+  `Exclusion`'s green channel equals the `Overlay` golden's exactly
+  (`0.46875`). `Exclusion` is `CPU_ONLY_BLEND_MODE`, is not admitted at the
+  predicate and has no WGSL entry point, so it is unreachable by a wrong-arm
+  dispatch; red and blue separate it regardless. Test 4 was then given a
+  *different* straddle pair from test 1's, and against it **every** rival
+  differs in all three channels.
+
+  **Seven render tests, not the six the commutative suites carry and not the
+  eight the guarded-division pair carries.** Six are the standard set; the
+  seventh is `..._agrees_across_its_own_branch_boundary`. There is no eighth
+  because this mode's branch has no *edge-case* semantics — no guard, no
+  undefined operation, nothing firing only at `0` or `1`.
+
+  **The unkillable mutation, disclosed rather than tested around.** The two
+  arms agree **bit-exactly** at `Cb == 0.5`: the low arm gives `Cs * 1.0`,
+  the high arm gives `t == 0.0` exactly and so `Cs + 0.0 - Cs * 0.0`. Both
+  are `Cs`, to the bit. So flipping `<=` to `<` changes the arm taken *only*
+  on inputs where the two arms compute identical bits, and **no test can
+  ever kill it**. Mutation (j) ran it and it survived, as predicted. Test 7
+  pins the *continuity* (a dropped `- 1.0` in `t`, or a `+` where the
+  `Screen` form needs a `-`, breaks it and fails red there) and says
+  explicitly that it cannot pin the comparison. Stated in the WGSL comment,
+  the wrapper doc, the suite header, the test doc, the assertion message and
+  the predicate bullet.
+
+  **Also disclosed: the spatial fixture is largely degenerate for this
+  mode.** `patterned_texels` draws from `{0.0, 0.25, 0.5, 0.75}`, which
+  lands on three of the four degeneracies. Worked out per channel: red's
+  four `x % 4` operand pairs are `(0, 0.25)` (degeneracy 3), `(0.25, 0.5)`
+  (degeneracy 2 — a total no-op), `(0.5, 0.75)` (degeneracy 1 — `Normal`)
+  and `(0.75, 0)` — so **only one red column in four discriminates the
+  formula**, green likewise in `y`, and blue is seed-independent so
+  `Cb == Cs` at every texel (degeneracy 4) with two of its four quadrants
+  discriminating. The test still earns its place as the spatial guard — a
+  wrong-texel bug shows up in three quarters of the columns and rows
+  regardless — but it must not be credited with formula discrimination in
+  the degenerate texels, and its doc comment enumerates exactly which.
+  Similarly, render test 6's opaque half has `Cb = 0.5` in **blue**, because
+  `half_transparent_texels`' colour is fixed and shared: blue is degeneracy
+  1 there and cannot discriminate, so red and green carry that test.
+
+  **Render test 5 is the first fixture in `composite.rs` to leave the unit
+  interval in *both* directions.** With `s.a = 2.0` the fold's `inv` is
+  `-1.0`, so `out = -Cb + 2B`, and the fixture is chosen so red undershoots
+  (`-0.09375`) while green overshoots (`1.09375`) — `ColorDodge`'s
+  equivalent overshoots only, `ColorBurn`'s undershoots only. Both were
+  verified against `composite_tile_cpu` as well as asserted absolutely, so a
+  clamp added to *both* implementations could not pass. The fixture is a
+  fresh one rather than test 1's colours (which the siblings reuse), because
+  test 1's leave every channel inside `[0, 1]` and would prove nothing about
+  output clamping; that departure is stated in the test's own doc.
+
+  **Mutation matrix: 15 mutations, every one applied to the working tree and
+  really run under `AURORA_REQUIRE_GPU=1`, not reasoned about.** Adapter:
+  NVIDIA GeForce RTX 3090, Vulkan, `DiscreteGpu`. Each was reverted by `cp`
+  from a byte-exact backup **outside the repo** — never `git checkout`, per
+  0.108.0's own hard-won process note — and a no-mutation baseline run
+  confirmed all-green first.
+
+  | # | mutation | predicted | actual |
+  |---|---|---|---|
+  | a | delete the whole dispatch arm | killed by the counter alone | **killed, by exactly 1 test** — the `GpuBlendDispatch::Overlay` count in `..._agree_on_an_overlay_blend_document`. All 7 render tests and both standing guards stayed green |
+  | a′ | (a) **plus** the counter assertion deleted | everything else green | **all green** — 7 render, the app differential, the app absolute golden, the `assert_ne!` vacuity guard and both standing guards. This is the direct proof that the counter is the *sole* detector for a fifth mode, rather than an inference from (a) aborting at the first assertion |
+  | b | swap `select()`'s two value arms (lo ↔ hi) | render 1 & 4 + app golden | **killed, 8 tests** — all 7 render + the app differential. Prediction beaten: tests 3, 5, 6 and 7 catch it too (7 via green and blue, which sit off the boundary) |
+  | c | branch on `s.rgb` instead of `cb` (this *is* `HardLight`) | same as (b) | **killed, 8 tests** — all 7 render + the app differential |
+  | d | `2.0 * cb` → `cb` in the low arm | render 1 | **killed, 8 tests** — all 7 render + the app differential |
+  | e | drop the `- 1.0` from `t` | render 1 & 4 | **killed, 8 tests** — all 7 render + the app differential. Affects the *high* arm only, so the app golden's red moved (`0.9453125` against `0.5703125`) while green and blue held |
+  | f | high arm written `s.rgb + t + s.rgb * t` | render 1 & 4 | **killed, 8 tests** — all 7 render + the app differential |
+  | g | `fragment_entry` points at `fs_composite_screen` | all `composite_overlay` tests | **killed, 8 tests** — all 7 render + the app differential |
+  | h | transpose `src`/`backdrop` in the dispatch arm, at the fixture's real opacity `0.5` | killed | **killed, 1 test** — measured `(0.2890625, 0.71875, 0.8359375, 1.0)` against the golden `(0.5703125, 0.46875, 0.2578125, 1.0)`, **exactly** the independent exact-rational prediction, all three channels |
+  | h′ | the same transpose at opacity `1.0` | killed anyway (conditional asymmetry, all channels straddle) | **killed** — measured `(0.328125, 0.6875, 0.796875, 1.0)` against the correct-at-`1.0` `(0.484375, 0.5625, 0.328125, 1.0)`, again exactly as derived, all three channels, with the fold contributing nothing at all |
+  | h″ | opacity `1.0` **without** the transpose — the control for h′ | GPU/CPU differential green, absolute golden fails | **exactly that**: the differential passed (both paths reached `(0.484375, 0.5625, 0.328125, 1.0)`) and only the golden and the standing guard failed. Without this control, h′ could not be attributed to the transpose rather than to the opacity change |
+  | i | delete `straight_backdrop`'s `ab > 0.0` guard entirely | **killed** by render 6 — `Overlay` has no `min`/`max` to launder the `NaN`, unlike the six laundering modes | **killed, exactly 1 test** — render 6, whose readback was literally `(NaN, NaN, NaN, 1.0)`. The other six render tests and the app golden stayed green (their backdrops are all opaque, so no `ab == 0` texel exists). **`Overlay` is a fourth detector of this guard's removal**, joining `Multiply`, `Screen` and `Difference`, and the first of the four whose detection was predicted from the formula rather than found by running the sweep |
+  | j | flip `<=` to `<` in the `select()` condition | **survives** (unkillable in principle) | **survived all 191 render + 404 app tests**, as predicted and as disclosed at six sites |
+  | k | omit the `TRANSPOSE_COVERAGE` row | killed by the standing guard | **killed, 1 test** — `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` |
+  | l | `counter()`'s `Overlay` arm returns `screen` | killed by the counter-distinctness test | **killed, 1 test** — `every_gpu_blend_dispatch_mode_gets_its_own_counter`, still the only assertion in the crate that can see a counter mis-wire |
+
+  Fourteen of fifteen killed; the one survivor is (j), predicted and
+  disclosed as unkillable in principle. **Five predictions were beaten
+  rather than merely met** — (b) through (g) each kill all seven render
+  tests where the plan credited two — and the two flagged-uncertain ones
+  both resolved in favour of the prediction: `select()` compiled with no
+  fallback needed, and (i) really is caught. Every measured transposed value
+  matched its independent exact-rational derivation bit for bit.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` (**1,725 passed, 0 failed, 10 ignored, and zero
+  `SKIPPED`** — so every GPU-gated test really ran on the RTX 3090 rather
+  than self-skipping; `aurora-render` **191 passed**, `aurora-app`
+  **404 passed**), `cargo test --workspace --doc`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`, `cargo deny check all`.
+
+  **Two clippy findings the round had to fix, both in its own new code**, and
+  worth naming because the second is a convention: a `doc_markdown`
+  unbalanced-backtick pair in render test 5's doc comment, and
+  `unreadable_literal` on `0.5703125`/`0.2578125`/`0.4921875` — the golden's
+  seven-significant-digit values. Written `0.570_312_5` etc. in code with the
+  unseparated spelling kept in every doc comment and assertion message, which
+  is exactly the convention `aurora-app`'s `ColorBurn` golden already carries
+  a note for; the new sites cross-reference it rather than re-arguing it.
+
+  **What is still not verified.** Vulkan/NVIDIA only. Metal and DX12 remain
+  unverified for `fs_composite_overlay`, and this mode has a *specific* new
+  reason to care rather than the boilerplate one: `select()` on a
+  `vec3<bool>` is a construct no other entry point in this file uses, and
+  both "is the discarded arm evaluated" and "what does `0.0 / 0.0` yield"
+  are per-backend properties that mutation (i) shows this suite is sensitive
+  to. Nothing in this round was verified interactively in the running app;
+  `Overlay` is still reachable only by setting a layer's blend mode
+  programmatically, since no blend-mode UI exists. Disk: **32G free before
+  the round**, and `target/debug/incremental` was cleared mid-round when it
+  fell to 30G — per CLAUDE.md's own precondition, and it never approached
+  the 25G floor.
+
 - [x] **`ColorDodge` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.108.0).** The ninth
   real blend-math mode on the GPU, and the second whose formula is not a
@@ -25096,6 +25359,59 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.110.0) — `Overlay` on the GPU: the tenth
+blend-math mode, a third shader shape, and the first *conditionally*
+asymmetric formula on the path.** The full account is in M1.10's own
+checklist entry above; this is the summary and the two things a later round
+should carry forward.
+
+Counts, recomputed: the app's GPU predicate now admits **twelve** modes, so
+**15 of 27** blend modes are still CPU-only there; `shaders/composite.wgsl`
+has **ten** blend-math entry points, so **16 of 26**
+`aurora_render::BlendMode` variants have none (`Normal` is one of those 16
+and is *not* CPU-only — it composites through the fixed-function unit — which
+is exactly the one mode between the two figures; `Dissolve` is in neither
+set). 1,717 → **1,725** tests (`aurora-render` 184 → **191**, `aurora-app`
+403 → **404**). `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so no fixture was
+retargeted and both tracked CPU-fallback benchmarks stay comparable.
+
+Two findings worth carrying to the next port:
+
+1. **`select()` is safe exactly when the discarded arm is *defined*.** This
+   round resolved the open question of whether a branching formula needs a
+   per-channel helper the way `ColorBurn`/`ColorDodge` do. It does not:
+   those two need one because a `select()` evaluates **both** arms and their
+   discarded arm divides by zero. `Overlay`'s arms are pure finite
+   multiply/add, so one componentwise `select(hi, lo, cb <= vec3<f32>(0.5))`
+   is the honest shape — the first `select()` in that file. The rule, not the
+   outcome, is the reusable part: `SoftLight`, `HardLight`, `VividLight`,
+   `PinLight` and `HardMix` all branch, and only `VividLight`/`HardMix` (which
+   delegate to the guarded divisions) inherit the helper requirement.
+2. **A mode detects the shared `straight_backdrop()` guard's removal exactly
+   when its blend term has no NaN-laundering `min`/`max` on the path from
+   `cb` to `b`.** 0.109.0 measured 3 of 9 detectors and left the mechanism as
+   an empirical fact; this round *predicted* from the formula that `Overlay`
+   would be a fourth (it has neither intrinsic) and the mutation confirmed it,
+   reading back a literal `(NaN, NaN, NaN, 1.0)`. So the disclosure is now
+   **four of the ten**, and the next port can predict its own answer rather
+   than discovering it.
+
+One mutation is **unkillable in principle** and is disclosed at six sites
+rather than tested around: flipping `<=` to `<` in the `select()` condition
+changes the arm taken only at `Cb == 0.5`, where the two arms compute
+*bit-identical* results (`Cs * 1.0` against `Cs + 0.0 - Cs * 0.0`). It was
+run and survived, as predicted.
+
+**Named follow-on, not done here, and the same call 0.105.0 made for the
+same reason.** `CLAUDE.md`'s M1.10 paragraph states the blend-mode counts
+inline (**"16 of 27"**, "17 of 26") and its narrative stops at 0.109.1. Both
+are now stale by exactly one mode — they should read **15 of 27** and **16 of
+26** — and the paragraph has no `Overlay` sentence. Deliberately **not**
+edited here: that paragraph is a hand-maintained prose summary whose own
+header says PLAN.md wins on any disagreement, and rewriting it is a separate,
+reviewable decision rather than a silent side effect of a blend-mode round.
+Flagged for the maintainer.
 
 **Addendum 2026-09-05 (0.109.1) — 0.109.0's prose corrected, and its one
 open question closed by measurement. Prose only: no WGSL logic, no Rust

@@ -6813,15 +6813,17 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the eleven
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the twelve
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no twelfth mode. The eleven are (count corrected in 0.107.1:
+/// no groups, no thirteenth mode. The twelve are (count corrected in
+/// 0.107.1:
 /// this header said "eight" from 0.106.0 to 0.107.0 while the list below
 /// already had nine bullets, so it was stale by one before `ColorBurn`
 /// made it stale by two — the bullets, `GpuBlendDispatch::ALL`'s own
 /// length and the predicate's `match` are the load-bearing lists, and
 /// this sentence is the hand-maintained one that drifted; 0.108.0 took it
-/// to eleven along with the `ColorDodge` bullet and arm it describes):
+/// to eleven along with the `ColorDodge` bullet and arm it describes, and
+/// 0.110.0 to twelve along with the `Overlay` ones):
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -7037,6 +7039,68 @@ fn composite_roots_into_tile(
 ///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
 ///   dispatch as its own arm and shares the *same single* `spare`
 ///   ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::Overlay`] (0.110.0), composited by
+///   `aurora_render::TileCompositor::composite_overlay_over_with_opacity`,
+///   the tenth mode ported to WGSL and a **third** shader shape again:
+///   `aurora_render`'s own `blend_channel` arm is one line,
+///   `blend_channel(HardLight, cs, cb)` — `HardLight` with the two channel
+///   arguments *swapped* — which substitutes out to
+///   `Multiply(Cs, 2*Cb)` where `Cb <= 0.5` and `Screen(Cs, 2*Cb - 1)`
+///   otherwise. Note the branch tests the **backdrop**, not the source;
+///   branching on the source computes `HardLight`, which is *not* admitted
+///   here and has no WGSL entry point.
+///
+///   **`fs_composite_overlay` is the first entry point in
+///   `composite.wgsl` to use a componentwise `select()`, and that is a
+///   reasoned exception rather than a new default.** `ColorBurn` and
+///   `ColorDodge` above needed per-channel helper *functions* precisely
+///   because a `select()` evaluates **both** arms and their discarded arm
+///   holds a division undefined in the lanes the branch excludes. Both of
+///   `Overlay`'s arms are finite multiply/add on operands already in
+///   `[0, 1]`, so evaluating both is harmless. There is no guard here at
+///   all, and no branch-order question — the two arms are exclusive on a
+///   total order.
+///
+///   **The two arms agree bit-exactly at `Cb == 0.5`** (the low arm gives
+///   `Cs * 1.0`; the high arm's `t` is exactly `0.0`, so
+///   `Cs + 0.0 - Cs * 0.0`), which makes the mode continuous there — and
+///   makes a `<=` → `<` mutation **unkillable in principle**. 0.110.0 ran
+///   that mutation for real and it survived, as predicted; it is disclosed
+///   in `aurora_render`'s `composite_overlay_*` suite rather than tested
+///   around.
+///
+///   **Two degeneracies, both verified algebraically:**
+///   `Overlay(0.5, Cs) = Cs` (a backdrop channel at exactly `0.5` is
+///   `Normal`), and `Overlay(Cb, 0.5) = Cb` for **every** `Cb` (a *source*
+///   channel at exactly `0.5` makes this mode a total no-op). The second is
+///   why `NORMAL_MULTIPLY_OVERLAY_STACK` is the first sibling fixture in
+///   this crate not built on a `Multiply` layer at opacity `0.5`: that
+///   value would have driven every backdrop channel to or below `0.5` *and*
+///   landed on the `Normal`-degenerate case, leaving the high arm
+///   unreachable.
+///
+///   **The `HardLight` collision rule**, which every fixture here is chosen
+///   against: `HardLight(Cb, Cs) = Overlay(Cs, Cb)`, so the two agree
+///   exactly wherever `Cb` and `Cs` share a side of `0.5` (both `<=` gives
+///   `2*Cb*Cs` either way; both `>` gives `2*Cb + 2*Cs - 1 - 2*Cb*Cs`
+///   either way) and differ only where they straddle it.
+///
+///   **It is the third admitted mode whose blend term is not symmetric in
+///   `Cb`/`Cs`, and the first whose asymmetry is *conditional*.**
+///   `ColorBurn` and `ColorDodge` are asymmetric everywhere; the seven
+///   modes before them are commutative everywhere. By the collision rule
+///   with `Overlay` on both sides, `B(Cb, Cs) == B(Cs, Cb)` in every
+///   channel whose operands share a side of `0.5`, and differs only in a
+///   straddling channel — so `NORMAL_MULTIPLY_OVERLAY_STACK` straddles in
+///   **all three** channels, and 0.110.0 confirmed by real measurement that
+///   a transposed binding is observable there at effective alpha `1.0` as
+///   well as at `0.5`. Non-unit fixture opacity is therefore
+///   sufficient-but-not-necessary for a third mode now, and
+///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
+///   un-special-cased for all three (plain backticks: that const is
+///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
+///   dispatch as its own arm and shares the *same single* `spare` ping-pong
+///   accumulator.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -7056,25 +7120,25 @@ fn composite_roots_into_tile(
 ///   paths_agree_on_a_dissolve_blend_document` pins that on real
 ///   hardware.
 ///
-/// **All ten non-`Normal` modes above carry a GPU dispatch counter**, as
+/// **All eleven non-`Normal` modes above carry a GPU dispatch counter**, as
 /// of 0.103.0, which retrofitted one onto each of the five admitted then
 /// (and `Difference` has carried one from its own first round in 0.104.0,
 /// `LinearDodge` from its own in 0.105.0, `LinearBurn` from its own in
 /// 0.106.0, `ColorBurn` from its own in 0.107.0, `ColorDodge` from its own
-/// in 0.108.0 — deliberately stated
+/// in 0.108.0, `Overlay` from its own in 0.110.0 — deliberately stated
 /// without
 /// ordinals, because "counter acquired Nth" and the bullets' own "Nth
 /// mode ported to WGSL" are two different orderings that disagree by
 /// one, `Normal` being ported but uncounted) — the
 /// per-mode bullets deliberately no longer say so one at
 /// a time, because as of that round it is true of every one of them and
-/// repeating it ten times only invites the list to drift out of step
+/// repeating it eleven times only invites the list to drift out of step
 /// again. `GpuBlendDispatches` is the single place that convention, and
 /// the gap it closes, is documented. `Normal` itself is deliberately
 /// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 16 blend modes) routes the *whole document*
+/// layer at any of the other 15 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -7108,6 +7172,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                             | aurora_doc::BlendMode::LinearBurn
                             | aurora_doc::BlendMode::ColorBurn
                             | aurora_doc::BlendMode::ColorDodge
+                            | aurora_doc::BlendMode::Overlay
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -7514,6 +7579,7 @@ enum GpuBlendDispatch {
     LinearBurn,
     ColorBurn,
     ColorDodge,
+    Overlay,
     #[cfg(test)]
     Dissolve,
 }
@@ -7535,15 +7601,16 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 10]` length is part of
-    /// that signal: an eleventh variant cannot be appended here without the
-    /// author also editing the count, and the test asserts the same `10`
+    /// new variant is added to. The fixed `[Self; 11]` length is part of
+    /// that signal: a twelfth variant cannot be appended here without the
+    /// author also editing the count, and the test asserts the same `11`
     /// as a literal so the expectation is stated in both places. (The
-    /// mechanism did its job on its first four outings: `LinearDodge` in
+    /// mechanism did its job on its first five outings: `LinearDodge` in
     /// 0.105.0 went from `[Self; 6]` to `[Self; 7]` in one edit,
     /// `LinearBurn` in 0.106.0 from `[Self; 7]` to `[Self; 8]`,
-    /// `ColorBurn` in 0.107.0 from `[Self; 8]` to `[Self; 9]`, and
-    /// `ColorDodge` in 0.108.0 from `[Self; 9]` to `[Self; 10]`, with the
+    /// `ColorBurn` in 0.107.0 from `[Self; 8]` to `[Self; 9]`,
+    /// `ColorDodge` in 0.108.0 from `[Self; 9]` to `[Self; 10]`, and
+    /// `Overlay` in 0.110.0 from `[Self; 10]` to `[Self; 11]`, with the
     /// test's own literal the only other place to touch each time. **Both
     /// halves of that belong in one edit**: 0.107.1 had to correct a round
     /// that left this prose quoting one length while the literal below read
@@ -7556,7 +7623,7 @@ impl GpuBlendDispatch {
     ///
     /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
     /// why that one variant is test-only.
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Multiply,
         Self::Darken,
         Self::Lighten,
@@ -7566,6 +7633,7 @@ impl GpuBlendDispatch {
         Self::LinearBurn,
         Self::ColorBurn,
         Self::ColorDodge,
+        Self::Overlay,
         Self::Dissolve,
     ];
 }
@@ -7640,6 +7708,23 @@ impl GpuBlendDispatch {
 ///   the mode rather than about the counter — the counter itself cost one
 ///   variant, one field, one `counter` arm, one `ALL` entry and one
 ///   `TRANSPOSE_COVERAGE` row, exactly as predicted.
+/// - `Overlay` (0.110.0): the same again, at the same cost, and the **third**
+///   asymmetric mode — but asymmetric in a new *way*, which is why it earns
+///   a bullet rather than joining the class silently. `ColorBurn`'s and
+///   `ColorDodge`'s asymmetry is unconditional; `Overlay`'s is
+///   **conditional**, holding only in channels where `Cb` and `Cs` straddle
+///   `0.5` (wherever they share a side, `Overlay(Cb, Cs) == Overlay(Cs, Cb)`
+///   exactly, by the same collision rule that makes `Overlay` and
+///   `HardLight` agree there). So its fixture,
+///   `NORMAL_MULTIPLY_OVERLAY_STACK`, is the first in this list chosen for a
+///   property of its *operand pairs* rather than only its opacity: all three
+///   channels straddle. That fixture is also the first here **not** built on
+///   a `Multiply` layer at opacity `0.5`, because `0.5` is exactly this
+///   mode's own no-op value on the source side and drives every backdrop
+///   channel to or below `0.5` on the other. Its round also confirmed the
+///   `<=` → `<` mutation is unkillable in principle (the two arms are
+///   bit-identical at `Cb == 0.5`), which is disclosed rather than tested
+///   around.
 ///
 /// **Why a struct of named fields and an exhaustive `match`, not a
 /// `[AtomicU64; N]` indexed by discriminant.** This workspace denies
@@ -7681,12 +7766,13 @@ struct GpuBlendDispatches {
     linear_burn: std::sync::atomic::AtomicU64,
     color_burn: std::sync::atomic::AtomicU64,
     color_dodge: std::sync::atomic::AtomicU64,
+    overlay: std::sync::atomic::AtomicU64,
     dissolve: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
 impl GpuBlendDispatches {
-    /// All ten counters at zero. `const` so the static below is a
+    /// All eleven counters at zero. `const` so the static below is a
     /// compile-time initializer rather than a lazily-initialized cell,
     /// exactly as the three separate `AtomicU64::new(0)` statics it
     /// replaces were.
@@ -7701,6 +7787,7 @@ impl GpuBlendDispatches {
             linear_burn: std::sync::atomic::AtomicU64::new(0),
             color_burn: std::sync::atomic::AtomicU64::new(0),
             color_dodge: std::sync::atomic::AtomicU64::new(0),
+            overlay: std::sync::atomic::AtomicU64::new(0),
             dissolve: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -7710,7 +7797,7 @@ impl GpuBlendDispatches {
     /// The `match` is exhaustive and total by construction — no `_` arm,
     /// no fallible lookup, so there is no "which counter?" failure to
     /// either defend against or drop on the floor. See
-    /// [`GpuBlendDispatches`] for why that mattered enough to spend ten
+    /// [`GpuBlendDispatches`] for why that mattered enough to spend eleven
     /// named fields on.
     ///
     /// That every variant maps to a *distinct* counter is not something
@@ -7728,6 +7815,7 @@ impl GpuBlendDispatches {
             GpuBlendDispatch::LinearBurn => &self.linear_burn,
             GpuBlendDispatch::ColorBurn => &self.color_burn,
             GpuBlendDispatch::ColorDodge => &self.color_dodge,
+            GpuBlendDispatch::Overlay => &self.overlay,
             GpuBlendDispatch::Dissolve => &self.dissolve,
         }
     }
@@ -9384,7 +9472,8 @@ fn begin_gpu_composite_tile(
             // carries `0.5` on its `ColorDodge` layer, because
             // `TRANSPOSE_COVERAGE`'s guard is deliberately not
             // special-cased for either asymmetric mode: non-unit opacity
-            // is now sufficient-but-not-necessary for two of the nine,
+            // is now sufficient-but-not-necessary for three of the ten
+            // (`Overlay`, 0.110.0, joined them, conditionally),
             // and a conservative guard that still demands it costs
             // nothing.
             aurora_render::BlendMode::ColorDodge => {
@@ -9406,10 +9495,72 @@ fn begin_gpu_composite_tile(
                 note_gpu_blend_dispatch(GpuBlendDispatch::ColorDodge);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // The tenth ported mode (0.110.0), through the *same* mechanism
+            // as the nine arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor method,
+            // and so the WGSL entry point behind it, differs:
+            // `Multiply(Cs, 2*Cb)` where `Cb <= 0.5`, else
+            // `Screen(Cs, 2*Cb - 1)` -- **the branch is on the backdrop**,
+            // and `fs_composite_overlay` writes it as one componentwise
+            // `select()`, this file's first (legitimate here because both
+            // arms are finite multiply/add, unlike the guarded-division
+            // pair's, whose discarded arm would divide by zero).
+            //
+            // **The copy-paste hazard for this arm is not an adjacent arm at
+            // all** -- unlike the burn pair and the guarded-division pair
+            // above, whose hazard is precisely their adjacency. It is
+            // `HardLight`, which is this mode with its two channel
+            // arguments swapped, is **not** admitted by
+            // `document_qualifies_for_gpu_compositing`, and has no WGSL
+            // entry point -- so it cannot be reached by a mistyped
+            // `fragment_entry`, only *computed* by getting this mode's own
+            // operand order wrong. Deliberately not `Cs * 2*Cb` in the
+            // other branch either: the two arms are `Multiply` and `Screen`
+            // with a doubled backdrop, so a wrong arm silently degrades to
+            // one of two modes that are themselves on the GPU.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs
+            // for real ((h) of its matrix). **This one's blend term is
+            // asymmetric like the two arms above, but only
+            // *conditionally*** -- `B(Cb, Cs) == B(Cs, Cb)` exactly where
+            // the two operands share a side of `0.5`, and differs only
+            // where they straddle it. `NORMAL_MULTIPLY_OVERLAY_STACK`
+            // straddles in all three channels for that reason, and 0.110.0
+            // confirmed the transpose is observable there at effective
+            // alpha `1.0` as well as at `0.5`. That fixture still carries
+            // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
+            // guard is deliberately not special-cased for any of the three
+            // asymmetric modes: non-unit opacity is now
+            // sufficient-but-not-necessary for three of the ten, and a
+            // conservative guard that still demands it costs nothing.
+            aurora_render::BlendMode::Overlay => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_overlay_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Overlay);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
             // `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
-            // `LinearBurn`, `ColorBurn`, `ColorDodge`
+            // `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`
             // and `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
@@ -9631,10 +9782,10 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// the other **18** blend modes and group isolation on the GPU. That 18
+/// the other **15** blend modes and group isolation on the GPU. That 15
 /// is the app-level count — 27 real `aurora_doc::BlendMode` variants
-/// minus the nine the predicate admits — and closing it would need the
-/// remaining **19** blend formulas ported to WGSL, which is
+/// minus the twelve the predicate admits — and closing it would need the
+/// remaining **16** blend formulas ported to WGSL, which is
 /// `aurora-render`'s own count over its own 26-variant enum; the one
 /// mode between the two figures is `Normal`, which needs no formula
 /// because the fixed-function unit already expresses it, and `Dissolve`
@@ -29696,6 +29847,68 @@ mod tests {
         ),
     ];
 
+    /// `..._agree_on_an_overlay_blend_document`'s three-layer fixture
+    /// (0.110.0). Golden `(0.5703125, 0.46875, 0.2578125, 1.0)`.
+    ///
+    /// **`l2` is a `Multiply` layer at opacity `1.0`, not `0.5`, and that
+    /// breaks the pattern every sibling fixture above follows — on purpose,
+    /// and it is the one thing about this const not to "normalise".** A
+    /// `Multiply` at `0.5` halves the accumulator, which for this mode is
+    /// not a cosmetic change but a *structural* one, twice over:
+    ///
+    ///   1. `Overlay` branches on `Cb <= 0.5`, so a halved backdrop puts
+    ///      every channel on or below the boundary and the high
+    ///      (`Screen`-form) arm becomes **unreachable** — the fixture would
+    ///      exercise one of the two arms and silently pass a shader that
+    ///      got the other wrong.
+    ///   2. `Overlay(0.5, Cs) = Cs` exactly, so any channel landing on
+    ///      `0.5` is indistinguishable from `Normal`.
+    ///
+    /// So `l1`/`l2` are chosen to leave `Cb = (0.65625, 0.375, 0.1875)`
+    /// after the `Multiply` fold: red above the boundary (the `Screen` arm),
+    /// green and blue below it (the `Multiply` arm), **both arms live in one
+    /// draw**, and no channel at exactly `0.5`.
+    ///
+    /// **Every channel straddles `0.5`**, which is what makes a transposed
+    /// `src`/`backdrop` binding observable in the blend term at all: against
+    /// `Cs = (0.25, 0.75, 0.875)` the pairs are
+    /// `(0.65625 > 0.5 >= 0.25)`, `(0.375 <= 0.5 < 0.75)` and
+    /// `(0.1875 <= 0.5 < 0.875)`. Wherever the two operands *shared* a side
+    /// this mode is commutative, so a fixture without that property would
+    /// leave only the asymmetric fold to catch the transpose. **No source
+    /// channel is `0.5`** either — that value is this mode's total no-op
+    /// (`Overlay(Cb, 0.5) = Cb` for every `Cb`) — and no channel has
+    /// `Cb == Cs`.
+    ///
+    /// **The `Overlay` layer still sits at opacity `0.5`**, because
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// requires it and is deliberately not special-cased for this mode
+    /// either. For this fixture that is sufficient-but-not-necessary (the
+    /// straddling channels already catch the transpose at `1.0`, measured in
+    /// 0.110.0), but it is also what makes the golden differ from `B` and so
+    /// keeps the fold itself under test. See the test's own doc comment for
+    /// the per-channel derivation.
+    const NORMAL_MULTIPLY_OVERLAY_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Overlay,
+            0.5,
+            [0.25, 0.75, 0.875, 1.0],
+        ),
+    ];
+
     /// **Which fixture makes which GPU blend-math dispatch arm's argument
     /// order observable** (0.105.3) — `(mode, the test that composites
     /// this fixture, the fixture itself)`, and the input to
@@ -29761,6 +29974,11 @@ mod tests {
             "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_color_dodge_blend_document",
             &NORMAL_MULTIPLY_COLOR_DODGE_STACK,
         ),
+        (
+            aurora_doc::BlendMode::Overlay,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_overlay_blend_document",
+            &NORMAL_MULTIPLY_OVERLAY_STACK,
+        ),
     ];
 
     /// The `aurora_doc` blend mode each [`GpuBlendDispatch`] counter is
@@ -29778,6 +29996,7 @@ mod tests {
             GpuBlendDispatch::LinearBurn => aurora_doc::BlendMode::LinearBurn,
             GpuBlendDispatch::ColorBurn => aurora_doc::BlendMode::ColorBurn,
             GpuBlendDispatch::ColorDodge => aurora_doc::BlendMode::ColorDodge,
+            GpuBlendDispatch::Overlay => aurora_doc::BlendMode::Overlay,
             GpuBlendDispatch::Dissolve => aurora_doc::BlendMode::Dissolve,
         }
     }
@@ -29824,42 +30043,55 @@ mod tests {
     /// immediately: `LinearBurn`, 0.106.0, was the first mode ported
     /// since, and this guard is what made its fixture's non-unit opacity a
     /// precondition of the round instead of a third round of hand
-    /// discovery. `ColorBurn`, 0.107.0, is the second, and `ColorDodge`,
-    /// 0.108.0, the third — the latter two being the modes for which the
-    /// guard's stated premise does not hold; see below.)
+    /// discovery. `ColorBurn`, 0.107.0, is the second, `ColorDodge`,
+    /// 0.108.0, the third, and `Overlay`, 0.110.0, the fourth — the latter
+    /// three being the modes for which the guard's stated premise does not
+    /// hold, the last of them only *conditionally*; see below.)
     ///
     /// The property, in one line: the first seven blend-math formulas the
     /// GPU path implemented (`Cb*Cs`, `min`, `max`, `Cb+Cs-Cb*Cs`,
     /// `|Cb - Cs|`, `min(Cb+Cs, 1)`, `max(Cb+Cs-1, 0)`) are all
     /// **commutative** — the eighth and ninth, the guarded-division pair,
-    /// are not; see the paragraph below — so the only thing
+    /// are not, and the tenth, `Overlay`, is commutative only in *some*
+    /// channels; see the paragraph below — so the only thing
     /// that can ever notice a swapped pair of operands is the asymmetric
     /// fold around it, `out = (1 - a) * bd + a * blended`, and it notices
     /// nothing at `a = 1`. A fixture whose layer at the mode under test is
     /// fully opaque therefore cannot see a transposed dispatch arm, no
     /// matter how many assertions it carries.
     ///
-    /// **`ColorBurn` (0.107.0) was the first exception and `ColorDodge`
-    /// (0.108.0) is the second, and this guard is deliberately not
-    /// special-cased for either.** `1 - min(1, (1 - Cb) / Cs)` and
+    /// **`ColorBurn` (0.107.0) was the first exception, `ColorDodge`
+    /// (0.108.0) the second and `Overlay` (0.110.0) the third, and this
+    /// guard is deliberately not special-cased for any of them.**
+    /// `1 - min(1, (1 - Cb) / Cs)` and
     /// `min(1, Cb / (1 - Cs))` are each *not* symmetric in their two
     /// operands, so each mode's own blend term
     /// catches a transposed dispatch arm even at effective alpha `1.0` —
     /// measured in both rounds at both `0.5` and `1.0`, not reasoned about.
-    /// For those two modes non-unit opacity is therefore
+    /// `Overlay` is a *third kind* of exception rather than a third member
+    /// of the same one: its asymmetry is **conditional**, holding only in
+    /// channels where `Cb` and `Cs` straddle `0.5` (wherever they share a
+    /// side, `Overlay(Cb, Cs) == Overlay(Cs, Cb)` exactly, by the same
+    /// collision rule that makes `Overlay` and `HardLight` agree there).
+    /// `NORMAL_MULTIPLY_OVERLAY_STACK` straddles in all three channels, so
+    /// 0.110.0 measured the transpose observable there at `1.0` as well as
+    /// at `0.5` — but that is a property of *that fixture*, not of the mode,
+    /// which is exactly why the conservative rule is worth keeping here.
+    /// For those three modes non-unit opacity is therefore
     /// sufficient-but-not-necessary, and this guard demanding it anyway is
     /// a false alarm waiting to happen rather than a false all-clear. It
     /// is left demanding it regardless: the roster is meant to be read and
     /// extended by rounds that will not want to re-derive per-mode
     /// symmetry arguments, an exemption list would be a second
     /// hand-maintained thing to keep in step with the enum, and the cost
-    /// of the conservative rule is two fixtures carrying a `0.5` they do
+    /// of the conservative rule is three fixtures carrying a `0.5` they do
     /// not strictly need. (`NORMAL_MULTIPLY_COLOR_DODGE_STACK` needs its
     /// `0.5` for an unrelated second reason anyway — see that const.) At
-    /// least eight more asymmetric modes are still to
-    /// be ported (`Subtract`, `Divide`, `Overlay`,
+    /// least seven more asymmetric modes are still to
+    /// be ported (`Subtract`, `Divide`,
     /// `HardLight`, `SoftLight`, `VividLight`, `PinLight` and
-    /// `LinearLight` among the separable ones);
+    /// `LinearLight` among the separable ones — `Overlay` was on that list
+    /// until 0.110.0 ported it);
     /// if a later round wants the exemption, it should be a deliberate,
     /// per-mode change to this test with its own measured justification,
     /// not a quiet loosening.
@@ -29964,7 +30196,8 @@ mod tests {
                      between 0 and 1 that is also unoccluded from above, so a dispatch arm that \
                      transposed src and backdrop for {mode:?} would be invisible to it: every \
                      formula on the GPU path except the guarded-division pair (ColorBurn, \
-                     ColorDodge) is commutative, and the fold \
+                     ColorDodge) is commutative -- Overlay everywhere its two operands share a \
+                     side of 0.5, which is most of a typical channel pair -- and the fold \
                      (1 - a) * bd + a * blended around it collapses to `blended` at a = 1 -- and \
                      a fully opaque Normal layer stacked above the mode-bearing one collapses it \
                      the same way, by replacing the accumulator outright. Restore the non-unit \
@@ -30117,8 +30350,9 @@ mod tests {
         let modes = GpuBlendDispatch::ALL;
         assert_eq!(
             modes.len(),
-            10,
-            "GpuBlendDispatch::ALL no longer has the ten variants this test was written against \
+            11,
+            "GpuBlendDispatch::ALL no longer has the eleven variants this test was written \
+             against \
              -- if a mode was added, that is expected: bump this literal. If a mode was added to \
              the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
              silently uncovered by the only test in this crate that can catch a counter mis-wire."
@@ -31890,6 +32124,227 @@ mod tests {
              the other dodge-family mode, which agrees with it in every *clamped* channel by \
              construction -- or the differential above would pass with the wrong dispatch arm \
              running. Red and green are what carry this, never blue."
+        );
+    }
+
+    /// **`Overlay` end to end through the real caller** (0.110.0), the
+    /// tenth mode ported: a three-layer `Normal`/`Multiply`/`Overlay` root
+    /// stack ([`NORMAL_MULTIPLY_OVERLAY_STACK`]) composited on real
+    /// hardware, with the `Overlay` layer sampling a backdrop a `Multiply`
+    /// pass wrote into the accumulator and reusing the spare accumulator
+    /// that pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`,
+    /// `(0.75, 0.75, 0.75)`) the accumulator is
+    /// `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0`. Against
+    /// `Cs = (0.25, 0.75, 0.875)`, `Overlay` branches on `Cb`:
+    ///
+    /// - red: `Cb = 0.65625 > 0.5`, so `t = 0.3125` and
+    ///   `B = 0.25 + 0.3125 - 0.25*0.3125 = 0.484375` — the `Screen` arm;
+    /// - green: `Cb = 0.375 <= 0.5`, so `B = 0.75 * 0.75 = 0.5625` — the
+    ///   `Multiply` arm;
+    /// - blue: `Cb = 0.1875 <= 0.5`, so `B = 0.875 * 0.375 = 0.328125`.
+    ///
+    /// The `Overlay` layer's own opacity `0.5` folds that in as
+    /// `0.5 * Cb + 0.5 * B`, giving the golden
+    /// `(0.5703125, 0.46875, 0.2578125, 1.0)`.
+    ///
+    /// **Both arms fire in this one draw**, which is what
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`]'s unusual `l2` opacity of `1.0` (not
+    /// the `0.5` every sibling fixture uses) is *for* — see that const. No
+    /// channel of either operand is `0.5`, this mode's own no-op value on the
+    /// source side and its `Normal`-degenerate value on the backdrop side;
+    /// no channel has `Cb == Cs`; and **all three channels straddle `0.5`**,
+    /// which is what makes a transposed binding observable in the blend term.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::Overlay`] count, which is what distinguishes
+    ///   "the `Overlay` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels" — historically the
+    ///   one mutation in a round like this that nothing else catches, and
+    ///   0.110.0's mutation (a) confirmed it again here;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `Overlay` replaced by **`HardLight`** must composite to something
+    ///   *different*. `HardLight` rather than the siblings' `Screen` or
+    ///   `LinearBurn`, and the choice is not stylistic: `HardLight` is this
+    ///   mode with its two channel arguments swapped
+    ///   (`aurora_render`'s own arm is literally
+    ///   `blend_channel(HardLight, cs, cb)`), so it is precisely what a
+    ///   transposed dispatch arm, or a branch on the source instead of the
+    ///   backdrop, actually computes. It gives
+    ///   `(0.4921875, 0.53125, 0.4921875)` against the golden's
+    ///   `(0.5703125, 0.46875, 0.2578125)` — **differing in all three
+    ///   channels**, which is only true because all three straddle `0.5`;
+    ///   wherever the two operands share a side of `0.5` the two modes agree
+    ///   exactly (both `<=` gives `2*Cb*Cs` either way, both `>` gives
+    ///   `2*Cb + 2*Cs - 1 - 2*Cb*Cs` either way), so on a non-straddling
+    ///   fixture this guard would be vacuous. `HardLight` is not admitted by
+    ///   [`document_qualifies_for_gpu_compositing`], so the substituted stack
+    ///   composites on the CPU path, which is what the guard wants anyway.
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`):
+    /// `HardLight` `(0.4921875, 0.53125, 0.4921875)`, `Normal`
+    /// `(0.453125, 0.5625, 0.53125)`, `Multiply`
+    /// `(0.41015625, 0.328125, 0.17578125)` — which is the `Cb <= 0.5` arm
+    /// *without* its doubling, so it is what a `2.0 * cb → cb` mutation gives
+    /// in green and blue — `Screen` `(0.69921875, 0.609375, 0.54296875)`,
+    /// `Darken` `(0.453125, 0.375, 0.1875)`, `Lighten`
+    /// `(0.65625, 0.5625, 0.53125)`, `Difference` `(0.53125, 0.375, 0.4375)`,
+    /// `LinearDodge` `(0.78125, 0.6875, 0.59375)`, `LinearBurn`
+    /// `(0.328125, 0.25, 0.125)`, `ColorBurn` roughly
+    /// `(0.328125, 0.2708.., 0.1294..)`, `ColorDodge`
+    /// `(0.765625, 0.6875, 0.59375)`, and `Exclusion`
+    /// `(0.6171875, 0.46875, 0.4609375)` — whose **green coincides with the
+    /// golden exactly**, disclosed rather than counted as separation
+    /// (`Exclusion` is this crate's `CPU_ONLY_BLEND_MODE` stand-in, is not
+    /// admitted at the predicate, and has no WGSL entry point, so it is not
+    /// reachable by a wrong-arm dispatch at all; red and blue separate it
+    /// regardless).
+    ///
+    /// Every one of those is distinct from the golden in at least one
+    /// channel, which is the only property the list has to have.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is caught
+    /// here, and — measured, not reasoned about — at opacity `1.0` as well as
+    /// at `0.5`.** The seven modes ported before `ColorBurn` have
+    /// *commutative* blend terms, so a transpose survives inside `B` and only
+    /// the asymmetric outer fold can see it, which it cannot at `a = 1`.
+    /// `Overlay`'s asymmetry is real but **conditional** — present only where
+    /// the operands straddle `0.5` — and this fixture straddles in all three
+    /// channels, so the blend term catches it. 0.110.0's mutation (h)
+    /// transposed this arm and ran it at both opacities: at `0.5` the
+    /// transposed composite measured `(0.2890625, 0.71875, 0.8359375, 1.0)`
+    /// against the correct `(0.5703125, 0.46875, 0.2578125, 1.0)`, and at
+    /// `1.0` it measured `(0.328125, 0.6875, 0.796875, 1.0)` against the
+    /// correct `(0.484375, 0.5625, 0.328125, 1.0)` — all three channels
+    /// caught at both, with the fold contributing nothing at all in the
+    /// second. The fixture keeps its `0.5` regardless, because the standing
+    /// transpose guard demands it and is deliberately not special-cased for
+    /// any of the three asymmetric modes. See
+    /// [`NORMAL_MULTIPLY_OVERLAY_STACK`].
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_overlay` — and for this mode that gap has
+    /// its own specific edge: `select()` on a `vec3<bool>` is a construct no
+    /// other entry point in `composite.wgsl` uses, so no prior round's
+    /// cross-backend evidence covers it. See PLAN.md's 0.110.0 entry.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_overlay_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_OVERLAY_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Overlay root stack must qualify for the GPU path as of \
+             0.110.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Overlay);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Overlay` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills only
+        // tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency
+        // viewport marks four tiles visible at `TILE` = 256, and the other
+        // three resolve nothing at all, taking `begin_gpu_composite_tile`'s
+        // `current?` bail before any blend pass is recorded. The second,
+        // CPU-only run inside that helper adds none. **A count of 0 is the
+        // failure this assertion exists for** -- see `GpuBlendDispatches`,
+        // and PLAN.md's 0.110.0 mutation-testing record, where deleting the
+        // dispatch arm left every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Overlay),
+            1,
+            "the Overlay layer must have dispatched a real GPU blend pass on the one visible tile \
+             that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Overlay document (the Overlay layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            // `0.570_312_5`/`0.257_812_5` are `0.5703125`/`0.2578125` --
+            // `clippy::unreadable_literal` again, the same convention the
+            // `ColorBurn` golden above already carries a note for. The doc
+            // comment and the message both spell them without separators.
+            (0.570_312_5, 0.46875, 0.257_812_5, 1.0),
+            "0.5*Cb + 0.5*Overlay(Cb, Cs) must come out of the GPU path itself, branching on the \
+             *backdrop*: Cb = (0.65625, 0.375, 0.1875) puts red on the Screen arm and green and \
+             blue on the Multiply arm, so B is (0.484375, 0.5625, 0.328125). \
+             (0.4921875, 0.53125, 0.4921875, 1.0) would mean HardLight ran -- this mode with its \
+             two channel arguments swapped, i.e. what a transposed binding or a branch on the \
+             source computes -- (0.453125, 0.5625, 0.53125, 1.0) the Normal arm, \
+             (0.41015625, 0.328125, 0.17578125, 1.0) the Multiply arm (the Cb <= 0.5 arm without \
+             its doubling), (0.69921875, 0.609375, 0.54296875, 1.0) the Screen arm, \
+             (0.453125, 0.375, 0.1875, 1.0) the Darken arm, \
+             (0.65625, 0.5625, 0.53125, 1.0) the Lighten arm, \
+             (0.53125, 0.375, 0.4375, 1.0) the Difference arm, \
+             (0.78125, 0.6875, 0.59375, 1.0) the LinearDodge arm, \
+             (0.328125, 0.25, 0.125, 1.0) the LinearBurn arm, roughly \
+             (0.328125, 0.2708, 0.1294, 1.0) the ColorBurn arm and \
+             (0.765625, 0.6875, 0.59375, 1.0) the ColorDodge arm. Exclusion gives \
+             (0.6171875, 0.46875, 0.4609375, 1.0), whose green coincides with the golden -- \
+             disclosed rather than counted as separation, and unreachable by dispatch anyway. A \
+             dispatch arm that transposed src and backdrop measured \
+             (0.2890625, 0.71875, 0.8359375, 1.0) on real hardware in 0.110.0."
+        );
+
+        // The vacuity guard: the same stack with its `Overlay` layer turned
+        // into a `HardLight` one, composited on the CPU path only (HardLight
+        // is not admitted at the predicate, which is exactly what this guard
+        // wants). If that produced the same texel, every assertion above
+        // would hold just as well with the wrong arm dispatched. `HardLight`
+        // rather than the siblings' `Screen` or `LinearBurn`, because it is
+        // *this mode with its two channel arguments swapped* -- what a
+        // transposed dispatch arm actually computes -- and because the two
+        // agree exactly wherever the operands share a side of 0.5, so this
+        // guard is a real three-channel claim only because every channel of
+        // this fixture straddles.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Overlay {
+                entry.1 = aurora_doc::BlendMode::HardLight;
+            }
+        }
+        let with_hard_light = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_hard_light,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_overlay_were_hard_light = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_overlay_were_hard_light,
+            "setup: this fixture must distinguish its Overlay layer from a HardLight one -- the \
+             same formula with its two channel arguments swapped, and therefore exactly what a \
+             transposed dispatch arm computes -- or the differential above would pass with the \
+             wrong arm running. This is a three-channel claim only because every channel of the \
+             fixture straddles 0.5; where the two operands share a side, the two modes agree \
+             exactly."
         );
     }
 
@@ -41136,7 +41591,7 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
-        // **All eleven modes `document_qualifies_for_gpu_compositing`
+        // **All twelve modes `document_qualifies_for_gpu_compositing`
         // admits, and this list has to keep pace with it** -- the test's
         // own name says "every expressible mode", so a mode ported to the
         // GPU path but not added here turns that name into a false claim
@@ -41156,10 +41611,10 @@ mod tests {
         // round of false coverage, not a bug in the shipped path. Add a
         // mode here in the same commit that admits it at the predicate.
         //
-        // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0) and `ColorDodge`
-        // (0.108.0) were each
+        // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge`
+        // (0.108.0) and `Overlay` (0.110.0) were each
         // added in exactly that same commit, which is the convention
-        // working rather than three more data points
+        // working rather than four more data points
         // for the drift. Nothing in this crate makes the omission a
         // compile error -- `every_gpu_blend_math_dispatch_arm_has_a_
         // fixture_that_could_see_a_transposed_argument` anchors on the
@@ -41177,6 +41632,7 @@ mod tests {
             aurora_doc::BlendMode::LinearBurn,
             aurora_doc::BlendMode::ColorBurn,
             aurora_doc::BlendMode::ColorDodge,
+            aurora_doc::BlendMode::Overlay,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(
