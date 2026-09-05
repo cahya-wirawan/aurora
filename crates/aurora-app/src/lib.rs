@@ -7681,7 +7681,28 @@ impl GpuBlendDispatch {
     /// new variant is added to. The fixed `[Self; 12]` length is part of
     /// that signal: a thirteenth variant cannot be appended here without the
     /// author also editing the count, and the test asserts the same `12`
-    /// as a literal so the expectation is stated in both places. (The
+    /// as a literal so the expectation is stated in both places.
+    ///
+    /// **As of 0.112.0 this length is no longer the only check on it, and
+    /// prose elsewhere should name the two tests below rather than restate
+    /// a number.** A hand-maintained count restated in prose drifts:
+    /// 0.111.1 had to correct this very doc comment for reading
+    /// `[Self; 11]` directly above an array of twelve, a self-contradiction
+    /// a reader could see and no test could. Two derived checks now stand
+    /// behind it, neither of which can be satisfied by editing a literal:
+    ///
+    /// - `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_
+    ///   with_a_dispatch_counter` measures the predicate's admitted set by
+    ///   *calling* it once per `aurora_doc::BlendMode::ALL` variant, and
+    ///   requires it to be this list plus exactly `Normal`.
+    /// - `gpu_blend_dispatch_count_matches_the_render_crates_blend_math_
+    ///   pass_count`
+    ///   ties this length to `aurora_render::BLEND_MATH_PASS_COUNT`, which
+    ///   is derived from `shaders/composite.wgsl`'s own `@fragment` entry
+    ///   points — so the figure is anchored to shader source in another
+    ///   crate rather than to a number someone typed twice.
+    ///
+    /// (The
     /// mechanism did its job on its first six outings: `LinearDodge` in
     /// 0.105.0 went from `[Self; 6]` to `[Self; 7]` in one edit,
     /// `LinearBurn` in 0.106.0 from `[Self; 7]` to `[Self; 8]`,
@@ -30501,6 +30522,89 @@ mod tests {
                  silent CPU fallback computing the same pixels)"
             );
         }
+    }
+
+    /// **Derives the predicate's admitted-mode set by calling it, instead
+    /// of re-reading its `match` arms** (0.112.0).
+    ///
+    /// Six consecutive porting rounds each restated "the predicate admits
+    /// N modes" somewhere in prose, and nothing could check it: the only
+    /// existing coverage is one `document_qualifies_for_gpu_compositing_
+    /// admits_a_<mode>_blend_mode` test per mode, each of which passes
+    /// happily while the *set* has an extra member no counter exists for.
+    /// This test measures the set by feeding every
+    /// [`aurora_doc::BlendMode`] variant through the real predicate, so a
+    /// mode added to the predicate's `matches!` and nowhere else fails
+    /// here — the failure mode a per-mode positive test structurally
+    /// cannot produce.
+    ///
+    /// The invariant is `admitted == GpuBlendDispatch::ALL + 1`, and the
+    /// `+ 1` is exactly `Normal`: it is admitted and deliberately
+    /// uncounted, compositing through the fixed-function path with no
+    /// blend-math dispatch to count. `Dissolve` *is* counted despite
+    /// having no blend-math shader, because it resolves to `Normal` before
+    /// the dispatch and its counter proves the resolution happened.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter() {
+        let mut admitted = Vec::new();
+        for mode in aurora_doc::BlendMode::ALL {
+            let stack: [StackEntry; 1] = [("only", mode, 1.0, [0.25, 0.5, 0.75, 1.0])];
+            if document_qualifies_for_gpu_compositing(&root_stack_tree(&stack)) {
+                admitted.push(mode);
+            }
+        }
+
+        assert_eq!(
+            admitted.len(),
+            GpuBlendDispatch::ALL.len() + 1,
+            "the real predicate admits {admitted:?} ({} modes) but GpuBlendDispatch::ALL has {} \
+             variants; the two must differ by exactly one (Normal, deliberately uncounted). \
+             Measured by calling the real predicate once per BlendMode::ALL variant, not by \
+             re-reading its match arms -- so a mode added to the predicate without a dispatch \
+             counter, or a counter added without admitting the mode, lands here.",
+            admitted.len(),
+            GpuBlendDispatch::ALL.len()
+        );
+
+        assert!(
+            admitted.contains(&aurora_doc::BlendMode::Normal),
+            "Normal must be admitted -- it is the one uncounted admitted mode the +1 above \
+             accounts for, so if it is absent the count can still match while naming a different \
+             set entirely"
+        );
+        for which in GpuBlendDispatch::ALL {
+            let mode = dispatch_arm_blend_mode(which);
+            assert!(
+                admitted.contains(&mode),
+                "{which:?} has a dispatch counter for {mode:?}, but the predicate does not admit \
+                 a document whose only layer uses that mode -- the counter can never be \
+                 incremented, so every test that reads it as dispatch proof is vacuous"
+            );
+        }
+    }
+
+    /// Cross-checks this crate's counted-mode list against
+    /// `aurora-render`'s own shader-derived blend-math pass count
+    /// (0.112.0) — the third of the three drifting numbers, and the only
+    /// one that spans a crate boundary.
+    ///
+    /// Neither crate could previously see the other's figure at all, which
+    /// is how 0.111.1 came to ship a doc comment reading `[Self; 11]`
+    /// above an array of twelve. `BLEND_MATH_PASS_COUNT` is
+    /// `ALL_BLEND_PASSES::len()` over there, itself checked against
+    /// `shaders/composite.wgsl`'s real `@fragment` entry points, so this
+    /// assertion chains a Rust list here to WGSL source in another crate.
+    #[test]
+    fn gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count() {
+        assert_eq!(
+            GpuBlendDispatch::ALL.len(),
+            aurora_render::BLEND_MATH_PASS_COUNT + 1,
+            "GpuBlendDispatch::ALL's length and aurora_render::BLEND_MATH_PASS_COUNT (+1 for \
+             Dissolve, the one counted mode with no blend-math shader, since it resolves to Normal \
+             before the dispatch) disagree. A mode was ported in one crate but not the other: \
+             either a BLEND_PASS_* const and its shader entry point exist with no counter here, or \
+             a counter exists here with no shader to dispatch."
+        );
     }
 
     /// One texel's own `(r, g, b, a)` channels — the shape

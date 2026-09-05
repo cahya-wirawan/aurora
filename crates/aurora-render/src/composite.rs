@@ -411,6 +411,54 @@ const BLEND_PASS_HARD_LIGHT: BlendPass = BlendPass {
     pass: LABEL_HARD_LIGHT_PASS,
 };
 
+/// Every [`BlendPass`] const above, once — this crate's own registry of
+/// the blend-math entry points it can dispatch (0.112.0).
+///
+/// **Why this exists.** Three separate hand-maintained numbers describe
+/// the same ported-mode set: the count of these consts, `aurora-app`'s
+/// `GpuBlendDispatch::ALL` length, and the set of modes its GPU
+/// compositing predicate admits. Six consecutive porting rounds each
+/// restated one or more of them in prose, and two of those rounds
+/// (0.107.1, 0.111.1) landed corrections for a number that had drifted
+/// out of agreement with the code it described. Nothing could *derive*
+/// any of them, so every check was a human re-reading match arms.
+///
+/// This constant makes the first of the three derivable, and
+/// `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`
+/// cross-checks it against `shaders/composite.wgsl`'s own `@fragment`
+/// entry points — by set equality on the names, not merely by count, so a
+/// renamed entry point fails as loudly as a missing one.
+///
+/// Only these consts are listed. `fs_composite` and
+/// `fs_composite_opacity` are fixed-function paths with no blend math and
+/// no `BlendPass`, and the test names them separately.
+const ALL_BLEND_PASSES: [&BlendPass; 11] = [
+    &BLEND_PASS_MULTIPLY,
+    &BLEND_PASS_DARKEN,
+    &BLEND_PASS_LIGHTEN,
+    &BLEND_PASS_SCREEN,
+    &BLEND_PASS_DIFFERENCE,
+    &BLEND_PASS_LINEAR_DODGE,
+    &BLEND_PASS_LINEAR_BURN,
+    &BLEND_PASS_COLOR_BURN,
+    &BLEND_PASS_COLOR_DODGE,
+    &BLEND_PASS_OVERLAY,
+    &BLEND_PASS_HARD_LIGHT,
+];
+
+/// How many blend-math `@fragment` entry points this crate dispatches —
+/// `ALL_BLEND_PASSES`'s own length, so it cannot be stated wrongly. (Named
+/// in plain backticks rather than linked: that constant is private, and a
+/// public item linking to it is a `rustdoc::private_intra_doc_links` error
+/// under CI's `-D warnings`.)
+///
+/// Public so `aurora-app` can cross-check its `GpuBlendDispatch::ALL`
+/// against it (that list is longer by exactly one: `Dissolve` is admitted
+/// to the GPU path and counted there, but resolves to `Normal` before any
+/// dispatch, so it has no blend-math shader here). Excludes the two
+/// fixed-function entry points, which have no `BlendPass`.
+pub const BLEND_MATH_PASS_COUNT: usize = ALL_BLEND_PASSES.len();
+
 /// The byte size of `composite_over_with_opacity`'s own uniform buffer —
 /// a real `f32` opacity value plus 12 bytes of padding, matching
 /// `shaders/composite.wgsl`'s own `Opacity` struct exactly.
@@ -1708,7 +1756,15 @@ pub struct TileCompositor {
 /// had gone un-updated since 0.105.0 and was four entry points stale before
 /// 0.111.0 brought it current; it is a roster, not a count, so nothing
 /// depended on it — but "every such entry point" is a claim, so it is
-/// corrected rather than left to drift further.)
+/// corrected rather than left to drift further. As of 0.112.0 that class of
+/// staleness is a test failure rather than a silent prose error:
+/// [`ALL_BLEND_PASSES`] registers the same entry points as real code, and
+/// `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`
+/// checks that registry against the shader source by set equality, so an
+/// entry point added or renamed without the roster following can no longer
+/// go unobserved — though keeping *this* list's prose in step is still a
+/// human's job, which is why it should be read as illustrative and the
+/// constant as authoritative.)
 ///
 /// A free function rather than more lines inside
 /// [`TileCompositor::new`] purely to keep that constructor under
@@ -3421,14 +3477,131 @@ impl std::fmt::Debug for TileCompositor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlendMode, CHUNK_SAMPLES, CHUNK_TEXELS, TileCompositor, blend_channel, blend_color,
-        blend_darker_color, blend_hue, blend_lighter_color, blend_luminosity, blend_rgb,
-        blend_saturation, clip_color, composite_layer_into, composite_tile_cpu, lum, sat, set_lum,
-        set_sat, soft_light_d, transparent_tile, un_premultiply_in_place,
+        ALL_BLEND_PASSES, BLEND_MATH_PASS_COUNT, BlendMode, CHUNK_SAMPLES, CHUNK_TEXELS,
+        COMPOSITE_SHADER, TileCompositor, blend_channel, blend_color, blend_darker_color,
+        blend_hue, blend_lighter_color, blend_luminosity, blend_rgb, blend_saturation, clip_color,
+        composite_layer_into, composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d,
+        transparent_tile, un_premultiply_in_place,
     };
     use crate::test_support::real_context;
     use aurora_tile::{CHANNELS, SAMPLES, TILE};
     use half::f16;
+
+    /// The two `@fragment` entry points in `shaders/composite.wgsl` that
+    /// are *not* blend math: `fs_composite` is the plain fixed-function
+    /// `over`, and `fs_composite_opacity` the same with a uniform opacity.
+    /// Neither has a [`BlendPass`], so both are excluded from the
+    /// derivation below rather than being expected in
+    /// [`ALL_BLEND_PASSES`].
+    const FIXED_FUNCTION_ENTRY_POINTS: [&str; 2] = ["fs_composite", "fs_composite_opacity"];
+
+    /// Every `@fragment` entry point name declared in the real shader
+    /// source, read from [`COMPOSITE_SHADER`] — the same `&'static str`
+    /// `create_shader_module` compiles, deliberately *not* a second
+    /// `include_str!` of the same file, which would itself be a duplicate
+    /// able to drift from the one the GPU actually sees.
+    ///
+    /// **The parsing contract**, which the shader satisfies today: each
+    /// entry point is exactly two lines — a line whose trimmed content is
+    /// `@fragment`, then a line beginning `fn <name>(`. That pattern
+    /// deliberately does not match `vs_composite` (preceded by `@vertex`)
+    /// nor the four plain helpers `straight_backdrop`, `fold_over`,
+    /// `color_burn_channel` and `color_dodge_channel` (preceded by
+    /// nothing). Counting substring occurrences of `"fs_composite"` would
+    /// be wrong instead of merely fragile: that string appears many times
+    /// in the shader's *comments*. If a future entry point is written with
+    /// its attribute and signature on one line, this stops seeing it and
+    /// the test below fails — a loud, correct failure rather than a silent
+    /// undercount, since the totals would then disagree.
+    fn shader_fragment_entry_points() -> Vec<&'static str> {
+        let mut names = Vec::new();
+        let mut previous_is_fragment = false;
+        for line in COMPOSITE_SHADER.lines() {
+            let trimmed = line.trim();
+            if previous_is_fragment && let Some(rest) = trimmed.strip_prefix("fn ") {
+                names.push(rest.split('(').next().unwrap_or_default().trim());
+            }
+            previous_is_fragment = trimmed == "@fragment";
+        }
+        names
+    }
+
+    /// **Derives one of the three drifting blend-mode counts from source
+    /// rather than restating it** (0.112.0).
+    ///
+    /// Ports no mode and changes no blend math: it asserts that
+    /// [`ALL_BLEND_PASSES`] and the shader agree about *which* entry points
+    /// exist, by set equality on the names. Set equality rather than a
+    /// count is the point — a count alone passes when an entry point is
+    /// renamed and a `BlendPass` is not, which is exactly the mis-wire the
+    /// `fragment_entry` doc comments have been warning about mode after
+    /// mode.
+    ///
+    /// It also makes the roster comment on [`blend_bind_group_layout`] a
+    /// test failure rather than stale prose, and gives `aurora-app` a
+    /// number ([`BLEND_MATH_PASS_COUNT`]) it can cross-check its own
+    /// `GpuBlendDispatch::ALL` against.
+    #[test]
+    fn all_blend_passes_matches_the_shaders_own_blend_math_entry_points() {
+        let declared = shader_fragment_entry_points();
+
+        for name in FIXED_FUNCTION_ENTRY_POINTS {
+            assert!(
+                declared.contains(&name),
+                "expected fixed-function entry point {name} not found among the @fragment entry \
+                 points parsed out of shaders/composite.wgsl -- either it was renamed, or the \
+                 two-line @fragment/fn parsing contract this test depends on no longer holds"
+            );
+        }
+
+        assert_eq!(
+            declared.len(),
+            BLEND_MATH_PASS_COUNT + FIXED_FUNCTION_ENTRY_POINTS.len(),
+            "shaders/composite.wgsl declares {} @fragment entry points, but ALL_BLEND_PASSES has \
+             {BLEND_MATH_PASS_COUNT} entries plus the {} fixed-function ones. A newly ported \
+             mode's shader entry point was added without its BlendPass const being registered in \
+             ALL_BLEND_PASSES, or the reverse.",
+            declared.len(),
+            FIXED_FUNCTION_ENTRY_POINTS.len()
+        );
+
+        let mut derived: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|name| !FIXED_FUNCTION_ENTRY_POINTS.contains(name))
+            .collect();
+        let mut registered: Vec<&str> = ALL_BLEND_PASSES
+            .iter()
+            .map(|pass| pass.fragment_entry)
+            .collect();
+        derived.sort_unstable();
+        registered.sort_unstable();
+        assert_eq!(
+            derived, registered,
+            "the shader's blend-math @fragment entry points and ALL_BLEND_PASSES's fragment_entry \
+             values name different sets. A BlendPass whose fragment_entry does not exist in the \
+             shader is a pipeline-creation failure at runtime; a shader entry point no BlendPass \
+             names is dead code no dispatch can reach."
+        );
+
+        // No two consts may share a `fragment_entry`: it is the
+        // discriminating field of the `PipelineKey` each pass caches under,
+        // so a duplicate would silently serve one mode's pipeline for
+        // another. On the sorted list a shared name is an adjacent pair.
+        // The set equality above cannot see this on its own, since two
+        // equal-length lists with a duplicate on one side and a distinct
+        // name on the other compare unequal only by luck of ordering.
+        for pair in registered.windows(2) {
+            if let [left, right] = pair {
+                assert_ne!(
+                    left, right,
+                    "two BLEND_PASS_* consts share the fragment_entry {left}, which is the \
+                     PipelineKey's discriminating field -- one mode would be composited with the \
+                     other's formula"
+                );
+            }
+        }
+    }
 
     /// A `SAMPLES`-length buffer of one solid `rgba` texel repeated —
     /// the CPU-side sibling of the GPU tests' own `solid_tile` below,

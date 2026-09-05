@@ -90,6 +90,62 @@ pub enum BlendMode {
     Luminosity,
 }
 
+impl BlendMode {
+    /// Every variant, once, in declaration order — the enumeration Rust
+    /// itself does not provide.
+    ///
+    /// **Why this exists** (0.112.0): several counts derived from this
+    /// enum are maintained by hand in three crates — `aurora-app`'s GPU
+    /// compositing predicate, its `GpuBlendDispatch` variant list, and
+    /// `aurora-render`'s blend-math shader roster — and six consecutive
+    /// blend-mode porting rounds each had to restate one or more of them
+    /// in prose, with 0.107.1 and 0.111.1 both landing corrections for
+    /// numbers that had drifted out of agreement with the code. A caller
+    /// that wants "the predicate's answer for every blend mode" can only
+    /// get it by iterating the variants, and without this constant every
+    /// such caller writes its own copy of the list.
+    ///
+    /// The fixed `[Self; 27]` length is half the guard: a twenty-eighth
+    /// variant cannot be appended without the author also editing the
+    /// count, and *deleting* an entry is a compile error rather than a
+    /// silent gap. The other half is
+    /// `blend_mode_all_lists_every_variant_exactly_once`, which is what
+    /// catches an entry *replaced* by a duplicate of another — the one
+    /// mutation the declared length cannot see.
+    ///
+    /// The enum has no `#[non_exhaustive]`, so this list being complete is
+    /// a property downstream crates may rely on.
+    pub const ALL: [Self; 27] = [
+        Self::Normal,
+        Self::Dissolve,
+        Self::Darken,
+        Self::Multiply,
+        Self::ColorBurn,
+        Self::LinearBurn,
+        Self::DarkerColor,
+        Self::Lighten,
+        Self::Screen,
+        Self::ColorDodge,
+        Self::LinearDodge,
+        Self::LighterColor,
+        Self::Overlay,
+        Self::SoftLight,
+        Self::HardLight,
+        Self::VividLight,
+        Self::LinearLight,
+        Self::PinLight,
+        Self::HardMix,
+        Self::Difference,
+        Self::Exclusion,
+        Self::Subtract,
+        Self::Divide,
+        Self::Hue,
+        Self::Saturation,
+        Self::Color,
+        Self::Luminosity,
+    ];
+}
+
 /// Which edits a layer refuses. Mirrors PSD's own `lspf` (Protected
 /// Setting) tagged block bit-for-bit — transparency / pixels (composite) /
 /// position — rather than inventing a different shape, so `aurora-io`
@@ -209,5 +265,70 @@ impl LayerEntry {
             lock: LayerLock::default(),
             mask: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlendMode;
+
+    /// A distinct number per variant, from an *exhaustive* `match` — so a
+    /// twenty-eighth variant added to the enum fails to compile here until
+    /// it is given an index, which is what makes this function a real
+    /// witness rather than a second hand-written list that can drift.
+    ///
+    /// Deliberately not `as u8` on the enum itself: `BlendMode` carries no
+    /// `#[repr]` and no explicit discriminants, so casting would be
+    /// asserting something about a representation this crate does not
+    /// promise.
+    fn variant_index(mode: BlendMode) -> u8 {
+        match mode {
+            BlendMode::Normal => 0,
+            BlendMode::Dissolve => 1,
+            BlendMode::Darken => 2,
+            BlendMode::Multiply => 3,
+            BlendMode::ColorBurn => 4,
+            BlendMode::LinearBurn => 5,
+            BlendMode::DarkerColor => 6,
+            BlendMode::Lighten => 7,
+            BlendMode::Screen => 8,
+            BlendMode::ColorDodge => 9,
+            BlendMode::LinearDodge => 10,
+            BlendMode::LighterColor => 11,
+            BlendMode::Overlay => 12,
+            BlendMode::SoftLight => 13,
+            BlendMode::HardLight => 14,
+            BlendMode::VividLight => 15,
+            BlendMode::LinearLight => 16,
+            BlendMode::PinLight => 17,
+            BlendMode::HardMix => 18,
+            BlendMode::Difference => 19,
+            BlendMode::Exclusion => 20,
+            BlendMode::Subtract => 21,
+            BlendMode::Divide => 22,
+            BlendMode::Hue => 23,
+            BlendMode::Saturation => 24,
+            BlendMode::Color => 25,
+            BlendMode::Luminosity => 26,
+        }
+    }
+
+    /// The half of [`BlendMode::ALL`]'s guard that its declared length
+    /// cannot provide: an entry *replaced* by a duplicate of another
+    /// variant keeps the array 27 long and compiles cleanly, and only a
+    /// completeness check notices. Deleting an entry, by contrast, is
+    /// already a compile error.
+    #[test]
+    fn blend_mode_all_lists_every_variant_exactly_once() {
+        let mut indices: Vec<u8> = BlendMode::ALL.iter().copied().map(variant_index).collect();
+        indices.sort_unstable();
+        let expected: Vec<u8> = (0..27).collect();
+        assert_eq!(
+            indices, expected,
+            "BlendMode::ALL must list each of the 27 variants exactly once, in any order. A \
+             repeated index means one entry is a duplicate of another; a missing index means the \
+             variant it belongs to is absent, so every count derived by iterating ALL is short by \
+             one and no length assertion can see it."
+        );
     }
 }
