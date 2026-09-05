@@ -240,6 +240,31 @@ const LABEL_VIVID_LIGHT_BIND_GROUP: &str = "composite.vivid_light.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_VIVID_LIGHT_PASS: &str = "composite.vivid_light.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_hard_mix_over_with_opacity`] (0.115.0)
+/// — the same four-label set the thirteen modes above each carry, for the
+/// same reason: fourteen blend-math pipelines sharing one `"composite"` label
+/// would leave a `wgpu` validation message or a frame capture unable to
+/// say which blend mode is at fault. **The near-name risk here is a *call
+/// graph* one level deeper than `VividLight`'s**: this mode's shader calls
+/// `hard_mix_channel`, which calls `vivid_light_channel`, which calls
+/// `color_burn_channel` and `color_dodge_channel` — so a capture naming
+/// `"composite.vivid_light"`, `"composite.color_burn"` or
+/// `"composite.color_dodge"` is a plausible reading of a `HardMix` frame gone
+/// wrong, and all three are live pipelines a mistyped `fragment_entry` here
+/// would build instead. `"composite.hard_light"` is a fourth hazard and a
+/// purely lexical one: `hard_mix` and `hard_light` share a prefix and a length,
+/// and `HardLight` is unrelated to this mode's formula, so a swap there is a
+/// typo rather than a reasoning error. Spelled in full (`hard_mix`, never
+/// `hard`) for the reason every pair above is.
+const LABEL_HARD_MIX: &str = "composite.hard_mix";
+/// That method's own per-call uniform buffer.
+const LABEL_HARD_MIX_UNIFORM: &str = "composite.hard_mix.opacity";
+/// That method's own per-call bind group.
+const LABEL_HARD_MIX_BIND_GROUP: &str = "composite.hard_mix.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_HARD_MIX_PASS: &str = "composite.hard_mix.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -503,6 +528,28 @@ const BLEND_PASS_VIVID_LIGHT: BlendPass = BlendPass {
     pass: LABEL_VIVID_LIGHT_PASS,
 };
 
+/// [`BlendMode::HardMix`]'s, likewise (0.115.0). Every field differs from every
+/// const above. Its `fragment_entry` mis-typing hazard is the widest in this
+/// file, because this mode's shader reaches *three* other live entry points
+/// transitively: `"fs_composite_vivid_light"` is what dropping its threshold
+/// computes exactly, and `"fs_composite_color_burn"` and
+/// `"fs_composite_color_dodge"` are what that mode's own two arms compute.
+/// Which channels can see each is not a matter of luck: every channel whose
+/// `B` is `0` provably agrees with `ColorBurn` and every channel whose `B` is
+/// `1` provably agrees with `ColorDodge` (see `hard_mix_channel`'s own comment
+/// in `shaders/composite.wgsl`, degeneracy 2), so separating both callees needs
+/// a fixture carrying both rails — which every `composite_hard_mix_*` fixture
+/// but the corner probe does. `"fs_composite_vivid_light"` is separated by any
+/// channel whose `VividLight` value is neither `0` nor `1`. Those are mutations
+/// (g) and (h) of this round's set.
+const BLEND_PASS_HARD_MIX: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_hard_mix",
+    pipeline: LABEL_HARD_MIX,
+    uniform: LABEL_HARD_MIX_UNIFORM,
+    bind_group: LABEL_HARD_MIX_BIND_GROUP,
+    pass: LABEL_HARD_MIX_PASS,
+};
+
 /// Every [`BlendPass`] const above, once — this crate's own registry of
 /// the blend-math entry points it can dispatch (0.112.0).
 ///
@@ -530,7 +577,7 @@ const BLEND_PASS_VIVID_LIGHT: BlendPass = BlendPass {
 /// one, which merged the two comments and left this array documented by
 /// nothing — one doc block per const, immediately above it, is the pattern
 /// every other mode here follows.)
-const ALL_BLEND_PASSES: [&BlendPass; 13] = [
+const ALL_BLEND_PASSES: [&BlendPass; 14] = [
     &BLEND_PASS_MULTIPLY,
     &BLEND_PASS_DARKEN,
     &BLEND_PASS_LIGHTEN,
@@ -544,6 +591,7 @@ const ALL_BLEND_PASSES: [&BlendPass; 13] = [
     &BLEND_PASS_HARD_LIGHT,
     &BLEND_PASS_LINEAR_LIGHT,
     &BLEND_PASS_VIVID_LIGHT,
+    &BLEND_PASS_HARD_MIX,
 ];
 
 /// How many blend-math `@fragment` entry points this crate dispatches —
@@ -1773,37 +1821,41 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// tenth, [`Self::composite_hard_light_over_with_opacity`] (0.111.0)
 /// the eleventh — that one being the exact transposed twin of the
 /// tenth — [`Self::composite_linear_light_over_with_opacity`] (0.113.0)
-/// the twelfth, and
+/// the twelfth,
 /// [`Self::composite_vivid_light_over_with_opacity`] (0.114.0) the
 /// thirteenth, whose blend term is built entirely out of the eighth's and
-/// ninth's own per-channel helpers,
+/// ninth's own per-channel helpers, and
+/// [`Self::composite_hard_mix_over_with_opacity`] (0.115.0) the
+/// fourteenth, whose blend term is the thirteenth's own helper plus one
+/// comparison,
 /// each built to exactly the same shape.
-/// The remaining 13 modes have no dedicated blend-math WGSL entry point
+/// The remaining 12 modes have no dedicated blend-math WGSL entry point
 /// of their own, and wait on one — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
-/// 13 is "26 minus the thirteen, `Multiply`, `Darken`, `Lighten`, `Screen`,
+/// 12 is "26 minus the fourteen, `Multiply`, `Darken`, `Lighten`, `Screen`,
 /// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
-/// `Overlay`, `HardLight`, `LinearLight` and `VividLight`, done so
+/// `Overlay`, `HardLight`, `LinearLight`, `VividLight` and `HardMix`, done so
 /// far." (Both halves of that arithmetic are derivable rather than typed:
 /// `BLEND_MATH_PASS_COUNT` is `ALL_BLEND_PASSES`'s own length, and
 /// `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`
 /// ties it to `shaders/composite.wgsl` by set equality.)
 ///
-/// **`Normal` is one of those 13 and is *not* CPU-only**, so read the
+/// **`Normal` is one of those 12 and is *not* CPU-only**, so read the
 /// figure as "no blend-math shader", never as "no GPU path":
 /// [`Self::composite_over_with_opacity`]'s fixed-function
 /// `Blend::AlphaBlending` unit already expresses `Normal` on the GPU,
 /// which is exactly why it needs no formula in
 /// `shaders/composite.wgsl`. The modes genuinely left to
-/// `composite_tile_cpu` are therefore the other **12**, and that is
+/// `composite_tile_cpu` are therefore the other **11**, and that is
 /// precisely `aurora-app`'s own count of what its GPU predicate
-/// rejects: 27 real `aurora_doc::BlendMode` variants minus the fifteen it
+/// rejects: 27 real `aurora_doc::BlendMode` variants minus the sixteen it
 /// admits (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`,
 /// `Difference`, `LinearDodge`, `LinearBurn`, `ColorBurn`, `ColorDodge`,
-/// `Overlay`, `HardLight`, `LinearLight`, `VividLight` and `Dissolve`). The two
-/// figures — 13
-/// here, 12 there —
+/// `Overlay`, `HardLight`, `LinearLight`, `VividLight`, `HardMix` and
+/// `Dissolve`). The two
+/// figures — 12
+/// here, 11 there —
 /// count different
 /// things, and the one mode between them is `Normal`. `Dissolve` is in
 /// neither set: absent from this crate's enum altogether, and *admitted*
@@ -3686,6 +3738,100 @@ impl TileCompositor {
             dst,
             opacity,
             &BLEND_PASS_VIVID_LIGHT,
+        );
+    }
+
+    /// [`BlendMode::HardMix`]'s in-shader composite (0.115.0) —
+    /// `fs_composite_hard_mix`, the **fourteenth** mode ported and the first
+    /// whose blend term is one *whole other ported mode's* per-channel helper
+    /// plus a comparison.
+    ///
+    /// Same signature, same aliasing rule (`dst` must not be `backdrop`), same
+    /// `(src, backdrop, dst)` order and same clamped-`opacity`/unclamped-`sa *
+    /// opacity` contract as
+    /// [`Self::composite_multiply_over_with_opacity`], whose doc comment
+    /// carries the full derivation of the surrounding "over".
+    ///
+    /// **The formula.** `blend_channel`'s own arm is
+    ///
+    /// ```text
+    /// BlendMode::HardMix => if VividLight(cb, cs) < 0.5 { 0.0 } else { 1.0 }
+    /// ```
+    ///
+    /// so the shader adds one helper, `hard_mix_channel`, called once per
+    /// channel. It computes no arithmetic of its own: it delegates to
+    /// `vivid_light_channel` (the entry point `VividLight` installed in
+    /// 0.114.0) and thresholds the result.
+    ///
+    /// **The closed form, and why it matters for every fixture.** Both of
+    /// `VividLight`'s arms cross `0.5` at exactly `Cb + Cs == 1`, so
+    /// `HardMix(Cb, Cs) = 1` iff `Cb + Cs >= 1` — **except at the single point
+    /// `(Cb, Cs) = (0, 1)`, where it is `0`**, because
+    /// `color_dodge_channel` tests `cb == 0.0` before `cs == 1.0` and the first
+    /// guard wins. Verified exhaustively over a `1/256` grid plus an
+    /// edge refinement: one exception, that point. Two consequences:
+    ///
+    /// - the blend term is **symmetric everywhere except that corner** (the
+    ///   sum rule is symmetric; the exception is not), and the same sweep found
+    ///   exactly two asymmetric pairs, `(0, 1)` and `(1, 0)`. So a channel with
+    ///   `Cb = 0, Cs = 1` is the *only* thing that can see the two arguments
+    ///   transposed inside this shader, and
+    ///   `composite_hard_mix_over_with_opacity_thresholds_the_guard_ordering_corner`
+    ///   is the test built on it;
+    /// - **every `B = 0` channel agrees with `ColorBurn` and every `B = 1`
+    ///   channel agrees with `ColorDodge`**, provably (`Cb + Cs < 1` forces
+    ///   `ColorBurn(Cb, Cs) = 0`; `Cb + Cs >= 1` forces
+    ///   `ColorDodge(Cb, Cs) = 1`), so separating this mode from both of its
+    ///   grand-callees needs a fixture carrying **both** rails.
+    ///
+    /// **Its `< 0.5` boundary mutation is killable, and it is the first ported
+    /// mode for which that is true.** `Overlay` (0.110.0), `HardLight`
+    /// (0.111.0) and `VividLight` (0.114.0) each disclosed an unkillable
+    /// `<=`-vs-`<` because their two branches agree *at* the boundary; here the
+    /// two arms are the constants `0.0` and `1.0`, so any input with
+    /// `VividLight(Cb, Cs)` exactly `0.5` flips the channel outright. Such
+    /// inputs are exact in binary (`Cb + Cs == 1` makes the burn arm
+    /// `1 - Cs/(2*Cs)` and the dodge arm `Cb/(2*Cb)`, both exactly `0.5`), and
+    /// `composite_hard_mix_over_with_opacity_flips_at_its_own_threshold`
+    /// carries one of each branch.
+    ///
+    /// **Not a sixth detector of `straight_backdrop`'s guard removal, and the
+    /// argument is stronger than any prior mode's**: it is a *total* launderer
+    /// twice over — the inherited `min()` in both of `VividLight`'s arms
+    /// (measured on this adapter), and, on any backend, `NaN < 0.5` being
+    /// `false` under IEEE-754, which sends `hard_mix_channel` down its `else`
+    /// branch to a finite `1.0`. The detector count stays at five.
+    ///
+    /// **Two portability guards inherited, unchanged.**
+    /// `color_burn_channel`'s `cs == 0.0` and `color_dodge_channel`'s
+    /// `cs == 1.0` are arithmetically redundant only because this adapter
+    /// divides by zero to `+inf`; see `vivid_light_channel`'s own comment in
+    /// `shaders/composite.wgsl`. This mode inherits both, exactly as
+    /// `VividLight` does — and here they are additionally *masked*, since the
+    /// threshold turns any of `0.0`/`1.0`/`+inf` into a `0.0` or `1.0` anyway.
+    ///
+    /// `aurora-app` is the only caller: `document_qualifies_for_gpu_compositing`
+    /// admits `HardMix` and `begin_gpu_composite_tile` dispatches here for every
+    /// `HardMix` root layer, counting each dispatch
+    /// (`GpuBlendDispatch::HardMix` in that crate), so no test here can be
+    /// silently satisfied by a CPU fallback.
+    pub fn composite_hard_mix_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_HARD_MIX,
         );
     }
 
@@ -6754,7 +6900,7 @@ mod tests {
     /// silently.
     ///
     /// **Since 0.109.0 the guard is shared, not per entry point, and this
-    /// is one of only five of the thirteen per-mode versions of this test
+    /// is one of only five of the fourteen per-mode versions of this test
     /// that still detect its removal** — with `screen`'s, `difference`'s,
     /// `overlay`'s (0.110.0) and `hard_light`'s (0.111.0). `Multiply`'s
     /// `cb * s.rgb`
@@ -7885,7 +8031,7 @@ mod tests {
     // `ab > 0.0` guard", and 0.109.1 corrected it here and at the six
     // sibling section headers below.** Since 0.109.0 the guard is written
     // *once*, in `composite.wgsl`'s `straight_backdrop()`, and shared by
-    // all thirteen blend-math entry points, so guard independence is not a
+    // all fourteen blend-math entry points, so guard independence is not a
     // per-entry-point property any more. It is worse than that for this
     // mode specifically: with the guard deleted, `composite_lighten_over_
     // with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
@@ -10239,7 +10385,7 @@ mod tests {
     ///
     /// **Confirmed by measurement in 0.109.0.** The guard now lives once in
     /// `composite.wgsl`'s shared `straight_backdrop()`, and deleting it
-    /// fails exactly five of the thirteen per-mode versions of this test —
+    /// fails exactly five of the fourteen per-mode versions of this test —
     /// `multiply`'s, `screen`'s, this one, `overlay`'s (0.110.0) and
     /// `hard_light`'s (0.111.0) —
     /// for exactly that reason,
@@ -19594,7 +19740,7 @@ mod tests {
     /// burn arm (`1 - min(1, NaN)` is `1 - 1`) or a finite `1.0` in the dodge
     /// arm, and `fold_over`'s `ab == 0.0` erases it anyway. Measured in
     /// 0.114.0: with the guard deleted, **this test stays green**. The detector
-    /// count stays at **five of thirteen**.
+    /// count stays at **five of fourteen**.
     ///
     /// The finiteness check below is kept regardless: a backend whose `min()`
     /// does *not* launder would surface exactly there rather than as a silent
@@ -19856,6 +20002,1200 @@ mod tests {
              (0.5, 0.375), Exclusion (0.625, 0.5625), LinearDodge (1.0, 1.0), LinearBurn \
              (0.0, 0.125), Overlay (0.625, 0.5625), HardLight (0.375, 0.6875) and HardMix \
              (1.0, 1.0)."
+        );
+    }
+
+    // -- `BlendMode::HardMix` on the GPU (0.115.0), the **fourteenth** mode
+    // ported. `fs_composite_hard_mix` + `hard_mix_channel` in
+    // `shaders/composite.wgsl`, dispatched through `BLEND_PASS_HARD_MIX` and
+    // `TileCompositor::composite_hard_mix_over_with_opacity`. Read
+    // `hard_mix_channel`'s own comment first; this header records only what
+    // constrains the eight fixtures below.
+    //
+    // **The closed form.** `HardMix(Cb, Cs) = 1` iff `Cb + Cs >= 1`, **except
+    // at `(Cb, Cs) = (0, 1)`, where it is `0`** -- `color_dodge_channel` tests
+    // `cb == 0.0` before `cs == 1.0`, so at that one point the first guard wins
+    // and returns `0` where the second would return `1`. Verified exhaustively
+    // over the `1/256` grid on `[0, 1]^2` plus an edge refinement (`0`, `2^-16`,
+    // `2^-10`, `1 - 2^-10`, `1 - 2^-16`, `1`): exactly one exception, exactly
+    // that point.
+    //
+    // **`B` only ever takes the values `0.0` and `1.0`** -- which is what
+    // `hard_mix_produces_only_pure_black_or_white` already pins on the CPU
+    // side, and it shapes every fixture here: at effective alpha `1.0` over an
+    // opaque accumulator the composite *is* `B`, so a golden of `(1, 0, 0)` or
+    // `(0, 1, 0)` is the expected shape rather than a suspicious one. The
+    // fixtures that need distinct, interior golden channels get them from a
+    // non-unit alpha (tests 1, 2 and 4) or from an alpha above `1` (test 5).
+    //
+    // **Degeneracies, and what each fixture must therefore carry.**
+    //
+    //   1. `Cb == 0` forces `B = 0` for every `Cs`, and `Cb == 1` forces
+    //      `B = 1`. A black or white *backdrop* channel is a formula dead end.
+    //   2. **Every `B = 0` channel provably agrees with `ColorBurn`, and every
+    //      `B = 1` channel with `ColorDodge`** (`Cb + Cs < 1` gives
+    //      `(1 - Cb)/Cs > 1` so `ColorBurn = 0`; `Cb + Cs >= 1` gives
+    //      `Cb/(1 - Cs) >= 1` so `ColorDodge = 1`). Separating both of this
+    //      mode's grand-callees therefore needs a fixture with **both** rails.
+    //      Tests 1, 2, 4, 5, 6 and 7 all have both; test 8 deliberately does
+    //      not, and says so.
+    //   3. A channel whose `VividLight` value is exactly `0` or `1` cannot see
+    //      the threshold being dropped, since `B` equals it there. Every
+    //      fixture but test 8 keeps at least one channel off both of
+    //      `VividLight`'s rails.
+    //   4. `Cb == Cs` hides a transposed operand pair, as for every mode.
+    //   5. A source channel at exactly `0.5` is **not** a no-op here (unlike
+    //      `VividLight`, whose degeneracy 1 it does not inherit):
+    //      `H(Cb, 0.5) = 1[Cb >= 0.5]`. It is still `vivid_light_channel`'s own
+    //      branch boundary, which test 7's blue exercises.
+    //
+    // **Symmetry: the blend term is symmetric everywhere except the `(0, 1)`
+    // corner**, since `Cb + Cs >= 1` is symmetric and the exception is not --
+    // the same sweep found exactly two asymmetric pairs, `(0, 1)` and `(1, 0)`.
+    // So a **transposed operand pair inside the shader** is invisible in every
+    // channel but a corner one, and test 8 is the only test here that can see
+    // it. That is a different mutation from a **transposed dispatch arm** in
+    // `aurora-app`, which also transposes the fold's own `(1 - a)*(Cb - Cs)`
+    // term and is caught in all three channels of
+    // `NORMAL_MULTIPLY_HARD_MIX_STACK` -- measured by
+    // `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+    // transposed_argument`'s arithmetic assertion, whose two folds differ by a
+    // full `1.0` in red there.
+    //
+    // **The `< 0.5` boundary mutation IS killable, and this is the first
+    // ported mode for which that is true** -- `Overlay` (0.110.0), `HardLight`
+    // (0.111.0) and `VividLight` (0.114.0) each had to disclose an unkillable
+    // `<=`-vs-`<`, because for those three the two branches agree at the
+    // boundary. Here the two arms are the constants `0.0` and `1.0`, so an
+    // input with `VividLight(Cb, Cs)` exactly `0.5` flips the channel outright;
+    // and `Cb + Cs == 1` with binary-exact operands gives exactly that, the
+    // burn arm computing `1 - Cs/(2*Cs)` and the dodge arm `Cb/(2*Cb)`, both
+    // exact in IEEE-754. Test 7 carries one of each branch.
+    //
+    // **Not a sixth detector of `straight_backdrop`'s guard removal** -- and
+    // the argument is stronger than any prior non-detector's, because it does
+    // not rest on this vendor's `FMin`. Two independent mechanisms each
+    // suffice: the `min()` inherited from both of `VividLight`'s arms launders
+    // the `NaN` on this adapter (probed in 0.109.1), and on *any* backend
+    // `NaN < 0.5` is `false`, so `hard_mix_channel` takes its `else` branch and
+    // returns a finite `1.0`. Predicted in this round, then measured: test 6
+    // stays green with the guard deleted. The detector count stays at **five of
+    // fourteen** (`Multiply`, `Screen`, `Difference`, `Overlay`, `HardLight`).
+    //
+    // **Two portability guards inherited unchanged**, `color_burn_channel`'s
+    // `cs == 0.0` and `color_dodge_channel`'s `cs == 1.0`, each redundant only
+    // because this adapter divides by zero to `+inf` where WGSL promises an
+    // indeterminate value. Here they are additionally *masked* by the
+    // threshold, which maps `0.0`, `1.0` and `+inf` alike onto a `0.0` or
+    // `1.0` -- so no test here can exercise them, exactly as none in the
+    // `VividLight` suite can.
+    //
+    // `CPU_ONLY_BLEND_MODE` in `aurora-app` stays `Exclusion`: this round
+    // retargeted no fixture anywhere, so both PLAN.md-tracked CPU-fallback
+    // benchmarks stay comparable across it.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`, NVIDIA GeForce
+    // RTX 3090, Vulkan, DiscreteGpu). One backend on one vendor: Metal and DX12
+    // remain unverified for `fs_composite_hard_mix`.
+
+    #[test]
+    /// The plain case, and the fixture that carries **both rails and the
+    /// `(0, 1)` corner in one draw**: an opaque `(0.0, 0.65625, 0.375)`
+    /// accumulator under a `(1.0, 0.5625, 0.4375)` source at its own `0.5`
+    /// alpha. These are exactly `aurora-app`'s
+    /// `NORMAL_MULTIPLY_HARD_MIX_STACK` operands, so the two crates' goldens
+    /// are the same number derived twice.
+    ///
+    /// Per channel, with `B = HardMix(Cb, Cs)`:
+    ///
+    /// - red: `Cb = 0`, `Cs = 1` — **the corner**. `Cs > 0.5` selects the dodge
+    ///   arm, whose `cb == 0.0` guard fires first and returns `0`, so
+    ///   `VividLight = 0` and `B = 0` — where the `Cb + Cs >= 1` sum rule alone
+    ///   would predict `1`. Its transpose `(1, 0)` selects the *burn* arm,
+    ///   whose `cb == 1.0` guard returns `1`, so `B^T = 1`. **This is the only
+    ///   channel shape in this mode that distinguishes its own threshold logic
+    ///   from the sum rule, or catches the two operands swapped inside the
+    ///   shader.**
+    /// - green: `Cs = 0.5625 > 0.5`, **dodge**:
+    ///   `ColorDodge(0.65625, 0.125) = min(1, 0.65625 / 0.875) = 0.75`
+    ///   exactly, so `B = 1` — and `0.75` is off both of `VividLight`'s rails,
+    ///   which is what keeps the dropped-threshold mutation live;
+    /// - blue: `Cs = 0.4375 <= 0.5`, **burn**:
+    ///   `1 - min(1, 0.625 / 0.875) = 2/7 ≈ 0.2857`, so `B = 0` — interior
+    ///   again, and *below* `0.5` where green's is above, so blue is also what
+    ///   catches the threshold constant being moved down.
+    ///
+    /// `B = (0.0, 1.0, 0.0)` — both rails — and the fold at `a = 0.5` over an
+    /// opaque accumulator is `0.5 * Cb + 0.5 * B`, giving
+    /// `(0.0, 0.828125, 0.1875)` at alpha `1.0`. **All three golden channels
+    /// are distinct.**
+    ///
+    /// Rival arms, re-derived in exact rationals (`0.5 * Cb + 0.5 * B` for each
+    /// mode's own `B`):
+    ///
+    /// - **`VividLight` `(0.0, 0.703125, 0.3303..)`** — what dropping the
+    ///   threshold, or a `fragment_entry` naming `fs_composite_vivid_light`,
+    ///   computes; a live GPU arm. Green and blue carry it. **REQUIRED
+    ///   DISCLOSURE: red cannot**, its `VividLight` value being `0`, which
+    ///   already equals its own `B`.
+    /// - **`ColorBurn` `(0.0, 0.5225.., 0.1875)`** — green only, by
+    ///   degeneracy 2: red and blue are `B = 0` channels and provably agree
+    ///   with it.
+    /// - **`ColorDodge` `(0.0, 0.828125, 0.5208..)`** — blue only, the mirror
+    ///   of that: red and green are `B = 1`-or-corner channels.
+    /// - **A componentwise `select(0.0, 1.0, cb + s >= 1.0)`**, i.e. the closed
+    ///   form with the corner exception dropped: `(0.5, 0.828125, 0.1875)` —
+    ///   **red alone**, which is the whole reason this fixture has a corner.
+    /// - **The two operands transposed inside the shader**:
+    ///   `(0.5, 0.828125, 0.1875)` — red alone, and identical to the previous
+    ///   row, since both mutations differ from the truth only at the corner.
+    /// - `Normal` `(0.5, 0.609375, 0.40625)`, `Multiply`
+    ///   `(0.0, 0.51269531, 0.26953125)`, `Screen`
+    ///   `(0.5, 0.75292969, 0.51171875)`, `Darken` `(0.0, 0.609375, 0.375)`,
+    ///   `Lighten` `(0.5, 0.65625, 0.40625)`, `Difference`
+    ///   `(0.5, 0.375, 0.21875)`, `Exclusion`
+    ///   `(0.5, 0.56835938, 0.4296875)`, `LinearDodge`
+    ///   `(0.5, 0.828125, 0.59375)`, `LinearBurn` `(0.0, 0.4375, 0.1875)`,
+    ///   `Overlay` `(0.0, 0.67773438, 0.3515625)`, `HardLight`
+    ///   `(0.5, 0.67773438, 0.3515625)`, `LinearLight`
+    ///   `(0.5, 0.71875, 0.3125)` and `PinLight`
+    ///   `(0.5, 0.65625, 0.375)` — none coinciding in more than one channel.
+    ///
+    /// The golden is cross-checked against the real [`composite_tile_cpu`]
+    /// first, so a stale literal fails as a setup error rather than as a GPU
+    /// disagreement.
+    fn composite_hard_mix_over_with_opacity_takes_both_rails_per_channel() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.0, 0.65625, 0.375, 1.0];
+        let top_rgba = [1.0, 0.5625, 0.4375, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.0, 0.65625, 0.375, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass then \
+             samples -- red's 0.0 is deliberate and is this fixture's corner channel (degeneracy \
+             1 for the formula, and the only channel shape that can see the operands transposed)"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.0, 0.828_125, 0.1875, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself computes \
+             for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.0, 0.828_125, 0.1875, 1.0),
+            "HardMix thresholds VividLight at 0.5: VividLight is (0.0, 0.75, 0.2857..) so B is \
+             (0.0, 1.0, 0.0), and 0.5*Cb + 0.5*B is (0.0, 0.828125, 0.1875). Red is the (0, 1) \
+             corner, where color_dodge_channel's cb == 0.0 guard fires before its cs == 1.0 one \
+             and returns 0 -- the single point at which HardMix departs from the Cb + Cs >= 1 sum \
+             rule. (0.5, 0.828125, 0.1875, 1.0) is what BOTH a componentwise \
+             select(0.0, 1.0, cb + s >= 1.0) and the two operands transposed inside the shader \
+             compute, and red alone can see either. (0.0, 0.703125, 0.3303.., 1.0) would mean the \
+             threshold was dropped, i.e. fs_composite_vivid_light -- green and blue see that, red \
+             cannot, its VividLight value already being 0. ColorBurn gives \
+             (0.0, 0.5225.., 0.1875) -- green only, since every B = 0 channel provably agrees \
+             with it -- and ColorDodge (0.0, 0.828125, 0.5208..) -- blue only, the mirror. The \
+             Normal arm gives (0.5, 0.609375, 0.40625), Multiply \
+             (0.0, 0.51269531, 0.26953125), Screen (0.5, 0.75292969, 0.51171875), Darken \
+             (0.0, 0.609375, 0.375), Lighten (0.5, 0.65625, 0.40625), Difference \
+             (0.5, 0.375, 0.21875), Exclusion (0.5, 0.56835938, 0.4296875), LinearDodge \
+             (0.5, 0.828125, 0.59375), LinearBurn (0.0, 0.4375, 0.1875), Overlay \
+             (0.0, 0.67773438, 0.3515625), HardLight (0.5, 0.67773438, 0.3515625), LinearLight \
+             (0.5, 0.71875, 0.3125) and PinLight (0.5, 0.65625, 0.375)."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case, exercising the shared
+    /// `straight_backdrop()`'s recovery
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`) as this entry point reaches it.
+    ///
+    /// The backdrop is `(0.75, 0.5, 0.25)` at half opacity — so the
+    /// accumulator arrives premultiplied as `(0.375, 0.25, 0.125)` at alpha
+    /// `0.5` and the shader has a real division to do — under a
+    /// `(0.375, 0.625, 0.4375)` source at alpha `1.0`.
+    ///
+    /// Correct `B`: red `Cb + Cs = 1.125 >= 1` so `1` (burn branch,
+    /// `VividLight = 2/3`); green `1.125 >= 1` so `1` (dodge branch,
+    /// `VividLight = 2/3`); blue `0.6875 < 1` so `0` (burn branch,
+    /// `VividLight = 1/7 ≈ 0.1429`). Both branches, both rails, and every
+    /// channel off both of `VividLight`'s rails. The fold at `ab = 0.5` with
+    /// `a = 1.0` is `0.5 * Cs + 0.5 * B`, giving
+    /// `(0.6875, 0.8125, 0.21875)` at alpha `1.0`.
+    ///
+    /// **A missing un-premultiply is a *threshold flip* here, not a magnitude
+    /// error** — which is what makes this mode's version of this test sharper
+    /// than its siblings'. Halving `Cb` to `(0.375, 0.25, 0.125)` takes red's
+    /// sum to `0.75` and green's to `0.875`, both under `1`, so both `B`
+    /// channels fall from `1` to `0`; blue's `0.5625` was already under `1` and
+    /// does not move. The mutant reads `(0.1875, 0.3125, 0.21875)` — red off by
+    /// `0.5` and green by `0.5`, against a `2 * f16::EPSILON` tolerance.
+    ///
+    /// **REQUIRED DISCLOSURE: blue cannot see that mutation at all**, for the
+    /// stated reason — it is a `B = 0` channel under both. Two live
+    /// discriminators remain, and each moves by half the range rather than by a
+    /// rounding.
+    ///
+    /// The expected value is asserted both ways: against the real
+    /// [`composite_tile_cpu`] within `2 * f16::EPSILON`, and as the absolute
+    /// literal `(0.6875, 0.8125, 0.21875, 1.0)`.
+    fn composite_hard_mix_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.75, 0.5, 0.25, 1.0];
+        let top_rgba = [0.375, 0.625, 0.4375, 1.0];
+        let backdrop_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                backdrop_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.375, 0.25, 0.125, 0.5),
+            "setup: the accumulator must be premultiplied at alpha 0.5, so the entry point under \
+             test has a real un-premultiply to do"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, backdrop_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        assert_eq!(
+            gpu_result,
+            (0.6875, 0.8125, 0.21875, 1.0),
+            "0.5*Cs + 0.5*B against a half-alpha accumulator, with Cb recovered as \
+             (0.75, 0.5, 0.25) and B = (1.0, 1.0, 0.0). Without the un-premultiply Cb would be \
+             (0.375, 0.25, 0.125), taking red's and green's sums under 1 and flipping both B \
+             channels to 0, which reads (0.1875, 0.3125, 0.21875, 1.0) -- red and green see that, \
+             blue cannot, being a B = 0 channel either way. Full texel: {gpu_result:?}"
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader HardMix path and composite_tile_cpu disagree \
+                 against a half-alpha accumulator ({gpu} vs {cpu}). Full texels: {gpu_result:?} \
+                 vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The spatial-addressing test for the `fs_composite_hard_mix` entry point,
+    /// and the only `HardMix` test here that can catch a V-flip, a transposed
+    /// axis or a UV offset: two [`patterned_texels`] layers, one whole-tile
+    /// differential against [`composite_tile_cpu`].
+    ///
+    /// **What this fixture cannot do, disclosed rather than implied.**
+    /// `patterned_texels` varies over multiples of `0.25`, so a large fraction
+    /// of the tile lands on this mode's dead ends: every *backdrop* channel of
+    /// `0.0` or `1.0` fixes `B` outright (degeneracy 1), and blue's quadrant
+    /// encoding puts `0.0` in a whole quadrant of the accumulator. Worse for a
+    /// *formula* check than the sibling suites', because `B` is two-valued: any
+    /// texel whose sum is far from `1` pins the right answer under a wide range
+    /// of wrong formulas.
+    ///
+    /// So this is deliberately a *spatial* check rather than a formula check.
+    /// The formula checks are tests 1, 2, 4, 5, 6, 7 and 8, whose solid
+    /// fixtures are chosen against the degeneracies above. What is only
+    /// reachable here is a wrong *texel*: the accumulator is verified
+    /// texel-for-texel first, so a disagreement below is attributable to the
+    /// `HardMix` pass alone.
+    fn composite_hard_mix_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the HardMix comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader HardMix path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel bug \
+             (V-flip, transpose, UV offset, transposed binding), not precision -- but note this \
+             fixture's degenerate texels, enumerated in the doc comment: a 0.0 or 1.0 backdrop \
+             channel fixes B outright, and B being two-valued means any texel whose Cb + Cs is \
+             far from 1 pins the right answer under many wrong formulas.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `HardMix` path, exercising the
+    /// `s.a * opacity.value` scale, with a fixture whose three channels sit in
+    /// three *different* places relative to `VividLight`'s own rails.
+    ///
+    /// `Cb = (0.375, 0.8125, 0.625)`, `Cs = (0.8125, 0.25, 0.3125)`, opacity
+    /// `0.5` against a source alpha of `1.0`:
+    ///
+    /// - red: **dodge**, `ColorDodge(0.375, 0.625) = min(1, 0.375/0.375)`,
+    ///   raw exactly `1.0`, so `VividLight` is **on its upper rail**;
+    ///   `Cb + Cs = 1.1875 >= 1` so `B = 1`;
+    /// - green: **burn**,
+    ///   `1 - min(1, 0.1875/0.5) = 0.625`, **interior and above `0.5`**;
+    ///   `Cb + Cs = 1.0625 >= 1` so `B = 1`;
+    /// - blue: **burn**, `1 - min(1, 0.375/0.625) = 0.4`, **interior and below
+    ///   `0.5`**; `Cb + Cs = 0.9375 < 1` so `B = 0`.
+    ///
+    /// `B = (1.0, 1.0, 0.0)` and `0.5 * Cb + 0.5 * B` gives
+    /// `(0.6875, 0.90625, 0.3125)` at alpha `1.0`. **All three golden channels
+    /// are distinct**, and blue's `0.4` is what makes this the fixture that
+    /// catches the threshold *constant* moving: at `0.25` blue's `B` flips to
+    /// `1` and the texel reads `(0.6875, 0.90625, 0.8125)`.
+    ///
+    /// **REQUIRED DISCLOSURE: red cannot see the threshold being dropped**, its
+    /// `VividLight` value being exactly `1.0` already (degeneracy 3); green and
+    /// blue can, giving `(0.6875, 0.71875, 0.5125)`.
+    ///
+    /// Rival arms, re-derived in exact rationals: `ColorBurn`
+    /// `(0.3028.., 0.53125, 0.3125)` — blue coincides, by degeneracy 2;
+    /// `ColorDodge` `(0.6875, 0.90625, 0.7670..)` — red and green coincide,
+    /// the mirror; `Normal` `(0.59375, 0.53125, 0.46875)`, `Multiply`
+    /// `(0.33984375, 0.5078125, 0.41015625)`, `Screen`
+    /// `(0.62890625, 0.8359375, 0.68359375)`, `Darken`
+    /// `(0.375, 0.53125, 0.46875)`, `Lighten` `(0.59375, 0.8125, 0.625)`,
+    /// `Difference` `(0.40625, 0.6875, 0.46875)`, `Exclusion`
+    /// `(0.4765625, 0.734375, 0.5859375)`, `LinearDodge`
+    /// `(0.6875, 0.90625, 0.78125)`, `LinearBurn`
+    /// `(0.28125, 0.4375, 0.3125)`, `Overlay`
+    /// `(0.4921875, 0.765625, 0.5546875)`, `HardLight`
+    /// `(0.5703125, 0.609375, 0.5078125)`, `LinearLight`
+    /// `(0.6875, 0.5625, 0.4375)`, `PinLight` `(0.5, 0.65625, 0.625)` —
+    /// none coinciding in more than two channels, and the two that reach two
+    /// are the two provable rail agreements.
+    ///
+    /// A componentwise sum-threshold and a shader-internal operand transpose
+    /// both leave this fixture **unchanged** — there is no corner channel here.
+    /// That is by design: test 8 is where those two live.
+    fn composite_hard_mix_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.375, 0.8125, 0.625, 1.0];
+        let top_rgba = [0.8125, 0.25, 0.3125, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::HardMix),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.6875, 0.90625, 0.3125, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself computes \
+             -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.6875, 0.90625, 0.3125, 1.0),
+            "the opacity uniform must scale the source alpha before the fold: VividLight is \
+             (1.0, 0.625, 0.4) -- red on its upper rail, green interior above 0.5, blue interior \
+             below it -- so B is (1.0, 1.0, 0.0) and 0.5*Cb + 0.5*B is \
+             (0.6875, 0.90625, 0.3125). (0.6875, 0.90625, 0.8125, 1.0) would mean the threshold \
+             constant moved to 0.25, seen by blue alone. (0.6875, 0.71875, 0.5125, 1.0) would \
+             mean the threshold was dropped entirely, i.e. fs_composite_vivid_light -- green and \
+             blue see that, red cannot, its VividLight value already being 1.0. ColorBurn gives \
+             (0.3028.., 0.53125, 0.3125) and ColorDodge (0.6875, 0.90625, 0.7670..), each \
+             coinciding only in the channels degeneracy 2 makes it provably agree with. The \
+             Normal arm gives (0.59375, 0.53125, 0.46875), Multiply \
+             (0.33984375, 0.5078125, 0.41015625), Screen (0.62890625, 0.8359375, 0.68359375), \
+             Darken (0.375, 0.53125, 0.46875), Lighten (0.59375, 0.8125, 0.625), Difference \
+             (0.40625, 0.6875, 0.46875), Exclusion (0.4765625, 0.734375, 0.5859375), LinearDodge \
+             (0.6875, 0.90625, 0.78125), LinearBurn (0.28125, 0.4375, 0.3125), Overlay \
+             (0.4921875, 0.765625, 0.5546875), HardLight (0.5703125, 0.609375, 0.5078125), \
+             LinearLight (0.6875, 0.5625, 0.4375) and PinLight (0.5, 0.65625, 0.625). A \
+             sum-threshold rewrite and a shader-internal operand transpose both leave this \
+             fixture unchanged -- it has no (0, 1) corner channel; see test 8."
+        );
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader HardMix path and composite_tile_cpu disagree at \
+                 opacity 0.5 ({gpu} vs {cpu}). Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// A source alpha above `1.0` — legal in `f16` and deliberately *not*
+    /// clamped, matching [`composite_layer_into`], which clamps the *opacity*
+    /// and not the `sa * opacity` product.
+    ///
+    /// `Cb = (0.75, 0.375, 0.5)`, `Cs = (0.375, 0.9375, 0.25)` at alpha `2.0`
+    /// and opacity `1.0`, so `a = 2.0`, `inv = -1.0`, and over an opaque
+    /// accumulator the fold is `out = 2*B - Cb`:
+    ///
+    /// - red: **burn**, `VividLight = 2/3`, `Cb + Cs = 1.125 >= 1` so `B = 1`;
+    ///   `out = 1.25`, deliberately above `1.0`;
+    /// - green: **dodge**, `VividLight = 1.0` (its upper rail),
+    ///   `Cb + Cs = 1.3125` so `B = 1`; `out = 1.625`;
+    /// - blue: **burn**, `VividLight = 0.0` (its lower rail),
+    ///   `Cb + Cs = 0.75 < 1` so `B = 0`; `out = -0.5`, deliberately below
+    ///   `0.0`.
+    ///
+    /// So this fixture goes out of range in **both** directions in one draw,
+    /// which is what it exists for.
+    ///
+    /// **REQUIRED DISCLOSURE, and it is specific to this mode: an output clamp
+    /// to `[0, 1]` and a clamped `s.a * opacity` product are *indistinguishable
+    /// here, and provably so for `HardMix` in general*.** Because `B` is only
+    /// ever `0` or `1`: clamping the alpha to `1.0` gives `out = B`, and
+    /// clamping the *output* of `2*B - Cb` gives `clamp(2 - Cb) = 1 = B` where
+    /// `B = 1` and `clamp(-Cb) = 0 = B` where `B = 0`. Both read
+    /// `(1.0, 1.0, 0.0, 1.0)`. Both are therefore *killed* by this test and
+    /// merely not *separated* by it — no fixture of this mode can separate
+    /// them, which is why this is disclosed rather than designed around.
+    /// (`VividLight`'s sibling test could separate them, its `B` being
+    /// interior in one channel.)
+    ///
+    /// Dropping the threshold gives `(0.5833.., 1.625, -0.5)` — **red alone**,
+    /// green and blue sitting on `VividLight`'s own rails.
+    fn composite_hard_mix_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.75, 0.375, 0.5, 1.0];
+        let top_rgba = [0.375, 0.9375, 0.25, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::HardMix),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's own \
+                 formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        for (gpu, expected, channel) in [
+            (gr, 1.25, "r"),
+            (gg, 1.625, "g"),
+            (gb, -0.5, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold (out = 2*B - Cb \
+                 with B = (1.0, 1.0, 0.0), out of range in both directions in one draw); got \
+                 {gpu}. (1.0, 1.0, 0.0, 1.0) would mean fs_composite_hard_mix clamped the \
+                 s.a * opacity product -- OR that something clamped the output to [0, 1]: for \
+                 this mode those two are provably the same texel, since B is only ever 0 or 1, so \
+                 this test kills both without separating them. (0.5833.., 1.625, -0.5, 1.0) would \
+                 mean the threshold was dropped, seen by red alone. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The shared `straight_backdrop()` guard's **untaken** branch as
+    /// `fs_composite_hard_mix` reaches it, on real hardware — and this mode was
+    /// **predicted not to detect the guard's removal**, then measured. That is
+    /// the third such prediction (after `LinearLight`, 0.113.0, and
+    /// `VividLight`, 0.114.0), and the first that does not depend on a measured
+    /// property of this vendor's `min()`.
+    ///
+    /// **Why, and by two independent arguments.** A mode detects the guard's
+    /// removal exactly when its blend term has no `NaN`-laundering step on the
+    /// path from `cb` to `b`. This mode has two:
+    ///
+    /// - *this adapter*: it delegates to `vivid_light_channel`, both of whose
+    ///   arms end in a `min()`, which returns the finite operand here (probed
+    ///   directly in 0.109.1) — so `VividLight` is already a finite `0.0` or
+    ///   `1.0` before the threshold sees it;
+    /// - *any backend, by spec*: even if `min()` propagated the `NaN`,
+    ///   `NaN < 0.5` is `false` under IEEE-754 and WGSL's own relational
+    ///   semantics, so `hard_mix_channel` takes its `else` branch and returns
+    ///   exactly `1.0`. It cannot return a non-finite value for any input.
+    ///
+    /// Measured in 0.115.0: with the guard deleted, **this test stays green**.
+    /// The detector count stays at **five of fourteen**. Note the two
+    /// mechanisms are *not* distinguishable from the output — `fold_over`'s
+    /// `ab == 0.0` multiplies `b` away regardless — so this test cannot say
+    /// which one saved it, only that the result is finite and correct.
+    ///
+    /// The finiteness check below is kept regardless, as the siblings' are.
+    ///
+    /// **The opaque half is a real formula check.**
+    /// [`half_transparent_texels`]'s opaque `(0.75, 0.25, 0.5)` has no channel
+    /// at `0.0` or `1.0`, so degeneracy 1 is avoided; its `0.5` blue is fine
+    /// here, a `0.5` *backdrop* not being degenerate for this mode. Against
+    /// `Cs = (0.4375, 0.625, 0.375)` at effective alpha `1.0`:
+    ///
+    /// - red: **burn**, `Cb + Cs = 1.1875 >= 1`, `B = 1`
+    ///   (`VividLight = 5/7 ≈ 0.714`);
+    /// - green: **dodge**, `0.875 < 1`, `B = 0` (`VividLight = 1/3`);
+    /// - blue: **burn**, `0.875 < 1`, `B = 0` (`VividLight = 1/3`).
+    ///
+    /// So both branches and both rails are live, every channel is off both of
+    /// `VividLight`'s rails, and `out = B = (1, 0, 0)` there. `ColorBurn` would
+    /// give `(0.4286.., 0, 0)` (red only, by degeneracy 2), `ColorDodge`
+    /// `(1, 0.6667.., 0.8)` (green and blue), dropping the threshold
+    /// `(0.714.., 0.3333.., 0.3333..)` (all three) and moving the threshold to
+    /// `0.25` `(1, 1, 1)` (green and blue). A shader-internal operand transpose
+    /// leaves it unchanged — no corner channel; see test 8.
+    fn composite_hard_mix_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
+    {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let top_rgba = [0.4375, 0.625, 0.375, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. Note this \
+             mode is *not* expected to catch the guard's deletion, and unlike every prior \
+             non-detector that does not rest on this vendor's min(): even if min() propagated the \
+             NaN out of vivid_light_channel, NaN < 0.5 is false under IEEE-754, so \
+             hard_mix_channel takes its else branch and returns a finite 1.0. This assertion is \
+             kept because a backend violating *both* would surface here rather than as a silent \
+             wrong pixel."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.4375, 0.625, 0.375, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader HardMix path and composite_tile_cpu disagree across a \
+             half-transparent backdrop. In the opaque half every channel is a live \
+             discriminator -- no backdrop channel is 0.0 or 1.0 (degeneracy 1) and every channel \
+             is off both of VividLight's rails -- and the correct answer is B = (1, 0, 0): \
+             ColorBurn would give (0.4286, 0, 0), ColorDodge (1, 0.6667, 0.8), a dropped \
+             threshold (0.7143, 0.3333, 0.3333) and a threshold moved to 0.25 (1, 1, 1). In the \
+             transparent half a NaN out of the untaken `ab > 0.0` branch would show up -- though \
+             this mode is a total launderer, by two independent arguments.",
+        );
+    }
+
+    #[test]
+    /// **The threshold boundary, and the mutation it *can* kill** — the first
+    /// mode ported for which that sentence is true. `Overlay` (0.110.0),
+    /// `HardLight` (0.111.0) and `VividLight` (0.114.0) each had to disclose an
+    /// unkillable `<=`-vs-`<` at their own branch boundary, because for those
+    /// three the two branches agree exactly there. Here the two arms of the
+    /// comparison are the *constants* `0.0` and `1.0`, so any input landing
+    /// exactly on `0.5` flips a whole channel.
+    ///
+    /// `Cb = (0.75, 0.25, 0.375)`, `Cs = (0.25, 0.75, 0.5)`, both alphas and
+    /// the opacity `1.0`, so `out = B`:
+    ///
+    /// - red sits on the threshold from the **burn** side: `Cs = 0.25 <= 0.5`,
+    ///   `ColorBurn(0.75, 0.5) = 1 - min(1, 0.25/0.5)` — and `0.25/0.5` is
+    ///   exactly `0.5` in IEEE-754, so `VividLight` is exactly `0.5` and
+    ///   `0.5 < 0.5` is false, giving `B = 1`;
+    /// - green sits on it from the **dodge** side: `Cs = 0.75 > 0.5`,
+    ///   `ColorDodge(0.25, 0.5) = min(1, 0.25/0.5)`, again exactly `0.5`, so
+    ///   `B = 1`;
+    /// - blue sits on `vivid_light_channel`'s own **branch** boundary
+    ///   (`Cs == 0.5`), where both of that helper's arms give `Cb` exactly:
+    ///   `VividLight = 0.375`, under the threshold, so `B = 0`. A `0.5` source
+    ///   channel is therefore *not* a no-op for this mode, unlike
+    ///   `VividLight`'s degeneracy 1.
+    ///
+    /// Golden `(1.0, 1.0, 0.0, 1.0)`. **Turning the `< 0.5` into `<= 0.5`
+    /// reads `(0.0, 0.0, 0.0, 1.0)`** — red and green both flip by the full
+    /// range, and the exactness above is what makes that a real kill rather
+    /// than a tolerance question. `0.25/0.5` and `1 - 0.5` are both exact for
+    /// these operands, so nothing here depends on rounding.
+    ///
+    /// Two boundary probes rather than one, because they reach the `0.5`
+    /// through *different* arms of `vivid_light_channel` — a mutation confined
+    /// to one arm's arithmetic would otherwise show up in only one channel and
+    /// could be mistaken for the boundary result itself.
+    ///
+    /// **REQUIRED DISCLOSURE: the golden has only two distinct values**, which
+    /// is unavoidable at effective alpha `1.0` for a mode whose `B` is
+    /// two-valued; tests 1, 2 and 4 are where the fold itself is under test.
+    /// Rivals: `ColorBurn` and `LinearBurn` both `(0, 0, 0)` — red and green
+    /// carry those; `ColorDodge` `(1, 1, 0.75)` and `LinearDodge`
+    /// `(1, 1, 0.875)` — blue only; a dropped threshold
+    /// `(0.5, 0.5, 0.375)` — all three; a threshold at `0.25` `(1, 1, 1)` —
+    /// blue only; `Normal` `(0.25, 0.75, 0.5)`, `Multiply`
+    /// `(0.1875, 0.1875, 0.1875)`, `Screen` `(0.8125, 0.8125, 0.6875)`,
+    /// `Darken` `(0.25, 0.25, 0.375)`, `Lighten` `(0.75, 0.75, 0.5)`,
+    /// `Difference` `(0.5, 0.5, 0.125)`, `Exclusion` `(0.625, 0.625, 0.5)`,
+    /// `Overlay` `(0.625, 0.375, 0.375)`, `HardLight` `(0.375, 0.625, 0.375)`,
+    /// `LinearLight` `(0.25, 0.75, 0.375)` and `PinLight`
+    /// `(0.5, 0.5, 0.375)` — all three channels each.
+    fn composite_hard_mix_over_with_opacity_flips_at_its_own_threshold() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.75, 0.25, 0.375, 1.0];
+        let top_rgba = [0.25, 0.75, 0.5, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (1.0, 1.0, 0.0, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own HardMix arm computes \
+             on and around the threshold"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped one of the two guarded divisions reached at the threshold: \
+             {gpu_result:?}"
+        );
+        assert_eq!(
+            gpu_result,
+            (1.0, 1.0, 0.0, 1.0),
+            "red and green each land VividLight on exactly 0.5 -- red from the burn arm \
+             (1 - 0.25/0.5) and green from the dodge arm (0.25/0.5), both exact in IEEE-754 -- \
+             and `0.5 < 0.5` is false, so both are 1.0. (0.0, 0.0, 0.0, 1.0) is what a `<= 0.5` \
+             computes there, and unlike Overlay's, HardLight's and VividLight's own branch \
+             boundaries this mutation IS killable: the two arms of this comparison are the \
+             constants 0.0 and 1.0, not two formulas that agree at the boundary. Blue sits on \
+             vivid_light_channel's own branch boundary instead (Cs == 0.5, where both of its arms \
+             give Cb = 0.375), which is under the threshold -- so a 0.5 source channel is not a \
+             no-op for this mode. (0.5, 0.5, 0.375, 1.0) would mean the threshold was dropped; \
+             (1, 1, 1, 1) a threshold at 0.25, seen by blue. ColorBurn and LinearBurn both give \
+             (0, 0, 0), ColorDodge (1, 1, 0.75), LinearDodge (1, 1, 0.875), Normal \
+             (0.25, 0.75, 0.5), Multiply (0.1875, 0.1875, 0.1875), Screen \
+             (0.8125, 0.8125, 0.6875), Darken (0.25, 0.25, 0.375), Lighten (0.75, 0.75, 0.5), \
+             Difference (0.5, 0.5, 0.125), Exclusion (0.625, 0.625, 0.5), Overlay \
+             (0.625, 0.375, 0.375), HardLight (0.375, 0.625, 0.375), LinearLight \
+             (0.25, 0.75, 0.375) and PinLight (0.5, 0.5, 0.375)."
+        );
+    }
+
+    #[test]
+    /// **The `(0, 1)` corner, this mode's single departure from its own closed
+    /// form — and the only channel shape in it that can see the two operands
+    /// transposed.**
+    ///
+    /// `HardMix(Cb, Cs) = 1` iff `Cb + Cs >= 1` everywhere except at
+    /// `(Cb, Cs) = (0, 1)`, where it is `0`, because `color_dodge_channel`
+    /// tests `cb == 0.0` *before* `cs == 1.0` and the first guard wins.
+    /// Verified exhaustively over the `1/256` grid plus an edge refinement:
+    /// exactly one exception, and exactly two asymmetric pairs, `(0, 1)` and
+    /// `(1, 0)`. This test puts both of them in one draw.
+    ///
+    /// `Cb = (0.0, 1.0, 0.375)`, `Cs = (1.0, 0.0, 0.4375)`, both alphas and the
+    /// opacity `1.0`, so `out = B`:
+    ///
+    /// - red is `(0, 1)`: the **dodge** arm, `cb == 0.0` guard, `B = 0` — where
+    ///   the sum rule alone would say `1`;
+    /// - green is `(1, 0)`, red's exact transpose: the **burn** arm,
+    ///   `cb == 1.0` guard, `B = 1` — which the sum rule *does* agree with;
+    /// - blue is an ordinary interior burn channel, `Cb + Cs = 0.8125 < 1` so
+    ///   `B = 0`, with `VividLight = 2/7 ≈ 0.2857` — off both of that mode's
+    ///   rails, so blue is what keeps the dropped-threshold and moved-threshold
+    ///   mutations live here.
+    ///
+    /// Golden `(0.0, 1.0, 0.0, 1.0)`.
+    ///
+    /// **What only this test can kill.** Transposing the two arguments inside
+    /// the shader (`hard_mix_channel(s.r, cb.r)` and so on) reads
+    /// `(1.0, 0.0, 0.0, 1.0)` — red *and* green both flip, since each is the
+    /// other's transpose. Rewriting the body as a componentwise
+    /// `select(0.0, 1.0, cb + s >= vec3(1.0))` reads `(1.0, 1.0, 0.0, 1.0)` —
+    /// red alone, the corner being the sum rule's only exception. Every other
+    /// fixture in this suite is blind to both, the blend term being symmetric
+    /// and sum-rule-exact away from the corner. (A transposed *dispatch arm* in
+    /// `aurora-app` is a different, more visible mutation: it also transposes
+    /// the fold's own `(1 - a)*(Cb - Cs)` term.)
+    ///
+    /// **REQUIRED DISCLOSURE: this fixture cannot separate `ColorBurn`, and no
+    /// three-channel corner fixture can separate both callees.** Degeneracy 2
+    /// says every `B = 0` channel agrees with `ColorBurn` and every `B = 1`
+    /// channel with `ColorDodge`; a *corner* channel agrees with **both**,
+    /// each corner being one of their guards firing. So with red and green
+    /// spent on the corner pair, the single remaining channel can rail only one
+    /// way — blue rails to `0` here, which separates `ColorDodge`
+    /// (`(0, 1, 0.6667..)`) and leaves `ColorBurn` coinciding in all three
+    /// (`(0, 1, 0)`), as does `Subtract`. Blue could instead have been given
+    /// `B = 1` to separate `ColorBurn` and coincide with `ColorDodge`; neither
+    /// choice dominates, and `ColorBurn` is separated by six of the seven other
+    /// fixtures here. Also coinciding in all three: `VividLight` would, if blue
+    /// were on one of its rails, which is exactly why blue's `2/7` is interior.
+    ///
+    /// Other rivals: `VividLight` `(0, 1, 0.2857..)` and a `0.25` threshold
+    /// `(0, 1, 1)` — blue only; `Normal` `(1, 0, 0.4375)`, `HardLight`
+    /// `(1, 0, 0.328125)`, `LinearLight` `(1, 0, 0.25)` and `PinLight`
+    /// `(1, 0, 0.375)` — all three; `Darken` `(0, 0, 0.375)` and `Multiply`
+    /// `(0, 0, 0.1640625)` — green and blue; `Lighten` `(1, 1, 0.4375)`,
+    /// `Screen` `(1, 1, 0.6484375)`, `Difference` `(1, 1, 0.0625)`,
+    /// `Exclusion` `(1, 1, 0.484375)` and `LinearDodge` `(1, 1, 0.8125)` — red
+    /// and blue; `LinearBurn` `(0, 0, 0)` — green only.
+    fn composite_hard_mix_over_with_opacity_thresholds_the_guard_ordering_corner() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.0, 1.0, 0.375, 1.0];
+        let top_rgba = [1.0, 0.0, 0.4375, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_hard_mix_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.0, 1.0, 0.375, 1.0),
+            "setup: red's backdrop must be exactly 0.0 and green's exactly 1.0, or neither corner \
+             is reached and this test degenerates into a duplicate of test 1"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::HardMix),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.0, 1.0, 0.0, 1.0),
+            "setup: the golden below must be what composite_tile_cpu's own HardMix arm computes \
+             at the guard-ordering corner and its transpose"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.0, 1.0, 0.0, 1.0),
+            "red is (Cb, Cs) = (0, 1), the ONE point at which HardMix departs from its own \
+             Cb + Cs >= 1 closed form: Cs > 0.5 selects color_dodge_channel, whose cb == 0.0 \
+             guard is tested before its cs == 1.0 one and returns 0, so B = 0 where the sum rule \
+             says 1. Green is red's exact transpose (1, 0), which selects color_burn_channel, \
+             whose cb == 1.0 guard returns 1 -- agreeing with the sum rule. So \
+             (1.0, 0.0, 0.0, 1.0) means the two operands are transposed inside the shader (red \
+             and green both flip, each being the other's transpose) and (1.0, 1.0, 0.0, 1.0) that \
+             the body was rewritten as a componentwise select(0.0, 1.0, cb + s >= 1.0), dropping \
+             the corner exception -- red alone sees that. No other fixture in this suite can see \
+             either mutation. Blue is an ordinary interior burn channel (VividLight 0.2857) and \
+             is what keeps the dropped-threshold mutation (0, 1, 0.2857) and the 0.25-threshold \
+             one (0, 1, 1) live here. REQUIRED DISCLOSURE: ColorBurn gives (0, 1, 0) and \
+             coincides in all three channels, as does Subtract -- no three-channel corner \
+             fixture can separate both callees, since a corner channel agrees with both and the \
+             one remaining channel can rail only one way. ColorDodge is separated \
+             ((0, 1, 0.6667)), and ColorBurn is separated by six of the seven other fixtures in \
+             this suite."
         );
     }
 

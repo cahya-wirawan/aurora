@@ -19921,6 +19921,138 @@ severity choice.
   that gap so far: two inherited division-by-zero guards, each redundant only
   under this adapter's `+inf` behaviour.
 
+- [x] **`HardMix` ported to WGSL, admitted at the predicate, and wired through
+  the real dispatch arm — done 2026-09-05 (0.115.0).** The **fourteenth** real
+  blend-math mode on the GPU, and the first whose blend term is one *whole other
+  ported mode's* per-channel helper plus a comparison: `hard_mix_channel` calls
+  `vivid_light_channel` (landed one round earlier) and thresholds it at `0.5`.
+  One WGSL entry point, one helper, one `BlendPass` const, four labels, one
+  one-line wrapper, one predicate arm, one dispatch arm, one counter
+  variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+  `TRANSPOSE_COVERAGE` row, one fixture const, **eight** render-level GPU tests,
+  one headless predicate test and one app-level integration test.
+  `composite_blend_over_with_opacity` was not touched — a **twelfth**
+  consecutive caller added with no line of change to it. `CPU_ONLY_BLEND_MODE`
+  stays `Exclusion`; no fixture anywhere was retargeted, so both PLAN.md-tracked
+  CPU-fallback benchmarks stay comparable across this round. `blend_channel`'s
+  own `HardMix` arm and `hard_mix_produces_only_pure_black_or_white` were left
+  untouched.
+
+  **Counts, recomputed against source rather than incremented.**
+  `ALL_BLEND_PASSES` is `[&BlendPass; 14]`; `GpuBlendDispatch::ALL` is
+  `[Self; 15]`; `GpuBlendDispatches` has 15 fields; the predicate admits **16 of
+  27**, leaving **11 of 27** CPU-only there; 12 of `aurora_render::BlendMode`'s
+  26 variants still lack a blend-math entry point, `Normal` among them and
+  needing none. Tests: `aurora-render` 214 → **222**, `aurora-app` 411 →
+  **413**; workspace 1756 → **1766**.
+
+  **The closed form, which is the round's real content.** Both of
+  `vivid_light_channel`'s arms cross `0.5` at exactly `Cb + Cs == 1` — burn:
+  `1 - min(1, (1-Cb)/(2Cs)) >= 0.5` iff `1 - Cb <= Cs`; dodge:
+  `min(1, Cb/(2-2Cs)) >= 0.5` iff `Cb >= 1 - Cs`. So
+  **`HardMix(Cb, Cs) = 1[Cb + Cs >= 1]` everywhere except the single point
+  `(Cb, Cs) = (0, 1)`, where it is `0`** — a guard-ordering artifact:
+  `color_dodge_channel` tests `cb == 0.0` *before* `cs == 1.0`, so the first
+  guard wins and returns `0` where the second would return `1`. Verified
+  exhaustively over the `1/256` grid on `[0,1]^2` plus an edge refinement
+  (`0`, `2^-16`, `2^-10`, `1 - 2^-10`, `1 - 2^-16`, `1`): **exactly one
+  exception, and exactly two asymmetric pairs**, `(0, 1)` and `(1, 0)`. The
+  transpose `(1, 0)` goes through `color_burn_channel`'s `cb == 1.0` guard and
+  gives `1`, which *does* agree with the sum rule.
+
+  **Why that corner had to be in the fixtures, and why it is the round's
+  headline.** The sum rule is symmetric and the exception is not, so the blend
+  term is symmetric in **every** channel but that corner — there is no interior
+  straddling pair at all, unlike `Overlay`/`HardLight`. A corner channel is
+  therefore the *only* thing that can tell "this mode's own threshold logic ran"
+  apart from "a bare sum-threshold ran", or catch the two operands swapped
+  *inside* the shader. `NORMAL_MULTIPLY_HARD_MIX_STACK` is the first roster
+  fixture not to reuse the family's shared `l1`: its `l1` red is `0.0` and its
+  `l3` red is `1.0`, so red *is* the corner. Measured, not argued: mutations (e)
+  and (f) below are each killed by **exactly the two render fixtures carrying a
+  corner**, and the six that do not carry one stayed green under both.
+
+  **Two mode-specific degeneracies worth carrying forward.** (1) `Cb == 0`
+  forces `B = 0` and `Cb == 1` forces `B = 1`, for every `Cs` — a black or white
+  *backdrop* channel says nothing about the source, which is exactly what makes
+  the corner a transpose probe and useless as a formula probe. (2) **Every
+  `B = 0` channel provably agrees with `ColorBurn` and every `B = 1` channel
+  with `ColorDodge`** (`Cb + Cs < 1` gives `(1-Cb)/Cs > 1` so `ColorBurn = 0`;
+  `Cb + Cs >= 1` gives `Cb/(1-Cs) >= 1` so `ColorDodge = 1`), so separating both
+  grand-callees needs a fixture with **both** rails — and a *corner* channel
+  agrees with both, each corner being one of their guards firing. Consequence
+  disclosed rather than designed out: no three-channel corner fixture can
+  separate both callees, and
+  `composite_hard_mix_over_with_opacity_thresholds_the_guard_ordering_corner`
+  coincides with `ColorBurn` in all three channels. Six of the seven other
+  fixtures separate it.
+
+  **First killable branch-comparison mutation on this path.** `Overlay`
+  (0.110.0), `HardLight` (0.111.0) and `VividLight` (0.114.0) each had to
+  disclose an unkillable `<=`-vs-`<`, because for those three the two branches
+  agree *at* the boundary. Here the two arms are the constants `0.0` and `1.0`,
+  so an input with `VividLight(Cb, Cs)` exactly `0.5` flips a whole channel —
+  and `Cb + Cs == 1` with binary-exact operands produces exactly that (the burn
+  arm computes `1 - Cs/(2Cs)`, the dodge arm `Cb/(2Cb)`, both exactly `0.5` in
+  IEEE-754). `composite_hard_mix_over_with_opacity_flips_at_its_own_threshold`
+  carries one of each branch (`(0.75, 0.25)` burn-side, `(0.25, 0.75)`
+  dodge-side) and mutation (a) was measured killed.
+
+  **A *total* `NaN` launderer, by an argument no prior non-detector has.** The
+  mode is **not** a sixth detector of `straight_backdrop`'s guard removal —
+  predicted, then measured — and two independent mechanisms each suffice: the
+  `min()` inherited from both of `VividLight`'s arms launders on this adapter
+  (probed in 0.109.1), **and**, on any backend, `NaN < 0.5` is `false` under
+  IEEE-754/WGSL relational semantics, so `hard_mix_channel` takes its `else`
+  branch and returns a finite `1.0`. It cannot return a non-finite value for any
+  input. Every prior non-detector rests on a measured property of `FMin`/`FMax`
+  that WGSL leaves undefined; this one does not. Honest limit: the two
+  mechanisms are **not distinguishable from the output**, since `fold_over`'s
+  `ab == 0.0` erases `b` either way — so the third bullet is an argument, not a
+  measurement, and the measurement is only that the test stays green. Detector
+  count stays at **five of fourteen**.
+
+  **A second `HardMix`-specific indistinguishability, disclosed.** Because `B`
+  is only ever `0` or `1`, an output clamp to `[0,1]` and a clamped
+  `s.a * opacity` product produce the *same* texel (`clamp(2 - Cb) = 1 = B`;
+  `clamp(-Cb) = 0 = B`), so
+  `composite_hard_mix_over_with_opacity_does_not_clamp_a_source_alpha_above_one`
+  kills both without separating them. No fixture of this mode can separate them.
+
+  **Mutation matrix: thirteen mutations, every one really run** on
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`,
+  reverted from an out-of-repo `cp` backup between rows (never
+  `git checkout`). Full table in the 0.115.0 addendum under "Next action". The
+  four load-bearing rows: **(e)** a shader-internal operand transpose is killed
+  by **exactly the two corner-carrying render fixtures** plus the app
+  differential, with all six non-corner fixtures green — the round's headline,
+  and the direct measurement that the corner is load-bearing; **(f)** the
+  componentwise `select(0.0, 1.0, cb + s >= 1.0)` rewrite is killed by exactly
+  the same three; **(m)** deleting `straight_backdrop`'s guard leaves this mode's
+  own transparent-backdrop test **green** while failing the same five as before,
+  as predicted; **(j)** deleting the dispatch arm's counter call is killed by the
+  counter assertion **alone** (`left: 0, right: 1`, confirmed by reading the
+  panic message).
+
+  **Two predictions corrected by really running the mutation.** (i) A transposed
+  `src`/`backdrop` *dispatch arm* was predicted to fail both the app differential
+  **and** `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
+  transposed_argument`. It fails only the differential: that guard is a *static*
+  check on the fixture roster — it folds `solid_stack_texel_cpu` both ways and
+  compares — so it can never see the real arm mutated. Worth carrying forward,
+  because the guard's name reads as though it could. (a) The `<=` mutation was
+  predicted to be killed by the dedicated boundary test only; it is also killed
+  by the spatially-varying-tile test, whose `patterned_texels` multiples of
+  `0.25` land on exact `Cb + Cs == 1` texels. Both corrections are in the
+  addendum table.
+
+  **Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+  for `fs_composite_hard_mix`. This mode inherits both of the guarded-division
+  modes' portability guards through `vivid_light_channel`, but the threshold
+  **masks** them — `0.0`, `1.0` and `+inf` all map onto a `0.0` or `1.0` — so a
+  backend whose division-by-zero differs would surface in `VividLight`'s tests,
+  not this mode's.
+
 - [x] **`HardLight` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.111.0).** The **eleventh**
   real blend-math mode on the GPU, and the first round in which the mode being
@@ -26200,6 +26332,130 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.115.0) — `HardMix` ported to the GPU compositing
+path.** The **fourteenth** real blend-math mode, and the first whose blend term
+is one *whole other ported mode's* per-channel helper plus a comparison:
+`hard_mix_channel` calls `vivid_light_channel` (landed one round earlier) and
+thresholds it at `0.5`. Rust-side cost was the usual one `BlendPass` const, four
+labels, one one-line wrapper, one predicate arm, one dispatch arm, one counter
+variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one
+`TRANSPOSE_COVERAGE` row and one fixture const — a **twelfth** consecutive
+caller of `composite_blend_over_with_opacity` added with no line of change to
+it. `CPU_ONLY_BLEND_MODE` stays `Exclusion` and **no fixture anywhere was
+retargeted**, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable.
+`blend_channel`'s own `HardMix` arm and
+`hard_mix_produces_only_pure_black_or_white` were not touched.
+
+**Counts after the round, each verified against source.** `ALL_BLEND_PASSES` is
+`[&BlendPass; 14]`, so `BLEND_MATH_PASS_COUNT` is 14; `GpuBlendDispatch::ALL` is
+`[Self; 15]` (14 + `Dissolve`); `GpuBlendDispatches` has 15 fields; the app
+predicate admits **16 of 27** (14 blend-math + `Normal` + `Dissolve`), leaving
+**11 of 27** CPU-only at the predicate; and 12 of `aurora_render::BlendMode`'s 26
+variants still have no blend-math WGSL entry point, `Normal` among them and
+needing none.
+
+**Tests: 214 -> 222 in `aurora-render` (+8) and 411 -> 413 in `aurora-app`
+(+2); workspace 1756 -> 1766.** The eight are all GPU tests
+(`composite_hard_mix_over_with_opacity_*`: both-rails per-channel golden,
+translucent accumulator, spatially-varying tile, half opacity, source alpha above
+one, transparent-backdrop-is-source-alone, **threshold flip** and
+**guard-ordering corner**). The last two are new shapes: no prior mode's suite
+has a killable-boundary test, and none has a corner probe.
+
+**The closed form, derived and then verified exhaustively.** Both of
+`vivid_light_channel`'s arms cross `0.5` at exactly `Cb + Cs == 1`, so
+**`HardMix(Cb, Cs) = 1[Cb + Cs >= 1]` everywhere except `(Cb, Cs) = (0, 1)`,
+where it is `0`** — `color_dodge_channel` tests `cb == 0.0` before `cs == 1.0`
+and the first guard wins. Swept the `1/256` grid on `[0,1]^2` plus an edge
+refinement (`0`, `2^-16`, `2^-10`, `1 - 2^-10`, `1 - 2^-16`, `1`): **one
+exception, and exactly two asymmetric pairs**, `(0, 1)` and `(1, 0)`. So the
+blend term is symmetric in every channel but that corner, with **no interior
+straddling pair at all** — and a corner channel is the only thing that can catch
+a shader-internal operand transpose or a bare sum-threshold rewrite.
+
+**The fixture, hand-derived and then measured.**
+`NORMAL_MULTIPLY_HARD_MIX_STACK` is the first roster fixture **not** to reuse the
+family's shared `l1`, precisely so red can be the corner:
+
+| layer | mode | opacity | rgba |
+|---|---|---|---|
+| `l1` | `Normal` | `1.0` | `[0.0, 0.875, 0.5, 1.0]` |
+| `l2` | `Multiply` | `1.0` | `[0.75, 0.75, 0.75, 1.0]` |
+| `l3` | `HardMix` | `0.5` | `[1.0, 0.5625, 0.4375, 1.0]` |
+
+`Cb = (0.0, 0.65625, 0.375)` after `l2`. Per channel: red is `(0, 1)`, the
+corner, dodge arm, `cb == 0.0` guard, `VividLight = 0`, `B = 0` (the sum rule
+would say `1`); green is dodge, `min(1, 0.65625/0.875) = 0.75` exactly, `B = 1`;
+blue is burn, `1 - min(1, 0.625/0.875) = 2/7`, `B = 0`. `B = (0, 1, 0)` — both
+rails — and `0.5*Cb + 0.5*B` gives the golden **`(0.0, 0.828125, 0.1875, 1.0)`**,
+asserted in both crates and cross-checked against the real `composite_tile_cpu`
+before the GPU readback in each. `solid_stack_texel_cpu` folded the other way is
+`(1.0, 0.78125, 0.21875, 1.0)` — a **`1.0`** gap in red, the largest
+single-channel transpose gap any roster fixture has.
+
+**Mutation matrix — thirteen mutations, every row really run** on
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`, one
+at a time, reverted from an out-of-repo `cp` backup between rows (never
+`git checkout <file>`). Baseline for the round is 222 / 413. `HM-*` names below
+are `composite_hard_mix_over_with_opacity_*`; `app-diff` is
+`recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_hard_mix_blend_document`.
+
+| # | mutation | predicted | measured |
+|---|---|---|---|
+| (a) | `< 0.5` -> `<= 0.5` | killed by the boundary test only | **killed, 2 tests**: `HM-flips_at_its_own_threshold`, `HM-matches_the_cpu_across_a_spatially_varying_tile`. **Prediction corrected**: `patterned_texels`' `0.25` multiples land on exact `Cb + Cs == 1` texels too |
+| (b) | threshold `0.5` -> `0.25` | killed by blue | **killed, 6 render + app-diff** (all but the translucent-accumulator and source-alpha fixtures) |
+| (c) | swap the returned `0.0`/`1.0` | broad | **killed, all 8 render + app-diff** |
+| (d) | drop the threshold (return `vivid_light_channel` raw) | green and blue, not red | **killed, all 8 render + app-diff.** Refined: red of the per-channel fixture *is* blind (its `VividLight` is already `0`), but every fixture has another live channel — the source-alpha fixture is killed by red, the corner fixture by blue |
+| (e) | operands transposed **inside** the shader | **only the corner** | **killed, exactly 2 render + app-diff**: `HM-takes_both_rails_per_channel` and `HM-thresholds_the_guard_ordering_corner` — the only two carrying a corner. **The six non-corner fixtures all stayed green**, which is the round's headline measurement and the direct evidence that the corner is load-bearing |
+| (f) | body rewritten as `select(0.0, 1.0, cb + s >= vec3(1.0))` | **only the corner** | **killed, exactly the same 2 + app-diff.** Notably it also survives the spatially-varying tile, so `patterned_texels` never produces a `(0, 1)` pair |
+| (g) | `fragment_entry` -> `"fs_composite_vivid_light"` | — | **killed, 9 render + app-diff** (the 8 plus `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`) |
+| (h) | `fragment_entry` -> `"fs_composite_color_dodge"` | — | **killed, the same 9 + app-diff** |
+| (i) | dispatch arm's `src`/`backdrop` transposed | app-diff **and** the standing transpose guard | **killed, app-diff alone.** **Prediction corrected**: `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` is a *static* check on the fixture roster (it folds `solid_stack_texel_cpu` both ways) and can never see the real arm mutated — its name reads as though it could |
+| (j) | `note_gpu_blend_dispatch` call deleted | the counter assertion alone | **confirmed**: app-diff alone, and the panic is the counter assertion (`left: 0, right: 1`), read from the message rather than inferred. Render crate 222/222 |
+| (k) | predicate arm deleted | — | **killed, 4 app tests**: the per-mode admits test, `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`, the transpose guard, and app-diff |
+| (l) | `TRANSPOSE_COVERAGE` row deleted | — | **killed, 1 app test**: `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` |
+| (m) | `straight_backdrop`'s `ab > 0.0` guard deleted | **survives** for this mode | **confirmed**: `HM-is_the_source_alone_where_the_backdrop_is_transparent` **green**; the failures are exactly the same five as before (`multiply`, `screen`, `difference`, `overlay`, `hard_light`) plus `recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack`. Detector count stays at **five of fourteen** |
+
+On (m), which of the two laundering mechanisms saves it: **not distinguishable
+from the output**, and stated that way rather than guessed at. On this adapter
+`min()` acts first (0.109.1 probed `min(NaN, x)` directly and it returns the
+finite operand), so the threshold never sees a `NaN` here; but `fold_over`'s
+`ab == 0.0` multiplies `b` away regardless, so no readback can separate "the
+`min()` laundered it" from "the `NaN < 0.5` comparison would have". The
+spec-guaranteed argument stands on IEEE-754 and WGSL's relational semantics, not
+on this measurement.
+
+**Two `HardMix`-specific indistinguishabilities, both disclosed in the tests
+themselves.** (1) No three-channel *corner* fixture can separate both
+grand-callees: every `B = 0` channel provably agrees with `ColorBurn`, every
+`B = 1` channel with `ColorDodge`, and a corner channel agrees with **both** —
+so with two channels spent on the corner pair, the remaining channel rails one
+way only. `HM-thresholds_the_guard_ordering_corner` coincides with `ColorBurn`
+(and `Subtract`) in all three channels and says so; the other six formula
+fixtures separate `ColorBurn`. (2) Because `B` is only ever `0` or `1`, an output
+clamp to `[0,1]` and a clamped `s.a * opacity` product give the *same* texel, so
+`HM-does_not_clamp_a_source_alpha_above_one` kills both without separating them —
+provably, for this mode, at any fixture.
+
+**Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+for `fs_composite_hard_mix`. This mode inherits both guarded-division
+portability guards through `vivid_light_channel`, but the threshold **masks**
+them (`0.0`, `1.0` and `+inf` all map onto a `0.0` or `1.0`), so a backend whose
+division-by-zero differs surfaces in `VividLight`'s tests rather than here — the
+first round in this series whose new exposure is *narrower* than the previous
+round's.
+
+**Also corrected this round, and found rather than looked for.**
+`document_qualifies_for_gpu_compositing`'s own header sentence read "one of the
+**fourteen** `aurora_doc::BlendMode`s ... no fifteenth mode" against a
+**fifteen**-bullet list: 0.114.0 bumped the trailing "count corrected in ..."
+clause to fifteen and left the opening sentence alone — the exact drift 0.107.1
+had already corrected once in the same sentence. Now sixteen, with sixteen
+bullets. The ordinals in
+`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_
+argument`'s doc comment were also off by one from 0.114.0 (it credited both
+`LinearLight` and `VividLight` as "the sixth"); fixed.
 
 **Addendum 2026-09-05 (0.114.0) — `VividLight` ported to the GPU compositing
 path.** The **thirteenth** real blend-math mode, and the first whose blend term
