@@ -19602,6 +19602,209 @@ severity choice.
   `aurora-render` error, and fixing it would put a shader file into a diff
   that is otherwise comment-and-test-only in `aurora-app`.
 
+- [x] **`ColorBurn` ported to WGSL, admitted at the predicate, and wired
+  through the real dispatch arm — done 2026-09-05 (0.107.0).** The
+  eighth real blend-math mode on the GPU, and the **first whose formula is
+  not a single componentwise expression**: one WGSL entry point *plus one
+  helper function*, one `BlendPass` const, one one-line wrapper, one
+  predicate arm, one dispatch arm, one counter variant/field/`counter()`
+  arm, one `TRANSPOSE_COVERAGE` row. The shared
+  `composite_blend_over_with_opacity` was not touched — a sixth
+  consecutive caller added without a line of change to it. No other
+  mode's shader, const, wrapper, dispatch arm, predicate entry or fixture
+  moved; `blend_channel`'s `ColorBurn` arm and `VividLight`'s delegation
+  to it are byte-identical to before.
+
+  **Mode counts, recomputed rather than incremented.**
+  `document_qualifies_for_gpu_compositing` now admits **ten** modes
+  (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+  `LinearDodge`, `LinearBurn`, `ColorBurn`, `Dissolve`), so **17 of 27**
+  blend modes are still CPU-only there. `shaders/composite.wgsl` now has
+  **eight** blend-math entry points, so **18 of 26**
+  `aurora_render::BlendMode` variants have none — and `Normal` is one of
+  those 18 while not being CPU-only, which is exactly the one mode
+  between the two figures. Ten tests added (1,697 → **1,707**;
+  `aurora-render` 168 → **176**, `aurora-app` 399 → **401**).
+  `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so **no fixture needed
+  retargeting** and both PLAN.md-tracked CPU-fallback benchmarks stay
+  comparable across this round — as in 0.104.0, 0.105.0 and 0.106.0, and
+  unlike `Screen`'s.
+
+  **Two tests more than any suite before it, and the reason is
+  structural.** Every mode ported so far has a formula reachable by
+  varying magnitudes, so six render-level tests covered it. `ColorBurn`'s
+  arm has **branches** — `Cb == 1 -> 1`, then `Cs == 0 -> 0`, then the
+  arithmetic — and neither branch is reachable by any fixture the other
+  six use. Tests 7
+  (`..._yields_one_where_the_backdrop_is_saturated`) and 8
+  (`..._yields_zero_where_the_source_is_zero`) exist for those two, and
+  test 7's **green channel** — where `Cb == 1` *and* `Cs == 0`, both
+  conditions true at once — is the only assertion in either crate that
+  can see the branch order.
+
+  **FINDING 1 — the division guard: both guards are arithmetically
+  redundant under IEEE-754, both are still required, and one of them is
+  provably untestable on this adapter.** Measured, not reasoned about.
+
+  - Without the `Cb == 1` guard, `(1 - 1) / Cs = 0` and `1 - min(1, 0) = 1`
+    — the same answer for every `Cs > 0`. It changes the result only at
+    `Cs == 0`, where the expression is `0 / 0`. Deleting it (mutation (h))
+    is therefore **killed deterministically**, and not by any
+    division-by-zero semantics: with the first guard gone the *second*
+    guard fires in its place and returns `0.0` where `1.0` is correct.
+    Test 7's green channel is the sole detector. The task plan flagged
+    this mutation's outcome as "genuinely uncertain, depending on whether
+    `0/0` evaluates to `NaN`"; the real answer is that no `0/0` is ever
+    evaluated on that path, so the outcome is backend-independent.
+  - Without the `Cs == 0` guard, `(1 - Cb) / 0` is `+inf`, `min(1, inf)`
+    is `1`, and the result is `0.0` — again the same answer, *if* the
+    backend divides like IEEE. Deleting it (mutation (i)) **survived every
+    one of `aurora-render`'s 176 tests and every one of `aurora-app`'s
+    401**, confirmed by running the whole crate under the mutation, not
+    just the `composite_color_burn` filter.
+
+  **That survival is the disclosed, expected result of a portability
+  guard, not a hole in the suite.** WGSL specifies division by zero as
+  yielding an *indeterminate value* — not `+inf` — so a backend producing
+  `NaN` would propagate it: `min(1.0, NaN)` is implementation-defined,
+  and the `ab == 0` half of a tile multiplies `b` by zero where
+  `0.0 * NaN` is `NaN`. **No test in this crate can distinguish the
+  guarded shader from the unguarded one, because no test can make this
+  adapter divide differently.** Stated in three places — the WGSL comment,
+  the wrapper's doc comment, and test 8's — rather than papered over with
+  an assertion that would not mean what it claimed. This is the sharpest
+  form yet of the standing Metal/DX12 gap: for every prior mode the
+  unverified backends could only differ in rounding, whereas here a
+  backend difference would change a *value*.
+
+  **FINDING 2 — golden derivation: a division mode's exact-binary-fraction
+  fixtures are far more constrained than any prior mode's, and the exact
+  `assert_eq!` is still sound.** `ColorBurn`'s blend term divides, so a
+  golden assertable with `assert_eq!` needs an operand pair whose quotient
+  *terminates* — most naive fixtures give a repeating fraction and force a
+  tolerance comparison, which would weaken every wrong-arm claim into an
+  approximate one. Two pairs do the work throughout:
+  `(1 - Cb) = 0.125, Cs = 0.5` (quotient `0.25`) and
+  `(1 - Cb) = 0.3125, Cs = 0.625` (quotient `0.5`), plus
+  `0.5625/0.75 = 0.75` and `0.546875/0.875 = 0.625` in the app fixture.
+  Six of the eight render tests and the app test assert exact goldens.
+  **Why that is sound despite a GPU divide being permitted 2.5 ULP of
+  error:** the result round-trips through `f16` tile storage, whose
+  spacing at these magnitudes is orders of magnitude coarser than an
+  `f32` ULP, so an exactly-representable quotient cannot be perturbed far
+  enough to land on a different `f16`. Every golden was hand-derived
+  first and then cross-checked against the real `composite_tile_cpu` in
+  the same test, and all of them matched on the first run.
+
+  **FINDING 3 — non-commutativity: the first ported mode whose blend term
+  catches a transposed dispatch arm on its own, measured at unit
+  opacity.** `B(Cb, Cs) != B(Cs, Cb)`. Every one of the seven modes ported
+  before this one is commutative (`Cb*Cs`, `min`, `max`,
+  `Cb+Cs-Cb*Cs`, `|Cb-Cs|`, `min(Cb+Cs,1)`, `max(Cb+Cs-1,0)`), and each of
+  their suites discloses that only the asymmetric outer fold
+  `out = (1-a)*bd + a*blended` can see a transpose — which it cannot at
+  `a = 1`. That premise is what
+  `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`
+  is built on, and **as of this round it is no longer universally true**;
+  the guard's doc comment now says so.
+
+  Run for real at both opacities rather than argued:
+  - transposed arm, fixture at the committed opacity `0.5`: GPU
+    `(0.5888672, 0.7993164, 0.25, 1.0)` against the correct
+    `(0.34375, 0.4140625, 0.125, 1.0)` — killed;
+  - transposed arm, fixture raised to opacity `1.0`: GPU
+    `(0.4284668, 0.7241211, 0.0, 1.0)` against a CPU reference of
+    `(0.25, 0.375, 0.0, 1.0)` — **still killed**, in red and green. (Blue
+    agrees at `0.0`: both orderings clamp there. So even an asymmetric
+    mode needs more than one channel.)
+
+  **The guard is deliberately left un-special-cased.** For this one mode
+  non-unit opacity is now sufficient-but-not-necessary, so the guard
+  demanding it is a potential false *alarm*, never a false all-clear —
+  the safe direction. `NORMAL_MULTIPLY_COLOR_BURN_STACK`'s `l3` keeps its
+  `0.5` and the golden is derived from it. An exemption list would be a
+  second hand-maintained thing to keep in step with the enum, which is
+  the very cost 0.105.3 built this guard to avoid; at least nine more
+  asymmetric separable modes are still to be ported, so if a later round
+  wants the exemption it should be a deliberate, per-mode change with its
+  own measured justification rather than a quiet loosening.
+
+  **The confusable-neighbour hazard, and where it actually lives.**
+  `ColorBurn` shares half a name with `LinearBurn` and **nothing about the
+  arithmetic** (`1 - min(1, (1-Cb)/Cs)` against `max(Cb+Cs-1, 0)`), so —
+  unlike `LinearBurn`/`LinearDodge`, whose blend lines differ by three
+  characters — the risk is not a copy-pasted shader line. It is the two
+  **adjacent dispatch arms** in `begin_gpu_composite_tile` and the two
+  adjacent `BlendPass` consts, which is where mutations (j) and (k) put it
+  and where every doc comment in this round points. The genuinely
+  near-identical mode is `ColorDodge` — the *other* guarded-division mode,
+  same two-guard shape, same clamped quotient, but branch conditions
+  `Cb == 0` / `Cs == 1` instead of `Cb == 1` / `Cs == 0` — and it is still
+  CPU-only, so that hazard is latent rather than live. `VividLight` is
+  called out in the new admission test's doc comment for a different
+  reason: `blend_channel` *defines* its `Cs <= 0.5` half by delegating to
+  the `ColorBurn` arm, so admitting `ColorBurn` at the predicate is
+  exactly the kind of change that could look like it admits `VividLight`
+  too. It does not, and must not.
+
+  **Mutation testing: 16 mutations plus two sub-experiments, every one
+  really applied to the committed baseline, run under
+  `AURORA_REQUIRE_GPU=1 --no-fail-fast` on the real RTX 3090
+  (Vulkan, DiscreteGpu), then reverted and the baseline verified
+  bit-identical by `md5sum`.** Fifteen killed, one survived as predicted.
+  Render-test numbering is the suite's own 1–8.
+
+  | # | mutation | predicted | **actual** |
+  |---|---|---|---|
+  | a | dispatch arm deleted | only the counter assert | **only the counter assert** — app test at `left: 0, right: 1`; sub-experiment below |
+  | b | quotient transposed, `(1-cs)/cb` | most render + app | **all 8 render + app** |
+  | c | `min(1.0, …)` clamp dropped | 1, 4, 3, app; 6/7/8 survive | **1, 2, 3, 4, 5, app; 6, 7, 8 survive** exactly as disclosed |
+  | d | outer `1.0 -` dropped | all | **all 8 render + app** |
+  | e | branch order swapped | only test 7 | **only test 7** |
+  | f | `cb == 1` arm returns `0.0` | test 7 | **only test 7** |
+  | g | `cs == 0` arm returns `1.0` | test 8 | **tests 3 and 8** (test 3's `patterned_texels` reaches `cs == 0`, as its doc discloses) |
+  | h | `cb == 1` guard deleted | uncertain, `NaN`-dependent | **killed, deterministically, by test 7** — no `0/0` is reached; see Finding 1 |
+  | i | `cs == 0` guard deleted | **survives** on IEEE hardware | **survived all 176 `aurora-render` + 401 `aurora-app` tests** — see Finding 1 |
+  | j | `fragment_entry` → `fs_composite_linear_burn` | all | **all 8 render + app** |
+  | k | wrapper delegates to `BLEND_PASS_LINEAR_BURN` | all | **all 8 render + app** |
+  | l | `ColorBurn` removed from the predicate | admission + app + mode loop + guard | **exactly those four** |
+  | m | `counter()`'s arm → `&self.linear_burn` | only counter-distinctness | **only `every_gpu_blend_dispatch_mode_gets_its_own_counter`** |
+  | n | `ColorBurn` removed from `ALL` | counter-distinctness + guard | **exactly those two** |
+  | o | dispatch arm's `src`/`backdrop` transposed | app; **open question at opacity 1.0** | **killed at `0.5` and at `1.0`** — see Finding 3 |
+  | p | fixture `l3` opacity `0.5` → `1.0` | guard + app golden | **exactly those two** |
+
+  Two sub-experiments, both run:
+
+  1. **Is the counter genuinely the *sole* detector of a deleted dispatch
+     arm?** With the arm deleted and *only* the counter's expected value
+     relaxed from `1` to `0`, the app test passes — differential, absolute
+     golden and `assert_ne!` vacuity guard all green. So yes: the CPU
+     fallback computes the same correct pixels, and the counter is the one
+     thing that notices. That is the third mode in a row for which this
+     has been confirmed by measurement (0.104.0, 0.105.0, now 0.107.0).
+  2. **Does mutation (i) survive beyond the `composite_color_burn`
+     filter?** Ran the entire `aurora-render` lib suite under it: 176
+     passed, 0 failed. The doc comments' claim is therefore measured, not
+     assumed.
+
+  **Disk, per CLAUDE.md's hard precondition.** `df -h /home` read **58G
+  free** before the round, **56G** before the full gate, and **52G** after
+  the mutation matrix — never near the 25G floor, so no
+  `target/debug/incremental` cleanup was needed. This is the first round
+  in six not to hit `/home` running tight mid-gate; the mutation matrix's
+  17 incremental rebuilds are what cost the 4G.
+
+  **Verified on Vulkan/NVIDIA only, and that gap matters more here than
+  for any prior mode** — see Finding 1. Metal and DX12 are unverified for
+  `fs_composite_color_burn`, and for this entry point specifically they
+  could differ in a *value*, not merely in rounding.
+
+  **One stale claim retired in `aurora-app`.** The `LinearBurn` admission
+  test's doc comment listed `ColorBurn` among the neighbours that "must
+  stay disqualified". Admitting it made that false, and the claim was
+  corrected in the same commit — the same discipline 0.106.1 had to apply
+  retroactively to two other enumerated lists.
+
 - [x] **`LinearBurn` ported to WGSL, admitted at the predicate, and wired
   through the real dispatch arm — done 2026-09-05 (0.106.0).** The
   seventh real blend-math mode on the GPU, at exactly the cost the
@@ -24676,6 +24879,55 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.107.0) — `ColorBurn` is the eighth real
+blend-math mode on the GPU, and the first that is neither a single
+expression nor commutative.** One WGSL entry point *plus a
+`color_burn_channel` helper* (this file's shaders' first non-entry-point
+function), one `BlendPass` const, one one-line wrapper, one predicate arm,
+one dispatch arm, one counter, one `TRANSPOSE_COVERAGE` row —
+`composite_blend_over_with_opacity` untouched for a sixth consecutive
+caller. **17 of 27** blend modes are now still CPU-only at the app's GPU
+predicate; **18 of 26** `aurora_render::BlendMode` variants still have no
+blend-math WGSL entry point (`Normal` is one of those 18 and is not
+CPU-only — the single mode between the two figures). 1,697 → **1,707**
+tests. `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so both tracked
+CPU-fallback benchmarks stay comparable.
+
+Three findings worth carrying forward, each measured rather than reasoned
+about; the tracked M1.10 checkbox above has the full account and the
+16-row mutation matrix.
+
+1. **A guarded division splits into a testable guard and an untestable
+   one.** Both of `ColorBurn`'s guards are arithmetically redundant under
+   IEEE-754. Deleting the `Cb == 1` one is killed *deterministically*
+   (the `Cs == 0` guard fires in its place; no `0/0` is ever reached, so
+   the outcome is backend-independent). Deleting the `Cs == 0` one
+   **survived all 176 `aurora-render` and 401 `aurora-app` tests**, because
+   this adapter divides by zero to `+inf` and `1 - min(1, inf)` is exactly
+   the `0.0` the guard returns. WGSL specifies an *indeterminate value*
+   there, not `+inf`, so the guard is a portability guard and **no test on
+   this hardware can distinguish the two shaders**. Disclosed in the WGSL
+   comment, the wrapper doc and test 8 rather than papered over. This is
+   the sharpest form yet of the standing Metal/DX12 gap: for every prior
+   mode an unverified backend could only differ in rounding; here it could
+   differ in a *value*.
+2. **Exact goldens survive a division, and the reason is `f16`.** A
+   dividing blend term needs operand pairs whose quotient terminates or
+   the goldens go approximate; four such pairs carry the whole suite. The
+   exact `assert_eq!`s are sound despite a GPU divide's permitted 2.5 ULP
+   because the result round-trips through `f16` storage, whose spacing
+   here is orders of magnitude coarser than an `f32` ULP.
+3. **The standing transpose guard's stated premise is no longer
+   universally true, and the guard is deliberately not special-cased.**
+   `ColorBurn`'s blend term is asymmetric, so a transposed dispatch arm is
+   caught by the blend term itself — confirmed by running that mutation at
+   opacity `1.0` as well as `0.5`, where every prior mode's would have
+   survived. Non-unit opacity is now sufficient-but-not-necessary for this
+   one mode, which makes the guard a potential false *alarm* and never a
+   false all-clear. The fixture keeps its `0.5`; the guard's doc comment
+   now records the exception and why an exemption list would cost more
+   than it saves.
 
 **Addendum 2026-09-05 (0.106.1) — 0.106.0's review follow-ups: two stale
 doc claims retired, and the standing transpose guard closes a latent hole.**
