@@ -19681,7 +19681,7 @@ severity choice.
   | # | Mutation | Predicted | **Actual** |
   |---|---|---|---|
   | a | delete the dispatch arm | only the counter assertion fails | **exactly that** — 1 of 405 app tests fails, on `take_gpu_blend_dispatch_count` reading `0` against `1` |
-  | a' | delete the arm **and** its counter assertion | everything else stays green | **exactly that** — 405/405 app and 134/134 render tests pass. The counter is the **sole** detector, confirmed on a third consecutive mode |
+  | a' | delete the arm **and** its counter assertion | everything else stays green | **exactly that** — 405/405 app and 198/198 render tests pass (this mutation only touches the dispatch arm and the app-level counter assertion; no render-level test changes). The counter is the **sole** detector, confirmed on a third consecutive mode |
   | b | swap the `select()` arms | tests 1, 4 + app golden | **broader**: all **7** render tests + the app golden |
   | c | branch on `cb` instead of `s.rgb` (**computes `Overlay`**) | tests 1, 4 + app golden | **broader**: all **7** render tests + the app golden |
   | d | `2.0 * s.rgb` → `s.rgb` in the low arm | test 1 only | **broader**: all **7** render tests + the app golden |
@@ -25622,6 +25622,43 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-05 (0.111.1) — prose-only correction of 13 issues an
+independent Critic and Red-team found in 0.111.0, zero logic changed.**
+Verified: `git diff` between the two commits touches only `//`/`///` lines;
+test counts are unchanged by construction (405 `aurora-app` / 198
+`aurora-render`, 0 failed, 0 clippy warnings).
+
+The single most important class: **five sites on the `Overlay` side of the
+codebase still claimed `HardLight` "is not admitted / has no WGSL entry
+point / is still CPU-only"** — exactly the claim 0.111.0 itself needed to
+come back and correct, and the same class Critic and Red-team found via two
+independent, non-overlapping searches (one site each from Critic, four more
+from Red-team). All five are now restated with the historical record kept
+("this said X at 0.110.0, which was true then; 0.111.0 made it Y"), not
+silently deleted. One of the five was a *reason*, not just a claim — a
+comment justifying why `VividLight` stays disqualified cited "its branch is
+on `Cs`, which nothing on the GPU path expresses," which `HardLight`
+falsifies; restated to rest on the still-true reason (`VividLight` has no
+WGSL entry point of its own).
+
+Also fixed: a `GpuBlendDispatch::ALL` doc self-contradicting `[Self; 11]`
+against the code's own `[Self; 12]`; a `4-of-10`/`5-of-11` guard-detector
+count inconsistent within the same file (`composite.wgsl`); three
+hand-maintained mode-count sites left at their pre-`HardLight` values; a
+missing roster entry; a stale `0.110.0` version marker; and a garbled
+illustrative near-miss comment. One more of the same class survived past
+0.111.1 and is fixed in this same commit's neighbourhood by the orchestrator
+directly: `composite.wgsl`'s "the other eight are" (of the nine per-mode
+tests using the second naming shape) should say **nine**, and PLAN.md's own
+mutation (a') row said "134/134 render tests," which does not match this
+round's own 198-test baseline and is corrected to **198/198** here.
+
+The reusable lesson, stated once rather than per-site: a hand-maintained
+prose count with no test deriving it from the predicate's own admitted set
+will drift on every round that changes the set, and has now recurred across
+0.105.1, 0.107.1, 0.108.1, 0.109.1, 0.110.1 and 0.111.0/0.111.1. Named,
+again, as a follow-on worth its own round rather than another patch.
 
 **Addendum 2026-09-05 (0.111.0) — `HardLight` on the GPU: the eleventh
 blend-math mode, and the first port whose transposed twin was *already a

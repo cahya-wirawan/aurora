@@ -138,7 +138,7 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `hard_light`'s. (Two naming
 // shapes are in play: `multiply`'s and `darken`'s are
 // `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
-// the other eight are
+// the other nine are
 // `composite_<mode>_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.)
 // The other six -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
 // `color_burn`, `color_dodge` -- pass with the guard gone, and not
