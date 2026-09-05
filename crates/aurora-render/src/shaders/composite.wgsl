@@ -102,6 +102,49 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
+// The two halves of the blend-math "over" that every blend-math entry
+// point below shares verbatim, extracted in 0.109.0. Each statement in
+// both bodies is byte-identical to the line it replaced in those entry
+// points -- moved, not retyped -- which is what makes "bit-for-bit
+// identical output" a property provable by text diff rather than by
+// trusting arithmetic reasoning about equivalent rewrites. Do not
+// "clean up" either body: `a + bd.a * inv` is deliberately not
+// `a + ab * inv` (numerically identical, textually not), the `if`
+// guard is deliberately not a `select()` (which would evaluate both
+// arms and make the `0.0 / 0.0` divide unconditional, defeating the
+// nine `..._is_the_source_alone_where_the_backdrop_is_transparent`
+// tests), and no expression may be reordered, since float addition is
+// not associative and the CPU differential tests assert exact equality.
+
+// `composite_layer_into`'s `straight_backdrop = d.rgb / backdrop_alpha,
+// or [0,0,0] if da == 0` -- the premultiplied accumulator's straight
+// colour. The `if (ab > 0.0)` guard is that function's own
+// `backdrop_alpha > 0.0` guard and the zero fallback is its
+// `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
+// once per entry point.
+fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
+    let ab = bd.a;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    return cb;
+}
+
+// The blend-mode-independent "over" fold around an already-computed
+// `b = blend_rgb(mode, cb, cs)`: `composite_layer_into`'s `alpha`,
+// `inverse`, `backdrop_alpha`, `backdrop_inverse`, `blended`, `out.rgb`
+// and `out.a` lines, in that order. The result is premultiplied, as the
+// CPU accumulator is.
+fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
 // exactly, for `BlendMode::Multiply` only.
 //
@@ -131,7 +174,12 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 //     out.a             = alpha + da * inverse
 //
 // and `blend_rgb(Multiply, cb, cs)` is `blend_channel`'s `cb * cs` per
-// channel. Each line below is that line, in the same order.
+// channel. As of 0.109.0 those lines are no longer all *below*: the
+// `straight_backdrop` line lives in `straight_backdrop()` above, and the
+// `alpha`/`inverse`/`backdrop_alpha`/`backdrop_inverse`/`blended`/
+// `out.rgb`/`out.a` lines live in `fold_over()` above, both still in
+// that same order. What remains below is the two `textureSample` lines,
+// this mode's own `b = ...`, and the two calls.
 //
 // `backdrop_tex` holds the *premultiplied* accumulator, exactly as the CPU
 // accumulator does; its straight colour is recovered by dividing by its
@@ -139,6 +187,14 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `composite_layer_into`'s own `backdrop_alpha > 0.0` guard, and the
 // zero fallback is its `[0.0, 0.0, 0.0]`. The result is written back
 // premultiplied.
+//
+// As of 0.109.0 that guard belongs to `straight_backdrop()`, not to each
+// entry point. The guard's existence and behaviour are unchanged, but the
+// several test comments in `composite.rs` that quote
+// `if (ab > 0.0) { cb = bd.rgb / ab; }` and attribute it to a *specific*
+// entry point are now stale about its **location** only -- disclosed here,
+// in one place, rather than by editing nine test comments to say the same
+// thing.
 //
 // `opacity.value` is not re-clamped here because the Rust caller
 // (`TileCompositor::composite_multiply_over_with_opacity`) already
@@ -149,41 +205,38 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // the reference for a source alpha above 1.0, which an `f16` tile can
 // legitimately hold.
 //
-// **A named, deliberately deferred follow-on** (recorded 0.106.1): the
-// straighten-backdrop and "over" fold lines below are byte-identical
-// across every blend-math entry point in this file, each of which differs
-// from this one in its single `let b = ...` line and nothing else (the
-// bodies are 13 lines each; 12 are shared verbatim, measured, not
-// eyeballed). **Two exceptions as of 0.108.0**, and they do not change the
-// plan: in `fs_composite_color_burn` and `fs_composite_color_dodge` the
-// `let b = ...` spans five lines rather than one, because each formula is
-// three calls to a per-channel helper (`color_burn_channel`,
+// **Deferred, then landed in 0.109.0** (the deferral was recorded in
+// 0.106.1): the straighten-backdrop and "over" fold lines were
+// byte-identical across every blend-math entry point in this file, each of
+// which differed from this one in its `let b = ...` line and nothing else
+// (the bodies were 13 lines each; 12 were shared verbatim, measured, not
+// eyeballed). **Two exceptions since 0.108.0**, and they did not change
+// the plan: in `fs_composite_color_burn` and `fs_composite_color_dodge`
+// the `let b = ...` spans five lines rather than one, because each formula
+// is three calls to a per-channel helper (`color_burn_channel`,
 // `color_dodge_channel`) rather than one componentwise expression. Stated
 // mode-agnostically so the next port does not have to re-sweep this note:
 // *every guarded-division entry point's `let b = ...` spans five lines*,
-// and that is the whole of the exception -- the *other* 12 lines are still
-// byte-identical in both, which is the property this note is about.
-// Extracting shared
-// `straight_backdrop()` and `fold_over()` WGSL functions would mirror the
-// Rust-side collapse 0.85.1 already made in `composite.rs`, and it is
-// worth doing — but as its own round with no mode port in it, so the
-// refactor's diff is not entangled with a new formula's. Do not fold it
-// into a porting round.
+// and that is the whole of the exception -- the *other* 12 lines were
+// byte-identical in both, which is the property this note was about.
+//
+// `straight_backdrop()` and `fold_over()` above now hold **10 of those 12
+// lines, not 12 of 12** -- the honest number. The two `textureSample`
+// lines stay inline in every entry point because they need `in.uv`, which
+// neither helper takes, and threading it through a third helper was
+// rejected as buying nothing. Bodies went 13 lines -> 5 for the seven
+// one-line-`b` modes and 17 -> 9 for the two guarded-division ones. This
+// mirrors the Rust-side collapse 0.85.1 already made in `composite.rs`,
+// and it landed as its own round with no mode port in it, so the
+// refactor's diff is not entangled with a new formula's -- which is also
+// why the next port does not get to fold a cleanup into itself.
 @fragment
 fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = cb * s.rgb;                       // blend_rgb(Multiply, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -209,17 +262,9 @@ fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_darken(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = min(cb, s.rgb);                   // blend_rgb(Darken, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -245,17 +290,9 @@ fn fs_composite_darken(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_lighten(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = max(cb, s.rgb);                   // blend_rgb(Lighten, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -292,17 +329,9 @@ fn fs_composite_lighten(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = cb + s.rgb - cb * s.rgb;          // blend_rgb(Screen, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -344,17 +373,9 @@ fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = abs(cb - s.rgb);                  // blend_rgb(Difference, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -433,17 +454,9 @@ fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = min(cb + s.rgb, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -545,17 +558,9 @@ fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_composite_linear_burn(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = max(cb + s.rgb - 1.0, vec3<f32>(0.0)); // blend_rgb(LinearBurn, cb, cs)
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // `blend_channel`'s own `BlendMode::ColorBurn` arm (src/composite.rs), one
@@ -647,21 +652,13 @@ fn color_burn_channel(cb: f32, cs: f32) -> f32 {
 fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = vec3<f32>(
         color_burn_channel(cb.r, s.r),
         color_burn_channel(cb.g, s.g),
         color_burn_channel(cb.b, s.b),
     );
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }
 
 // `blend_channel`'s own `BlendMode::ColorDodge` arm (src/composite.rs), one
@@ -762,19 +759,11 @@ fn color_dodge_channel(cb: f32, cs: f32) -> f32 {
 fn fs_composite_color_dodge(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
-    let a = s.a * opacity.value;
-    let inv = 1.0 - a;
-    let ab = bd.a;
-    let ab_inv = 1.0 - ab;
-    var cb = vec3<f32>(0.0, 0.0, 0.0);
-    if (ab > 0.0) {
-        cb = bd.rgb / ab;
-    }
+    let cb = straight_backdrop(bd);
     let b = vec3<f32>(
         color_dodge_channel(cb.r, s.r),
         color_dodge_channel(cb.g, s.g),
         color_dodge_channel(cb.b, s.b),
     );
-    let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+    return fold_over(s, bd, b);
 }

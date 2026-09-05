@@ -19629,6 +19629,15 @@ severity choice.
   retargeting** and both PLAN.md-tracked CPU-fallback benchmarks stay
   comparable across this round — as in 0.104.0 through 0.107.0, and unlike
   `Screen`'s.
+  **The next port is cheaper than any of these were, as of 0.109.0's shared
+  `straight_backdrop()`/`fold_over()` extraction**: a new entry point is now
+  its two `textureSample` lines, one `straight_backdrop()` call, **its own
+  `let b = ...` line** (five lines if it needs a guarded-division per-channel
+  helper) and one `fold_over()` call — five body lines rather than 13 — plus
+  the unchanged per-mode machinery every round above already pays for (one
+  `BlendPass` const, one one-line wrapper, one predicate arm, one dispatch
+  arm, one counter, one `TRANSPOSE_COVERAGE` row). The blend math is the only
+  part left to write; the fold is no longer retyped per mode.
 
   **A pre-existing defect fixed in the same round: six sites transcribed
   `ColorDodge`'s formula with a spurious outer `1 -`.** Every one wrote
@@ -25088,6 +25097,102 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.109.0) — the WGSL fold duplication, extracted: a
+pure refactor with no mode port in it.** The deferral recorded in 0.106.1
+(item 4 of the 0.106.1-era list below) is now discharged. Two new
+non-entry-point functions in `composite.wgsl`, `straight_backdrop(bd)` and
+`fold_over(s, bd, b)`, replace the boilerplate in **all nine** blend-math
+entry points. **No mode was ported, and every count is deliberately
+unchanged**: still **16 of 27** blend modes CPU-only at the app's GPU
+predicate, still **17 of 26** `aurora_render::BlendMode` variants with no
+blend-math WGSL entry point, still **1,717** tests — no test was added,
+removed, renamed or edited, and `aurora-app/src/lib.rs` was not touched at
+all. `CPU_ONLY_BLEND_MODE` stays `Exclusion`, so both tracked CPU-fallback
+benchmarks stay comparable.
+
+**The honest number is 10 of 12, not 12 of 12.** The 12 shared lines were
+never contiguous, and two of them — `let s = textureSample(src_tex, ...)`
+and `let bd = textureSample(backdrop_tex, ...)` — need `in.uv`. Neither
+helper takes it, and adding a third helper to thread it through was
+rejected as buying nothing but indirection, so those two lines stay inline
+in every entry point. Bodies went 13 lines → 5 for the seven one-line-`b`
+modes and 17 → 9 for `fs_composite_color_burn` and
+`fs_composite_color_dodge`; net −90/+61 lines in the one file changed.
+
+**Four things about this round are worth carrying forward.**
+
+1. **"Bit-for-bit identical" was proved by text diff, not by trusting
+   arithmetic reasoning.** Every statement inside both helper bodies is
+   *byte-identical* to the line it replaced — moved, not retyped. The check
+   was mechanical: extract the distinct removed lines from `git diff`
+   (exactly **10**) and confirm each is `grep -qxF`-present in the two
+   helper bodies. **All 10 matched, zero unmatched.** This is what makes the
+   no-behaviour-change claim checkable rather than argued, and it is why
+   three tempting cleanups were deliberately *not* made: `a + bd.a * inv`
+   stays instead of `a + ab * inv` (numerically identical, textually not);
+   the `if (ab > 0.0)` guard stays instead of a `select()` (which evaluates
+   both arms, making the `0.0 / 0.0` divide unconditional and defeating the
+   nine transparent-backdrop tests); and no expression was reordered, since
+   float addition is not associative and these tests assert *exact*
+   equality against the CPU reference. The 10 absorbed lines become 11
+   helper statement lines, because `let ab = bd.a;` is needed by both halves
+   and so appears once in each helper.
+2. **Mutation 1 (delete the guard) was killed, but by 3 tests, not the
+   predicted 9 — and the shortfall is pre-existing, not introduced.**
+   Replacing `straight_backdrop`'s body with an unguarded
+   `return bd.rgb / bd.a;` failed exactly three of the nine per-mode
+   transparent-backdrop tests: `multiply`
+   (`..._over_a_fully_transparent_backdrop_is_the_source_alone`), `screen`
+   and `difference` (`..._is_the_source_alone_where_the_backdrop_is_transparent`),
+   each on the existing `is_finite()` assertion with `(NaN, NaN, NaN, 1.0)`.
+   The other six modes' tests **passed with the guard gone**. Rather than
+   leave that as a guess, a **control** was run: the same guard deletion
+   applied to the *pre-refactor* file (all nine copies removed) fails the
+   **identical three tests**. So the extraction did not widen the
+   undetectable-bug class — the six-mode gap is a property those nine tests
+   already had. Carried forward as a real, open coverage gap: for
+   `darken`, `lighten`, `linear_dodge`, `linear_burn`, `color_burn` and
+   `color_dodge`, the transparent-backdrop test does **not** detect a
+   missing divide-by-zero guard on this backend.
+3. **The mechanism behind that survival is *not* settled, and a first guess
+   was refuted by measurement.** The initial hypothesis was NaN
+   "laundering" by each survivor's `min`/`max`/branch. A diagnostic run
+   (guard removed *and* `fs_composite_darken`'s `min(cb, s.rgb)` reduced to
+   plain `cb`, so a NaN would reach the fold unlaundered) left darken's
+   transparent-backdrop test **still passing** — refuting laundering as the
+   whole explanation. The remaining candidate is backend-level algebraic
+   simplification of `ab * (bd.rgb / ab)` → `bd.rgb`, which would apply to
+   the reduced darken case but not through `multiply`'s extra factor. Both
+   mechanisms are plausible and neither was isolated; recorded as an
+   unresolved backend-compiler question, not a finding.
+4. **Mutation 2 (transpose `src`/`backdrop` in the fold) was killed far
+   harder than predicted: 55 tests, not ~9.** Swapping the roles in
+   `fold_over`'s last two lines (`ab_inv * bd.rgb` and `inv * s.rgb`) failed
+   **55 of 184** `aurora-render` tests, spanning all nine modes — every
+   `..._matches_the_cpu_across_a_spatially_varying_tile`, every
+   `..._matches_the_cpu_against_a_translucent_accumulator`, every
+   `..._at_half_opacity_matches_the_cpu`, every
+   `..._does_not_clamp_a_source_alpha_above_one`, each mode's own
+   formula-specific test, and the ping-pong chain tests. Concentrating the
+   fold in one function means a single wrong character there is now caught
+   by 55 assertions instead of being a per-entry-point risk.
+
+**Both mutations were reverted by `cp` from a backup outside the repo,
+verified with `md5sum -c`, never by `git checkout <file>`** — the rule
+0.107.0's round paid for the hard way (see the note below about discarded
+uncommitted work). `git status` and a full re-run (184/184) confirmed the
+tree afterwards.
+
+**Verification.** Real GPU throughout: `AURORA_REQUIRE_GPU=1`, adapter
+reported by the tests themselves as `NVIDIA GeForce RTX 3090 (Vulkan,
+DiscreteGpu)` on every creation. This matters more than usual here —
+`aurora-render` has no `naga` dependency, so this WGSL only compiles at
+pipeline creation *inside* GPU-gated tests, and a missing adapter would let
+broken WGSL ship green via `SKIPPED`. `aurora-render` was 184 passed / 0
+failed both before and after, with a **byte-identical sorted test-name
+list**. Vulkan/NVIDIA only; Metal and DX12 are unverified for this
+refactor, exactly as they are for the nine entry points it rewrites.
+
 **Addendum 2026-09-05 (0.108.0) — `ColorDodge` is the ninth real blend-math
 mode on the GPU, the second guarded-division one, and the second
 non-commutative one.** One WGSL entry point *plus a `color_dodge_channel`
@@ -25360,7 +25465,7 @@ and the test count stays at **1,697**.
    future partially-painted or masked occluder would be rejected here even
    though its uncovered pixels stay observable — a false alarm, which is the
    safe direction.
-4. **Deferred, deliberately: the WGSL fold duplication.** Critic observed
+4. **Deferred then landed (0.109.0): the WGSL fold duplication.** Critic observed
    that all seven blend-math entry points in `composite.wgsl` have 13-line
    bodies of which 12 are shared verbatim, differing only in `let b = ...`
    (measured, not eyeballed). Extracting shared `straight_backdrop()` and
@@ -25368,7 +25473,11 @@ and the test count stays at **1,697**.
    is worth doing — **as its own round with no mode port in it**, so the
    refactor's diff is not entangled with a new formula's. Named in a comment
    above `fs_composite_multiply`, the template entry point, so the next
-   porter meets it there rather than here.
+   porter meets it there rather than here. **Landed in 0.109.0 across all nine
+   entry points, and it absorbed 10 of those 12 lines, not 12** — the two
+   `textureSample` lines need `in.uv`, which neither helper takes. Bodies went
+   13 lines → **5** for the seven one-line-`b` modes and 17 → **9** for the two
+   guarded-division ones (`ColorBurn`, `ColorDodge`).
 
 **Addendum 2026-09-05 (0.106.0) — `LinearBurn` is the seventh real
 blend-math mode on the GPU.** One WGSL entry point, one `BlendPass` const,
