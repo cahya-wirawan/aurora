@@ -7915,10 +7915,10 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 14]` length is part of
-    /// that signal: a fifteenth variant cannot be appended here without the
-    /// author also editing the count, and the test asserts the same `14`
-    /// as a literal so the expectation is stated in both places.
+    /// new variant is added to. The fixed `[Self; 16]` length is part of
+    /// that signal: a seventeenth variant cannot be appended here without
+    /// the author also editing the count, and the test asserts the same
+    /// `16` as a literal so the expectation is stated in both places.
     ///
     /// **As of 0.112.0 this length is no longer the only check on it, and
     /// prose elsewhere should name the two tests below rather than restate
