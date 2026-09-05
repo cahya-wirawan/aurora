@@ -11100,23 +11100,32 @@ mod tests {
     /// - `ColorDodge`'s `min(1, Cb / (1 - Cs))` — the other
     ///   guarded-division mode: `q = (1.75, 1.833.., 0.4)`, so
     ///   `B = (1.0, 1.0, 0.4)` and `(0.9375, 0.84375, 0.325)`;
-    /// - the `Multiply` arm: `(0.65625, 0.5595703125, 0.171875)`;
-    /// - the `Lighten` arm: `(0.875, 0.65625, 0.3125)`;
+    /// - the `Multiply` arm: `(0.65625, 0.55859375, 0.171875)`;
+    /// - the `Lighten` arm: `(0.875, 0.6875, 0.3125)`;
     /// - the `Darken` arm: `(0.6875, 0.65625, 0.25)`;
-    /// - the `Screen` arm: `(0.90625, 0.7392578125, 0.390625)`;
+    /// - the `Screen` arm: `(0.90625, 0.78515625, 0.390625)`;
     /// - the `Difference` arm: `(0.625, 0.375, 0.1875)`;
-    /// - `LinearDodge`'s `min(Cb + Cs, 1)`: `(0.9375, 0.78125, 0.4375)`;
+    /// - `LinearDodge`'s `min(Cb + Cs, 1)`: `(0.9375, 0.84375, 0.4375)`;
     /// - a dropped `min` clamp (`1 - q`): `(0.8125, 0.59375, -0.375)` —
     ///   note red and green *agree*, which is exactly why the fixture
     ///   needs a clamped channel as well as unclamped ones;
     /// - the outer `1 -` dropped (`min(1, q)`): `(0.5625, 0.59375, 0.625)`;
     /// - the quotient transposed (`(1 - Cs) / Cb`):
-    ///   `q = (0.571.., 0.545.., 0.15625/0.25 = 0.625)`, so
-    ///   `B = (0.428.., 0.454.., 0.375)` and roughly
-    ///   `(0.651.., 0.571.., 0.3125)` — **caught, and this is the first
-    ///   ported mode where the blend term itself catches a transpose**,
-    ///   because `B` is not symmetric in `Cb`/`Cs`. Every suite above
-    ///   discloses the opposite for its own mode.
+    ///   `q = (0.5/0.875, 0.375/0.6875, 0.625/0.25) =
+    ///   (0.571.., 0.545.., 2.5)`, so `B = (0.428.., 0.454.., 0.0)` and
+    ///   roughly `(0.651.., 0.571.., 0.125)` — **caught, and this is the
+    ///   first ported mode where the blend term itself catches a
+    ///   transpose**, because `B` is not symmetric in `Cb`/`Cs`. Every
+    ///   suite above discloses the opposite for its own mode. **Red and
+    ///   green are what catch it here; blue does not** — the transposed
+    ///   `2.5` and the correct `2.0` both exceed the clamp boundary, so
+    ///   blue lands on exactly the golden `0.125`. (Corrected in 0.107.1,
+    ///   which also fixed four rival greens above: this bullet had the
+    ///   blue quotient as `0.15625/0.25 = 0.625`, but `0.15625` is
+    ///   `(1 - Cs) * Cb` rather than `1 - Cs`, and it therefore claimed a
+    ///   three-channel discriminator where there are two. The bullet's
+    ///   conclusion is unchanged — red and green were always doing the
+    ///   work.)
     ///
     /// The golden is asserted *and* cross-checked against the real
     /// [`composite_tile_cpu`] for the same two layers, so a stale
@@ -11213,10 +11222,10 @@ mod tests {
              max(Cb + Cs - 1, 0) -- the other burn and the adjacent dispatch arm -- \
              (0.625, 0.5, 0.125) (agreeing in blue, where both clamp), ColorDodge's \
              min(1, Cb / (1 - Cs)) (0.9375, 0.84375, 0.325), the Multiply arm \
-             (0.65625, 0.5595703125, 0.171875), the Lighten arm (0.875, 0.65625, 0.3125), the \
+             (0.65625, 0.55859375, 0.171875), the Lighten arm (0.875, 0.6875, 0.3125), the \
              Darken arm (0.6875, 0.65625, 0.25), the Screen arm \
-             (0.90625, 0.7392578125, 0.390625), the Difference arm (0.625, 0.375, 0.1875), \
-             LinearDodge's min(Cb + Cs, 1) (0.9375, 0.78125, 0.4375), a dropped min clamp \
+             (0.90625, 0.78515625, 0.390625), the Difference arm (0.625, 0.375, 0.1875), \
+             LinearDodge's min(Cb + Cs, 1) (0.9375, 0.84375, 0.4375), a dropped min clamp \
              (0.8125, 0.59375, -0.375) and a dropped outer 1 - (0.5625, 0.59375, 0.625)."
         );
     }
@@ -11523,14 +11532,35 @@ mod tests {
     /// `LinearBurn`'s `max(Cb + Cs - 1, 0)` `(0.5625, 0.5, 0.125)`
     /// (agreeing in blue, where both clamp — red and green separate the
     /// two burns), `ColorDodge`'s `min(1, Cb / (1 - Cs))`
-    /// `(0.96875, 0.84375, 0.375)`, `Multiply` `(0.58203125, 0.5595703125,
-    /// 0.1875)`, `Screen` `(0.94921875, 0.7392578125, 0.4375)`, `Darken`
-    /// `(0.59375, 0.65625, 0.25)`, `Lighten` `(0.9375, 0.65625, 0.375)`,
+    /// `(0.96875, 0.84375, 0.375)`, `Multiply` `(0.5859375, 0.55859375,
+    /// 0.1875)`, `Screen` `(0.9453125, 0.78515625, 0.4375)`, `Darken`
+    /// `(0.59375, 0.65625, 0.25)`, `Lighten` `(0.9375, 0.6875, 0.375)`,
     /// `Difference` `(0.8125, 0.375, 0.25)`, `LinearDodge`'s
-    /// `min(Cb + Cs, 1)` `(1.0, 0.78125, 0.5)`, a dropped outer `1 -`
+    /// `min(Cb + Cs, 1)` `(0.96875, 0.84375, 0.5)`, a dropped outer `1 -`
     /// `(0.59375, 0.59375, 0.625)`, and the quotient transposed
-    /// (`(1 - Cs) / Cb`) `(0.86875, 0.571875, 0.375)` — every one of them
+    /// (`(1 - Cs) / Cb`, whose `q` is `(0.8, 0.545.., 2.0)`)
+    /// `(0.56875, 0.571.., 0.125)` — every one of them
     /// differing from the golden in at least two channels.
+    ///
+    /// **Four of those rivals were wrong as first written, and were
+    /// recomputed in exact rationals in 0.107.1** (`Multiply` red and
+    /// green, `Screen` red and green, `Lighten` green, `LinearDodge` red
+    /// and green, plus all three channels of the transposed quotient).
+    /// Two things are worth carrying forward from that. First, the green
+    /// operands `(Cb, Cs) = (0.6875, 0.625)` are *identical* in this
+    /// fixture and test 1's, and the same four wrong greens appeared in
+    /// both — one slip copied between siblings, not two independent ones,
+    /// which is the argument for deriving such a list mechanically if it
+    /// ever grows again. Second, the transposed quotient's blue **agrees**
+    /// with the golden (`q' = 2.0` and the correct `q = 1.5` both clamp),
+    /// so that row is a two-channel discriminator; the quoted `0.375`
+    /// claimed three. The "at least two channels" claim above was
+    /// re-checked against every corrected value and still holds, with
+    /// `LinearBurn`, the dropped outer `1 -` and the transposed quotient
+    /// as the three rows that sit exactly at two. `LinearDodge` and
+    /// `ColorDodge` now agree in red and green and differ only in blue —
+    /// true of the corrected values, and not a problem, since each is
+    /// still distinct from the golden and from each other.
     fn composite_color_burn_over_with_opacity_at_half_opacity_matches_the_cpu() {
         let Some(context) = real_context() else {
             return;
@@ -11602,8 +11632,8 @@ mod tests {
              (0.84375, 0.59375, -0.125), a dropped outer 1 - gives (0.59375, 0.59375, 0.625), \
              LinearBurn's max(Cb + Cs - 1, 0) gives (0.5625, 0.5, 0.125), ColorDodge's \
              min(1, Cb / (1 - Cs)) gives (0.96875, 0.84375, 0.375), Multiply gives \
-             (0.58203125, 0.5595703125, 0.1875) and Screen gives \
-             (0.94921875, 0.7392578125, 0.4375)."
+             (0.5859375, 0.55859375, 0.1875) and Screen gives \
+             (0.9453125, 0.78515625, 0.4375)."
         );
 
         let tolerance = 2.0 * f32::from(f16::EPSILON);

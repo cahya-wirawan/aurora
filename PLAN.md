@@ -24880,6 +24880,106 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-05 (0.107.1) — 0.107.0's review follow-ups: stale mode
+counts and eighteen wrong illustrative numbers, all in prose.** Independent
+Critic and Red-team review of 0.107.0 found **no defect in the ported code** —
+shader formula, `color_burn_channel` helper and its two guards, wrapper,
+predicate arm, dispatch arm, counter, `TRANSPOSE_COVERAGE` row, and every
+golden re-checked out, and the 16-mutation matrix was not re-run because
+nothing it covers changed. **This round changes only doc comments and
+`assert_*` message strings.** No shader, `BlendPass` const, wrapper, dispatch
+arm, predicate, fixture value, or assertion changed; `VividLight`'s delegation
+was not touched; the test count stays at **1,707**.
+
+1. **A Critic "critical" finding was a false positive, and is recorded as one.**
+   Both C1 and C2 claimed `NORMAL_MULTIPLY_COLOR_BURN_STACK`'s `l3` had been
+   left at opacity `1.0` — an un-reverted mutation that would fail
+   `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`.
+   It is `0.5` in the shipped commit and always was; the `1.0` in that tuple is
+   the RGBA **alpha** field, one position later. Verified three ways before
+   anything was touched: direct read of the fixture, a direct run of that guard
+   test (passes), and Red-team's own RT-04 control, which set the opacity to
+   `1.0` deliberately and confirmed *that* fails the guard. **No fixture line
+   was changed.** Worth recording because the misread is a structural hazard of
+   a four-field tuple whose third and fourth fields are both plausible
+   opacities.
+2. **`document_qualifies_for_gpu_compositing`'s roster was stale by two and
+   self-contradictory.** Its header said "one of the eight … no ninth mode. The
+   eight are:" above a list that already held **nine** bullets before this
+   round — `LinearBurn`'s port added a bullet in 0.106.0 without bumping the
+   count — and ten after it. Fixed to "ten"/"eleventh", with the drift itself
+   recorded in the sentence so the next porter meets it. `ColorBurn` had **no
+   bullet at all**, so the one mode the round added was the one mode the
+   predicate's own documentation never mentioned; it now has one in the
+   established style. And the `LinearBurn` bullet still said `ColorBurn` "is
+   still CPU-only" — false as of the very commit it shipped in, and contradicted
+   28 lines later by the same comment's own "`ColorBurn` from its own in
+   0.107.0". It now reads the way `aurora-render`'s side of the same
+   cross-reference already did.
+3. **`GpuBlendDispatch`'s doc contradicted itself about its own array
+   length.** It said the fixed `[Self; 8]` length is the signal that guards
+   against an unnoticed variant, two clauses before saying the test "asserts the
+   same `9`" — while the real code is `const ALL: [Self; 9]`. Fixed to `[Self;
+   9]`; the neighbouring past-tense "`ColorBurn` … from `[Self; 8]` to `[Self;
+   9]`" is a historical fact and stays. Also "the eight modes … other than
+   `Normal`" → nine, "the other seven are named by real dispatch arms" → eight,
+   "eight are counted as of 0.106.1" → nine as of 0.107.0, and the per-mode
+   history list gained the `ColorBurn` entry it was missing.
+4. **Eighteen illustrative "what a wrong arm would give" numbers were
+   arithmetically wrong, in three test doc comments and their assert
+   messages.** Every one was **recomputed independently in exact rationals**
+   before being changed, against the real fixture values and the real
+   `fold_texel` algebra (`out = (1-a)·Cb + a·B` for these opaque-accumulator
+   fixtures), and each corrected list was re-checked to still support the claim
+   built on it. Two of the Critic's specific claims here did **not** survive
+   that check and were rejected: the app test's dropped-`min`-clamp row is
+   *correct* as written (red and green *must* equal the golden there, since only
+   blue's quotient exceeds `1.0` — that is the row's whole point), and the value
+   the Critic wanted moved into it, `0.5390625`, belongs to the **dropped outer
+   `1 -`** row one line later, which was indeed wrong. Corrected: `aurora-app`'s
+   ColorBurn integration test (`Multiply`, `Darken`, `Screen`, `LinearDodge`,
+   and the dropped outer `1 -`'s green); `aurora-render` test 1 (`Multiply`,
+   `Lighten`, `Screen`, `LinearDodge` greens, plus a three-part wrong
+   transposed-quotient derivation); `aurora-render` test 4 (`Multiply` and
+   `Screen` red+green, `Lighten` green, `LinearDodge` red+green, and all three
+   channels of its transposed quotient). **No assertion changed verdict**: every
+   wrong value still differed from its golden, so the lists were misleading
+   rather than unsound.
+   - **Two findings from that recomputation are substantive, not cosmetic.**
+     In *both* render fixtures the "quotient transposed" mutation actually
+     **coincides with the golden in blue** — the transposed and correct
+     quotients both exceed the clamp boundary — so those rows are two-channel
+     discriminators where the prose claimed three. Red and green still catch the
+     transpose, so `ColorBurn`'s headline asymmetry claim is unaffected, but the
+     per-channel picture is now stated correctly and the coincidence explained.
+   - **The green operands `(Cb, Cs) = (0.6875, 0.625)` are identical in render
+     tests 1 and 4**, and the same four wrong greens appeared in both — one slip
+     copied between siblings, not two independent derivations. That is the
+     strongest argument yet for not hand-deriving these lists.
+5. **Six pre-existing stale mode-count sites in `aurora-app`, fixed while in
+   the area** (Red-team's RT-09; drift predating this round, last correct at
+   0.105.0). Five said "the other 19 modes" — the count for eight admitted
+   modes — while the GPU predicate now admits ten, and four of them enumerated
+   the admitted set without `LinearBurn` or `ColorBurn`. All now read **17** and
+   name all ten. A seventh site the report did not list was found by the same
+   sweep and fixed too. The sixth was the `Multiply` dispatch arm's own comment,
+   which described the shared spare accumulator as belonging to "the seven
+   blend-math arms" and listed six siblings; `ColorBurn`'s arm calls the same
+   `accumulator_or_create`, so it is eight arms and seven siblings. The
+   canonical `CPU_ONLY_BLEND_MODE` doc — the worst of the set, since it dated
+   itself to 0.105.0 — now also records that this count is hand-maintained and
+   has drifted twice.
+   - **Named follow-on, deliberately not implemented here:** derive these
+     counts instead of hand-maintaining them. A headless test asserting
+     `27 - <the admitted set's own size>` equals each stated number would make
+     the class impossible, and the admitted set is already enumerated in exactly
+     one place (`document_qualifies_for_gpu_compositing`'s `match`). Left out of
+     this round because it is a real test with a real design question — how a
+     test reads a `match`'s arm count without a second hand-maintained list —
+     and this round is otherwise prose-only. **Five separate rounds have now
+     shipped a stale hand-written mode count** (0.106.1 fixed two, this one
+     seven), so the mechanical fix has earned its own round.
+
 **Addendum 2026-09-05 (0.107.0) — `ColorBurn` is the eighth real
 blend-math mode on the GPU, and the first that is neither a single
 expression nor commutative.** One WGSL entry point *plus a
