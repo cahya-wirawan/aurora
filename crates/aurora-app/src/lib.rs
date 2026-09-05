@@ -7105,10 +7105,14 @@ fn composite_roots_into_tile(
 ///   **all three** channels, and 0.110.0 confirmed by real measurement that
 ///   a transposed binding is observable there at effective alpha `1.0` as
 ///   well as at `0.5`. Non-unit fixture opacity is therefore
-///   sufficient-but-not-necessary for four of the twelve modes as of
-///   0.111.0, and
+///   sufficient-but-not-necessary for five of the thirteen modes as of
+///   0.113.0 (the fifth being `LinearLight`, whose *unconditional*
+///   asymmetry makes a transpose observable at alpha `1.0` even though its
+///   own fixture's interior channels are blind to one at exactly `0.5` —
+///   see `solid_stack_texel_cpu` for how the standing guard now catches
+///   that case computationally instead), and
 ///   `TRANSPOSE_COVERAGE`'s standing guard stays deliberately
-///   un-special-cased for all four (plain backticks: that const is
+///   un-special-cased for all five (plain backticks: that const is
 ///   `cfg(test)`). It too reaches [`begin_gpu_composite_tile`]'s blend
 ///   dispatch as its own arm and shares the *same single* `spare` ping-pong
 ///   accumulator.
@@ -30693,6 +30697,13 @@ mod tests {
     /// Headless and single-texel — `composite_layer_into`'s scalar tail
     /// handles a four-sample buffer, and the fixtures are solid fills, so one
     /// texel is the whole tile.
+    ///
+    /// This model's faithfulness depends on every roster row's mode-bearing
+    /// layer having texel alpha `1.0` (true of all thirteen today): swapping
+    /// which side is straight vs. premultiplied only reproduces the real
+    /// dispatch arm term for term when there is no partial coverage to
+    /// un-premultiply differently on each side. A future roster row with a
+    /// translucent texel at its tested mode would need this re-checked.
     fn solid_stack_texel_cpu(
         entries: &[StackEntry],
         transposed: Option<aurora_doc::BlendMode>,
