@@ -20088,10 +20088,15 @@ severity choice.
   portability claim. Unsurprising, since the mode *is* `Darken` and `Lighten`
   behind a branch, and both of those are in the same class.
 
-  **A degeneracy that is provable rather than incidental**: every backdrop-wins
-  channel (`B == Cb`) agrees with `Darken` in the low branch and `Lighten` in the
-  high branch, both **live GPU arms**. So separating them needs a *source-derived*
-  channel in each branch, which every fixture in the suite carries.
+  **A degeneracy that is provable rather than incidental** (restated in 0.116.2,
+  the 0.116.0 wording having been false — see that addendum): every backdrop-wins
+  channel (`B == Cb`) agrees with exactly one of `Darken` and `Lighten`, and
+  `sign(Cb - Cs)` decides which — `Darken` iff `Cb <= Cs`, `Lighten` iff
+  `Cb >= Cs`, both only where `Cb == Cs`. It follows from `B == Cb` alone, since
+  one of `min(Cb, Cs)`/`max(Cb, Cs)` is always `Cb`; **the branch does not enter
+  it**. Both rivals are **live GPU arms**, so such a channel hides one and
+  separates the other, and separating both needs a *source-derived* channel in
+  each branch, which every fixture in the suite carries.
 
   **A real, measured coverage hole in the spatial fixture, disclosed rather than
   papered over.** `patterned_texels` puts red at `quarters(x + seed)`, green at
@@ -26696,6 +26701,99 @@ so it inherits none of `ColorBurn`/`ColorDodge`/`VividLight`/`HardMix`'s
 division-by-zero or 2.5-ULP portability exposure. The one thing it does rest on
 is this adapter's `min`/`max` `NaN` behaviour, above — and that affects only a
 disclosure, not a shipped value.
+
+---
+
+**Addendum 2026-09-05 (0.116.2) — a false "provable" degeneracy from the
+`PinLight` round, its stale counts, and the one test-robustness gap that round
+left, all found by independent review.** No WGSL formula, dispatch arm,
+predicate arm, existing golden or existing assertion *value* changed; the only
+behavioural change is one added test.
+
+**1. The false theorem (the blocking one).** 0.116.0 shipped, in **fourteen**
+places across `composite.wgsl`, `aurora-render/src/composite.rs`,
+`aurora-app/src/lib.rs` and this file — with five further per-fixture
+disclosures whose attribution followed from it — the claim that **every
+backdrop-wins channel (`B == Cb`) agrees
+with `Darken` in the low branch and with `Lighten` in the high branch** — and, in
+the app's app-level fixture and its vacuity guard, an even stronger version with
+no branch qualifier at all ("every backdrop-wins channel of this mode provably
+agrees with `Darken`"). Both are false. The correct rule is keyed to
+`sign(Cb - Cs)` and not to the branch: `B == Cb` means `Cb` is the output, and
+one of `min(Cb, Cs)`/`max(Cb, Cs)` is always `Cb`, so such a channel agrees with
+`Darken` iff `Cb <= Cs` and with `Lighten` iff `Cb >= Cs` (both only where
+`Cb == Cs`). Brute-forced over the same 129×129 grid the round's own blind set
+used: of 8321 backdrop-wins pairs, **4096 — very nearly half — name the opposite
+rival from the branch rule**, and none agrees with neither.
+
+Two of the round's own shipped fixtures were already counterexamples, which is
+what makes this a self-contradiction rather than a subtle slip:
+
+- `NORMAL_MULTIPLY_PIN_LIGHT_STACK`'s blue (also render test 1's) is
+  `Cb = 0.1875, Cs = 0.5625` — the **high** branch, backdrop-wins, and it agrees
+  with **`Darken`**. Every site that discloses this coincidence names `Darken`
+  correctly while the theorem beside it predicts `Lighten`.
+- Render test 5's green is `Cb = 0.5625, Cs = 0.4375` — the **low** branch,
+  backdrop-wins, agreeing with **`Lighten`**. 0.116.0's own doc there called
+  that "coincidence rather than the provable rail", i.e. the test prose had
+  already noticed the rule did not explain its own result, and the rule shipped
+  unqualified anyway.
+
+All fourteen sites now state the `sign(Cb - Cs)` rule, "provably" is gone from
+every wrong claim, and the per-fixture disclosures are re-attributed (each one's
+named rival was already right; only the reason was wrong). The two
+counterexample channels are now cited *as* counterexamples in the suite header
+and in the app fixture doc, so the branch-keyed version cannot be reintroduced
+without contradicting a fixture two lines away.
+
+**A second false claim found while re-deriving the first.** Render test 4's doc
+and its assertion message both said `Lighten` `(0.40625, 0.875, 0.5625)`
+"coincides in green" against a golden of `(0.375, 0.84375, 0.53125)` — it
+coincides in **no** channel, and the row's own numbers show it: in green
+`Lighten`'s `max` picks `Cs = 0.9375` where this mode's high arm picks
+`2*Cs - 1 = 0.875`. Re-derived in exact rationals for all seven fixtures; that
+was the only wrong coincidence claim among them.
+
+**2. Stale counts.** `GpuBlendDispatch`'s own doc still described its variants as
+"the fifteen modes … other than `Normal`" and "the other thirteen … named by real
+dispatch arms" against an `ALL: [Self; 16]` — now sixteen and fifteen. The
+`ColorDodge` and `Overlay` dispatch-arm comments still read "six of the fifteen
+non-`Normal` admitted modes" while the predicate's own doc, which 0.116.0 *did*
+update, read "seven of the sixteen"; `PinLight` genuinely does join that list
+(its blend term is symmetric only on a measure-zero set, so a generic fixture
+sees a transposed arm at `a = 1`), so seven of sixteen is right and both arms now
+say it. `CPU_ONLY_BLEND_MODE`'s doc still read "11 modes … minus the sixteen
+admitted as of 0.115.0"; it is 10 of 27 against seventeen admitted as of 0.116.0,
+matching the predicate. Three further stale counts in `aurora-render` that
+0.115.0 and 0.116.0 both missed were found by grep and fixed with them: "six of
+the thirteen" (now seven of the fifteen blend-math arms) and two copies of "five
+of the thirteen … the other eight" (now five of the fifteen … the other ten,
+which `composite.wgsl`'s own copy already had right).
+
+**3. The test-robustness gap, and the new test.** `PinLight`'s `<=`-vs-`<`
+boundary kill — the thing 0.116.0 resolved by measurement instead of disclosing —
+rests entirely on `straight_backdrop()` dividing `bd.rgb / bd.a` **without
+clamping**, since in gamut the two arms agree exactly at `Cs == 0.5`. That
+dependency was undefended: adding a plausible "defensive"
+`cb = clamp(bd.rgb / ab, vec3(0.0), vec3(1.0))` to the helper was measured to
+leave **all 415 `aurora-app` tests and all 229 `aurora-render` tests green**,
+the boundary test included, because that test's setup assertion checks the
+*accumulator* (`1.5`) rather than the helper's output and its out-of-gamut
+golden is `min(1.5, 1) = 1.0` — numerically what a clamped `Cb = 1.0` gives too.
+So the round's own proof could have been silently disarmed with nothing going
+red. Fixed two ways: a disclosure beside `straight_backdrop()` naming the
+dependency and the test that carries it, and a new test,
+`straight_backdrop_does_not_clamp_an_out_of_gamut_accumulator`, which puts the
+out-of-gamut backdrop where the *golden itself* moves under a clamp — a
+`(0.75, 1.25, 0.3125)` accumulator at alpha `0.5` recovering
+`Cb = (1.5, 2.5, 0.625)`, all three channels in `PinLight`'s high branch, golden
+`(1.125, 1.6875, 0.90625, 1.0)` against a clamped `(0.875, 0.9375, 0.90625, 1.0)`.
+Blue is in gamut and is the control channel. The clamp mutation was then applied
+for real and reverted: with it, this test is the **only** failure in either
+crate, failing in exactly the two predicted channels.
+
+**Tests: 229 -> 230 in `aurora-render` (+1); `aurora-app` unchanged at 415;
+workspace 1776 -> 1777.** Everything else in this round is comment and doc text.
 
 ---
 

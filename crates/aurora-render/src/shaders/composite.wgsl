@@ -217,6 +217,31 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `composite_hard_mix_over_with_opacity_is_the_source_alone_where_the_backdrop_
 // is_transparent` stays green. The two mechanisms are not distinguishable from
 // the output, since `fold_over`'s `ab == 0.0` erases `b` either way.
+//
+// **The divide is deliberately unclamped, and one live proof depends on that
+// (disclosed 0.116.2).** `bd.rgb / ab` may exceed `1.0`: an accumulator whose
+// premultiplied `rgb` exceeds its own `a` is legal content under invariant
+// §7.3.1b -- an unclamped float-TIFF import, not off-nominal input -- so
+// `Cb > 1` legitimately reaches every blend term in this file, and clamping
+// here would silently discard it. **Do not "harden" this into
+// `clamp(bd.rgb / ab, vec3(0.0), vec3(1.0))`.** `PinLight`'s `<=`-vs-`<`
+// branch-boundary mutation is the one mutation-kill in this file that rests on
+// it: at `Cs == 0.5` that mode's two arms are `min(Cb, 1)` and `max(Cb, 0)`,
+// which agree for every `Cb` in `[0, 1]` and diverge only above it, so a clamp
+// here would make that mutation unkillable -- the state `Overlay`,
+// `HardLight` and `VividLight` are already in, and the one thing 0.116.0
+// resolved by measurement instead of disclosing. Two tests hold this down:
+// `composite_pin_light_over_with_opacity_agrees_across_its_own_branch_boundary`
+// is the one that kills the mutation, and
+// `straight_backdrop_does_not_clamp_an_out_of_gamut_accumulator` pins the
+// no-clamp property itself. The second exists because the first does **not**
+// catch such a clamp: its red golden is `min(1.5, 1) = 1.0`, numerically the
+// same answer a clamped `Cb = 1.0` gives, and its setup assertion checks the
+// *accumulator* (`1.5`) rather than this function's output. Measured in
+// 0.116.2 rather than argued: with the clamp above applied for real, all 415
+// `aurora-app` tests and 229 of `aurora-render`'s 230 stayed green on this
+// adapter, the boundary test among them, and the **only** failure in either
+// crate was the no-clamp test named above.
 fn straight_backdrop(bd: vec4<f32>) -> vec3<f32> {
     let ab = bd.a;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
@@ -1852,13 +1877,24 @@ fn fs_composite_hard_mix(in: VsOut) -> @location(0) vec4<f32> {
 //
 // **Degeneracy regions, and the two live GPU arms they hand this mode to:**
 //
-//   - **every `B == Cb` ("backdrop-wins") channel agrees with `Darken` when it
-//     is in the low branch and with `Lighten` when it is in the high branch**,
-//     provably: `B == Cb` in the low branch means `Cb <= 2*Cs`, and if also
-//     `Cb <= Cs` then `Darken = Cb` too. Both are live entry points and live
-//     dispatch arms, so a `fragment_entry` naming either is separated only by a
-//     *source-derived* channel. Every fixture in the
-//     `composite_pin_light_*` suite carries at least one of each.
+//   - **every `B == Cb` ("backdrop-wins") channel agrees with exactly one of
+//     `Darken` and `Lighten`, and which one is decided by `sign(Cb - Cs)`, not
+//     by which branch fired**: with `Darken` iff `Cb <= Cs`, with `Lighten` iff
+//     `Cb >= Cs`, and with both only where `Cb == Cs`. That follows from
+//     `B == Cb` alone, since one of `min(Cb, Cs)`/`max(Cb, Cs)` is always `Cb`
+//     -- the branch condition never enters the argument.
+//     **A branch-keyed version of this rule shipped in 0.116.0 and was false**
+//     (corrected in 0.116.2, and disproved by this round's own fixtures): a
+//     backdrop-wins low channel means `Cb <= 2*Cs`, which does not imply
+//     `Cb <= Cs` -- at `Cb = 0.5625, Cs = 0.4375` it is `Lighten` that agrees,
+//     not `Darken` -- and a backdrop-wins high channel means `Cb >= 2*Cs - 1`,
+//     which does not imply `Cb >= Cs`, as `Cb = 0.1875, Cs = 0.5625` shows
+//     against `Darken`. Both of those pairs are real channels of fixtures in
+//     the `composite_pin_light_*` suite. Both rivals are live entry points and
+//     live dispatch arms, so a backdrop-wins channel hides exactly one of them
+//     and separates the other; separating **both** needs a *source-derived*
+//     channel, which every fixture in that suite carries in each branch it
+//     reaches.
 //   - `PinLight(Cb, 0) = 0` and `PinLight(Cb, 1) = 1` -- a black or white
 //     **source** channel erases the backdrop.
 //   - `PinLight(Cb, 0.5) = Cb` for in-gamut `Cb` -- a **source** channel at
