@@ -20104,7 +20104,24 @@ severity choice.
   the outer one for a stronger reason than any prior mode's.** At `Cs == 0.5` the
   low arm's multiplier `1 - 2*Cs` and the high arm's `2*Cs - 1` are *both exactly
   `0.0`* (`2*0.5` being exact in binary), so **both arms reduce to `cb` for every
-  finite `cb`**. That is stronger than `Overlay`'s, `HardLight`'s and
+  `cb` the pipeline can produce**. **That domain is bounded, and 0.117.1
+  corrected the "every finite `cb`" overclaim this entry originally carried:** the
+  low arm is safe unconditionally (`1 - 2*Cs` collapses to `0.0` *before* it
+  multiplies anything), but the high arm evaluates `soft_light_d(cb)` *first*, and
+  below about `cb = -2.7706e12` that polynomial overflows `f32` to `-inf`, so the
+  mutant's `0.0 * (-inf - cb)` is a `NaN` where the low arm still returns the
+  finite `cb`. Mutation (j) genuinely survives today only because
+  `straight_backdrop` divides an `Rgba16Float` texel by its own `f16` alpha,
+  bounding `|cb|` by
+  `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12` — about
+  `2.52×` below that threshold. That is a **cross-file precondition owned by
+  `aurora-tile`**, not by the shader, and invariant §7.3.1b would put it back in
+  play if the intermediate format ever widened. A second-order consequence worth
+  carrying forward: the *unmutated*, shipped high arm returns `-inf` for such a
+  `cb` rather than propagating through the zero multiplier, an overflow domain
+  `blend_channel`'s own `f32` `soft_light_d` shares — so the CPU/GPU mirror is
+  unaffected, and no measurement in this round is. That is stronger than
+  `Overlay`'s, `HardLight`'s and
   `VividLight`'s boundaries, whose arms merely *agree* over `[0, 1]`, and it
   closes the escape that made `PinLight`'s killable: there the arms were
   `min(Cb, 1)` and `max(Cb, 0)`, which diverge once an unclamped
@@ -26705,6 +26722,64 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-20 (0.117.1) — four documentation defects from 0.117.0's own
+round, no shipped behaviour changed.** Independent review re-derived every
+formula, dispatch arm, predicate arm and golden of that round and reproduced all
+of them; what it found wrong was the *prose* around two of the measurements. No
+WGSL expression, dispatch arm, predicate arm, test assertion or golden value was
+touched here — the diff is comments, doc comments, two assertion *messages* and
+this file.
+
+1. **A kill margin overstated by exactly 8×, at five sites.** Mutation (g)'s
+   divergence `0.0107421875` was quoted as "about 44× the `2 * f16::EPSILON`
+   tolerance, measured, not estimated". The real ratio is **5.5×**:
+   `half::f16::EPSILON` is `2^-10`, so the tolerance is `2^-9 = 0.001953125`
+   and `0.0107421875 / 0.001953125 = 5.5` exactly. The `44` came from dividing
+   by `2^-12`. The substantive claim survives — the margin is real, 176 `f16`
+   ULPs at that magnitude, and `LinearLight`'s own `0.046875` is exactly `24×`
+   the same denominator, which is the cross-check that settles which epsilon
+   this series uses. Corrected at all five sites that carried it:
+   `aurora-render/src/composite.rs` (a doc comment and an assertion message),
+   `aurora-app/src/lib.rs`, and two places here. `composite.wgsl` never quoted
+   the ratio and needed no change for this one.
+2. **"Both arms reduce to `cb` for every finite `cb` whatsoever" is false in
+   `f32`, and was billed as *stronger* than `PinLight`'s boundary.** Two
+   reviewers reached it independently. The low arm is safe unconditionally
+   (`1 - 2*Cs` collapses to `0.0` *before* it multiplies anything), but the high
+   arm evaluates `soft_light_d(cb)` *first*, and below about `cb = -2.7706e12`
+   (measured: first `-inf` at `cb = -2770595610624`) the polynomial overflows
+   `f32` to `-inf`, so mutation (j)'s `0.0 * (-inf - cb)` is a `NaN` where the
+   low arm still returns the finite `cb`. **The mutation still genuinely
+   survives every test**, because `straight_backdrop` divides an `Rgba16Float`
+   texel by its own `f16` alpha, bounding `|cb|` by
+   `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12` — about
+   `2.52×` under the threshold (and `~1.073e9` on an adapter that flushes `f16`
+   subnormals). What was wrong was the framing, and that the thing actually
+   saving the claim is a **cross-file precondition owned by `aurora-tile`** and
+   was named in none of the seven sites. All seven now state the bounded domain
+   and flag invariant §7.3.1b: widening the intermediate storage format would
+   put this back in play. Second-order, now disclosed: for such a `cb` the
+   *unmutated*, shipped high arm returns `-inf` rather than propagating through
+   the zero multiplier — an overflow domain `blend_channel`'s own `f32`
+   `soft_light_d` shares, so the CPU/GPU mirror and every measurement in the
+   0.117.0 round are unaffected.
+3. **The near-miss table's polynomial-coefficient example had a wrong value and
+   overstated its own detectability.** `16.0 -> 1.0` moves `poly(0.0625)` to
+   **`0.203369140625`**, not the `0.23730...` written — a `D` shift of
+   `0.003662109375`. Scaled by the high arm's `(2*Cs - 1)` and `fold_over`'s
+   effective alpha, the two fixtures carrying `Cb = 0.0625` move by
+   `0.00091552734375`, which is **below** their `2 * f16::EPSILON` tolerance;
+   they kill it through their *exact* `assert_eq!` goldens instead (the mutant
+   is `f16`-representable, 15 ULPs off). The margin that is large everywhere
+   comes from a `Cb` on the `0.25` boundary, where `D` moves `0.5 -> 0.265625`
+   and the `soft_light_d`-boundary test sees `0.1171875` and `0.05859375`. The
+   bullet now separates "exercised by" from "detected by".
+4. **A severed subordinate clause** in the transpose guard's stale-mode-list
+   sentence (`aurora-app/src/lib.rs`): 0.117.0's count fix — correctly reducing
+   the list to `Subtract` and `Divide` — turned the original `…did); if a later
+   round…` into a full stop followed by a lowercase fragment. Rejoined; the
+   count itself was right and is unchanged.
+
 **Addendum 2026-09-19 (0.117.0) — `SoftLight` ported to the GPU compositing
 path, completing the overlay family.** The **sixteenth** real blend-math mode,
 and the only member of the six-mode branch-on-the-source overlay family whose
@@ -26770,8 +26845,13 @@ load-bearing**: `l1.r = 0.75` (not `0.875`) makes `Cb.r = 0.5625 = 0.75²`
 exactly, so the `sqrt` arm returns `0.75` with no rounding and the golden stays
 `f16`-exact; `l2.b = 0.25` (not `0.75`) puts `Cb.b = 0.0625` four steps *below*
 `soft_light_d`'s `0.25` boundary, so the always-`sqrt` mutation moves the golden
-by `0.0107421875` — about 44× the `2 * f16::EPSILON` tolerance, measured, not
-estimated. **No rival separable mode coincides in any channel**, all eighteen
+by `0.0107421875` — **about 5.5×** the `2 * f16::EPSILON` tolerance
+(`2 * 2^-10 = 2^-9 = 0.001953125`), i.e. 176 `f16` ULPs at that magnitude. The
+divergence is measured; **the multiplier read `44×` until 0.117.1 corrected it**,
+that figure having divided by `2^-12` rather than by the real tolerance — the
+margin is real either way, and `2 * f16::EPSILON` is the denominator this series
+has always used (`LinearLight`'s `0.046875` is exactly `24×` it).
+**No rival separable mode coincides in any channel**, all eighteen
 checked. Transposed both ways through `solid_stack_texel_cpu`:
 `(0.75725159, 0.111328125, 0.66796875, 1.0)` against the golden — largest channel
 gap **`0.5693359375`** in blue, the roster's second largest after `HardMix`'s
@@ -26792,7 +26872,7 @@ actual failing-test list the run printed.
 | (d) | delete the whole dispatch arm | only the counter assertion fails | **killed by the counter assertion alone (1 of 417)**, `left: 0, right: 1`, read from the panic — the pixel assertions passed, the CPU fallback computing the same correct pixels |
 | (e) | outer branch tests `cb` instead of `s.rgb` | killed | **killed, 8 tests** (the branch-boundary test survives: at `Cs == 0.5` both arms give `cb` regardless of which operand is tested) |
 | (f) | swap the two outer arms | killed | **killed, 9 tests** |
-| (g) | drop `soft_light_d`'s branch, **always `sqrt`** | blue fails by a real margin | **killed, 4 tests** — and the negative-backdrop test read back **`(NaN, 0.65625, -0.020507813, 1.0)`**, which is the round's Finding-1 measurement. The margin was real: `0.0107421875` in the main fixture's blue, ~44× tolerance |
+| (g) | drop `soft_light_d`'s branch, **always `sqrt`** | blue fails by a real margin | **killed, 4 tests** — and the negative-backdrop test read back **`(NaN, 0.65625, -0.020507813, 1.0)`**, which is the round's Finding-1 measurement. The margin was real: `0.0107421875` in the main fixture's blue, **~5.5× the `2 * f16::EPSILON` tolerance** (176 `f16` ULPs there; this cell read `~44×` until 0.117.1 corrected the divisor) |
 | (h) | drop it the other way, **always polynomial** | red fails hugely | **killed, 9 tests** (`poly(0.5625) = 1.30078125` against `sqrt(0.5625) = 0.75`) |
 | (i) | `soft_light_d`'s `x <= 0.25` → `x < 0.25` | **SURVIVES** — provably unkillable | **survived: 239 / 239 green.** Confirms the arithmetic: `poly(0.25) = 0.5 = sqrt(0.25)` bit-exactly |
 | (j) | outer `cs <= 0.5` → `cs < 0.5` | **SURVIVES** — provably unkillable, **including out of gamut** | **survived: 239 / 239 green**, with the boundary fixture's out-of-gamut `Cb = 1.5` channel deliberately present. Both arms' multipliers are *exactly* `0.0` at `Cs == 0.5`, so `PinLight`'s escape does not transfer |

@@ -2133,14 +2133,44 @@ fn soft_light_d(x: f32) -> f32 {
 // **The outer `<= 0.5` boundary mutation is provably unkillable, and for a
 // stronger reason than any prior mode's.** At `Cs == 0.5` exactly the low arm's
 // factor is `1.0 - 2.0*0.5 = 0.0` and the high arm's is `2.0*0.5 - 1.0 = 0.0`,
-// so **both arms reduce to `cb` for every finite `cb` whatsoever** -- the
-// multipliers are exactly zero, not merely equal-in-effect. `Overlay`'s,
+// so **both arms reduce to `cb` for every `cb` this pipeline can hand them** --
+// the multipliers are exactly zero, not merely equal-in-effect. `Overlay`'s,
 // `HardLight`'s and `VividLight`'s boundaries agree only over `[0, 1]`, and
 // `fs_composite_pin_light`'s is killable precisely because its two arms diverge
 // once `straight_backdrop` hands it a `Cb > 1`. That escape does not exist
 // here: `composite_soft_light_over_with_opacity_agrees_across_its_own_branch_
 // boundary` carries an out-of-gamut `Cb = 1.5` boundary channel specifically to
 // measure the mutation surviving *there* too, and it does.
+//
+// **The domain is bounded, and 0.117.1 corrected the overclaim** -- this read
+// "for every finite `cb` whatsoever" until then, and that is false in `f32`.
+// The two arms are not equally safe:
+//
+//   - the **low** arm is safe unconditionally. `(1.0 - 2.0 * cs)` collapses to
+//     `0.0` *before* it multiplies anything, so `cb - 0.0*cb*(1.0 - cb)` is
+//     `cb - (+-0.0)` for every finite `cb`, no intermediate ever formed.
+//   - the **high** arm is not, because `soft_light_d(cb)` runs *first*. For
+//     `cb` below about `-2.7706e12` the polynomial `((16*cb - 12)*cb + 4)*cb`
+//     overflows `f32` to `-inf` (measured: the first `-inf` is at
+//     `cb = -2770595610624`), so the mutant's `0.0 * (-inf - cb)` is a `NaN`
+//     while the low arm still returns the finite `cb`. Past that point the
+//     mutation is observable.
+//
+// **What keeps it unreachable is a cross-file precondition, named here rather
+// than assumed:** `cb` is `straight_backdrop(bd)`, an `Rgba16Float` texel
+// divided by its own `f16` alpha, so `|cb|` cannot exceed
+// `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ~= 1.099e12` (and
+// only `~1.073e9` on any adapter that flushes `f16` subnormals) -- about
+// **2.52x below** the overflow threshold. That ceiling lives in `aurora-tile`,
+// not in this file. Under invariant §7.3.1b a move to a wider intermediate
+// storage format would raise the bound and this claim would need re-checking.
+//
+// Second-order, and disclosed rather than left implicit: for such a `cb` the
+// **unmutated, shipped** high arm returns `-inf` rather than propagating
+// through the zero multiplier (`cb + (2*cs - 1)*(-inf - cb)` with
+// `2*cs - 1 > 0`), so the formula itself has an overflow domain. `f32` is what
+// `blend_channel`'s own `soft_light_d` computes in too, so the CPU/GPU mirror
+// this file is checked against is unaffected.
 //
 // **Degeneracies, and the one provable rival identity:**
 //
@@ -2180,8 +2210,24 @@ fn soft_light_d(x: f32) -> f32 {
 //   - **`(1.0 - cb)` written as `cb` in the low arm** -- makes it
 //     `cb - (1 - 2Cs)*cb*cb`, agreeing only at `cb == 0.5` or `Cs == 0.5`.
 //   - **The polynomial's `16.0` or `12.0` or `4.0`** -- all three are exercised
-//     by any `Cb <= 0.25` high-branch channel; `16.0 -> 1.0` moves
-//     `poly(0.0625)` from `0.20703125` to `0.23730...`.
+//     by any `Cb <= 0.25` high-branch channel, but "exercised" is not
+//     "detected", and 0.117.1 split the two after finding this bullet's own
+//     numbers wrong. `16.0 -> 1.0` moves `poly(0.0625)` from `0.20703125` to
+//     **`0.203369140625`** (the figure here read `0.23730...`, which is not a
+//     value this polynomial takes at `0.0625` under any of the three
+//     coefficients). That is a `D` shift of only `0.003662109375`, and the high
+//     arm then scales it by `(2*Cs - 1)` and `fold_over` by the effective
+//     alpha: in the two fixtures that carry `Cb = 0.0625` at `Cs = 0.75` and
+//     `a = 0.5` the output moves `0.00091552734375`, which is **below** the
+//     `2 * f16::EPSILON` (`0.001953125`) tolerance their CPU-vs-GPU comparisons
+//     use. What kills it there is their *exact* `assert_eq!` goldens -- the
+//     mutant value is `f16`-representable and 15 ULPs off, so it is caught
+//     decisively, just not by a tolerance. The margin that is large everywhere
+//     comes from a `Cb` on the `0.25` boundary itself, where `D` moves from
+//     `0.5` to `0.265625`: in
+//     `composite_soft_light_over_with_opacity_agrees_across_soft_light_ds_own_
+//     branch_boundary` that is `0.1171875` and `0.05859375` in two channels,
+//     both far above tolerance.
 //   - **Swapping the two outer arms**, or **branching on `cb`**. Neither
 //     computes a named mode.
 //   - **A `fragment_entry` naming `fs_composite_overlay`** -- the one live

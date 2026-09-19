@@ -7443,9 +7443,18 @@ fn composite_roots_into_tile(
 ///   `+`/`-`/`*` on `cb`. Both of its branch-comparison mutations are
 ///   **provably unkillable**, and the outer one for a stronger reason than any
 ///   prior mode's: at `Cs == 0.5` both arms' multipliers are *exactly* `0.0`,
-///   so both reduce to `Cb` for every finite `Cb` — `PinLight`'s
+///   so both reduce to `Cb` for every `Cb` the pipeline can produce —
+///   `PinLight`'s
 ///   out-of-gamut escape does not transfer, which 0.117.0 measured rather than
-///   assumed. One degeneracy is worth carrying forward because it points at a
+///   assumed. (0.117.1 bounded that domain, which read "every finite `Cb`":
+///   past about `Cb = -2.7706e12` the high arm's polynomial overflows `f32` to
+///   `-inf` and the mutant returns a `NaN` where the low arm returns `cb`.
+///   `f16` tile storage holds `|Cb|` under
+///   `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12`,
+///   `~2.52×` below that, so the measurement stands — see
+///   `aurora-render`'s `soft_light_channel` comment for the cross-file
+///   precondition.) One degeneracy is worth carrying forward because it points
+///   at a
 ///   live arm: **`SoftLight(0.25, Cs) = Overlay(0.25, Cs)` for every
 ///   `Cs > 0.5`, provably** (both are `0.5*Cs`), so a `0.25` *backdrop* channel
 ///   hides an `Overlay` substitution — which is why
@@ -31699,9 +31708,12 @@ mod tests {
     /// - `Cb.b = 0.0625` is four steps *below* `soft_light_d`'s `0.25`
     ///   boundary, so the "always `sqrt`" mutation
     ///   (`sqrt(0.0625) = 0.25` against `poly(0.0625) = 0.20703125`) moves this
-    ///   fixture's golden by `0.0107421875` — about 44× the `2 * f16::EPSILON`
-    ///   tolerance, measured. A `Cb` nearer the boundary would make that
-    ///   mutation survive.
+    ///   fixture's golden by `0.0107421875` — **about 5.5×** the
+    ///   `2 * f16::EPSILON` tolerance (`2^-9 = 0.001953125`), i.e. 176 `f16`
+    ///   ULPs at this magnitude. The divergence is measured; **the multiplier
+    ///   read `44×` until 0.117.1 corrected it**, that figure having divided by
+    ///   `2^-12` instead of by the real tolerance. A `Cb` nearer the boundary
+    ///   would make that mutation survive.
     ///
     /// Against `Cs = (0.75, 0.125, 0.75)` the three per-channel shapes are all
     /// reached in one draw, which no other fixture in this family can do
@@ -32274,13 +32286,13 @@ mod tests {
     /// its failure message — and the arithmetic is what actually decides.
     ///
     /// **Two** more asymmetric separable modes are still to
-    /// be ported: `Subtract` and `Divide`.
-    /// (This list was stale by one before 0.117.0 read it and by two after:
+    /// be ported — `Subtract` and `Divide`
+    /// (this list was stale by one before 0.117.0 read it and by two after:
     /// it still named `PinLight`, which 0.116.0 had ported, and `SoftLight`,
     /// which 0.117.0 ported — `Overlay` was on it
     /// until 0.110.0 ported it, `HardLight` until 0.111.0 did,
-    /// `LinearLight` until 0.113.0 did, and `VividLight` until 0.114.0 did.)
-    /// if a later round wants the exemption, it should be a deliberate,
+    /// `LinearLight` until 0.113.0 did, and `VividLight` until 0.114.0 did) —
+    /// so if a later round wants the exemption, it should be a deliberate,
     /// per-mode change to this test with its own measured justification,
     /// not a quiet loosening.
     ///

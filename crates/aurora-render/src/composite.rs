@@ -4119,8 +4119,25 @@ impl TileCompositor {
     /// **Both boundary mutations are provably unkillable, and the outer one for
     /// a stronger reason than any prior mode's.** At `Cs == 0.5` *both* arms'
     /// multipliers (`1 - 2Cs` and `2Cs - 1`) are exactly `0.0`, so both reduce
-    /// to `cb` for every finite `cb` — including the out-of-gamut `Cb > 1` that
+    /// to `cb` for every `cb` this pipeline can produce — including the
+    /// out-of-gamut `Cb > 1` that
     /// is what makes `PinLight`'s own boundary mutation killable.
+    /// **That domain is bounded, not "every finite `cb`"** (corrected in
+    /// 0.117.1): the low arm is safe unconditionally, since `1 - 2Cs` collapses
+    /// to `0.0` before it multiplies anything, but the high arm evaluates
+    /// `soft_light_d(cb)` *first*, and below about `cb = -2.7706e12` that
+    /// polynomial overflows `f32` to `-inf`, making the mutant's
+    /// `0.0 * (-inf - cb)` a `NaN` where the low arm still returns `cb`. It
+    /// stays unreachable only because `straight_backdrop` divides an
+    /// `Rgba16Float` texel by its own `f16` alpha, bounding `|cb|` by
+    /// `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12`,
+    /// about `2.52×` below that threshold — a cross-file precondition that
+    /// lives in `aurora-tile`, and one invariant §7.3.1b would put back in play
+    /// if the intermediate format ever widened. See
+    /// `shaders/composite.wgsl`'s `soft_light_channel` comment for the full
+    /// account, including the unmutated arm's own `-inf` domain there — which
+    /// this file's own `soft_light_d` shares, both being `f32`, so the CPU
+    /// mirror is unaffected.
     /// `composite_soft_light_over_with_opacity_agrees_across_its_own_branch_
     /// boundary` carries a `Cb = 1.5` boundary channel to measure exactly that.
     /// At `Cb == 0.25` the polynomial and the `sqrt` both give `0.5`
@@ -22935,7 +22952,17 @@ mod tests {
     // **Both branch-boundary mutations are provably unkillable, and the outer
     // one for a stronger reason than any prior mode's.** At `Cs == 0.5` the low
     // arm's multiplier `1 - 2*Cs` and the high arm's `2*Cs - 1` are *both
-    // exactly `0.0`*, so both arms reduce to `cb` for every finite `cb`. That is
+    // exactly `0.0`*, so both arms reduce to `cb` for every `cb` this pipeline
+    // can produce -- **a bounded domain, not "every finite `cb`"** (corrected in
+    // 0.117.1). The low arm is safe unconditionally; the high arm evaluates
+    // `soft_light_d(cb)` first, and below about `cb = -2.7706e12` its polynomial
+    // overflows `f32` to `-inf`, so `0.0 * (-inf - cb)` is a `NaN` there. What
+    // makes that unreachable is `straight_backdrop` dividing an `Rgba16Float`
+    // texel by its own `f16` alpha, which bounds `|cb|` by
+    // `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ~= 1.099e12`,
+    // about 2.52x below the threshold -- a cross-file precondition owned by
+    // `aurora-tile`. See `shaders/composite.wgsl`'s `soft_light_channel`
+    // comment. That is
     // not the `Overlay`/`HardLight`/`VividLight` situation (arms that agree over
     // `[0, 1]` and might diverge outside it) but a stronger one: `PinLight`'s
     // boundary mutation is killable precisely *because* an unclamped
@@ -22994,8 +23021,15 @@ mod tests {
     /// `f16`-representable value; blue is `0.0625`, four steps *below*
     /// `soft_light_d`'s `0.25` boundary, so the "always `sqrt`" mutation
     /// (`sqrt(0.0625) = 0.25` against `poly(0.0625) = 0.20703125`) moves the
-    /// golden by `0.0107421875` — about 44× the `2 * f16::EPSILON` tolerance,
-    /// measured, not estimated. The mirror mutation "always polynomial" moves
+    /// golden by `0.0107421875` — **about 5.5×** the `2 * f16::EPSILON`
+    /// tolerance (`2 * 2^-10 = 2^-9 = 0.001953125`), i.e. 176 `f16` ULPs at
+    /// this magnitude, where the step is `2^-14`. The divergence itself is
+    /// measured; **the multiplier read `44×` until 0.117.1 corrected it**, that
+    /// figure coming from dividing by `2^-12` rather than by the real tolerance
+    /// — the margin is real either way, and `2 * f16::EPSILON` is the same
+    /// denominator `aurora-app`'s transpose guard quotes its own smallest
+    /// roster gap against (`LinearLight`'s `0.046875`, exactly `24×`). The
+    /// mirror mutation "always polynomial" moves
     /// red by `0.1376953125` (`poly(0.5625) = 1.30078125`).
     ///
     /// `B = (0.65625, 0.19921875, 0.134765625)` and the fold at `a = 0.5` over
@@ -23112,7 +23146,8 @@ mod tests {
              0.19921875) and blue the high branch through the POLYNOMIAL arm (Cb = 0.0625 <= 0.25, \
              D = 0.20703125, B = 0.134765625). So 0.5*Cb + 0.5*B is \
              (0.609375, 0.287109375, 0.0986328125). An always-sqrt soft_light_d reads \
-             (0.609375, 0.287109375, 0.109375) -- blue alone, by 0.0107421875, ~44x tolerance; an \
+             (0.609375, 0.287109375, 0.109375) -- blue alone, by 0.0107421875, ~5.5x the \
+             2 * f16::EPSILON tolerance (176 f16 ULPs here); an \
              always-polynomial one reads (0.7470703125, 0.287109375, 0.0986328125) -- red alone, \
              by 0.1376953125. Rival arms: Normal (0.65625, 0.25, 0.40625), Multiply \
              (0.4921875, 0.2109375, 0.0546875), Darken (0.5625, 0.25, 0.0625), Lighten \
@@ -23761,8 +23796,21 @@ mod tests {
     /// multiplier is `1.0 - 2.0*0.5 = 0.0` and the high arm's is
     /// `2.0*0.5 - 1.0 = 0.0`. Both are *exactly* zero — `2*0.5` is exact in
     /// binary — so the low arm is `cb - 0.0 * (...)` and the high arm
-    /// `cb + 0.0 * (...)`, and **both reduce to `cb` for every finite `cb`
-    /// whatsoever**. That is stronger than `Overlay`'s or `VividLight`'s
+    /// `cb + 0.0 * (...)`, and **both reduce to `cb` for every `cb` this
+    /// pipeline can hand them**. That domain is bounded rather than "every
+    /// finite `cb`" — 0.117.1 corrected that overclaim. The low arm is safe
+    /// unconditionally, because `1.0 - 2.0*cs` collapses to `0.0` *before* it
+    /// multiplies anything; the high arm calls `soft_light_d(cb)` *first*, and
+    /// for `cb` below about `-2.7706e12` that polynomial overflows `f32` to
+    /// `-inf`, making `0.0 * (-inf - cb)` a `NaN` while the low arm still
+    /// returns `cb`. It is `straight_backdrop` dividing an `Rgba16Float` texel
+    /// by its own `f16` alpha that keeps this out of reach —
+    /// `|cb| <= f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈
+    /// 1.099e12`, about `2.52×` under the threshold — a cross-file precondition
+    /// owned by `aurora-tile` and one invariant §7.3.1b would reopen if the
+    /// intermediate format widened. Everything below is measured inside that
+    /// domain and is unaffected. That is stronger than `Overlay`'s or
+    /// `VividLight`'s
     /// boundary, whose two arms merely *agree* over `[0, 1]`, and it is exactly
     /// why `PinLight`'s trick does not transfer: there the arms were
     /// `min(Cb, 1)` and `max(Cb, 0)`, which diverge once `straight_backdrop`
@@ -23887,7 +23935,9 @@ mod tests {
             (1.5, 0.75, 0.65625, 1.0),
             "red and green both sit on the outer branch boundary (Cs == 0.5 exactly), where the \
              low arm's multiplier 1 - 2*Cs and the high arm's 2*Cs - 1 are BOTH exactly 0.0, so \
-             both arms reduce to cb for every finite cb -- red's out-of-gamut 1.5 included, which \
+             both arms reduce to cb for every cb straight_backdrop can produce (|cb| <= 65504 / \
+             2^-24 ~= 1.099e12, ~2.52x under the ~2.7706e12 where the high arm's polynomial \
+             overflows f32) -- red's out-of-gamut 1.5 included, which \
              is what makes this mutation unkillable where PinLight's is not. Blue is off the \
              boundary (high/sqrt, Cb = 0.5625 = 0.75^2, D = 0.75, B = 0.65625) and is the only \
              channel here that separates the rivals: a 0.5 source channel is this mode's total \
