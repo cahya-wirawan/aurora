@@ -7933,7 +7933,7 @@ fn accumulator_or_create<'slot>(
 /// call site and why it is where it is.
 ///
 /// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
-/// consequence of 0.103.1 rather than an inconsistency.** The other fifteen
+/// consequence of 0.103.1 rather than an inconsistency.** The other sixteen
 /// are named by real dispatch arms that exist in both builds, so they are
 /// constructed in both. `Dissolve` has no arm; the only thing that ever
 /// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
@@ -7981,7 +7981,7 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 16]` length is part of
+    /// new variant is added to. The fixed `[Self; 17]` length is part of
     /// that signal: an eighteenth variant cannot be appended here without
     /// the author also editing the count, and the test asserts the same
     /// `17` as a literal so the expectation is stated in both places.
