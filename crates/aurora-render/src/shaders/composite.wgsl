@@ -75,7 +75,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // fs_composite_color_burn, fs_composite_color_dodge,
 // fs_composite_overlay, fs_composite_hard_light,
 // fs_composite_linear_light, fs_composite_vivid_light,
-// fs_composite_hard_mix and fs_composite_pin_light -- use it,
+// fs_composite_hard_mix, fs_composite_pin_light and
+// fs_composite_soft_light -- use it,
 // through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
@@ -101,7 +102,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // (0.102.0), `Difference` (0.104.0), `LinearDodge` (0.105.0),
 // `LinearBurn` (0.106.0), `ColorBurn` (0.107.0), `ColorDodge` (0.108.0),
 // `Overlay` (0.110.0), `HardLight` (0.111.0), `LinearLight` (0.113.0),
-// `VividLight` (0.114.0), `HardMix` (0.115.0) and `PinLight` (0.116.0) have
+// `VividLight` (0.114.0), `HardMix` (0.115.0), `PinLight` (0.116.0) and
+// `SoftLight` (0.117.0) have
 // since landed, and the live numbers live in `TileCompositor`'s own doc
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
@@ -132,16 +134,17 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `[0.0, 0.0, 0.0]`; as of 0.109.0 the guard lives here rather than
 // once per entry point.
 //
-// **What actually protects this guard is five tests, not fifteen (measured,
-// 0.109.0 for the first three, 0.110.0 for the fourth and 0.111.0 for the
-// fifth; explained, 0.109.1).** Deleting the guard -- or replacing it with a
+// **What actually protects this guard is six tests, not sixteen (measured,
+// 0.109.0 for the first three, 0.110.0 for the fourth, 0.111.0 for the
+// fifth and 0.117.0 for the sixth; explained, 0.109.1).** Deleting the guard --
+// or replacing it with a
 // `select()`, which evaluates both arms -- fails
-// exactly five of the fifteen per-mode transparent-backdrop tests:
-// `multiply`'s, `screen`'s, `difference`'s, `overlay`'s and
-// `hard_light`'s. (Two naming
+// exactly six of the sixteen per-mode transparent-backdrop tests:
+// `multiply`'s, `screen`'s, `difference`'s, `overlay`'s,
+// `hard_light`'s and `soft_light`'s. (Two naming
 // shapes are in play: `multiply`'s and `darken`'s are
 // `composite_<mode>_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`,
-// the other twelve are
+// the other thirteen are
 // `composite_<mode>_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.)
 // The other ten -- `darken`, `lighten`, `linear_dodge`, `linear_burn`,
 // `color_burn`, `color_dodge`, `linear_light`, `vivid_light`, `hard_mix`,
@@ -202,6 +205,18 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `1.0` before `fold_over` ever sees it. Measured in 0.114.0: with the guard
 // deleted, `composite_vivid_light_over_with_opacity_is_the_source_alone_where_
 // the_backdrop_is_transparent` stays green.
+//
+// **`SoftLight` (0.117.0) is the SIXTH detector, and the rule predicted it
+// too.** Its low arm (`Cs <= 0.5`) is pure `+`/`-`/`*` on `cb` with no
+// laundering intrinsic anywhere, so the `NaN` propagates by IEEE-754 arithmetic
+// alone -- no vendor behaviour involved, which makes it the first detector whose
+// argument does not depend on this adapter at all. (Its high arm reaches
+// `soft_light_d(NaN)`, where `NaN <= 0.25` is `false` and `sqrt(NaN)` runs; WGSL
+// says no more about that than about `FMin` on a `NaN`, which is why
+// `composite_soft_light_over_with_opacity_is_the_source_alone_where_the_backdrop_
+// is_transparent` deliberately carries **two `Cs <= 0.5` channels**.) Measured
+// in 0.117.0: with the guard deleted that test reads back
+// `(NaN, NaN, NaN, 1.0)`.
 //
 // **`HardMix` (0.115.0) is the third such prediction and the first one that
 // does not depend on this vendor's `min()` at all.** It is a *total* launderer,
@@ -322,16 +337,16 @@ fn fold_over(s: vec4<f32>, bd: vec4<f32>, b: vec3<f32>) -> vec4<f32> {
 //      justify keeping a per-mode transparent-backdrop test by listing
 //      "its own separately-compiled `ab > 0.0` guard" among the things
 //      that test uniquely exercises. That is no longer true: the guard is
-//      written once and shared by all fifteen entry points. (A backend is
+//      written once and shared by all sixteen entry points. (A backend is
 //      still free to inline it per call site, so per-entry-point *machine
 //      code* is not ruled out -- but the source-level independence the
-//      comments leaned on is gone, and the measured 5-of-11 kill above is
+//      comments leaned on is gone, and the measured 6-of-16 kill above is
 //      the direct evidence.)
 //
 // Those suite-header comments in `composite.rs` were corrected in 0.109.1
 // and carry the specific sites; the per-test doc comments there carry a
-// one-line back-reference to here rather than repeating this. Only 5 of
-// the 15 kept transparent-backdrop tests can currently detect the guard's
+// one-line back-reference to here rather than repeating this. Only 6 of
+// the 16 kept transparent-backdrop tests can currently detect the guard's
 // removal at all -- see the `straight_backdrop()` comment above, and
 // PLAN.md's 0.109.0 entry for why.
 //
@@ -1794,8 +1809,8 @@ fn fs_composite_hard_mix(in: VsOut) -> @location(0) vec4<f32> {
 
 // `blend_channel`'s own `BlendMode::PinLight` arm (src/composite.rs),
 // componentwise -- the **fifteenth** blend mode ported to WGSL (0.116.0), and
-// the last of the six branch-on-the-source overlay-family modes to reach the
-// GPU except `SoftLight`. Derived textually from that Rust arm:
+// at the time the last of the six branch-on-the-source overlay-family modes to
+// reach the GPU except `SoftLight`, which followed in 0.117.0. Derived textually from that Rust arm:
 //
 //     BlendMode::PinLight => if cs <= 0.5 { Darken(cb, 2*cs) }
 //                            else         { Lighten(cb, 2*cs - 1) }
@@ -1871,7 +1886,7 @@ fn fs_composite_hard_mix(in: VsOut) -> @location(0) vec4<f32> {
 // `composite_pin_light_over_with_opacity_is_the_source_alone_where_the_backdrop_
 // is_transparent` stays green with the guard deleted. The detector count stays
 // at **five of fifteen** (`Multiply`, `Screen`, `Difference`, `Overlay`,
-// `HardLight`). Unlike `HardMix`'s, this argument rests entirely on that
+// `HardLight`) -- 0.117.0's `SoftLight` is what later made it six of sixteen. Unlike `HardMix`'s, this argument rests entirely on that
 // measured `FMin`/`FMax` property, which WGSL leaves undefined on a `NaN`
 // operand -- so it is this adapter's result, not a portability guarantee.
 //
@@ -1946,5 +1961,275 @@ fn fs_composite_pin_light(in: VsOut) -> @location(0) vec4<f32> {
     let lo = min(cb, 2.0 * s.rgb);
     let hi = max(cb, 2.0 * s.rgb - 1.0);
     let b = select(hi, lo, s.rgb <= vec3<f32>(0.5));
+    return fold_over(s, bd, b);
+}
+
+// `soft_light_d(x)`, the W3C spec's own auxiliary `D(Cb)` function, and
+// `blend_channel`'s own `soft_light_d` (src/composite.rs) transcribed line for
+// line:
+//
+//     fn soft_light_d(x: f32) -> f32 {
+//         if x <= 0.25 { ((16.0 * x - 12.0) * x + 4.0) * x } else { x.sqrt() }
+//     }
+//
+// **This `if` is load-bearing and must not become a `select()`.** It is the
+// only thing that keeps `sqrt()`'s argument non-negative, and a negative `cb`
+// genuinely reaches this file -- proven below, not assumed. WGSL leaves
+// `sqrt(e)` for `e < 0` an *indeterminate value*, so a `select(sqrt(x),
+// poly(x), x <= 0.25)` would evaluate `sqrt` on that negative operand every
+// time. A conforming implementation discards the unselected arm, so such a
+// rewrite would still *return* the polynomial -- this is a defensive choice of
+// exactly the kind `color_burn_channel`'s `cs == 0.0` guard is (0.107.0), not a
+// demonstrated miscompile, and it is stated that way rather than overclaimed.
+// What decides it is that unlike `fs_composite_overlay`'s,
+// `fs_composite_hard_light`'s and `fs_composite_pin_light`'s branches, **this
+// mode's inner arms are not both total**: `sqrt` has a restricted domain and
+// the restriction is reachable. That is the same property that makes
+// `color_burn_channel` and `color_dodge_channel` per-channel helpers with real
+// early returns instead of componentwise `select()`s, and this file resolves it
+// the same way.
+//
+// **Why a negative `cb` is reachable, from in-gamut content** (0.117.0).
+// `fold_over` computes `a = s.a * opacity.value` with `opacity` pre-clamped by
+// the Rust caller but `s.a` deliberately **not** clamped -- an `f16` tile may
+// legitimately hold a source alpha above `1.0`, which every
+// `composite_*_over_with_opacity_does_not_clamp_a_source_alpha_above_one` test
+// in `composite.rs` already pins as real content rather than off-nominal input.
+// With `a > 1` the `inv = 1.0 - a` factor is **negative**, so
+// `out.rgb = inv * bd.rgb + a * blended` can come out negative while
+// `out.a = a + bd.a * inv` stays positive. Worked example, every colour channel
+// in `[0, 1]`: an opaque `(0.5, 0.75, 0.375)` accumulator under a `Multiply`
+// layer at `Cs = (0.375, 0.875, 0.25)` and `s.a = 2.0` gives
+// `out.rgb = -1 * bd.rgb + 2 * (bd.rgb * Cs) = bd.rgb * (2*Cs - 1)`, i.e.
+// `(-0.125, 0.5625, -0.1875)`, at `out.a = 2 + 1*(-1) = 1.0`. The *next*
+// layer's `straight_backdrop` then divides that by an alpha of `1.0` -- guard
+// intact, no degenerate division -- and hands this function a `cb` of `-0.125`.
+// So the hazard needs neither an out-of-gamut import nor an adversarial
+// fixture, only two ordinary layers one of which has an `f16` alpha above one.
+// `composite_soft_light_over_with_opacity_takes_the_polynomial_arm_for_a_
+// negative_backdrop` builds exactly that stack and is what makes this measured
+// evidence rather than an argument.
+//
+// (Note which way the guard falls for such a `cb`: `-0.125 <= 0.25` is true, so
+// the polynomial arm runs and `sqrt` is never reached. That is the guard
+// *working*, not the hazard being hypothetical -- delete the branch and the same
+// fixture reads back a `NaN`, measured in 0.117.0 as mutation (g) of this
+// round.)
+//
+// **The `<= 0.25` boundary mutation is provably unkillable**, and that is
+// proven arithmetic rather than a fixture limitation: at `x == 0.25` exactly the
+// polynomial is `((16*0.25 - 12)*0.25 + 4)*0.25 = ((4 - 12)*0.25 + 4)*0.25 =
+// (-2 + 4)*0.25 = 0.5` and `sqrt(0.25) = 0.5`, so the two arms agree
+// *bit-exactly* at the boundary -- every term above is an exact binary fraction,
+// so no rounding is involved. The pre-existing CPU test
+// `soft_light_d_agrees_at_and_around_its_own_branch_boundary` (composite.rs)
+// already records that equality, and unlike `fs_composite_pin_light`'s boundary it
+// cannot be rescued by an out-of-gamut operand: the agreement is at a single
+// point, not over a range.
+fn soft_light_d(x: f32) -> f32 {
+    if (x <= 0.25) {
+        return ((16.0 * x - 12.0) * x + 4.0) * x;
+    }
+    return sqrt(x);
+}
+
+// `blend_channel`'s own `BlendMode::SoftLight` arm (src/composite.rs),
+// per channel -- the **sixteenth** blend mode ported to WGSL (0.117.0) and the
+// last member of the six-mode branch-on-the-source overlay family
+// (`Overlay`/`HardLight`/`VividLight`/`LinearLight`/`PinLight` preceding it).
+// Derived textually from that arm:
+//
+//     BlendMode::SoftLight => if cs <= 0.5 {
+//         cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+//     } else {
+//         cb + (2.0 * cs - 1.0) * (soft_light_d(cb) - cb)
+//     }
+//
+// **It is the only mode in that family whose arms reuse nothing.** Every other
+// one substitutes two already-ported modes' arms or helpers
+// (`Multiply`/`Screen` for `HardLight`, `ColorBurn`/`ColorDodge` for
+// `VividLight`, `Darken`/`Lighten` for `PinLight`, `LinearBurn`/`LinearDodge`
+// for `LinearLight`); this one is real cross-term arithmetic plus its own
+// auxiliary `soft_light_d` above. So there is no sibling entry point a
+// mistyped `fragment_entry` could land on that computes anything close, which
+// removes this file's usual wrong-arm hazard and replaces it with an
+// arithmetic one -- see the near-miss table below.
+//
+// **The branch tests the SOURCE**, like `fs_composite_hard_light`,
+// `fs_composite_vivid_light` and `fs_composite_pin_light`; branching on `cb`
+// here is a real mutation and computes no named PSD mode.
+//
+// **A real `if` rather than an outer `select()`, and the reason is the inner
+// helper.** Both *outer* arms are total (the high one only because
+// `soft_light_d` is itself branch-guarded), so an outer `select()` would in
+// fact be safe -- what it would not be is simpler: it would still need
+// `soft_light_d` called per channel as a real-branched scalar helper, so the
+// per-channel shape is forced either way. Given that, the real `if` is chosen
+// for being textually 1:1 with the Rust arm above, which is how every entry
+// point in this file is checked.
+//
+// **The blind set: exactly the diagonal, and NO interior blind alpha anywhere
+// in gamut -- swept exhaustively, not sampled.** Write `D0 = Cb - Cs` and
+// `D1 = B(Cb, Cs) - B(Cs, Cb)`. Over an opaque backdrop at effective alpha `a`,
+// `out - out_transposed = (1 - a)*D0 + a*D1`, which vanishes at
+// `a* = D0 / (D0 - D1)`; an *interior* blind alpha (one in `(0, 1)`) exists iff
+// `D0` and `D1` have strictly opposite signs. Swept over **all 15,361 `f16`
+// values in `[0, 1]`, i.e. all 235,960,321 ordered pairs** (0.117.0, in `f64`):
+//
+//   - **zero pairs with an interior blind alpha**, so no opacity whatsoever
+//     hides a transposed operand pair in gamut; and
+//   - **zero off-diagonal pairs with `D1 == 0`**, so the blend term's symmetric
+//     set is *exactly* `Cb == Cs`, where `D0 == 0` too and the channel is blind
+//     at every `a`.
+//
+// That is strictly stronger than any prior ported mode's result. `Overlay` and
+// `HardLight` are symmetric over whole regions; `PinLight` over four classes
+// including the easy-to-hit `|Cb - Cs| == 0.5`; `LinearLight` is
+// unconditionally asymmetric yet still has blind alphas (railed channels at
+// `a = 1`, interior ones at exactly `a = 0.5`); `HardMix` is symmetric
+// everywhere but one corner. Here a channel is blind only where it is blind for
+// *every* mode.
+//
+// The closed form behind the "Region 1" part of that sweep, which is worth
+// keeping because it is exact: for `Cb, Cs` both `<= 0.5` (both operands in the
+// low arm), `D1 = D0 * Exclusion(Cb, Cs)` where
+// `Exclusion(x, y) = x + y - 2xy` is `blend_channel`'s own `Exclusion` arm.
+// On `[0, 0.5]^2` that factor lies in `[0, 0.5]`, so
+// `a* = 1 / (1 - Exclusion) ` lies in `[1, 2]` -- never interior. Verified
+// symbolically (the difference expands to exactly `0`) as well as swept.
+//
+// **The one exception is out of gamut, and it is the *same* `cb < 0` mechanism
+// `soft_light_d` above documents.** Negative operands leave the closed form's
+// `[0, 0.5]` range: at `Cb = -0.2, Cs = 0.05` the factor is `-0.13` and
+// `a* = 1/1.13 ~= 0.885`, a genuine interior blind alpha; at
+// `Cb = -0.5, Cs = 0.25` the factor is exactly `0`, so `D1 == 0` off the
+// diagonal. Disclosed rather than designed around: the in-gamut sweep result
+// above is what `NORMAL_MULTIPLY_SOFT_LIGHT_STACK`'s transpose coverage rests
+// on, and that fixture's operands are all in gamut.
+//
+// **The SIXTH detector of `straight_backdrop`'s guard removal -- predicted from
+// 0.110.0's rule, then measured** (0.117.0). With the guard deleted `cb` is
+// `0.0 / 0.0`, a `NaN`, and this mode has no `min`, `max` or `clamp` anywhere
+// on the path from `cb` to `b`:
+//
+//   - the **low** arm (`cs <= 0.5`) is pure `+`/`-`/`*` on `cb`, so the `NaN`
+//     propagates by IEEE-754 arithmetic alone -- no vendor behaviour involved,
+//     which is why
+//     `composite_soft_light_over_with_opacity_is_the_source_alone_where_the_
+//     backdrop_is_transparent` deliberately carries **two `Cs <= 0.5`
+//     channels**: the detection rests on that argument and not on the weaker
+//     one below;
+//   - the **high** arm reaches `soft_light_d(NaN)`, where `NaN <= 0.25` is
+//     `false` under IEEE-754, so `sqrt(NaN)` runs -- and WGSL says no more
+//     about `sqrt` of a `NaN` than it does about `FMin`/`FMax` of one, so that
+//     path is this adapter's behaviour rather than a guarantee.
+//
+// Measured: with the guard deleted that test reads back
+// `(NaN, NaN, NaN, 1.0)`. This mode joins `Multiply`, `Screen`, `Difference`,
+// `Overlay` and `HardLight`, taking the count to **six of sixteen**; the other
+// ten launder the `NaN` through a `min`/`max`/`clamp` and are genuinely
+// output-equivalent on this adapter (see `straight_backdrop()`'s own comment).
+//
+// **The outer `<= 0.5` boundary mutation is provably unkillable, and for a
+// stronger reason than any prior mode's.** At `Cs == 0.5` exactly the low arm's
+// factor is `1.0 - 2.0*0.5 = 0.0` and the high arm's is `2.0*0.5 - 1.0 = 0.0`,
+// so **both arms reduce to `cb` for every finite `cb` whatsoever** -- the
+// multipliers are exactly zero, not merely equal-in-effect. `Overlay`'s,
+// `HardLight`'s and `VividLight`'s boundaries agree only over `[0, 1]`, and
+// `fs_composite_pin_light`'s is killable precisely because its two arms diverge
+// once `straight_backdrop` hands it a `Cb > 1`. That escape does not exist
+// here: `composite_soft_light_over_with_opacity_agrees_across_its_own_branch_
+// boundary` carries an out-of-gamut `Cb = 1.5` boundary channel specifically to
+// measure the mutation surviving *there* too, and it does.
+//
+// **Degeneracies, and the one provable rival identity:**
+//
+//   - `SoftLight(Cb, 0.5) = Cb` for every `Cb` -- a **source** channel at
+//     exactly `0.5` is a total no-op, and is also the branch boundary above. It
+//     is where this mode collides with every other no-op-at-`0.5` mode at once
+//     (`Overlay`, `HardLight`, `VividLight`, `PinLight`, and `LinearLight` and
+//     `Lighten` in gamut).
+//   - **`SoftLight(0.25, Cs) = Overlay(0.25, Cs)` for every `Cs > 0.5`,
+//     provably** -- at `Cb == 0.25`, `soft_light_d` gives `0.5`, so the high arm
+//     is `0.25 + (2Cs - 1)*0.25 = 0.5*Cs`; and `Overlay(0.25, Cs) =
+//     HardLight(Cs, 0.25) = Multiply(Cs, 0.5) = 0.5*Cs`. `Overlay` is a live
+//     GPU arm, so a `0.25` **backdrop** channel hides it. That is why
+//     `composite_soft_light_over_with_opacity_agrees_across_soft_light_ds_own_
+//     branch_boundary` -- which must put `Cb` at `0.25` -- carries a third
+//     channel off that value.
+//   - `SoftLight(0, Cs) = 0` and `SoftLight(1, Cs) = 1`: a black or white
+//     **backdrop** channel says nothing about `Cs` (the low arm's `cb` and
+//     `1 - cb` factors, and `soft_light_d(0) = 0`, `soft_light_d(1) = 1`).
+//   - `Cb == Cs` hides a transposed operand pair, as for every mode -- and here
+//     that is the *whole* symmetric set, per the sweep above.
+//
+// **Near misses, in decreasing order of how easy the slip is:**
+//
+//   - **Dropping `soft_light_d`'s branch and always taking `sqrt`** -- correct
+//     for `Cb > 0.25`, so only a `Cb <= 0.25` high-branch channel sees it, and
+//     a `Cb < 0` one reads back `NaN`.
+//   - **Dropping it the other way and always taking the polynomial** -- wrong
+//     by a lot above `0.25` (`poly(0.5625) = 1.30078125` against
+//     `sqrt(0.5625) = 0.75`), so broadly detectable.
+//   - **`(soft_light_d(cb) - cb)` written as `soft_light_d(cb)`** -- turns the
+//     high arm into `cb + (2Cs - 1)*D(Cb)`, which is right only where
+//     `Cs == 0.5` or `Cb == 0`.
+//   - **Dropping the `2.0 *` in either arm** -- the low arm becomes
+//     `cb - (1 - cs)*cb*(1 - cb)` and the high `cb + (cs - 1)*(D - cb)`, whose
+//     multiplier is *negative* for `Cs < 1`, pushing the result the wrong way.
+//   - **`(1.0 - cb)` written as `cb` in the low arm** -- makes it
+//     `cb - (1 - 2Cs)*cb*cb`, agreeing only at `cb == 0.5` or `Cs == 0.5`.
+//   - **The polynomial's `16.0` or `12.0` or `4.0`** -- all three are exercised
+//     by any `Cb <= 0.25` high-branch channel; `16.0 -> 1.0` moves
+//     `poly(0.0625)` from `0.20703125` to `0.23730...`.
+//   - **Swapping the two outer arms**, or **branching on `cb`**. Neither
+//     computes a named mode.
+//   - **A `fragment_entry` naming `fs_composite_overlay`** -- the one live
+//     sibling with a provable identity here (`Cb == 0.25`, above), and the
+//     nearest rival on the roster. `fs_composite_hard_light` is the other
+//     name worth checking, being `Overlay`'s own transpose.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the fifteen entry points
+// above; no new binding, no new layout.
+fn soft_light_channel(cb: f32, cs: f32) -> f32 {
+    if (cs <= 0.5) {
+        return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
+    }
+    return cb + (2.0 * cs - 1.0) * (soft_light_d(cb) - cb);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs) exactly,
+// for `BlendMode::SoftLight` only -- the **sixteenth** blend mode ported to the
+// GPU (0.117.0), and the last of the branch-on-the-source overlay family.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of the
+// surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` block below differs. Read
+// `soft_light_channel` directly above for this mode's own formula, its
+// exhaustively swept blind set, its out-of-gamut exception, its
+// sixth-detector result, its two provably unkillable boundary mutations, its
+// degeneracies and its near-miss table -- and `soft_light_d` above that for why
+// its inner `if` may not become a `select()`.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the fifteen entry points
+// above; no new binding, no new layout.
+@fragment
+fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    // blend_channel(SoftLight, cb, cs): cb - (1 - 2*cs)*cb*(1 - cb) where
+    // cs <= 0.5, else cb + (2*cs - 1)*(soft_light_d(cb) - cb). The branch tests
+    // the SOURCE. Three calls to a per-channel helper rather than a
+    // componentwise select(), because soft_light_d's own guard must stay a real
+    // branch -- see that function's comment for the reachable cb < 0 that makes
+    // it load-bearing.
+    let b = vec3<f32>(
+        soft_light_channel(cb.r, s.r),
+        soft_light_channel(cb.g, s.g),
+        soft_light_channel(cb.b, s.b),
+    );
     return fold_over(s, bd, b);
 }
