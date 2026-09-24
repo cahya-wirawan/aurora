@@ -2350,6 +2350,39 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
 // of gamut too. It is a *proven identity*, not a search finding, and should
 // not be described as swept.
 //
+// **Its premise, stated because 0.118.0 left it implicit and one comment then
+// over-applied it (0.118.1).** `D1 = D0` is a property of the blend term
+// alone and is unconditional. The *gap* identity above is not: the single
+// shorthand `out = (1 - a)*Cb + a*B` has to be **both** orders' fold, and it
+// only is when the two transposed slots share an alpha -- in practice
+// `s.a == 1.0` over an opaque accumulator, with all the non-unit alpha coming
+// from the `opacity` uniform, which stays attached to the source slot across
+// the swap. When they differ, transposing the bindings also swaps which alpha
+// becomes `fold_over`'s `a` and which becomes `straight_backdrop`'s
+// un-premultiply divisor, and the gap is no longer `D0`. Two measured
+// consequences on this adapter, both real runs rather than derivations:
+//
+//   - `aurora_render`'s own
+//     `composite_subtract_over_with_opacity_subtracts_and_clamps_per_channel`
+//     has a source alpha of `0.5`, and its transposed gaps are
+//     `(+0.3125, -0.5625, -0.6875)`, not `D0`'s `(+0.625, -0.25, -0.5625)`.
+//     The swap is still caught there, in all three channels;
+//   - the blind set is *not* `{Cb == Cs}` once the alphas differ. `Cb = 0.75`
+//     opaque against `Cs = 0.5` at source alpha `0.5` and opacity `1.0`
+//     composites to exactly `(0.5, 0.5, 0.5, 1.0)` **both ways**, a genuinely
+//     blind point with `Cb != Cs`. Solving the fold in that regime (opaque
+//     accumulator, source alpha `sa`, uniform opacity `p`, in the branch
+//     `Cb >= Cs` and `Cs > sa*Cb`) gives the blind locus
+//     `Cs = Cb*(1 - p + 2*sa*p)/(1 + sa*p)`, of which that texel is the
+//     `sa = 1/2, p = 1` case. At `sa = 1` it collapses to `Cs == Cb`, which is
+//     why the equal-alpha statement above is the correct one and not merely
+//     the convenient one.
+//
+// Where the identity is *used* -- `aurora-app`'s
+// `NORMAL_MULTIPLY_SUBTRACT_STACK`, whose three layers are all opaque with
+// only the uniform opacity non-unit -- the premise holds, and the gap there is
+// `D0` at every opacity, measured at `0.5` and at `1.0`.
+//
 // **Three near misses, the first of which is the sharpest in this file:**
 //
 //   - **`abs(cb - s.rgb)` is `Difference`** (`fs_composite_difference` far

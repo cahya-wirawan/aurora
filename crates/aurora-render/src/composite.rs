@@ -4279,6 +4279,23 @@ impl TileCompositor {
     /// which is what makes it stronger in kind than `SoftLight`'s exhaustively
     /// swept "no interior blind alpha".
     ///
+    /// **`D1 = D0` is unconditional; the gap identity built on it is not**
+    /// (0.118.1). `out = (1 - a)*Cb + a*B` has to be *both* orders' fold for
+    /// that substitution to be legal, which it is only when the two transposed
+    /// slots share an alpha — the usual case of an opaque source over an opaque
+    /// accumulator, all the non-unit alpha coming from the `opacity` argument,
+    /// which follows the source slot across the swap. Where the two alphas
+    /// differ, transposing also swaps which one becomes the effective alpha and
+    /// which becomes `straight_backdrop`'s divisor, and the gap is not `D0`:
+    /// `composite_subtract_over_with_opacity_subtracts_and_clamps_per_channel`'s
+    /// own fixture (source alpha `0.5`) measures `(+0.3125, -0.5625, -0.6875)`,
+    /// and `Cb = 0.75` opaque against `Cs = 0.5` at source alpha `0.5`, opacity
+    /// `1.0` is measurably blind in all three channels despite `Cb != Cs`. See
+    /// `fs_composite_subtract`'s comment in `shaders/composite.wgsl` for the
+    /// blind locus in that regime. `aurora-app`'s
+    /// `NORMAL_MULTIPLY_SUBTRACT_STACK`, which is where the identity is relied
+    /// on, satisfies the premise.
+    ///
     /// **Deliberately not `(Cb - Cs).abs()`, which is `Difference` — and this is
     /// the widest rival coincidence in the crate.** The two are identical on the
     /// whole closed half-plane `Cb >= Cs`, not on a point or a curve, so a
@@ -24491,30 +24508,59 @@ mod tests {
     ///   are bit-identical wherever `Cb >= Cs`. Green and blue are what catch
     ///   it here, and test 4 below has the opposite split so all three channels
     ///   see it across the suite;
-    /// - a **dropped `max`** (`Cb - Cs`): `(0.6875, 0.25, -0.15625)` — red
+    /// - a **dropped `max`** (`Cb - Cs`): `(0.6875, 0.1875, -0.15625)` — red
     ///   agrees again, for the same reason, and blue goes negative;
-    /// - the **clamp reversed** (`min(Cb - Cs, 0)`): `(0.375, 0.25, -0.15625)`;
+    /// - the **clamp reversed** (`min(Cb - Cs, 0)`): `(0.375, 0.1875,
+    ///   -0.15625)`;
     /// - the **clamp bound mistyped** as `vec3<f32>(1.0)`
     ///   (`max(Cb - Cs, 1)`): `(0.875, 0.8125, 0.625)`;
-    /// - the **`-` mistyped as `+`** (`max(Cb + Cs, 0)`): `(0.8125, 0.8125,
-    ///   0.78125)`;
+    /// - the **`-` mistyped as `+`** (`max(Cb + Cs, 0)`): `(0.8125, 1.0625,
+    ///   0.65625)` — green and blue leave `[0, 1]`, so this mutant is the
+    ///   first in the series that an 8-bit whole-tile comparison could not
+    ///   see (both `read_rgba8` and `rgba8_of` clamp before comparing); it is
+    ///   caught here because this test reads the texel back as `f16`;
     /// - **`LinearBurn`'s `max(Cb + Cs - 1, 0)`**: `(0.375, 0.5625, 0.15625)` —
     ///   all three channels separate it, no source channel being `0.5`
     ///   (degeneracy 5);
     /// - the `Normal` arm: `(0.4375, 0.75, 0.53125)`; `LinearDodge`
     ///   `(0.8125, 0.8125, 0.625)` — note this coincides with the mistyped
-    ///   clamp bound above, both saturating; `Multiply`
+    ///   clamp bound above **in green and blue only**, the two channels where
+    ///   `Cb + Cs >= 1` drives `LinearDodge`'s own `min` to the same `1.0` the
+    ///   mistyped bound returns unconditionally; **red differs** (`0.8125`
+    ///   against `0.875`), `Cb + Cs` being `0.875` there. Through 0.118.0 this
+    ///   said the two coincided outright, which was wrong in red; `Multiply`
     ///   `(0.421875, 0.5859375, 0.2265625)`; `Darken` `(0.4375, 0.625, 0.25)`;
     ///   `Lighten` `(0.75, 0.75, 0.53125)`; `Screen`
     ///   `(0.765625, 0.7890625, 0.5546875)`; `Exclusion`
     ///   `(0.71875, 0.515625, 0.453125)`;
-    /// - **bindings 0 and 3 transposed**: caught, and by the blend term itself
-    ///   rather than only by the surrounding "over". `B(Cb, Cs)` and
-    ///   `B(Cs, Cb)` are the positive and negative parts of the same number, so
-    ///   `D1 = D0` identically and `out - out_transposed = D0` at **every**
-    ///   alpha — the blind set is exactly `Cb == Cs`, which this fixture has
-    ///   none of, and there is no blind alpha at all. See the entry point's
-    ///   comment for the two-line proof.
+    /// - **bindings 0 and 3 transposed**: caught, in all three channels —
+    ///   **measured at `(0.375, 0.875, 0.8125, 1.0)`** by really performing
+    ///   that swap on this adapter (0.118.1), against the golden's
+    ///   `(0.6875, 0.3125, 0.125, 1.0)`.
+    ///
+    ///   **The `out - out_transposed = D0` identity the entry point proves
+    ///   does *not* apply to this fixture, and through 0.118.0 this bullet
+    ///   claimed it did.** That identity is a statement about the fold
+    ///   `out = (1 - a)*Cb + a*B`, which is only both orders' fold when the
+    ///   two transposed slots *share* their alpha. Here they do not: the
+    ///   source carries its own `f16` alpha `0.5` while the accumulator is
+    ///   opaque, so transposing the bindings also swaps which alpha becomes
+    ///   the effective alpha and which becomes `straight_backdrop`'s
+    ///   un-premultiply divisor. The real per-channel gaps are therefore
+    ///   `(+0.3125, -0.5625, -0.6875)`, not `D0`'s
+    ///   `(+0.625, -0.25, -0.5625)`. What survives unconditionally is
+    ///   `D1 = D0` — a property of the blend term alone — and that is what
+    ///   makes the swap visible here through the blend term rather than only
+    ///   through the "over". The `D0` gap, the empty blind-alpha set and
+    ///   "the blind set is exactly `Cb == Cs`" are the *equal-alpha*
+    ///   specialisation, which `aurora-app`'s
+    ///   `NORMAL_MULTIPLY_SUBTRACT_STACK` does satisfy (every layer opaque,
+    ///   only the uniform opacity non-unit) and this fixture does not. For a
+    ///   measured counterexample: `Cb = 0.75` opaque against `Cs = 0.5` at
+    ///   source alpha `0.5` and opacity `1.0` composites to exactly
+    ///   `(0.5, 0.5, 0.5, 1.0)` **both ways** on this adapter, despite
+    ///   `Cb != Cs`. See the entry point's comment for the identity's proof
+    ///   and its stated premise.
     ///
     /// The golden is asserted *and* cross-checked against the real
     /// [`composite_tile_cpu`] for the same two layers, so a stale literal
@@ -24602,13 +24648,18 @@ mod tests {
              the two modes are bit-identical wherever Cb >= Cs and red is this fixture's only \
              unclamped channel; green and blue are what catch that substitution here, and the \
              half-opacity test below has the opposite split. A dropped max gives \
-             (0.6875, 0.25, -0.15625) (red agrees again), a reversed clamp min(Cb - Cs, 0) \
-             (0.375, 0.25, -0.15625), a clamp bound mistyped as 1.0 (0.875, 0.8125, 0.625), a \
-             `+` for the `-` (0.8125, 0.8125, 0.78125), LinearBurn's max(Cb + Cs - 1, 0) \
+             (0.6875, 0.1875, -0.15625) (red agrees again), a reversed clamp min(Cb - Cs, 0) \
+             (0.375, 0.1875, -0.15625), a clamp bound mistyped as 1.0 (0.875, 0.8125, 0.625), a \
+             `+` for the `-` (0.8125, 1.0625, 0.65625) -- out of range in green and blue, which \
+             only an f16 read like this one can see -- LinearBurn's max(Cb + Cs - 1, 0) \
              (0.375, 0.5625, 0.15625), the Normal arm (0.4375, 0.75, 0.53125), LinearDodge \
-             (0.8125, 0.8125, 0.625), Multiply (0.421875, 0.5859375, 0.2265625), Darken \
+             (0.8125, 0.8125, 0.625) (which matches the mistyped clamp bound in green and blue \
+             but not in red), Multiply (0.421875, 0.5859375, 0.2265625), Darken \
              (0.4375, 0.625, 0.25), Lighten (0.75, 0.75, 0.53125), Screen \
-             (0.765625, 0.7890625, 0.5546875) and Exclusion (0.71875, 0.515625, 0.453125)."
+             (0.765625, 0.7890625, 0.5546875) and Exclusion (0.71875, 0.515625, 0.453125). \
+             Transposing bindings 0 and 3 gives (0.375, 0.875, 0.8125, 1.0) -- all three \
+             channels, though NOT by D0, this fixture's two slots not sharing an alpha; see the \
+             doc comment."
         );
     }
 
@@ -25070,6 +25121,45 @@ mod tests {
     /// three — no unclamped source channel is `0.5` (degeneracy 5), and green's
     /// `LinearBurn` sum stays above `1.0` while its `Subtract` difference does
     /// not.
+    ///
+    /// **What the opaque half does and does not catch, corrected in 0.118.1.**
+    /// Through 0.118.0 the whole-tile assertion below said "a wrong blend
+    /// formula shows up here", citing the `Difference` substitution. That is
+    /// true of `Difference` — and of any mutant whose output stays inside
+    /// `[0, 1]` — but **it is not true of a dropped `max`, which this test
+    /// cannot see at all.** With the clamp gone the opaque half's green channel
+    /// computes `B = 0.25 - 0.875 = -0.625`, genuinely out of range in `f16`;
+    /// but the comparison runs through [`read_rgba8`] on the GPU side and
+    /// [`rgba8_of`] on the CPU side, **both of which `.clamp(0.0, 1.0)` before
+    /// quantising**, so the mutation's own divergence is clamped back to the
+    /// reference's `0` on the way into the comparison. Measured, not reasoned:
+    /// deleting the `max` in `fs_composite_subtract` leaves this test green
+    /// while failing five others in this suite —
+    /// `composite_subtract_over_with_opacity_subtracts_and_clamps_per_channel`,
+    /// `..._matches_the_cpu_against_a_translucent_accumulator`,
+    /// `..._matches_the_cpu_across_a_spatially_varying_tile`,
+    /// `..._at_half_opacity_matches_the_cpu` and
+    /// `..._does_not_clamp_a_source_alpha_above_one` — plus `aurora-app`'s
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_subtract_blend_document`.
+    /// So nothing about this mutation ships undetected; what was wrong was one
+    /// assertion message's account of its own coverage. The last of those five
+    /// is the one that closes the class exactly: it asserts a deliberately
+    /// negative green (`-0.375`) through [`read_first_texel`], which does *not*
+    /// clamp.
+    ///
+    /// **The class, disclosed because the next mode will reopen it.** Every
+    /// `assert_whole_tile_matches` comparison in this file is blind to
+    /// out-of-`[0, 1]` shader output, for the same reason: both sides are
+    /// clamped before comparing. It has never mattered before, every mode
+    /// ported ahead of `Subtract` having a range-safe formula by construction.
+    /// `Subtract` is the first whose *mutants* can leave the range (a dropped
+    /// clamp, or the `+`-for-`-` mistype in test 1's table), and `Divide` — the
+    /// obvious next candidate — is the first whose *correct* formula can, since
+    /// `Cb / Cs` exceeds `1.0` whenever `Cb > Cs`. Closing it properly needs an
+    /// exact-`f16` readback at an arbitrary texel; [`read_first_texel`] reads
+    /// only `(0, 0)`, which in this fixture is in the *transparent* half, so
+    /// the helper does not exist yet. Deliberately left as a named follow-on
+    /// for the round that needs it rather than built speculatively here.
     fn composite_subtract_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent()
     {
         let Some(context) = real_context() else {
@@ -25175,11 +25265,14 @@ mod tests {
             &read_rgba8(device, queue, &dst),
             &rgba8_of(&cpu_out),
             "the in-shader Subtract path and composite_tile_cpu disagree across a \
-             half-transparent backdrop. In the opaque half a wrong blend formula shows up here \
-             (Difference only in green, the one clamped channel); in the transparent half a NaN \
-             out of the untaken `ab > 0.0` branch would -- though this mode launders one, so \
-             that half is a weaker guard here than in the Multiply/Screen/Difference/Overlay/ \
-             HardLight/SoftLight suites.",
+             half-transparent backdrop. In the opaque half an IN-RANGE wrong blend formula shows \
+             up here (Difference only in green, the one clamped channel); in the transparent half \
+             a NaN out of the untaken `ab > 0.0` branch would -- though this mode launders one, \
+             so that half is a weaker guard here than in the Multiply/Screen/Difference/Overlay/ \
+             HardLight/SoftLight suites. A mutant that leaves [0, 1] is NOT caught here: \
+             read_rgba8 and rgba8_of both clamp before comparing, so a dropped max (green would \
+             be -0.625 in the opaque half) is invisible to this assertion and is caught by the \
+             five other tests named in this test's doc comment instead.",
         );
     }
 

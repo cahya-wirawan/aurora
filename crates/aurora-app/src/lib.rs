@@ -7492,9 +7492,15 @@ fn composite_roots_into_tile(
 ///   path: `B(Cb, Cs) = max(Cb - Cs, 0)` and `B(Cs, Cb) = max(Cs - Cb, 0)` are
 ///   the positive and negative parts of the *same* number `D0 = Cb - Cs`, so
 ///   `D1 = D0` identically and `out - out_transposed = (1 - a)*D0 + a*D0 = D0`
-///   for **every** `a`. The blind set is exactly `Cb == Cs` and **no blind
-///   alpha exists at all** — the usual `a* = D0/(D0 - D1)` has a zero
-///   denominator. That holds off any grid and out of gamut, unlike
+///   for **every** `a` — **given the premise that makes `(1 - a)*Cb + a*B` both
+///   orders' fold, namely that the two transposed slots share an alpha**, which
+///   `NORMAL_MULTIPLY_SUBTRACT_STACK`'s all-opaque layers do (0.118.1 stated
+///   this; 0.118.0 left it implicit, and `aurora-render`'s own half-alpha
+///   fixture is a measured case where the gap is *not* `D0`, the swap still
+///   being caught there in all three channels). The blind set is exactly
+///   `Cb == Cs` and **no blind alpha exists at all** — the usual
+///   `a* = D0/(D0 - D1)` has a zero denominator. That holds off any grid and
+///   out of gamut, unlike
 ///   `SoftLight`'s exhaustively swept "no interior blind alpha", so
 ///   `TRANSPOSE_COVERAGE`'s `0.5` demand is *provably* unnecessary for this one
 ///   row (and the guard is still deliberately not special-cased for it: plain
@@ -10510,15 +10516,22 @@ fn begin_gpu_composite_tile(
             // strongest on this path.** `B(Cb, Cs) = max(Cb - Cs, 0)` and
             // `B(Cs, Cb) = max(Cs - Cb, 0)` are the positive and negative parts
             // of the *same* number `D0 = Cb - Cs`, so `D1 = D0` identically and
-            // `out - out_transposed = (1 - a)*D0 + a*D0 = D0` for **every** `a`.
-            // The blind set is exactly `Cb == Cs` and there is **no blind alpha
-            // at all** -- `a* = D0/(D0 - D1)` has a zero denominator. That is a
-            // closed-form identity, not a sweep result like `SoftLight`'s, so it
-            // holds off any grid and out of gamut too. The fixture has no
-            // `Cb == Cs` channel, so the transpose is caught in all three
-            // channels at `0.5` and at `1.0` with *identical* per-channel gaps.
-            // `TRANSPOSE_COVERAGE`'s arithmetic assertion (0.113.1) is what
-            // measures that.
+            // `out - out_transposed = (1 - a)*D0 + a*D0 = D0` for **every** `a`,
+            // **so long as the two transposed slots share an alpha** -- the
+            // premise that makes `(1 - a)*Cb + a*B` both orders' fold, and one
+            // 0.118.0 left implicit (0.118.1). It holds here:
+            // `NORMAL_MULTIPLY_SUBTRACT_STACK`'s three layers are all opaque and
+            // the only non-unit alpha is the `opacity` uniform, which stays with
+            // the source slot across the swap. Under it the blind set is exactly
+            // `Cb == Cs` and there is **no blind alpha at all** --
+            // `a* = D0/(D0 - D1)` has a zero denominator. That is a closed-form
+            // identity, not a sweep result like `SoftLight`'s, so it holds off
+            // any grid and out of gamut too. The fixture has no `Cb == Cs`
+            // channel, so the transpose is caught in all three channels at `0.5`
+            // and at `1.0` with per-channel gaps of identical *magnitude*
+            // (`|D0|`, i.e. `(0.40625, 0.375, 0.15625)`; green's signed gap is
+            // `-0.375`). `TRANSPOSE_COVERAGE`'s arithmetic assertion (0.113.1),
+            // which compares magnitudes, is what measures that.
             aurora_render::BlendMode::Subtract => {
                 let spare_accumulator = accumulator_or_create(
                     &mut spare,
@@ -32059,9 +32072,22 @@ mod tests {
     /// is strictly stronger in *kind* than `SoftLight`'s "no interior blind
     /// alpha", which came from an exhaustive sweep of 235,960,321 in-gamut `f16`
     /// pairs: this is a two-line closed-form identity that holds off any grid
-    /// and out of gamut too. Measured, not merely derived: the per-channel gaps
-    /// are `(0.40625, 0.375, 0.15625)` at opacity `0.5` **and the same three
-    /// values at `1.0`**.
+    /// and out of gamut too.
+    ///
+    /// **Two things 0.118.0 stated loosely here, corrected in 0.118.1.** First,
+    /// the gap identity — unlike `D1 = D0`, which is unconditional — needs
+    /// `(1 - a)*Cb + a*B` to be *both* orders' fold, i.e. needs the two
+    /// transposed slots to share an alpha. **This fixture satisfies that**: all
+    /// three layers are opaque and the only non-unit alpha is `l3`'s `0.5`
+    /// *opacity*, which follows the source slot across the swap. (Where the two
+    /// alphas differ the gap is not `D0` at all —
+    /// `aurora_render::composite_subtract_over_with_opacity`'s own doc comment
+    /// has the measured counterexample.) Second, the gaps are **signed**, and
+    /// green's is negative: `D0 = (+0.40625, -0.375, +0.15625)`. Measured, not
+    /// merely derived — the magnitudes `(0.40625, 0.375, 0.15625)` are what
+    /// come out at opacity `0.5` **and again at `1.0`**, and magnitudes are what
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// compares, since it folds through `f32::abs`.
     ///
     /// **The `Subtract` layer sits at opacity `0.5`** because
     /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
@@ -32766,8 +32792,10 @@ mod tests {
                      transposed src and backdrop for {mode:?} would be invisible to it: most \
                      formulas on the GPU path are commutative, the exceptions being ColorBurn, \
                      ColorDodge, LinearLight, VividLight, SoftLight, PinLight and Subtract (for \
-                     which D1 == D0 identically, so no alpha at all hides its transpose and this \
-                     demand is provably unnecessary) -- Overlay and HardLight \
+                     which D1 == D0 identically, so for a fixture whose mode-bearing layer is \
+                     opaque -- its non-unit effective alpha coming from opacity, as every row \
+                     here does -- no alpha at all hides its transpose and this demand is \
+                     provably unnecessary) -- Overlay and HardLight \
                      everywhere their two \
                      operands share a side of 0.5, which is most of a typical channel pair, and \
                      the two are each other's transpose so they also agree with each other \
@@ -36549,13 +36577,26 @@ mod tests {
     /// `D1 = D0` identically and `out - out_transposed = (1 - a)*D0 + a*D0 = D0`
     /// for all `a`; the blind set is exactly `Cb == Cs` (which this fixture has
     /// none of) and no blind alpha exists at all, `a* = D0/(D0 - D1)` having a
-    /// zero denominator. [`solid_stack_texel_cpu`] folded both ways gives
+    /// zero denominator. **The premise, made explicit in 0.118.1:** that
+    /// substitution needs `(1 - a)*Cb + a*B` to be *both* orders' fold, so it
+    /// needs the two transposed slots to share an alpha — satisfied here,
+    /// [`NORMAL_MULTIPLY_SUBTRACT_STACK`]'s three layers all being opaque with
+    /// the `0.5` coming from `l3`'s *opacity*. `aurora_render`'s own half-alpha
+    /// `Subtract` fixture is a measured case where it does not hold and the gap
+    /// is not `D0`; the swap is caught there anyway.
+    ///
+    /// [`solid_stack_texel_cpu`] folded both ways gives
     /// `(0.53125, 0.1875, 0.171875, 1.0)` against
-    /// `(0.125, 0.5625, 0.015625, 1.0)` — per-channel gaps of exactly
-    /// `(0.40625, 0.375, 0.15625)`, **the same three values at opacity `1.0`**,
-    /// which is what
+    /// `(0.125, 0.5625, 0.015625, 1.0)` — per-channel gaps of
+    /// `(+0.40625, -0.375, +0.15625)`, i.e. `D0` itself, **signs included**:
+    /// green's gap is *negative*, the golden's `0.1875` being below the
+    /// transposed `0.5625`, and 0.118.0's text here listed the three as though
+    /// they shared `D0`'s red sign. Their **magnitudes** are `(0.40625, 0.375,
+    /// 0.15625)` and are the same three at opacity `1.0`; magnitudes are also
+    /// what
     /// `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_
-    /// transposed_argument`'s third assertion measures.
+    /// transposed_argument`'s third assertion measures, since it folds the
+    /// per-channel differences through `f32::abs`.
     ///
     /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
     /// unverified for `fs_composite_subtract`. **This mode has the narrowest
@@ -36635,10 +36676,13 @@ mod tests {
              (0.328125, 0.6875, 0.09375, 1.0) HardMix and \
              (0.59985, 0.43434, 0.11609, 1.0) SoftLight -- Difference being the ONLY rival that \
              coincides in any channel. A dispatch arm that transposed src and backdrop folds on \
-             the CPU to (0.125, 0.5625, 0.015625, 1.0) -- all three channels, and by exactly the \
-             same per-channel gaps (0.40625, 0.375, 0.15625) at EVERY opacity including 1.0, \
-             because B(Cb, Cs) and B(Cs, Cb) are the positive and negative parts of the same \
-             number, making D1 = D0 identically and out - out_transposed = D0 alpha-independent."
+             the CPU to (0.125, 0.5625, 0.015625, 1.0) -- all three channels, and by gaps of the \
+             same MAGNITUDE (0.40625, 0.375, 0.15625) at EVERY opacity including 1.0 (signed, \
+             they are D0 itself: +0.40625, -0.375, +0.15625 -- green's is negative), because \
+             B(Cb, Cs) and B(Cs, Cb) are the positive and negative parts of the same number, \
+             making D1 = D0 identically and out - out_transposed = D0 alpha-independent. That \
+             last step assumes the two transposed slots share an alpha, which this fixture's \
+             all-opaque layers do; see the doc comment."
         );
 
         // The vacuity guard: the same stack with its `Subtract` layer turned
