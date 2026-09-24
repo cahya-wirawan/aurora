@@ -20001,6 +20001,183 @@ severity choice.
   that gap so far: two inherited division-by-zero guards, each redundant only
   under this adapter's `+inf` behaviour.
 
+- [x] **`SoftLight` ported to WGSL, admitted at the predicate, and wired through
+  the real dispatch arm — done 2026-09-19 (0.117.0).** The **sixteenth** real
+  blend-math mode on the GPU, and the one that **completes the six-member
+  branch-on-the-source overlay family** (`Overlay`, `HardLight`, `SoftLight`,
+  `VividLight`, `LinearLight`, `PinLight`). It is also the only member of that
+  family whose blend term reuses *nothing*: `HardLight` substitutes
+  `Multiply`/`Screen`, `VividLight` `ColorBurn`/`ColorDodge`, `PinLight`
+  `Darken`/`Lighten` and `LinearLight` `LinearBurn`/`LinearDodge`, while this one
+  is real cross-term arithmetic plus its own auxiliary `soft_light_d` — which is
+  exactly why every prior round named it as the one no prior port brought closer.
+  Two WGSL functions (`soft_light_d`, `soft_light_channel`) and one entry point,
+  one `BlendPass` const, four labels, one one-line wrapper, one predicate arm,
+  one dispatch arm, one counter variant/field/`counter()`/
+  `dispatch_arm_blend_mode` arm, one `TRANSPOSE_COVERAGE` row, one fixture const,
+  **nine** render-level GPU tests, one headless predicate test and one app-level
+  integration test. `composite_blend_over_with_opacity` was not touched — a
+  **fourteenth** consecutive caller added with no line of change to it.
+  `CPU_ONLY_BLEND_MODE` stays `Exclusion`; no fixture anywhere was retargeted, so
+  both PLAN.md-tracked CPU-fallback benchmarks stay comparable across this round.
+  `blend_channel`'s own `SoftLight` arm, its `soft_light_d` helper and their four
+  existing CPU tests were left untouched.
+
+  **Counts, recomputed against source rather than incremented.**
+  `ALL_BLEND_PASSES` is `[&BlendPass; 16]`, so `BLEND_MATH_PASS_COUNT` is 16;
+  `GpuBlendDispatch::ALL` is `[Self; 17]` (16 + `Dissolve`);
+  `GpuBlendDispatches` has 17 fields; the predicate admits **18 of 27** (16
+  blend-math + `Normal` + `Dissolve`), leaving **9 of 27** CPU-only there; 10 of
+  `aurora_render::BlendMode`'s 26 variants still lack a blend-math entry point,
+  `Normal` among them and needing none. Tests: `aurora-render` 229 → **239**
+  (+9 new, and note the baseline is 230 as measured at the start of this round,
+  because 0.116.2 landed one — see the addendum), `aurora-app` 415 → **417**.
+
+  **Finding 1, and the reason the shader has a real `if` where three siblings
+  have a `select()`: a negative `Cb` is reachable from wholly in-gamut content,
+  and it is now measured rather than reasoned about.** `fold_over` computes
+  `a = s.a * opacity` with `opacity` pre-clamped but `s.a` deliberately
+  **unclamped** — every mode's own
+  `..._does_not_clamp_a_source_alpha_above_one` test already pins an `f16` source
+  alpha above `1.0` as real content. With `a > 1` the factor `inv = 1 - a` is
+  negative, so `out.rgb = inv * bd.rgb + a * blended` can go negative while
+  `out.a = a + bd.a * inv` stays healthy; the *next* layer's `straight_backdrop`
+  then divides by a positive alpha — guard intact, no degenerate division — and
+  hands the blend term a `Cb < 0`. Worked, shipped example: an opaque
+  `(0.5, 0.75, 0.375)` accumulator under a `Multiply` layer at
+  `Cs = (0.375, 0.875, 0.25)` and `s.a = 2.0` gives
+  `out.rgb = bd.rgb * (2*Cs - 1) = (-0.125, 0.5625, -0.1875)` at `out.a = 1.0`.
+  `soft_light_d`'s `x <= 0.25` guard is what keeps `sqrt`'s argument
+  non-negative there, and WGSL leaves `sqrt` of a negative operand an
+  *indeterminate value*. **A new test,
+  `composite_soft_light_over_with_opacity_takes_the_polynomial_arm_for_a_negative_
+  backdrop`, builds exactly that three-pass stack**, and mutation (g) of this
+  round (drop the guard, always `sqrt`) was run against it and read back
+  `(NaN, 0.65625, -0.020507813, 1.0)` — the closest a test can come to
+  exhibiting the hazard. **Honest limit, stated in the test itself:** this does
+  *not* prove a `select()`-based helper would fail, since a conforming
+  implementation discards the unselected arm and an indeterminate value is still
+  a value. It is the same class of defensive guard `ColorBurn`'s `cs == 0.0` is
+  (0.107.0), and it is labelled that way rather than overclaimed.
+
+  **Finding 2 — the blind set is the cleanest in the file, and it is *swept*
+  rather than sampled.** With `D0 = Cb - Cs` and
+  `D1 = B(Cb, Cs) - B(Cs, Cb)`, `out - out_transposed = (1 - a)*D0 + a*D1`, so
+  an *interior* blind alpha exists iff `D0` and `D1` have strictly opposite
+  signs. Swept over **all 15,361 `f16` values in `[0, 1]` — all 235,960,321
+  ordered pairs, in `f64`**: **zero pairs with an interior blind alpha** and
+  **zero off-diagonal pairs with `D1 == 0`**. So in gamut the symmetric set is
+  *exactly* `Cb == Cs`, and **no opacity whatsoever can hide a transposed
+  dispatch arm**. Compare `PinLight`'s four classes (one of them the
+  easy-to-hit `|Cb - Cs| == 0.5`), `Overlay`/`HardLight`'s whole same-side
+  region, `LinearLight`'s railed-at-`1.0`/interior-at-exactly-`0.5` pair, and
+  `HardMix`'s everywhere-but-one-corner. The closed form behind the
+  both-operands-low region is exact and worth keeping: for `Cb, Cs <= 0.5`,
+  **`D1 = D0 * Exclusion(Cb, Cs)`** with `Exclusion(x, y) = x + y - 2xy` —
+  `blend_channel`'s own `Exclusion` arm — verified symbolically (the difference
+  expands to exactly `0`) as well as swept; on `[0, 0.5]²` that factor lies in
+  `[0, 0.5]`, so the blind alpha `1/(1 - Exclusion)` lies in `[1, 2]`.
+  **The exception is out of gamut and is Finding 1's own mechanism**: negative
+  operands leave that range, and at `Cb = -0.2, Cs = 0.05` the factor is `-0.13`
+  and the blind alpha `≈ 0.885`, genuinely interior; at `Cb = -0.5, Cs = 0.25`
+  the factor is exactly `0`, so `D1 == 0` off the diagonal. Disclosed rather
+  than designed around — the in-gamut result is what the fixture's transpose
+  coverage rests on, and that fixture is in gamut.
+
+  **Finding 3 — the SIXTH detector of `straight_backdrop`'s guard removal,
+  predicted from 0.110.0's rule and then measured.** This mode has no `min`,
+  `max` or `clamp` on the path from `cb` to `b`, so nothing launders a `NaN`. Its
+  **low** arm is pure `+`/`-`/`*` on `cb`, which makes it **the first detector of
+  any kind whose argument rests on IEEE-754 arithmetic alone** rather than on a
+  measured property of this vendor's `FMin`/`FMax`; its high arm reaches
+  `soft_light_d(NaN)`, where `NaN <= 0.25` is `false` and `sqrt(NaN)` runs, about
+  which WGSL says no more than it does about `FMin` on a `NaN`. **That asymmetry
+  is why the fixture deliberately carries two `Cs <= 0.5` channels** — the
+  detection rests on the strong half. Measured (mutation (o)): with the guard
+  deleted, **exactly six of the sixteen** per-mode transparent-backdrop tests
+  fail — `multiply`'s, `screen`'s, `difference`'s, `overlay`'s, `hard_light`'s
+  and this round's `soft_light`'s — and `soft_light`'s reads back literally
+  `(NaN, NaN, NaN, 1.0)`. The other ten stayed green, so the count is
+  **six of sixteen**, measured on both sides rather than incremented.
+
+  **Finding 4 — both branch-comparison mutations are provably unkillable, and
+  the outer one for a stronger reason than any prior mode's.** At `Cs == 0.5` the
+  low arm's multiplier `1 - 2*Cs` and the high arm's `2*Cs - 1` are *both exactly
+  `0.0`* (`2*0.5` being exact in binary), so **both arms reduce to `cb` for every
+  `cb` the pipeline can produce**. **That domain is bounded, and 0.117.1
+  corrected the "every finite `cb`" overclaim this entry originally carried:** the
+  low arm is safe unconditionally (`1 - 2*Cs` collapses to `0.0` *before* it
+  multiplies anything), but the high arm evaluates `soft_light_d(cb)` *first*, and
+  below about `cb = -2.7706e12` that polynomial overflows `f32` to `-inf`, so the
+  mutant's `0.0 * (-inf - cb)` is a `NaN` where the low arm still returns the
+  finite `cb`. Mutation (j) genuinely survives today only because
+  `straight_backdrop` divides an `Rgba16Float` texel by its own `f16` alpha,
+  bounding `|cb|` by
+  `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12` — about
+  `2.52×` below that threshold. That is a **cross-file precondition owned by
+  `aurora-tile`**, not by the shader, and invariant §7.3.1b would put it back in
+  play if the intermediate format ever widened. A second-order consequence worth
+  carrying forward: the *unmutated*, shipped high arm returns `-inf` for such a
+  `cb` rather than propagating through the zero multiplier, an overflow domain
+  `blend_channel`'s own `f32` `soft_light_d` shares — so the CPU/GPU mirror is
+  unaffected, and no measurement in this round is. That is stronger than
+  `Overlay`'s, `HardLight`'s and
+  `VividLight`'s boundaries, whose arms merely *agree* over `[0, 1]`, and it
+  closes the escape that made `PinLight`'s killable: there the arms were
+  `min(Cb, 1)` and `max(Cb, 0)`, which diverge once an unclamped
+  `straight_backdrop` hands them a `Cb > 1`.
+  `composite_soft_light_over_with_opacity_agrees_across_its_own_branch_boundary`
+  carries a `Cb = 1.5` boundary channel specifically to measure that — and
+  mutation (j) survived, as predicted. At `Cb == 0.25` the polynomial
+  (`((16x - 12)x + 4)x = 0.5`) and the `sqrt` (`0.5`) agree bit-exactly, every
+  term an exact binary fraction, so `<= 0.25` against `< 0.25` is unkillable too;
+  mutation (i) survived, and a second new test,
+  `composite_soft_light_over_with_opacity_agrees_across_soft_light_ds_own_branch_
+  boundary`, measures that through the real entry point at two distinct `Cs`
+  values rather than only through `blend_channel`.
+
+  **Finding 5 — one provable rival identity, pointing at a live arm.**
+  **`SoftLight(0.25, Cs) = Overlay(0.25, Cs)` for every `Cs > 0.5`**: at
+  `Cb == 0.25` this mode's high arm is `0.25 + (2Cs - 1)*(0.5 - 0.25) = 0.5*Cs`,
+  and `Overlay(0.25, Cs) = HardLight(Cs, 0.25) = Multiply(Cs, 0.5) = 0.5*Cs`.
+  `Overlay` is a live GPU entry point and a live dispatch arm, so any `0.25`
+  **backdrop** channel hides a substitution — which is why
+  `NORMAL_MULTIPLY_SOFT_LIGHT_STACK` has no `Cb` at that value, why the
+  app-level vacuity guard substitutes **`Overlay`** specifically, and why the
+  `soft_light_d`-boundary test (which *must* sit on `0.25`) carries a third
+  channel off it. That test's own doc comment discloses the coincidence in red
+  and green rather than hiding it.
+
+  **Mutation matrix: seventeen mutations, every one really run** on
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`,
+  reverted from an out-of-repo `cp` backup between rows (never `git checkout`).
+  Full table in the 0.117.0 addendum under "Next action". The load-bearing rows:
+  **(g)** drop `soft_light_d`'s branch and always `sqrt` — killed by 4 tests,
+  including the negative-backdrop one **reading back a real `NaN`**, which is
+  Finding 1's measurement; **(i)** and **(j)**, the two boundary mutations, both
+  **surviving all 239 tests** exactly as the arithmetic predicts, which is
+  Finding 4; **(o)** deleting `straight_backdrop`'s guard, failing **exactly six
+  of sixteen** transparent-backdrop tests with `soft_light`'s newly among them,
+  which is Finding 3 and the round's headline; **(c)** a transposed
+  `src`/`backdrop` dispatch arm, killed by the app differential **alone** (the
+  standing transpose guard stayed green, as it must — it is a static check on the
+  fixture roster and can never see the real arm mutated); **(d)** deleting the
+  dispatch arm, killed by the counter assertion **alone** (`left: 0, right: 1`,
+  read from the panic); and **(q)** deleting the new
+  `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_
+  expressible_mode` entry, which **nothing** catches — the same hand-maintained
+  gap 0.104.0, 0.115.1 and 0.116.0 each recorded, measured again rather than
+  argued.
+
+  **Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+  for `fs_composite_soft_light`. This mode divides nowhere, so it inherits none
+  of the guarded-division modes' `+inf`-vs-indeterminate-value gaps and none of
+  `HardMix`'s 2.5-ULP divide exposure — but it introduces **two** unknowns of its
+  own, both disclosed in the shader: `soft_light_d`'s guard is a portability
+  guard this hardware can only exercise by having it *deleted* (per Finding 1),
+  and the high arm's `sqrt(NaN)` is the weak half of Finding 3's detection
+  argument.
+
 - [x] **`PinLight` ported to WGSL, admitted at the predicate, and wired through
   the real dispatch arm — done 2026-09-05 (0.116.0).** The **fifteenth** real
   blend-math mode on the GPU, the last branch-on-the-source overlay-family mode
@@ -26544,6 +26721,248 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-20 (0.117.1) — four documentation defects from 0.117.0's own
+round, no shipped behaviour changed.** Independent review re-derived every
+formula, dispatch arm, predicate arm and golden of that round and reproduced all
+of them; what it found wrong was the *prose* around two of the measurements. No
+WGSL expression, dispatch arm, predicate arm, test assertion or golden value was
+touched here — the diff is comments, doc comments, two assertion *messages* and
+this file.
+
+1. **A kill margin overstated by exactly 8×, at five sites.** Mutation (g)'s
+   divergence `0.0107421875` was quoted as "about 44× the `2 * f16::EPSILON`
+   tolerance, measured, not estimated". The real ratio is **5.5×**:
+   `half::f16::EPSILON` is `2^-10`, so the tolerance is `2^-9 = 0.001953125`
+   and `0.0107421875 / 0.001953125 = 5.5` exactly. The `44` came from dividing
+   by `2^-12`. The substantive claim survives — the margin is real, 176 `f16`
+   ULPs at that magnitude, and `LinearLight`'s own `0.046875` is exactly `24×`
+   the same denominator, which is the cross-check that settles which epsilon
+   this series uses. Corrected at all five sites that carried it:
+   `aurora-render/src/composite.rs` (a doc comment and an assertion message),
+   `aurora-app/src/lib.rs`, and two places here. `composite.wgsl` never quoted
+   the ratio and needed no change for this one.
+2. **"Both arms reduce to `cb` for every finite `cb` whatsoever" is false in
+   `f32`, and was billed as *stronger* than `PinLight`'s boundary.** Two
+   reviewers reached it independently. The low arm is safe unconditionally
+   (`1 - 2*Cs` collapses to `0.0` *before* it multiplies anything), but the high
+   arm evaluates `soft_light_d(cb)` *first*, and below about `cb = -2.7706e12`
+   (measured: first `-inf` at `cb = -2770595610624`) the polynomial overflows
+   `f32` to `-inf`, so mutation (j)'s `0.0 * (-inf - cb)` is a `NaN` where the
+   low arm still returns the finite `cb`. **The mutation still genuinely
+   survives every test**, because `straight_backdrop` divides an `Rgba16Float`
+   texel by its own `f16` alpha, bounding `|cb|` by
+   `f16::MAX / f16::MIN_POSITIVE_SUBNORMAL = 65504 / 2^-24 ≈ 1.099e12` — about
+   `2.52×` under the threshold (and `~1.073e9` on an adapter that flushes `f16`
+   subnormals). What was wrong was the framing, and that the thing actually
+   saving the claim is a **cross-file precondition owned by `aurora-tile`** and
+   was named in none of the seven sites. All seven now state the bounded domain
+   and flag invariant §7.3.1b: widening the intermediate storage format would
+   put this back in play. Second-order, now disclosed: for such a `cb` the
+   *unmutated*, shipped high arm returns `-inf` rather than propagating through
+   the zero multiplier — an overflow domain `blend_channel`'s own `f32`
+   `soft_light_d` shares, so the CPU/GPU mirror and every measurement in the
+   0.117.0 round are unaffected.
+3. **The near-miss table's polynomial-coefficient example had a wrong value and
+   overstated its own detectability.** `16.0 -> 1.0` moves `poly(0.0625)` to
+   **`0.203369140625`**, not the `0.23730...` written — a `D` shift of
+   `0.003662109375`. Scaled by the high arm's `(2*Cs - 1)` and `fold_over`'s
+   effective alpha, the two fixtures carrying `Cb = 0.0625` move by
+   `0.00091552734375`, which is **below** their `2 * f16::EPSILON` tolerance;
+   they kill it through their *exact* `assert_eq!` goldens instead (the mutant
+   is `f16`-representable, 15 ULPs off). The margin that is large everywhere
+   comes from a `Cb` on the `0.25` boundary, where `D` moves `0.5 -> 0.265625`
+   and the `soft_light_d`-boundary test sees `0.1171875` and `0.05859375`. The
+   bullet now separates "exercised by" from "detected by".
+4. **A severed subordinate clause** in the transpose guard's stale-mode-list
+   sentence (`aurora-app/src/lib.rs`): 0.117.0's count fix — correctly reducing
+   the list to `Subtract` and `Divide` — turned the original `…did); if a later
+   round…` into a full stop followed by a lowercase fragment. Rejoined; the
+   count itself was right and is unchanged.
+
+**Addendum 2026-09-19 (0.117.0) — `SoftLight` ported to the GPU compositing
+path, completing the overlay family.** The **sixteenth** real blend-math mode,
+and the only member of the six-mode branch-on-the-source overlay family whose
+blend term reuses *no other mode's arm or helper*: every prior member of that
+family substituted two already-ported modes' arms or helpers, which is why every
+round since 0.110.0 named `SoftLight` as the one no prior port brought any closer.
+Its shader is two functions — `soft_light_d(x)` (the W3C spec's own `D`,
+`((16x - 12)x + 4)x` for `x <= 0.25`, `sqrt(x)` above) and
+`soft_light_channel(cb, cs)` — plus an entry point calling the latter three
+times. Rust-side cost was the usual one `BlendPass` const, four labels, one
+one-line wrapper, one predicate arm, one dispatch arm, one counter
+variant/field/`counter()`/`dispatch_arm_blend_mode` arm, one `TRANSPOSE_COVERAGE`
+row and one fixture const. `composite_blend_over_with_opacity` was not touched —
+a **fourteenth** consecutive caller added with no line of change to it.
+`CPU_ONLY_BLEND_MODE` stays `Exclusion` and **no fixture anywhere was
+retargeted**, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable.
+`blend_channel`'s own `SoftLight` arm, its `soft_light_d` helper and their four
+existing CPU tests were not touched.
+
+**Counts after the round, each verified against source.** `ALL_BLEND_PASSES` is
+`[&BlendPass; 16]`, so `BLEND_MATH_PASS_COUNT` is 16; `GpuBlendDispatch::ALL` is
+`[Self; 17]` (16 + `Dissolve`); `GpuBlendDispatches` has 17 fields; the app
+predicate admits **18 of 27** (16 blend-math + `Normal` + `Dissolve`), leaving
+**9 of 27** CPU-only at the predicate; and 10 of `aurora_render::BlendMode`'s 26
+variants still have no blend-math WGSL entry point, `Normal` among them and
+needing none. The nine still CPU-only at the predicate are `Exclusion`,
+`Subtract`, `Divide`, `Hue`, `Saturation`, `Color`, `Luminosity`, `DarkerColor`
+and `LighterColor` — i.e. **only two separable modes are left**, `Subtract` and
+`Divide`; everything else is non-separable and no per-channel blend term can
+express it at all.
+
+**Tests: 230 -> 239 in `aurora-render` (+9) and 415 -> 417 in `aurora-app`
+(+2).** The `aurora-render` baseline is **230, not the 229 the 0.116.0 addendum
+records**, because 0.116.2 landed `straight_backdrop_does_not_clamp_an_out_of_
+gamut_accumulator` between the two rounds; both numbers were measured with
+`cargo test -- --list` at the start of this round rather than incremented. The
+nine new ones are all GPU tests: `composite_soft_light_over_with_opacity_*` —
+per-channel golden reaching all three arm shapes, translucent accumulator,
+spatially-varying tile, half opacity, source alpha above one,
+transparent-backdrop-is-source-alone, **outer branch-boundary agreement**,
+**`soft_light_d`'s own branch-boundary agreement**, and **the negative-backdrop
+polynomial-arm test**. The two app tests are the headless predicate test and the
+app-level differential.
+
+**The fixture, hand-derived and then measured.**
+`NORMAL_MULTIPLY_SOFT_LIGHT_STACK` is `l1` `Normal` @ `1.0`
+`(0.75, 0.5, 0.25, 1.0)`; `l2` `Multiply` @ `1.0` `(0.75, 0.75, 0.25, 1.0)`;
+`l3` `SoftLight` @ **`0.5`** `(0.75, 0.125, 0.75, 1.0)`. After the first two,
+`Cb = (0.5625, 0.375, 0.0625)` at alpha `1.0`. Then:
+
+| ch | `Cs` vs `0.5` | outer arm | `Cb` vs `0.25` | `D` | `B` |
+|---|---|---|---|---|---|
+| red | `0.75 > 0.5` | high | `0.5625 > 0.25` | **`sqrt`** → `0.75` | `0.65625` |
+| green | `0.125 <= 0.5` | low | — (unused) | — | `0.19921875` |
+| blue | `0.75 > 0.5` | high | `0.0625 <= 0.25` | **poly** → `0.20703125` | `0.134765625` |
+
+`0.5 * Cb + 0.5 * B` gives the golden **`(0.609375, 0.287109375,
+0.0986328125, 1.0)`** = `39/64`, `147/512`, `101/1024` — all exact in `f16`, and
+the same number derived twice, once in `aurora-render`'s own test and once here.
+**This is the first fixture in the family to depart from the shared
+`(0.875, 0.5, 0.25)` / `0.75`-grey bottom pair, and both departures are
+load-bearing**: `l1.r = 0.75` (not `0.875`) makes `Cb.r = 0.5625 = 0.75²`
+exactly, so the `sqrt` arm returns `0.75` with no rounding and the golden stays
+`f16`-exact; `l2.b = 0.25` (not `0.75`) puts `Cb.b = 0.0625` four steps *below*
+`soft_light_d`'s `0.25` boundary, so the always-`sqrt` mutation moves the golden
+by `0.0107421875` — **about 5.5×** the `2 * f16::EPSILON` tolerance
+(`2 * 2^-10 = 2^-9 = 0.001953125`), i.e. 176 `f16` ULPs at that magnitude. The
+divergence is measured; **the multiplier read `44×` until 0.117.1 corrected it**,
+that figure having divided by `2^-12` rather than by the real tolerance — the
+margin is real either way, and `2 * f16::EPSILON` is the denominator this series
+has always used (`LinearLight`'s `0.046875` is exactly `24×` it).
+**No rival separable mode coincides in any channel**, all eighteen
+checked. Transposed both ways through `solid_stack_texel_cpu`:
+`(0.75725159, 0.111328125, 0.66796875, 1.0)` against the golden — largest channel
+gap **`0.5693359375`** in blue, the roster's second largest after `HardMix`'s
+corner-driven `1.0`, and unlike that one it comes from a region rather than a
+point.
+
+**Mutation matrix: seventeen mutations, every one really run** on
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1`, one
+at a time, reverted from an out-of-repo `cp` backup between rows (never
+`git checkout`). No row below is a prediction: each "killed by" column is the
+actual failing-test list the run printed.
+
+| # | Mutation | Predicted | Measured |
+|---|---|---|---|
+| (a) | `BLEND_PASS_SOFT_LIGHT.fragment_entry` → `"fs_composite_hard_light"` | killed | **killed, 10 tests** — all 9 new ones **plus `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`**, which catches it by set equality independently of any fixture |
+| (b) | …→ `"fs_composite_overlay"` | killed | **killed, the same 10** |
+| (c) | dispatch arm binds `src`/`backdrop` transposed | app differential fails; transpose guard stays green | **killed by the app differential alone (1 of 417)**; the standing transpose guard stayed green, as it must — it is a static check on the fixture roster and can never see the real arm mutated |
+| (d) | delete the whole dispatch arm | only the counter assertion fails | **killed by the counter assertion alone (1 of 417)**, `left: 0, right: 1`, read from the panic — the pixel assertions passed, the CPU fallback computing the same correct pixels |
+| (e) | outer branch tests `cb` instead of `s.rgb` | killed | **killed, 8 tests** (the branch-boundary test survives: at `Cs == 0.5` both arms give `cb` regardless of which operand is tested) |
+| (f) | swap the two outer arms | killed | **killed, 9 tests** |
+| (g) | drop `soft_light_d`'s branch, **always `sqrt`** | blue fails by a real margin | **killed, 4 tests** — and the negative-backdrop test read back **`(NaN, 0.65625, -0.020507813, 1.0)`**, which is the round's Finding-1 measurement. The margin was real: `0.0107421875` in the main fixture's blue, **~5.5× the `2 * f16::EPSILON` tolerance** (176 `f16` ULPs there; this cell read `~44×` until 0.117.1 corrected the divisor) |
+| (h) | drop it the other way, **always polynomial** | red fails hugely | **killed, 9 tests** (`poly(0.5625) = 1.30078125` against `sqrt(0.5625) = 0.75`) |
+| (i) | `soft_light_d`'s `x <= 0.25` → `x < 0.25` | **SURVIVES** — provably unkillable | **survived: 239 / 239 green.** Confirms the arithmetic: `poly(0.25) = 0.5 = sqrt(0.25)` bit-exactly |
+| (j) | outer `cs <= 0.5` → `cs < 0.5` | **SURVIVES** — provably unkillable, **including out of gamut** | **survived: 239 / 239 green**, with the boundary fixture's out-of-gamut `Cb = 1.5` channel deliberately present. Both arms' multipliers are *exactly* `0.0` at `Cs == 0.5`, so `PinLight`'s escape does not transfer |
+| (k) | drop the `2.0 *` in the low arm | killed | **killed, 8 tests** |
+| (l) | `(1.0 - cb)` → `cb` in the low arm | killed | **killed, 6 tests** |
+| (m) | `(soft_light_d(cb) - cb)` → `soft_light_d(cb)` | killed | **killed, 9 tests** |
+| (n) | polynomial `16.0` → `1.0` | killed | **killed, 5 tests** |
+| (o) | delete `straight_backdrop`'s `ab > 0.0` guard | **SoftLight's transparent-backdrop test NEWLY fails — 6th detector**; the other ten stay green | **exactly as predicted: 6 of 239 failed** — `multiply`'s, `screen`'s, `difference`'s, `overlay`'s, `hard_light`'s and `soft_light`'s, and no others. `soft_light`'s read back literally **`(NaN, NaN, NaN, 1.0)`**. Detector count **five of fifteen → six of sixteen**, measured on both sides |
+| (p) | delete the new `TRANSPOSE_COVERAGE` row | the standing guard fails | **killed by `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` alone (1 of 417)** |
+| (q) | delete the new entry from the "every expressible mode" loop | **SURVIVES** — a known, disclosed gap | **survived: 417 / 417 green.** The same hand-maintained gap 0.104.0, 0.115.1 and 0.116.0 each recorded; measured again rather than argued, and the array's own header comment is still the only guard |
+
+**The `cb < 0` reachability proof, which is the round's most transferable
+finding.** `fold_over`'s `a = s.a * opacity` is unclamped on the alpha side by
+design, so `inv = 1 - a` goes negative for `s.a > 1` and `out.rgb` can come out
+negative while `out.a` stays positive. A shipped, in-gamut example: an opaque
+`(0.5, 0.75, 0.375)` accumulator under a `Multiply` layer at
+`Cs = (0.375, 0.875, 0.25)` and `s.a = 2.0` yields
+`out.rgb = bd.rgb * (2*Cs - 1) = (-0.125, 0.5625, -0.1875)` at `out.a = 1.0`, so
+the next layer's `straight_backdrop` divides by one and hands the blend term a
+`Cb` of `-0.125`. **Every colour channel of every layer is inside `[0, 1]`**; the
+only unusual value is an `f16` alpha of `2.0`, which this codebase already treats
+as real content. That is why `soft_light_d`'s `if` must not become a `select()`,
+and why the new test exists: mutation (g) run against it produced a real `NaN`,
+so the hazard is exhibited rather than argued. **Two honest limits.** First, the
+guard *works* for such a `cb` — `-0.125 <= 0.25`, so the polynomial runs and
+`sqrt` is never reached, which means no passing test can distinguish the `if`
+from a `select()` on a conforming backend; it is a defensive guard of
+`ColorBurn`'s `cs == 0.0` class (0.107.0), labelled as such. Second, and the
+mirror image: the polynomial's value at a negative operand is large
+(`poly(-0.125) = -0.71875`, giving `B = -0.421875`), which is exactly what the
+CPU computes too — the test asserts agreement, not plausibility.
+
+**The exhaustive sweep, and why it is worth the words.** The blind-set claims
+above were *swept*, not sampled: all 15,361 `f16` values in `[0, 1]`, all
+235,960,321 ordered pairs, evaluated in `f64` in a throwaway script (not
+committed). Zero pairs with `D0` and `D1` of strictly opposite sign — so **no
+in-gamut pair has a blind alpha inside `(0, 1)` at all** — and zero off-diagonal
+pairs with `D1 == 0` — so the symmetric set is **exactly `Cb == Cs`**. That is
+strictly stronger than every prior ported mode's result, and it is the one round
+in this series where the roster fixture needed no engineering against the blind
+set: any generically chosen operands would have worked. The Region-1 closed form
+`D1 = D0 * Exclusion(Cb, Cs)` was additionally verified **symbolically** (the
+difference expands to exactly `0`), not just numerically. The out-of-gamut
+exception is real and is Finding 1's own mechanism: at `Cb = -0.2, Cs = 0.05` the
+factor is `-0.13` and the blind alpha `≈ 0.885`; at `Cb = -0.5, Cs = 0.25` the
+factor is exactly `0`. Disclosed, not designed around.
+
+**One provable rival identity, and it points at a live arm.**
+`SoftLight(0.25, Cs) = Overlay(0.25, Cs)` for every `Cs > 0.5`: at `Cb == 0.25`,
+`D = 0.5`, so the high arm is `0.25 + (2Cs - 1)*0.25 = 0.5*Cs`, and
+`Overlay(0.25, Cs) = HardLight(Cs, 0.25) = Multiply(Cs, 0.5) = 0.5*Cs`. `Overlay`
+is live on both sides, so a `0.25` **backdrop** channel hides a substitution
+outright. Three consequences are wired in rather than noted:
+`NORMAL_MULTIPLY_SOFT_LIGHT_STACK` has no `Cb` at `0.25`; the app-level vacuity
+guard substitutes **`Overlay`** specifically (and separates it in all three
+channels); and the `soft_light_d`-boundary test, which *must* sit on `0.25`,
+carries a third channel off it and discloses the red/green coincidence in its own
+message.
+
+**Prose swept for stale counts, including two pre-existing errors this round did
+not introduce.** The detector list in `composite.wgsl` (five of fifteen → six of
+sixteen, `soft_light` added to the detectors), the three per-mode
+transparent-backdrop test comments in `composite.rs` that each restate it, the
+`TileCompositor` header's "remaining 11 modes" arithmetic (→ 10, with the
+sixteen-name list), `GpuBlendDispatch::ALL`'s length prose and its
+`every_gpu_blend_dispatch_mode_gets_its_own_counter` literal, the predicate's own
+"seventeen admitted"/"other 10 blend modes" sentences (→ eighteen / 9), the
+`TRANSPOSE_COVERAGE` guard's "all sixteen live rows" (→ seventeen, with
+`SoftLight`'s measured gap), the "seven of the sixteen" asymmetry figures (→
+eight of seventeen, `SoftLight` being the strongest case), and the "every
+expressible mode" loop's own header count (→ eighteen). **The two pre-existing
+errors**: the transpose guard's doc comment still said "at least four more
+asymmetric modes are still to be ported (`Subtract`, `Divide`, `SoftLight` and
+`PinLight`)" — already stale by one when this round read it, `PinLight` having
+landed in 0.116.0 — now "two: `Subtract` and `Divide`", with the drift recorded;
+and three separate suite headers said `SoftLight` (and in one case `PinLight`)
+were "the rest of the overlay-and-light family still CPU-only", now corrected to
+record that the family is complete on the GPU and the list is empty.
+
+**Verified on one backend only.** Vulkan/NVIDIA, `AURORA_REQUIRE_GPU=1`, adapter
+line `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` confirmed in the test log.
+Metal and DX12 are unverified for `fs_composite_soft_light`. This mode divides
+nowhere, so it inherits none of the guarded-division modes'
+`+inf`-vs-indeterminate-value gaps and none of `HardMix`'s 2.5-ULP divide
+exposure — but it adds **two** unknowns of its own, both disclosed in the shader
+rather than buried: `soft_light_d`'s `x <= 0.25` guard is a portability guard
+this hardware can only exercise by having it *deleted*, and the high arm's
+`sqrt(NaN)` is the weak half of the sixth-detector argument (the low arm's pure
+arithmetic is the strong half, which is why the fixture carries two `Cs <= 0.5`
+channels).
 
 **Addendum 2026-09-05 (0.116.0) — `PinLight` ported to the GPU compositing
 path.** The **fifteenth** real blend-math mode, the last branch-on-the-source
