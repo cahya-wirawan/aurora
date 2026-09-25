@@ -49,6 +49,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
+use crate::shortcut::NamedKey;
 use crate::tree::{WidgetId, WidgetTree};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +227,13 @@ impl TextFieldState {
             self.content.insert_str(self.cursor, text);
             self.cursor += text.len();
         }
+        // Inserted text can join the grapheme cluster after it (a
+        // zero-width joiner between two emoji, a base letter before a
+        // leading combining mark), leaving the caret mid-cluster; snap it
+        // forward to the end of that cluster so `cursor`'s invariant holds.
+        if !is_grapheme_boundary(&self.content, self.cursor) {
+            self.cursor = next_boundary(&self.content, self.cursor);
+        }
         self.selection_anchor = None;
     }
 
@@ -378,6 +386,12 @@ impl TextFieldState {
         self.composition = None;
         self.insert_str(text);
     }
+}
+
+/// Whether byte offset `at` is a grapheme-cluster boundary of `content`
+/// (both ends included).
+fn is_grapheme_boundary(content: &str, at: usize) -> bool {
+    at == content.len() || content.grapheme_indices(true).any(|(i, _)| i == at)
 }
 
 /// The start byte of the grapheme cluster immediately before `from`, or
@@ -556,6 +570,132 @@ pub fn set_text_field_disabled(
     };
     tree.set_accessibility(id, node(state))?;
     Ok(())
+}
+
+/// The named keys a focused text field consumes (PLAN.md M1.8, 0.131.0):
+/// caret motion and the two deletions. Deliberately not `Tab`, `Enter`
+/// or `Escape` (focus traversal and a dialog's own keys stay the
+/// caller's), and not word motion or `Ctrl`/`Cmd` editing chords — a
+/// chord never reaches a widget ([`crate::handle_widget_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFieldKey {
+    Left,
+    Right,
+    Home,
+    End,
+    Backspace,
+    Delete,
+}
+
+impl TextFieldKey {
+    /// The text-field key `key` stands for, if any — `None` for every
+    /// `NamedKey` a text field does not handle, so the caller's own
+    /// handling (focus traversal, shortcuts) still sees it.
+    #[must_use]
+    pub fn from_named_key(key: NamedKey) -> Option<Self> {
+        match key {
+            NamedKey::ArrowLeft => Some(Self::Left),
+            NamedKey::ArrowRight => Some(Self::Right),
+            NamedKey::Home => Some(Self::Home),
+            NamedKey::End => Some(Self::End),
+            NamedKey::Backspace => Some(Self::Backspace),
+            NamedKey::Delete => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Applies `key` to text field `id` — caret motion extends the selection
+/// when `extend` (`Shift` held); the deletions ignore it. Goes through
+/// [`with_text_field_mut`], so the accessibility value follows. Returns
+/// whether content, caret or selection actually changed (`Left` at the
+/// start with nothing selected changes nothing).
+///
+/// # Errors
+///
+/// Whatever [`with_text_field_mut`] refuses — a disabled field included.
+pub fn handle_text_field_key(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    key: TextFieldKey,
+    extend: bool,
+) -> Result<bool, WidgetError> {
+    with_text_field_mut(tree, id, |state| {
+        let before = state.snapshot();
+        match key {
+            TextFieldKey::Left => state.move_left(extend),
+            TextFieldKey::Right => state.move_right(extend),
+            TextFieldKey::Home => state.move_to_start(extend),
+            TextFieldKey::End => state.move_to_end(extend),
+            TextFieldKey::Backspace => state.backspace(),
+            TextFieldKey::Delete => state.delete_forward(),
+        }
+        state.snapshot() != before
+    })
+}
+
+/// The most bytes typed input may grow a text field's content to
+/// ([`TextFieldState::insert_typed`]). Every edit snapshots the whole
+/// content for undo and re-shapes it, so an unbounded single-line field
+/// would make each keystroke cost grow without limit; this caps it.
+pub const TEXT_FIELD_MAX_BYTES: usize = 4096;
+
+/// Whether `c` may be typed into a single-line text field: not a control
+/// character (a platform delivers `Enter`, `Tab`, `Backspace` and
+/// `Delete` as text too — `"\r"`, `"\t"`, `"\u{8}"`, `"\u{7f}"` — and
+/// those are keys, not characters), not a line or paragraph separator
+/// (U+2028, U+2029), and not an invisible bidirectional embedding,
+/// override or isolate control (U+202A–U+202E, U+2066–U+2069), which
+/// would silently reorder what the field shows.
+#[must_use]
+pub fn is_insertable_char(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+impl TextFieldState {
+    /// Inserts typed (or IME-committed) `text` at the caret, replacing any
+    /// selection, after dropping every character [`is_insertable_char`]
+    /// rejects and truncating it (at a character boundary) so the content
+    /// stays within [`TEXT_FIELD_MAX_BYTES`]. Returns whether anything was
+    /// inserted; text that is empty once filtered changes nothing and
+    /// records no undo step.
+    pub fn insert_typed(&mut self, text: &str) -> bool {
+        let selected = self.selection_range().map_or(0, |range| range.len());
+        let mut room = TEXT_FIELD_MAX_BYTES.saturating_sub(self.content.len() - selected);
+        let mut printable = String::new();
+        for c in text.chars().filter(|&c| is_insertable_char(c)) {
+            let Some(left) = room.checked_sub(c.len_utf8()) else {
+                break;
+            };
+            room = left;
+            printable.push(c);
+        }
+        if printable.is_empty() {
+            return false;
+        }
+        self.insert_str(&printable);
+        true
+    }
+}
+
+/// Inserts typed `text` at text field `id`'s caret
+/// ([`TextFieldState::insert_typed`]: filtered, capped, replacing any
+/// selection). Returns whether anything was inserted.
+///
+/// # Errors
+///
+/// Whatever [`with_text_field_mut`] refuses — a disabled field included,
+/// whatever the text was.
+pub fn insert_text_field_text(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    text: &str,
+) -> Result<bool, WidgetError> {
+    with_text_field_mut(tree, id, |state| state.insert_typed(text))
 }
 
 #[cfg(test)]
@@ -1112,5 +1252,50 @@ mod tests {
             unreachable!("just inserted");
         };
         assert_eq!(accessibility.description(), None);
+    }
+
+    #[test]
+    fn inserting_a_joiner_between_two_emoji_leaves_the_caret_on_a_boundary() {
+        let mut state = TextFieldState::new(String::new(), "\u{1f469}\u{1f467}".to_owned());
+        state.move_left(false);
+        assert!(state.insert_typed("\u{200d}"));
+        assert_eq!(state.content, "\u{1f469}\u{200d}\u{1f467}");
+        assert_eq!(
+            state.cursor,
+            state.content.len(),
+            "snapped past the joined cluster"
+        );
+    }
+
+    #[test]
+    fn inserting_a_base_before_a_leading_combining_mark_snaps_past_the_cluster() {
+        let mut state = TextFieldState::new(String::new(), "\u{301}x".to_owned());
+        state.move_to_start(false);
+        assert!(state.insert_typed("e"));
+        assert_eq!(state.content, "e\u{301}x");
+        assert_eq!(state.cursor, "e\u{301}".len());
+    }
+
+    #[test]
+    fn insert_typed_drops_separators_and_bidi_controls() {
+        let mut state = TextFieldState::new(String::new(), String::new());
+        assert!(!state.insert_typed("\u{2028}\u{2029}\u{202e}\u{2067}\r"));
+        assert!(state.insert_typed("a\u{202a}b\u{2069}c"));
+        assert_eq!(state.content, "abc");
+    }
+
+    #[test]
+    fn insert_typed_caps_the_content_at_the_maximum_length() {
+        let mut state =
+            TextFieldState::new(String::new(), "a".repeat(super::TEXT_FIELD_MAX_BYTES - 1));
+        state.move_to_end(false);
+        assert!(
+            !state.insert_typed("\u{e9}b"),
+            "a two-byte char does not fit, and nothing after it is taken"
+        );
+        assert_eq!(state.content.len(), super::TEXT_FIELD_MAX_BYTES - 1);
+        assert!(state.insert_typed("bc"));
+        assert_eq!(state.content.len(), super::TEXT_FIELD_MAX_BYTES);
+        assert!(!state.insert_typed("d"), "full");
     }
 }

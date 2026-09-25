@@ -30,14 +30,38 @@
 //! the `Down` itself, because the value under the pointer is the whole
 //! point of pressing there.
 //!
-//! # What this deliberately does not do (0.131.0 is the named follow-on)
+//! # Drags (0.131.0)
 //!
-//! - **No drags and no pointer capture.** A slider set on `Down` does not
-//!   follow a held pointer; neither does a picker's area or a curve
-//!   point. `move_selected_point_from_point` exists and is not called.
-//! - **No hover.** Tooltips are never shown from here.
-//! - **No text editing.** A `TextField` is focused by a click and that is
-//!   all; no caret placement and no character input.
+//! A value widget's `Down` also **captures** it ([`ClickTracker::captured`]):
+//! every later [`PointerPhase::Move`] drives the same mutator the `Down`
+//! used, wherever the pointer is — a slider or scrollbar clamps at its
+//! ends, a colour picker keeps driving the part the drag began on (an
+//! area drag never changes the hue), a curve drag moves the selected
+//! point ([`widgets::move_selected_point_from_point`], clamped by
+//! `ToneCurve::move_point_to` to `[0, 1]` in `y` and to its neighbours
+//! in `x`). The `Up` ends it ([`PointerOutcome::Released`]) without
+//! applying its own position. A `Move` with nothing captured does
+//! nothing — no hit test. A `Move` never changes focus or the focus
+//! ring's visibility. A captured widget removed or disabled mid-drag ends
+//! the drag ([`PointerOutcome::Cancelled`]); a new `Down` drops a capture
+//! whose `Up` was lost.
+//!
+//! # Text (0.131.0)
+//!
+//! A focused `TextField` takes caret motion and the two deletions
+//! ([`widgets::TextFieldKey`], `Shift` extending the selection) from
+//! [`handle_widget_key`], and typed characters from
+//! [`handle_widget_text`].
+//!
+//! # What this deliberately does not do
+//!
+//! - **No hover.** Tooltips are never shown from here (the owner drives
+//!   them from its own pointer-move handling).
+//! - **No escape-to-revert on a drag, and no grab offset**: a scrollbar
+//!   drag re-centres the thumb on the pointer at the first `Move`.
+//! - **A click does not place a text field's caret**, and word motion,
+//!   select-all and the clipboard chords are not routed (a chord is
+//!   never a widget's key — below).
 //! - **Tree rows expand and collapse from the keyboard only** — a click
 //!   on a row *activates* it (`handle_action`'s `Click`, which is all an
 //!   assistive technology's `Click` does too); there is no
@@ -73,7 +97,8 @@ use crate::shortcut::{Modifiers, NamedKey};
 use crate::tree::{ACCESSIBILITY_TREE_ID, WidgetId, WidgetTree};
 use crate::widgets::{
     self, ColorPickerKey, ColorPickerOutcome, ColorPickerPart, CurveEditorKey, CurveEditorOutcome,
-    DropdownKey, DropdownOutcome, MenuKey, MenuOutcome, TabBarKey, TabBarOutcome, WidgetKind,
+    DropdownKey, DropdownOutcome, MenuKey, MenuOutcome, TabBarKey, TabBarOutcome, TextFieldKey,
+    WidgetKind,
 };
 
 /// Which half of a primary-button click an event is.
@@ -83,6 +108,10 @@ pub enum PointerPhase {
     Down,
     /// The button came back up.
     Up,
+    /// The pointer moved while the button may be held (0.131.0). Only a
+    /// captured drag acts on it; with nothing captured it is ignored
+    /// without even a hit test.
+    Move,
 }
 
 /// One primary-button pointer event in logical pixels, window space —
@@ -94,11 +123,47 @@ pub struct PointerEvent {
 }
 
 /// Which widget, if any, a primary `Down` armed for activation on the
-/// matching `Up`. Deliberately nothing more — no capture and no drag
-/// state (see this module's own doc comment).
+/// matching `Up`, or captured for a drag (0.131.0). The two are
+/// exclusive: an activation widget arms, a value widget captures, and
+/// every `Down` drops whatever the last one left behind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClickTracker {
     pressed: Option<WidgetId>,
+    captured: Option<Capture>,
+}
+
+/// What a value widget's `Down` captured: the widget, plus — for a colour
+/// picker — which part the drag began on, so a drag that starts in the
+/// saturation/value area never changes the hue however far it strays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Range(WidgetId),
+    PickerArea {
+        picker: WidgetId,
+    },
+    PickerHue {
+        picker: WidgetId,
+    },
+    /// `point` is the index the `Down` grabbed and `count` the curve's
+    /// point count then: a key that deletes or re-selects a point mid-drag
+    /// changes one of them, and the drag then ends rather than moving a
+    /// different point.
+    CurvePoint {
+        editor: WidgetId,
+        point: usize,
+        count: usize,
+    },
+}
+
+impl Capture {
+    fn id(self) -> WidgetId {
+        match self {
+            Self::Range(id)
+            | Self::PickerArea { picker: id }
+            | Self::PickerHue { picker: id }
+            | Self::CurvePoint { editor: id, .. } => id,
+        }
+    }
 }
 
 impl ClickTracker {
@@ -109,11 +174,33 @@ impl ClickTracker {
         self.pressed
     }
 
-    /// Forgets the armed widget without activating or un-pressing it —
-    /// for an owner removing the subtree the armed widget lived in, so a
-    /// later `Up` cannot be routed to a stale id.
+    /// The widget a `Down` captured for a drag (a slider, scrollbar,
+    /// colour picker or curve editor), if no `Up` has released it yet.
+    #[must_use]
+    pub fn captured(&self) -> Option<WidgetId> {
+        self.captured.map(Capture::id)
+    }
+
+    /// Whether a `Down` left anything for a later event to resolve — an
+    /// armed widget or a captured one.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.pressed.is_some() || self.captured.is_some()
+    }
+
+    /// Ends a drag without routing anything — for a pointer that left the
+    /// window, whose `Up` may never arrive. The value the drag last set
+    /// stays; an armed (not captured) widget is left alone.
+    pub fn release_capture(&mut self) {
+        self.captured = None;
+    }
+
+    /// Forgets the armed and the captured widget without activating or
+    /// un-pressing anything — for an owner removing the subtree either
+    /// lived in, so a later `Up` or `Move` cannot be routed to a stale id.
     pub fn reset(&mut self) {
         self.pressed = None;
+        self.captured = None;
     }
 }
 
@@ -128,8 +215,15 @@ pub enum PointerOutcome {
     Pressed(WidgetId),
     /// Focus moved to (or stayed on) this widget and nothing else changed.
     Focused(WidgetId),
-    /// The `Up` landed away from the armed widget: nothing activated.
+    /// The `Up` landed away from the armed widget: nothing activated. Also
+    /// a drag whose captured widget was removed or disabled mid-drag, or
+    /// that the caller abandoned (0.131.0).
     Cancelled(WidgetId),
+    /// The `Up` that ended a drag on this captured widget (0.131.0). The
+    /// value is whatever the last `Down`/`Move` set — the `Up`'s own
+    /// position is not applied (winit reports a `CursorMoved` before the
+    /// release, so it has already been routed as a `Move`).
+    Released(WidgetId),
     /// Internal state changed with no meaning beyond the widget itself —
     /// a menu's highlight moving.
     Changed(WidgetId),
@@ -290,6 +384,7 @@ pub fn handle_pointer(
     let result = match event.phase {
         PointerPhase::Down => pointer_down(tree, focus, click, event.position),
         PointerPhase::Up => pointer_up(tree, focus, click, event.position),
+        PointerPhase::Move => pointer_move(tree, focus, click, event.position),
     };
     focus.validate(tree);
     result
@@ -307,6 +402,9 @@ fn pointer_down(
     if let Some(stale) = click.pressed.take() {
         release_button(tree, stale)?;
     }
+    // Likewise a drag whose `Up` never arrived: it simply ends where the
+    // last `Move` left it.
+    click.captured = None;
     let Some((id, interactive)) = target_at(tree, point) else {
         return Ok(PointerOutcome::Ignored);
     };
@@ -336,9 +434,9 @@ fn pointer_down(
             focus_pointer(tree, focus, id)?;
             Ok(PointerOutcome::Focused(id))
         }
-        Interactive::Range => range_down(tree, focus, id, point),
-        Interactive::Picker => picker_down(tree, focus, id, point),
-        Interactive::Curve => curve_down(tree, focus, id, point),
+        Interactive::Range => range_down(tree, focus, click, id, point),
+        Interactive::Picker => picker_down(tree, focus, click, id, point),
+        Interactive::Curve => curve_down(tree, focus, click, id, point),
     }
 }
 
@@ -411,10 +509,13 @@ fn value_at(tree: &WidgetTree<WidgetKind>, id: WidgetId, point: (f32, f32)) -> O
 fn range_down(
     tree: &mut WidgetTree<WidgetKind>,
     focus: &mut FocusManager,
+    click: &mut ClickTracker,
     id: WidgetId,
     point: (f32, f32),
 ) -> Result<PointerOutcome, ActionRejection> {
     focus_pointer(tree, focus, id)?;
+    // Captured even when this point maps to no value: a later `Move` can.
+    click.captured = Some(Capture::Range(id));
     let Some(value) = value_at(tree, id, point) else {
         return Ok(PointerOutcome::Focused(id));
     };
@@ -430,6 +531,7 @@ fn range_down(
 fn picker_down(
     tree: &mut WidgetTree<WidgetKind>,
     focus: &mut FocusManager,
+    click: &mut ClickTracker,
     picker: WidgetId,
     point: (f32, f32),
 ) -> Result<PointerOutcome, ActionRejection> {
@@ -443,6 +545,13 @@ fn picker_down(
     if let Some(target) = target {
         focus_pointer(tree, focus, target)?;
     }
+    // The part the drag began on is the part it drives; the preview is
+    // no part and captures nothing.
+    click.captured = match part {
+        Some(ColorPickerPart::SaturationValue) => Some(Capture::PickerArea { picker }),
+        Some(ColorPickerPart::Hue) => Some(Capture::PickerHue { picker }),
+        None => None,
+    };
     let outcome = match part {
         Some(ColorPickerPart::SaturationValue) => {
             widgets::set_saturation_value_from_point(tree, picker, point)?
@@ -469,13 +578,27 @@ fn color_outcome(
 fn curve_down(
     tree: &mut WidgetTree<WidgetKind>,
     focus: &mut FocusManager,
+    click: &mut ClickTracker,
     editor: WidgetId,
     point: (f32, f32),
 ) -> Result<PointerOutcome, ActionRejection> {
-    let outcome = match widgets::curve_editor_point_at(tree, editor, point.0, point.1)? {
-        Some(index) => widgets::select_curve_point(tree, editor, index)?,
-        None => widgets::add_curve_point_from_point(tree, editor, point.0, point.1)?,
-    };
+    let (outcome, grabbed) =
+        if let Some(index) = widgets::curve_editor_point_at(tree, editor, point.0, point.1)? {
+            (widgets::select_curve_point(tree, editor, index)?, true)
+        } else {
+            let added = widgets::add_curve_point_from_point(tree, editor, point.0, point.1)?;
+            // Add-then-drag: the new point is selected, so a drag moves
+            // it. A refused add (too close to a neighbour) grabs nothing.
+            (added, added == CurveEditorOutcome::Changed)
+        };
+    if grabbed {
+        let state = widgets::curve_editor_state(tree, editor)?;
+        click.captured = Some(Capture::CurvePoint {
+            editor,
+            point: state.selected(),
+            count: state.curve().points().len(),
+        });
+    }
     // Re-read after the mutation: selecting or adding a point moves the
     // editor's one tab stop (roving focus).
     let target = widgets::curve_editor_state(tree, editor)?.focus_target();
@@ -490,12 +613,86 @@ fn curve_down(
     })
 }
 
+/// A `Move`: only a captured drag acts on it, through the same mutators
+/// its `Down` used. Never a hit test, never a focus change, never
+/// `note_input` — moving the mouse is not a modality switch.
+fn pointer_move(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    click: &mut ClickTracker,
+    point: (f32, f32),
+) -> Result<PointerOutcome, ActionRejection> {
+    let Some(capture) = click.captured else {
+        return Ok(PointerOutcome::Ignored);
+    };
+    let id = capture.id();
+    if tree.payload(id).is_none() || is_disabled(tree, id) {
+        // Removed or disabled mid-drag: the drag ends with whatever value
+        // it last set, and nothing more is routed to it.
+        click.captured = None;
+        return Ok(PointerOutcome::Cancelled(id));
+    }
+    match capture {
+        Capture::Range(id) => match value_at(tree, id, point) {
+            Some(value) => act(
+                tree,
+                focus,
+                id,
+                Action::SetValue,
+                Some(ActionData::NumericValue(value)),
+            ),
+            None => Ok(PointerOutcome::Ignored),
+        },
+        Capture::PickerArea { picker } => {
+            let outcome = widgets::set_saturation_value_from_point(tree, picker, point)?;
+            Ok(drag_color_outcome(picker, outcome))
+        }
+        Capture::PickerHue { picker } => {
+            let outcome = widgets::set_hue_from_point(tree, picker, point)?;
+            Ok(drag_color_outcome(picker, outcome))
+        }
+        Capture::CurvePoint {
+            editor,
+            point: grabbed,
+            count,
+        } => {
+            let state = widgets::curve_editor_state(tree, editor)?;
+            if state.selected() != grabbed || state.curve().points().len() != count {
+                // A key deleted or re-selected the grabbed point mid-drag:
+                // the drag ends rather than moving another point.
+                click.captured = None;
+                return Ok(PointerOutcome::Cancelled(editor));
+            }
+            Ok(
+                match widgets::move_selected_point_from_point(tree, editor, point.0, point.1)? {
+                    CurveEditorOutcome::Changed => {
+                        PointerOutcome::Action(ActionOutcome::CurveChanged { editor })
+                    }
+                    CurveEditorOutcome::Ignored => PointerOutcome::Ignored,
+                },
+            )
+        }
+    }
+}
+
+/// A drag's colour outcome: `Ignored` (not `Focused`) when the point
+/// changed nothing, since a `Move` never moves focus.
+fn drag_color_outcome(picker: WidgetId, outcome: ColorPickerOutcome) -> PointerOutcome {
+    match outcome {
+        ColorPickerOutcome::Ignored => PointerOutcome::Ignored,
+        changed @ ColorPickerOutcome::Changed { .. } => color_outcome(picker, changed, None),
+    }
+}
+
 fn pointer_up(
     tree: &mut WidgetTree<WidgetKind>,
     focus: &mut FocusManager,
     click: &mut ClickTracker,
     point: (f32, f32),
 ) -> Result<PointerOutcome, ActionRejection> {
+    if let Some(capture) = click.captured.take() {
+        return Ok(PointerOutcome::Released(capture.id()));
+    }
     let Some(armed) = click.pressed.take() else {
         return Ok(PointerOutcome::Ignored);
     };
@@ -523,7 +720,9 @@ fn pointer_up(
             }
             None => act(tree, focus, id, Action::Click, None),
         },
-        // Never armed (they act on `Down`), so an `Up` cannot match them.
+        // Never armed — a value widget *captures* on `Down` instead, and a
+        // captured `Up` returned `Released` above — so an `Up` matching
+        // the armed id cannot be one of these.
         Interactive::Range | Interactive::TextField | Interactive::Picker | Interactive::Curve => {
             Ok(PointerOutcome::Cancelled(armed))
         }
@@ -549,8 +748,8 @@ fn focus_selected_tab(
 
 /// Routes one key to the **focused** widget — see the table in this
 /// module's own doc comment. [`KeyOutcome::Ignored`] whenever the focused
-/// widget has no meaning for `key` (including a text field, which takes no
-/// key input this round), so the caller can fall through to its own
+/// widget has no meaning for `key` (a text field's meaning is
+/// [`widgets::TextFieldKey`]'s table), so the caller can fall through to its own
 /// shortcuts. `Shift` is the colour picker's and curve editor's "coarse"
 /// step; a key held with `Ctrl`, `Alt` or `Meta` is always
 /// [`KeyOutcome::Ignored`] and changes nothing.
@@ -623,8 +822,66 @@ fn widget_key(
             handled(act(tree, focus, id, Action::Click, None))
         }
         WidgetKind::TreeItem(_) => tree_item_key(tree, focus, id, key),
+        WidgetKind::TextField(_) => {
+            // Outside the table (`Tab`, `Enter`, `Escape`, ...) the key
+            // falls through, so focus traversal and dialogs still work.
+            let Some(key) = TextFieldKey::from_named_key(key) else {
+                return Ok(KeyOutcome::Ignored);
+            };
+            widgets::handle_text_field_key(tree, id, key, modifiers.shift)?;
+            Ok(KeyOutcome::Handled(PointerOutcome::Changed(id)))
+        }
         _ => Ok(KeyOutcome::Ignored),
     }
+}
+
+/// Routes typed `text` (a platform's committed characters for one key
+/// press — winit's `KeyEvent::text`) to the **focused** text field
+/// (0.131.0). Anything else focused, or nothing, is
+/// [`KeyOutcome::Ignored`].
+///
+/// Which modifiers still type: `Alt`/`Option` and `Ctrl+Alt` (`AltGr` on
+/// Windows reports both) produce real characters on many layouts, so
+/// they type; `Meta`/`Cmd`, and `Ctrl` without `Alt`, are shortcut
+/// chords and are refused so the caller's shortcuts see them. Control
+/// characters are dropped ([`widgets::insert_text_field_text`]); text
+/// that inserts nothing is [`KeyOutcome::Ignored`].
+///
+/// Whether a key press with `modifiers` is a shortcut chord rather than
+/// typing: `Meta`, or `Ctrl` without `Alt`. `Ctrl+Alt` is typing, since
+/// Windows reports `AltGr` as that pair (`AltGr+Q` is `@` on a German
+/// layout). The single predicate both [`handle_widget_text`] and the
+/// app's own "consume every character key while typing" rule use, so the
+/// two can never disagree about which presses are text.
+#[must_use]
+pub fn is_shortcut_chord(modifiers: Modifiers) -> bool {
+    modifiers.meta || (modifiers.control && !modifiers.alt)
+}
+
+/// # Errors
+///
+/// Whatever the text field's own mutator refuses — a disabled field
+/// included.
+pub fn handle_widget_text(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &FocusManager,
+    text: &str,
+    modifiers: Modifiers,
+) -> Result<KeyOutcome, ActionRejection> {
+    if is_shortcut_chord(modifiers) {
+        return Ok(KeyOutcome::Ignored);
+    }
+    let Some(id) = focus.focused() else {
+        return Ok(KeyOutcome::Ignored);
+    };
+    if !matches!(tree.payload(id), Some(WidgetKind::TextField(_))) {
+        return Ok(KeyOutcome::Ignored);
+    }
+    Ok(if widgets::insert_text_field_text(tree, id, text)? {
+        KeyOutcome::Handled(PointerOutcome::Changed(id))
+    } else {
+        KeyOutcome::Ignored
+    })
 }
 
 fn handled(result: Result<PointerOutcome, ActionRejection>) -> Result<KeyOutcome, ActionRejection> {
@@ -775,10 +1032,10 @@ mod tests {
 
     use super::{
         ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
-        handle_widget_key,
+        handle_widget_key, handle_widget_text,
     };
     use crate::action::{ActionOutcome, ActionRejection};
-    use crate::input::FocusManager;
+    use crate::input::{FocusManager, FocusOrigin};
     use crate::shortcut::{Modifiers, NamedKey};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
@@ -1211,11 +1468,14 @@ mod tests {
             f.event(PointerPhase::Down, point),
             PointerOutcome::Focused(f.text_field)
         );
-        assert_eq!(
-            f.key(NamedKey::Enter, false),
-            KeyOutcome::Ignored,
-            "no key input this round"
-        );
+        for key in [NamedKey::Enter, NamedKey::Tab, NamedKey::Escape] {
+            assert_eq!(
+                f.key(key, false),
+                KeyOutcome::Ignored,
+                "{key:?} is outside the text field's table and falls through"
+            );
+        }
+        assert_eq!(f.click.captured(), None, "a text field captures nothing");
     }
 
     #[test]
@@ -1595,5 +1855,541 @@ mod tests {
         f.click.reset();
         assert_eq!(f.event(PointerPhase::Up, point), PointerOutcome::Ignored);
         assert_eq!(f.checked(), Toggled::False);
+    }
+
+    // -- drags (0.131.0) --
+
+    fn below_and_left_of_everything() -> (f32, f32) {
+        (-500.0, HEIGHT + 500.0)
+    }
+
+    #[test]
+    fn a_slider_drag_follows_moves_and_clamps_outside_its_bounds() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        assert_eq!(f.click.captured(), Some(f.slider));
+        let moved = f.event(PointerPhase::Move, at(&f.tree, f.slider, 0.75, 0.5));
+        assert!(
+            matches!(
+                moved,
+                PointerOutcome::Action(ActionOutcome::ValueChanged { id, value })
+                    if id == f.slider && (value - 75.0).abs() < 0.3
+            ),
+            "{moved:?}"
+        );
+        // Far outside the slider (over other widgets or nothing at all):
+        // the drag still drives the slider, clamped.
+        f.event(PointerPhase::Move, below_and_left_of_everything());
+        assert!(f.number(f.slider).abs() < 1e-9, "{}", f.number(f.slider));
+        f.event(PointerPhase::Move, (WIDTH + 500.0, -500.0));
+        assert!((f.number(f.slider) - 100.0).abs() < 1e-9);
+        f.event(PointerPhase::Move, centre(&f.tree, f.checkbox));
+        assert_eq!(
+            f.checked(),
+            Toggled::False,
+            "the widget under it got nothing"
+        );
+    }
+
+    #[test]
+    fn a_move_without_capture_changes_nothing() {
+        let mut f = fixture();
+        let over = at(&f.tree, f.slider, 0.9, 0.5);
+        assert_eq!(f.event(PointerPhase::Move, over), PointerOutcome::Ignored);
+        assert!((f.number(f.slider) - 50.0).abs() < f64::EPSILON);
+        // An armed (not captured) button does not make a move a drag.
+        f.event(PointerPhase::Down, centre(&f.tree, f.button));
+        assert_eq!(f.click.captured(), None);
+        assert_eq!(f.event(PointerPhase::Move, over), PointerOutcome::Ignored);
+        assert!((f.number(f.slider) - 50.0).abs() < f64::EPSILON);
+        assert_eq!(f.click.pressed(), Some(f.button), "still armed");
+    }
+
+    #[test]
+    fn up_releases_the_capture_and_later_moves_do_nothing() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        let before = f.number(f.slider);
+        assert_eq!(
+            f.event(PointerPhase::Up, at(&f.tree, f.slider, 0.9, 0.5)),
+            PointerOutcome::Released(f.slider)
+        );
+        assert!(
+            (f.number(f.slider) - before).abs() < f64::EPSILON,
+            "the Up's own position is not applied"
+        );
+        assert_eq!(f.click.captured(), None);
+        assert!(!f.click.is_active());
+        assert_eq!(
+            f.event(PointerPhase::Move, at(&f.tree, f.slider, 0.9, 0.5)),
+            PointerOutcome::Ignored
+        );
+        assert!((f.number(f.slider) - before).abs() < f64::EPSILON);
+        assert_eq!(
+            f.event(PointerPhase::Up, at(&f.tree, f.slider, 0.9, 0.5)),
+            PointerOutcome::Ignored,
+            "a second Up has nothing to release"
+        );
+    }
+
+    #[test]
+    fn a_scrollbar_drag_maps_the_thumb_centre() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.scrollbar, 0.1, 0.5));
+        assert_eq!(f.click.captured(), Some(f.scrollbar));
+        let three_quarters = at(&f.tree, f.scrollbar, 0.75, 0.5);
+        f.event(PointerPhase::Move, three_quarters);
+        let dragged = f.number(f.scrollbar);
+        // The same mapping a press there gives.
+        let mut g = fixture();
+        g.event(PointerPhase::Down, three_quarters);
+        assert!(
+            (dragged - g.number(g.scrollbar)).abs() < 1e-9,
+            "{dragged} vs {}",
+            g.number(g.scrollbar)
+        );
+        f.event(PointerPhase::Move, (WIDTH + 500.0, 0.0));
+        assert!((f.number(f.scrollbar) - 100.0).abs() < 1e-9);
+    }
+
+    fn picker_parts(f: &Fixture) -> (WidgetId, WidgetId) {
+        let state = ok(widgets::color_picker_state(&f.tree, f.picker));
+        let (Some(area), Some(hue)) = (
+            state.area_id(),
+            state.part_id(widgets::ColorPickerPart::Hue),
+        ) else {
+            unreachable!()
+        };
+        (area, hue)
+    }
+
+    fn set_hsv(f: &mut Fixture, hue: f32, saturation: f32, value: f32) {
+        ok(widgets::set_color_picker_hsv(
+            &mut f.tree,
+            f.picker,
+            widgets::Hsv {
+                hue,
+                saturation,
+                value,
+            },
+        ));
+    }
+
+    #[test]
+    fn a_picker_area_drag_clamps_and_never_changes_hue() {
+        let mut f = fixture();
+        let (area, hue) = picker_parts(&f);
+        set_hsv(&mut f, 120.0, 0.5, 0.5);
+        f.event(PointerPhase::Down, at(&f.tree, area, 0.5, 0.5));
+        assert_eq!(f.click.captured(), Some(f.picker));
+        // Onto the hue strip: an area drag stays an area drag.
+        f.event(PointerPhase::Move, at(&f.tree, hue, 0.1, 0.1));
+        assert!((hsv(&f).hue - 120.0).abs() < 1e-3, "{:?}", hsv(&f));
+        // Far past the area's top-right: saturation and value clamp at 1.
+        let moved = f.event(PointerPhase::Move, (WIDTH + 500.0, -500.0));
+        assert!(matches!(
+            moved,
+            PointerOutcome::Action(ActionOutcome::ColorChanged { picker, .. }) if picker == f.picker
+        ));
+        let after = hsv(&f);
+        assert!(after.saturation > 0.999 && after.value > 0.999, "{after:?}");
+        assert!((after.hue - 120.0).abs() < 1e-3, "{after:?}");
+    }
+
+    #[test]
+    fn a_hue_drag_stays_on_hue() {
+        let mut f = fixture();
+        let (area, hue) = picker_parts(&f);
+        set_hsv(&mut f, 0.0, 0.25, 0.75);
+        f.event(PointerPhase::Down, at(&f.tree, hue, 0.5, 0.5));
+        let start = hsv(&f).hue;
+        // Into the area: the drag keeps driving the hue, never s/v.
+        f.event(PointerPhase::Move, at(&f.tree, area, 0.9, 0.9));
+        f.event(PointerPhase::Move, at(&f.tree, hue, 0.9, 0.9));
+        let after = hsv(&f);
+        assert!((after.hue - start).abs() > 1.0, "hue moved: {after:?}");
+        assert!(
+            (after.saturation - 0.25).abs() < 1e-6 && (after.value - 0.75).abs() < 1e-6,
+            "{after:?}"
+        );
+    }
+
+    fn plot(f: &Fixture) -> (f32, f32, f32, f32) {
+        #[allow(clippy::cast_precision_loss)]
+        let marker = test_scales().spacing.xs as f32;
+        let Some(rect) = f
+            .tree
+            .bounds(f.curve)
+            .and_then(|b| widgets::plot_rect(b, marker))
+        else {
+            unreachable!("laid out")
+        };
+        rect
+    }
+
+    fn selected_point(f: &Fixture) -> (f32, f32) {
+        let state = ok(widgets::curve_editor_state(&f.tree, f.curve));
+        state
+            .curve()
+            .points()
+            .get(state.selected())
+            .map_or((f32::NAN, f32::NAN), |p| (p.x, p.y))
+    }
+
+    #[test]
+    fn a_curve_point_drag_moves_the_selected_point_without_adding() {
+        let mut f = fixture();
+        let (left, top, width, height) = plot(&f);
+        let count = points(&f);
+        f.event(PointerPhase::Down, (left + width, top));
+        assert_eq!(f.click.captured(), Some(f.curve));
+        let moved = f.event(PointerPhase::Move, (left + width * 0.5, top + height * 0.5));
+        assert_eq!(
+            moved,
+            PointerOutcome::Action(ActionOutcome::CurveChanged { editor: f.curve })
+        );
+        let (x, y) = selected_point(&f);
+        assert!((x - 1.0).abs() < 1e-6, "an endpoint keeps its input: {x}");
+        assert!((y - 0.5).abs() < 0.02, "{y}");
+        assert_eq!(points(&f), count, "a drag adds nothing");
+        // Far below the plot: the output clamps at 0.
+        f.event(PointerPhase::Move, (left, top + height * 10.0));
+        assert!(selected_point(&f).1.abs() < 1e-6);
+        assert_eq!(points(&f), count);
+    }
+
+    #[test]
+    fn a_curve_add_then_drag_moves_the_new_point() {
+        let mut f = fixture();
+        let (left, top, width, height) = plot(&f);
+        let count = points(&f);
+        f.event(PointerPhase::Down, (left + width * 0.5, top + height * 0.2));
+        assert_eq!(points(&f), count + 1, "added");
+        assert_eq!(f.click.captured(), Some(f.curve));
+        f.event(PointerPhase::Move, (left + width * 0.5, top + height * 0.9));
+        let (x, y) = selected_point(&f);
+        assert!(
+            (x - 0.5).abs() < 0.02 && (y - 0.1).abs() < 0.02,
+            "({x}, {y})"
+        );
+        // Far above and right: y clamps to 1, x stays inside its
+        // neighbours (the endpoint at 1.0).
+        f.event(
+            PointerPhase::Move,
+            (left + width * 10.0, top - height * 10.0),
+        );
+        let (x, y) = selected_point(&f);
+        assert!(x < 1.0 && (y - 1.0).abs() < 1e-6, "({x}, {y})");
+        assert_eq!(points(&f), count + 1, "the drag added nothing more");
+    }
+
+    #[test]
+    fn a_curve_drag_ends_when_a_key_deletes_its_point_mid_drag() {
+        let mut f = fixture();
+        let (left, top, width, height) = plot(&f);
+        f.event(PointerPhase::Down, (left + width * 0.5, top + height * 0.2));
+        let count = points(&f);
+        assert_eq!(f.click.captured(), Some(f.curve));
+        // `Delete` removes the grabbed point; the selection moves to a
+        // neighbour, which the drag must not now move.
+        ok(widgets::handle_curve_editor_key(
+            &mut f.tree,
+            f.curve,
+            widgets::CurveEditorKey::Delete,
+            false,
+        ));
+        assert_eq!(points(&f), count - 1, "deleted");
+        let before = selected_point(&f);
+        let moved = f.event(PointerPhase::Move, (left + width * 0.5, top + height * 0.9));
+        assert_eq!(moved, PointerOutcome::Cancelled(f.curve));
+        assert_eq!(f.click.captured(), None, "the drag ended");
+        assert_eq!(selected_point(&f), before, "the neighbour did not move");
+    }
+
+    #[test]
+    fn a_down_on_the_preview_or_a_button_captures_nothing() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, centre(&f.tree, f.button));
+        assert_eq!(f.click.captured(), None);
+        assert!(f.click.is_active(), "armed, not captured");
+        f.event(PointerPhase::Up, centre(&f.tree, f.button));
+        let Some(b) = f.tree.bounds(f.picker) else {
+            unreachable!()
+        };
+        // The preview: inside the picker, on neither part.
+        #[allow(clippy::cast_precision_loss)]
+        let preview = (0..40)
+            .flat_map(|i| (0..40).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                (
+                    b.x as f32 + (i as f32 + 0.5) * b.width as f32 / 40.0,
+                    b.y as f32 + (j as f32 + 0.5) * b.height as f32 / 40.0,
+                )
+            })
+            .find(|&p| {
+                super::target_at(&f.tree, p).map(|(id, _)| id) == Some(f.picker)
+                    && widgets::color_picker_part_at(&f.tree, f.picker, p).is_none()
+            });
+        let Some(preview) = preview else {
+            unreachable!("the picker has a preview")
+        };
+        let before = hsv(&f);
+        f.event(PointerPhase::Down, preview);
+        assert_eq!(f.click.captured(), None);
+        f.event(
+            PointerPhase::Move,
+            at(&f.tree, picker_parts(&f).0, 0.1, 0.1),
+        );
+        assert_eq!(hsv(&f), before);
+    }
+
+    #[test]
+    fn a_captured_widget_disabled_mid_drag_is_released_unchanged() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        let before = f.number(f.slider);
+        ok(widgets::set_slider_disabled(&mut f.tree, f.slider, true));
+        assert_eq!(
+            f.event(PointerPhase::Move, at(&f.tree, f.slider, 0.75, 0.5)),
+            PointerOutcome::Cancelled(f.slider)
+        );
+        assert!((f.number(f.slider) - before).abs() < f64::EPSILON);
+        assert_eq!(f.click.captured(), None);
+        ok(widgets::set_slider_disabled(&mut f.tree, f.slider, false));
+        assert_eq!(
+            f.event(PointerPhase::Move, at(&f.tree, f.slider, 0.75, 0.5)),
+            PointerOutcome::Ignored,
+            "re-enabling does not resume the drag"
+        );
+        assert!((f.number(f.slider) - before).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_move_does_not_touch_focus_or_the_focus_ring() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        ok(f.focus
+            .focus_with(&mut f.tree, f.checkbox, FocusOrigin::Keyboard));
+        assert!(f.focus.focus_visible());
+        f.event(PointerPhase::Move, at(&f.tree, f.slider, 0.75, 0.5));
+        assert!(f.number(f.slider) > 70.0, "the drag still ran");
+        assert_eq!(f.focus.focused(), Some(f.checkbox));
+        assert!(
+            f.focus.focus_visible(),
+            "a move is not a pointer modality switch"
+        );
+    }
+
+    #[test]
+    fn a_new_down_replaces_a_lost_capture() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        let slider = f.number(f.slider);
+        // The Up was lost (released outside the window).
+        f.event(PointerPhase::Down, at(&f.tree, f.scrollbar, 0.1, 0.5));
+        assert_eq!(f.click.captured(), Some(f.scrollbar));
+        f.event(PointerPhase::Move, at(&f.tree, f.scrollbar, 0.9, 0.5));
+        assert!((f.number(f.slider) - slider).abs() < f64::EPSILON);
+        assert!(f.number(f.scrollbar) > 80.0);
+        f.event(PointerPhase::Down, centre(&f.tree, f.button));
+        assert_eq!(f.click.captured(), None, "a button's Down drops it too");
+    }
+
+    #[test]
+    fn reset_and_release_capture_clear_the_capture() {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        f.click.reset();
+        assert!(!f.click.is_active());
+        let far = at(&f.tree, f.slider, 0.9, 0.5);
+        assert_eq!(f.event(PointerPhase::Move, far), PointerOutcome::Ignored);
+        assert_eq!(f.event(PointerPhase::Up, far), PointerOutcome::Ignored);
+        f.event(PointerPhase::Down, at(&f.tree, f.slider, 0.25, 0.5));
+        f.click.release_capture();
+        assert_eq!(f.click.captured(), None);
+        assert_eq!(f.event(PointerPhase::Move, far), PointerOutcome::Ignored);
+        assert!(f.number(f.slider) < 30.0);
+    }
+
+    // -- text (0.131.0) --
+
+    fn content(f: &Fixture) -> String {
+        ok(widgets::text_field_state(&f.tree, f.text_field))
+            .content
+            .clone()
+    }
+
+    fn type_text(f: &mut Fixture, text: &str, modifiers: Modifiers) -> KeyOutcome {
+        ok(handle_widget_text(&mut f.tree, &f.focus, text, modifiers))
+    }
+
+    fn focused_field(initial: &str) -> Fixture {
+        let mut f = fixture();
+        f.event(PointerPhase::Down, centre(&f.tree, f.text_field));
+        f.event(PointerPhase::Up, centre(&f.tree, f.text_field));
+        if !initial.is_empty() {
+            type_text(&mut f, initial, Modifiers::none());
+        }
+        f
+    }
+
+    #[test]
+    fn typing_inserts_at_the_caret_preserving_case() {
+        let mut f = focused_field("");
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        };
+        assert_eq!(
+            type_text(&mut f, "H", shift),
+            KeyOutcome::Handled(PointerOutcome::Changed(f.text_field))
+        );
+        type_text(&mut f, "ello", Modifiers::none());
+        f.key(NamedKey::ArrowLeft, false);
+        f.key(NamedKey::ArrowLeft, false);
+        type_text(&mut f, "X", shift);
+        assert_eq!(content(&f), "HelXlo");
+    }
+
+    #[test]
+    fn shift_arrows_extend_the_selection_and_typing_replaces_it() {
+        let mut f = focused_field("abcd");
+        f.key(NamedKey::ArrowLeft, true);
+        f.key(NamedKey::ArrowLeft, true);
+        assert_eq!(
+            ok(widgets::text_field_state(&f.tree, f.text_field)).selected_text(),
+            "cd"
+        );
+        type_text(&mut f, "Z", Modifiers::none());
+        assert_eq!(content(&f), "abZ");
+        f.key(NamedKey::Home, true);
+        assert_eq!(
+            ok(widgets::text_field_state(&f.tree, f.text_field)).selected_text(),
+            "abZ"
+        );
+        f.key(NamedKey::End, false);
+        assert_eq!(
+            ok(widgets::text_field_state(&f.tree, f.text_field)).selected_text(),
+            "",
+            "an unshifted move collapses the selection"
+        );
+    }
+
+    #[test]
+    fn home_end_backspace_and_delete() {
+        let mut f = focused_field("abc");
+        assert_eq!(
+            f.key(NamedKey::Home, false),
+            KeyOutcome::Handled(PointerOutcome::Changed(f.text_field))
+        );
+        f.key(NamedKey::Delete, false);
+        assert_eq!(content(&f), "bc");
+        f.key(NamedKey::End, false);
+        f.key(NamedKey::Backspace, false);
+        assert_eq!(content(&f), "b");
+        f.key(NamedKey::ArrowRight, false);
+        f.key(NamedKey::Delete, false);
+        assert_eq!(content(&f), "b", "delete at the end is a no-op");
+    }
+
+    #[test]
+    fn control_characters_are_filtered() {
+        let mut f = focused_field("x");
+        for text in ["\r", "\t", "\u{8}", "\u{7f}", "\u{1b}", ""] {
+            assert_eq!(
+                type_text(&mut f, text, Modifiers::none()),
+                KeyOutcome::Ignored,
+                "{text:?}"
+            );
+            assert_eq!(content(&f), "x", "{text:?}");
+        }
+        type_text(&mut f, "a\tb\r", Modifiers::none());
+        assert_eq!(content(&f), "xab");
+    }
+
+    #[test]
+    fn ctrl_and_meta_text_is_refused_but_alt_and_altgr_type() {
+        let mut f = focused_field("");
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::none()
+        };
+        let meta = Modifiers {
+            meta: true,
+            ..Modifiers::none()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::none()
+        };
+        let alt_gr = Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::none()
+        };
+        let meta_alt = Modifiers {
+            meta: true,
+            alt: true,
+            ..Modifiers::none()
+        };
+        for refused in [control, meta, meta_alt] {
+            assert_eq!(type_text(&mut f, "s", refused), KeyOutcome::Ignored);
+        }
+        assert_eq!(content(&f), "");
+        type_text(&mut f, "\u{e5}", alt);
+        type_text(&mut f, "@", alt_gr);
+        assert_eq!(content(&f), "\u{e5}@");
+    }
+
+    #[test]
+    fn text_goes_only_to_a_focused_text_field() {
+        let mut f = fixture();
+        assert_eq!(
+            type_text(&mut f, "a", Modifiers::none()),
+            KeyOutcome::Ignored
+        );
+        ok(f.focus.focus(&mut f.tree, f.slider));
+        assert_eq!(
+            type_text(&mut f, "a", Modifiers::none()),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(content(&f), "");
+    }
+
+    #[test]
+    fn a_disabled_field_refuses() {
+        let mut f = focused_field("ab");
+        ok(widgets::set_text_field_disabled(
+            &mut f.tree,
+            f.text_field,
+            true,
+        ));
+        assert!(handle_widget_text(&mut f.tree, &f.focus, "c", Modifiers::none()).is_err());
+        assert!(
+            handle_widget_key(
+                &mut f.tree,
+                &mut f.focus,
+                NamedKey::Backspace,
+                Modifiers::none()
+            )
+            .is_err()
+                || f.focus.focused() != Some(f.text_field)
+        );
+        assert_eq!(content(&f), "ab");
+    }
+
+    #[test]
+    fn the_accessibility_value_follows_edits() {
+        let mut f = focused_field("abc");
+        let value = |f: &Fixture| {
+            f.tree
+                .accessibility(f.text_field)
+                .and_then(|node| node.value().map(str::to_owned))
+        };
+        assert_eq!(value(&f).as_deref(), Some("abc"));
+        f.key(NamedKey::Backspace, false);
+        assert_eq!(value(&f).as_deref(), Some("ab"));
+        type_text(&mut f, "Z", Modifiers::none());
+        assert_eq!(value(&f).as_deref(), Some("abZ"));
     }
 }

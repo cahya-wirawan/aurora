@@ -3582,6 +3582,137 @@ check licenses` clean with the new `toml` dependency.
   skipped; doctests and strict rustdoc clean; the G4 `Up`-guard
   mutation was re-run by name and killed.
 
+  **Widget Gallery panel, round 2, landed 2026-09-26 (0.131.0).** Drags,
+  the tooltip's hover timer, and text-field typing. **(1) Pointer capture
+  (`aurora_widgets::pointer`):** `PointerPhase::Move` and
+  `PointerOutcome::Released`; `ClickTracker` gains a private `Capture`
+  (`captured()`, `is_active()`, `release_capture()`; `reset()` clears
+  both). A slider/scrollbar `Down` captures; a colour picker captures the
+  *part* it began on (an area drag never changes the hue); a curve editor
+  captures when a point was hit or a new point was added (add-then-drag),
+  never on a refused add. A captured `Move` drives the same mutator the
+  `Down` used, wherever the pointer is (clamped); with nothing captured a
+  `Move` is ignored without a hit test; a `Move` never changes focus or
+  the focus ring. A captured widget removed or disabled mid-drag ends the
+  drag (`Cancelled`); a new `Down` drops a capture whose `Up` was lost;
+  the `Up` ends it (`Released`) without applying its own position. The
+  curve drag's clamp needed no change: `ToneCurve::move_point_to` already
+  clamps `y` to `[0, 1]` and interior `x` to its neighbours.
+  **(2) Text:** `TextFieldKey` (Left/Right/Home/End/Backspace/Delete,
+  Shift extends), `handle_text_field_key`, `insert_text_field_text`
+  (drops control characters, so `\r`/`\t`/`\u{8}`/`\u{7f}` delivered as
+  text are not inserted) and `handle_widget_text` (types under
+  `Alt`/`Option` and `Ctrl+Alt`/AltGr, refuses `Meta` and `Ctrl` without
+  `Alt`). In `aurora-app`, `route_gallery_key` now takes the event's
+  `text`: with the gallery's text field focused, a named key goes to the
+  field's table first, then is offered as text (`Space`), and a
+  character key without `Ctrl`/`Meta` is consumed even when it inserted
+  nothing (dead key, composition) — so a single-letter tool shortcut
+  cannot fire while typing. `Tab`, `Enter` and `Escape` still fall
+  through. Text comes from `KeyEvent::text`, never the lowercased
+  `translate_key` result. IME: `WindowEvent::Ime` Preedit/Commit/Disabled
+  reach the field (`apply_gallery_ime`) only while it is focused, IME is
+  allowed on the window only then (`App::sync_ime`, which also sets the
+  candidate-window area), and a key's own text is not inserted during a
+  composition. **(3) Tooltip timer:** `aurora_ui::gallery_hover`,
+  `gallery_tick`, `gallery_next_deadline`; `apply_gallery_outcome`
+  dismisses the tooltip on a press or activation of its button, by any
+  path. The app reports hover from `CursorMoved` (masked to `None` by
+  `gallery_hover_point` while a modal, a gallery drag, a canvas drag or a
+  rail resize owns the pointer) and `CursorLeft`; `about_to_wait` now
+  sets the control flow on **every** iteration on every platform —
+  `next_control_flow(now, deadline, poll)` picks `Wait` or `WaitUntil`
+  the earliest of the tooltip deadline and (macOS only) the muda poll —
+  after `gallery_timer_step`, which ticks *before* reading the deadline
+  so a passed deadline is consumed instead of spinning. **(4) App
+  wiring:** a gallery `Move`/`Up` under a modal cancels a live capture;
+  a `Down` outside the gallery drops any stale armed or captured widget;
+  `CursorLeft` releases the capture; a non-primary press during a
+  gallery drag is swallowed; a gallery `Down` also ends a rail resize
+  (invariant: captured implies no canvas drag and no rail resize).
+  +36 tests (21 `aurora-widgets`, 5 `aurora-ui`, 10 `aurora-app`),
+  e.g. `a_slider_drag_follows_moves_and_clamps_outside_its_bounds`,
+  `a_picker_area_drag_clamps_and_never_changes_hue`,
+  `a_curve_add_then_drag_moves_the_new_point`,
+  `control_characters_are_filtered`,
+  `a_tool_letter_typed_into_the_gallery_text_field_is_consumed_not_a_shortcut`,
+  `gallery_timer_step_at_the_deadline_shows_and_leaves_no_deadline`,
+  `next_control_flow_waits_until_the_earliest_wakeup_or_blocks`.
+  **Disclosed, not done:** no caret or selection is painted (and no
+  glyphs); a click does not place the caret; no accesskit
+  `TextSelection`; word motion and `Ctrl`/`Cmd`+A/C/X/V/Z are not routed
+  (`Ctrl+Z` in the field still undoes the *document*); IME is untested on
+  any real platform, and double insertion (a key's text plus an
+  `Ime::Commit`) is guarded only for an active composition; no
+  Escape-to-revert on a drag; the `Up`'s position is not applied;
+  dragging off the window ends the drag (X11 may send `CursorLeft`
+  mid-drag); a scrollbar drag has no grab offset (the thumb re-centres
+  on the first `Move`); the tooltip is hover-only (no focus trigger, no
+  warm-up, invisible text); every captured `Move` re-runs layout and
+  re-announces the tree (cost unmeasured). **Needs a human:** drag feel
+  and HiDPI, tooltip delay, IME typing, and idle CPU with the gallery
+  open (the loop must stay in `Wait` when nothing is pending).
+  **Review revision (0.131.0, same version).** Fixes from the critic and
+  red-team pass. **H1:** every gallery drag move, keystroke, IME event
+  and tooltip change (and every ordinary key press, pre-existing) went
+  through `App::apply_resize`, which always reconfigured the surface and
+  rebuilt the canvas atlas (`TileResidency::resize` drops every resident
+  tile), so a slider drag re-uploaded the visible canvas per mouse move.
+  `apply_resize` now does GPU work only on a real size change
+  (`gpu_target_needs_resize`; new `App::residency_viewport`), and the
+  "pure CPU geometry, no GPU" comment is now true. **H2:** a primary
+  press outside the gallery now blurs the gallery's text field (only the
+  field: a light-dismissed menu's focus still returns to its opener,
+  critic C11), so tool letters are shortcuts again. **RT-1:** a stale IME
+  composition no longer eats every keystroke on refocus: `Ime::Disabled`
+  clears it whether or not the field is focused, and `sync_ime` drops a
+  composition the field no longer owns (`drop_stale_gallery_composition`).
+  **M1:** `sync_ime` runs once per `about_to_wait` iteration and after an
+  accessibility action (window calls only on change; the candidate area
+  is cached). **M2:** during a composition, the field's named editing
+  keys are consumed without editing. **RT-5:** a curve capture records
+  the grabbed index and point count; a key that deletes or re-selects a
+  point mid-drag ends the drag (`Cancelled`). **L2:** one predicate,
+  `aurora_widgets::is_shortcut_chord` (`Meta`, or `Ctrl` without `Alt`),
+  for both insertion and the consume rule. **L3:** a failing tooltip tick
+  returns no deadline. **RT-2/RT-3:** an insertion that joins the next
+  grapheme cluster snaps the caret past it. **RT-4:** U+2028/2029 and the
+  bidi embedding/override/isolate controls are filtered too
+  (`is_insertable_char`), IME commits included. **L1:** docs no longer
+  claim a dead key reaches the router. **L4:** hover is refreshed after
+  any release and when a gallery capture begins. **RT-6/RT-7:** a
+  character key that inserts nothing reports `Focused`, not `Changed`,
+  and typed content is capped at `TEXT_FIELD_MAX_BYTES` (4096). +11
+  tests (5 `aurora-widgets`, 6 `aurora-app`):
+  `gpu_target_needs_resize_only_for_a_real_nonzero_size_change`,
+  `a_gallery_drag_leaves_the_canvas_size_so_no_gpu_resize_is_needed`,
+  `a_press_outside_the_gallery_blurs_its_text_field_so_tool_letters_are_shortcuts`,
+  `ime_disabled_after_focus_moved_away_still_drops_the_composition`,
+  `a_composition_is_dropped_once_the_field_is_no_longer_focused`,
+  `a_named_edit_key_during_a_composition_is_consumed_without_editing`,
+  `a_curve_drag_ends_when_a_key_deletes_its_point_mid_drag`,
+  `inserting_a_joiner_between_two_emoji_leaves_the_caret_on_a_boundary`,
+  `inserting_a_base_before_a_leading_combining_mark_snaps_past_the_cluster`,
+  `insert_typed_drops_separators_and_bidi_controls`,
+  `insert_typed_caps_the_content_at_the_maximum_length`. **Still
+  disclosed:** a platform that delivers the same text as both
+  `KeyboardInput.text` and an `Ime::Commit` with no preedit (some X11
+  IMEs) would insert it twice — ignoring key text whenever IME is allowed
+  would break plain typing on macOS, so this stays unverified until
+  tested on real IMEs; the H1 skip is proven headlessly (the decision and
+  the unchanged canvas size), not measured on a real GPU; the
+  `CursorLeft` capture release has no extracted pure helper or test; the
+  L3 error path has no test (no way to make `gallery_tick` fail
+  headlessly); undo still snapshots the whole (now bounded) content per
+  keystroke.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,338 passed, 0 failed, 45 ignored, 0
+  skipped; doctests and strict rustdoc clean. Eight plan mutations
+  (range capture dropped, Up keeps capture, hue captures the area, no
+  release on disable, control filter removed, `Wait` → `WaitUntil(now)`,
+  deadline read before tick, character suppression removed) were each
+  killed, files restored sha256-identical. Judge: PASS, 0.92.
+
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
     `Click` and a closed dropdown declares no `Increment`/`Decrement`, so
@@ -28306,6 +28437,22 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-26 (0.131.0) — Widget Gallery, round 2.** Gallery
+drags (pointer capture for slider, scrollbar, colour-picker part and
+curve point), the demo tooltip's hover timer (driven by `about_to_wait`,
+which now sets `Wait`/`WaitUntil` every iteration on every platform),
+and text-field typing with single-key tool shortcuts suppressed while
+the field is focused; IME events reach the field while it is focused.
+Full account and disclosures: M1.7's round-2 gallery entry. Review
+revision: gallery events no longer rebuild the canvas atlas (a GPU
+resize only on a real size change), a press outside blurs the text
+field, a stale IME composition can no longer eat keystrokes, and a
+curve drag ends if its point is deleted mid-drag. **Needs a
+human:** drag feel on real hardware and HiDPI, the tooltip delay, IME
+typing on each platform, and idle CPU with the gallery open.
+**Suggested next:** a painted caret and selection (needs caret
+colour/width/blink tokens — a design-owner decision) and click-to-place.
 
 **Addendum 2026-09-25 (0.130.0) — in-app Widget Gallery, round 1.**
 `Toggle Widget Gallery` (command palette, `Ctrl+Shift+P`; macOS View

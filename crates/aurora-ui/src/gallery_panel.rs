@@ -25,15 +25,18 @@
 //! **What this does not do**, all disclosed rather than hidden: no text
 //! is drawn anywhere in this toolkit, so every label is blank on screen
 //! and reaches the accessibility tree only; the demo button's
-//! [`Tooltip`] is created (so its owner wiring is real) but never shown —
-//! hover timing is 0.131.0 work; drags, pointer capture and text-field
-//! caret editing are 0.131.0 work too (see `aurora_widgets`' pointer
-//! module doc comment). The panel never shrinks: on a narrow window
+//! [`Tooltip`] is shown by **hover only** (0.131.0: [`gallery_hover`],
+//! [`gallery_tick`], [`gallery_next_deadline`] — the owner drives them
+//! from pointer moves and its event loop's wake-ups), never by keyboard
+//! focus, with no warm-up and — like every label — no visible text; a
+//! press on the button dismisses it. Drags and text-field typing are
+//! routed (see `aurora_widgets`' pointer module doc comment), but no
+//! caret or selection is painted. The panel never shrinks: on a narrow window
 //! (640 x 480) it and the dock rail leave the canvas a sliver (18 px),
 //! pinned by a test rather than fixed. Nothing here touches a document: every outcome
 //! is a widget-state change only.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use accesskit::Orientation;
 use aurora_core::ToneCurve;
@@ -59,8 +62,8 @@ pub const GALLERY_TREE_ROWS: f32 = 3.0;
 
 /// The demo tooltip's show delay. **Not a token**, deliberately — see
 /// `aurora_widgets::widgets::tooltip`'s own doc comment ("The show delay
-/// is a caller-supplied `Duration`, not a token"). Unused this round:
-/// nothing drives the tooltip's timer yet.
+/// is a caller-supplied `Duration`, not a token"). Driven by the owner's
+/// event loop through [`gallery_next_deadline`] and [`gallery_tick`].
 pub const GALLERY_TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 
 /// The sample colour the demo swatch shows — gallery *content*, the same
@@ -107,7 +110,8 @@ pub struct GalleryPanel {
     pub tree_rows: [WidgetId; 3],
     pub picker: WidgetId,
     pub curve: WidgetId,
-    /// Owned by [`Self::button`]; created, never shown this round.
+    /// Owned by [`Self::button`]; shown on hover after
+    /// [`GALLERY_TOOLTIP_DELAY`] ([`gallery_hover`]/[`gallery_tick`]).
     pub tooltip: Tooltip,
     /// The demo menu, while open (a popover under the panel body, so
     /// [`gallery_contains`] sees it).
@@ -357,8 +361,9 @@ pub fn remove_gallery_panel(
     gallery: GalleryPanel,
 ) -> Result<(), WidgetError> {
     let mut gallery = gallery;
-    // The tooltip was never shown, so this removes nothing today; it is
-    // here so a shown tooltip (0.131.0) cannot outlive its owner.
+    // A shown tooltip's node is a popover under the button, so removing
+    // the panel would take it too; detaching first also returns the
+    // controller to `Idle` so nothing is left pending.
     let detached = gallery.tooltip.detach(tree);
     tree.remove(gallery.panel.root)?;
     detached
@@ -428,6 +433,57 @@ pub fn gallery_light_dismiss(
     Ok(closed)
 }
 
+/// Reports the pointer's position (`None`: off the window, or owned by
+/// something else — a drag, a modal) to the demo button's tooltip:
+/// hovering the button arms it, hovering the shown tooltip itself keeps
+/// it open, anything else hides it. Returns whether the tooltip's node
+/// appeared or went away — the caller re-runs layout (a new node has no
+/// bounds until then), re-announces and redraws on `true`.
+///
+/// # Errors
+///
+/// Whatever [`Tooltip::set_hover`] refuses (the button gone).
+pub fn gallery_hover(
+    tree: &mut WidgetTree<WidgetKind>,
+    gallery: &mut GalleryPanel,
+    point: Option<(f32, f32)>,
+    now: Instant,
+) -> Result<bool, WidgetError> {
+    let before = gallery.tooltip.node();
+    let hit = point.and_then(|point| tree.hit_test(point));
+    let on_tip = hit.is_some_and(|hit| before.is_some() && tree.popover_root_of(hit) == before);
+    // The tooltip's node is parented under the button, so "within the
+    // button" alone would count the tooltip as the owner.
+    let owner = !on_tip && hit.is_some_and(|hit| tree.is_within(gallery.button, hit));
+    gallery.tooltip.set_hover(tree, owner, on_tip, now)?;
+    Ok(gallery.tooltip.node() != before)
+}
+
+/// Advances the demo tooltip's timer to `now` — a pending tooltip whose
+/// delay has elapsed is shown. Returns whether its node appeared or went
+/// away, as [`gallery_hover`].
+///
+/// # Errors
+///
+/// Whatever [`Tooltip::tick`] refuses (the button gone).
+pub fn gallery_tick(
+    tree: &mut WidgetTree<WidgetKind>,
+    gallery: &mut GalleryPanel,
+    now: Instant,
+) -> Result<bool, WidgetError> {
+    let before = gallery.tooltip.node();
+    gallery.tooltip.tick(tree, now)?;
+    Ok(gallery.tooltip.node() != before)
+}
+
+/// When the gallery next needs a [`gallery_tick`]: a pending tooltip's
+/// show deadline, `None` when nothing is pending (the owner's event loop
+/// can then sleep until the next real event).
+#[must_use]
+pub fn gallery_next_deadline(gallery: &GalleryPanel) -> Option<Instant> {
+    gallery.tooltip.next_deadline()
+}
+
 fn forget_stale_menu(tree: &WidgetTree<WidgetKind>, gallery: &mut GalleryPanel) {
     if gallery.open_menu.is_some_and(|menu| !tree.contains(menu)) {
         gallery.open_menu = None;
@@ -445,6 +501,8 @@ fn forget_stale_menu(tree: &WidgetTree<WidgetKind>, gallery: &mut GalleryPanel) 
 /// row's `Click` actually succeeded); a disabled row that was selected is
 /// deselected too. Re-expanding the demo tree's parent after a collapse
 /// rebuilds its two children and updates [`GalleryPanel::tree_rows`].
+/// A press or activation of the demo button dismisses its tooltip,
+/// whichever path (pointer, keyboard, assistive technology) it came by.
 /// Every other outcome needs nothing from the gallery.
 ///
 /// # Errors
@@ -459,6 +517,12 @@ pub fn apply_gallery_outcome(
 ) -> Result<(), WidgetError> {
     let previous = gallery.open_menu;
     forget_stale_menu(tree, gallery);
+    if let PointerOutcome::Pressed(id) | PointerOutcome::Action(ActionOutcome::Activated(id)) =
+        outcome
+        && *id == gallery.button
+    {
+        gallery.tooltip.owner_pressed(tree)?;
+    }
     match outcome {
         PointerOutcome::Action(ActionOutcome::Activated(id)) if *id == gallery.menu_button => {
             if let Some(menu) = gallery.open_menu.take() {
@@ -564,9 +628,14 @@ mod tests {
     use aurora_widgets::widgets::{self, WidgetKind};
     use aurora_widgets::{ActionOutcome, FocusManager, PointerOutcome, WidgetId, WidgetTree};
 
+    use std::time::Instant;
+
+    use aurora_widgets::widgets::TooltipPhase;
+
     use super::{
-        GalleryPanel, apply_gallery_outcome, gallery_contains, gallery_content_height,
-        gallery_light_dismiss, gallery_width, insert_gallery_panel, remove_gallery_panel,
+        GALLERY_TOOLTIP_DELAY, GalleryPanel, apply_gallery_outcome, gallery_contains,
+        gallery_content_height, gallery_hover, gallery_light_dismiss, gallery_next_deadline,
+        gallery_tick, gallery_width, insert_gallery_panel, remove_gallery_panel,
     };
     use crate::workspace::{Workspace, build_workspace};
 
@@ -953,5 +1022,169 @@ mod tests {
             "the detach error is still reported: {result:?}"
         );
         assert!(!ws.tree.contains(root), "but the panel is gone");
+    }
+
+    // -- the demo tooltip (0.131.0) --
+
+    fn centre_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (f32, f32) {
+        let Some(b) = tree.bounds(id) else {
+            unreachable!("{id:?} is laid out")
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = (
+            b.x as f32 + b.width as f32 / 2.0,
+            b.y as f32 + b.height as f32 / 2.0,
+        );
+        point
+    }
+
+    fn hover(
+        ws: &mut Workspace,
+        g: &mut GalleryPanel,
+        point: Option<(f32, f32)>,
+        now: Instant,
+    ) -> bool {
+        match gallery_hover(&mut ws.tree, g, point, now) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn tick(ws: &mut Workspace, g: &mut GalleryPanel, now: Instant) -> bool {
+        match gallery_tick(&mut ws.tree, g, now) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// Hovers the button and ticks past the delay; returns the shown node.
+    fn show(ws: &mut Workspace, g: &mut GalleryPanel, t0: Instant) -> WidgetId {
+        let on_button = centre_of(&ws.tree, g.button);
+        assert!(!hover(ws, g, Some(on_button), t0), "armed, not shown yet");
+        assert_eq!(gallery_next_deadline(g), Some(t0 + GALLERY_TOOLTIP_DELAY));
+        assert!(
+            tick(ws, g, t0 + GALLERY_TOOLTIP_DELAY),
+            "shown at the deadline"
+        );
+        ws.tree.compute_layout(WIDE, TALL);
+        let Some(node) = g.tooltip.node() else {
+            unreachable!("shown")
+        };
+        node
+    }
+
+    #[test]
+    fn hovering_the_button_arms_and_tick_shows_the_tooltip() {
+        let (mut ws, mut g, _) = opened(TALL);
+        let t0 = Instant::now();
+        assert_eq!(gallery_next_deadline(&g), None, "nothing pending");
+        let on_button = centre_of(&ws.tree, g.button);
+        hover(&mut ws, &mut g, Some(on_button), t0);
+        assert!(!tick(&mut ws, &mut g, t0), "too early");
+        assert!(g.tooltip.node().is_none());
+        let node = show(&mut ws, &mut g, t0);
+        assert_eq!(g.tooltip.phase(), TooltipPhase::Shown);
+        assert!(gallery_contains(&ws.tree, &g, node), "inside the gallery");
+        assert_eq!(gallery_next_deadline(&g), None, "nothing left pending");
+        assert!(
+            !hover(
+                &mut ws,
+                &mut g,
+                Some(on_button),
+                t0 + GALLERY_TOOLTIP_DELAY * 2
+            ),
+            "continued hover changes nothing"
+        );
+    }
+
+    #[test]
+    fn leaving_hides_it() {
+        let (mut ws, mut g, _) = opened(TALL);
+        let t0 = Instant::now();
+        let node = show(&mut ws, &mut g, t0);
+        let elsewhere = centre_of(&ws.tree, g.slider);
+        assert!(hover(
+            &mut ws,
+            &mut g,
+            Some(elsewhere),
+            t0 + GALLERY_TOOLTIP_DELAY
+        ));
+        assert!(!ws.tree.contains(node));
+        assert_eq!(g.tooltip.phase(), TooltipPhase::Idle);
+        // Off the window entirely hides it too.
+        show(&mut ws, &mut g, t0 + GALLERY_TOOLTIP_DELAY * 4);
+        assert!(hover(&mut ws, &mut g, None, t0 + GALLERY_TOOLTIP_DELAY * 6));
+        assert!(g.tooltip.node().is_none());
+    }
+
+    #[test]
+    fn moving_onto_the_shown_tooltip_keeps_it() {
+        let (mut ws, mut g, _) = opened(TALL);
+        let t0 = Instant::now();
+        let node = show(&mut ws, &mut g, t0);
+        let on_tip = centre_of(&ws.tree, node);
+        assert_eq!(
+            ws.tree
+                .hit_test(on_tip)
+                .and_then(|hit| ws.tree.popover_root_of(hit)),
+            Some(node),
+            "the tooltip is hittable"
+        );
+        assert!(!hover(
+            &mut ws,
+            &mut g,
+            Some(on_tip),
+            t0 + GALLERY_TOOLTIP_DELAY * 2
+        ));
+        assert_eq!(g.tooltip.node(), Some(node), "kept open");
+        assert_eq!(g.tooltip.phase(), TooltipPhase::Shown);
+    }
+
+    #[test]
+    fn pressing_the_button_dismisses_it() {
+        let (mut ws, mut g, scales) = opened(TALL);
+        let t0 = Instant::now();
+        let node = show(&mut ws, &mut g, t0);
+        let mut focus = FocusManager::new();
+        let pressed = PointerOutcome::Pressed(g.button);
+        if let Err(err) = apply_gallery_outcome(&mut ws.tree, &mut focus, &mut g, &scales, &pressed)
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(!ws.tree.contains(node), "hidden by the press");
+        assert_eq!(g.tooltip.phase(), TooltipPhase::Dismissed);
+        // Still hovering the button: dismissed is sticky until a fresh rise.
+        let on_button = centre_of(&ws.tree, g.button);
+        hover(
+            &mut ws,
+            &mut g,
+            Some(on_button),
+            t0 + GALLERY_TOOLTIP_DELAY * 2,
+        );
+        assert_eq!(gallery_next_deadline(&g), None);
+        // A keyboard or assistive-technology activation dismisses too.
+        hover(&mut ws, &mut g, None, t0 + GALLERY_TOOLTIP_DELAY * 3);
+        show(&mut ws, &mut g, t0 + GALLERY_TOOLTIP_DELAY * 4);
+        let activated = PointerOutcome::Action(ActionOutcome::Activated(g.button));
+        if let Err(err) =
+            apply_gallery_outcome(&mut ws.tree, &mut focus, &mut g, &scales, &activated)
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(g.tooltip.node().is_none());
+    }
+
+    #[test]
+    fn removing_the_gallery_with_a_shown_tooltip_leaves_no_node() {
+        let (mut ws, mut g, _) = opened(TALL);
+        let node = show(&mut ws, &mut g, Instant::now());
+        if let Err(err) = remove_gallery_panel(&mut ws.tree, g) {
+            unreachable!("{err:?}");
+        }
+        assert!(!ws.tree.contains(node));
+        assert_eq!(
+            ws.tree.children(ws.root),
+            Some([ws.canvas_area, ws.divider, ws.rail].as_slice())
+        );
     }
 }

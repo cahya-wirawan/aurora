@@ -89,7 +89,7 @@ pub use paint::{
 };
 pub use pointer::{
     ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
-    handle_widget_key,
+    handle_widget_key, handle_widget_text, is_shortcut_chord,
 };
 pub use render::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
