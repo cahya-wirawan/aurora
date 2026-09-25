@@ -20190,12 +20190,32 @@ severity choice.
   `read_texel_at(TILE - 1, 0)` assertion. `read_first_texel` could not have
   served: `(0, 0)` is in that fixture's *transparent* half.
 
-  **Finding 1 — the first guard in the whole eighteen-round series that is
-  load-bearing on *this* adapter.** `ColorBurn`'s `Cs == 0` guard (0.107.0) and
-  `ColorDodge`'s `Cs == 1` guard (0.108.0) were each *measured* surviving every
-  test in both crates, because this backend divides by zero to `+inf` and their
-  surrounding arithmetic maps `+inf` back onto exactly the value the guard
-  returns; both were kept purely as portability guards. Deleting *this* guard
+  **Finding 1 — the first *division-domain* guard in the eighteen-round series
+  that is load-bearing on *this* adapter.** The qualifier is load-bearing in the
+  finding itself, and an earlier draft of this entry (and of five code sites,
+  corrected in 0.119.1) stated it without one, as "the first guard ported that is
+  load-bearing here, unlike every guard before it". That was **false**, and this
+  file already recorded the counterexample two rounds' worth of entries earlier.
+  The distinction is between the two *kinds* of guard the guarded-division modes
+  carry:
+
+  - **Division-domain guards**, standing directly in front of the quotient:
+    `ColorBurn`'s `Cs == 0` (0.107.0), `ColorDodge`'s `Cs == 1` (0.108.0), and
+    `Divide`'s own `Cs == 0`. The first two were each *measured* surviving every
+    test in both crates, because this backend divides by zero to `+inf` and their
+    surrounding arithmetic maps `+inf` back onto exactly the value the guard
+    returns; both were kept purely as portability guards. `Divide`'s is the first
+    of this kind whose deletion this adapter can see, and that is the finding.
+  - **Precedence guards**, which decide which of two guards fires first:
+    `ColorBurn`'s `Cb == 1` and `ColorDodge`'s `Cb == 0`. Both were measured
+    **killed deterministically** in those same two rounds, so this adapter has
+    seen a load-bearing guard before — it had just never seen a load-bearing
+    *division* guard. Neither of those two is load-bearing through arithmetic at
+    all: delete one and the mode's other guard fires in its place and returns the
+    wrong constant, ordinary control flow with no quotient computed.
+
+  `Divide` carries exactly one guard, it is a division-domain guard, and it has
+  no precedence question behind it. Deleting it
   leaves `min(1.0, cb / 0.0)`, which splits three ways on the sign of `cb`:
 
   | `cb` | `cb / 0.0` | `min(1.0, …)` | vs the guard's `1.0` |
@@ -20301,6 +20321,23 @@ severity choice.
   railed cell where a dropped `min` computes `2.4375` against the reference's
   `0.9375` — visible even to the 8-bit whole-tile comparison, since the mutant
   crosses `1.0` there.
+
+  **Finding 6 — a second planner operand corrected before shipping, on the same
+  degeneracy, and recorded here for the same reason Finding 5 is.** Fixture B's
+  unclamped (green) channel was proposed at `Cs = 0.5`, which is *exactly*
+  degeneracy 3: at a source of `0.5`, `Cb/Cs` and `Cb/(1 - Cs)` are the same
+  expression, so `Divide` and `ColorDodge` — a live GPU arm — agree bit-for-bit
+  and that channel would have discriminated nothing. It ships at `Cs = 0.75`
+  (`top_rgba = [0.125, 0.75, 0.0625, 1.0]`), giving the interior ratio `1/3` and
+  a real separation from `ColorDodge`. Worth recording alongside the seed pair
+  because the two are the same class of near-miss caught the same way — a
+  degeneracy enumerated *before* the fixtures were written, then checked against
+  each proposed operand rather than after the goldens were already green. The one
+  channel in the suite that does sit at `Cs = 0.5` is fixture D's green, kept
+  deliberately: that fixture's subject is the `cs == 0.0` guard, not rival
+  discrimination, which its red and blue carry instead. 0.119.1 qualified the
+  three summary sites that had overstated this as "no unclamped channel sits at
+  `Cs == 0.5`" full stop, which fixture D's own doc comment already contradicted.
 
   **Mutation matrix: fourteen mutations, every one really run** on
   `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1` and

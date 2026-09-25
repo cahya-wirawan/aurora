@@ -4421,9 +4421,21 @@ impl TileCompositor {
     /// out of it. `fs_composite_overlay`'s and `fs_composite_pin_light`'s
     /// `select()`s are legitimate because neither of their arms divides.
     ///
-    /// **This is the first ported mode whose guard is load-bearing on *this*
-    /// adapter**, and not merely a portability guard for an unverified backend.
-    /// Deleting it leaves `min(1.0, cb / 0.0)`, which splits three ways on the
+    /// **This is the first *division-domain* guard in the series that is
+    /// load-bearing on *this* adapter**, and not merely a portability guard for
+    /// an unverified backend. The class matters, because two earlier guards were
+    /// already load-bearing here. `ColorBurn` and `ColorDodge` each carry two
+    /// guards: their **division-domain** ones (`Cs == 0`, `Cs == 1`, standing
+    /// directly in front of the division) were each measured *surviving* every
+    /// test in both crates and are kept purely for portability, while their
+    /// **precedence** ones (`Cb == 1`, `Cb == 0`) were each measured *killed
+    /// deterministically* in their own rounds (0.107.0, 0.108.0) — load-bearing
+    /// here all along, but for a reason that never reaches the division:
+    /// deleting one lets the mode's other guard fire in its place and return the
+    /// wrong constant, pure control flow with no quotient computed. `Divide`'s
+    /// single guard has no precedence question to answer and is a
+    /// division-domain guard, so it is the first of *that* class this adapter can
+    /// see. Deleting it leaves `min(1.0, cb / 0.0)`, which splits three ways on the
     /// sign of `cb`: `cb > 0` gives `+inf` and `min(1.0, +inf) == 1.0`, the
     /// guard's own value; `cb == 0` gives a `NaN` and `min(1.0, NaN) == 1.0` on
     /// this adapter (0.109.1), the guard's own value again; but **`cb < 0` gives
@@ -4464,7 +4476,10 @@ impl TileCompositor {
     /// simultaneously indistinguishable from `ColorDodge`, `LinearDodge` **and**
     /// `HardMix`, all live arms, so **every railed fixture channel below has
     /// `Cb + Cs < 1`**; `Divide == ColorDodge` exactly at `Cs == 0.5`, so no
-    /// unclamped channel sits there; `Divide(Cb, 1) = Cb` is a no-op;
+    /// unclamped channel *whose job is rival discrimination* sits there — the
+    /// negative-backdrop guard fixture's green channel does, unclamped, and says
+    /// so in its own comment, because that fixture exists to exercise the guard
+    /// and leaves rival separation to its red and blue; `Divide(Cb, 1) = Cb` is a no-op;
     /// `Divide(0, Cs) = 0` and `Divide(Cb, 0) = 1`; and this is the first mode
     /// whose *correct* output need not be dyadic, so every `assert_eq!` below is
     /// on an `f16`-exact channel and nothing else.
@@ -6289,6 +6304,20 @@ mod tests {
     /// a short slice, which the `let ... else` below turns into an
     /// `unreachable!` with a message naming the coordinate rather than an
     /// index-slicing panic.
+    ///
+    /// **Precondition: `texture` is exactly `TILE` × `TILE` `Rgba16Float`, and
+    /// that is asserted rather than assumed** (0.119.1). The copy extent, the
+    /// readback buffer's size, `bytes_per_row`, and the row-major offset multiply
+    /// below are all written in terms of `TILE`, so a differently sized texture
+    /// would either fail `copy_texture_to_buffer` validation deep inside `wgpu`
+    /// or — for a *larger* one — silently read only its top-left `TILE` × `TILE`
+    /// corner while `(x, y)` past `TILE` hit the coordinate `unreachable!` as if
+    /// they were out of bounds of the texture itself. Every call site satisfies it
+    /// today (every texture in this module comes from [`solid_tile`],
+    /// [`tile_from_texels`] or a `TILE`-sized render target), which is exactly
+    /// when a cheap assertion is worth adding: it pins the assumption while it is
+    /// still true, instead of after a caller has spent an afternoon on a `wgpu`
+    /// validation message.
     fn read_texel_at(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -6296,6 +6325,13 @@ mod tests {
         x: u32,
         y: u32,
     ) -> (f32, f32, f32, f32) {
+        assert_eq!(
+            (texture.width(), texture.height()),
+            (TILE, TILE),
+            "read_texel_at reads a TILE x TILE Rgba16Float image: its copy extent, buffer size, \
+             bytes_per_row and offset multiply are all written in terms of TILE, so any other \
+             size either fails wgpu validation or reads the wrong corner"
+        );
         let bytes_per_row = TILE * 8; // Rgba16Float, already a multiple of wgpu's 256-byte alignment.
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite-readback"),
@@ -25506,11 +25542,19 @@ mod tests {
     // **Three things make this suite structurally different from every
     // sibling's, and each earns a test of its own.**
     //
-    //   1. **The guard is load-bearing on this adapter**, the first in the
-    //      series that is. `ColorBurn`'s and `ColorDodge`'s inner guards were
-    //      each measured redundant here (0.107.0, 0.108.0) because this backend
-    //      divides by zero to `+inf` and their surrounding arithmetic maps that
-    //      back onto the guard's own value. Deleting *this* guard splits three
+    //   1. **The guard is load-bearing on this adapter** — the first
+    //      *division-domain* guard in the series that is, which is the honest
+    //      form of the claim. `ColorBurn`'s and `ColorDodge`'s division-domain
+    //      guards (`Cs == 0`, `Cs == 1`) were each measured redundant here
+    //      (0.107.0, 0.108.0) because this backend divides by zero to `+inf` and
+    //      their surrounding arithmetic maps that back onto the guard's own
+    //      value; but those modes' *precedence* guards (`Cb == 1`, `Cb == 0`)
+    //      were each measured killed deterministically in the same rounds, so
+    //      they have been load-bearing here since — by branch ordering rather
+    //      than by any quotient, since deleting one simply lets the other guard
+    //      fire and return the wrong constant. `Divide` has one guard, it is a
+    //      division-domain one, and no precedence question arises.
+    //      Deleting *this* guard splits three
     //      ways on the sign of `cb`: `cb > 0` gives `min(1, +inf) = 1`, the
     //      guard's value; `cb == 0` gives `min(1, NaN) = 1` on this adapter, the
     //      guard's value again; **`cb < 0` gives `min(1, -inf) = -inf`, which is
@@ -25527,9 +25571,12 @@ mod tests {
     //      `composite_subtract_*`'s own transparent-backdrop test named.
     //   3. **The correct output need not be dyadic.** `Cb / Cs` is rational, so
     //      `Cb = 0.5, Cs = 0.75` is `2/3`. Every `assert_eq!` below is on a
-    //      channel that is exact in `f16`; the one non-dyadic reference value in
-    //      the suite (fixture B's green, `1/3`) is compared against the real CPU
-    //      path rather than a literal.
+    //      channel that is exact in `f16`; the suite's three non-dyadic
+    //      reference values — the transparent-backdrop fixture's green `1/3` and
+    //      the translucent-accumulator fixture's `6/7` and `5/6` — are each
+    //      compared against the real CPU path rather than a literal. (The
+    //      spatial fixture's `(1, 1)` is not a fourth: its `1/3` folds to an
+    //      exactly dyadic `0.3125`, which is why that one *is* a literal.)
     //
     // **Degeneracies, referred to by number from the tests below:**
     //
@@ -25542,7 +25589,13 @@ mod tests {
     //      all three live GPU arms returning `1.0` there. **Every railed channel
     //      in this suite has `Cb + Cs < 1`.**
     //   3. `Divide == ColorDodge` exactly when `Cs == 0.5`. **No *unclamped*
-    //      channel here has `Cs == 0.5`.**
+    //      channel whose job is telling this mode from a rival has
+    //      `Cs == 0.5`.** One unclamped channel in the suite does:
+    //      `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_
+    //      a_negative_backdrop`'s green, whose `-0.75` never rails. That fixture's
+    //      subject is the `cs == 0.0` guard, and it separates `ColorDodge` in red
+    //      and blue instead — its own doc comment states the exception, and this
+    //      line is qualified so the two cannot drift apart.
     //   4. `Divide(Cb, 1) = Cb` is a total no-op, shared with `Darken` and
     //      `ColorBurn`; no channel here has `Cs == 1`.
     //   5. `Divide(0, Cs) = 0` for `Cs > 0`; `Divide(Cb, 0) = 1` for every `Cb`
@@ -25853,9 +25906,14 @@ mod tests {
     ///   red and green take the interior ratio `1/3`, blue takes the `0 / 0`
     ///   branch of the guard. Golden `(0.3125, 0.3125, 0.75, 1.0)`. The `1/3` is
     ///   not dyadic; `0.25*0.25 + 0.75*(1/3)` is exactly `0.3125` in real
-    ///   arithmetic and the `f32` computation lands `7.5e-9` above it, some
-    ///   `1/16000` of an `f16` ULP at that magnitude, so the `f16` result is
-    ///   `0.3125` with enormous margin.
+    ///   arithmetic, and the `f32` path lands on `0.3125` too, with margin to
+    ///   spare at both steps. `f32(1/3)` sits `2^-27` (`7.45e-9`) above `1/3`
+    ///   once scaled by `0.75`, which is a quarter of an `f32` ULP at `0.25`, so
+    ///   the multiply rounds back *down* to exactly `0.25` and the sum is
+    ///   exactly `0.3125` before `f16` is ever reached. Even taking that
+    ///   `7.45e-9` as if it had survived, it is `2^-15` — one part in `32768` —
+    ///   of the `2^-12` `f16` ULP at this magnitude, so the `f16` result is
+    ///   `0.3125` with enormous margin either way.
     /// - **`(3, 2)`** — `Cb = (0.75, 0.5, 0)` against `Cs = (0.25, 0, 0)`: red is
     ///   **railed** (ratio `3`, the channel a dropped `min` changes to
     ///   `2.4375`), green takes the `cb > 0, cs == 0` branch of the guard (the
@@ -25957,8 +26015,15 @@ mod tests {
             (0.3125, 0.3125, 0.75, 1.0),
             "at (1, 1) Cb = (0.25, 0.25, 0) and Cs = (0.75, 0.75, 0): red and green take the \
              interior ratio 1/3 and blue the guard's 0/0 arm, folded at the top layer's own 0.75 \
-             alpha. ColorDodge would give (0.25, 0.25, 0) in red/green (Cb/(1-Cs) = 1 rails), and \
-             a reciprocal-transposed Cs/Cb would give 1.0 there."
+             alpha. The two rivals below are quoted first as B (the blend term alone) and then as \
+             the folded output this assertion actually compares, because the two live on different \
+             scales and conflating them has misstated this message before. ColorDodge rails in red \
+             and green (B = 1, since Cb/(1-Cs) = 0.25/0.25 = 1) and takes its own cb == 0 guard in \
+             blue (B = 0), folding to (0.8125, 0.8125, 0) -- separated from the shipped \
+             (0.3125, 0.3125, 0.75) in all three channels. A reciprocal-transposed Cs/Cb rails in \
+             red and green as well (B = min(1, 3) = 1), folding to 0.8125 there, so this cell \
+             separates it from the shipped value but NOT from ColorDodge; blue cannot see the \
+             transpose at all, the cs == 0 guard firing whichever way round the operands go."
         );
         // Cell (3, 2): the railed channel a dropped `min` changes, plus both
         // non-negative arms of the guard.
@@ -26236,9 +26301,13 @@ mod tests {
     /// Red's and blue's `Cb + Cs` are `0.875` and `0.5625`, both below `1.0`
     /// (degeneracy 2, or they would agree with `ColorDodge`, `LinearDodge` and
     /// `HardMix`). Green is the unclamped channel, its source `0.75` rather than
-    /// `0.5` (degeneracy 3) — and its `1/3` is the suite's one non-dyadic
-    /// reference value, so it is compared against the real CPU path rather than
-    /// a literal (degeneracy 6).
+    /// `0.5` (degeneracy 3) — and its `1/3` is non-dyadic, so it is compared
+    /// against the real CPU path rather than a literal (degeneracy 6). It is not
+    /// the *only* non-dyadic reference in the suite: the translucent-accumulator
+    /// fixture's `B = (6/7, 5/6, 1)` carries two more, and is differential for
+    /// the same reason. What holds across all three is the property that
+    /// matters — no `assert_eq!` anywhere in the suite is aimed at a non-`f16`-
+    /// exact value.
     // `too_many_lines`: 122 against a 100 limit. This fixture carries three
     // whole-tile setup assertions (the transparent half's exact zero alpha, the
     // opaque half's exact backdrop, and the accumulator's whole-tile identity)
@@ -26414,12 +26483,23 @@ mod tests {
     ///
     /// So only a *negative* backdrop channel separates the two, and every other
     /// `composite_divide_*` fixture was measured surviving the deletion. That
-    /// makes this the **first guard in the whole porting series that is
-    /// observably load-bearing on this hardware**: `ColorBurn`'s `Cs == 0` guard
-    /// (0.107.0) and `ColorDodge`'s `Cs == 1` guard (0.108.0) were each measured
-    /// *redundant* here, surviving every test in both crates, and were kept
-    /// purely as portability guards for backends where WGSL's
-    /// indeterminate-value licence might bite.
+    /// makes this the **first *division-domain* guard in the porting series that
+    /// is observably load-bearing on this hardware** — the qualifier is not
+    /// hedging, it is what keeps the claim true. The other two modes with a
+    /// guarded division put a guard on each side of it, and the two sides came
+    /// out opposite. Their division-domain guards, the ones standing directly in
+    /// front of the quotient — `ColorBurn`'s `Cs == 0` (0.107.0) and
+    /// `ColorDodge`'s `Cs == 1` (0.108.0) — were each measured *redundant* here,
+    /// surviving every test in both crates, and were kept purely as portability
+    /// guards for backends where WGSL's indeterminate-value licence might bite.
+    /// Their precedence guards — `ColorBurn`'s `Cb == 1` and `ColorDodge`'s
+    /// `Cb == 0` — were each measured *killed deterministically* in those same
+    /// rounds, so this hardware has seen a load-bearing guard before; it has just
+    /// never seen a load-bearing *division* guard. That earlier pair is
+    /// load-bearing through branch ordering alone: delete one and the mode's
+    /// other guard fires in its place and returns the wrong constant, without any
+    /// division being performed. `Divide` carries a single guard, on the division,
+    /// with no ordering question behind it.
     ///
     /// **How a negative `Cb` is reached from wholly in-gamut colours.** The same
     /// mechanism `composite_soft_light_over_with_opacity_takes_the_polynomial_arm_for_a_negative_backdrop`

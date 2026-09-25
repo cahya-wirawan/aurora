@@ -2471,14 +2471,28 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
 // their arms divides; this one's does, so it gets a per-channel helper and a
 // real early return.
 //
-// **Unlike every guard ported before it, this one is load-bearing on *this*
-// adapter and not merely a portability guard -- and the reason splits three
-// ways on the sign of `cb`.** `ColorBurn`'s `Cs == 0` guard and
-// `ColorDodge`'s `Cs == 1` guard were each measured (0.107.0, 0.108.0)
+// **This is the first *division-domain* guard in the series that is
+// load-bearing on *this* adapter rather than only for portability -- and the
+// reason splits three ways on the sign of `cb`.** State the class, not "the
+// first guard ever", because two earlier guards were already load-bearing
+// here and this claim is not about them. `ColorBurn` (0.107.0) and
+// `ColorDodge` (0.108.0) each carry *two* guards, and the two kinds behave
+// oppositely. Their **division-domain** guards -- the ones standing directly
+// in front of the division, `Cs == 0` and `Cs == 1` -- were each measured
 // surviving every test in both crates, because this backend divides by zero
 // to `+inf` and their surrounding arithmetic maps `+inf` back onto exactly
-// the value the guard returns. Deleting *this* guard leaves
-// `min(1.0, cb / 0.0)`, and that has three genuinely different outcomes:
+// the value the guard returns; both are kept purely as portability guards.
+// Their **precedence** guards (`color_burn_channel`'s `cb == 1.0`,
+// `color_dodge_channel`'s `cb == 0.0`) were each measured *killed
+// deterministically*, so those two have been load-bearing on this adapter
+// since their own rounds -- but for a reason that never reaches the
+// division at all: deleting one lets the mode's *other* guard fire in its
+// place and return the wrong constant, ordinary control flow with no
+// quotient computed. `Divide` has a single guard and therefore no
+// precedence question to answer; that guard is a division-domain guard, and
+// it is the first of *those* whose deletion this adapter can see. Deleting
+// it leaves `min(1.0, cb / 0.0)`, and that has three genuinely different
+// outcomes:
 //
 //   - `cb > 0`: `cb / 0.0` is `+inf` on this adapter and `min(1.0, +inf)` is
 //     `1.0` -- **the value the guard returns**, so the mutant agrees;
@@ -2505,8 +2519,11 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
 // on an unverified backend (Metal, DX12) those two arms could differ in a
 // *value*, not just in rounding, and the guard becomes load-bearing there
 // too. And the guard is *not* redundant in the `cb < 0` arm even in theory,
-// which makes this the first ported mode whose guard no test on any backend
-// could be expected to find dispensable.
+// which makes it the first *division-domain* guard in the series that no
+// test on any backend could be expected to find dispensable. (The two
+// precedence guards above are not redundant in theory either -- but they
+// are redundant-or-not by branch ordering, not by what a division returns,
+// so they belong to the other class.)
 //
 // **The transpose result: no blind alpha in `[0, 1]` for any pair of
 // non-negative operands, with two stated out-of-gamut exceptions.** Write
@@ -2578,8 +2595,12 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
 //      -- all three live GPU arms, all three returning `1.0` there. **Every
 //      railed fixture channel below therefore has `Cb + Cs < 1`.**
 //   3. `Divide == ColorDodge` exactly when `Cs == 0.5` (`Cb/Cs` against
-//      `Cb/(1 - Cs)`), so **no *unclamped* fixture channel sits at
-//      `Cs == 0.5`**.
+//      `Cb/(1 - Cs)`), so **no *unclamped* fixture channel whose job is
+//      telling this mode from a rival sits at `Cs == 0.5`**. One unclamped
+//      channel does sit there: the negative-backdrop guard fixture's green,
+//      whose `-0.75` never rails. That fixture's subject is this helper's
+//      `cs == 0.0` guard, and it separates `ColorDodge` in red and blue
+//      instead; its own doc comment in `composite.rs` states the exception.
 //   4. `Divide(Cb, 1) = Cb` -- a `Cs == 1` channel is a total no-op, where
 //      this mode also meets `Darken` and `ColorBurn`.
 //   5. `Divide(0, Cs) = 0` for `Cs > 0`, and `Divide(Cb, 0) = 1` for every
@@ -2606,7 +2627,10 @@ fn divide_channel(cb: f32, cs: f32) -> f32 {
 // back as this workspace's standing CPU-fallback fixture. See
 // `divide_channel` directly above for the whole analysis: why this is a real
 // branch rather than a `select()`, the three-way guard-deletion split that
-// makes this the first load-bearing guard in the series on this adapter, the
+// makes this the first *division-domain* guard in the series to be
+// load-bearing on this adapter (`ColorBurn`'s and `ColorDodge`'s own
+// division-domain guards both survived; their *precedence* guards were
+// killed, which is a different class), the
 // blind-alpha result and its two out-of-gamut exceptions, the six
 // degeneracies, and the measured non-detection of `straight_backdrop`'s own
 // guard.

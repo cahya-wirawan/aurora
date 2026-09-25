@@ -7538,8 +7538,10 @@ fn composite_roots_into_tile(
 ///   on the very lane the guard exists to exclude.
 ///
 ///   **Three findings from its round, each stated rather than assumed.** First,
-///   **this is the first ported mode whose guard is load-bearing on *this*
-///   adapter**. Deleting it leaves `min(1, Cb/0)`, which splits three ways on
+///   **this is the first *division-domain* guard in the series that is
+///   load-bearing on *this* adapter** — the qualifier is what makes the claim
+///   true, so do not drop it back to "the first guard". Deleting it leaves
+///   `min(1, Cb/0)`, which splits three ways on
 ///   the sign of `Cb`: `Cb > 0` gives `min(1, +inf) = 1`, the guard's own
 ///   value; `Cb == 0` gives `min(1, NaN) = 1` here, the guard's value again;
 ///   and `Cb < 0` gives `min(1, -inf) = -inf`, which is simply wrong. Only a
@@ -7547,10 +7549,20 @@ fn composite_roots_into_tile(
 ///   workspace kills that mutation —
 ///   `aurora_render`'s own `composite_divide_over_with_opacity_applies_its_
 ///   zero_source_guard_to_a_negative_backdrop`, which reaches a negative
-///   accumulator through the `f16`-source-alpha-above-one route. Every prior
-///   mode's guards were measured *redundant* on this hardware and kept only for
-///   backends where WGSL's indeterminate-value licence might bite; this one is
-///   not. Second, **no blind alpha in `[0, 1]` for any non-negative operand
+///   accumulator through the `f16`-source-alpha-above-one route. The two earlier
+///   guarded-division modes each put a guard on *both* sides of the division,
+///   and the two sides came out opposite. Their division-domain guards
+///   (`ColorBurn`'s `Cs == 0`, `ColorDodge`'s `Cs == 1`) were measured
+///   *redundant* on this hardware and kept only for backends where WGSL's
+///   indeterminate-value licence might bite — this one is not. Their
+///   *precedence* guards (`ColorBurn`'s `Cb == 1`, `ColorDodge`'s `Cb == 0`)
+///   were each measured *killed deterministically* in 0.107.0 and 0.108.0, so
+///   "every prior mode's guards were redundant here" would be false: those two
+///   were load-bearing all along, through branch ordering rather than through
+///   any quotient — delete one and the mode's other guard fires in its place
+///   and returns the wrong constant, with no division performed. `Divide` has a
+///   single guard and no ordering question behind it. Second, **no blind alpha
+///   in `[0, 1]` for any non-negative operand
 ///   pair**, and that is a closed form rather than a sweep: off the diagonal
 ///   exactly one of the two orders rails to `1.0`, so
 ///   `a* = D0/(D0 - D1)` collapses to `a* = M/(M - 1)` with `M = max(Cb, Cs)`,
@@ -37132,8 +37144,12 @@ mod tests {
     /// `cb < 0`, which is what
     /// `aurora_render`'s own
     /// `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_a_negative_backdrop`
-    /// measures — the first guard in this whole porting series that no backend
-    /// could find dispensable.
+    /// measures — the first *division-domain* guard in this porting series that no
+    /// backend could find dispensable. `ColorBurn`'s and `ColorDodge`'s own
+    /// division-domain guards were both found dispensable here; their *precedence*
+    /// guards (`Cb == 1`, `Cb == 0`) were not, but those turn on branch ordering
+    /// rather than on what a division returns, which is why the qualifier belongs
+    /// in this sentence.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_document() {
         let Some(context) = real_gpu_context() else {
