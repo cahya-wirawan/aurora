@@ -2422,7 +2422,7 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
 // So `b` is finite before `fold_over` ever sees it, and
 // `composite_subtract_over_with_opacity_is_the_source_alone_where_the_backdrop_
 // is_transparent` stays green with the guard deleted. Measured in 0.118.0, not
-// assumed. The detector count stays at **six of seventeen** (`Multiply`,
+// assumed. The detector count stays at **six of eighteen** (`Multiply`,
 // `Screen`, `Difference`, `Overlay`, `HardLight`, `SoftLight`). As with every
 // other laundering mode, that argument rests on this vendor's `FMin`/`FMax`
 // behaviour, which WGSL leaves undefined on a `NaN` operand -- so it is this
@@ -2452,5 +2452,200 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
     let b = max(cb - s.rgb, vec3<f32>(0.0)); // blend_rgb(Subtract, cb, cs)
+    return fold_over(s, bd, b);
+}
+
+// One channel of `blend_channel`'s own `BlendMode::Divide` arm
+// (src/composite.rs), derived textually from that Rust arm:
+//
+//     BlendMode::Divide => {
+//         if cs == 0.0 { 1.0 } else { (cb / cs).min(1.0) }
+//     }
+//
+// **A real branch, not `select()` -- the same decision `color_burn_channel`
+// and `color_dodge_channel` made and for the identical reason.** `select()`
+// evaluates *both* arms and picks one afterwards, so a `select(1.0,
+// min(1.0, cb / cs), cs != 0.0)` would still perform `cb / cs` on the very
+// lane the guard exists to keep out of the division. `fs_composite_overlay`
+// and `fs_composite_pin_light` use `select()` legitimately because neither of
+// their arms divides; this one's does, so it gets a per-channel helper and a
+// real early return.
+//
+// **This is the first *division-domain* guard in the series that is
+// load-bearing on *this* adapter rather than only for portability -- and the
+// reason splits three ways on the sign of `cb`.** State the class, not "the
+// first guard ever", because two earlier guards were already load-bearing
+// here and this claim is not about them. `ColorBurn` (0.107.0) and
+// `ColorDodge` (0.108.0) each carry *two* guards, and the two kinds behave
+// oppositely. Their **division-domain** guards -- the ones standing directly
+// in front of the division, `Cs == 0` and `Cs == 1` -- were each measured
+// surviving every test in both crates, because this backend divides by zero
+// to `+inf` and their surrounding arithmetic maps `+inf` back onto exactly
+// the value the guard returns; both are kept purely as portability guards.
+// Their **precedence** guards (`color_burn_channel`'s `cb == 1.0`,
+// `color_dodge_channel`'s `cb == 0.0`) were each measured *killed
+// deterministically*, so those two have been load-bearing on this adapter
+// since their own rounds -- but for a reason that never reaches the
+// division at all: deleting one lets the mode's *other* guard fire in its
+// place and return the wrong constant, ordinary control flow with no
+// quotient computed. `Divide` has a single guard and therefore no
+// precedence question to answer; that guard is a division-domain guard, and
+// it is the first of *those* whose deletion this adapter can see. Deleting
+// it leaves `min(1.0, cb / 0.0)`, and that has three genuinely different
+// outcomes:
+//
+//   - `cb > 0`: `cb / 0.0` is `+inf` on this adapter and `min(1.0, +inf)` is
+//     `1.0` -- **the value the guard returns**, so the mutant agrees;
+//   - `cb == 0`: `0.0 / 0.0` is a `NaN`, and `min(1.0, NaN)` returns the
+//     non-`NaN` operand `1.0` on this adapter (probed directly in 0.109.1)
+//     -- **again the guard's own value**, so the mutant agrees here too;
+//   - `cb < 0`: `cb / 0.0` is `-inf`, and `min(1.0, -inf)` is `-inf`, which
+//     is **not** `1.0`. The mutant is wrong, and wrong by well-defined IEEE
+//     arithmetic rather than by anything vendor-specific.
+//
+// So the guard is only observable through a *negative* backdrop channel,
+// which is reachable from wholly in-gamut colours by the mechanism
+// `fs_composite_soft_light`'s comment describes: an `f16` source alpha above
+// `1.0` makes `fold_over`'s `inv` negative, so an earlier layer can leave the
+// accumulator with negative `rgb` at alpha `1.0`, and `straight_backdrop`
+// deliberately does not clamp it. `composite_divide_over_with_opacity_
+// applies_its_zero_source_guard_to_a_negative_backdrop` is the fixture built
+// for exactly that, and it is what kills this mutation; every other
+// `composite_divide_*` fixture was measured surviving it. **Two caveats,
+// both disclosed rather than smoothed over.** The `cb > 0` and `cb == 0`
+// arms above rest on this vendor's division-by-zero and `FMin`-on-`NaN`
+// behaviour, neither of which WGSL specifies -- it calls the quotient an
+// *indeterminate value* and leaves `min` on a `NaN` operand undefined -- so
+// on an unverified backend (Metal, DX12) those two arms could differ in a
+// *value*, not just in rounding, and the guard becomes load-bearing there
+// too. And the guard is *not* redundant in the `cb < 0` arm even in theory,
+// which makes it the first *division-domain* guard in the series that no
+// test on any backend could be expected to find dispensable. (The two
+// precedence guards above are not redundant in theory either -- but they
+// are redundant-or-not by branch ordering, not by what a division returns,
+// so they belong to the other class.)
+//
+// **The transpose result: no blind alpha in `[0, 1]` for any pair of
+// non-negative operands, with two stated out-of-gamut exceptions.** Write
+// `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`; over an opaque backdrop
+// at effective alpha `a` a transposed `src`/`backdrop` dispatch arm shifts
+// the output by `out - out_transposed = (1 - a)*D0 + a*D1`, which vanishes
+// at `a* = D0 / (D0 - D1)`. The structural fact that decides it: `Cb/Cs <= 1`
+// and `Cs/Cb <= 1` can hold together only at `Cb == Cs`, so **off the
+// diagonal exactly one of the two orders rails to `1.0`**. Take `Cb > Cs >= 0`
+// (the other order is symmetric); then `B(Cb, Cs) = 1` and
+// `B(Cs, Cb) = Cs/Cb`, and
+//
+//     a* = (Cb - Cs) / ((Cb - Cs) - (1 - Cs/Cb)) = Cb / (Cb - 1)
+//
+// after multiplying numerator and denominator by `Cb` and cancelling the
+// common `(Cb - Cs)`. Writing `M = max(Cb, Cs)` that is `a* = M / (M - 1)`
+// for either order, and for `M` in `(0, 1)` the denominator is negative
+// while the numerator is positive, so **`a*` is negative and no alpha in
+// `[0, 1]` is blind**. (Equivalently: `D0` and `D1` are both positive here,
+// so their convex combination cannot reach zero.) The universal case, then
+// two genuine out-of-gamut exceptions, stated in full because "no blind
+// alpha at all" would be an overclaim of exactly the kind 0.118.1 had to
+// walk back for `Subtract`:
+//
+//   - **`Cb == Cs`** (not an exception, the universal case every mode in
+//     this file shares) makes `B = 1` both ways, so `D0 = D1 = 0` and the
+//     channel is blind at *every* alpha. That is this mode's whole
+//     transpose-blind set for non-negative operands, and it is the same
+//     universal `Cb == Cs` set every mode in this file has;
+//   - **`M > 1`**, reachable because `straight_backdrop` leaves an
+//     out-of-gamut accumulator unclamped, gives `a* = M/(M - 1) > 1` -- also
+//     outside the reachable `[0, 1]`, so harmless, but it is a finite
+//     positive root rather than the absent one the in-gamut case has;
+//   - **`Cb < 0 < Cs`**, reachable by the same negative-accumulator
+//     mechanism the guard section above describes, breaks the derivation
+//     outright: *neither* order rails, both ratios being negative, so `D0`
+//     and `D1` can carry opposite signs and a genuine interior blind alpha
+//     exists. Constructed, not swept: `Cb = -0.25, Cs = 0.5` gives
+//     `B = -0.5`, `B_T = -2`, `D0 = -0.75`, `D1 = +1.5`, so
+//     `gap(a) = -0.75 + 2.25a` and the channel is exactly blind at
+//     `a = 1/3`.
+//
+// The honest one-line summary is therefore "no blind alpha in `[0, 1]` for
+// any non-negative operand pair (`Cb == Cs` excepted, blind at every alpha);
+// a negative `Cb` creates real interior blind alphas" -- never "no blind
+// alpha at all".
+//
+// **Not a detector of `straight_backdrop`'s `ab > 0.0` guard being deleted
+// -- predicted from 0.110.0's rule, then measured.** With that guard gone
+// `cb` is `0.0/0.0`, a `NaN`; `NaN / cs` is `NaN`, and `min(1.0, NaN)`
+// returns `1.0` on this adapter, exactly as the six other `min`/`max`
+// laundering modes do. So `b` is finite before `fold_over` ever sees it and
+// `composite_divide_over_with_opacity_is_the_source_alone_where_the_backdrop_
+// is_transparent` stays green with the guard deleted. The detector count
+// stays at **six of eighteen** (`Multiply`, `Screen`, `Difference`,
+// `Overlay`, `HardLight`, `SoftLight`). As always that rests on this
+// vendor's `FMin`-on-`NaN` behaviour, which WGSL leaves undefined, so it is
+// this adapter's result and not a portability guarantee.
+//
+// **Degeneracies that constrain every fixture -- the first of them stronger
+// than any prior mode's:**
+//
+//   1. `B == 1` on the **entire closed half-plane `Cb >= Cs`**, so a railed
+//      channel carries *no* operand information whatsoever: `(0.75, 0.25)`
+//      and `(0.5, 0.0625)` are indistinguishable. Every prior mode's
+//      degenerate region either lost only *some* of the operands (a clamped
+//      `Subtract` channel still bounds `Cs - Cb`) or was a curve; this is
+//      half the unit square collapsing to one constant.
+//   2. Consequently a railed channel with `Cb + Cs >= 1` is *simultaneously*
+//      indistinguishable from `ColorDodge`, `LinearDodge` **and** `HardMix`
+//      -- all three live GPU arms, all three returning `1.0` there. **Every
+//      railed fixture channel below therefore has `Cb + Cs < 1`.**
+//   3. `Divide == ColorDodge` exactly when `Cs == 0.5` (`Cb/Cs` against
+//      `Cb/(1 - Cs)`), so **no *unclamped* fixture channel whose job is
+//      telling this mode from a rival sits at `Cs == 0.5`**. One unclamped
+//      channel does sit there: the negative-backdrop guard fixture's green,
+//      whose `-0.75` never rails. That fixture's subject is this helper's
+//      `cs == 0.0` guard, and it separates `ColorDodge` in red and blue
+//      instead; its own doc comment in `composite.rs` states the exception.
+//   4. `Divide(Cb, 1) = Cb` -- a `Cs == 1` channel is a total no-op, where
+//      this mode also meets `Darken` and `ColorBurn`.
+//   5. `Divide(0, Cs) = 0` for `Cs > 0`, and `Divide(Cb, 0) = 1` for every
+//      `Cb` (the guard) -- the two extreme rows of the unit square.
+//   6. **This is the first ported mode whose *correct* output need not be
+//      dyadic**: `Cb / Cs` is rational, not binary, so `Cb = 0.5, Cs = 0.75`
+//      gives `2/3`. Every `assert_eq!` in this mode's fixtures is on a
+//      channel whose value is exact in `f16`; anything else appears in prose
+//      as an approximation only.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the seventeen entry points
+// above; no new binding, no new layout.
+fn divide_channel(cb: f32, cs: f32) -> f32 {
+    if (cs == 0.0) {
+        return 1.0;
+    }
+    return min(1.0, cb / cs);
+}
+
+// `blend_channel`'s own `BlendMode::Divide` arm, per channel -- the
+// **eighteenth** blend mode ported to WGSL (0.119.0) and the last separable
+// one to reach the GPU apart from `Exclusion`, which is deliberately held
+// back as this workspace's standing CPU-fallback fixture. See
+// `divide_channel` directly above for the whole analysis: why this is a real
+// branch rather than a `select()`, the three-way guard-deletion split that
+// makes this the first *division-domain* guard in the series to be
+// load-bearing on this adapter (`ColorBurn`'s and `ColorDodge`'s own
+// division-domain guards both survived; their *precedence* guards were
+// killed, which is a different class), the
+// blind-alpha result and its two out-of-gamut exceptions, the six
+// degeneracies, and the measured non-detection of `straight_backdrop`'s own
+// guard.
+@fragment
+fn fs_composite_divide(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    // blend_rgb(Divide, cb, cs), one guarded division per channel.
+    let b = vec3<f32>(
+        divide_channel(cb.r, s.r),
+        divide_channel(cb.g, s.g),
+        divide_channel(cb.b, s.b),
+    );
     return fold_over(s, bd, b);
 }
