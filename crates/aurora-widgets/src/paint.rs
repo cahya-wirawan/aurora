@@ -7,7 +7,7 @@
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
 //! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`,
-//! `DropdownList`, `TabBar`, and `Tab` — solid rounded-rect shapes, the simplest of
+//! `DropdownList`, `TabBar`, `Tab`, and `Tooltip` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -207,6 +207,7 @@ pub fn paint_widget(
         WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
         WidgetKind::TabBar(state) => paint_tab_bar(state, bounds, theme, scale_factor),
         WidgetKind::Tab(state) => paint_tab(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Tooltip => paint_tooltip(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -895,6 +896,66 @@ fn paint_dropdown_list(
     Ok(paints)
 }
 
+/// A shown tooltip: a `scales.radius.sm` rounded rect filled with
+/// `surface.overlay`, an **unconditional 1 px `border.default`** stroke
+/// over it, and the conditional [`control_outline`] drawn last — two
+/// shapes in Dark/Light/Colour-Critical, three in the two High Contrast
+/// themes, the same shape and order as [`paint_dialog`] and
+/// [`paint_dropdown_list`]. Always full opacity: a tooltip has no
+/// disabled state of its own.
+///
+/// **`surface.overlay` and `radius.sm` are the mockup's own**
+/// (`design/gallery/index.html:126-133`: `background:
+/// var(--surface-overlay)`, `border-radius: var(--radius-sm)`). **A
+/// design-owner question, raised rather than resolved**: the same rule
+/// sets `box-shadow: var(--elevation-1)`, while
+/// `design/tokens/vocabulary.md:26-27` names `surface.overlay`
+/// "Elevation 2: modals, dialogs" and `surface.raised` "Elevation 1:
+/// dropdowns, popovers" — so the mockup pairs the Elevation 2 fill with
+/// the Elevation 1 shadow. This follows the mockup's fill and does not
+/// pick a side (PRD FR-027 *Ownership*). The shadow itself is not drawn:
+/// nothing in this crate draws shadows (see [`paint_dialog`]).
+///
+/// **The border is not in the mockup, and is load-bearing anyway** —
+/// [`paint_dialog`]'s own finding. Light resolves `surface.overlay`,
+/// `surface.raised`, `surface.panel` and `surface.canvas` all to
+/// `neutral.900` with `border.control_opacity = 0.0`, so without the
+/// border a Light tooltip over a panel is byte-identical to it;
+/// `a_light_theme_tooltip_still_paints_a_border` pins that. It inherits
+/// [`paint_dialog`]'s disclosed Colour-Critical residual unchanged:
+/// `border.default` clears `cc.overlay` by only ≈1.35:1.
+fn paint_tooltip(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px `paint_dialog` strokes at: no "border
+    // width" token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [br, bg, bb] = theme.border.default.to_srgb_f32();
+    let mut paints = vec![
+        (fill_mesh, [fr, fg, fb, 1.0]),
+        (border_mesh, [br, bg, bb, 1.0]),
+    ];
+    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
 /// A plain, square-cornered filled rectangle — `rounded_rect` at radius
 /// `0.0` — or `None` when it has no area, so a degenerate (zero-width or
 /// zero-height) band paints nothing rather than tessellating an empty
@@ -1262,7 +1323,7 @@ mod tests {
         set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
         set_tree_item_selected, toggle_checkbox,
     };
-    use crate::widgets::{insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
+    use crate::widgets::{Tooltip, insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
     use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
@@ -3685,6 +3746,141 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---- Tooltip -----------------------------------------------------------
+
+    /// A laid-out button with its tooltip shown. Returns the tree and the
+    /// tooltip's own node.
+    fn laid_out_tooltip() -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(160.0_f32),
+                height: taffy::style_helpers::length(120.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = scales();
+        let button = match insert_button(&mut tree, root, &scales, "Apply") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let delay = std::time::Duration::ZERO;
+        let mut tooltip = match Tooltip::new(&tree, button, &scales, "Apply the change", delay) {
+            Ok(tooltip) => tooltip,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let t0 = std::time::Instant::now();
+        if let Err(err) = tooltip.set_hover(&mut tree, true, false, t0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tooltip.tick(&mut tree, t0) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(160.0, 120.0);
+        let Some(node) = tooltip.node() else {
+            unreachable!("shown");
+        };
+        (tree, node)
+    }
+
+    fn colors_of(tree: &WidgetTree<WidgetKind>, id: WidgetId, theme: &Theme) -> Vec<[f32; 4]> {
+        paints_of(tree, id, theme).iter().map(|(_, c)| *c).collect()
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_paints_surface_overlay_then_a_default_border() {
+        let (tree, id) = laid_out_tooltip();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Light", light_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_eq!(theme.border.control_opacity, 0.0, "{name}");
+            assert_eq!(
+                colors_of(&tree, id, &theme),
+                vec![
+                    rgba(theme.surface.overlay, 1.0),
+                    rgba(theme.border.default, 1.0)
+                ],
+                "{name}"
+            );
+        }
+        for (mesh, _) in &paints_of(&tree, id, &dark_theme()) {
+            assert!(!mesh.vertices.is_empty() && !mesh.indices.is_empty());
+        }
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.width > 0 && bounds.height > 0, "{bounds:?}");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_gains_the_control_outline_last_in_high_contrast() {
+        let (tree, id) = laid_out_tooltip();
+        let theme = high_contrast_theme();
+        assert!(theme.border.control_opacity > 0.0);
+        assert_eq!(
+            colors_of(&tree, id, &theme),
+            vec![
+                rgba(theme.surface.overlay, 1.0),
+                rgba(theme.border.default, 1.0),
+                rgba(theme.border.control, theme.border.control_opacity),
+            ],
+            "fill, border, and the control outline drawn last"
+        );
+    }
+
+    /// The load-bearing half of `paint_tooltip`'s border, pinned against
+    /// the real Light theme: there `surface.overlay` *is* `surface.panel`
+    /// and `control_outline` returns `None`.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_tooltip_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.overlay, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        let (tree, id) = laid_out_tooltip();
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        let colors = colors_of(&tree, id, &theme);
+        assert!(
+            colors.iter().any(|color| *color != backdrop),
+            "a Light tooltip must paint something that is not the panel behind it: {colors:?}"
+        );
+    }
+
+    /// `surface.overlay` (the mockup's token), not the `surface.raised` a
+    /// dropdown list uses — scoped to the two themes where the tokens
+    /// differ, each guarded so it cannot become a tautology.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_paints_surface_overlay_not_surface_raised() {
+        let (tree, id) = laid_out_tooltip();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_ne!(
+                theme.surface.overlay, theme.surface.raised,
+                "{name}: only meaningful while the two tokens differ"
+            );
+            let colors = colors_of(&tree, id, &theme);
+            assert_eq!(
+                colors.first(),
+                Some(&rgba(theme.surface.overlay, 1.0)),
+                "{name}"
+            );
+            assert_ne!(
+                colors.first(),
+                Some(&rgba(theme.surface.raised, 1.0)),
+                "{name}"
+            );
         }
     }
 

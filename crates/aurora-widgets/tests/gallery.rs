@@ -333,7 +333,7 @@ use aurora_widgets::widgets::{
     set_slider_disabled, set_text_field_disabled, set_tree_item_disabled, set_tree_item_expanded,
     set_tree_item_selected, toggle_checkbox,
 };
-use aurora_widgets::widgets::{insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
+use aurora_widgets::widgets::{Tooltip, insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -4434,6 +4434,273 @@ tab_bar_golden_test!(
     tab_bar_gallery_matches_the_golden_image_in_color_critical_theme,
     color_critical_theme(),
     "tab_bar_gallery_color_critical.png"
+);
+
+/// `Tooltip`'s own gallery: one cell, the mockup's only state
+/// ("default"), a `TOOLTIP_OWNER`-sized button at the cell's
+/// `TOOLTIP_CELL_PADDING` inset with its tooltip shown directly below it
+/// — so the button spans `y = 16..48` and `x = 16..144`, and the
+/// tooltip `y = 48..67` (one `typography.size.xs` line, 11 px, plus two
+/// `spacing.xxs`, 4 px) at the same `x` and width. `192 * 4 = 768 =
+/// 3 * 256`, row-aligned (see [`BUTTON_GALLERY_SIZE`]). All of it is
+/// checked against the real layout by
+/// `tooltip_gallery_lays_the_tooltip_out_under_its_owner`.
+const TOOLTIP_GALLERY_SIZE: (u32, u32) = (192, 96);
+const TOOLTIP_CELL_PADDING: u32 = 16;
+const TOOLTIP_OWNER: (u32, u32) = (128, 32);
+const TOOLTIP_HEIGHT: u32 = 19;
+const TOOLTIP_TOP: u32 = TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.1;
+/// The tooltip's bottom edge, exclusive.
+const TOOLTIP_BOTTOM: u32 = TOOLTIP_TOP + TOOLTIP_HEIGHT;
+const TOOLTIP_CENTRE_X: u32 = TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.0 / 2;
+
+/// The gallery backdrop for a tooltip: the theme's own `surface.panel`,
+/// the same computed backdrop [`tab_bar_clear`] uses — a tooltip hangs
+/// over panel chrome in the real app, and that is exactly where its
+/// Light-theme collision lives (`surface.overlay` *is* `surface.panel`
+/// there, `paint_tooltip`'s own doc comment), so a neutral backdrop
+/// would hide the case the unconditional border exists for.
+fn tooltip_clear(theme: &Theme) -> wgpu::Color {
+    tab_bar_clear(theme)
+}
+
+/// A real, laid-out `Tooltip` gallery: a fixed-size button in a padded
+/// cell, its tooltip shown (a zero delay and one tick at the same
+/// fabricated instant — no sleeping). Returns the tree, the owner, and
+/// the tooltip's node.
+fn tooltip_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let pad = length(TOOLTIP_CELL_PADDING as f32);
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Column,
+        align_items: Some(taffy::AlignItems::FLEX_START),
+        size: Size {
+            width: length(TOOLTIP_GALLERY_SIZE.0 as f32),
+            height: length(TOOLTIP_GALLERY_SIZE.1 as f32),
+        },
+        padding: LayoutRect {
+            left: pad,
+            right: pad,
+            top: pad,
+            bottom: pad,
+        },
+        ..Default::default()
+    });
+    let owner = match insert_button(&mut tree, root, scales, "Opacity") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = tree.set_style(owner, sized_style(TOOLTIP_OWNER)) {
+        unreachable!("{err:?}");
+    }
+    let delay = std::time::Duration::ZERO;
+    let mut tooltip = match Tooltip::new(&tree, owner, scales, "Opacity: 100%", delay) {
+        Ok(tooltip) => tooltip,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let t0 = std::time::Instant::now();
+    if let Err(err) = tooltip.set_hover(&mut tree, true, false, t0) {
+        unreachable!("{err:?}");
+    }
+    if let Err(err) = tooltip.tick(&mut tree, t0) {
+        unreachable!("{err:?}");
+    }
+    let Some(node) = tooltip.node() else {
+        unreachable!("a zero delay shows on the first tick");
+    };
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(TOOLTIP_GALLERY_SIZE.0 as f32, TOOLTIP_GALLERY_SIZE.1 as f32);
+    (tree, [owner, node])
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims.
+#[test]
+fn tooltip_gallery_lays_the_tooltip_out_under_its_owner() {
+    let (tree, [owner, node]) = tooltip_gallery_tree(&scales());
+    let (Some(owner), Some(tip)) = (tree.bounds(owner), tree.bounds(node)) else {
+        unreachable!("laid out");
+    };
+    assert_eq!(owner.x, i64::from(TOOLTIP_CELL_PADDING));
+    assert_eq!(owner.y, i64::from(TOOLTIP_CELL_PADDING));
+    assert_eq!((owner.width, owner.height), TOOLTIP_OWNER);
+    assert_eq!(tip.x, owner.x);
+    assert_eq!(tip.y, i64::from(TOOLTIP_TOP));
+    assert_eq!(tip.width, TOOLTIP_OWNER.0);
+    assert_eq!(tip.height, TOOLTIP_HEIGHT);
+    assert!(TOOLTIP_BOTTOM + 3 < TOOLTIP_GALLERY_SIZE.1);
+}
+
+/// The rendered-pixel claims every theme's `Tooltip` gallery makes.
+fn assert_tooltip_is_distinct(
+    image: &aurora_testkit::Image,
+    theme: &Theme,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, TOOLTIP_GALLERY_SIZE.0);
+    assert_eq!(image.height, TOOLTIP_GALLERY_SIZE.1);
+    let tip_centre_y = TOOLTIP_TOP + TOOLTIP_HEIGHT / 2;
+
+    // 1. Outside everything, and three pixels below the tooltip, is the
+    //    panel backdrop: the tooltip does not extend past its box.
+    let backdrop = sample_at(image, 4, 4);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+    assert_eq!(
+        sample_at(image, TOOLTIP_CENTRE_X, TOOLTIP_BOTTOM + 3),
+        backdrop,
+        "{theme_name}: below the tooltip is the untouched backdrop"
+    );
+
+    // 2. The tooltip is its own shape, not the owner stretched.
+    let owner = sample_at(
+        image,
+        TOOLTIP_CENTRE_X,
+        TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.1 / 2,
+    );
+    let fill = sample_at(image, TOOLTIP_CENTRE_X, tip_centre_y);
+    assert_ne!(
+        fill, owner,
+        "{theme_name}: the tooltip's surface.overlay must differ from the owner's accent"
+    );
+
+    // 3. Its fill differs from the panel exactly where the tokens do --
+    //    and in Light, where they collide, it is the same byte.
+    if theme.surface.overlay == theme.surface.panel {
+        assert_eq!(
+            fill, backdrop,
+            "{theme_name}: surface.overlay is surface.panel here, so the fill alone is invisible"
+        );
+    } else {
+        assert_ne!(
+            fill, backdrop,
+            "{theme_name}: the tooltip's fill must differ from the panel"
+        );
+    }
+
+    // 4. The unconditional border (plus the HC outline) is really
+    //    painted along the bottom edge -- in every theme, Light included.
+    //    Which of the two rows straddling the edge a 1 px centred stroke
+    //    lands on is the rasterizer's fill rule, so either counts.
+    let edge = [TOOLTIP_BOTTOM - 1, TOOLTIP_BOTTOM].map(|y| sample_at(image, TOOLTIP_CENTRE_X, y));
+    assert!(
+        edge.iter().any(|&pixel| pixel != backdrop),
+        "{theme_name}: the tooltip's border must differ from the panel behind it: {edge:?} vs \
+         {backdrop:?}"
+    );
+}
+
+/// `Tooltip`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`tooltip_clear`]).
+macro_rules! tooltip_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tooltip_clear(&theme);
+            let (tree, _ids) = tooltip_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TOOLTIP_GALLERY_SIZE,
+                clear,
+            );
+            assert_tooltip_is_distinct(&image, &theme, clear, $theme_name);
+        }
+    };
+}
+
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip,
+    dark_theme(),
+    "Dark"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_light_theme,
+    light_theme(),
+    "Light"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Tooltip`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows one button on the panel colour with a
+/// thin, bordered, full-width box hanging directly below it — before
+/// these attributes come off.
+macro_rules! tooltip_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tooltip_clear(&theme);
+            let (tree, _ids) = tooltip_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TOOLTIP_GALLERY_SIZE,
+                clear,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image,
+    dark_theme(),
+    "tooltip_gallery.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "tooltip_gallery_light.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "tooltip_gallery_high_contrast_dark.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "tooltip_gallery_high_contrast_light.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "tooltip_gallery_color_critical.png"
 );
 
 /// `Slider`'s own "distinct pixels" proof is shaped differently from

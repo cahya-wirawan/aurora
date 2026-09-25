@@ -11,11 +11,11 @@
 //! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
 //! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
 //! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), `Dropdown`
-//! ([`DropdownState`], `0.120.0`), and now `TabBar` ([`TabBarState`],
-//! `0.121.0`) followed — **8 of the 12 named widgets**: button,
-//! checkbox, slider, dropdown, scrollbar, colour swatch, tree, and tab
-//! bar. (Recounted, not carried forward: this
-//! sentence said "4 of the 12" through `0.75.1`, a count inherited from
+//! ([`DropdownState`], `0.120.0`), `TabBar` ([`TabBarState`],
+//! `0.121.0`), and now `Tooltip` ([`Tooltip`], `0.122.0`) followed —
+//! **9 of the 12 named widgets**: button, checkbox, slider, dropdown,
+//! scrollbar, colour swatch, tree, tab bar, and tooltip. (Recounted,
+//! not carried forward: this sentence said "4 of the 12" through `0.75.1`, a count inherited from
 //! PLAN.md's own stricter transcription of the same list — which reads
 //! "colour picker" where `design/gallery/index.html` has "Color
 //! swatch", so [`ColorSwatchState`] was going uncounted against a list
@@ -56,9 +56,17 @@
 //! automatic activation, wrapping arrow keys, `Home`/`End`, and roving
 //! focus (only the selected tab is focusable) — the bar only, no tab
 //! panels, no label glyphs, and no keyboard-focus ring (`tab_bar.rs`'s
-//! own doc comment has the full list). The rest still need infrastructure that doesn't exist yet
-//! (popover layering for menus/tooltips — which a dropdown's list also
-//! lacks, see above — number semantics for a number field, and
+//! own doc comment has the full list). `Tooltip` ([`Tooltip`]) is a
+//! caller-owned show/hide controller, not a payload: a pure,
+//! exhaustively tested hover/focus/delay/`Escape` state machine that
+//! inserts a real `Role::Tooltip` child under its owner while shown and
+//! removes it when hidden — the caller supplies every `Instant` (no clock
+//! in this crate), it never writes the owner's own node, and like the
+//! dropdown's list it paints in ordinary tree order with **no popover
+//! layering**, no viewport flip, and no text measurement
+//! (`tooltip.rs`'s own doc comment has the full list). The rest still
+//! need infrastructure that doesn't exist yet (popover layering for menus — which a dropdown's list and a tooltip
+//! also lack, see above — number semantics for a number field, and
 //! `aurora-vector` path rendering for the curve editor) and are
 //! deliberately left open rather than stubbed out half-built.
 //!
@@ -68,12 +76,12 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **fifteen**
+//! tessellates real geometry through `aurora-vector` for **sixteen**
 //! of the [`WidgetKind`] variants below (every one except `Container`,
 //! [`WidgetKind::Dialog`] included as of `0.79.0`,
 //! [`WidgetKind::Dropdown`] and [`WidgetKind::DropdownList`] as of
 //! `0.120.0`, [`WidgetKind::TabBar`] and [`WidgetKind::Tab`] as of
-//! `0.121.0`). This mirrors
+//! `0.121.0`, [`WidgetKind::Tooltip`] as of `0.122.0`). This mirrors
 //! `WidgetTree` itself: a complete, tested logical model with painting
 //! layered on afterward, not built into the model.
 //!
@@ -102,6 +110,7 @@ mod scrollbar;
 mod slider;
 mod tab_bar;
 mod text_field;
+mod tooltip;
 mod tree_view;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
@@ -132,6 +141,7 @@ pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
     set_text_field_disabled, text_field_state, with_text_field_mut,
 };
+pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{
     MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
     set_tree_item_disabled, set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
@@ -241,6 +251,16 @@ pub enum WidgetKind {
     /// `accent.primary` underline (`paint::paint_tab`); an inactive one
     /// paints nothing outside High Contrast.
     Tab(TabState),
+    /// A shown tooltip — the `Role::Tooltip` child `tooltip.rs`'s
+    /// [`Tooltip`] controller inserts under its owner while shown and
+    /// removes when hidden. No state, for the same reason
+    /// [`WidgetKind::DropdownList`] has none: its text lives only in its
+    /// accessibility label, and its paint (`surface.overlay` plus an
+    /// unconditional `border.default` outline — `paint::paint_tooltip`)
+    /// is a pure function of its bounds and the theme. See `tooltip.rs`'s
+    /// own module doc comment for the transition table and what it
+    /// deliberately does not do (no z-layering, no text measurement).
+    Tooltip,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

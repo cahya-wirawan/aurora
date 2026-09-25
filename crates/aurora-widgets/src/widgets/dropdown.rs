@@ -142,8 +142,8 @@
 //!   later sibling of the dropdown (or of any of its ancestors) paints
 //!   over the open list**. A real popover needs a top layer this crate
 //!   does not have yet — `widgets`' own module doc comment names it as
-//!   missing infrastructure for menus and tooltips, and it is missing
-//!   here too.
+//!   missing infrastructure for menus, and it is missing here (and for
+//!   `tooltip.rs`'s shown tooltip, `0.122.0`) too.
 //! - **Hit testing never reaches an option.** Both `WidgetTree::
 //!   hit_test` and `input::hit_test` refuse to descend into a widget
 //!   whose own bounds exclude the point, and the list lies entirely

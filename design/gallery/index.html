@@ -271,7 +271,16 @@
       tabs with the first selected, painted over the theme's own panel
       colour — a 1 px rule under the bar and a 2 px accent underline under
       the selected tab. It draws no tab labels, and there is no "focused"
-      cell at all, because nothing there paints a keyboard-focus ring.)
+      cell at all, because nothing there paints a keyboard-focus ring.
+      The Tooltip has since landed too, 0.122.0: its rendered gallery is
+      one cell, a button with its tooltip shown directly below it, as wide
+      as the button, over the theme's own panel colour. It paints the
+      surface-overlay fill above plus a 1 px default border this mockup
+      does not have (in Light the fill alone is identical to the panel),
+      draws no text, and draws no shadow — nothing there draws shadows
+      yet, so the elevation-1 box-shadow above is not rendered. Whether a
+      tooltip is Elevation 1 (surface-raised) or Elevation 2
+      (surface-overlay, as above) is an open design question.)
     </p>
   </section>
 </main>
