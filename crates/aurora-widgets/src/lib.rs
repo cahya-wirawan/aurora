@@ -67,6 +67,7 @@
 //! paints a gradient yet; the colour picker is the first planned
 //! consumer.
 
+pub mod action;
 mod error;
 mod input;
 mod paint;
@@ -78,6 +79,7 @@ mod test_support;
 mod tree;
 pub mod widgets;
 
+pub use action::{ALL_ACTIONS, ActionOutcome, ActionRejection, handle_action};
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};
 pub use paint::{Paint, PaintOp, paint_widget, paint_widget_ops};
@@ -85,4 +87,4 @@ pub use render::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
-pub use tree::{PaintLayer, WidgetId, WidgetTree};
+pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};

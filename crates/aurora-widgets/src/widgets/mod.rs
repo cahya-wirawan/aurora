@@ -174,7 +174,7 @@ pub use curve_editor::{
     CurveEditorKey, CurveEditorOutcome, CurveEditorPointState, CurveEditorState,
     add_curve_point_from_point, curve_editor_of, curve_editor_point_at, curve_editor_state,
     handle_curve_editor_key, insert_curve_editor, move_selected_point_from_point,
-    select_curve_point, set_curve_editor_disabled, set_curve_editor_points,
+    select_curve_point, set_curve_editor_disabled, set_curve_editor_points, set_curve_point_output,
 };
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
@@ -185,8 +185,8 @@ pub use dropdown::{
 };
 pub use list_row::ListRowState;
 pub use menu::{
-    MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, close_menu, handle_menu_key,
-    menu_state, open_menu,
+    MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,
+    handle_menu_key, menu_state, open_menu,
 };
 pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,

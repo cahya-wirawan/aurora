@@ -78,8 +78,12 @@
 //! `Action::Focus` (the `tab_bar.rs` precedent), so the selection *is*
 //! the focus. Every enabled point declares `SetValue`, `Increment` and
 //! `Decrement`; a disabled editor's points declare none and are marked
-//! disabled. **Accessibility `ActionRequest`s are not routed** — the same
-//! crate-wide gap every widget here has.
+//! disabled. **Accessibility requests are routed** (0.128.0) by
+//! `crate::action::handle_action`: `SetValue` (in levels, `0..=255`)
+//! selects the point and moves its output through
+//! [`set_curve_point_output`]; `Increment`/`Decrement` select it and
+//! apply `Up`/`Down`. Adding or removing a point has no accessibility
+//! action at all — keys only.
 //!
 //! # Keys
 //!
@@ -890,6 +894,43 @@ pub fn move_selected_point_from_point(
     })
 }
 
+/// Selects point `index` and sets its output to `output` (curve space,
+/// `[0, 1]`; clamped there), keeping its input — what an assistive
+/// technology's `Action::SetValue` on one point slider does
+/// (`crate::action::handle_action`), the vertical half of a pointer drag.
+/// Validated by the same [`ToneCurve::move_point_to`] a drag uses, so an
+/// endpoint keeps its input and an interior point keeps its separation.
+/// `Changed` if the point moved **or** the selection did.
+///
+/// # Errors
+///
+/// As [`select_curve_point`], plus [`WidgetError::InvalidRange`] for a
+/// non-finite `output`. Nothing changes when any of these happens.
+pub fn set_curve_point_output(
+    tree: &mut WidgetTree<WidgetKind>,
+    editor: WidgetId,
+    index: usize,
+    output: f32,
+) -> Result<CurveEditorOutcome, WidgetError> {
+    if !output.is_finite() {
+        return Err(WidgetError::InvalidRange { min: 0.0, max: 1.0 });
+    }
+    with_curve_editor_mut(tree, editor, |state| {
+        if state.disabled {
+            return Err(WidgetError::WidgetDisabled(editor));
+        }
+        let len = state.curve.points().len();
+        let Some(point) = state.curve.points().get(index).copied() else {
+            return Err(WidgetError::IndexOutOfRange { index, len });
+        };
+        let mut next = state.curve.clone();
+        match next.move_point_to(index, point.x, output.clamp(0.0, 1.0)) {
+            Ok(_) => Ok(state.set_curve(next, index)),
+            Err(err) => Err(WidgetError::InvalidCurve(err)),
+        }
+    })
+}
+
 /// Replaces the curve with one through `points` — an owner-driven change
 /// (an undo, a preset, a document load), so it works on a disabled editor
 /// too. The selection is kept, clamped to the new last point. Points
@@ -1095,6 +1136,7 @@ mod tests {
         add_curve_point_from_point, curve_editor_of, curve_editor_point_at, curve_editor_state,
         handle_curve_editor_key, insert_curve_editor, keyed, move_selected_point_from_point,
         select_curve_point, set_curve_editor_disabled, set_curve_editor_points,
+        set_curve_point_output,
     };
     use crate::shortcut::NamedKey;
     use crate::tree::{WidgetId, WidgetTree};
@@ -1368,6 +1410,44 @@ mod tests {
 
     fn inserted() -> (WidgetTree<WidgetKind>, WidgetId) {
         inserted_with(three())
+    }
+
+    #[test]
+    fn set_curve_point_output_moves_only_the_output_and_selects_the_point() {
+        let (mut tree, editor) = inserted();
+        assert_eq!(
+            ok(set_curve_point_output(&mut tree, editor, 2, 0.25)),
+            CurveEditorOutcome::Changed
+        );
+        let state = snapshot(&tree, editor);
+        assert_eq!(state.selected(), 2);
+        assert_eq!(state.curve().points().get(2).copied(), Some(p(1.0, 0.25)));
+        assert_eq!(
+            ok(set_curve_point_output(&mut tree, editor, 2, 7.0)),
+            CurveEditorOutcome::Changed,
+            "clamped to 1"
+        );
+        assert_eq!(
+            snapshot(&tree, editor).curve().points().get(2).copied(),
+            Some(p(1.0, 1.0))
+        );
+        assert_eq!(
+            ok(set_curve_point_output(&mut tree, editor, 2, 1.0)),
+            CurveEditorOutcome::Ignored
+        );
+        assert!(matches!(
+            set_curve_point_output(&mut tree, editor, 3, 0.5),
+            Err(WidgetError::IndexOutOfRange { index: 3, len: 3 })
+        ));
+        assert!(matches!(
+            set_curve_point_output(&mut tree, editor, 1, f32::NAN),
+            Err(WidgetError::InvalidRange { .. })
+        ));
+        ok(set_curve_editor_disabled(&mut tree, editor, true));
+        assert!(matches!(
+            set_curve_point_output(&mut tree, editor, 1, 0.5),
+            Err(WidgetError::WidgetDisabled(_))
+        ));
     }
 
     fn snapshot(tree: &WidgetTree<WidgetKind>, editor: WidgetId) -> CurveEditorState {

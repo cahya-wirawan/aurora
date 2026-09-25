@@ -155,9 +155,11 @@
 //!   only driver.
 //! - **No submenus**, no check/radio items, no glyphs (labels, shortcut
 //!   hints, arrows), no viewport flip near a window edge (only the
-//!   window clamp above), and
-//!   no routing of `accesskit::ActionRequest`s (a screen reader's
-//!   `Click` on an item reaches no code here yet).
+//!   window clamp above). An assistive technology's `Click` on an
+//!   enabled item **is** routed (0.128.0): `crate::action::handle_action`
+//!   calls [`activate_menu_item`], which activates that item exactly as
+//!   `Enter` would — restoring focus to whatever opened the menu stays
+//!   the caller's job, as it is after `Enter`.
 //!
 //! **Design-owner questions** (PRD FR-027 *Ownership*): there is no
 //! menu mockup in `design/gallery/index.html`, so every token here is
@@ -669,6 +671,50 @@ pub fn handle_menu_key(
     Ok(outcome)
 }
 
+/// Activates the action item whose own tree id is `item` — what an
+/// assistive technology's `Action::Click` on one menu item does
+/// (`crate::action::handle_action`). The same result `Enter` on that
+/// item would give: [`MenuOutcome::Activated`] with `item`'s index into
+/// the caller's own `items` (**separators included**, exactly the index
+/// [`handle_menu_key`] reports), and the menu's whole subtree removed.
+///
+/// **Reconciles first**, the same as [`handle_menu_key`], and for the
+/// same reason returns [`MenuOutcome::Ignored`] (menu left open) if that
+/// repair changed anything: the item the request named was built from a
+/// structure that was not the one announced. A disabled action item or
+/// a separator is `Ignored` too — neither declares `Action::Click`, so
+/// the dispatcher's own gate refuses those before this is reached; the
+/// check here is for a caller calling this directly. The highlight is
+/// not consulted or moved: the request names its item outright.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`]/[`WidgetError::WrongWidgetKind`]
+/// for an id that isn't a live menu, or [`WidgetError::UnknownWidget`]
+/// for an `item` that is not one of its own items; nothing changes.
+pub fn activate_menu_item(
+    tree: &mut WidgetTree<WidgetKind>,
+    menu: WidgetId,
+    item: WidgetId,
+) -> Result<MenuOutcome, WidgetError> {
+    let previous = state(tree, menu)?.highlighted;
+    // Refuse a foreign `item` before the repair below can change the
+    // tree, so a refused request really changes nothing.
+    if !is_own_item(tree, menu, item) {
+        return Err(WidgetError::UnknownWidget(item));
+    }
+    let repaired = sync(tree, menu, previous)?;
+    let current = state(tree, menu)?;
+    let Some(index) = current.item_ids.iter().position(|&id| id == item) else {
+        return Err(WidgetError::UnknownWidget(item));
+    };
+    if repaired || !current.is_enabled(index) {
+        return Ok(MenuOutcome::Ignored);
+    }
+    tree.remove(menu)?;
+    Ok(MenuOutcome::Activated(index))
+}
+
 /// Closes `menu` without activating anything — removes its whole
 /// subtree, exactly as `Escape` does.
 ///
@@ -858,8 +904,8 @@ fn insert_children(
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, close_menu, handle_menu_key,
-        menu_state, open_menu,
+        MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,
+        handle_menu_key, menu_state, open_menu,
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
@@ -1052,6 +1098,43 @@ mod tests {
             items,
         ));
         (tree, menu)
+    }
+
+    #[test]
+    fn activating_an_item_by_id_reports_its_index_counting_separators_and_closes() {
+        let (mut tree, menu) = opened(items());
+        let ids = ok(menu_state(&tree, menu)).item_ids().to_vec();
+        let (Some(&delete), Some(&paste), Some(&separator)) = (ids.get(4), ids.get(3), ids.get(2))
+        else {
+            unreachable!("five items");
+        };
+        // Neither a disabled action nor a separator activates.
+        assert_eq!(
+            ok(activate_menu_item(&mut tree, menu, paste)),
+            MenuOutcome::Ignored
+        );
+        assert_eq!(
+            ok(activate_menu_item(&mut tree, menu, separator)),
+            MenuOutcome::Ignored
+        );
+        assert!(tree.contains(menu));
+        // Not the highlight (item 0): the item the request named.
+        assert_eq!(
+            ok(activate_menu_item(&mut tree, menu, delete)),
+            MenuOutcome::Activated(4)
+        );
+        assert!(!tree.contains(menu));
+    }
+
+    #[test]
+    fn activating_something_that_is_not_one_of_its_items_is_an_error() {
+        let (mut tree, menu) = opened(items());
+        let root = tree.root();
+        assert!(matches!(
+            activate_menu_item(&mut tree, menu, root),
+            Err(WidgetError::UnknownWidget(id)) if id == root
+        ));
+        assert!(tree.contains(menu));
     }
 
     fn press(tree: &mut WidgetTree<WidgetKind>, menu: WidgetId, key: MenuKey) -> MenuOutcome {

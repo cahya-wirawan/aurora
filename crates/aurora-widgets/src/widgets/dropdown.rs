@@ -46,10 +46,10 @@
 //! `PageDown`, `Alt+Down`, and type-ahead — the APG lists all of them.
 //! Nothing here handles a pointer click on an option either (see "Hit
 //! testing" below); [`toggle_dropdown`] is the whole pointer story, for
-//! a click on the control itself. And nothing in the workspace routes an
-//! assistive technology's `Expand`/`Collapse`/`Click` action request to
-//! these functions yet (see "No accessibility action is routed here"
-//! below), so the keys above are the only input path that is real today.
+//! a click on the control itself. An assistive technology's
+//! `Expand`/`Collapse`/`Click` request reaches [`set_dropdown_open`] and
+//! [`toggle_dropdown`] through `crate::action::handle_action` (0.128.0;
+//! see "Accessibility actions" below).
 //!
 //! # The accessibility vocabulary, checked against the pinned sources
 //!
@@ -161,13 +161,15 @@
 //!   [`toggle_dropdown`], [`set_dropdown_open`], disabling); nothing
 //!   here observes a click elsewhere or focus moving away, so a caller
 //!   that wants either must call [`set_dropdown_open`] itself.
-//! - **No accessibility action is routed here.** The control declares
-//!   `Focus`/`Click`/`Expand`/`Collapse`, but nothing in the workspace
-//!   turns an incoming `accesskit::ActionRequest` into a call on this
-//!   module: `aurora-app`'s own `ActionRequested` handler
-//!   (`crates/aurora-app/src/lib.rs`, `user_event`) logs every request
-//!   and drops it, for every widget. [`toggle_dropdown`] and
-//!   [`set_dropdown_open`] are what such routing would call.
+//! - **Accessibility actions: the control only.** The control's
+//!   `Focus`/`Click`/`Expand`/`Collapse` are routed (0.128.0) by
+//!   `crate::action::handle_action` to [`toggle_dropdown`] and
+//!   [`set_dropdown_open`] — `Collapse` closes without committing, like
+//!   `Escape`. **Choosing an option is not possible through an assistive
+//!   technology's actions**: option rows declare no `Click`, so the
+//!   dispatcher refuses one; a screen-reader user picks an option with
+//!   the arrow keys and `Enter`, and whether a real screen reader lets
+//!   them do that has not been checked by a human.
 //! - **The highlighted option covers part of the list's border.** A
 //!   highlighted row is the list's full width (`paint_list_row` fills
 //!   the row's whole box), so its `accent.primary` fill lies over the

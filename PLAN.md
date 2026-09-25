@@ -3231,6 +3231,106 @@ check licenses` clean with the new `toml` dependency.
   (the surviving M-d) now fails the new descendant-clamp test; removal
   not dropping a root from the set fails the fuzz test and an existing
   removal test.
+  **Accessibility action routing landed 2026-09-25 (0.128.0).** Every
+  widget has declared `accesskit` actions since it landed, and
+  `aurora-app`'s `ActionRequested` handler logged and dropped all of
+  them. New `aurora_widgets::action` (`handle_action`, `ActionOutcome`,
+  `ActionRejection`, `ALL_ACTIONS` — 22 actions, backed by an exhaustive
+  `match`) routes a request through a fixed gate: `target_tree` must be
+  the new `ACCESSIBILITY_TREE_ID` (the `TreeId::ROOT` every
+  `accessibility_update` publishes under — one constant now, so they
+  cannot drift); the target must be live; **the widget's current node
+  must declare the action** (the security gate — a disabled widget, an
+  unselected tab, a leaf tree row's `Expand`, an open dropdown's
+  `Expand` are all refused); a disabled node or payload is refused
+  again; the data must fit (`SetValue` takes a finite number, or a
+  string for a text field only). Routes: `Focus`; `Click` on a checkbox
+  (toggle), dropdown (toggle), tab (select, roving focus follows only
+  from the old tab), menu item (new `activate_menu_item`: the named
+  item's index, separators included, menu closed; ignored after a
+  repair, like `Enter`); `Click` on a button/swatch/tree row is reported
+  as `Activated` for the owner; `SetValue`/`Increment`/`Decrement` on a
+  slider/scrollbar (step = the node's `numeric_value_step`, else the
+  provisional `DEFAULT_STEP_FRACTION` of 1% of the range — neither
+  declares a step today), colour-picker channel (units read from the
+  node's own maximum: percent or degrees) and curve point (new
+  `set_curve_point_output`, levels 0..=255); `SetValue` replaces a text
+  field's whole text as one undo step (it was already declared, so the
+  standing guard required a route); `Expand`/`Collapse` on a tree row or
+  dropdown (dropdown `Collapse` never commits). Focus is validated after
+  every dispatch; a tree collapse that removes the focused row focuses
+  the collapsed row. A standing test builds a fixture holding one of
+  every `WidgetKind` (checked by an exhaustive `match`) and sends all 22
+  actions to every widget: routed ⇒ declared, and no declared action is
+  ever `Unsupported`. `aurora-app`: new free, headless
+  `route_accessibility_action` (modal gate first — while a dialog is
+  open, a target outside it is `BlockedByModal`, like the pointer and
+  keyboard), a dialog button's `Click` runs `run_dialog_action`, a layer
+  row's `Click` runs `press_layer_row` with the pointer path's exact
+  arguments (so a live drag is committed first), and a layer group's
+  collapse/expand reconciles `layer_rows` (`reconcile_layer_rows`:
+  prune on collapse; on expand, repopulate the panel, re-select the
+  active layer and keep focus on the group's new row).
+  `App::handle_accessibility_action` pushes the accessibility tree and
+  sets `needs_redraw` (`user_event` set neither). `accesskit` moved from
+  a dev- to a normal dependency of `aurora-app` (already in the lockfile
+  and the workspace; no new crate). **Disclosed:** not verified with any
+  screen reader — the tests drive the router with hand-built requests;
+  VoiceOver's `setAccessibilityValue:` sends a *string* when it has one
+  (`accesskit_macos` 0.26.3 `node.rs:556-578`), which a slider refuses as
+  `DataMismatch`, while UIA's `RangeValue.SetValue` and AT-SPI send a
+  number (`accesskit_windows` 0.34.0 `node.rs:1361-1366`,
+  `accesskit_atspi_common` 0.19.1 `node.rs:1663`). Re-expanding one
+  layer group reopens every other collapsed group (nothing persists
+  collapse state). No dropdown option can be chosen through AT actions
+  (option rows declare no `Click`). `App::handle_accessibility_action`
+  was at first untested (an `App` needs a real `EventLoopProxy`) —
+  superseded by the review revision below, which moved its body into a
+  tested free function; only the wrapper's two `if effects.*` lines
+  remain review-only. Scrolling, text selection, tooltips, context menus, custom
+  actions and `Blur` stay undeclared and refused. +33 tests (25
+  dispatcher, 3 helper, 5 app): workspace 2,162 → 2,195 passing, 40
+  ignored (`AURORA_REQUIRE_GPU=1 cargo test --workspace`, full gate
+  green).
+
+  **Review revision (still 0.128.0).** An independent critic, red team
+  and external reviewer found one blocker and nine smaller issues; all
+  fixed in place. **Blocker:** an AT expand rebuilt the Layers panel but
+  nothing re-ran layout, so the rebuilt rows sat at zero bounds —
+  invisible and unhittable. The whole reaction now lives in a free,
+  headless `apply_accessibility_action`, which returns
+  `AccessibilityEffects { relayout, redraw }` (both false for a refusal);
+  `App::handle_accessibility_action` is a thin wrapper that re-runs layout
+  through `apply_resize` exactly as `handle_key_event` does. That closes
+  the "untested wrapper" disclosure above: new app tests prove a row
+  `Click` goes through `press_layer_row` (live drag committed), rebuilt
+  rows are laid out and hittable, and a refusal asks for nothing — each of
+  the relayout, redraw, `press_layer_row`-vs-`select_layer`, refocus and
+  palette-gate mutations was really run and killed (the wrapper's own
+  two `if effects.*` lines remain review-only). Also: an expand now keeps
+  focus on *any* Layers row, not only the expanded one; an open command
+  palette is modal to an AT as it is to the keyboard; unmapped
+  owner-meaningful outcomes log at `warn`, and a live-workspace guard
+  sends every declared action and fails on any such outcome (none today);
+  text-field `SetValue` refuses control characters, text over
+  `MAX_SET_VALUE_TEXT_BYTES` (64 KiB) and any request while an IME
+  composition is active (new `ActionRejection::CompositionActive`, no
+  silent clear, no no-op undo step); a slider/scrollbar with a `NaN` or
+  inverted range refuses instead of panicking in `f64::clamp`; a curve
+  `SetValue`/step that only moves the selection is `Unchanged`; and the
+  standing sweep also runs after every state-dependent declaration flips.
+  **Disclosed, not fixed:** no widget publishes `accesskit` bounds at all
+  (a crate-wide gap, not this routing's), so VoiceOver has no focus
+  rectangle anywhere; and dropdown options still cannot be chosen
+  through AT actions (named open item below). +11 tests: workspace
+  2,206 passing, 40 ignored, full gate green under
+  `AURORA_REQUIRE_GPU=1`.
+
+  - [ ] **Dropdown options through AT actions.** Option rows declare no
+    `Click` and a closed dropdown declares no `Increment`/`Decrement`, so
+    a screen-reader user can open a dropdown but not choose an option.
+    Needs an owner-side commit reaction as well (a `Committed` outcome is
+    owner-meaningful), so it is deferred rather than bolted on.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to
@@ -27949,6 +28049,18 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-25 (0.128.0) — accessibility action routing
+landed.** `aurora_widgets::handle_action` routes every action a widget
+declares (and refuses everything else, the declared set being the
+security gate); `aurora-app` adds a modal gate, dialog-button and
+layer-row activation, and layer-group row reconciliation, and now
+re-lays-out, repaints and re-announces after a routed action. Full account and
+disclosures: M1.7's widget-set bullet. **Needs a human:** a screen
+reader on real macOS (VoiceOver may send a slider's `SetValue` as a
+string, which is refused). **Suggested next:** a painted keyboard focus
+ring (nothing in `paint.rs` reads `FocusManager`), then the popover
+viewport flip and light-dismiss.
 
 **Addendum 2026-09-25 (0.127.0) — popover (overlay) layer landed.** A
 per-widget `PaintLayer` flag on `WidgetTree`: popover roots paint after

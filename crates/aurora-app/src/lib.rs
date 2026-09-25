@@ -2485,6 +2485,301 @@ fn handle_dialog_pointer(
     true
 }
 
+/// What [`route_accessibility_action`] decided an assistive technology's
+/// `accesskit::ActionRequest` means for this app — the half of routing
+/// only the app can do, on top of `aurora_widgets::handle_action`'s own
+/// widget-level half.
+#[derive(Debug)]
+enum AccessibilityReaction {
+    /// Routed at the widget level; nothing app-level follows.
+    Handled(aurora_widgets::ActionOutcome),
+    /// A `Click` on one of the open dialog's own action buttons: run it
+    /// through [`run_dialog_action`], exactly as `Enter` or a pointer
+    /// click on that button does.
+    DialogAction(Option<String>),
+    /// A `Click` on a Layers-panel row: select that layer through
+    /// [`press_layer_row`], exactly as a pointer press on the row does.
+    PressLayer(aurora_doc::LayerId),
+    /// A Layers-panel row group expanded or collapsed: the caller must
+    /// reconcile its own row map ([`App::handle_accessibility_action`]).
+    LayerRowExpanded { row: WidgetId, expanded: bool },
+    /// A modal dialog is open and the request targets something outside
+    /// it — refused before any widget sees it, the same modal precedence
+    /// the keyboard ([`handle_dialog_key`]) and the pointer
+    /// ([`handle_dialog_pointer`]) already get.
+    BlockedByModal(WidgetId),
+    /// The widget layer refused the request.
+    Rejected(aurora_widgets::ActionRejection),
+}
+
+/// Whether `id` is `ancestor` or lies anywhere below it.
+fn is_within(tree: &WidgetTree<WidgetKind>, ancestor: WidgetId, id: WidgetId) -> bool {
+    let mut current = Some(id);
+    while let Some(candidate) = current {
+        if candidate == ancestor {
+            return true;
+        }
+        current = tree.parent(candidate);
+    }
+    false
+}
+
+/// Routes one assistive-technology `request` (PLAN.md M1.8, 0.128.0):
+/// the modal gate first, then `aurora_widgets::handle_action` (which owns
+/// the declared-action security gate and every widget-level mutation),
+/// then the app-level meaning of an activation — a dialog button or a
+/// Layers-panel row. Free and platform-free, like [`handle_dialog_key`],
+/// so it is testable with no window or adapter; the caller performs the
+/// side effects the returned [`AccessibilityReaction`] names.
+fn route_accessibility_action(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: Option<&DialogHandle>,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    request: &accesskit::ActionRequest,
+) -> AccessibilityReaction {
+    if let Some(handle) = dialog
+        && !is_within(&workspace.tree, handle.root, request.target_node)
+    {
+        return AccessibilityReaction::BlockedByModal(request.target_node);
+    }
+    match aurora_widgets::handle_action(&mut workspace.tree, focus, request) {
+        Ok(aurora_widgets::ActionOutcome::Activated(id)) => {
+            if let Some(action) = dialog.and_then(|handle| handle.action_id(id)) {
+                AccessibilityReaction::DialogAction(Some(action.to_owned()))
+            } else if let Some(&layer_id) = layer_rows.get(&id) {
+                AccessibilityReaction::PressLayer(layer_id)
+            } else {
+                AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
+            }
+        }
+        Ok(aurora_widgets::ActionOutcome::ExpandedChanged { id, expanded })
+            if layer_rows.contains_key(&id) =>
+        {
+            AccessibilityReaction::LayerRowExpanded { row: id, expanded }
+        }
+        Ok(outcome) => AccessibilityReaction::Handled(outcome),
+        Err(err) => AccessibilityReaction::Rejected(err),
+    }
+}
+
+/// Brings the Layers panel back in line after an assistive technology
+/// expanded or collapsed one of its group rows (`row`, showing
+/// `layer_id`).
+///
+/// A **collapse** removed that group's descendant rows from the widget
+/// tree; their stale ids are dropped from `layer_rows` so nothing can
+/// ever look one up again. An **expand** cannot recreate them — the rows
+/// are built only by `aurora_ui::populate_layers_panel` — so the whole
+/// panel is repopulated, the active layer's row re-selected
+/// ([`select_layer`]), and focus moved to the new row of whichever layer
+/// it was on before — the expanded row itself or any other Layers-panel
+/// row, since the rebuild replaces every one of them. **Disclosed cost:** repopulating rebuilds every
+/// row expanded, so another group an assistive technology had collapsed
+/// reopens too; nothing in this app persists per-group collapse state yet.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_layer_rows(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    layer_rows: &mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    row: WidgetId,
+    expanded: bool,
+) {
+    if !expanded {
+        layer_rows.retain(|&id, _| workspace.tree.contains(id));
+        return;
+    }
+    if !layer_rows.contains_key(&row) {
+        return;
+    }
+    // Recorded before the rebuild replaces every row id: the layer behind
+    // whichever Layers-panel row held focus, not only `row` (critic C4).
+    let focused_layer = focus
+        .focused()
+        .and_then(|focused| layer_rows.get(&focused))
+        .copied();
+    match aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers) {
+        Ok(rows) => *layer_rows = rows,
+        Err(err) => {
+            tracing::warn!(?err, "failed to rebuild the Layers panel after an expand");
+            layer_rows.retain(|&id, _| workspace.tree.contains(id));
+            focus.validate(&workspace.tree);
+            return;
+        }
+    }
+    if let Some(active) = *active_layer {
+        select_layer(workspace, layer_rows, active_layer, view, layers, active);
+    }
+    focus.validate(&workspace.tree);
+    if let Some(layer_id) = focused_layer
+        && let Some((&new_row, _)) = layer_rows.iter().find(|&(_, &id)| id == layer_id)
+        && let Err(err) = focus.focus(&mut workspace.tree, new_row)
+    {
+        tracing::warn!(?err, "failed to refocus a rebuilt Layers-panel row");
+    }
+}
+
+/// Every piece of `App` state an accessibility action can touch, borrowed
+/// for one [`apply_accessibility_action`] call — so the whole reaction is
+/// a free function a headless test can run against the same state shape
+/// `App` holds, with no window or adapter.
+struct AccessibilityContext<'a> {
+    workspace: &'a mut aurora_ui::Workspace,
+    focus: &'a mut FocusManager,
+    dialog: &'a mut Option<DialogHandle>,
+    /// The open command palette's root, if any.
+    palette: Option<WidgetId>,
+    scales: &'a Scales,
+    layers: &'a aurora_doc::LayerTree,
+    layer_rows: &'a mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &'a mut Option<aurora_doc::LayerId>,
+    view: &'a mut aurora_ui::CanvasView,
+    history: &'a mut aurora_doc::History,
+    pixel_history: &'a mut aurora_brush::PixelHistory,
+    undo_order: &'a mut UndoOrder,
+    composite_cache: &'a mut CompositeCache,
+    drag: &'a mut Option<Drag>,
+}
+
+/// What the caller of [`apply_accessibility_action`] still has to do —
+/// the two side effects only `App` can perform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AccessibilityEffects {
+    /// The widget tree may have changed shape or content: re-run layout
+    /// (`App::apply_resize` from the window's own size, as every other
+    /// tree-mutating path does). Without it, rows an expand rebuilt keep
+    /// zero bounds — invisible, unhittable, and announced with no
+    /// bounding box (critic C1 / red-team RT-1).
+    relayout: bool,
+    /// Something visible may have changed: request a redraw. `user_event`
+    /// sets no `needs_redraw` of its own.
+    redraw: bool,
+}
+
+/// Whether an outcome the app maps to no reaction of its own is
+/// legitimately the widget's business alone — focus moving, a no-op, a
+/// non-Layers tree row or a dropdown list opening or closing. Anything
+/// else (text, a value, a tab, a menu item, a committed option, a colour,
+/// a curve, a toggle, an activation) is state the widget's *owner* would
+/// have to act on, and reaching [`apply_accessibility_action`] unmapped is
+/// logged at `warn` — and kept out of the live workspace by
+/// `every_action_the_live_workspace_declares_is_mapped_or_widget_local`.
+fn outcome_is_widget_local(outcome: &aurora_widgets::ActionOutcome) -> bool {
+    use aurora_widgets::ActionOutcome as Outcome;
+    use aurora_widgets::widgets::DropdownOutcome;
+    match outcome {
+        Outcome::Focused(_) | Outcome::Unchanged(_) | Outcome::ExpandedChanged { .. } => true,
+        Outcome::Dropdown { outcome, .. } => matches!(
+            outcome,
+            DropdownOutcome::Opened
+                | DropdownOutcome::Cancelled
+                | DropdownOutcome::HighlightMoved(_)
+                | DropdownOutcome::Ignored
+                | DropdownOutcome::Committed { changed: false, .. }
+        ),
+        _ => false,
+    }
+}
+
+/// Routes one assistive-technology `request` ([`route_accessibility_action`])
+/// and performs the app-level reaction it names — [`run_dialog_action`]
+/// for a dialog button, [`press_layer_row`] (with the exact argument list
+/// the pointer path passes) for a Layers-panel row,
+/// [`reconcile_layer_rows`] after a Layers-panel expand/collapse.
+/// `App::handle_accessibility_action` is a thin wrapper over this.
+///
+/// **The command palette is modal to an assistive technology too**
+/// (critic C9): [`handle_key`] sends every key to the palette while it
+/// is open, so a request targeting anything outside the palette's own
+/// subtree is refused as [`AccessibilityReaction::BlockedByModal`], the
+/// same as outside an open dialog.
+///
+/// A refusal changes nothing and asks for neither a relayout nor a
+/// redraw; every other reaction asks for both.
+fn apply_accessibility_action(
+    cx: &mut AccessibilityContext<'_>,
+    request: &accesskit::ActionRequest,
+) -> AccessibilityEffects {
+    let reaction = match cx.palette {
+        Some(palette)
+            if cx.dialog.is_none()
+                && !is_within(&cx.workspace.tree, palette, request.target_node) =>
+        {
+            AccessibilityReaction::BlockedByModal(request.target_node)
+        }
+        _ => route_accessibility_action(
+            cx.workspace,
+            cx.focus,
+            cx.dialog.as_ref(),
+            cx.layer_rows,
+            request,
+        ),
+    };
+    match reaction {
+        AccessibilityReaction::DialogAction(action) => {
+            run_dialog_action(cx.workspace, cx.focus, cx.dialog, action);
+        }
+        AccessibilityReaction::PressLayer(layer_id) => {
+            press_layer_row(
+                cx.workspace,
+                cx.layer_rows,
+                cx.active_layer,
+                cx.view,
+                cx.layers,
+                cx.history,
+                cx.pixel_history,
+                cx.undo_order,
+                cx.composite_cache,
+                cx.drag,
+                layer_id,
+            );
+        }
+        AccessibilityReaction::LayerRowExpanded { row, expanded } => {
+            reconcile_layer_rows(
+                cx.workspace,
+                cx.focus,
+                cx.scales,
+                cx.layers,
+                cx.layer_rows,
+                cx.active_layer,
+                cx.view,
+                row,
+                expanded,
+            );
+        }
+        AccessibilityReaction::Handled(outcome) => {
+            if outcome_is_widget_local(&outcome) {
+                tracing::debug!(?outcome, "accessibility action routed");
+            } else {
+                tracing::warn!(
+                    ?outcome,
+                    "accessibility action changed a widget nothing in the app reacts to"
+                );
+            }
+        }
+        AccessibilityReaction::BlockedByModal(target) => {
+            tracing::debug!(
+                ?target,
+                action = ?request.action,
+                "accessibility action outside the open modal dialog or palette refused"
+            );
+            return AccessibilityEffects::default();
+        }
+        AccessibilityReaction::Rejected(err) => {
+            tracing::debug!(%err, action = ?request.action, "accessibility action refused");
+            return AccessibilityEffects::default();
+        }
+    }
+    AccessibilityEffects {
+        relayout: true,
+        redraw: true,
+    }
+}
+
 // -- Command dispatch: keyboard shortcuts and the command palette --
 //
 // PLAN.md M1.8's "command palette, keyboard shortcuts" bullet. Every
@@ -14084,6 +14379,46 @@ impl App {
         adapter.update_if_active(|| tree.accessibility_update(focused));
     }
 
+    /// An assistive technology's `accesskit::ActionRequest`: a thin
+    /// wrapper over [`apply_accessibility_action`], which owns routing and
+    /// every app-level reaction and is tested headlessly. This method only
+    /// performs the side effects that function names — re-running layout
+    /// exactly as [`Self::handle_key_event`] does (`apply_resize` from the
+    /// window's own size), requesting a redraw (`user_event` sets no
+    /// `needs_redraw` of its own) — and always pushes the accessibility
+    /// tree so a routed change is announced.
+    fn handle_accessibility_action(&mut self, request: &accesskit::ActionRequest) {
+        let effects = apply_accessibility_action(
+            &mut AccessibilityContext {
+                workspace: &mut self.workspace,
+                focus: &mut self.focus,
+                dialog: &mut self.dialog,
+                palette: self.command_palette,
+                scales: &self.scales,
+                layers: &self.layers,
+                layer_rows: &mut self.layer_rows,
+                active_layer: &mut self.active_layer,
+                view: &mut self.canvas_view,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                undo_order: &mut self.undo_order,
+                composite_cache: &mut self.composite_cache,
+                drag: &mut self.drag,
+            },
+            request,
+        );
+        if effects.relayout {
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+        }
+        self.push_accessibility();
+        if effects.redraw {
+            self.needs_redraw = true;
+        }
+    }
+
     /// A real `winit::event::KeyEvent`'s full handling: ignores key-up
     /// (only a press should trigger a shortcut or type a character —
     /// otherwise every binding would fire twice), translates it into
@@ -16107,10 +16442,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 self.push_accessibility();
             }
             accesskit_winit::WindowEvent::ActionRequested(request) => {
-                // No interactive widgets exist yet to route this to —
-                // real input/focus wiring is separate, still-open M1.8
-                // work. Logged, not dropped silently.
-                tracing::debug!(action = ?request.action, "accessibility action requested (not yet routed to a widget)");
+                self.handle_accessibility_action(&request);
             }
             accesskit_winit::WindowEvent::AccessibilityDeactivated => {
                 tracing::debug!("accessibility deactivated");
@@ -16398,10 +16730,10 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
-        COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
-        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
-        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
+        AccessibilityReaction, ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY,
+        COMMAND_CLOSE_LAYERS, COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE,
+        COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO,
+        COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
         COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
         Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
@@ -16430,8 +16762,9 @@ mod tests {
         open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
         pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
-        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
+        recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
+        replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
+        route_accessibility_action, run_command, run_dialog_action, run_shutdown_cleanup,
         sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
         skipped_tiles_message, skipped_tiles_warning, splitmix64, take_gpu_blend_dispatch_count,
         tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
@@ -16449,7 +16782,7 @@ mod tests {
     use aurora_doc::SelectionSet;
     use aurora_theme::{Palette, ThemeSet};
     use aurora_ui::{CanvasView, Tool};
-    use aurora_widgets::widgets::{insert_button, new_tree};
+    use aurora_widgets::widgets::{DialogHandle, insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
 
@@ -16865,6 +17198,575 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         (workspace, layers, layer_rows, a, b)
+    }
+
+    // ---- Accessibility action routing (0.128.0) -------------------
+
+    fn a11y_request(id: WidgetId, action: accesskit::Action) -> accesskit::ActionRequest {
+        accesskit::ActionRequest {
+            action,
+            target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+            target_node: id,
+            data: None,
+        }
+    }
+
+    fn row_of(
+        layer_rows: &std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        layer: aurora_doc::LayerId,
+    ) -> WidgetId {
+        match layer_rows.iter().find(|&(_, &id)| id == layer) {
+            Some((&row, _)) => row,
+            None => unreachable!("layer {layer:?} has no row"),
+        }
+    }
+
+    /// A screen reader's `Click` on a Layers-panel row selects that layer
+    /// through the same `press_layer_row` a pointer press uses — which is
+    /// what also commits a drag still live under it.
+    #[test]
+    fn an_accessibility_click_on_a_layer_row_presses_it_like_the_pointer() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut focus = FocusManager::default();
+        let row_b = row_of(&layer_rows, b);
+        let reaction = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            None,
+            &layer_rows,
+            &a11y_request(row_b, accesskit::Action::Click),
+        );
+        let AccessibilityReaction::PressLayer(pressed) = reaction else {
+            unreachable!("expected PressLayer, got {reaction:?}");
+        };
+        assert_eq!(pressed, b);
+
+        // What `App::handle_accessibility_action` then runs.
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        let mut drag = begin_drag(Tool::Brush, PointerButton::Middle, (1.0, 1.0), &view, None);
+        assert!(drag.is_some(), "setup: a live pan");
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut aurora_doc::History::new(),
+            &mut aurora_brush::PixelHistory::new(),
+            &mut UndoOrder::default(),
+            &mut CompositeCache::default(),
+            &mut drag,
+            pressed,
+        );
+        assert_eq!(active_layer, Some(b));
+        assert!(drag.is_none(), "the live drag was ended first");
+        let selected = workspace
+            .tree
+            .accessibility(row_b)
+            .and_then(accesskit::Node::is_selected);
+        assert_eq!(selected, Some(true));
+    }
+
+    #[test]
+    fn an_accessibility_click_on_a_dialog_button_runs_that_action() {
+        let (mut workspace, _layers, layer_rows, _a, _b) = two_layers_one_moved();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(button) = dialog.as_ref().and_then(DialogHandle::first_action) else {
+            unreachable!("just opened, with an action");
+        };
+        let expected = dialog
+            .as_ref()
+            .and_then(|handle| handle.action_id(button))
+            .map(str::to_owned);
+        let reaction = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            dialog.as_ref(),
+            &layer_rows,
+            &a11y_request(button, accesskit::Action::Click),
+        );
+        let AccessibilityReaction::DialogAction(action) = reaction else {
+            unreachable!("expected DialogAction, got {reaction:?}");
+        };
+        assert_eq!(action, expected);
+        assert!(action.is_some());
+        run_dialog_action(&mut workspace, &mut focus, &mut dialog, action);
+        assert!(dialog.is_none());
+        assert!(!workspace.tree.contains(button));
+        assert!(focus.focused().is_none_or(|id| workspace.tree.contains(id)));
+    }
+
+    /// The modal gate: while a dialog is open, a screen reader can no
+    /// more select a layer behind it than the pointer or keyboard can.
+    #[test]
+    fn an_open_dialog_blocks_accessibility_actions_outside_it() {
+        let (mut workspace, _layers, layer_rows, _a, b) = two_layers_one_moved();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let row_b = row_of(&layer_rows, b);
+        let focused = focus.focused();
+        for action in [accesskit::Action::Click, accesskit::Action::Focus] {
+            let reaction = route_accessibility_action(
+                &mut workspace,
+                &mut focus,
+                dialog.as_ref(),
+                &layer_rows,
+                &a11y_request(row_b, action),
+            );
+            assert!(
+                matches!(reaction, AccessibilityReaction::BlockedByModal(id) if id == row_b),
+                "{action:?}: {reaction:?}"
+            );
+        }
+        assert_eq!(focus.focused(), focused);
+        assert!(dialog.is_some());
+    }
+
+    #[test]
+    fn a_bogus_or_misaddressed_accessibility_request_is_refused_without_panicking() {
+        let (mut workspace, _layers, layer_rows, _a, _b) = two_layers_one_moved();
+        let mut focus = FocusManager::default();
+        let bogus = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            None,
+            &layer_rows,
+            &a11y_request(accesskit::NodeId(u64::MAX), accesskit::Action::Click),
+        );
+        assert!(matches!(
+            bogus,
+            AccessibilityReaction::Rejected(aurora_widgets::ActionRejection::UnknownTarget(_))
+        ));
+        let mut wrong = a11y_request(workspace.root, accesskit::Action::Focus);
+        wrong.target_tree = accesskit::TreeId(accesskit::Uuid::from_u128(1));
+        let reaction =
+            route_accessibility_action(&mut workspace, &mut focus, None, &layer_rows, &wrong);
+        assert!(matches!(
+            reaction,
+            AccessibilityReaction::Rejected(aurora_widgets::ActionRejection::WrongTree(_))
+        ));
+    }
+
+    /// Collapsing a layer group through a screen reader prunes the rows
+    /// it removed; expanding it again rebuilds them, keeps the active
+    /// layer selected, and keeps focus on the group's (new) row.
+    #[test]
+    fn collapsing_and_expanding_a_layer_group_keeps_the_row_map_live() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let group = match layers.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("c", layer_bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut focus = FocusManager::default();
+        let mut active_layer = Some(child);
+        let mut view = CanvasView::new();
+        let group_row = row_of(&layer_rows, group);
+        let child_row = row_of(&layer_rows, child);
+        if let Err(err) = focus.focus(&mut workspace.tree, group_row) {
+            unreachable!("{err:?}");
+        }
+
+        let reaction = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            None,
+            &layer_rows,
+            &a11y_request(group_row, accesskit::Action::Collapse),
+        );
+        let AccessibilityReaction::LayerRowExpanded { row, expanded } = reaction else {
+            unreachable!("expected LayerRowExpanded, got {reaction:?}");
+        };
+        assert!(!expanded);
+        reconcile_layer_rows(
+            &mut workspace,
+            &mut focus,
+            &scales,
+            &layers,
+            &mut layer_rows,
+            &mut active_layer,
+            &mut view,
+            row,
+            expanded,
+        );
+        assert!(!workspace.tree.contains(child_row));
+        assert!(!layer_rows.contains_key(&child_row), "stale row pruned");
+        assert!(layer_rows.contains_key(&group_row));
+
+        let reaction = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            None,
+            &layer_rows,
+            &a11y_request(group_row, accesskit::Action::Expand),
+        );
+        let AccessibilityReaction::LayerRowExpanded { row, expanded } = reaction else {
+            unreachable!("expected LayerRowExpanded, got {reaction:?}");
+        };
+        assert!(expanded);
+        reconcile_layer_rows(
+            &mut workspace,
+            &mut focus,
+            &scales,
+            &layers,
+            &mut layer_rows,
+            &mut active_layer,
+            &mut view,
+            row,
+            expanded,
+        );
+        let new_child_row = row_of(&layer_rows, child);
+        let new_group_row = row_of(&layer_rows, group);
+        assert!(
+            workspace.tree.contains(new_child_row),
+            "the child row is back"
+        );
+        assert!(layer_rows.keys().all(|&id| workspace.tree.contains(id)));
+        assert_eq!(focus.focused(), Some(new_group_row));
+        assert_eq!(active_layer, Some(child));
+        let selected = workspace
+            .tree
+            .accessibility(new_child_row)
+            .and_then(accesskit::Node::is_selected);
+        assert_eq!(
+            selected,
+            Some(true),
+            "the active layer's row is re-selected"
+        );
+    }
+
+    /// `apply_accessibility_action` — the whole reaction
+    /// `App::handle_accessibility_action` wraps — against the same state
+    /// shape `App` holds (review revision of 0.128.0: red-team RT-2 found
+    /// the wrapper executed by no test).
+    mod accessibility_reactions {
+        use super::super::*;
+        use super::{a11y_request, layer_bounds, row_of, two_layers_one_moved};
+
+        const WIDTH: f32 = 1280.0;
+        const HEIGHT: f32 = 800.0;
+
+        struct AtState {
+            workspace: aurora_ui::Workspace,
+            focus: FocusManager,
+            dialog: Option<DialogHandle>,
+            palette: Option<WidgetId>,
+            scales: Scales,
+            layers: aurora_doc::LayerTree,
+            layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+            active_layer: Option<aurora_doc::LayerId>,
+            view: aurora_ui::CanvasView,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: UndoOrder,
+            composite_cache: CompositeCache,
+            drag: Option<Drag>,
+        }
+
+        impl AtState {
+            /// A laid-out workspace showing `layers`, as `App` has after
+            /// its first `apply_resize`.
+            fn new(
+                mut workspace: aurora_ui::Workspace,
+                layers: aurora_doc::LayerTree,
+                active_layer: Option<aurora_doc::LayerId>,
+            ) -> Self {
+                let scales = match load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let layer_rows = match aurora_ui::populate_layers_panel(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                    &layers,
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                workspace.tree.compute_layout(WIDTH, HEIGHT);
+                Self {
+                    workspace,
+                    focus: FocusManager::default(),
+                    dialog: None,
+                    palette: None,
+                    scales,
+                    layers,
+                    layer_rows,
+                    active_layer,
+                    view: aurora_ui::CanvasView::new(),
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order: UndoOrder::default(),
+                    composite_cache: CompositeCache::default(),
+                    drag: None,
+                }
+            }
+
+            /// Runs one request, then performs the relayout the effects
+            /// ask for — what the `App` wrapper does through
+            /// `apply_resize`, whose layout half is exactly this call.
+            fn act(&mut self, request: &accesskit::ActionRequest) -> AccessibilityEffects {
+                let effects = apply_accessibility_action(
+                    &mut AccessibilityContext {
+                        workspace: &mut self.workspace,
+                        focus: &mut self.focus,
+                        dialog: &mut self.dialog,
+                        palette: self.palette,
+                        scales: &self.scales,
+                        layers: &self.layers,
+                        layer_rows: &mut self.layer_rows,
+                        active_layer: &mut self.active_layer,
+                        view: &mut self.view,
+                        history: &mut self.history,
+                        pixel_history: &mut self.pixel_history,
+                        undo_order: &mut self.undo_order,
+                        composite_cache: &mut self.composite_cache,
+                        drag: &mut self.drag,
+                    },
+                    request,
+                );
+                if effects.relayout {
+                    self.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                }
+                effects
+            }
+        }
+
+        const BOTH: AccessibilityEffects = AccessibilityEffects {
+            relayout: true,
+            redraw: true,
+        };
+
+        /// A group `g` holding `c`, plus a top-level `top`.
+        fn group_child_and_top() -> (
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+            aurora_doc::LayerId,
+            aurora_doc::LayerId,
+        ) {
+            let mut layers = aurora_doc::LayerTree::new();
+            let ok = |r: Result<aurora_doc::LayerId, _>| match r {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let group = ok(layers.add_group("g", None));
+            let child = ok(layers.add_pixel_layer("c", layer_bounds(), Some(group)));
+            let top = ok(layers.add_pixel_layer("top", layer_bounds(), None));
+            (layers, group, child, top)
+        }
+
+        fn has_area(state: &AtState, id: WidgetId) -> bool {
+            state
+                .workspace
+                .tree
+                .bounds(id)
+                .is_some_and(|r| r.width > 0 && r.height > 0)
+        }
+
+        #[test]
+        fn a_row_click_presses_the_layer_commits_the_drag_and_asks_for_a_redraw() {
+            let (workspace, layers, _, a, b) = two_layers_one_moved();
+            let mut state = AtState::new(workspace, layers, Some(a));
+            state.drag = begin_drag(
+                aurora_ui::Tool::Brush,
+                PointerButton::Middle,
+                (1.0, 1.0),
+                &state.view,
+                None,
+            );
+            assert!(state.drag.is_some(), "setup: a live pan");
+            let row_b = row_of(&state.layer_rows, b);
+            let effects = state.act(&a11y_request(row_b, accesskit::Action::Click));
+            assert_eq!(effects, BOTH);
+            assert_eq!(state.active_layer, Some(b));
+            assert!(
+                state.drag.is_none(),
+                "press_layer_row commits the live drag; select_layer alone would not"
+            );
+        }
+
+        /// The R1 regression (critic C1, red-team RT-1): rows an AT expand
+        /// rebuilt must be laid out, not left at `Rect {0, 0, 0, 0}`.
+        #[test]
+        fn rows_an_expand_rebuilt_are_laid_out() {
+            let (layers, group, child, _) = group_child_and_top();
+            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let group_row = row_of(&state.layer_rows, group);
+            assert!(has_area(&state, group_row), "setup: laid out");
+            let effects = state.act(&a11y_request(group_row, accesskit::Action::Collapse));
+            assert_eq!(effects, BOTH);
+            let group_row = row_of(&state.layer_rows, group);
+            let effects = state.act(&a11y_request(group_row, accesskit::Action::Expand));
+            assert_eq!(effects, BOTH);
+            for &row in state.layer_rows.keys() {
+                assert!(has_area(&state, row), "rebuilt row {row:?} has no bounds");
+            }
+            let child_row = row_of(&state.layer_rows, child);
+            let Some(bounds) = state.workspace.tree.bounds(child_row) else {
+                unreachable!("the rebuilt child row is gone");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (
+                bounds.x as f32 + bounds.width as f32 / 2.0,
+                bounds.y as f32 + bounds.height as f32 / 2.0,
+            );
+            let hit = state.workspace.tree.hit_test(centre);
+            assert!(
+                hit.is_some_and(|hit| is_within(&state.workspace.tree, child_row, hit)),
+                "the rebuilt child row cannot be hit: {hit:?}"
+            );
+        }
+
+        /// Critic C4: focus on a *different* Layers-panel row survives an
+        /// expand that rebuilds every row.
+        #[test]
+        fn an_expand_keeps_focus_on_another_layers_row() {
+            let (layers, group, child, top) = group_child_and_top();
+            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let group_row = row_of(&state.layer_rows, group);
+            state.act(&a11y_request(group_row, accesskit::Action::Collapse));
+            let top_row = row_of(&state.layer_rows, top);
+            state.act(&a11y_request(top_row, accesskit::Action::Focus));
+            assert_eq!(state.focus.focused(), Some(top_row));
+            let group_row = row_of(&state.layer_rows, group);
+            state.act(&a11y_request(group_row, accesskit::Action::Expand));
+            let new_top_row = row_of(&state.layer_rows, top);
+            assert_ne!(new_top_row, top_row, "setup: the rows really were rebuilt");
+            assert_eq!(state.focus.focused(), Some(new_top_row));
+        }
+
+        /// A refusal changes nothing and asks for nothing.
+        #[test]
+        fn a_refused_request_asks_for_neither_relayout_nor_redraw() {
+            let (workspace, layers, _, a, b) = two_layers_one_moved();
+            let mut state = AtState::new(workspace, layers, Some(a));
+            let row_b = row_of(&state.layer_rows, b);
+            let effects = state.act(&a11y_request(row_b, accesskit::Action::Increment));
+            assert_eq!(effects, AccessibilityEffects::default());
+            assert_eq!(state.active_layer, Some(a));
+        }
+
+        /// Critic C9: the keyboard sends every key to an open command
+        /// palette (`handle_key`), so an AT is confined to it too.
+        #[test]
+        fn an_open_command_palette_blocks_requests_outside_it() {
+            let (workspace, layers, _, a, b) = two_layers_one_moved();
+            let mut state = AtState::new(workspace, layers, Some(a));
+            open_command_palette(&mut state.workspace, &mut state.focus, &mut state.palette);
+            let Some(palette) = state.palette else {
+                unreachable!("the palette did not open");
+            };
+            let row_b = row_of(&state.layer_rows, b);
+            let effects = state.act(&a11y_request(row_b, accesskit::Action::Click));
+            assert_eq!(effects, AccessibilityEffects::default());
+            assert_eq!(
+                state.active_layer,
+                Some(a),
+                "the row behind the palette was pressed"
+            );
+            let inside = state
+                .focus
+                .focused()
+                .filter(|&id| is_within(&state.workspace.tree, palette, id));
+            let Some(inside) = inside else {
+                unreachable!("the palette took no focus");
+            };
+            let effects = state.act(&a11y_request(inside, accesskit::Action::Focus));
+            assert_eq!(effects, BOTH, "the palette's own widgets stay reachable");
+        }
+
+        /// Critic C5: every action the live workspace declares, sent
+        /// well-formed to every widget, either reaches an app-level
+        /// reaction or is widget-local (`outcome_is_widget_local`) — no
+        /// app-owned widget can be changed by an AT with nothing in the app
+        /// reacting. A new app-owned slider, text field, tab bar, menu,
+        /// colour picker or curve editor fails this until it is mapped.
+        #[test]
+        fn every_action_the_live_workspace_declares_is_mapped_or_widget_local() {
+            let fresh = || {
+                let (layers, _history) = demo_document();
+                let active = topmost_pixel_layer(&layers);
+                AtState::new(aurora_ui::build_workspace(), layers, active)
+            };
+            let probe = fresh();
+            let mut ids = Vec::new();
+            let mut stack = vec![probe.workspace.root];
+            while let Some(id) = stack.pop() {
+                ids.push(id);
+                stack.extend(probe.workspace.tree.children(id).unwrap_or_default());
+            }
+            let mut routed = 0_usize;
+            for &id in &ids {
+                for action in aurora_widgets::ALL_ACTIONS {
+                    let declared = probe
+                        .workspace
+                        .tree
+                        .accessibility(id)
+                        .is_some_and(|node| node.supports_action(action));
+                    if !declared {
+                        continue;
+                    }
+                    let mut state = fresh();
+                    let mut request = a11y_request(id, action);
+                    if action == accesskit::Action::SetValue {
+                        request.data = Some(match state.workspace.tree.payload(id) {
+                            Some(WidgetKind::TextField(_)) => {
+                                accesskit::ActionData::Value("v".into())
+                            }
+                            _ => accesskit::ActionData::NumericValue(1.0),
+                        });
+                    }
+                    let reaction = route_accessibility_action(
+                        &mut state.workspace,
+                        &mut state.focus,
+                        None,
+                        &state.layer_rows,
+                        &request,
+                    );
+                    routed += 1;
+                    if let AccessibilityReaction::Handled(outcome) = &reaction {
+                        assert!(
+                            outcome_is_widget_local(outcome),
+                            "{action:?} on {id:?} changed app-owned state nothing maps: {outcome:?}"
+                        );
+                    }
+                }
+            }
+            assert!(
+                routed > 10,
+                "only {routed} declared actions in the live workspace"
+            );
+        }
     }
 
     #[test]

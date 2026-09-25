@@ -119,10 +119,11 @@
 //!   not stop on it (and the bar above it is not focusable either). A
 //!   caller that wants click-to-select hit-tests, maps the hit tab with
 //!   [`TabBarState::index_of`], and calls [`select_tab`].
-//! - **No accessibility action is routed here** — the same workspace-wide
-//!   gap `dropdown.rs` records: `aurora-app`'s `ActionRequested` handler
-//!   logs and drops every request. [`select_tab`] is what a routed
-//!   `Click` would call.
+//! - **Accessibility `Click` and `Focus` are routed** (0.128.0) by
+//!   `crate::action::handle_action`: a `Click` on a tab calls
+//!   [`select_tab`] and, if focus sat on the previously selected tab,
+//!   moves it to the new one (roving focus). Nothing else is declared,
+//!   so nothing else is accepted.
 //! - **No keyboard-focus ring is painted** — a crate-wide gap (nothing in
 //!   `paint.rs` reads `FocusManager`), so the mockup's "focused" gallery
 //!   state is not rendered here and the gallery has no cell for it. There

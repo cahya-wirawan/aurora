@@ -891,11 +891,18 @@ impl<W> WidgetTree<W> {
         TreeUpdate {
             nodes,
             tree: Some(Tree::new(self.root)),
-            tree_id: TreeId::ROOT,
+            tree_id: ACCESSIBILITY_TREE_ID,
             focus,
         }
     }
 }
+
+/// The one `accesskit::TreeId` every [`WidgetTree::accessibility_update`]
+/// is published under — and therefore the only `target_tree` an incoming
+/// `accesskit::ActionRequest` can legitimately name
+/// (`crate::action::handle_action` rejects any other). One constant, so
+/// the two cannot drift apart.
+pub const ACCESSIBILITY_TREE_ID: TreeId = TreeId::ROOT;
 
 /// Half-open containment — `point` is inside `rect` if `rect.x <=
 /// point.x < rect.right()` (and the same for `y`) — matching
