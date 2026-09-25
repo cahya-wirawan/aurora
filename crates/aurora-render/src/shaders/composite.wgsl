@@ -505,8 +505,14 @@ fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
 //
 // **`abs()` on the difference, not `max(cb - s.rgb, 0.0)`.** Those two
 // agree wherever `Cb >= Cs` and disagree everywhere else, and the second
-// is `Subtract`, a different, still-CPU-only mode. The fixtures in this
-// crate's `composite_difference_*` tests separate the two deliberately:
+// is `Subtract`, a different mode -- **on the GPU itself as of 0.118.0**,
+// as `fs_composite_subtract` at the bottom of this file, so this hazard
+// is now live in both directions rather than pointing at a mode that does
+// not exist here. That is the sharpest `fragment_entry` hazard either
+// entry point has, because the agreement is not a single point or a
+// measure-zero curve: it is the whole closed half-plane `Cb >= Cs`. The
+// fixtures in this crate's `composite_difference_*` tests separate the two
+// deliberately:
 // each has at least one channel where `Cb < Cs`, so a `max(..., 0)` in
 // place of the `abs()` here fails them rather than passing by accident.
 //
@@ -2277,5 +2283,174 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
         soft_light_channel(cb.g, s.g),
         soft_light_channel(cb.b, s.b),
     );
+    return fold_over(s, bd, b);
+}
+
+// `blend_channel`'s own `BlendMode::Subtract` arm (src/composite.rs),
+// componentwise -- the **seventeenth** blend mode ported to WGSL (0.118.0),
+// and the simplest formula in the whole series. Derived textually from that
+// Rust arm:
+//
+//     BlendMode::Subtract => (cb - cs).max(0.0)
+//
+// one subtraction and one one-sided clamp. The `vec3<f32>(0.0)` splat rather
+// than a bare `0.0` is the same WGSL typing requirement
+// `fs_composite_linear_burn` above documents: `max` needs both operands at the
+// same type, so the scalar form does not type-check.
+//
+// **The clamp is part of the mode, not a defensive guard** -- the same
+// relationship `fs_composite_linear_burn`'s has to its own sum. `Cb - Cs`
+// reaches `-1` at `Cb = 0, Cs = 1`, and Photoshop's "Subtract" is *defined* as
+// the clamped difference; dropping the `max` would compute a different function
+// on the whole open half-plane `Cb < Cs` and emit negative colour channels.
+//
+// **Four analysis categories this file spends paragraphs on elsewhere are
+// genuinely inapplicable here, and are listed rather than skipped silently:**
+//
+//   - **branch-boundary killability** -- there is no branch. `max` is a
+//     selection, not a control-flow split, so there is no `<=`-vs-`<`
+//     comparison to mutate and no boundary test to write. `Overlay`,
+//     `HardLight`, `VividLight`, `HardMix`, `PinLight` and `SoftLight` each
+//     needed one; this mode has nothing to put in it;
+//   - **domain safety and portability guards** -- there is no division, no
+//     `sqrt` and no reciprocal, so none of `color_burn_channel`'s /
+//     `color_dodge_channel`'s / `soft_light_d`'s guarded-operation analysis
+//     transfers. Every operand reaches every operation, and every result is
+//     defined under IEEE-754 for every finite input. There is no
+//     WGSL-indeterminate-value gap for an unverified backend to differ on in
+//     *value* rather than in rounding;
+//   - **`select()` versus a real per-channel branch** -- the question does not
+//     arise. The formula is one componentwise `vec3` expression, so there is
+//     no discarded arm to worry about evaluating;
+//   - **dependence on `straight_backdrop`'s no-clamp property** -- none.
+//     `max(cb - cs, 0)` is total and monotone in `cb` for every finite `cb`,
+//     including the out-of-gamut `Cb > 1` and `Cb < 0` that make
+//     `fs_composite_pin_light`'s boundary mutation killable and
+//     `soft_light_d`'s inner guard load-bearing. Nothing here behaves
+//     differently outside `[0, 1]`.
+//
+// **The transpose result is an exact identity, and it is the strongest in the
+// series.** Write `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`. Over an
+// opaque backdrop at effective alpha `a`, a transposed `src`/`backdrop`
+// dispatch arm shifts the output by `out - out_transposed = (1 - a)*D0 + a*D1`.
+// Here `B(Cb, Cs) = max(Cb - Cs, 0)` and `B(Cs, Cb) = max(Cs - Cb, 0)` are the
+// positive and negative parts of *the same number* `D0`, so
+// `D1 = D0⁺ - D0⁻ = D0` identically:
+//
+//   - if `D0 >= 0`: `B(Cb, Cs) = D0`, `B(Cs, Cb) = 0`, so `D1 = D0`;
+//   - if `D0 < 0`: `B(Cb, Cs) = 0`, `B(Cs, Cb) = -D0`, so `D1 = 0 - (-D0) = D0`.
+//
+// Substituting, `out - out_transposed = (1 - a)*D0 + a*D0 = D0` **for every
+// `a`, under the equal-alpha premise the next paragraph states precisely --
+// see it before applying this to a fixture whose two swapped roles carry
+// different alphas.** So the blind set is exactly `{Cb == Cs}` and there is
+// **no blind alpha at all** under that premise: the usual
+// `a* = D0/(D0 - D1)` has a zero denominator, because `D0 - D1 == 0` always.
+// That is stronger than every prior mode's
+// result in kind, not just in degree -- `SoftLight`'s "no interior blind
+// alpha" came from an exhaustive sweep of all 235,960,321 in-gamut `f16`
+// pairs, whereas this is a closed-form identity holding off the grid and out
+// of gamut too. It is a *proven identity*, not a search finding, and should
+// not be described as swept.
+//
+// **Its premise, stated because 0.118.0 left it implicit and one comment then
+// over-applied it (0.118.1).** `D1 = D0` is a property of the blend term
+// alone and is unconditional. The *gap* identity above is not: the single
+// shorthand `out = (1 - a)*Cb + a*B` has to be **both** orders' fold, and it
+// only is when the two transposed slots share an alpha -- in practice
+// `s.a == 1.0` over an opaque accumulator, with all the non-unit alpha coming
+// from the `opacity` uniform, which stays attached to the source slot across
+// the swap. When they differ, transposing the bindings also swaps which alpha
+// becomes `fold_over`'s `a` and which becomes `straight_backdrop`'s
+// un-premultiply divisor, and the gap is no longer `D0`. Two measured
+// consequences on this adapter, both real runs rather than derivations:
+//
+//   - `aurora_render`'s own
+//     `composite_subtract_over_with_opacity_subtracts_and_clamps_per_channel`
+//     has a source alpha of `0.5`, and its transposed gaps are
+//     `(+0.3125, -0.5625, -0.6875)`, not `D0`'s `(+0.625, -0.25, -0.5625)`.
+//     The swap is still caught there, in all three channels;
+//   - the blind set is *not* `{Cb == Cs}` once the alphas differ. `Cb = 0.75`
+//     opaque against `Cs = 0.5` at source alpha `0.5` and opacity `1.0`
+//     composites to exactly `(0.5, 0.5, 0.5, 1.0)` **both ways**, a genuinely
+//     blind point with `Cb != Cs`. Solving the fold in that regime (opaque
+//     accumulator, source alpha `sa`, uniform opacity `p`, in the branch
+//     `Cb >= Cs` and `Cs > sa*Cb`) gives the blind locus
+//     `Cs = Cb*(1 - p + 2*sa*p)/(1 + sa*p)`, of which that texel is the
+//     `sa = 1/2, p = 1` case. At `sa = 1` it collapses to `Cs == Cb`, which is
+//     why the equal-alpha statement above is the correct one and not merely
+//     the convenient one.
+//
+// Where the identity is *used* -- `aurora-app`'s
+// `NORMAL_MULTIPLY_SUBTRACT_STACK`, whose three layers are all opaque with
+// only the uniform opacity non-unit -- the premise holds, and the gap there is
+// `D0` at every opacity, measured at `0.5` and at `1.0`.
+//
+// **Three near misses, the first of which is the sharpest in this file:**
+//
+//   - **`abs(cb - s.rgb)` is `Difference`** (`fs_composite_difference` far
+//     above), and the two are **identical on the entire closed half-plane
+//     `Cb >= Cs`**, since `|Cb - Cs| = Cb - Cs` there and that is exactly what
+//     this mode's unclamped branch returns. Every prior mode's rival
+//     coincidence in this file was a point, a curve or a conditional region;
+//     this one is half the unit square. `Difference` is a live entry point and
+//     a live dispatch arm, so a `fragment_entry` naming it -- or a dropped
+//     `max` reaching for `abs` instead -- is invisible in any channel with
+//     `Cb >= Cs`. **Consequence for every fixture here: at least one channel
+//     must have `Cb < Cs`, i.e. must actually clamp.** A fully unclamped
+//     fixture cannot separate the two at all;
+//   - **`max(cb + s.rgb - 1.0, vec3<f32>(0.0))` is `LinearBurn`**
+//     (`fs_composite_linear_burn` above), which shares this mode's clamp
+//     direction and its `max(..., 0)` exactly and differs only in what is
+//     combined. In an *unclamped* channel the two coincide iff
+//     `Cb - Cs == Cb + Cs - 1`, i.e. iff `Cs == 0.5`; in a channel where
+//     *both* clamp they coincide trivially at `0`. So a fixture needs a
+//     clamped channel whose `LinearBurn` sum stays above `1.0` to separate
+//     them, which is what the `composite_subtract_*` fixtures carry.
+//     `LinearBurn` is also a live arm;
+//   - **`cb - s.rgb` with no clamp at all** is not any named PSD mode, but it
+//     agrees with this one on the same `Cb >= Cs` half-plane and emits
+//     negative channels below it -- caught only by a clamped channel, the same
+//     one `Difference` needs.
+//
+// **Not a detector of `straight_backdrop`'s `ab > 0.0` guard being deleted --
+// predicted from 0.110.0's rule, then measured.** With the guard gone `cb` is
+// `0.0/0.0`, a `NaN`. Subtraction propagates it (`NaN - cs` is `NaN`, exactly
+// as `fs_composite_linear_burn`'s addition does), but the result then reaches
+// `max(NaN, 0.0)`, and on this adapter `FMax` with a `NaN` operand returns the
+// non-`NaN` one -- probed directly in 0.109.1 for this very operand position.
+// So `b` is finite before `fold_over` ever sees it, and
+// `composite_subtract_over_with_opacity_is_the_source_alone_where_the_backdrop_
+// is_transparent` stays green with the guard deleted. Measured in 0.118.0, not
+// assumed. The detector count stays at **six of seventeen** (`Multiply`,
+// `Screen`, `Difference`, `Overlay`, `HardLight`, `SoftLight`). As with every
+// other laundering mode, that argument rests on this vendor's `FMin`/`FMax`
+// behaviour, which WGSL leaves undefined on a `NaN` operand -- so it is this
+// adapter's result and not a portability guarantee.
+//
+// **Degeneracies that constrain every fixture:**
+//
+//   1. `Subtract(0, Cs) = 0` for every `Cs >= 0` -- a zero backdrop channel
+//      erases the source entirely, exactly as `LinearBurn`'s does.
+//   2. `Subtract(Cb, 0) = Cb` -- a zero *source* channel is a total no-op, and
+//      is also where this mode coincides with `Difference`, `Lighten`,
+//      `LinearDodge` and `Screen` at once.
+//   3. A clamped channel (`Cb < Cs`) outputs `0` and so carries no information
+//      about how far below the boundary the operands were: `(0.25, 0.5)` and
+//      `(0.1, 0.9)` both give `0`. A clamped channel discriminates the clamp,
+//      not the operands -- which is why the fixtures pair each clamped channel
+//      with at least one unclamped one.
+//   4. `Cb == Cs` in a channel makes `B = 0` *and* is the mode's entire
+//      transpose-blind set, so the solid-colour fixtures avoid it.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2) and
+// `TileCompositor::bind_group_layout_blend` with the sixteen entry points
+// above; no new binding, no new layout.
+@fragment
+fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let cb = straight_backdrop(bd);
+    let b = max(cb - s.rgb, vec3<f32>(0.0)); // blend_rgb(Subtract, cb, cs)
     return fold_over(s, bd, b);
 }
