@@ -2341,9 +2341,12 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
 //   - if `D0 < 0`: `B(Cb, Cs) = 0`, `B(Cs, Cb) = -D0`, so `D1 = 0 - (-D0) = D0`.
 //
 // Substituting, `out - out_transposed = (1 - a)*D0 + a*D0 = D0` **for every
-// `a`**. So the blind set is exactly `{Cb == Cs}` and there is **no blind
-// alpha at all**: the usual `a* = D0/(D0 - D1)` has a zero denominator,
-// because `D0 - D1 == 0` always. That is stronger than every prior mode's
+// `a`, under the equal-alpha premise the next paragraph states precisely --
+// see it before applying this to a fixture whose two swapped roles carry
+// different alphas.** So the blind set is exactly `{Cb == Cs}` and there is
+// **no blind alpha at all** under that premise: the usual
+// `a* = D0/(D0 - D1)` has a zero denominator, because `D0 - D1 == 0` always.
+// That is stronger than every prior mode's
 // result in kind, not just in degree -- `SoftLight`'s "no interior blind
 // alpha" came from an exhaustive sweep of all 235,960,321 in-gamut `f16`
 // pairs, whereas this is a closed-form identity holding off the grid and out

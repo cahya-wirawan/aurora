@@ -4272,9 +4272,10 @@ impl TileCompositor {
     /// series.** With `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, the two
     /// blend terms `max(Cb - Cs, 0)` and `max(Cs - Cb, 0)` are the positive and
     /// negative parts of the *same* number, so `D1 = D0` identically — hence
-    /// `out - out_transposed = (1 - a)*D0 + a*D0 = D0` for **every** `a`. The
+    /// `out - out_transposed = (1 - a)*D0 + a*D0 = D0` for **every** `a`, under
+    /// the equal-alpha premise the next paragraph states precisely. The
     /// blind set is exactly `Cb == Cs` and there is **no blind alpha whatsoever**
-    /// (`a* = D0/(D0 - D1)` has a zero denominator). That is a closed-form
+    /// under that premise (`a* = D0/(D0 - D1)` has a zero denominator). That is a closed-form
     /// identity, not a sweep result: it holds off any grid and out of gamut,
     /// which is what makes it stronger in kind than `SoftLight`'s exhaustively
     /// swept "no interior blind alpha".

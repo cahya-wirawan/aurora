@@ -36575,8 +36575,10 @@ mod tests {
     /// than a fixture property or a sweep result.** `B(Cb, Cs)` and `B(Cs, Cb)`
     /// are the positive and negative parts of the same number `D0 = Cb - Cs`, so
     /// `D1 = D0` identically and `out - out_transposed = (1 - a)*D0 + a*D0 = D0`
-    /// for all `a`; the blind set is exactly `Cb == Cs` (which this fixture has
-    /// none of) and no blind alpha exists at all, `a* = D0/(D0 - D1)` having a
+    /// for all `a`, under the equal-alpha premise stated two sentences below;
+    /// the blind set is exactly `Cb == Cs` (which this fixture has
+    /// none of) and no blind alpha exists at all under that premise,
+    /// `a* = D0/(D0 - D1)` having a
     /// zero denominator. **The premise, made explicit in 0.118.1:** that
     /// substitution needs `(1 - a)*Cb + a*B` to be *both* orders' fold, so it
     /// needs the two transposed slots to share an alpha — satisfied here,
