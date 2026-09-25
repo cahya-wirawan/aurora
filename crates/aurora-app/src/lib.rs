@@ -521,7 +521,10 @@ use aurora_widgets::widgets::{
     insert_command_palette, insert_dialog, move_command_palette_selection,
     set_command_palette_query,
 };
-use aurora_widgets::{FocusManager, GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
+use aurora_widgets::{
+    FocusManager, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline,
+    WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -562,12 +565,14 @@ fn load_theme() -> anyhow::Result<Theme> {
 fn background_color_from_theme(theme: &Theme) -> wgpu::Color {
     let [r, g, b] = theme.surface.app.to_srgb_f32();
     wgpu::Color {
-        // The surface format is sRGB-aware (`Bgra8UnormSrgb`, per
-        // `aurora-gpu`'s own `create_surface`/`examples/surface_smoke.rs`),
-        // and every graphics API's clear-colour convention expects
-        // linear values for an sRGB-typed render target, not the
-        // token's own sRGB-gamma-encoded bytes — using those directly
-        // would wash the colour out (a classic double-encoding bug).
+        // For an sRGB-aware surface format (what `aurora-gpu`'s
+        // `create_surface` picks whenever the surface offers one, via
+        // `choose_surface_format`), every graphics API's clear-colour
+        // convention expects linear values, not the token's own
+        // sRGB-gamma-encoded bytes — using those directly would wash
+        // the colour out (a classic double-encoding bug). A non-sRGB
+        // fallback surface takes the encoded values instead; see
+        // [`clear_color_for_format`].
         r: f64::from(aurora_color::srgb_to_linear(r)),
         g: f64::from(aurora_color::srgb_to_linear(g)),
         b: f64::from(aurora_color::srgb_to_linear(b)),
@@ -575,9 +580,48 @@ fn background_color_from_theme(theme: &Theme) -> wgpu::Color {
     }
 }
 
+/// The window clear colour for a surface of `format`: `linear` (the
+/// [`background_color_from_theme`] value) for an sRGB-aware format, or
+/// the theme's own sRGB-encoded `surface.app` token for a plain one,
+/// which stores what it is given. The same one rule
+/// [`target_paint_color`] applies to widget solids.
+#[must_use]
+fn clear_color_for_format(
+    theme: &Theme,
+    linear: wgpu::Color,
+    format: wgpu::TextureFormat,
+) -> wgpu::Color {
+    if format.is_srgb() {
+        return linear;
+    }
+    let [r, g, b] = theme.surface.app.to_srgb_f32();
+    wgpu::Color {
+        r: f64::from(r),
+        g: f64::from(g),
+        b: f64::from(b),
+        a: 1.0,
+    }
+}
+
+/// A widget solid's paint colour for a render target of `format`: for
+/// an sRGB-aware target, [`linearize_paint_color`] (the hardware
+/// re-encodes on store); for a plain target, unchanged (it stores the
+/// value it is given, so the gamma-encoded colour *is* the right byte).
+/// This is the one colour rule both widget pipelines follow: the
+/// gradient pipeline makes the same choice per fragment, from the same
+/// target format (`aurora_widgets::GradientPipeline`).
+#[must_use]
+fn target_paint_color(color: [f32; 4], format: wgpu::TextureFormat) -> [f32; 4] {
+    if format.is_srgb() {
+        linearize_paint_color(color)
+    } else {
+        color
+    }
+}
+
 /// Linearizes a widget's own straight, sRGB-gamma-encoded paint colour
-/// ([`aurora_widgets::paint_widget`]'s own return convention) for the
-/// swapchain surface's sRGB-aware target format — the same "the target
+/// ([`aurora_widgets::paint_widget`]'s own return convention) for an
+/// sRGB-aware target format ([`target_paint_color`]) — the same "the target
 /// expects linear, using gamma-encoded values directly double-encodes
 /// and washes the colour out" reasoning [`background_color_from_theme`]
 /// already applies to the window's own clear colour. Alpha is a
@@ -3808,6 +3852,8 @@ fn translate_named_key(named: winit::keyboard::NamedKey) -> Option<NamedKey> {
         Winit::ArrowDown => NamedKey::ArrowDown,
         Winit::ArrowLeft => NamedKey::ArrowLeft,
         Winit::ArrowRight => NamedKey::ArrowRight,
+        Winit::Home => NamedKey::Home,
+        Winit::End => NamedKey::End,
         Winit::F1 => NamedKey::F1,
         Winit::F2 => NamedKey::F2,
         Winit::F3 => NamedKey::F3,
@@ -13760,6 +13806,11 @@ struct App {
     /// `canvas_pipeline` doesn't need a computed canvas area to size
     /// itself to, so it's never skipped once a device exists.
     path_pipeline: Option<PathPipeline>,
+    /// The gradient renderer (`aurora_widgets::GradientPipeline`) that
+    /// draws a widget's `PaintOp::Gradient` ops, beside `path_pipeline`
+    /// in the same pass — built in `resumed` under the same "needs only a
+    /// real device" rule.
+    gradient_pipeline: Option<GradientPipeline>,
     /// The pointer's last known position, in the *window's* own logical
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
@@ -13998,6 +14049,7 @@ impl App {
             canvas_pipeline: None,
             compositor: None,
             path_pipeline: None,
+            gradient_pipeline: None,
             pointer_position: None,
             drag: None,
             rail_resize: None,
@@ -15667,6 +15719,7 @@ impl App {
                     &self.theme,
                     &self.scales,
                     gpu,
+                    surface.format(),
                     self.scale_factor,
                 );
 
@@ -15714,7 +15767,11 @@ impl App {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(self.background),
+                                load: wgpu::LoadOp::Clear(clear_color_for_format(
+                                    &self.theme,
+                                    self.background,
+                                    surface.format(),
+                                )),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -15740,15 +15797,28 @@ impl App {
 
                     if !widget_paints.is_empty()
                         && let Some(path_pipeline) = self.path_pipeline.as_mut()
+                        && let Some(gradient_pipeline) = self.gradient_pipeline.as_mut()
                     {
                         draw_widget_paints(
                             &mut pass,
                             path_pipeline,
+                            gradient_pipeline,
                             gpu,
                             surface.format(),
                             surface.size(),
                             self.scale_factor,
                             &widget_paints,
+                        );
+                    } else if !widget_paints.is_empty() {
+                        // Both pipelines are created together in `resumed`,
+                        // so this is unreachable today -- but if one ever
+                        // goes missing the whole widget layer vanishes, and
+                        // that must not happen silently.
+                        tracing::warn!(
+                            paints = widget_paints.len(),
+                            path_pipeline = self.path_pipeline.is_some(),
+                            gradient_pipeline = self.gradient_pipeline.is_some(),
+                            "widget pipelines missing; no widgets drawn this frame"
                         );
                     }
                 }
@@ -15769,45 +15839,50 @@ impl App {
     }
 }
 
-/// Resolves every widget in `tree` into a real, uploaded `GpuMesh`
-/// (`aurora_widgets::paint_widget`, in [`WidgetTree::paint_order`]'s own
-/// order — root first, each child subtree before the next sibling's
-/// own, so a later entry in the returned `Vec` draws on top of an
-/// earlier one, the same "last-painted child is topmost" convention
-/// `WidgetTree::hit_test` already assumes for the reverse (pointer-hit)
-/// direction).
+/// Resolves every widget in `tree` into its [`PaintOp`]s for a render
+/// target of `format` — the pure, CPU-only half of
+/// [`collect_widget_paints`], split out so the colour rule below is
+/// testable without a GPU.
 ///
-/// Called *before* [`App::redraw`]'s own render pass begins, not from
-/// inside it: [`PathPipeline::draw`] needs `mesh: &'pass GpuMesh`, so
-/// every `GpuMesh` it draws must outlive the pass — one uploaded fresh
-/// inside the pass's own draw loop would be dropped at the end of that
-/// iteration, before the pass (borrowed for `'pass`) is done with it.
-/// Building the whole list first, then only borrowing from it inside
-/// the pass ([`draw_widget_paints`]), is the shape that forces.
+/// Walks [`WidgetTree::paint_order`] (root first, each child subtree
+/// before the next sibling's own, so a later op draws on top of an
+/// earlier one — the same "last-painted child is topmost" convention
+/// `WidgetTree::hit_test` assumes for the reverse direction).
 ///
 /// A widget whose own paint fails to tessellate (`WidgetError::Paint`)
 /// is logged and skipped, not fatal to the frame — one broken widget's
-/// own geometry shouldn't blank the rest of a real user's UI. Colour is
-/// linearized ([`linearize_paint_color`]) here, once, rather than by
-/// [`draw_widget_paints`] on every draw call.
+/// own geometry shouldn't blank the rest of a real user's UI. A solid
+/// op's colour is converted for `format` ([`target_paint_color`]:
+/// linearized for an sRGB-aware target, passed through for a plain one)
+/// here, once, rather than by [`draw_widget_paints`] on every draw call.
+/// A gradient op's vertex colours are deliberately passed through
+/// **untouched**: the gradient pipeline interpolates in gamma-encoded
+/// sRGB and linearizes per fragment itself when the target is sRGB-aware
+/// (see `aurora_widgets::GradientPipeline`); linearizing the vertices
+/// here would interpolate in linear light instead and change the
+/// gradient — for the colour picker (`0.125.0`, the first gradient
+/// consumer) that would show a square that no longer matches the colour
+/// it reports.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-fn collect_widget_paints(
+fn target_paint_ops(
     tree: &WidgetTree<WidgetKind>,
     theme: &Theme,
     scales: &Scales,
-    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
     scale_factor: f64,
-) -> Vec<(GpuMesh, [f32; 4])> {
+) -> Vec<PaintOp> {
     let scale_factor = scale_factor as f32;
-    let mut widget_paints = Vec::new();
+    let mut ops = Vec::new();
     for id in tree.paint_order() {
-        match paint_widget(tree, id, theme, scales, scale_factor) {
-            Ok(paints) => {
-                for (mesh, color) in paints {
-                    let gpu_mesh = GpuMesh::upload(gpu.device(), gpu.queue(), &mesh);
-                    widget_paints.push((gpu_mesh, linearize_paint_color(color)));
-                }
+        match paint_widget_ops(tree, id, theme, scales, scale_factor) {
+            Ok(widget_ops) => {
+                ops.extend(widget_ops.into_iter().map(|op| match op {
+                    PaintOp::Solid((mesh, color)) => {
+                        PaintOp::Solid((mesh, target_paint_color(color, format)))
+                    }
+                    gradient @ PaintOp::Gradient(_) => gradient,
+                }));
             }
             Err(err) => {
                 tracing::warn!(
@@ -15818,7 +15893,39 @@ fn collect_widget_paints(
             }
         }
     }
-    widget_paints
+    ops
+}
+
+/// Uploads every op [`target_paint_ops`] resolves for `tree` as a real
+/// `GpuMesh`/`GpuColorMesh`, in the same order.
+///
+/// Called *before* [`App::redraw`]'s own render pass begins, not from
+/// inside it: [`PathPipeline::draw`] needs `mesh: &'pass GpuMesh`, so
+/// every `GpuMesh` it draws must outlive the pass — one uploaded fresh
+/// inside the pass's own draw loop would be dropped at the end of that
+/// iteration, before the pass (borrowed for `'pass`) is done with it.
+/// Building the whole list first, then only borrowing from it inside
+/// the pass ([`draw_widget_paints`]), is the shape that forces.
+#[must_use]
+fn collect_widget_paints(
+    tree: &WidgetTree<WidgetKind>,
+    theme: &Theme,
+    scales: &Scales,
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    scale_factor: f64,
+) -> Vec<GpuPaintOp> {
+    target_paint_ops(tree, theme, scales, format, scale_factor)
+        .into_iter()
+        .map(|op| match op {
+            PaintOp::Solid((mesh, color)) => {
+                GpuPaintOp::Solid(GpuMesh::upload(gpu.device(), gpu.queue(), &mesh), color)
+            }
+            PaintOp::Gradient(mesh) => {
+                GpuPaintOp::Gradient(GpuColorMesh::upload(gpu.device(), gpu.queue(), &mesh))
+            }
+        })
+        .collect()
 }
 
 /// Draws `widget_paints` ([`collect_widget_paints`]) within `pass`,
@@ -15839,14 +15946,19 @@ fn collect_widget_paints(
 /// with logical, not physical, size — a fraction of the window is the
 /// same fraction regardless of which pixel unit measures it, so this is
 /// correct at any DPI scale, not just `1.0`.
+// One more than clippy's default: the gradient pipeline joined the
+// path pipeline as a second, separately owned renderer, and bundling the
+// two `&mut` borrows into a struct would only move the same fields.
+#[allow(clippy::too_many_arguments)]
 fn draw_widget_paints<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
     path_pipeline: &mut PathPipeline,
+    gradient_pipeline: &mut GradientPipeline,
     gpu: &GpuContext,
     format: wgpu::TextureFormat,
     physical_size: (u32, u32),
     scale_factor: f64,
-    widget_paints: &'pass [(GpuMesh, [f32; 4])],
+    widget_paints: &'pass [GpuPaintOp],
 ) {
     let (physical_width, physical_height) = physical_size;
     #[allow(clippy::cast_precision_loss)]
@@ -15859,13 +15971,16 @@ fn draw_widget_paints<'pass>(
         1.0,
     );
     let viewport_size = logical_size(physical_size, scale_factor);
-    let pipeline = path_pipeline.pipeline(gpu.device(), format);
-    pass.set_pipeline(pipeline);
-    for (mesh, color) in widget_paints {
-        let bind_group = path_pipeline.bind_group(gpu.device(), gpu.queue(), viewport_size, *color);
-        pass.set_bind_group(0, &bind_group, &[]);
-        path_pipeline.draw(pass, mesh);
-    }
+    draw_paint_ops(
+        pass,
+        path_pipeline,
+        gradient_pipeline,
+        gpu.device(),
+        gpu.queue(),
+        format,
+        viewport_size,
+        widget_paints,
+    );
 }
 
 /// How often [`App::about_to_wait`] re-checks muda's own menu-event
@@ -15974,6 +16089,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // device -- no computed canvas area to size itself to -- so it's
         // never skipped here.
         self.path_pipeline = Some(PathPipeline::new(gpu.device()));
+        self.gradient_pipeline = Some(GradientPipeline::new(gpu.device()));
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -16289,39 +16405,39 @@ mod tests {
         COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
         Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
-        GpuBlendDispatch, GpuBlendDispatches, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS, RECOMPOSITE_MARK_IMBALANCE,
-        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
-        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
-        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
-        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_roots_into_tile, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
-        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
-        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
-        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
-        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
-        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        GpuBlendDispatch, GpuBlendDispatches, GpuPaintOp, Key, KeyChord, MIN_WINDOW_HEIGHT,
+        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
+        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
+        RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
+        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
+        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
+        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
+        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_roots_into_tile,
+        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
+        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
+        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
+        skipped_tiles_message, skipped_tiles_warning, splitmix64, take_gpu_blend_dispatch_count,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
+        toggle_command_palette, topmost_pixel_layer, translate_blend_mode, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -18433,6 +18549,20 @@ mod tests {
                 winit::keyboard::NamedKey::Escape
             )),
             Some(Key::Named(NamedKey::Escape))
+        );
+    }
+
+    #[test]
+    fn translate_key_maps_home_and_end_for_the_tab_bar() {
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(
+                winit::keyboard::NamedKey::Home
+            )),
+            Some(Key::Named(NamedKey::Home))
+        );
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::End)),
+            Some(Key::Named(NamedKey::End))
         );
     }
 
@@ -21939,12 +22069,223 @@ mod tests {
             unreachable!("{err:?}");
         }
 
-        let paints = collect_widget_paints(&tree, &theme, &scales, &context, 1.0);
+        let paints = collect_widget_paints(
+            &tree,
+            &theme,
+            &scales,
+            &context,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1.0,
+        );
         assert_eq!(
             paints.len(),
             1,
             "only the Button has paint defined -- the plain Container root does not"
         );
+        assert!(
+            matches!(paints.first(), Some(GpuPaintOp::Solid(..))),
+            "a Button paints a solid shape, never a gradient: {paints:?}"
+        );
+    }
+
+    /// One colour rule for both widget pipelines: a solid's colour is
+    /// linearized for an sRGB-aware target and passed through unchanged
+    /// for a plain one -- the same choice the gradient pipeline makes
+    /// per fragment from the same format. Before this, solids were
+    /// linearized unconditionally, so on a non-sRGB swapchain a 0.5
+    /// grey solid stored about 0.216 while a 0.5 grey gradient stored
+    /// 0.5.
+    #[test]
+    fn collect_widget_paints_linearizes_solids_only_for_an_srgb_target() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let button = match insert_button(&mut tree, root, &scales, "OK") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            button,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 32,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let authored = match super::paint_widget_ops(&tree, button, &theme, &scales, 1.0) {
+            Ok(ops) => match ops.into_iter().next() {
+                Some(super::PaintOp::Solid((_, color))) => color,
+                other => unreachable!("a Button paints one solid first: {other:?}"),
+            },
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            authored
+                .iter()
+                .take(3)
+                .any(|&channel| channel > 0.04045 && channel < 1.0),
+            "the fixture needs a channel the sRGB curve actually moves: {authored:?}"
+        );
+        let solid_colour = |format: wgpu::TextureFormat| -> [f32; 4] {
+            match collect_widget_paints(&tree, &theme, &scales, &context, format, 1.0)
+                .into_iter()
+                .next()
+            {
+                Some(GpuPaintOp::Solid(_, color)) => color,
+                other => unreachable!("expected a solid: {other:?}"),
+            }
+        };
+        for plain in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ] {
+            assert_eq!(
+                solid_colour(plain).map(f32::to_bits),
+                authored.map(f32::to_bits),
+                "{plain:?} stores what it is given: the solid must pass through unlinearized"
+            );
+        }
+        for srgb in [
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ] {
+            assert_eq!(
+                solid_colour(srgb).map(f32::to_bits),
+                super::linearize_paint_color(authored).map(f32::to_bits),
+                "{srgb:?} re-encodes on store: the solid must be linearized"
+            );
+        }
+    }
+
+    /// The pure half of [`collect_widget_paints`], headless: for every
+    /// target format the app can pick, every gradient vertex colour of a
+    /// real colour picker reaches the upload stage **bit-for-bit** as
+    /// `paint_widget_ops` produced it (the gradient pipeline linearizes
+    /// per fragment itself), while every solid still follows
+    /// [`target_paint_color`]. Needs no GPU, so it runs everywhere.
+    #[test]
+    fn target_paint_ops_never_linearizes_gradient_vertices_for_any_format() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let orange = aurora_theme::Color {
+            r: 255,
+            g: 128,
+            b: 0,
+        };
+        if let Err(err) = aurora_widgets::widgets::insert_color_picker(
+            &mut tree, root, &scales, "Colour", orange, 96.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+        let mut authored = Vec::new();
+        for id in tree.paint_order() {
+            match super::paint_widget_ops(&tree, id, &theme, &scales, 1.0) {
+                Ok(ops) => authored.extend(ops),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let authored_gradients: Vec<_> = authored
+            .iter()
+            .filter_map(|op| match op {
+                super::PaintOp::Gradient(mesh) => Some(mesh.clone()),
+                super::PaintOp::Solid(_) => None,
+            })
+            .collect();
+        assert_eq!(authored_gradients.len(), 2, "the square and the strip");
+        assert!(
+            authored_gradients
+                .iter()
+                .any(|mesh| mesh.vertices.iter().any(|v| v
+                    .color
+                    .iter()
+                    .take(3)
+                    .any(|&c| c > 0.04045 && c < 1.0))),
+            "the fixture needs a vertex channel the sRGB curve actually moves"
+        );
+        for format in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ] {
+            let resolved = super::target_paint_ops(&tree, &theme, &scales, format, 1.0);
+            assert_eq!(resolved.len(), authored.len(), "{format:?}");
+            for (got, want) in resolved.iter().zip(&authored) {
+                match (got, want) {
+                    (super::PaintOp::Gradient(got), super::PaintOp::Gradient(want)) => {
+                        assert_eq!(got.indices, want.indices);
+                        assert_eq!(got.vertices.len(), want.vertices.len());
+                        for (g, w) in got.vertices.iter().zip(&want.vertices) {
+                            assert_eq!(g.position, w.position);
+                            assert_eq!(
+                                g.color.map(f32::to_bits),
+                                w.color.map(f32::to_bits),
+                                "{format:?}: a gradient vertex must pass through untouched"
+                            );
+                        }
+                    }
+                    (
+                        super::PaintOp::Solid((got_mesh, got)),
+                        super::PaintOp::Solid((want_mesh, want)),
+                    ) => {
+                        assert_eq!(got_mesh, want_mesh);
+                        assert_eq!(
+                            got.map(f32::to_bits),
+                            super::target_paint_color(*want, format).map(f32::to_bits),
+                            "{format:?}"
+                        );
+                    }
+                    other => unreachable!("op order changed: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The clear colour follows the same rule as widget solids.
+    #[test]
+    fn clear_color_is_linear_only_for_an_srgb_target() {
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("the checked-in design files must parse: {err}"),
+        };
+        let linear = background_color_from_theme(&theme);
+        let srgb =
+            super::clear_color_for_format(&theme, linear, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(srgb, linear);
+        let plain = super::clear_color_for_format(&theme, linear, wgpu::TextureFormat::Bgra8Unorm);
+        let [r, g, b] = theme.surface.app.to_srgb_f32();
+        assert_eq!(
+            plain,
+            wgpu::Color {
+                r: f64::from(r),
+                g: f64::from(g),
+                b: f64::from(b),
+                a: 1.0,
+            }
+        );
+        assert!(plain.r > linear.r, "encoded must be brighter than linear");
     }
 
     #[test]

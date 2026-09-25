@@ -260,7 +260,36 @@
       `TextField`/`CommandPalette`. The tree's own rendered gallery is
       two cells, expanded and collapsed; it draws selection highlights
       and indentation only — no disclosure triangle and no row text,
-      since that crate draws no glyphs at all.)
+      since that crate draws no glyphs at all. The Dropdown above has
+      since landed in `aurora-widgets` too, 0.120.0: its rendered
+      gallery is three cells — closed, open with a three-option list
+      and the middle option highlighted, and disabled — and like the
+      tree it draws no text and no ▾ indicator; its "focused" border
+      is keyed on the list being open, since no widget there paints
+      keyboard focus yet. The Tab bar has since landed too, 0.121.0:
+      its rendered gallery is two cells, enabled and disabled, each three
+      tabs with the first selected, painted over the theme's own panel
+      colour — a 1 px rule under the bar and a 2 px accent underline under
+      the selected tab. It draws no tab labels, and there is no "focused"
+      cell at all, because nothing there paints a keyboard-focus ring.
+      The Tooltip has since landed too, 0.122.0: its rendered gallery is
+      one cell, a button with its tooltip shown directly below it, as wide
+      as the button, over the theme's own panel colour. It paints the
+      surface-overlay fill above plus a 1 px default border this mockup
+      does not have (in Light the fill alone is identical to the panel),
+      draws no text, and draws no shadow — nothing there draws shadows
+      yet, so the elevation-1 box-shadow above is not rendered. Whether a
+      tooltip is Elevation 1 (surface-raised) or Elevation 2
+      (surface-overlay, as above) is an open design question.
+      A Menu has since landed too, 0.123.0, with no mockup here at all:
+      its rendered gallery is three cells, each a bordered surface-raised
+      menu of five rows (Cut, a separator, Copy, a disabled Paste,
+      Delete) over the theme's own panel colour — the first row
+      highlighted, then the third after one Down crosses the separator,
+      then a menu whose every action is disabled and so nothing is
+      highlighted. A separator is a 1 px default-border rule. It draws
+      no text. Every token it uses is provisional until a menu mockup
+      exists.)
     </p>
   </section>
 </main>

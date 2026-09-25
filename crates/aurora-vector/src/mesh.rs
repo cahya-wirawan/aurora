@@ -70,10 +70,11 @@ pub struct Mesh {
 }
 
 /// Extracts just the position from whichever vertex kind `lyon` hands
-/// back — every real UI shape this crate tessellates today is a flat,
-/// single-colour fill or stroke, so position is all a caller needs;
-/// per-vertex colour/UV data is separate, still-open follow-on work for
-/// whenever a real GPU consumer needs it.
+/// back — every shape this crate tessellates is a flat, single-colour
+/// fill or stroke, so position is all a caller needs. Per-vertex colour
+/// lives in a separate type, [`crate::ColorMesh`] (`gradient.rs`), built
+/// directly rather than through `lyon`; per-vertex UV/texture data is
+/// still open follow-on work for whenever a real GPU consumer needs it.
 struct PositionOnly;
 
 impl FillVertexConstructor<Point> for PositionOnly {

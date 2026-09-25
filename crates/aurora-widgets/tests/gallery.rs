@@ -242,10 +242,13 @@
 //! neither is in its counts.** `Scrollbar` (0.75.1) and now `TreeView`
 //! (0.76.0) each add a per-theme distinct-pixels test in all five
 //! built-in themes plus five `#[ignore]`d golden-diff tests — so this
-//! file now has code for **40** goldens across **eight** widgets, of
-//! which the 30 committed under `tests/golden/` are blessed and the ten
-//! newest (`scrollbar_gallery*.png`, `tree_view_gallery*.png`) do not
-//! exist at all. Backdrops for both were inherited rather than
+//! file had code for **40** goldens across **eight** widgets **as of
+//! 0.76.0**, of which the 30 committed under `tests/golden/` were
+//! blessed and the ten then-newest (`scrollbar_gallery*.png`,
+//! `tree_view_gallery*.png`) did not exist at all. *Historical figure:*
+//! every widget since (through the colour picker, 0.125.0) has added its
+//! own tests, so count the golden-diff functions and `tests/golden/`
+//! rather than trusting a number in this paragraph. Backdrops for both were inherited rather than
 //! re-derived, and the reasoning is recorded on their own per-theme
 //! test groups rather than repeated up here.
 //!
@@ -325,14 +328,29 @@
 use accesskit::Orientation;
 use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, ScrollbarRange, WidgetKind, insert_button, insert_checkbox,
-    insert_color_swatch, insert_command_palette, insert_dialog, insert_scrollbar, insert_slider,
-    insert_text_field, insert_tree_item, insert_tree_view, new_tree, set_button_disabled,
-    set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled, set_scrollbar_disabled,
+    ColorPickerPart, Hsv, color_picker_state, insert_color_picker, set_color_picker_disabled,
+    set_color_picker_hsv,
+};
+use aurora_widgets::widgets::{
+    CommandEntry, DialogAction, ScrollbarRange, WidgetKind, dropdown_state, insert_button,
+    insert_checkbox, insert_color_swatch, insert_command_palette, insert_dialog, insert_dropdown,
+    insert_scrollbar, insert_slider, insert_text_field, insert_tree_item, insert_tree_view,
+    new_tree, set_button_disabled, set_button_pressed, set_checkbox_disabled,
+    set_color_swatch_disabled, set_dropdown_disabled, set_dropdown_open, set_scrollbar_disabled,
     set_slider_disabled, set_text_field_disabled, set_tree_item_disabled, set_tree_item_expanded,
     set_tree_item_selected, toggle_checkbox,
 };
-use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
+use aurora_widgets::widgets::{
+    MenuItem, MenuKey, MenuOutcome, Tooltip, handle_menu_key, insert_tab_bar, menu_state,
+    open_menu, set_tab_bar_disabled, tab_bar_state,
+};
+use aurora_widgets::widgets::{
+    curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
+};
+use aurora_widgets::{
+    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline, WidgetId,
+    WidgetTree, draw_paint_ops, paint_widget_ops,
+};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
 use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
@@ -498,6 +516,30 @@ const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = (
 /// leaves a generous band of backdrop above and below it.
 const DIALOG_CELL: (u32, u32) = (256, 192);
 const DIALOG_GALLERY_SIZE: (u32, u32) = DIALOG_CELL;
+
+/// `Dropdown`'s own three cells — closed, open (three options, the
+/// second highlighted), and disabled — each a `DROPDOWN_CELL` square with
+/// a `DROPDOWN_CELL_PADDING` inset, so each control is `128 - 2*16 = 96`
+/// px wide and the open cell's list (three 21 px rows under a 21 px
+/// control) ends at `y = 16 + 21 + 63 = 100`, inside its own cell.
+/// `128 * 3 * 4 = 1536 = 6 * 256`, row-aligned (see
+/// [`BUTTON_GALLERY_SIZE`]).
+const DROPDOWN_CELL: (u32, u32) = (128, 128);
+const DROPDOWN_CELL_PADDING: u32 = 16;
+const DROPDOWN_GALLERY_SIZE: (u32, u32) = (DROPDOWN_CELL.0 * 3, DROPDOWN_CELL.1);
+/// One option row / the control's own height — `widgets::row_height`,
+/// restated as a number and checked against the real layout by
+/// `dropdown_gallery_lays_out_the_list_under_the_control`, the same
+/// "not a second source of truth" arrangement `TREE_VIEW_ROW_HEIGHT` has.
+const DROPDOWN_ROW_HEIGHT: u32 = 21;
+/// Well inside every control and every row horizontally.
+const DROPDOWN_SAMPLE_X: u32 = DROPDOWN_CELL.0 / 2;
+/// Mid-control.
+const DROPDOWN_CONTROL_SAMPLE_Y: u32 = DROPDOWN_CELL_PADDING + DROPDOWN_ROW_HEIGHT / 2;
+/// Mid option row `n` of the open list.
+const fn dropdown_row_sample_y(n: u32) -> u32 {
+    DROPDOWN_CELL_PADDING + DROPDOWN_ROW_HEIGHT * (n + 1) + DROPDOWN_ROW_HEIGHT / 2
+}
 
 /// `render_gallery`'s own clear colour for `CommandPalette`/`TextField`
 /// specifically, not the plain `wgpu::Color::BLACK` every other
@@ -1707,7 +1749,7 @@ fn assert_backdrop_is_the_clear_colour(pixel: [u8; 4], clear: wgpu::Color, theme
 /// double-encode, the same bug in the opposite direction from the one
 /// that conversion exists to prevent for a real sRGB-aware swapchain.
 ///
-/// All `GpuMesh`es are uploaded and collected *before* the render pass
+/// Every `GpuMesh`/`GpuColorMesh` is uploaded and collected *before* the render pass
 /// begins, not inside it — `PathPipeline::draw` needs
 /// `mesh: &'pass GpuMesh`, so every mesh it draws must outlive the
 /// pass, the same constraint `aurora-app`'s own
@@ -1794,17 +1836,26 @@ fn collect_gallery_paints(
     scales: &Scales,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-) -> Vec<(GpuMesh, [f32; 4])> {
+) -> Vec<GpuPaintOp> {
     let mut widget_paints = Vec::new();
     // `1.0`: this harness renders to a headless offscreen target with no
     // real window to derive a DPI scale factor from, so `1.0` (no
     // scaling) is the honest, correct choice -- not a stand-in for a
     // real value this test harness is missing.
     for id in tree.paint_order() {
-        if let Ok(paints) = paint_widget(tree, id, theme, scales, 1.0) {
-            for (mesh, color) in paints {
-                let gpu_mesh = GpuMesh::upload(device, queue, &mesh);
-                widget_paints.push((gpu_mesh, color));
+        if let Ok(ops) = paint_widget_ops(tree, id, theme, scales, 1.0) {
+            for op in ops {
+                // No linearization for either kind: this target is
+                // `Rgba8Unorm` (see `render_gallery`), and the gradient
+                // pipeline picks its own conversion from the format.
+                widget_paints.push(match op {
+                    PaintOp::Solid((mesh, color)) => {
+                        GpuPaintOp::Solid(GpuMesh::upload(device, queue, &mesh), color)
+                    }
+                    PaintOp::Gradient(mesh) => {
+                        GpuPaintOp::Gradient(GpuColorMesh::upload(device, queue, &mesh))
+                    }
+                });
             }
         }
     }
@@ -1818,21 +1869,25 @@ fn draw_gallery_paints<'pass>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     size: (u32, u32),
-    widget_paints: &'pass [(GpuMesh, [f32; 4])],
+    widget_paints: &'pass [GpuPaintOp],
 ) {
     if widget_paints.is_empty() {
         return;
     }
     let mut path = PathPipeline::new(device);
-    let pipeline = path.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
-    pass.set_pipeline(pipeline);
+    let mut gradient = GradientPipeline::new(device);
     #[allow(clippy::cast_precision_loss)]
     let viewport_size = (size.0 as f32, size.1 as f32);
-    for (mesh, color) in widget_paints {
-        let bind_group = path.bind_group(device, queue, viewport_size, *color);
-        pass.set_bind_group(0, &bind_group, &[]);
-        path.draw(pass, mesh);
-    }
+    draw_paint_ops(
+        pass,
+        &mut path,
+        &mut gradient,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        viewport_size,
+        widget_paints,
+    );
 }
 
 /// [`render_gallery`]'s own final "copy the rendered target back to the
@@ -3775,6 +3830,1280 @@ tree_view_golden_test!(
     "tree_view_gallery_color_critical.png"
 );
 
+/// One `Dropdown` gallery cell: a sized, padded `Column` holding a
+/// dropdown over the same three options, optionally opened (highlight on
+/// the selection, option 1) or disabled.
+fn dropdown_gallery_cell(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    open: bool,
+    disabled: bool,
+) -> WidgetId {
+    let pad = length(DROPDOWN_CELL_PADDING as f32);
+    let cell = match aurora_widgets::widgets::insert_container(
+        tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size {
+                width: length(DROPDOWN_CELL.0 as f32),
+                height: length(DROPDOWN_CELL.1 as f32),
+            },
+            padding: LayoutRect {
+                left: pad,
+                right: pad,
+                top: pad,
+                bottom: pad,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let options = ["Normal", "Multiply", "Screen"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let dropdown = match insert_dropdown(tree, cell, scales, "Blend mode", options, Some(1)) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if open && let Err(err) = set_dropdown_open(tree, dropdown, true) {
+        unreachable!("{err:?}");
+    }
+    if disabled && let Err(err) = set_dropdown_disabled(tree, dropdown, true) {
+        unreachable!("{err:?}");
+    }
+    dropdown
+}
+
+/// A real, laid-out `Dropdown` gallery: closed, open, disabled, left to
+/// right. Returns the three dropdowns' own control ids.
+fn dropdown_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let closed = dropdown_gallery_cell(&mut tree, root, scales, false, false);
+    let open = dropdown_gallery_cell(&mut tree, root, scales, true, false);
+    let disabled = dropdown_gallery_cell(&mut tree, root, scales, false, true);
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        DROPDOWN_GALLERY_SIZE.0 as f32,
+        DROPDOWN_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [closed, open, disabled])
+}
+
+/// The rendered-pixel claims every theme's `Dropdown` gallery makes,
+/// shared for the reason [`assert_tree_view_states_are_distinct`] gives.
+fn assert_dropdown_states_are_distinct(
+    image: &aurora_testkit::Image,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, DROPDOWN_GALLERY_SIZE.0);
+    assert_eq!(image.height, DROPDOWN_GALLERY_SIZE.1);
+    let at = |cell: u32, x: u32, y: u32| sample_at(image, cell * DROPDOWN_CELL.0 + x, y);
+    let (closed, open, disabled) = (0, 1, 2);
+
+    // 1. A closed control paints a real well, not backdrop.
+    let closed_control = at(closed, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y);
+    let backdrop = at(closed, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(0));
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+    assert_ne!(
+        closed_control, backdrop,
+        "{theme_name}: a closed dropdown's surface.sunken well must differ from the backdrop"
+    );
+
+    // 2. Opening really builds the list: where the closed cell shows
+    //    backdrop under its control, the open cell shows the list.
+    let open_row0 = at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(0));
+    assert_ne!(
+        open_row0, backdrop,
+        "{theme_name}: an open dropdown's list (surface.raised) must paint below the control"
+    );
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(2)),
+        open_row0,
+        "{theme_name}: the un-highlighted options share the list's own fill"
+    );
+
+    // 3. Exactly the highlighted option is painted accent.primary.
+    let open_row1 = at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(1));
+    assert_ne!(
+        open_row1, open_row0,
+        "{theme_name}: the highlighted option must differ from its neighbours"
+    );
+
+    // 4. The list ends after its three rows.
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, DROPDOWN_CELL.1 - 4),
+        backdrop,
+        "{theme_name}: below the list's last row is backdrop again"
+    );
+
+    // 5. The open control's border differs from the closed one's: some
+    //    pixel of the top-edge band differs, while the fill inside is
+    //    identical. Compared across a band rather than one pixel so the
+    //    claim doesn't hinge on how a 1 px stroke centred on an integer
+    //    edge rasterizes. This proves *a difference*, not which colour:
+    //    it would pass with any token other than `border.default` there.
+    //    That the open border is `border.focus` (and, in High Contrast,
+    //    drawn after the control outline) is pinned only by `paint.rs`'s
+    //    own unit tests, `an_open_dropdowns_border_turns_border_focus`
+    //    and `a_dropdown_and_its_list_each_gain_the_control_outline_in_
+    //    high_contrast`.
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y),
+        closed_control,
+        "{theme_name}: opening changes the border, not the well"
+    );
+    let band = (DROPDOWN_CELL_PADDING - 2)..=(DROPDOWN_CELL_PADDING + 2);
+    assert!(
+        band.clone()
+            .any(|y| at(open, DROPDOWN_SAMPLE_X, y) != at(closed, DROPDOWN_SAMPLE_X, y)),
+        "{theme_name}: an open dropdown's border (border.focus) must render differently from \
+         a closed one's somewhere in its top-edge band: open {:?} vs closed {:?}",
+        band.clone()
+            .map(|y| at(open, DROPDOWN_SAMPLE_X, y))
+            .collect::<Vec<_>>(),
+        band.map(|y| at(closed, DROPDOWN_SAMPLE_X, y))
+            .collect::<Vec<_>>()
+    );
+
+    // 6. Disabled dims the well.
+    assert_ne!(
+        at(disabled, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y),
+        closed_control,
+        "{theme_name}: a disabled dropdown must render dimmer than an enabled one"
+    );
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims: the control one row tall at the cell's padding, the
+/// list directly under it, three rows, all inside the cell.
+#[test]
+fn dropdown_gallery_lays_out_the_list_under_the_control() {
+    let scales = scales();
+    let (tree, [closed, open, disabled]) = dropdown_gallery_tree(&scales);
+    for (cell, id) in [closed, open, disabled].into_iter().enumerate() {
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        let cell = u32::try_from(cell).unwrap_or(0);
+        assert_eq!(
+            bounds.x,
+            i64::from(cell * DROPDOWN_CELL.0 + DROPDOWN_CELL_PADDING)
+        );
+        assert_eq!(bounds.y, i64::from(DROPDOWN_CELL_PADDING));
+        assert_eq!(bounds.width, DROPDOWN_CELL.0 - 2 * DROPDOWN_CELL_PADDING);
+        assert_eq!(bounds.height, DROPDOWN_ROW_HEIGHT);
+    }
+    let state = match dropdown_state(&tree, open) {
+        Ok(state) => state,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert_eq!(state.highlighted(), Some(1));
+    let (Some(list), Some(control)) =
+        (state.list().and_then(|l| tree.bounds(l)), tree.bounds(open))
+    else {
+        unreachable!("open and laid out");
+    };
+    assert_eq!(list.y, control.bottom());
+    assert_eq!(list.height, DROPDOWN_ROW_HEIGHT * 3);
+    assert!(list.bottom() < i64::from(DROPDOWN_CELL.1 - 4), "{list:?}");
+    for (n, &row) in state.rows().iter().enumerate() {
+        let Some(bounds) = tree.bounds(row) else {
+            unreachable!("laid out");
+        };
+        let n = u32::try_from(n).unwrap_or(0);
+        let mid = i64::from(dropdown_row_sample_y(n));
+        assert!(
+            bounds.y <= mid && mid < bounds.bottom(),
+            "row {n}: {bounds:?}"
+        );
+    }
+    for id in [closed, disabled] {
+        assert!(
+            dropdown_state(&tree, id).is_ok_and(|s| s.list().is_none()),
+            "only the middle cell is open"
+        );
+    }
+}
+
+/// `Dropdown`'s own gallery, one distinct-pixels test per built-in
+/// theme. **Every theme uses `NEUTRAL_CLEAR`**, computed rather than
+/// inherited: the open list's `surface.raised` is byte-identical to
+/// Light's `LIGHT_CLEAR` and ≈1.13:1 against Colour-Critical's
+/// `COLOR_CRITICAL_CLEAR` (the same two collisions
+/// `COMMAND_PALETTE_LIGHT_CLEAR`/`COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`
+/// record for the same token), and Dark's `surface.sunken` well is the
+/// near-black `neutral.0` the plain `BLACK` clear would swallow (the
+/// `TextField` history `NEUTRAL_CLEAR`'s own doc comment records). The
+/// two High Contrast themes already use `#808080`. Against it no painted
+/// fill collides in any theme: `surface.sunken`/`surface.raised` are
+/// never `#808080`, and the High Contrast `border.default`
+/// (`hc.mid_gray`, which *is* `#808080`) is always covered by the
+/// control outline or `border.focus` drawn over it.
+macro_rules! dropdown_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let (tree, _ids) = dropdown_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &$theme,
+                &scales,
+                DROPDOWN_GALLERY_SIZE,
+                NEUTRAL_CLEAR,
+            );
+            assert_dropdown_states_are_distinct(&image, NEUTRAL_CLEAR, $theme_name);
+        }
+    };
+}
+
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state,
+    dark_theme(),
+    "Dark"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Dropdown`'s own five golden-diff tests, against goldens that **do
+/// not exist** — `#[ignore]`d, Dark included, exactly as
+/// `scrollbar_golden_test!`'s own doc comment records. A human runs
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, opens the five written PNGs, and confirms each shows a
+/// closed well, an open well with an accent-coloured border and a
+/// three-row list under it (middle row highlighted), and a dimmed well —
+/// before any of these attributes come off.
+macro_rules! dropdown_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let (tree, _ids) = dropdown_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &$theme,
+                &scales,
+                DROPDOWN_GALLERY_SIZE,
+                NEUTRAL_CLEAR,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image,
+    dark_theme(),
+    "dropdown_gallery.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "dropdown_gallery_light.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "dropdown_gallery_high_contrast_dark.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "dropdown_gallery_high_contrast_light.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "dropdown_gallery_color_critical.png"
+);
+
+/// `TabBar`'s own two cells — enabled and disabled, three tabs each with
+/// the first selected — each a `TAB_BAR_CELL` rectangle with a
+/// `TAB_BAR_CELL_PADDING` inset. So each bar is `192 - 2*16 = 160` px
+/// wide and one row (21 px) tall, from `y = 16` to `y = 37`, and its
+/// three tabs share it equally around two `spacing.xs` (8 px) gaps:
+/// `(160 - 16) / 3 = 48` px each, at cell-relative `x = 16..64`,
+/// `72..120` and `128..176`. `192 * 2 * 4 = 1536 = 6 * 256`,
+/// row-aligned (see [`BUTTON_GALLERY_SIZE`]). All of it is checked
+/// against the real layout by `tab_bar_gallery_lays_out_three_equal_tabs`.
+///
+/// The mockup's fourth state, "focused", has no cell: no widget in this
+/// crate paints a keyboard-focus ring (see `tab_bar.rs`'s own doc
+/// comment).
+const TAB_BAR_CELL: (u32, u32) = (192, 64);
+const TAB_BAR_CELL_PADDING: u32 = 16;
+const TAB_BAR_GALLERY_SIZE: (u32, u32) = (TAB_BAR_CELL.0 * 2, TAB_BAR_CELL.1);
+const TAB_BAR_HEIGHT: u32 = 21;
+const TAB_BAR_TAB_WIDTH: u32 = 48;
+const TAB_BAR_GAP: u32 = 8;
+/// The bar's bottom edge, exclusive: its last pixel row is `- 1`.
+const TAB_BAR_BOTTOM: u32 = TAB_BAR_CELL_PADDING + TAB_BAR_HEIGHT;
+/// Cell-relative horizontal centre of tab `n`.
+const fn tab_centre_x(n: u32) -> u32 {
+    TAB_BAR_CELL_PADDING + n * (TAB_BAR_TAB_WIDTH + TAB_BAR_GAP) + TAB_BAR_TAB_WIDTH / 2
+}
+/// Cell-relative centre of the gap between tabs 0 and 1 — where only the
+/// bar's own rule is painted, never a tab's (High Contrast outlines
+/// included, which straddle each tab's own edge by half a pixel).
+const TAB_BAR_GAP_X: u32 = TAB_BAR_CELL_PADDING + TAB_BAR_TAB_WIDTH + TAB_BAR_GAP / 2;
+
+/// The gallery backdrop for a tab bar: the theme's own `surface.panel`,
+/// computed from the token rather than picked — a tab bar has no
+/// background of its own and sits on a panel, and `accent.primary on
+/// surface.panel` is exactly the pair `design/check_contrast.py` gates
+/// for the selected tab's underline. (`NEUTRAL_CLEAR` would not do:
+/// both High Contrast themes' `border.default` *is* `#808080`, so the
+/// bar's rule would vanish into it.)
+fn tab_bar_clear(theme: &Theme) -> wgpu::Color {
+    let [r, g, b] = theme.surface.panel.to_srgb_f32();
+    wgpu::Color {
+        r: f64::from(r),
+        g: f64::from(g),
+        b: f64::from(b),
+        a: 1.0,
+    }
+}
+
+/// One `TabBar` gallery cell: a sized, padded `Column` holding a
+/// three-tab bar with the first tab selected, optionally disabled.
+fn tab_bar_gallery_cell(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    disabled: bool,
+) -> WidgetId {
+    let pad = length(TAB_BAR_CELL_PADDING as f32);
+    let cell = match aurora_widgets::widgets::insert_container(
+        tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size {
+                width: length(TAB_BAR_CELL.0 as f32),
+                height: length(TAB_BAR_CELL.1 as f32),
+            },
+            padding: LayoutRect {
+                left: pad,
+                right: pad,
+                top: pad,
+                bottom: pad,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let labels = ["Layers", "Channels", "Paths"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let bar = match insert_tab_bar(tree, cell, scales, "Panels", labels, 0) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if disabled && let Err(err) = set_tab_bar_disabled(tree, bar, true) {
+        unreachable!("{err:?}");
+    }
+    bar
+}
+
+/// A real, laid-out `TabBar` gallery: enabled, disabled, left to right.
+fn tab_bar_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let enabled = tab_bar_gallery_cell(&mut tree, root, scales, false);
+    let disabled = tab_bar_gallery_cell(&mut tree, root, scales, true);
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(TAB_BAR_GALLERY_SIZE.0 as f32, TAB_BAR_GALLERY_SIZE.1 as f32);
+    (tree, [enabled, disabled])
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims.
+#[test]
+fn tab_bar_gallery_lays_out_three_equal_tabs() {
+    let scales = scales();
+    let (tree, bars) = tab_bar_gallery_tree(&scales);
+    for (cell, bar) in bars.into_iter().enumerate() {
+        let cell = u32::try_from(cell).unwrap_or(0);
+        let Some(bounds) = tree.bounds(bar) else {
+            unreachable!("laid out");
+        };
+        let origin = i64::from(cell * TAB_BAR_CELL.0 + TAB_BAR_CELL_PADDING);
+        assert_eq!(bounds.x, origin);
+        assert_eq!(bounds.y, i64::from(TAB_BAR_CELL_PADDING));
+        assert_eq!(bounds.width, TAB_BAR_CELL.0 - 2 * TAB_BAR_CELL_PADDING);
+        assert_eq!(bounds.height, TAB_BAR_HEIGHT);
+        let state = match tab_bar_state(&tree, bar) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.selected(), 0);
+        for (n, &tab) in state.tabs().iter().enumerate() {
+            let n = u32::try_from(n).unwrap_or(0);
+            let Some(tab_bounds) = tree.bounds(tab) else {
+                unreachable!("laid out");
+            };
+            assert_eq!(
+                tab_bounds.x,
+                i64::from(cell * TAB_BAR_CELL.0 + tab_centre_x(n) - TAB_BAR_TAB_WIDTH / 2)
+            );
+            assert_eq!(tab_bounds.width, TAB_BAR_TAB_WIDTH);
+            assert_eq!(tab_bounds.bottom(), i64::from(TAB_BAR_BOTTOM));
+        }
+    }
+}
+
+/// The rendered-pixel claims every theme's `TabBar` gallery makes.
+fn assert_tab_bar_states_are_distinct(
+    image: &aurora_testkit::Image,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, TAB_BAR_GALLERY_SIZE.0);
+    assert_eq!(image.height, TAB_BAR_GALLERY_SIZE.1);
+    let at = |cell: u32, x: u32, y: u32| sample_at(image, cell * TAB_BAR_CELL.0 + x, y);
+    let (enabled, disabled) = (0, 1);
+    let underline_y = TAB_BAR_BOTTOM - 2;
+    let rule_y = TAB_BAR_BOTTOM - 1;
+    let inside_y = TAB_BAR_BOTTOM - 4;
+
+    // 1. Inside the bar, above the rule, is the panel backdrop.
+    let backdrop = at(enabled, TAB_BAR_GAP_X, inside_y);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+
+    // 2. The bar's own border.default rule is really painted, in the gap
+    //    between tabs where nothing else draws.
+    assert_ne!(
+        at(enabled, TAB_BAR_GAP_X, rule_y),
+        backdrop,
+        "{theme_name}: the bar's bottom rule (border.default) must differ from the panel"
+    );
+
+    // 3. The selected tab's underline differs from an inactive tab's
+    //    bottom band.
+    let active = at(enabled, tab_centre_x(0), underline_y);
+    assert_ne!(
+        active,
+        at(enabled, tab_centre_x(1), underline_y),
+        "{theme_name}: the selected tab's accent.primary underline must differ from an \
+         inactive tab"
+    );
+    assert_ne!(
+        active, backdrop,
+        "{theme_name}: the selected tab's underline must differ from the panel"
+    );
+    assert_eq!(
+        at(enabled, tab_centre_x(0), inside_y),
+        backdrop,
+        "{theme_name}: the underline is a band at the bottom, not a fill"
+    );
+
+    // 4. Disabled dims the underline.
+    assert_ne!(
+        at(disabled, tab_centre_x(0), underline_y),
+        active,
+        "{theme_name}: a disabled bar's underline must render dimmer than an enabled one's"
+    );
+}
+
+/// `TabBar`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`tab_bar_clear`]).
+macro_rules! tab_bar_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tab_bar_clear(&theme);
+            let (tree, _ids) = tab_bar_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TAB_BAR_GALLERY_SIZE,
+                clear,
+            );
+            assert_tab_bar_states_are_distinct(&image, clear, $theme_name);
+        }
+    };
+}
+
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state,
+    dark_theme(),
+    "Dark"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `TabBar`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `dropdown_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows two bars on the panel colour, each with
+/// a 1 px rule along its bottom and a 2 px accent underline under the
+/// first tab only, the right-hand one dimmed — before these attributes
+/// come off.
+macro_rules! tab_bar_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tab_bar_clear(&theme);
+            let (tree, _ids) = tab_bar_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TAB_BAR_GALLERY_SIZE,
+                clear,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image,
+    dark_theme(),
+    "tab_bar_gallery.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "tab_bar_gallery_light.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "tab_bar_gallery_high_contrast_dark.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "tab_bar_gallery_high_contrast_light.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "tab_bar_gallery_color_critical.png"
+);
+
+/// `Tooltip`'s own gallery: one cell, the mockup's only state
+/// ("default"), a `TOOLTIP_OWNER`-sized button at the cell's
+/// `TOOLTIP_CELL_PADDING` inset with its tooltip shown directly below it
+/// — so the button spans `y = 16..48` and `x = 16..144`, and the
+/// tooltip `y = 48..67` (one `typography.size.xs` line, 11 px, plus two
+/// `spacing.xxs`, 4 px) at the same `x` and width. `192 * 4 = 768 =
+/// 3 * 256`, row-aligned (see [`BUTTON_GALLERY_SIZE`]). All of it is
+/// checked against the real layout by
+/// `tooltip_gallery_lays_the_tooltip_out_under_its_owner`.
+const TOOLTIP_GALLERY_SIZE: (u32, u32) = (192, 96);
+const TOOLTIP_CELL_PADDING: u32 = 16;
+const TOOLTIP_OWNER: (u32, u32) = (128, 32);
+const TOOLTIP_HEIGHT: u32 = 19;
+const TOOLTIP_TOP: u32 = TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.1;
+/// The tooltip's bottom edge, exclusive.
+const TOOLTIP_BOTTOM: u32 = TOOLTIP_TOP + TOOLTIP_HEIGHT;
+const TOOLTIP_CENTRE_X: u32 = TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.0 / 2;
+
+/// The gallery backdrop for a tooltip: the theme's own `surface.panel`,
+/// the same computed backdrop [`tab_bar_clear`] uses — a tooltip hangs
+/// over panel chrome in the real app, and that is exactly where its
+/// Light-theme collision lives (`surface.overlay` *is* `surface.panel`
+/// there, `paint_tooltip`'s own doc comment), so a neutral backdrop
+/// would hide the case the unconditional border exists for.
+fn tooltip_clear(theme: &Theme) -> wgpu::Color {
+    tab_bar_clear(theme)
+}
+
+/// A real, laid-out `Tooltip` gallery: a fixed-size button in a padded
+/// cell, its tooltip shown (a zero delay and one tick at the same
+/// fabricated instant — no sleeping). Returns the tree, the owner, and
+/// the tooltip's node.
+fn tooltip_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let pad = length(TOOLTIP_CELL_PADDING as f32);
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Column,
+        align_items: Some(taffy::AlignItems::FLEX_START),
+        size: Size {
+            width: length(TOOLTIP_GALLERY_SIZE.0 as f32),
+            height: length(TOOLTIP_GALLERY_SIZE.1 as f32),
+        },
+        padding: LayoutRect {
+            left: pad,
+            right: pad,
+            top: pad,
+            bottom: pad,
+        },
+        ..Default::default()
+    });
+    let owner = match insert_button(&mut tree, root, scales, "Opacity") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = tree.set_style(owner, sized_style(TOOLTIP_OWNER)) {
+        unreachable!("{err:?}");
+    }
+    let delay = std::time::Duration::ZERO;
+    let mut tooltip = match Tooltip::new(&tree, owner, scales, "Opacity: 100%", delay) {
+        Ok(tooltip) => tooltip,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let t0 = std::time::Instant::now();
+    if let Err(err) = tooltip.set_hover(&mut tree, true, false, t0) {
+        unreachable!("{err:?}");
+    }
+    if let Err(err) = tooltip.tick(&mut tree, t0) {
+        unreachable!("{err:?}");
+    }
+    let Some(node) = tooltip.node() else {
+        unreachable!("a zero delay shows on the first tick");
+    };
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(TOOLTIP_GALLERY_SIZE.0 as f32, TOOLTIP_GALLERY_SIZE.1 as f32);
+    (tree, [owner, node])
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims.
+#[test]
+fn tooltip_gallery_lays_the_tooltip_out_under_its_owner() {
+    let (tree, [owner, node]) = tooltip_gallery_tree(&scales());
+    let (Some(owner), Some(tip)) = (tree.bounds(owner), tree.bounds(node)) else {
+        unreachable!("laid out");
+    };
+    assert_eq!(owner.x, i64::from(TOOLTIP_CELL_PADDING));
+    assert_eq!(owner.y, i64::from(TOOLTIP_CELL_PADDING));
+    assert_eq!((owner.width, owner.height), TOOLTIP_OWNER);
+    assert_eq!(tip.x, owner.x);
+    assert_eq!(tip.y, i64::from(TOOLTIP_TOP));
+    assert_eq!(tip.width, TOOLTIP_OWNER.0);
+    assert_eq!(tip.height, TOOLTIP_HEIGHT);
+    assert!(TOOLTIP_BOTTOM + 3 < TOOLTIP_GALLERY_SIZE.1);
+}
+
+/// The rendered-pixel claims every theme's `Tooltip` gallery makes.
+fn assert_tooltip_is_distinct(
+    image: &aurora_testkit::Image,
+    theme: &Theme,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, TOOLTIP_GALLERY_SIZE.0);
+    assert_eq!(image.height, TOOLTIP_GALLERY_SIZE.1);
+    let tip_centre_y = TOOLTIP_TOP + TOOLTIP_HEIGHT / 2;
+
+    // 1. Outside everything, and three pixels below the tooltip, is the
+    //    panel backdrop: the tooltip does not extend past its box.
+    let backdrop = sample_at(image, 4, 4);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+    assert_eq!(
+        sample_at(image, TOOLTIP_CENTRE_X, TOOLTIP_BOTTOM + 3),
+        backdrop,
+        "{theme_name}: below the tooltip is the untouched backdrop"
+    );
+
+    // 2. The tooltip is its own shape, not the owner stretched.
+    let owner = sample_at(
+        image,
+        TOOLTIP_CENTRE_X,
+        TOOLTIP_CELL_PADDING + TOOLTIP_OWNER.1 / 2,
+    );
+    let fill = sample_at(image, TOOLTIP_CENTRE_X, tip_centre_y);
+    assert_ne!(
+        fill, owner,
+        "{theme_name}: the tooltip's surface.overlay must differ from the owner's accent"
+    );
+
+    // 3. Its fill differs from the panel exactly where the tokens do --
+    //    and in Light, where they collide, it is the same byte.
+    if theme.surface.overlay == theme.surface.panel {
+        assert_eq!(
+            fill, backdrop,
+            "{theme_name}: surface.overlay is surface.panel here, so the fill alone is invisible"
+        );
+    } else {
+        assert_ne!(
+            fill, backdrop,
+            "{theme_name}: the tooltip's fill must differ from the panel"
+        );
+    }
+
+    // 4. The unconditional border (plus the HC outline) is really
+    //    painted along the bottom edge -- in every theme, Light included.
+    //    Which of the two rows straddling the edge a 1 px centred stroke
+    //    lands on is the rasterizer's fill rule, so either counts.
+    let edge = [TOOLTIP_BOTTOM - 1, TOOLTIP_BOTTOM].map(|y| sample_at(image, TOOLTIP_CENTRE_X, y));
+    assert!(
+        edge.iter().any(|&pixel| pixel != backdrop),
+        "{theme_name}: the tooltip's border must differ from the panel behind it: {edge:?} vs \
+         {backdrop:?}"
+    );
+}
+
+/// `Tooltip`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`tooltip_clear`]).
+macro_rules! tooltip_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tooltip_clear(&theme);
+            let (tree, _ids) = tooltip_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TOOLTIP_GALLERY_SIZE,
+                clear,
+            );
+            assert_tooltip_is_distinct(&image, &theme, clear, $theme_name);
+        }
+    };
+}
+
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip,
+    dark_theme(),
+    "Dark"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_light_theme,
+    light_theme(),
+    "Light"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+tooltip_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_the_tooltip_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Tooltip`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows one button on the panel colour with a
+/// thin, bordered, full-width box hanging directly below it — before
+/// these attributes come off.
+macro_rules! tooltip_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tooltip_clear(&theme);
+            let (tree, _ids) = tooltip_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TOOLTIP_GALLERY_SIZE,
+                clear,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image,
+    dark_theme(),
+    "tooltip_gallery.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "tooltip_gallery_light.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "tooltip_gallery_high_contrast_dark.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "tooltip_gallery_high_contrast_light.png"
+);
+tooltip_golden_test!(
+    tooltip_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "tooltip_gallery_color_critical.png"
+);
+
+/// `Menu`'s own gallery: three cells side by side, each `MENU_CELL`
+/// wide, each holding one open menu of `Cut`, a separator, `Copy`, a
+/// disabled `Paste` and `Delete` at the cell's `MENU_INSET` inset and
+/// `MENU_WIDTH` wide. The states:
+///
+/// 0. freshly opened — the first item, `Cut`, highlighted;
+/// 1. after one `Down` — `Copy` highlighted, the highlight having
+///    crossed the separator;
+/// 2. every action disabled — nothing highlighted at all.
+///
+/// A disabled item is present in the first two. There is **no menu
+/// mockup** in `design/gallery/index.html`, so every token this paints
+/// is provisional (`menu.rs`'s design-owner questions). `384 * 4 =
+/// 1536 = 6 * 256`, row-aligned (see [`BUTTON_GALLERY_SIZE`]). Every
+/// sample point is read from the real layout rather than restated.
+const MENU_GALLERY_SIZE: (u32, u32) = (384, 128);
+const MENU_CELL: u32 = 128;
+const MENU_INSET: u32 = 16;
+const MENU_WIDTH: u32 = 96;
+
+/// The gallery backdrop: the theme's own `surface.panel`, where a menu
+/// really hangs — and where Light and both High Contrast themes collide
+/// `surface.raised` with it, the case the unconditional border is for.
+fn menu_clear(theme: &Theme) -> wgpu::Color {
+    tab_bar_clear(theme)
+}
+
+fn menu_gallery_items(all_disabled: bool) -> Vec<MenuItem> {
+    let item = |label: &str, enabled: bool| MenuItem {
+        enabled: enabled && !all_disabled,
+        ..MenuItem::action(label)
+    };
+    vec![
+        item("Cut", true),
+        MenuItem::separator(),
+        item("Copy", true),
+        item("Paste", false),
+        item("Delete", true),
+    ]
+}
+
+/// The laid-out gallery tree and each cell's menu id.
+fn menu_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(sized_style(MENU_GALLERY_SIZE));
+    let mut open = |cell: u32, all_disabled: bool| {
+        #[allow(clippy::cast_precision_loss)]
+        let at = ((cell * MENU_CELL + MENU_INSET) as f32, MENU_INSET as f32);
+        #[allow(clippy::cast_precision_loss)]
+        let width = MENU_WIDTH as f32;
+        match open_menu(
+            &mut tree,
+            root,
+            scales,
+            "Edit",
+            at,
+            width,
+            menu_gallery_items(all_disabled),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    };
+    let fresh = open(0, false);
+    let moved = open(1, false);
+    let disabled = open(2, true);
+    match handle_menu_key(&mut tree, moved, MenuKey::Down) {
+        Ok(MenuOutcome::Moved(2)) => {}
+        other => unreachable!("Down from Cut crosses the separator to Copy: {other:?}"),
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(MENU_GALLERY_SIZE.0 as f32, MENU_GALLERY_SIZE.1 as f32);
+    (tree, [fresh, moved, disabled])
+}
+
+/// The centre pixel of `id`'s own laid-out box.
+fn menu_centre(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (u32, u32) {
+    let Some(bounds) = tree.bounds(id) else {
+        unreachable!("laid out");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let point = (
+        (bounds.x + i64::from(bounds.width / 2)) as u32,
+        (bounds.y + i64::from(bounds.height / 2)) as u32,
+    );
+    point
+}
+
+/// A headless (no GPU) proof that each menu sits where the samples
+/// below assume, inside its own cell and the image.
+#[test]
+fn menu_gallery_lays_each_menu_out_inside_its_cell() {
+    let (tree, menus) = menu_gallery_tree(&scales());
+    for (cell, &menu) in (0_u32..).zip(&menus) {
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(bounds.x, i64::from(cell * MENU_CELL + MENU_INSET));
+        assert_eq!(bounds.y, i64::from(MENU_INSET));
+        assert_eq!(bounds.width, MENU_WIDTH);
+        assert!(
+            bounds.bottom() + 3 < i64::from(MENU_GALLERY_SIZE.1),
+            "room below the menu for a backdrop sample: {bounds:?}"
+        );
+    }
+}
+
+/// Keeps `assert_menu_separator_rule` on its non-trivial branch: in every
+/// built-in theme the separator's `border.default` must differ from the
+/// menu's `surface.raised` fill, or that check silently degrades to
+/// "the rule is the fill" and proves nothing about the rule being
+/// painted. Headless — no adapter needed.
+#[test]
+fn menu_separator_border_differs_from_the_menu_fill_in_every_built_in_theme() {
+    for (name, theme) in [
+        ("Dark", dark_theme()),
+        ("Light", light_theme()),
+        ("High Contrast Dark", high_contrast_dark_theme()),
+        ("High Contrast Light", high_contrast_light_theme()),
+        ("Colour-Critical", color_critical_theme()),
+    ] {
+        assert_ne!(
+            theme.border.default, theme.surface.raised,
+            "{name}: a separator rule would be invisible against the menu fill"
+        );
+    }
+}
+
+/// `assert_menu_is_distinct`'s step 5: the separator paints its
+/// one-pixel rule on the row nearest its centre, in `border.default` —
+/// visible against the menu's fill exactly where those two tokens
+/// differ.
+fn assert_menu_separator_rule(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    items: &[WidgetId],
+    fill: [u8; 4],
+    theme: &Theme,
+    theme_name: &str,
+) {
+    let Some(&separator) = items.get(1) else {
+        unreachable!("five items");
+    };
+    let Some(sep) = tree.bounds(separator) else {
+        unreachable!("laid out");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (sx, sy) = (
+        (sep.x + i64::from(sep.width / 2)) as u32,
+        (sep.y + i64::from((sep.height - 1) / 2)) as u32,
+    );
+    let rule = sample_at(image, sx, sy);
+    if theme.border.default == theme.surface.raised {
+        assert_eq!(
+            rule, fill,
+            "{theme_name}: the rule's token is the fill's here"
+        );
+    } else {
+        assert_ne!(
+            rule, fill,
+            "{theme_name}: the separator's rule must be painted"
+        );
+    }
+}
+
+/// The rendered-pixel claims every theme's `Menu` gallery makes.
+fn assert_menu_is_distinct(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    menus: [WidgetId; 3],
+    theme: &Theme,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, MENU_GALLERY_SIZE.0);
+    assert_eq!(image.height, MENU_GALLERY_SIZE.1);
+    let backdrop = sample_at(image, 4, 4);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+
+    let items = |menu: WidgetId| match menu_state(tree, menu) {
+        Ok(state) => state.item_ids().to_vec(),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let pixel = |id: WidgetId| {
+        let (x, y) = menu_centre(tree, id);
+        sample_at(image, x, y)
+    };
+    let [fresh, moved, disabled] = menus.map(items);
+    let (Some(&cut), Some(&paste)) = (fresh.first(), fresh.get(3)) else {
+        unreachable!("five items");
+    };
+    // An unhighlighted, disabled row paints nothing: it shows the menu's
+    // own surface.raised fill.
+    let fill = pixel(paste);
+
+    // 1. The fill differs from the panel exactly where the tokens do.
+    if theme.surface.raised == theme.surface.panel {
+        assert_eq!(
+            fill, backdrop,
+            "{theme_name}: surface.raised is surface.panel here, so the fill alone is invisible"
+        );
+    } else {
+        assert_ne!(
+            fill, backdrop,
+            "{theme_name}: the menu's fill must differ from the panel"
+        );
+    }
+
+    // 2. State 0: `Cut` is highlighted; the other rows are plain fill.
+    let highlight = pixel(cut);
+    assert_ne!(
+        highlight, fill,
+        "{theme_name}: the highlighted row must differ from the menu's fill"
+    );
+    for row in [fresh.get(2), fresh.get(4)].into_iter().flatten().copied() {
+        assert_eq!(
+            pixel(row),
+            fill,
+            "{theme_name}: an unhighlighted row is plain fill"
+        );
+    }
+
+    // 3. State 1: the highlight moved across the separator to `Copy`.
+    let (Some(&moved_cut), Some(&moved_copy)) = (moved.first(), moved.get(2)) else {
+        unreachable!("five items");
+    };
+    assert_eq!(
+        pixel(moved_cut),
+        fill,
+        "{theme_name}: Cut is no longer highlighted"
+    );
+    assert_eq!(pixel(moved_copy), highlight, "{theme_name}: Copy now is");
+
+    // 4. State 2: nothing highlighted anywhere.
+    for (index, &row) in disabled.iter().enumerate() {
+        if index != 1 {
+            assert_eq!(
+                pixel(row),
+                fill,
+                "{theme_name}: all-disabled row {index} is plain fill"
+            );
+        }
+    }
+
+    // 5. The separator's rule.
+    assert_menu_separator_rule(image, tree, &fresh, fill, theme, theme_name);
+
+    // 6. The unconditional border (plus the HC outline) is really painted
+    //    along each menu's bottom edge, in every theme, Light included;
+    //    and three pixels below is untouched backdrop.
+    for &menu in &menus {
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, bottom) = (
+            (bounds.x + i64::from(bounds.width / 2)) as u32,
+            bounds.bottom() as u32,
+        );
+        let edge = [bottom - 1, bottom].map(|y| sample_at(image, x, y));
+        assert!(
+            edge.iter().any(|&p| p != backdrop),
+            "{theme_name}: the menu's border must differ from the panel: {edge:?} vs {backdrop:?}"
+        );
+        assert_eq!(
+            sample_at(image, x, bottom + 3),
+            backdrop,
+            "{theme_name}: below the menu is the untouched backdrop"
+        );
+    }
+}
+
+/// `Menu`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`menu_clear`]).
+macro_rules! menu_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = menu_clear(&theme);
+            let (tree, menus) = menu_gallery_tree(&scales);
+            let image = render_gallery(&context, &tree, &theme, &scales, MENU_GALLERY_SIZE, clear);
+            assert_menu_is_distinct(&image, &tree, menus, &theme, clear, $theme_name);
+        }
+    };
+}
+
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state,
+    dark_theme(),
+    "Dark"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Menu`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows three bordered menus on the panel
+/// colour — the first with its top row highlighted, the second with its
+/// third row highlighted below a thin rule, the third with none —
+/// before these attributes come off.
+macro_rules! menu_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = menu_clear(&theme);
+            let (tree, _menus) = menu_gallery_tree(&scales);
+            let image = render_gallery(&context, &tree, &theme, &scales, MENU_GALLERY_SIZE, clear);
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image,
+    dark_theme(),
+    "menu_gallery.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "menu_gallery_light.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "menu_gallery_high_contrast_dark.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "menu_gallery_high_contrast_light.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "menu_gallery_color_critical.png"
+);
+
 /// `Slider`'s own "distinct pixels" proof is shaped differently from
 /// the others: instead of comparing each cell's own centre (which
 /// would just show the track, not the thumb, for anything but a
@@ -5680,3 +7009,646 @@ fn render_gallery_produces_the_dialogs_own_surface_in_color_critical_theme() {
         "Colour-Critical",
     );
 }
+
+// ---- Colour picker (0.125.0) -------------------------------------------
+
+/// One colour-picker cell: `COLOR_PICKER_PADDING` around a picker
+/// `COLOR_PICKER_SIZE` wide.
+const COLOR_PICKER_CELL: (u32, u32) = (128, 192);
+const COLOR_PICKER_PADDING: u32 = 16;
+const COLOR_PICKER_SIZE: u32 = 96;
+/// Enabled, then disabled. 256 px wide keeps readback rows aligned.
+const COLOR_PICKER_GALLERY_SIZE: (u32, u32) = (COLOR_PICKER_CELL.0 * 2, COLOR_PICKER_CELL.1);
+/// The picked colour: hue 210, near the top-right of the square, so the
+/// marker sits well away from every sampled pixel below.
+const COLOR_PICKER_HSV: Hsv = Hsv {
+    hue: 210.0,
+    saturation: 0.9,
+    value: 0.9,
+};
+
+/// Two pickers side by side over `surface.panel` — enabled and disabled.
+fn color_picker_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let mut root_style = sized_style(COLOR_PICKER_GALLERY_SIZE);
+    root_style.flex_direction = FlexDirection::Row;
+    let (mut tree, root) = new_tree(root_style);
+    let mut pickers = Vec::new();
+    for disabled in [false, true] {
+        let padding = length(COLOR_PICKER_PADDING as f32);
+        let cell = match aurora_widgets::widgets::insert_container(
+            &mut tree,
+            root,
+            Style {
+                flex_direction: FlexDirection::Column,
+                padding: LayoutRect {
+                    left: padding,
+                    right: padding,
+                    top: padding,
+                    bottom: padding,
+                },
+                ..sized_style(COLOR_PICKER_CELL)
+            },
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let black = Color { r: 0, g: 0, b: 0 };
+        let picker = match insert_color_picker(
+            &mut tree,
+            cell,
+            scales,
+            "Colour",
+            black,
+            COLOR_PICKER_SIZE as f32,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_color_picker_hsv(&mut tree, picker, COLOR_PICKER_HSV) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_color_picker_disabled(&mut tree, picker, disabled) {
+            unreachable!("{err:?}");
+        }
+        pickers.push(picker);
+    }
+    tree.compute_layout(
+        COLOR_PICKER_GALLERY_SIZE.0 as f32,
+        COLOR_PICKER_GALLERY_SIZE.1 as f32,
+    );
+    let [enabled, disabled] = pickers.as_slice() else {
+        unreachable!("two pickers");
+    };
+    (tree, [*enabled, *disabled])
+}
+
+/// The square's and the strip's bounds for `picker`.
+fn color_picker_parts(
+    tree: &WidgetTree<WidgetKind>,
+    picker: WidgetId,
+) -> (aurora_core::Rect, aurora_core::Rect) {
+    let Ok(state) = color_picker_state(tree, picker) else {
+        unreachable!("a picker");
+    };
+    let (Some(area), Some(hue)) = (
+        state.area_id().and_then(|id| tree.bounds(id)),
+        state
+            .part_id(ColorPickerPart::Hue)
+            .and_then(|id| tree.bounds(id)),
+    ) else {
+        unreachable!("laid out");
+    };
+    (area, hue)
+}
+
+/// Pixels of the square (as `(px, py)` offsets inside it) and of the
+/// strip (as hues whose pixel column is sampled) that lie well away from
+/// both markers.
+fn color_picker_samples(area: aurora_core::Rect) -> Vec<(u32, u32)> {
+    let (w, h) = (area.width, area.height);
+    vec![
+        (2, 2),
+        (2, h - 3),
+        (w / 2, h - 3),
+        (w - 3, h - 3),
+        (w / 4, h / 2),
+        (w / 2, h / 2 + 8),
+    ]
+}
+const COLOR_PICKER_HUE_SAMPLES: [f32; 5] = [30.0, 90.0, 150.0, 270.0, 330.0];
+
+/// One sampled pixel: where, what was read, and what HSV says it should be.
+type SampledPixel = ((u32, u32), [u8; 4], [u8; 3]);
+
+/// A laid-out coordinate as an image pixel index (never negative here).
+fn to_px(v: i64) -> u32 {
+    u32::try_from(v).unwrap_or(0)
+}
+
+fn to_rgb8(rgb: [f32; 3]) -> [u8; 3] {
+    #[allow(clippy::cast_sign_loss)]
+    rgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn within(pixel: [u8; 4], want: [u8; 3], tolerance: u8) -> bool {
+    pixel
+        .iter()
+        .zip(want)
+        .all(|(&got, want)| got.abs_diff(want) <= tolerance)
+}
+
+/// Every sampled gradient pixel of `picker` (enabled): the square's is
+/// HSV at the pixel's own centre, the strip's the pure hue there — each
+/// within 3 of 255.
+fn color_picker_gradient_pixels(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    picker: WidgetId,
+) -> Vec<SampledPixel> {
+    let (area, strip) = color_picker_parts(tree, picker);
+    let mut out = Vec::new();
+    let (ax, ay) = (to_px(area.x), to_px(area.y));
+    for (dx, dy) in color_picker_samples(area) {
+        let s = (dx as f32 + 0.5) / area.width as f32;
+        let v = 1.0 - (dy as f32 + 0.5) / area.height as f32;
+        let want = to_rgb8(
+            Hsv {
+                hue: 210.0,
+                saturation: s,
+                value: v,
+            }
+            .to_srgb_f32(),
+        );
+        out.push(((ax + dx, ay + dy), sample_at(image, ax + dx, ay + dy), want));
+    }
+    let (sx, sy) = (to_px(strip.x), to_px(strip.y) + strip.height / 2);
+    for hue in COLOR_PICKER_HUE_SAMPLES {
+        #[allow(clippy::cast_sign_loss)]
+        let dx = (hue / 360.0 * strip.width as f32).floor() as u32;
+        let at = (dx as f32 + 0.5) / strip.width as f32 * 360.0;
+        let want = to_rgb8(
+            Hsv {
+                hue: at,
+                saturation: 1.0,
+                value: 1.0,
+            }
+            .to_srgb_f32(),
+        );
+        out.push(((sx + dx, sy), sample_at(image, sx + dx, sy), want));
+    }
+    out
+}
+
+fn assert_color_picker_gallery(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    pickers: [WidgetId; 2],
+    theme_name: &str,
+) {
+    let [enabled, disabled] = pickers;
+    let pixels = color_picker_gradient_pixels(image, tree, enabled);
+    for (at, got, want) in &pixels {
+        assert!(
+            within(*got, *want, 3),
+            "{theme_name}: gradient pixel {at:?} is {got:?}, HSV there is {want:?}"
+        );
+    }
+    // The disabled picker's same pixels are dimmed over the panel.
+    let dimmed = color_picker_gradient_pixels(image, tree, disabled);
+    let differing = pixels
+        .iter()
+        .zip(&dimmed)
+        .filter(|((_, a, _), (_, b, _))| a != b)
+        .count();
+    assert!(
+        differing >= pixels.len() - 1,
+        "{theme_name}: the disabled picker must read differently ({differing})"
+    );
+    // The marker: somewhere in its box a pixel is far from the gradient.
+    let (area, _) = color_picker_parts(tree, enabled);
+    let cx = area.x as f32 + COLOR_PICKER_HSV.saturation * area.width as f32;
+    let cy = area.y as f32 + (1.0 - COLOR_PICKER_HSV.value) * area.height as f32;
+    #[allow(clippy::cast_sign_loss)]
+    let (cx, cy) = (cx as u32, cy as u32);
+    let marked = (cx - 6..=cx + 6)
+        .flat_map(|px| (cy - 6..=cy + 6).map(move |py| (px, py)))
+        .any(|(px, py)| {
+            let s = (px as f32 + 0.5 - area.x as f32) / area.width as f32;
+            let v = 1.0 - (py as f32 + 0.5 - area.y as f32) / area.height as f32;
+            let want = to_rgb8(
+                Hsv {
+                    hue: 210.0,
+                    saturation: s.clamp(0.0, 1.0),
+                    value: v.clamp(0.0, 1.0),
+                }
+                .to_srgb_f32(),
+            );
+            !within(sample_at(image, px, py), want, 40)
+        });
+    assert!(marked, "{theme_name}: the square's marker must be visible");
+}
+
+macro_rules! color_picker_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, pickers) = color_picker_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                COLOR_PICKER_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            assert_color_picker_gallery(&image, &tree, pickers, $theme_name);
+        }
+    };
+}
+
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_dark_theme,
+    dark_theme(),
+    "Dark"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_light_theme,
+    light_theme(),
+    "Light"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// The gradient is content, not chrome: the enabled picker's sampled
+/// gradient pixels are byte-identical in every built-in theme.
+#[test]
+fn render_gallery_color_picker_gradient_is_identical_in_every_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, [enabled, _]) = color_picker_gallery_tree(&scales);
+    let mut seen: Option<Vec<[u8; 4]>> = None;
+    for theme in [
+        dark_theme(),
+        light_theme(),
+        high_contrast_dark_theme(),
+        high_contrast_light_theme(),
+        color_critical_theme(),
+    ] {
+        let image = render_gallery(
+            &context,
+            &tree,
+            &theme,
+            &scales,
+            COLOR_PICKER_GALLERY_SIZE,
+            tab_bar_clear(&theme),
+        );
+        let pixels: Vec<[u8; 4]> = color_picker_gradient_pixels(&image, &tree, enabled)
+            .into_iter()
+            .map(|(_, got, _)| got)
+            .collect();
+        match &seen {
+            Some(first) => assert_eq!(&pixels, first, "no theme token reaches the gradient"),
+            None => seen = Some(pixels),
+        }
+    }
+}
+
+/// The colour picker's own five golden-diff tests, against goldens that
+/// **do not exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s
+/// own doc comment records. A human blesses them (`AURORA_BLESS_GOLDEN=1
+/// cargo test -p aurora-widgets --test gallery -- --ignored`) after
+/// confirming each PNG shows two pickers — a white-to-hue-to-black square
+/// with a ring near its top-right, a rainbow strip with a bar at blue,
+/// and a small preview swatch — the right one dimmed.
+macro_rules! color_picker_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, _pickers) = color_picker_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                COLOR_PICKER_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image,
+    dark_theme(),
+    "color_picker_gallery.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "color_picker_gallery_light.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "color_picker_gallery_high_contrast_dark.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "color_picker_gallery_high_contrast_light.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "color_picker_gallery_color_critical.png"
+);
+
+// ---- Curve editor (0.126.0) --------------------------------------------
+
+/// One curve-editor cell: `CURVE_EDITOR_PADDING` around an editor
+/// `CURVE_EDITOR_SIZE` square.
+const CURVE_EDITOR_CELL: (u32, u32) = (160, 160);
+const CURVE_EDITOR_PADDING: u32 = 16;
+const CURVE_EDITOR_SIZE: u32 = 128;
+/// Enabled, then disabled. 320 px wide keeps readback rows aligned.
+const CURVE_EDITOR_GALLERY_SIZE: (u32, u32) = (CURVE_EDITOR_CELL.0 * 2, CURVE_EDITOR_CELL.1);
+/// A gentle S-curve; point 1 is selected.
+const CURVE_EDITOR_POINTS: [(f32, f32); 4] = [(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)];
+
+/// Two editors side by side over `surface.panel` — enabled and disabled.
+fn curve_editor_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let mut root_style = sized_style(CURVE_EDITOR_GALLERY_SIZE);
+    root_style.flex_direction = FlexDirection::Row;
+    let (mut tree, root) = new_tree(root_style);
+    let points: Vec<aurora_core::CurvePoint> = CURVE_EDITOR_POINTS
+        .iter()
+        .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+        .collect();
+    let Ok(curve) = aurora_core::ToneCurve::new(&points) else {
+        unreachable!("a valid curve");
+    };
+    let mut editors = Vec::new();
+    for disabled in [false, true] {
+        let padding = length(CURVE_EDITOR_PADDING as f32);
+        let cell = match aurora_widgets::widgets::insert_container(
+            &mut tree,
+            root,
+            Style {
+                flex_direction: FlexDirection::Column,
+                padding: LayoutRect {
+                    left: padding,
+                    right: padding,
+                    top: padding,
+                    bottom: padding,
+                },
+                ..sized_style(CURVE_EDITOR_CELL)
+            },
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let editor = match insert_curve_editor(
+            &mut tree,
+            cell,
+            scales,
+            "Curve",
+            CURVE_EDITOR_SIZE as f32,
+            curve.clone(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = select_curve_point(&mut tree, editor, 1) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_curve_editor_disabled(&mut tree, editor, disabled) {
+            unreachable!("{err:?}");
+        }
+        editors.push(editor);
+    }
+    tree.compute_layout(
+        CURVE_EDITOR_GALLERY_SIZE.0 as f32,
+        CURVE_EDITOR_GALLERY_SIZE.1 as f32,
+    );
+    let [enabled, disabled] = editors.as_slice() else {
+        unreachable!("two editors");
+    };
+    (tree, [*enabled, *disabled])
+}
+
+/// `(x, y)` in curve space as an image pixel inside `editor`'s plot —
+/// the plot is the editor inset by `spacing.xs` plus the 1 px ring.
+fn curve_editor_pixel(
+    tree: &WidgetTree<WidgetKind>,
+    editor: WidgetId,
+    scales: &Scales,
+    x: f32,
+    y: f32,
+) -> (u32, u32) {
+    let Some(bounds) = tree.bounds(editor) else {
+        unreachable!("laid out");
+    };
+    let reach = scales.spacing.xs as f32 + 1.0;
+    let side = bounds.width as f32 - 2.0 * reach;
+    let px = bounds.x as f32 + reach + x * side;
+    let py = bounds.y as f32 + reach + (1.0 - y) * side;
+    #[allow(clippy::cast_sign_loss)]
+    (px as u32, py as u32)
+}
+
+fn assert_curve_editor_gallery(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    scales: &Scales,
+    theme: &Theme,
+    editors: [WidgetId; 2],
+    theme_name: &str,
+) {
+    let [enabled, disabled] = editors;
+    let rgb8 = |color: Color| to_rgb8(color.to_srgb_f32());
+    // Empty well, far from the grid, the diagonal, the curve and markers.
+    let (wx, wy) = curve_editor_pixel(tree, enabled, scales, 0.9, 0.1);
+    let well = sample_at(image, wx, wy);
+    assert!(
+        within(well, rgb8(theme.surface.sunken), 3),
+        "{theme_name}: well pixel {well:?} is not surface.sunken"
+    );
+    // The selected point's disc centre is accent.primary.
+    let (x, y) = CURVE_EDITOR_POINTS[1];
+    let (cx, cy) = curve_editor_pixel(tree, enabled, scales, x, y);
+    let disc = sample_at(image, cx, cy);
+    assert!(
+        within(disc, rgb8(theme.accent.primary), 3),
+        "{theme_name}: selected marker {disc:?} is not accent.primary"
+    );
+    // The curve: a text.primary pixel in the column at input 0.375.
+    let Ok(state) = curve_editor_state(tree, enabled) else {
+        unreachable!("an editor");
+    };
+    let at = state.curve().evaluate(0.375);
+    let (qx, qy) = curve_editor_pixel(tree, enabled, scales, 0.375, at);
+    let text = rgb8(theme.text.primary);
+    let hit = (qy - 3..=qy + 3).find(|&py| within(sample_at(image, qx, py), text, 8));
+    let Some(row) = hit else {
+        unreachable!("{theme_name}: no text.primary curve pixel near ({qx}, {qy})");
+    };
+    // The disabled editor's same curve pixel is dimmed — and dimmed by
+    // exactly `state.disabled_opacity`: text.primary blended at that
+    // alpha over the disabled editor's own (itself dimmed) well pixel,
+    // in the sRGB-encoded `Rgba8Unorm` target's own space. Checking
+    // only "not text.primary" would also pass a curve drawn in the well
+    // colour, or not drawn at all.
+    let (dx, _) = curve_editor_pixel(tree, disabled, scales, 0.375, at);
+    let dimmed = sample_at(image, dx, row);
+    assert!(
+        !within(dimmed, text, 8),
+        "{theme_name}: the disabled editor's curve must be dimmed ({dimmed:?})"
+    );
+    let (ux, uy) = curve_editor_pixel(tree, disabled, scales, 0.9, 0.1);
+    let [ur, ug, ub, _] = sample_at(image, ux, uy);
+    let under = [ur, ug, ub];
+    let alpha = theme.state.disabled_opacity;
+    let mut expected = [0_u8; 3];
+    for (i, slot) in expected.iter_mut().enumerate() {
+        let (t, u) = (
+            f32::from(text.get(i).copied().unwrap_or(0)),
+            f32::from(under.get(i).copied().unwrap_or(0)),
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            *slot = (t * alpha + u * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    assert!(
+        within(dimmed, expected, 8),
+        "{theme_name}: the disabled curve {dimmed:?} is not text.primary at \
+         state.disabled_opacity ({alpha}) over the dimmed well {under:?} (want {expected:?})"
+    );
+    assert!(
+        !within(dimmed, under, 8),
+        "{theme_name}: the disabled curve {dimmed:?} must differ from its well {under:?}"
+    );
+}
+
+macro_rules! curve_editor_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, editors) = curve_editor_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            assert_curve_editor_gallery(&image, &tree, &scales, &theme, editors, $theme_name);
+        }
+    };
+}
+
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_dark_theme,
+    dark_theme(),
+    "Dark"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_light_theme,
+    light_theme(),
+    "Light"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// The curve editor's own five golden-diff tests, against goldens that
+/// **do not exist** — `#[ignore]`d, exactly as `color_picker_golden_test!`'s
+/// own doc comment records. A human blesses them (`AURORA_BLESS_GOLDEN=1
+/// cargo test -p aurora-widgets --test gallery -- --ignored`) after
+/// confirming each PNG shows two square wells with a quarter grid, a
+/// diagonal, an S-shaped curve and four ringed markers (the second one
+/// filled with the accent) — the right editor dimmed. A green headless
+/// run of the tests above proves the sampled pixels only, nothing about
+/// how the editor looks.
+macro_rules! curve_editor_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, _editors) = curve_editor_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image,
+    dark_theme(),
+    "curve_editor_gallery.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "curve_editor_gallery_light.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "curve_editor_gallery_high_contrast_dark.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "curve_editor_gallery_high_contrast_light.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "curve_editor_gallery_color_critical.png"
+);

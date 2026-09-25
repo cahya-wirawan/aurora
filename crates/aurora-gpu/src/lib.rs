@@ -41,4 +41,4 @@ pub use error::GpuError;
 pub use pipeline::{Blend, PipelineCache, PipelineKey};
 pub use residency::{SyncStats, TileResidency};
 pub use shader::ShaderLibrary;
-pub use surface::GpuSurface;
+pub use surface::{GpuSurface, choose_surface_format};

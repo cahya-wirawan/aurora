@@ -6,8 +6,16 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, `TreeItem`, `Panel`, and `Dialog` — solid rounded-rect shapes, the simplest of
-//! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
+//! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`,
+//! `DropdownList`, `TabBar`, `Tab`, `Tooltip`, `Menu`, `MenuSeparator`
+//! (as of `0.125.0`) the colour picker's `ColorPickerPart` markers, and
+//! (as of `0.126.0`) the whole `CurveEditor` — well, grid, diagonal,
+//! curve and markers, the first **open** strokes ([`paint_curve_editor`])
+//! — solid shapes, the simplest of the widgets this crate has
+//! (`widgets`' own doc comment). The colour picker's saturation/value
+//! square and hue strip are the first **gradients**, and reach a
+//! renderer only through [`paint_widget_ops`] (`paint_widget` returns
+//! exactly its solid subset). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
 //! solid fills only, `render`'s own doc comment); `Toggled::True` and
@@ -50,7 +58,8 @@
 //! window behind it (out of scope, see `widgets::dialog`'s own module
 //! doc comment). Every other
 //! [`WidgetKind`] (`Container` on its own, a dialog's own message node
-//! included) returns `Ok(vec![])` too — a real, deliberate "nothing to
+//! included, and a curve editor's `CurveEditorPoint` sliders) returns
+//! `Ok(vec![])` too — a real, deliberate "nothing to
 //! paint," not an error.
 //!
 //! Every kind's own geometry is built from bounds that
@@ -95,16 +104,21 @@
 
 use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
-use aurora_theme::{Scales, Theme};
-use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
+use aurora_theme::{Color, Scales, Theme};
+use aurora_vector::{
+    ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Path, PathBuilder, Point,
+    bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
+};
 
 use taffy::Overflow;
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
-    TextFieldState, TreeItemState, WidgetKind, row_height,
+    ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
+    CurveEditorState, DropdownState, Hsv, ListRowState, MARKER_RING_WIDTH, ScrollbarState,
+    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind, plot_rect,
+    row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -114,6 +128,361 @@ use crate::widgets::{
 /// ([`paint_widget`]'s own return type) — see this module's own doc
 /// comment for why a single widget can need more than one.
 pub type Paint = (Mesh, [f32; 4]);
+
+/// One draw in a widget's paint, in paint order: either a solid shape
+/// ([`Paint`], drawn by [`crate::render::PathPipeline`]) or a
+/// vertex-coloured gradient ([`ColorMesh`], drawn by
+/// [`crate::render::GradientPipeline`]). [`paint_widget_ops`] returns
+/// these; renderers should call it rather than [`paint_widget`] so a
+/// widget that starts painting a gradient needs no renderer change.
+///
+/// A `Solid` colour is resolved from a design token (invariant
+/// §7.3.10). A `Gradient`'s vertex colours are *content* — the value a
+/// colour picker shows or a swatch displays, which a theme must not
+/// override — the same carve-out `ColorSwatch`'s own colour already
+/// has. Both are straight sRGB-gamma-encoded RGBA; only `Solid`'s is
+/// ever linearized by a caller for an sRGB-aware target, because the
+/// gradient pipeline chooses its own fragment conversion from the
+/// target format.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaintOp {
+    Solid(Paint),
+    Gradient(ColorMesh),
+}
+
+impl From<Paint> for PaintOp {
+    fn from(paint: Paint) -> Self {
+        Self::Solid(paint)
+    }
+}
+
+/// [`paint_widget`], as [`PaintOp`]s — the entry point renderers use.
+///
+/// Every widget's gradients come first, then its solid shapes, in
+/// [`paint_widget`]'s own order: the solids are exactly
+/// [`paint_widget`]'s output wrapped in [`PaintOp::Solid`], so the two
+/// functions can never disagree about a widget's solid paint. As of
+/// `0.125.0` the colour picker is the first (and only) gradient
+/// consumer: its saturation/value square and its hue strip each paint
+/// one gradient (or, when an ancestor clips them, the visible part of
+/// one — `color_picker_gradients`) beneath a token-coloured marker.
+/// Every other kind paints solids only.
+///
+/// # Errors
+///
+/// Exactly [`paint_widget`]'s.
+pub fn paint_widget_ops(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
+    let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
+    let gradients = match tree.payload(id) {
+        Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
+        _ => Vec::new(),
+    };
+    Ok(gradients
+        .into_iter()
+        .map(PaintOp::Gradient)
+        .chain(solids.into_iter().map(PaintOp::Solid))
+        .collect())
+}
+
+/// `a * (1 - t) + b * t` per channel — `aurora_vector`'s own lerp form,
+/// bit-exact at `t == 0` and `t == 1`.
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let [ar, ag, ab, aa] = a;
+    let [br, bg, bb, ba] = b;
+    [
+        ar * (1.0 - t) + br * t,
+        ag * (1.0 - t) + bg * t,
+        ab * (1.0 - t) + bb * t,
+        aa * (1.0 - t) + ba * t,
+    ]
+}
+
+/// `hsv`'s colour as a gradient vertex colour with alpha `alpha`.
+fn vertex_color(hsv: Hsv, alpha: f32) -> [f32; 4] {
+    let [r, g, b] = hsv.to_srgb_f32();
+    [r, g, b, alpha]
+}
+
+/// The pure hue `hue` (`saturation == value == 1`).
+fn pure_hue(hue: f32) -> Hsv {
+    Hsv {
+        hue,
+        saturation: 1.0,
+        value: 1.0,
+    }
+}
+
+/// The saturation/value square's four corner colours: white top-left,
+/// the pure hue top-right, black along the bottom. Bilinear between
+/// them is exactly HSV with this hue: the colour at `(s, 1 - v)` is
+/// `v * ((1 - s) * white + s * hue)`, which is the HSV formula.
+fn sv_corners(hue: f32, alpha: f32) -> GradientCorners {
+    GradientCorners {
+        top_left: [1.0, 1.0, 1.0, alpha],
+        top_right: vertex_color(pure_hue(hue), alpha),
+        bottom_left: [0.0, 0.0, 0.0, alpha],
+        bottom_right: [0.0, 0.0, 0.0, alpha],
+    }
+}
+
+/// The bilinear colour of `corners` at `(tx, ty)` — interpolated along
+/// x first, then y, exactly as `aurora_vector::bilinear_rect` does.
+fn bilinear_at(corners: GradientCorners, tx: f32, ty: f32) -> [f32; 4] {
+    let top = mix(corners.top_left, corners.top_right, tx);
+    let bottom = mix(corners.bottom_left, corners.bottom_right, tx);
+    mix(top, bottom, ty)
+}
+
+/// A rect's `(x, y, width, height)` as `f32`s.
+fn rect_f32(rect: Rect) -> (f32, f32, f32, f32) {
+    (
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
+    )
+}
+
+/// The colour picker's gradients — nothing for any part but the square
+/// and the hue strip, and nothing when [`clip_to_clipping_ancestors`]
+/// leaves nothing visible.
+///
+/// Unclipped, the square is one [`bilinear_rect`] over its whole box and
+/// the strip one [`horizontal_strip`] with seven stops (`hue = 0, 60,
+/// ..., 360`). **Clipped**, only the visible rect is tessellated, and its
+/// colours are the full-rect gradient's own, evaluated there — so what
+/// is drawn is exactly what the unclipped gradient shows at those
+/// pixels, never the whole gradient squeezed into the visible part. For
+/// the square that is one `bilinear_rect` whose corners are the
+/// full-rect bilinear colour at the visible corners (a bilinear function
+/// restricted to an axis-aligned sub-rectangle is bilinear with those
+/// corners, so this is exact). For the strip it is one two-stop
+/// `horizontal_strip` per hue segment `[i/6, (i+1)/6]` that overlaps the
+/// visible span, its ends linearly interpolated — at most six.
+///
+/// "Exact" means at the mesh's vertices: inside each tessellated cell
+/// the GPU interpolates barycentrically, so the square only approximates
+/// bilinear HSV between vertices (within `aurora_vector`'s documented
+/// bound, under half an 8-bit step at `DEFAULT_GRADIENT_CELLS` = 16 —
+/// the control for that bound). The strip is exact everywhere, being
+/// piecewise-linear by construction.
+///
+/// A disabled picker multiplies every vertex alpha by
+/// `state.disabled_opacity`, the same dimming every solid widget uses.
+/// An empty mesh (a zero-size, never-laid-out part) is dropped rather
+/// than emitted.
+fn color_picker_gradients(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &ColorPickerPartState,
+    theme: &Theme,
+) -> Vec<ColorMesh> {
+    let Some(full) = tree.bounds(id) else {
+        return Vec::new();
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Vec::new();
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let (fx, fy, fw, fh) = rect_f32(full);
+    let (vx, vy, vw, vh) = rect_f32(visible);
+    let meshes = match state.role() {
+        ColorPickerPartRole::Area => {
+            let corners = sv_corners(state.hsv().hue, alpha);
+            let corners = if visible == full {
+                corners
+            } else {
+                let tx0 = (vx - fx) / fw;
+                let tx1 = (vx + vw - fx) / fw;
+                let ty0 = (vy - fy) / fh;
+                let ty1 = (vy + vh - fy) / fh;
+                GradientCorners {
+                    top_left: bilinear_at(corners, tx0, ty0),
+                    top_right: bilinear_at(corners, tx1, ty0),
+                    bottom_left: bilinear_at(corners, tx0, ty1),
+                    bottom_right: bilinear_at(corners, tx1, ty1),
+                }
+            };
+            vec![bilinear_rect(
+                vx,
+                vy,
+                vw,
+                vh,
+                corners,
+                DEFAULT_GRADIENT_CELLS,
+            )]
+        }
+        ColorPickerPartRole::Hue => {
+            let stops: Vec<[f32; 4]> = (0_u8..=6)
+                .map(|i| vertex_color(pure_hue(f32::from(i) * 60.0), alpha))
+                .collect();
+            if visible == full {
+                vec![horizontal_strip(fx, fy, fw, fh, &stops)]
+            } else {
+                // Positions are clipped directly in pixels — a visible
+                // edge is exactly the clip line, never rebuilt through a
+                // fraction — and `t` is derived only for the colour.
+                let (left_clip, right_clip) = (vx, vx + vw);
+                let segment_edge = |i: f32| fx + i / 6.0 * fw;
+                stops
+                    .windows(2)
+                    .zip(0_u8..)
+                    .filter_map(|(pair, i)| {
+                        let (&[left, right], i) = (pair, f32::from(i)) else {
+                            return None;
+                        };
+                        let start = segment_edge(i).max(left_clip);
+                        let end = segment_edge(i + 1.0).min(right_clip);
+                        if end <= start {
+                            return None;
+                        }
+                        let at = |px: f32| {
+                            let t = (px - fx) / fw;
+                            mix(left, right, (t * 6.0 - i).clamp(0.0, 1.0))
+                        };
+                        Some(horizontal_strip(
+                            start,
+                            vy,
+                            end - start,
+                            vh,
+                            &[at(start), at(end)],
+                        ))
+                    })
+                    .collect()
+            }
+        }
+        ColorPickerPartRole::Saturation | ColorPickerPartRole::Value => Vec::new(),
+    };
+    meshes
+        .into_iter()
+        .filter(|mesh| !mesh.vertices.is_empty())
+        .collect()
+}
+
+/// A colour picker part's solid paint: the square's marker (a small
+/// ring at the picked saturation/value) or the strip's marker (a bar at
+/// the picked hue); nothing for a channel slider. Each marker is stroked
+/// twice, 1 px apart — an outer `text.primary` ring and an inner
+/// `surface.panel` one — so it stays visible over any colour the
+/// gradient beneath it shows (the two tokens are a pair
+/// `design/check_contrast.py` gates at 4.5:1 in every built-in theme).
+/// That pairing is this function's own choice, not a design-owner
+/// decision; no marker token exists.
+///
+/// Positions come from the part's **unclipped** bounds, with the
+/// marker's centre **clamped** so its whole stroked outline (half a
+/// ring width past the outer path) stays inside the part: at an extreme
+/// (`s`/`v` at `0` or `1`, hue at `0` or `360`) the marker sits flush
+/// with the part's edge instead of straddling it, so it never paints
+/// over a neighbour or outside the part's own damage rect, and a clipping
+/// ancestor flush with the part keeps it. A part too small to hold its
+/// marker — zero-size (never laid out) or a tiny picker — paints none.
+/// A marker is emitted only when no clipping ancestor cuts any of it (its outer
+/// bounding box, rounded outward, survives [`clip_to_clipping_ancestors`]
+/// unchanged): a partly clipped marker is dropped rather than drawn
+/// sliced, since the clip is applied to rects before tessellation and
+/// a stroked ring cannot be cut that way.
+fn paint_color_picker_markers(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &ColorPickerPartState,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    const RING_WIDTH: f32 = 1.0;
+
+    let Some(full) = tree.bounds(id) else {
+        return Ok(vec![]);
+    };
+    let (fx, fy, fw, fh) = rect_f32(full);
+    let hsv = state.hsv();
+    let half = RING_WIDTH / 2.0;
+    // `centre` along an axis starting at `start`, `length` long, clamped
+    // so a marker reaching `reach` either side of it stays inside; `None`
+    // when the axis is too short to hold the marker at all.
+    let inside = |centre: f32, start: f32, length: f32, reach: f32| -> Option<f32> {
+        let (lo, hi) = (start + reach, start + length - reach);
+        (centre.is_finite() && lo <= hi).then(|| centre.clamp(lo, hi))
+    };
+    // The outer ring's own path rect: (x, y, width, height, radius).
+    let outer = match state.role() {
+        ColorPickerPartRole::Area => {
+            let side = 2.0 * scales.spacing.xs as f32;
+            let reach = side / 2.0 + half;
+            let (Some(cx), Some(cy)) = (
+                inside(fx + hsv.saturation * fw, fx, fw, reach),
+                inside(fy + (1.0 - hsv.value) * fh, fy, fh, reach),
+            ) else {
+                return Ok(vec![]);
+            };
+            (cx - side / 2.0, cy - side / 2.0, side, side, side / 2.0)
+        }
+        ColorPickerPartRole::Hue => {
+            // Inset by half a ring vertically, so the outer stroke lies
+            // inside the strip's own rows rather than straddling them.
+            let width = 2.0 * scales.spacing.xs as f32;
+            let Some(cx) = inside(fx + hsv.hue / 360.0 * fw, fx, fw, width / 2.0 + half) else {
+                return Ok(vec![]);
+            };
+            (
+                cx - width / 2.0,
+                fy + RING_WIDTH / 2.0,
+                width,
+                fh - RING_WIDTH,
+                scales.radius.sm as f32,
+            )
+        }
+        ColorPickerPartRole::Saturation | ColorPickerPartRole::Value => return Ok(vec![]),
+    };
+    let (x, y, width, height, radius) = outer;
+    if !(x.is_finite() && y.is_finite()) || width <= 2.0 * RING_WIDTH || height <= 2.0 * RING_WIDTH
+    {
+        return Ok(vec![]);
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let bbox = Rect {
+        x: (x - half).floor() as i64,
+        y: (y - half).floor() as i64,
+        width: ((x + width + half).ceil() - (x - half).floor()) as u32,
+        height: ((y + height + half).ceil() - (y - half).floor()) as u32,
+    };
+    if clip_to_clipping_ancestors(tree, id, bbox) != Some(bbox) {
+        return Ok(vec![]);
+    }
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let outer_path = rounded_rect(x, y, width, height, radius);
+    let inner_path = rounded_rect(
+        x + RING_WIDTH,
+        y + RING_WIDTH,
+        width - 2.0 * RING_WIDTH,
+        height - 2.0 * RING_WIDTH,
+        (radius - RING_WIDTH).max(0.0),
+    );
+    let outer_mesh = stroke(&outer_path, RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let inner_mesh = stroke(&inner_path, RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [outer_r, outer_g, outer_b] = theme.text.primary.to_srgb_f32();
+    let [inner_r, inner_g, inner_b] = theme.surface.panel.to_srgb_f32();
+    Ok(vec![
+        (outer_mesh, [outer_r, outer_g, outer_b, alpha]),
+        (inner_mesh, [inner_r, inner_g, inner_b, alpha]),
+    ])
+}
 
 /// The mandatory control-outline stroke `border.control`/
 /// `border.control_opacity` describe (`design/tokens/vocabulary.md`) —
@@ -202,7 +571,22 @@ pub fn paint_widget(
         WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
-        WidgetKind::Container => Ok(vec![]),
+        WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
+        WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
+        WidgetKind::TabBar(state) => paint_tab_bar(state, bounds, theme, scale_factor),
+        WidgetKind::Tab(state) => paint_tab(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Tooltip => paint_tooltip(bounds, theme, scales, scale_factor),
+        WidgetKind::Menu(_) => paint_menu(bounds, theme, scales, scale_factor),
+        WidgetKind::MenuSeparator => paint_menu_separator(bounds, theme, scale_factor),
+        WidgetKind::ColorPickerPart(state) => {
+            paint_color_picker_markers(tree, id, state, theme, scales, scale_factor)
+        }
+        WidgetKind::CurveEditor(state) => {
+            paint_curve_editor(tree, id, state, theme, scales, scale_factor)
+        }
+        WidgetKind::ColorPicker(_) | WidgetKind::CurveEditorPoint(_) | WidgetKind::Container => {
+            Ok(vec![])
+        }
     }
 }
 
@@ -693,15 +1077,16 @@ fn paint_command_palette(
 /// the two High Contrast themes, the third drawn last and therefore on
 /// top — coincident with the second, and deliberately so.
 ///
-/// **These are two functions rather than one token-parameterized helper
-/// for a documentation reason, not a testing one.** An earlier version
-/// of this comment said "do not simplify," implying a shared helper
-/// would make some test vacuous; that was imprecise — nothing here
-/// depends on the duplication, and no drift between the two has
-/// occurred. The real reason is narrower: each function carries its own
-/// `vocabulary.md` elevation citation next to the token it actually
-/// resolves, which a shared helper would move away from both call
-/// sites. Worth knowing either way: the two tokens resolve
+/// **The shape lives in [`bordered_surface`]; the token choice stays
+/// here.** Through `0.122.0` this function and its siblings each
+/// duplicated the fill/border/outline sequence, kept apart so each
+/// could carry its own `vocabulary.md` elevation citation next to the
+/// token it resolves. `0.123.0` keeps exactly that — this wrapper still
+/// names `surface.overlay` and `radius.md` itself, with this comment —
+/// and delegates only the shape, so the citation did not move and the
+/// sequence can no longer drift between callers. Worth knowing: this
+/// function's `surface.overlay` and [`paint_command_palette`]'s
+/// `surface.raised` resolve
 /// *byte-identically* in three of the five built-in themes — Light
 /// (both `neutral.900`), High Contrast Dark (both `hc.black`) and High
 /// Contrast Light (both `hc.white`) — so in those three no
@@ -723,9 +1108,38 @@ fn paint_dialog(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    // The same 1.0 logical px `paint_panel` strokes its own border at,
-    // and a plain engineering default for the same reason: no "border
-    // width" token exists in `design/tokens/scales.toml` yet.
+    bordered_surface(
+        bounds,
+        theme.surface.overlay,
+        scales.radius.md as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// The one shape [`paint_dialog`], [`paint_dropdown_list`],
+/// [`paint_tooltip`] and [`paint_menu`] share: a `radius` rounded rect
+/// filled with `fill` at full alpha, an **unconditional 1.0 logical px
+/// `border.default` stroke** over it, and the conditional
+/// [`control_outline`] drawn last. Two shapes in Dark/Light/
+/// Colour-Critical, three in the two High Contrast themes.
+///
+/// Every caller keeps its own doc comment and passes its own fill token
+/// and radius, so each `design/tokens/vocabulary.md` elevation citation
+/// still sits next to the call that actually resolves the token; only
+/// the shape itself lives here. Extracted in `0.123.0` as a pure
+/// refactor: the three existing callers' tests pass unedited.
+///
+/// The 1.0 logical px border width is a plain engineering default, the
+/// same one [`paint_panel`] strokes at: no "border width" token exists
+/// in `design/tokens/scales.toml` yet.
+fn bordered_surface(
+    bounds: Rect,
+    fill_color: Color,
+    radius: f32,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
     const BORDER_WIDTH: f32 = 1.0;
 
     let path = rounded_rect(
@@ -733,15 +1147,13 @@ fn paint_dialog(
         bounds.y as f32,
         bounds.width as f32,
         bounds.height as f32,
-        scales.radius.md as f32,
+        radius,
     );
     let tolerance = tolerance_for_scale_factor(scale_factor);
     let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
-    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
-
+    let [fr, fg, fb] = fill_color.to_srgb_f32();
     let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
     let [br, bg, bb] = theme.border.default.to_srgb_f32();
-
     let mut paints = vec![
         (fill_mesh, [fr, fg, fb, 1.0]),
         (border_mesh, [br, bg, bb, 1.0]),
@@ -750,6 +1162,583 @@ fn paint_dialog(
         paints.push(outline);
     }
     Ok(paints)
+}
+
+/// A dropdown's own control: a `scales.radius.sm` rounded rect filled
+/// with `surface.sunken` (`design/tokens/vocabulary.md`: "Inset wells:
+/// ... input backgrounds" — the token `design/gallery/index.html`'s own
+/// `.dropdown` mockup uses), an **unconditional 1 px border** over it,
+/// and the conditional [`control_outline`] on top in a High Contrast
+/// theme. So two shapes in Dark/Light/Colour-Critical, three in the two
+/// High Contrast themes — the same count [`paint_dialog`] has.
+///
+/// **Which of the two strokes draws last depends on state, and that is
+/// load-bearing in High Contrast.** Both strokes are the same path at the
+/// same width, so whichever draws second hides the other completely.
+/// Closed, the mandatory `border.control` outline draws last (the same
+/// order [`paint_dialog`] uses, so `border.default`'s `hc.mid_gray` never
+/// downgrades the theme's full-strength outline). Open, `border.focus`
+/// draws last: with the outline on top, an open and a closed dropdown
+/// were measured pixel-identical in both High Contrast themes, so the
+/// one visual signal this widget has for "open" vanished in exactly the
+/// themes meant to make state *more* visible. Both themes' `border.focus`
+/// (`hc.yellow`/`hc.blue`) is itself a full-strength accent.
+///
+/// The border is `border.default` while closed and `border.focus` while
+/// **open** — the mockup's `.dropdown.state-focus` rule, keyed on the
+/// one state this widget actually knows. It is *not* a keyboard-focus
+/// ring: no widget in this crate paints keyboard focus at all
+/// ([`crate::FocusManager`] tracks it and marks damage, but nothing
+/// reads it at paint time), which is a crate-wide, disclosed gap rather
+/// than a dropdown one.
+///
+/// **An unchecked contrast pair, flagged rather than added**:
+/// `design/check_contrast.py` gates `border.focus` against
+/// `surface.panel`, `surface.canvas` and `surface.raised`, not against
+/// `surface.sunken`, which is what this border sits on the inside of.
+/// Adding a gated pair is a design-owner decision (PRD FR-027
+/// *Ownership*), so it is named here and not done.
+///
+/// The unconditional border is the mockup's own `1px solid
+/// var(--border-default)`, and it is not decoration in Colour-Critical
+/// or High Contrast: a `surface.sunken` well is byte-identical to the
+/// panel behind it in both High Contrast themes. `state.disabled_opacity`
+/// dims all of it, border included. No `▾` indicator: this crate draws
+/// no glyphs, and which token one would use is a design-owner question.
+fn paint_dropdown(
+    state: &DropdownState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px `paint_panel`/`bordered_surface` stroke at: no
+    // "border width" token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let [fr, fg, fb] = theme.surface.sunken.to_srgb_f32();
+    let border = if state.is_open() {
+        theme.border.focus
+    } else {
+        theme.border.default
+    };
+    let [br, bg, bb] = border.to_srgb_f32();
+    let border_paint = (border_mesh, [br, bg, bb, alpha]);
+    let outline = control_outline(&path, theme, alpha, scale_factor)?;
+    let mut paints = vec![(fill_mesh, [fr, fg, fb, alpha])];
+    // Draw order depends on state -- see this function's doc comment.
+    if state.is_open() {
+        paints.extend(outline);
+        paints.push(border_paint);
+    } else {
+        paints.push(border_paint);
+        paints.extend(outline);
+    }
+    Ok(paints)
+}
+
+/// An open dropdown's own list: a `scales.radius.sm` rounded rect filled
+/// with `surface.raised` — `design/tokens/vocabulary.md`'s "Elevation 1:
+/// dropdowns, popovers, context menus", named for exactly this — with an
+/// **unconditional `border.default` outline** over it and the
+/// conditional [`control_outline`] on top. `radius.sm` rather than the
+/// `radius.md` [`paint_command_palette`] uses for a free-floating panel,
+/// so the list's corners match the control it hangs from and the
+/// full-width option highlights ([`paint_list_row`], `radius.sm`)
+/// inside it. Always full opacity: a disabled dropdown is closed first,
+/// so a list never exists for one.
+///
+/// **The unconditional border is load-bearing, the same finding
+/// [`paint_dialog`] records.** Light resolves `surface.raised` and
+/// `surface.panel` to the same `neutral.900`, and both High Contrast
+/// themes resolve `surface.raised`, `surface.panel` *and*
+/// `surface.sunken` to one value each (`hc.black`/`hc.white`) — so over
+/// a panel, a fill alone would make the list byte-identical to what is
+/// behind it. `a_light_theme_dropdown_list_still_paints_a_border`
+/// pins it.
+fn paint_dropdown_list(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    bordered_surface(
+        bounds,
+        theme.surface.raised,
+        scales.radius.sm as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// A shown tooltip: a `scales.radius.sm` rounded rect filled with
+/// `surface.overlay`, an **unconditional 1 px `border.default`** stroke
+/// over it, and the conditional [`control_outline`] drawn last — two
+/// shapes in Dark/Light/Colour-Critical, three in the two High Contrast
+/// themes, the same shape and order as [`paint_dialog`] and
+/// [`paint_dropdown_list`]. Always full opacity: a tooltip has no
+/// disabled state of its own.
+///
+/// **`surface.overlay` and `radius.sm` are the mockup's own**
+/// (`design/gallery/index.html:126-133`: `background:
+/// var(--surface-overlay)`, `border-radius: var(--radius-sm)`). **A
+/// design-owner question, raised rather than resolved**: the same rule
+/// sets `box-shadow: var(--elevation-1)`, while
+/// `design/tokens/vocabulary.md:26-27` names `surface.overlay`
+/// "Elevation 2: modals, dialogs" and `surface.raised` "Elevation 1:
+/// dropdowns, popovers" — so the mockup pairs the Elevation 2 fill with
+/// the Elevation 1 shadow. This follows the mockup's fill and does not
+/// pick a side (PRD FR-027 *Ownership*). The shadow itself is not drawn:
+/// nothing in this crate draws shadows (see [`paint_dialog`]).
+///
+/// **The border is not in the mockup, and is load-bearing anyway** —
+/// [`paint_dialog`]'s own finding. Light resolves `surface.overlay`,
+/// `surface.raised`, `surface.panel` and `surface.canvas` all to
+/// `neutral.900` with `border.control_opacity = 0.0`, so without the
+/// border a Light tooltip over a panel is byte-identical to it;
+/// `a_light_theme_tooltip_still_paints_a_border` pins that. It inherits
+/// [`paint_dialog`]'s disclosed Colour-Critical residual unchanged:
+/// `border.default` clears `cc.overlay` by only ≈1.35:1.
+fn paint_tooltip(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    bordered_surface(
+        bounds,
+        theme.surface.overlay,
+        scales.radius.sm as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// An open menu's own surface: [`bordered_surface`] with
+/// `surface.raised` and `scales.radius.sm`. **Provisional** — there is
+/// no menu mockup in `design/gallery/index.html`, so the tokens are
+/// chosen from `design/tokens/vocabulary.md`, whose `surface.raised`
+/// entry reads "Elevation 1: dropdowns, popovers, context menus" — a
+/// menu is named there outright — and `radius.sm` so the full-width
+/// item highlights ([`paint_list_row`], `radius.sm`) match its corners,
+/// the same reasoning [`paint_dropdown_list`] records. The unconditional
+/// border is load-bearing for the same reason it is there: Light and
+/// both High Contrast themes resolve `surface.raised` to their
+/// `surface.panel`. Always full opacity: a menu has no disabled state.
+///
+/// A highlighted item is full width, so its `accent.primary` fill covers
+/// the inner half of this border beside it — the same as a dropdown's
+/// list, disclosed rather than inset.
+fn paint_menu(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    bordered_surface(
+        bounds,
+        theme.surface.raised,
+        scales.radius.sm as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// A menu separator: one filled `border.default` band, the separator's
+/// full width and `min(1.0, height)` logical px tall, vertically centred
+/// in its box (the offset floored so the band lands on a whole logical-pixel
+/// row). `border.default` is decorative and deliberately not gated by
+/// `design/check_contrast.py` — the same status [`paint_tab_bar`]'s rule
+/// has. The token and the separator's own height are provisional: no
+/// mockup exists (a design-owner question, `menu.rs`'s doc comment).
+fn paint_menu_separator(
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px every border here uses: no "border width"
+    // token exists in `design/tokens/scales.toml` yet.
+    const RULE: f32 = 1.0;
+    let height = bounds.height as f32;
+    let rule = RULE.min(height);
+    let top = bounds.y as f32 + ((height - rule) / 2.0).floor();
+    let Some(mesh) = band(
+        bounds.x as f32,
+        top,
+        bounds.width as f32,
+        rule,
+        scale_factor,
+    )?
+    else {
+        return Ok(vec![]);
+    };
+    let [r, g, b] = theme.border.default.to_srgb_f32();
+    Ok(vec![(mesh, [r, g, b, 1.0])])
+}
+
+/// A plain, square-cornered filled rectangle — `rounded_rect` at radius
+/// `0.0` — or `None` when it has no area, so a degenerate (zero-width or
+/// zero-height) band paints nothing rather than tessellating an empty
+/// path.
+fn band(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    scale_factor: f32,
+) -> Result<Option<Mesh>, WidgetError> {
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(None);
+    }
+    let path = rounded_rect(x, y, width, height, 0.0);
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    fill(&path, tolerance).map(Some).map_err(WidgetError::Paint)
+}
+
+/// A tab bar's own paint: one **filled** 1 px `border.default` rule
+/// along its bottom edge, the full width of the bar — the mockup's
+/// `.tabs { border-bottom: 1px solid var(--border-default) }`. A fill
+/// rather than a stroke, so the band lies exactly inside the bar's own
+/// bottom pixel row instead of straddling its edge. The bar has no
+/// background of its own: it sits on whatever panel holds it.
+/// `state.disabled_opacity` dims the rule when the bar is disabled.
+///
+/// `border.default` is listed but deliberately **not gated** by
+/// `design/check_contrast.py` against `surface.panel` ("decorative");
+/// the rule is not the only way a tab is identified here — the selected
+/// tab's `accent.primary` underline, which *is* gated against
+/// `surface.panel` (3:1), carries the state.
+fn paint_tab_bar(
+    state: &TabBarState,
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px every border here uses: no "border width"
+    // token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    let rule_height = BORDER_WIDTH.min(height);
+    let Some(mesh) = band(
+        bounds.x as f32,
+        bounds.y as f32 + height - rule_height,
+        width,
+        rule_height,
+        scale_factor,
+    )?
+    else {
+        return Ok(vec![]);
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let [r, g, b] = theme.border.default.to_srgb_f32();
+    Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
+/// One tab's own paint. The conditional [`control_outline`] (High
+/// Contrast only) first; then, **only on the selected tab**, a filled
+/// `accent.primary` underline along its bottom edge, drawn **last** so
+/// it lies over both the outline and the bar's own `border.default`
+/// rule beneath it. An inactive tab outside High Contrast paints
+/// nothing (`Ok(vec![])`, the same "nothing to highlight" convention
+/// [`paint_list_row`] uses). `state.disabled_opacity` dims everything.
+///
+/// `accent.primary` is `design/tokens/vocabulary.md`'s "selection
+/// highlight" token, and `accent.primary on surface.panel` is one of
+/// `design/check_contrast.py`'s gated 3:1 pairs — the surface a tab bar
+/// sits on.
+///
+/// **No keyboard-focus ring and no label glyph** — see `tab_bar.rs`'s
+/// own module doc comment.
+fn paint_tab(
+    state: &TabState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The mockup's `.tab.active { border-bottom: 2px solid
+    // var(--accent-primary) }`. **Not a token**: `design/tokens/
+    // scales.toml` has no stroke-weight scale at all, the same gap every
+    // `BORDER_WIDTH` above records. Flagged to the design owner (Cahya,
+    // PRD FR-027 *Ownership*) rather than invented as a token here.
+    const UNDERLINE_WIDTH: f32 = 2.0;
+
+    let (left, top) = (bounds.x as f32, bounds.y as f32);
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(vec![]);
+    }
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let path = rounded_rect(left, top, width, height, scales.radius.sm as f32);
+    let mut paints: Vec<Paint> = control_outline(&path, theme, alpha, scale_factor)?
+        .into_iter()
+        .collect();
+    if state.is_selected() {
+        let underline = UNDERLINE_WIDTH.min(height);
+        if let Some(mesh) = band(
+            left,
+            top + height - underline,
+            width,
+            underline,
+            scale_factor,
+        )? {
+            let [r, g, b] = theme.accent.primary.to_srgb_f32();
+            paints.push((mesh, [r, g, b, alpha]));
+        }
+    }
+    Ok(paints)
+}
+
+/// The curve editor's whole paint, in order — see `curve_editor.rs`'s
+/// own module doc comment for the plot rectangle every shape after the
+/// well is drawn through ([`plot_rect`], the same function the pointer
+/// mapping uses):
+///
+/// 1. **The well**: a `scales.radius.sm` rounded rect filled with
+///    `surface.sunken` ("Inset wells", `design/tokens/vocabulary.md` —
+///    the dropdown's own control well), an unconditional
+///    `border.default` stroke, and the conditional [`control_outline`].
+///    Not [`bordered_surface`], which draws at full alpha: every shape
+///    here is dimmed by `state.disabled_opacity` when disabled.
+/// 2. **The grid**: six filled `border.default` bands, one at each
+///    quarter of the plot along each axis (vertical ones first).
+/// 3. **The identity diagonal**: a `border.default` line from the plot's
+///    bottom-left to its top-right.
+/// 4. **The curve**: a polyline through [`curve_polyline_samples`] —
+///    the `CURVE_SEGMENTS + 1` uniform samples merged with every
+///    control point's own input — stroked in `text.primary`.
+/// 5. **The markers**: per point, the colour picker's own two-ring
+///    marker (`text.primary` outside, `surface.panel` inside) around a
+///    circle of radius `spacing.xs` (fixed at insert). The **selected**
+///    point is drawn last, on top of every other marker, with an
+///    `accent.primary` filled disc beneath its rings.
+///
+/// **No curve-specific token exists** (`design/tokens/vocabulary.md` has
+/// no "plot line" or "grid" role), so `text.primary`, `border.default` and
+/// `accent.primary` are this function's own choices from the existing
+/// vocabulary, flagged to the design owner rather than invented here.
+///
+/// **Clipping** (the colour picker's precedent): the clip is applied to
+/// rects before tessellation, and a stroke cannot be cut that way, so if
+/// [`clip_to_clipping_ancestors`] changes the editor's rect at all, only
+/// the rect fills survive — the well's fill and the grid bands, each
+/// intersected with the visible rect — and every stroke (the well's
+/// border and outline, the diagonal, the curve, the markers) is dropped.
+/// A plot with no area (a tiny `size`) paints the well only; a marker
+/// radius too small to hold both rings paints no markers.
+fn paint_curve_editor(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &CurveEditorState,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    /// The grid lines' width. **Not a token**: `design/tokens/scales.toml`
+    /// has no stroke-weight scale, the same gap every `BORDER_WIDTH` in
+    /// this module records.
+    const GRID_LINE_WIDTH: f32 = 1.0;
+    /// The identity diagonal's stroke width — not a token, as above.
+    const DIAGONAL_WIDTH: f32 = 1.0;
+    /// The curve's stroke width — not a token, as above; the tab
+    /// underline's `UNDERLINE_WIDTH` weight, so the curve reads heavier
+    /// than the 1 px chrome under it. Provisional, flagged to the design
+    /// owner (Cahya, PRD FR-027 *Ownership*).
+    const CURVE_WIDTH: f32 = 2.0;
+    /// The well's border width — the same plain 1.0 logical px every
+    /// `BORDER_WIDTH` here uses.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let Some(full) = tree.bounds(id) else {
+        return Ok(vec![]);
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Ok(vec![]);
+    };
+    let clipped = visible != full;
+    let alpha = if state.disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let rgba = |color: Color| {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let (vx, vy, vw, vh) = rect_f32(visible);
+    let well = rounded_rect(vx, vy, vw, vh, scales.radius.sm as f32);
+    let mut paints = vec![(
+        fill(&well, tolerance).map_err(WidgetError::Paint)?,
+        rgba(theme.surface.sunken),
+    )];
+    if !clipped {
+        let border = stroke(&well, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        paints.push((border, rgba(theme.border.default)));
+        if let Some(outline) = control_outline(&well, theme, alpha, scale_factor)? {
+            paints.push(outline);
+        }
+    }
+    let Some((left, top, width, height)) = plot_rect(full, state.marker_radius()) else {
+        return Ok(paints);
+    };
+    let (right, bottom) = (left + width, top + height);
+    // The six grid bands, each intersected with the visible rect.
+    let half_line = GRID_LINE_WIDTH / 2.0;
+    let quarters = [0.25_f32, 0.5, 0.75];
+    let vertical = quarters.map(|q| (left + q * width - half_line, top, GRID_LINE_WIDTH, height));
+    let horizontal = quarters.map(|q| (left, top + q * height - half_line, width, GRID_LINE_WIDTH));
+    for (x, y, w, h) in vertical.into_iter().chain(horizontal) {
+        let (x0, y0) = (x.max(vx), y.max(vy));
+        let (x1, y1) = ((x + w).min(vx + vw), (y + h).min(vy + vh));
+        if let Some(mesh) = band(x0, y0, x1 - x0, y1 - y0, scale_factor)? {
+            paints.push((mesh, rgba(theme.border.default)));
+        }
+    }
+    if clipped {
+        return Ok(paints);
+    }
+    let to_screen =
+        |p: aurora_core::CurvePoint| Point::new(left + p.x * width, bottom - p.y * height);
+    let mut diagonal = PathBuilder::new();
+    diagonal
+        .move_to(Point::new(left, bottom))
+        .line_to(Point::new(right, top))
+        .end();
+    let diagonal =
+        stroke(&diagonal.build(), DIAGONAL_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    paints.push((diagonal, rgba(theme.border.default)));
+    let curve = state.curve();
+    let mut polyline = PathBuilder::new();
+    for (i, sample) in curve_polyline_samples(curve).into_iter().enumerate() {
+        let at = to_screen(sample);
+        if i == 0 {
+            polyline.move_to(at);
+        } else {
+            polyline.line_to(at);
+        }
+    }
+    polyline.end();
+    let polyline = stroke(&polyline.build(), CURVE_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    paints.push((polyline, rgba(theme.text.primary)));
+    paints.extend(curve_editor_markers(
+        state, theme, alpha, tolerance, to_screen,
+    )?);
+    Ok(paints)
+}
+
+/// [`paint_curve_editor`]'s markers, in draw order — every unselected
+/// point's two rings, then the selected point's `accent.primary` disc and
+/// rings — or none when the marker radius cannot hold both rings.
+fn curve_editor_markers(
+    state: &CurveEditorState,
+    theme: &Theme,
+    alpha: f32,
+    tolerance: f32,
+    to_screen: impl Fn(aurora_core::CurvePoint) -> Point,
+) -> Result<Vec<Paint>, WidgetError> {
+    let rgba = |color: Color| {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    };
+    let curve = state.curve();
+    let mut paints = Vec::new();
+    let r = state.marker_radius();
+    if !(r.is_finite() && 2.0 * r > 2.0 * MARKER_RING_WIDTH) {
+        return Ok(vec![]);
+    }
+    let selected = state.selected();
+    let order = (0..curve.points().len())
+        .filter(|&i| i != selected)
+        .chain(std::iter::once(selected));
+    for index in order {
+        let Some(&point) = curve.points().get(index) else {
+            continue;
+        };
+        let centre = to_screen(point);
+        let outer = rounded_rect(centre.x - r, centre.y - r, 2.0 * r, 2.0 * r, r);
+        let inner_r = r - MARKER_RING_WIDTH;
+        let inner = rounded_rect(
+            centre.x - inner_r,
+            centre.y - inner_r,
+            2.0 * inner_r,
+            2.0 * inner_r,
+            inner_r,
+        );
+        if index == selected {
+            let disc = fill(&outer, tolerance).map_err(WidgetError::Paint)?;
+            paints.push((disc, rgba(theme.accent.primary)));
+        }
+        let outer = stroke(&outer, MARKER_RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        let inner = stroke(&inner, MARKER_RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        paints.push((outer, rgba(theme.text.primary)));
+        paints.push((inner, rgba(theme.surface.panel)));
+    }
+    Ok(paints)
+}
+
+/// How many uniform input steps [`curve_polyline_samples`] samples a
+/// curve at: 256, so a polyline segment spans one 8-bit input level or
+/// less. That alone does **not** bound the polyline's distance from the
+/// spline: a legal curve can hold intervals only `1/256` wide, and a
+/// uniform grid can straddle a whole narrow peak (a knot at `y = 1`
+/// drawn at `y = 0.5`). What makes the drawn curve pass through every
+/// control point is merging each knot's own input into the samples —
+/// between two consecutive samples the spline is one smooth Hermite
+/// piece, which a chord at most `1/256` wide follows to within a
+/// fraction of a pixel at typical panel sizes.
+const CURVE_SEGMENTS: usize = 256;
+
+/// The points [`paint_curve_editor`]'s polyline passes through, in
+/// increasing input order: `i / CURVE_SEGMENTS` for every `i` in
+/// `0..=CURVE_SEGMENTS`, merged with every control point's own `x`,
+/// deduplicated (a knot on the uniform grid adds nothing), each at
+/// `(x, curve.evaluate(x))` — so every knot is a vertex, drawn at its
+/// own exact output. At most `CURVE_SEGMENTS + 1 + MAX_POINTS - 2`
+/// samples (the endpoints are always on the grid).
+pub(crate) fn curve_polyline_samples(
+    curve: &aurora_core::ToneCurve,
+) -> Vec<aurora_core::CurvePoint> {
+    let knots = curve.points();
+    let mut xs: Vec<f32> = Vec::with_capacity(CURVE_SEGMENTS + 1 + knots.len());
+    let mut k = knots.iter().map(|p| p.x).peekable();
+    for i in 0..=CURVE_SEGMENTS {
+        let grid = i as f32 / CURVE_SEGMENTS as f32;
+        while let Some(x) = k.next_if(|&x| x < grid) {
+            xs.push(x);
+        }
+        xs.push(grid);
+    }
+    xs.extend(k);
+    xs.dedup();
+    xs.into_iter()
+        .map(|x| aurora_core::CurvePoint::new(x, curve.evaluate(x)))
+        .collect()
 }
 
 /// A colour swatch's own fill: `state.color` itself — the one widget in
@@ -987,13 +1976,19 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, DialogAction, DialogHandle, ListRowState, ScrollbarRange, ScrollbarState,
-        WidgetKind, command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_container, insert_dialog, insert_scrollbar, insert_slider,
-        insert_text_field, insert_tree_item, insert_tree_view, new_tree, row_height,
-        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
-        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
-        set_text_field_disabled, set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
+        CommandEntry, DialogAction, DialogHandle, DropdownState, ListRowState, ScrollbarRange,
+        ScrollbarState, WidgetKind, command_palette_state, dropdown_state, insert_button,
+        insert_checkbox, insert_color_swatch, insert_command_palette, insert_container,
+        insert_dialog, insert_dropdown, insert_scrollbar, insert_slider, insert_text_field,
+        insert_tree_item, insert_tree_view, new_tree, row_height, set_button_disabled,
+        set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_dropdown_disabled, set_dropdown_open, set_scrollbar_disabled, set_scrollbar_value,
+        set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
+        set_tree_item_selected, toggle_checkbox,
+    };
+    use crate::widgets::{
+        MenuItem, Tooltip, handle_menu_key, insert_tab_bar, menu_state, open_menu,
+        set_tab_bar_disabled, tab_bar_state,
     };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
@@ -3017,6 +4012,768 @@ mod tests {
             paints.is_empty(),
             "a dialog's message is a plain Container -- this crate draws no glyphs, so \
              there is nothing to paint: {paints:?}"
+        );
+    }
+
+    /// A laid-out dropdown in a definitely sized root, optionally open
+    /// and/or disabled. Returns the control and (when open) its list.
+    fn laid_out_dropdown(
+        scales: &Scales,
+        open: bool,
+        disabled: bool,
+    ) -> (WidgetTree<WidgetKind>, WidgetId, Option<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(160.0_f32),
+                height: taffy::style_helpers::length(160.0_f32),
+            },
+            ..Default::default()
+        });
+        let options = vec![
+            "Normal".to_owned(),
+            "Multiply".to_owned(),
+            "Screen".to_owned(),
+        ];
+        let id = match insert_dropdown(&mut tree, root, scales, "Blend mode", options, Some(1)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if open && let Err(err) = set_dropdown_open(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        if disabled && let Err(err) = set_dropdown_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(160.0, 160.0);
+        let list = dropdown_state(&tree, id).ok().and_then(DropdownState::list);
+        (tree, id, list)
+    }
+
+    fn paints_of(tree: &WidgetTree<WidgetKind>, id: WidgetId, theme: &Theme) -> Vec<Paint> {
+        match paint_widget(tree, id, theme, &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn rgba(color: Color, alpha: f32) -> [f32; 4] {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_closed_dropdown_paints_a_sunken_well_with_a_default_border() {
+        let theme = dark_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), false, false);
+        assert_eq!(list, None);
+        let paints = paints_of(&tree, id, &theme);
+        assert_eq!(paints.len(), 2, "a fill and its border: {paints:?}");
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                rgba(theme.border.default, 1.0)
+            ]
+        );
+        for (mesh, _) in &paints {
+            assert!(!mesh.vertices.is_empty() && !mesh.indices.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_open_dropdowns_border_turns_border_focus() {
+        let theme = dark_theme();
+        assert_ne!(
+            theme.border.focus, theme.border.default,
+            "this test only proves anything while the two tokens differ"
+        );
+        let (tree, id, _list) = laid_out_dropdown(&scales(), true, false);
+        let paints = paints_of(&tree, id, &theme);
+        assert_eq!(paints.len(), 2);
+        let Some((_, border)) = paints.get(1) else {
+            unreachable!("two shapes");
+        };
+        assert_eq!(*border, rgba(theme.border.focus, 1.0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_dropdown_dims_its_fill_and_its_border() {
+        let theme = dark_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), true, true);
+        assert_eq!(list, None, "disabling closed the list first");
+        let paints = paints_of(&tree, id, &theme);
+        let alpha = theme.state.disabled_opacity;
+        assert!(alpha < 1.0);
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.sunken, alpha),
+                rgba(theme.border.default, alpha)
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dropdown_and_its_list_each_gain_the_control_outline_in_high_contrast() {
+        let theme = high_contrast_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let outline = rgba(theme.border.control, theme.border.control_opacity);
+        let list_colors: Vec<[f32; 4]> = paints_of(&tree, list, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            list_colors,
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0),
+                outline
+            ],
+            "the list: fill, border, and the control outline drawn last"
+        );
+        // Open: border.focus draws *after* the outline, or the two
+        // coincident strokes would hide the open state entirely.
+        let open_colors: Vec<[f32; 4]> = paints_of(&tree, id, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            open_colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                outline,
+                rgba(theme.border.focus, 1.0)
+            ]
+        );
+        // Closed: the outline draws last, over border.default.
+        let (closed_tree, closed, _) = laid_out_dropdown(&scales(), false, false);
+        let closed_colors: Vec<[f32; 4]> = paints_of(&closed_tree, closed, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            closed_colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                rgba(theme.border.default, 1.0),
+                outline
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_open_dropdown_list_paints_surface_raised_with_a_border() {
+        let theme = dark_theme();
+        let (tree, _id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let paints = paints_of(&tree, list, &theme);
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0)
+            ]
+        );
+        let (Some(bounds), true) = (tree.bounds(list), !paints.is_empty()) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.width > 0 && bounds.height > 0, "{bounds:?}");
+    }
+
+    /// The load-bearing half of `paint_dropdown_list`'s border, pinned
+    /// against the real Light theme: there `surface.raised` *is*
+    /// `surface.panel` and `control_outline` returns `None`, so without
+    /// the unconditional border a list over a panel would be invisible.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_dropdown_list_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.raised, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        assert_eq!(theme.border.control_opacity, 0.0);
+        let (tree, _id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let paints = paints_of(&tree, list, &theme);
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        assert!(
+            paints.iter().any(|(_, color)| *color != backdrop),
+            "a Light list must paint something that is not the panel behind it: {paints:?}"
+        );
+        assert_eq!(paints.len(), 2);
+    }
+
+    /// The highlighted option is an ordinary `ListRow`, painted by the
+    /// existing `paint_list_row` in `accent.primary`; the others paint
+    /// nothing.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn only_the_highlighted_option_row_paints_a_highlight() {
+        let theme = dark_theme();
+        let (tree, id, _list) = laid_out_dropdown(&scales(), true, false);
+        let rows = match dropdown_state(&tree, id) {
+            Ok(state) => state.rows().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(rows.len(), 3);
+        for (index, row) in rows.into_iter().enumerate() {
+            let paints = paints_of(&tree, row, &theme);
+            if index == 1 {
+                let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+                assert_eq!(colors, vec![rgba(theme.accent.primary, 1.0)]);
+            } else {
+                assert!(paints.is_empty(), "row {index}: {paints:?}");
+            }
+        }
+    }
+
+    // ---- TabBar / Tab ----------------------------------------------------
+
+    /// A laid-out tab bar (three tabs, `selected` selected) in a 180 px
+    /// wide column. Returns the tree, the bar, and its three tabs.
+    fn laid_out_tab_bar(
+        selected: usize,
+        disabled: bool,
+    ) -> (WidgetTree<WidgetKind>, WidgetId, Vec<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(180.0_f32),
+                height: taffy::style_helpers::length(100.0_f32),
+            },
+            ..Default::default()
+        });
+        let labels = ["Layers", "Channels", "Paths"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let bar = match insert_tab_bar(&mut tree, root, &scales(), "Panels", labels, selected) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if disabled && let Err(err) = set_tab_bar_disabled(&mut tree, bar, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(180.0, 100.0);
+        let tabs = match tab_bar_state(&tree, bar) {
+            Ok(state) => state.tabs().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, bar, tabs)
+    }
+
+    fn bounds_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Rect {
+        match tree.bounds(id) {
+            Some(bounds) => bounds,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tab_bar_paints_one_border_default_rule_along_its_bottom_pixel_row() {
+        let theme = dark_theme();
+        let (tree, bar, _tabs) = laid_out_tab_bar(0, false);
+        let paints = paints_of(&tree, bar, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.first() else {
+            unreachable!("one shape");
+        };
+        assert_eq!(*color, rgba(theme.border.default, 1.0));
+        let b = bounds_of(&tree, bar);
+        let (x0, y0, x1, y1) = bbox(mesh);
+        assert_eq!((x0, x1), (b.x as f32, (b.x + i64::from(b.width)) as f32));
+        assert_eq!(
+            y1,
+            b.bottom() as f32,
+            "the rule ends at the bar's bottom edge"
+        );
+        assert_eq!(y1 - y0, 1.0, "the rule is 1 px tall");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn the_selected_tab_paints_a_2px_accent_underline_and_an_inactive_one_nothing() {
+        let theme = dark_theme();
+        let (tree, _bar, tabs) = laid_out_tab_bar(1, false);
+        let Some((&first, &second)) = tabs.first().zip(tabs.get(1)) else {
+            unreachable!("three tabs");
+        };
+        assert!(
+            paints_of(&tree, first, &theme).is_empty(),
+            "an inactive tab paints nothing outside High Contrast"
+        );
+        let paints = paints_of(&tree, second, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.last() else {
+            unreachable!("one shape");
+        };
+        assert_eq!(*color, rgba(theme.accent.primary, 1.0));
+        let b = bounds_of(&tree, second);
+        let (x0, y0, x1, y1) = bbox(mesh);
+        assert_eq!((x0, x1), (b.x as f32, (b.x + i64::from(b.width)) as f32));
+        assert_eq!(y1, b.bottom() as f32);
+        assert_eq!(y1 - y0, 2.0, "the underline is 2 px tall");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn in_high_contrast_every_tab_gains_the_outline_and_the_underline_draws_last() {
+        let theme = high_contrast_theme();
+        let (tree, _bar, tabs) = laid_out_tab_bar(0, false);
+        let Some((&active, &inactive)) = tabs.first().zip(tabs.get(1)) else {
+            unreachable!("three tabs");
+        };
+        let inactive_paints = paints_of(&tree, inactive, &theme);
+        assert_eq!(inactive_paints.len(), 1, "the outline alone");
+        let active_paints = paints_of(&tree, active, &theme);
+        let colors: Vec<[f32; 4]> = active_paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.border.control, theme.border.control_opacity),
+                rgba(theme.accent.primary, 1.0),
+            ],
+            "outline first, underline last so it lies over it"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_tab_bar_dims_its_rule_and_every_tab_shape() {
+        let theme = high_contrast_theme();
+        let alpha = theme.state.disabled_opacity;
+        assert!(alpha < 1.0);
+        let (tree, bar, tabs) = laid_out_tab_bar(0, true);
+        let bar_paints = paints_of(&tree, bar, &theme);
+        assert_eq!(
+            bar_paints.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            vec![rgba(theme.border.default, alpha)]
+        );
+        let Some(&active) = tabs.first() else {
+            unreachable!("three tabs");
+        };
+        assert_eq!(
+            paints_of(&tree, active, &theme)
+                .iter()
+                .map(|(_, c)| *c)
+                .collect::<Vec<_>>(),
+            vec![
+                rgba(theme.border.control, theme.border.control_opacity * alpha),
+                rgba(theme.accent.primary, alpha),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_bar_and_a_tab_with_degenerate_bounds_paint_without_error() {
+        let theme = high_contrast_theme();
+        let (mut tree, bar, tabs) = laid_out_tab_bar(0, false);
+        let Some(&active) = tabs.first() else {
+            unreachable!("three tabs");
+        };
+        for (width, height) in [(0, 0), (40, 0), (0, 21), (40, 1)] {
+            for id in [bar, active] {
+                let rect = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                if let Err(err) = tree.set_bounds(id, rect) {
+                    unreachable!("{err:?}");
+                }
+                let paints = paints_of(&tree, id, &theme);
+                if width == 0 || height == 0 {
+                    assert!(paints.is_empty(), "{width}x{height}: {paints:?}");
+                }
+                for (mesh, _) in &paints {
+                    let (_, y0, _, y1) = bbox(mesh);
+                    assert!(
+                        y0 >= -0.5 && y1 <= height as f32 + 0.5,
+                        "{width}x{height}: a band clamped to the box, not past it"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- Tooltip -----------------------------------------------------------
+
+    /// A laid-out button with its tooltip shown. Returns the tree and the
+    /// tooltip's own node.
+    fn laid_out_tooltip() -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(160.0_f32),
+                height: taffy::style_helpers::length(120.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = scales();
+        let button = match insert_button(&mut tree, root, &scales, "Apply") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let delay = std::time::Duration::ZERO;
+        let mut tooltip = match Tooltip::new(&tree, button, &scales, "Apply the change", delay) {
+            Ok(tooltip) => tooltip,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let t0 = std::time::Instant::now();
+        if let Err(err) = tooltip.set_hover(&mut tree, true, false, t0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tooltip.tick(&mut tree, t0) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(160.0, 120.0);
+        let Some(node) = tooltip.node() else {
+            unreachable!("shown");
+        };
+        (tree, node)
+    }
+
+    fn colors_of(tree: &WidgetTree<WidgetKind>, id: WidgetId, theme: &Theme) -> Vec<[f32; 4]> {
+        paints_of(tree, id, theme).iter().map(|(_, c)| *c).collect()
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_paints_surface_overlay_then_a_default_border() {
+        let (tree, id) = laid_out_tooltip();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Light", light_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_eq!(theme.border.control_opacity, 0.0, "{name}");
+            assert_eq!(
+                colors_of(&tree, id, &theme),
+                vec![
+                    rgba(theme.surface.overlay, 1.0),
+                    rgba(theme.border.default, 1.0)
+                ],
+                "{name}"
+            );
+        }
+        for (mesh, _) in &paints_of(&tree, id, &dark_theme()) {
+            assert!(!mesh.vertices.is_empty() && !mesh.indices.is_empty());
+        }
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.width > 0 && bounds.height > 0, "{bounds:?}");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_gains_the_control_outline_last_in_high_contrast() {
+        let (tree, id) = laid_out_tooltip();
+        let theme = high_contrast_theme();
+        assert!(theme.border.control_opacity > 0.0);
+        assert_eq!(
+            colors_of(&tree, id, &theme),
+            vec![
+                rgba(theme.surface.overlay, 1.0),
+                rgba(theme.border.default, 1.0),
+                rgba(theme.border.control, theme.border.control_opacity),
+            ],
+            "fill, border, and the control outline drawn last"
+        );
+    }
+
+    /// The load-bearing half of `paint_tooltip`'s border, pinned against
+    /// the real Light theme: there `surface.overlay` *is* `surface.panel`
+    /// and `control_outline` returns `None`.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_tooltip_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.overlay, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        let (tree, id) = laid_out_tooltip();
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        let colors = colors_of(&tree, id, &theme);
+        assert!(
+            colors.iter().any(|color| *color != backdrop),
+            "a Light tooltip must paint something that is not the panel behind it: {colors:?}"
+        );
+    }
+
+    /// `surface.overlay` (the mockup's token), not the `surface.raised` a
+    /// dropdown list uses — scoped to the two themes where the tokens
+    /// differ, each guarded so it cannot become a tautology.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tooltip_paints_surface_overlay_not_surface_raised() {
+        let (tree, id) = laid_out_tooltip();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_ne!(
+                theme.surface.overlay, theme.surface.raised,
+                "{name}: only meaningful while the two tokens differ"
+            );
+            let colors = colors_of(&tree, id, &theme);
+            assert_eq!(
+                colors.first(),
+                Some(&rgba(theme.surface.overlay, 1.0)),
+                "{name}"
+            );
+            assert_ne!(
+                colors.first(),
+                Some(&rgba(theme.surface.raised, 1.0)),
+                "{name}"
+            );
+        }
+    }
+
+    // ---- Menu --------------------------------------------------------------
+
+    /// A laid-out open menu — `Cut`, a separator, a disabled `Paste`,
+    /// `Delete` — at `(10, 20)`, 120 px wide. Returns the tree, the menu,
+    /// and its item ids.
+    fn laid_out_menu() -> (WidgetTree<WidgetKind>, WidgetId, Vec<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        });
+        let menu = match open_menu(
+            &mut tree,
+            root,
+            &scales(),
+            "Edit",
+            (10.0, 20.0),
+            120.0,
+            vec![
+                MenuItem::action("Cut"),
+                MenuItem::separator(),
+                MenuItem {
+                    enabled: false,
+                    ..MenuItem::action("Paste")
+                },
+                MenuItem::action("Delete"),
+            ],
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 200.0);
+        let ids = match menu_state(&tree, menu) {
+            Ok(state) => state.item_ids().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, menu, ids)
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menu_paints_surface_raised_then_a_default_border_and_the_outline_last() {
+        let (tree, menu, _) = laid_out_menu();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Light", light_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_eq!(theme.border.control_opacity, 0.0, "{name}");
+            assert_eq!(
+                colors_of(&tree, menu, &theme),
+                vec![
+                    rgba(theme.surface.raised, 1.0),
+                    rgba(theme.border.default, 1.0)
+                ],
+                "{name}"
+            );
+        }
+        let theme = high_contrast_theme();
+        assert!(theme.border.control_opacity > 0.0);
+        assert_eq!(
+            colors_of(&tree, menu, &theme),
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0),
+                rgba(theme.border.control, theme.border.control_opacity),
+            ],
+            "fill, border, and the control outline drawn last"
+        );
+    }
+
+    /// `surface.raised`, not the `surface.overlay` a tooltip or dialog
+    /// uses — scoped to the two themes where the tokens differ, each
+    /// guarded so it cannot become a tautology.
+    #[test]
+    fn a_menu_paints_surface_raised_not_surface_overlay() {
+        let (tree, menu, _) = laid_out_menu();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_ne!(
+                theme.surface.overlay, theme.surface.raised,
+                "{name}: only meaningful while the two tokens differ"
+            );
+            let colors = colors_of(&tree, menu, &theme);
+            assert_eq!(
+                colors.first(),
+                Some(&rgba(theme.surface.raised, 1.0)),
+                "{name}"
+            );
+            assert_ne!(
+                colors.first(),
+                Some(&rgba(theme.surface.overlay, 1.0)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Light resolves `surface.raised` to `surface.panel`, so only the
+    /// unconditional border separates a menu from the panel behind it.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_menu_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.raised, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        let (tree, menu, _) = laid_out_menu();
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        let colors = colors_of(&tree, menu, &theme);
+        assert!(
+            colors.iter().any(|color| *color != backdrop),
+            "a Light menu must paint something that is not the panel behind it: {colors:?}"
+        );
+    }
+
+    /// Pins `paint_menu`'s own corner radius to `radius.sm`, the dialog
+    /// radius test's anchor method (`rounded_rect`'s `(x, y + radius)`
+    /// vertex is present and the square corner is not). Guarded so it
+    /// cannot pass for a `radius.md` or `radius.lg` substitution: both
+    /// must differ from `radius.sm` for the anchor to tell them apart.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menus_fill_mesh_has_the_radius_sm_corner_and_not_a_square_one() {
+        let scales = scales();
+        let (tree, menu, _) = laid_out_menu();
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("just laid out");
+        };
+        assert_ne!(scales.radius.sm, scales.radius.md, "radius.md must differ");
+        assert_ne!(scales.radius.sm, scales.radius.lg, "radius.lg must differ");
+        let paints = match paint_widget(&tree, menu, &dark_theme(), &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((fill_mesh, _)) = paints.first() else {
+            unreachable!("a menu paints its fill first");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let (left, top, radius) = (bounds.x as f32, bounds.y as f32, scales.radius.sm as f32);
+        assert!(radius > 0.0, "radius.sm must be non-zero: {radius}");
+        let has = |x: f32, y: f32| fill_mesh.vertices.iter().any(|v| v.x == x && v.y == y);
+        assert!(
+            has(left, top + radius),
+            "the fill must carry the (x, y + radius.sm) anchor: {:?}",
+            fill_mesh.vertices
+        );
+        assert!(
+            !has(left, top),
+            "... and not the square corner a radius of 0 would give: {:?}",
+            fill_mesh.vertices
+        );
+    }
+
+    /// One `border.default` band, the separator's full width, at most
+    /// 1 px tall, on the whole pixel row nearest its centre.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menu_separator_paints_one_centred_default_rule() {
+        let (tree, _, ids) = laid_out_menu();
+        let Some(&separator) = ids.get(1) else {
+            unreachable!("four items");
+        };
+        let theme = dark_theme();
+        let paints = paints_of(&tree, separator, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.first() else {
+            unreachable!("one paint");
+        };
+        assert_eq!(*color, rgba(theme.border.default, 1.0));
+        let Some(bounds) = tree.bounds(separator) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.height > 1, "a real gap to centre in: {bounds:?}");
+        let (x0, y0, x1, y1) = bbox(mesh);
+        #[allow(clippy::cast_precision_loss)]
+        let (bx, by, bw, bh) = (
+            bounds.x as f32,
+            bounds.y as f32,
+            bounds.width as f32,
+            bounds.height as f32,
+        );
+        assert_eq!((x0, x1), (bx, bx + bw), "full width");
+        assert_eq!(y1 - y0, 1.0, "one logical px tall");
+        assert_eq!(
+            y0,
+            by + ((bh - 1.0) / 2.0).floor(),
+            "centred, on a whole row"
+        );
+    }
+
+    /// Items paint through the shared `ListRow` arm: the highlighted
+    /// one `accent.primary`, the rest nothing — and a highlight follows a
+    /// move.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn only_the_highlighted_menu_item_paints_and_the_highlight_follows_a_move() {
+        let (mut tree, menu, ids) = laid_out_menu();
+        let theme = dark_theme();
+        let Some(&[cut, _, paste, delete]) = Some(ids.as_slice()) else {
+            unreachable!("four items");
+        };
+        assert_eq!(
+            colors_of(&tree, cut, &theme),
+            vec![rgba(theme.accent.primary, 1.0)]
+        );
+        assert!(colors_of(&tree, paste, &theme).is_empty());
+        assert!(colors_of(&tree, delete, &theme).is_empty());
+        if let Err(err) = handle_menu_key(&mut tree, menu, crate::widgets::MenuKey::Down) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+        assert!(colors_of(&tree, cut, &theme).is_empty());
+        assert!(
+            colors_of(&tree, paste, &theme).is_empty(),
+            "disabled is skipped"
+        );
+        assert_eq!(
+            colors_of(&tree, delete, &theme),
+            vec![rgba(theme.accent.primary, 1.0)]
         );
     }
 

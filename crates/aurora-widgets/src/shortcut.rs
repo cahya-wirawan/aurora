@@ -65,6 +65,8 @@ pub enum NamedKey {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    Home,
+    End,
     F1,
     F2,
     F3,
@@ -92,6 +94,8 @@ impl fmt::Display for NamedKey {
             Self::ArrowDown => "Down",
             Self::ArrowLeft => "Left",
             Self::ArrowRight => "Right",
+            Self::Home => "Home",
+            Self::End => "End",
             Self::F1 => "F1",
             Self::F2 => "F2",
             Self::F3 => "F3",
@@ -195,6 +199,8 @@ fn parse_key(token: &str) -> Result<Key, ParseChordError> {
         "down" | "arrowdown" => Some(NamedKey::ArrowDown),
         "left" | "arrowleft" => Some(NamedKey::ArrowLeft),
         "right" | "arrowright" => Some(NamedKey::ArrowRight),
+        "home" => Some(NamedKey::Home),
+        "end" => Some(NamedKey::End),
         "f1" => Some(NamedKey::F1),
         "f2" => Some(NamedKey::F2),
         "f3" => Some(NamedKey::F3),
@@ -453,6 +459,21 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(parsed.to_string(), "Esc");
+    }
+
+    /// `Home`/`End` (added in `0.121.0` for the tab bar) parse and
+    /// display symmetrically, like every other named key.
+    #[test]
+    fn home_and_end_parse_and_display() {
+        for (text, key) in [("Home", NamedKey::Home), ("end", NamedKey::End)] {
+            let parsed = match KeyChord::parse(text) {
+                Ok(chord) => chord,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(parsed.key, Key::Named(key));
+        }
+        assert_eq!(NamedKey::Home.to_string(), "Home");
+        assert_eq!(NamedKey::End.to_string(), "End");
     }
 
     // -- ShortcutRegistry --

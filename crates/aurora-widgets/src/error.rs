@@ -60,10 +60,22 @@ pub enum WidgetError {
         depth: usize,
         max: usize,
     },
+    /// A widget constructor or mutator was handed an index into a list
+    /// it owns (a dropdown's options) that names no entry — returned
+    /// rather than stored, since every later read of that index would
+    /// otherwise have to re-check it.
+    #[error("index {index} is out of range for a list of {len}")]
+    IndexOutOfRange { index: usize, len: usize },
     /// [`crate::paint_widget`] failed to tessellate a widget's own paint
     /// geometry into a `Mesh`. In practice unreachable from this crate's
     /// own callers today: `rounded_rect`'s own cubic-Bézier output never
     /// triggers a `lyon` tessellation failure in this module's tests.
+    /// A curve editor was handed control points `aurora_core::ToneCurve`
+    /// refuses (too few or many, non-finite, out of range, endpoints not
+    /// at `x = 0`/`1`, or two points too close) — carried as the model's
+    /// own reason.
+    #[error("invalid tone curve: {0}")]
+    InvalidCurve(#[source] aurora_core::ToneCurveError),
     #[error("failed to tessellate a widget's own paint geometry: {0}")]
     Paint(#[source] aurora_vector::VectorError),
 }
