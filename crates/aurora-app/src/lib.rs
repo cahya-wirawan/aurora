@@ -15839,62 +15839,50 @@ impl App {
     }
 }
 
-/// Resolves every widget in `tree` into a real, uploaded `GpuMesh`
-/// (`aurora_widgets::paint_widget`, in [`WidgetTree::paint_order`]'s own
-/// order — root first, each child subtree before the next sibling's
-/// own, so a later entry in the returned `Vec` draws on top of an
-/// earlier one, the same "last-painted child is topmost" convention
-/// `WidgetTree::hit_test` already assumes for the reverse (pointer-hit)
-/// direction).
+/// Resolves every widget in `tree` into its [`PaintOp`]s for a render
+/// target of `format` — the pure, CPU-only half of
+/// [`collect_widget_paints`], split out so the colour rule below is
+/// testable without a GPU.
 ///
-/// Called *before* [`App::redraw`]'s own render pass begins, not from
-/// inside it: [`PathPipeline::draw`] needs `mesh: &'pass GpuMesh`, so
-/// every `GpuMesh` it draws must outlive the pass — one uploaded fresh
-/// inside the pass's own draw loop would be dropped at the end of that
-/// iteration, before the pass (borrowed for `'pass`) is done with it.
-/// Building the whole list first, then only borrowing from it inside
-/// the pass ([`draw_widget_paints`]), is the shape that forces.
+/// Walks [`WidgetTree::paint_order`] (root first, each child subtree
+/// before the next sibling's own, so a later op draws on top of an
+/// earlier one — the same "last-painted child is topmost" convention
+/// `WidgetTree::hit_test` assumes for the reverse direction).
 ///
 /// A widget whose own paint fails to tessellate (`WidgetError::Paint`)
 /// is logged and skipped, not fatal to the frame — one broken widget's
 /// own geometry shouldn't blank the rest of a real user's UI. A solid
 /// op's colour is converted for `format` ([`target_paint_color`]:
 /// linearized for an sRGB-aware target, passed through for a plain one)
-/// here, once, rather than by [`draw_widget_paints`] on every draw
-/// call. A gradient
-/// op's vertex colours are deliberately *not* linearized: the gradient
-/// pipeline interpolates in gamma-encoded sRGB and linearizes per
-/// fragment itself when the target is sRGB-aware (see
-/// `aurora_widgets::GradientPipeline`); linearizing the vertices here
-/// would interpolate in linear light instead and change the gradient.
+/// here, once, rather than by [`draw_widget_paints`] on every draw call.
+/// A gradient op's vertex colours are deliberately passed through
+/// **untouched**: the gradient pipeline interpolates in gamma-encoded
+/// sRGB and linearizes per fragment itself when the target is sRGB-aware
+/// (see `aurora_widgets::GradientPipeline`); linearizing the vertices
+/// here would interpolate in linear light instead and change the
+/// gradient — for the colour picker (`0.125.0`, the first gradient
+/// consumer) that would show a square that no longer matches the colour
+/// it reports.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-fn collect_widget_paints(
+fn target_paint_ops(
     tree: &WidgetTree<WidgetKind>,
     theme: &Theme,
     scales: &Scales,
-    gpu: &GpuContext,
     format: wgpu::TextureFormat,
     scale_factor: f64,
-) -> Vec<GpuPaintOp> {
+) -> Vec<PaintOp> {
     let scale_factor = scale_factor as f32;
-    let mut widget_paints = Vec::new();
+    let mut ops = Vec::new();
     for id in tree.paint_order() {
         match paint_widget_ops(tree, id, theme, scales, scale_factor) {
-            Ok(ops) => {
-                for op in ops {
-                    widget_paints.push(match op {
-                        PaintOp::Solid((mesh, color)) => GpuPaintOp::Solid(
-                            GpuMesh::upload(gpu.device(), gpu.queue(), &mesh),
-                            target_paint_color(color, format),
-                        ),
-                        PaintOp::Gradient(mesh) => GpuPaintOp::Gradient(GpuColorMesh::upload(
-                            gpu.device(),
-                            gpu.queue(),
-                            &mesh,
-                        )),
-                    });
-                }
+            Ok(widget_ops) => {
+                ops.extend(widget_ops.into_iter().map(|op| match op {
+                    PaintOp::Solid((mesh, color)) => {
+                        PaintOp::Solid((mesh, target_paint_color(color, format)))
+                    }
+                    gradient @ PaintOp::Gradient(_) => gradient,
+                }));
             }
             Err(err) => {
                 tracing::warn!(
@@ -15905,7 +15893,39 @@ fn collect_widget_paints(
             }
         }
     }
-    widget_paints
+    ops
+}
+
+/// Uploads every op [`target_paint_ops`] resolves for `tree` as a real
+/// `GpuMesh`/`GpuColorMesh`, in the same order.
+///
+/// Called *before* [`App::redraw`]'s own render pass begins, not from
+/// inside it: [`PathPipeline::draw`] needs `mesh: &'pass GpuMesh`, so
+/// every `GpuMesh` it draws must outlive the pass — one uploaded fresh
+/// inside the pass's own draw loop would be dropped at the end of that
+/// iteration, before the pass (borrowed for `'pass`) is done with it.
+/// Building the whole list first, then only borrowing from it inside
+/// the pass ([`draw_widget_paints`]), is the shape that forces.
+#[must_use]
+fn collect_widget_paints(
+    tree: &WidgetTree<WidgetKind>,
+    theme: &Theme,
+    scales: &Scales,
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    scale_factor: f64,
+) -> Vec<GpuPaintOp> {
+    target_paint_ops(tree, theme, scales, format, scale_factor)
+        .into_iter()
+        .map(|op| match op {
+            PaintOp::Solid((mesh, color)) => {
+                GpuPaintOp::Solid(GpuMesh::upload(gpu.device(), gpu.queue(), &mesh), color)
+            }
+            PaintOp::Gradient(mesh) => {
+                GpuPaintOp::Gradient(GpuColorMesh::upload(gpu.device(), gpu.queue(), &mesh))
+            }
+        })
+        .collect()
 }
 
 /// Draws `widget_paints` ([`collect_widget_paints`]) within `pass`,
@@ -22147,6 +22167,99 @@ mod tests {
                 super::linearize_paint_color(authored).map(f32::to_bits),
                 "{srgb:?} re-encodes on store: the solid must be linearized"
             );
+        }
+    }
+
+    /// The pure half of [`collect_widget_paints`], headless: for every
+    /// target format the app can pick, every gradient vertex colour of a
+    /// real colour picker reaches the upload stage **bit-for-bit** as
+    /// `paint_widget_ops` produced it (the gradient pipeline linearizes
+    /// per fragment itself), while every solid still follows
+    /// [`target_paint_color`]. Needs no GPU, so it runs everywhere.
+    #[test]
+    fn target_paint_ops_never_linearizes_gradient_vertices_for_any_format() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let orange = aurora_theme::Color {
+            r: 255,
+            g: 128,
+            b: 0,
+        };
+        if let Err(err) = aurora_widgets::widgets::insert_color_picker(
+            &mut tree, root, &scales, "Colour", orange, 96.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+        let mut authored = Vec::new();
+        for id in tree.paint_order() {
+            match super::paint_widget_ops(&tree, id, &theme, &scales, 1.0) {
+                Ok(ops) => authored.extend(ops),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let authored_gradients: Vec<_> = authored
+            .iter()
+            .filter_map(|op| match op {
+                super::PaintOp::Gradient(mesh) => Some(mesh.clone()),
+                super::PaintOp::Solid(_) => None,
+            })
+            .collect();
+        assert_eq!(authored_gradients.len(), 2, "the square and the strip");
+        assert!(
+            authored_gradients
+                .iter()
+                .any(|mesh| mesh.vertices.iter().any(|v| v
+                    .color
+                    .iter()
+                    .take(3)
+                    .any(|&c| c > 0.04045 && c < 1.0))),
+            "the fixture needs a vertex channel the sRGB curve actually moves"
+        );
+        for format in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ] {
+            let resolved = super::target_paint_ops(&tree, &theme, &scales, format, 1.0);
+            assert_eq!(resolved.len(), authored.len(), "{format:?}");
+            for (got, want) in resolved.iter().zip(&authored) {
+                match (got, want) {
+                    (super::PaintOp::Gradient(got), super::PaintOp::Gradient(want)) => {
+                        assert_eq!(got.indices, want.indices);
+                        assert_eq!(got.vertices.len(), want.vertices.len());
+                        for (g, w) in got.vertices.iter().zip(&want.vertices) {
+                            assert_eq!(g.position, w.position);
+                            assert_eq!(
+                                g.color.map(f32::to_bits),
+                                w.color.map(f32::to_bits),
+                                "{format:?}: a gradient vertex must pass through untouched"
+                            );
+                        }
+                    }
+                    (
+                        super::PaintOp::Solid((got_mesh, got)),
+                        super::PaintOp::Solid((want_mesh, want)),
+                    ) => {
+                        assert_eq!(got_mesh, want_mesh);
+                        assert_eq!(
+                            got.map(f32::to_bits),
+                            super::target_paint_color(*want, format).map(f32::to_bits),
+                            "{format:?}"
+                        );
+                    }
+                    other => unreachable!("op order changed: {other:?}"),
+                }
+            }
         }
     }
 

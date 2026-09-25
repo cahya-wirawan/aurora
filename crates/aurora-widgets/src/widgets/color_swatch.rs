@@ -46,14 +46,21 @@ fn node(state: ColorSwatchState) -> Node {
     node
 }
 
-fn style(scales: &Scales) -> Style {
+pub(super) fn style(scales: &Scales) -> Style {
     // Same "no dedicated control-size token exists yet" grounding
     // `Checkbox`'s own `style` already uses, for the same reason: a
     // literal (even the design mockup's own hardcoded 32px) isn't a
     // resolved token, and inventing a new one here isn't this crate's
     // decision to make (invariant §7.3.10, `CLAUDE.md`: "don't invent
     // tokens ad hoc").
-    let side = length(type_size(scales.typography.size.md));
+    style_for_side(type_size(scales.typography.size.md))
+}
+
+/// A swatch `side` by `side` — [`style`] with its token already
+/// resolved, for `color_picker.rs`'s preview, which rebuilds its
+/// children from mutators that take no `&Scales`.
+pub(super) fn style_for_side(side: f32) -> Style {
+    let side = length(side);
     Style {
         size: Size {
             width: side,

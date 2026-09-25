@@ -7,8 +7,13 @@
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
 //! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`,
-//! `DropdownList`, `TabBar`, `Tab`, and `Tooltip` — solid rounded-rect shapes, the simplest of
-//! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
+//! `DropdownList`, `TabBar`, `Tab`, `Tooltip`, `Menu`, `MenuSeparator`
+//! and (as of `0.125.0`) the colour picker's `ColorPickerPart` markers —
+//! solid rounded-rect shapes, the simplest of the widgets this crate has
+//! (`widgets`' own doc comment). The colour picker's saturation/value
+//! square and hue strip are the first **gradients**, and reach a
+//! renderer only through [`paint_widget_ops`] (`paint_widget` returns
+//! exactly its solid subset). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
 //! solid fills only, `render`'s own doc comment); `Toggled::True` and
@@ -98,7 +103,8 @@ use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Color, Scales, Theme};
 use aurora_vector::{
-    ColorMesh, Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor,
+    ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Path, bilinear_rect, fill,
+    horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
 };
 
 use taffy::Overflow;
@@ -106,8 +112,9 @@ use taffy::Overflow;
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, DropdownState, ListRowState, ScrollbarState,
-    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind, row_height,
+    ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
+    DropdownState, Hsv, ListRowState, ScrollbarState, SliderState, TabBarState, TabState,
+    TextFieldState, TreeItemState, WidgetKind, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -146,9 +153,16 @@ impl From<Paint> for PaintOp {
 }
 
 /// [`paint_widget`], as [`PaintOp`]s — the entry point renderers use.
-/// Every widget currently paints solid shapes only, so today this wraps
-/// each [`Paint`] in [`PaintOp::Solid`], in the same order; the first
-/// gradient consumer (the colour picker) lands in 0.125.0.
+///
+/// Every widget's gradients come first, then its solid shapes, in
+/// [`paint_widget`]'s own order: the solids are exactly
+/// [`paint_widget`]'s output wrapped in [`PaintOp::Solid`], so the two
+/// functions can never disagree about a widget's solid paint. As of
+/// `0.125.0` the colour picker is the first (and only) gradient
+/// consumer: its saturation/value square and its hue strip each paint
+/// one gradient (or, when an ancestor clips them, the visible part of
+/// one — `color_picker_gradients`) beneath a token-coloured marker.
+/// Every other kind paints solids only.
 ///
 /// # Errors
 ///
@@ -160,10 +174,310 @@ pub fn paint_widget_ops(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<PaintOp>, WidgetError> {
-    Ok(paint_widget(tree, id, theme, scales, scale_factor)?
+    let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
+    let gradients = match tree.payload(id) {
+        Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
+        _ => Vec::new(),
+    };
+    Ok(gradients
         .into_iter()
-        .map(PaintOp::Solid)
+        .map(PaintOp::Gradient)
+        .chain(solids.into_iter().map(PaintOp::Solid))
         .collect())
+}
+
+/// `a * (1 - t) + b * t` per channel — `aurora_vector`'s own lerp form,
+/// bit-exact at `t == 0` and `t == 1`.
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let [ar, ag, ab, aa] = a;
+    let [br, bg, bb, ba] = b;
+    [
+        ar * (1.0 - t) + br * t,
+        ag * (1.0 - t) + bg * t,
+        ab * (1.0 - t) + bb * t,
+        aa * (1.0 - t) + ba * t,
+    ]
+}
+
+/// `hsv`'s colour as a gradient vertex colour with alpha `alpha`.
+fn vertex_color(hsv: Hsv, alpha: f32) -> [f32; 4] {
+    let [r, g, b] = hsv.to_srgb_f32();
+    [r, g, b, alpha]
+}
+
+/// The pure hue `hue` (`saturation == value == 1`).
+fn pure_hue(hue: f32) -> Hsv {
+    Hsv {
+        hue,
+        saturation: 1.0,
+        value: 1.0,
+    }
+}
+
+/// The saturation/value square's four corner colours: white top-left,
+/// the pure hue top-right, black along the bottom. Bilinear between
+/// them is exactly HSV with this hue: the colour at `(s, 1 - v)` is
+/// `v * ((1 - s) * white + s * hue)`, which is the HSV formula.
+fn sv_corners(hue: f32, alpha: f32) -> GradientCorners {
+    GradientCorners {
+        top_left: [1.0, 1.0, 1.0, alpha],
+        top_right: vertex_color(pure_hue(hue), alpha),
+        bottom_left: [0.0, 0.0, 0.0, alpha],
+        bottom_right: [0.0, 0.0, 0.0, alpha],
+    }
+}
+
+/// The bilinear colour of `corners` at `(tx, ty)` — interpolated along
+/// x first, then y, exactly as `aurora_vector::bilinear_rect` does.
+fn bilinear_at(corners: GradientCorners, tx: f32, ty: f32) -> [f32; 4] {
+    let top = mix(corners.top_left, corners.top_right, tx);
+    let bottom = mix(corners.bottom_left, corners.bottom_right, tx);
+    mix(top, bottom, ty)
+}
+
+/// A rect's `(x, y, width, height)` as `f32`s.
+fn rect_f32(rect: Rect) -> (f32, f32, f32, f32) {
+    (
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
+    )
+}
+
+/// The colour picker's gradients — nothing for any part but the square
+/// and the hue strip, and nothing when [`clip_to_clipping_ancestors`]
+/// leaves nothing visible.
+///
+/// Unclipped, the square is one [`bilinear_rect`] over its whole box and
+/// the strip one [`horizontal_strip`] with seven stops (`hue = 0, 60,
+/// ..., 360`). **Clipped**, only the visible rect is tessellated, and its
+/// colours are the full-rect gradient's own, evaluated there — so what
+/// is drawn is exactly what the unclipped gradient shows at those
+/// pixels, never the whole gradient squeezed into the visible part. For
+/// the square that is one `bilinear_rect` whose corners are the
+/// full-rect bilinear colour at the visible corners (a bilinear function
+/// restricted to an axis-aligned sub-rectangle is bilinear with those
+/// corners, so this is exact). For the strip it is one two-stop
+/// `horizontal_strip` per hue segment `[i/6, (i+1)/6]` that overlaps the
+/// visible span, its ends linearly interpolated — at most six.
+///
+/// "Exact" means at the mesh's vertices: inside each tessellated cell
+/// the GPU interpolates barycentrically, so the square only approximates
+/// bilinear HSV between vertices (within `aurora_vector`'s documented
+/// bound, under half an 8-bit step at `DEFAULT_GRADIENT_CELLS` = 16 —
+/// the control for that bound). The strip is exact everywhere, being
+/// piecewise-linear by construction.
+///
+/// A disabled picker multiplies every vertex alpha by
+/// `state.disabled_opacity`, the same dimming every solid widget uses.
+/// An empty mesh (a zero-size, never-laid-out part) is dropped rather
+/// than emitted.
+fn color_picker_gradients(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &ColorPickerPartState,
+    theme: &Theme,
+) -> Vec<ColorMesh> {
+    let Some(full) = tree.bounds(id) else {
+        return Vec::new();
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Vec::new();
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let (fx, fy, fw, fh) = rect_f32(full);
+    let (vx, vy, vw, vh) = rect_f32(visible);
+    let meshes = match state.role() {
+        ColorPickerPartRole::Area => {
+            let corners = sv_corners(state.hsv().hue, alpha);
+            let corners = if visible == full {
+                corners
+            } else {
+                let tx0 = (vx - fx) / fw;
+                let tx1 = (vx + vw - fx) / fw;
+                let ty0 = (vy - fy) / fh;
+                let ty1 = (vy + vh - fy) / fh;
+                GradientCorners {
+                    top_left: bilinear_at(corners, tx0, ty0),
+                    top_right: bilinear_at(corners, tx1, ty0),
+                    bottom_left: bilinear_at(corners, tx0, ty1),
+                    bottom_right: bilinear_at(corners, tx1, ty1),
+                }
+            };
+            vec![bilinear_rect(
+                vx,
+                vy,
+                vw,
+                vh,
+                corners,
+                DEFAULT_GRADIENT_CELLS,
+            )]
+        }
+        ColorPickerPartRole::Hue => {
+            let stops: Vec<[f32; 4]> = (0_u8..=6)
+                .map(|i| vertex_color(pure_hue(f32::from(i) * 60.0), alpha))
+                .collect();
+            if visible == full {
+                vec![horizontal_strip(fx, fy, fw, fh, &stops)]
+            } else {
+                // Positions are clipped directly in pixels — a visible
+                // edge is exactly the clip line, never rebuilt through a
+                // fraction — and `t` is derived only for the colour.
+                let (left_clip, right_clip) = (vx, vx + vw);
+                let segment_edge = |i: f32| fx + i / 6.0 * fw;
+                stops
+                    .windows(2)
+                    .zip(0_u8..)
+                    .filter_map(|(pair, i)| {
+                        let (&[left, right], i) = (pair, f32::from(i)) else {
+                            return None;
+                        };
+                        let start = segment_edge(i).max(left_clip);
+                        let end = segment_edge(i + 1.0).min(right_clip);
+                        if end <= start {
+                            return None;
+                        }
+                        let at = |px: f32| {
+                            let t = (px - fx) / fw;
+                            mix(left, right, (t * 6.0 - i).clamp(0.0, 1.0))
+                        };
+                        Some(horizontal_strip(
+                            start,
+                            vy,
+                            end - start,
+                            vh,
+                            &[at(start), at(end)],
+                        ))
+                    })
+                    .collect()
+            }
+        }
+        ColorPickerPartRole::Saturation | ColorPickerPartRole::Value => Vec::new(),
+    };
+    meshes
+        .into_iter()
+        .filter(|mesh| !mesh.vertices.is_empty())
+        .collect()
+}
+
+/// A colour picker part's solid paint: the square's marker (a small
+/// ring at the picked saturation/value) or the strip's marker (a bar at
+/// the picked hue); nothing for a channel slider. Each marker is stroked
+/// twice, 1 px apart — an outer `text.primary` ring and an inner
+/// `surface.panel` one — so it stays visible over any colour the
+/// gradient beneath it shows (the two tokens are a pair
+/// `design/check_contrast.py` gates at 4.5:1 in every built-in theme).
+/// That pairing is this function's own choice, not a design-owner
+/// decision; no marker token exists.
+///
+/// Positions come from the part's **unclipped** bounds, with the
+/// marker's centre **clamped** so its whole stroked outline (half a
+/// ring width past the outer path) stays inside the part: at an extreme
+/// (`s`/`v` at `0` or `1`, hue at `0` or `360`) the marker sits flush
+/// with the part's edge instead of straddling it, so it never paints
+/// over a neighbour or outside the part's own damage rect, and a clipping
+/// ancestor flush with the part keeps it. A part too small to hold its
+/// marker — zero-size (never laid out) or a tiny picker — paints none.
+/// A marker is emitted only when no clipping ancestor cuts any of it (its outer
+/// bounding box, rounded outward, survives [`clip_to_clipping_ancestors`]
+/// unchanged): a partly clipped marker is dropped rather than drawn
+/// sliced, since the clip is applied to rects before tessellation and
+/// a stroked ring cannot be cut that way.
+fn paint_color_picker_markers(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &ColorPickerPartState,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    const RING_WIDTH: f32 = 1.0;
+
+    let Some(full) = tree.bounds(id) else {
+        return Ok(vec![]);
+    };
+    let (fx, fy, fw, fh) = rect_f32(full);
+    let hsv = state.hsv();
+    let half = RING_WIDTH / 2.0;
+    // `centre` along an axis starting at `start`, `length` long, clamped
+    // so a marker reaching `reach` either side of it stays inside; `None`
+    // when the axis is too short to hold the marker at all.
+    let inside = |centre: f32, start: f32, length: f32, reach: f32| -> Option<f32> {
+        let (lo, hi) = (start + reach, start + length - reach);
+        (centre.is_finite() && lo <= hi).then(|| centre.clamp(lo, hi))
+    };
+    // The outer ring's own path rect: (x, y, width, height, radius).
+    let outer = match state.role() {
+        ColorPickerPartRole::Area => {
+            let side = 2.0 * scales.spacing.xs as f32;
+            let reach = side / 2.0 + half;
+            let (Some(cx), Some(cy)) = (
+                inside(fx + hsv.saturation * fw, fx, fw, reach),
+                inside(fy + (1.0 - hsv.value) * fh, fy, fh, reach),
+            ) else {
+                return Ok(vec![]);
+            };
+            (cx - side / 2.0, cy - side / 2.0, side, side, side / 2.0)
+        }
+        ColorPickerPartRole::Hue => {
+            // Inset by half a ring vertically, so the outer stroke lies
+            // inside the strip's own rows rather than straddling them.
+            let width = 2.0 * scales.spacing.xs as f32;
+            let Some(cx) = inside(fx + hsv.hue / 360.0 * fw, fx, fw, width / 2.0 + half) else {
+                return Ok(vec![]);
+            };
+            (
+                cx - width / 2.0,
+                fy + RING_WIDTH / 2.0,
+                width,
+                fh - RING_WIDTH,
+                scales.radius.sm as f32,
+            )
+        }
+        ColorPickerPartRole::Saturation | ColorPickerPartRole::Value => return Ok(vec![]),
+    };
+    let (x, y, width, height, radius) = outer;
+    if !(x.is_finite() && y.is_finite()) || width <= 2.0 * RING_WIDTH || height <= 2.0 * RING_WIDTH
+    {
+        return Ok(vec![]);
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let bbox = Rect {
+        x: (x - half).floor() as i64,
+        y: (y - half).floor() as i64,
+        width: ((x + width + half).ceil() - (x - half).floor()) as u32,
+        height: ((y + height + half).ceil() - (y - half).floor()) as u32,
+    };
+    if clip_to_clipping_ancestors(tree, id, bbox) != Some(bbox) {
+        return Ok(vec![]);
+    }
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let outer_path = rounded_rect(x, y, width, height, radius);
+    let inner_path = rounded_rect(
+        x + RING_WIDTH,
+        y + RING_WIDTH,
+        width - 2.0 * RING_WIDTH,
+        height - 2.0 * RING_WIDTH,
+        (radius - RING_WIDTH).max(0.0),
+    );
+    let outer_mesh = stroke(&outer_path, RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let inner_mesh = stroke(&inner_path, RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [outer_r, outer_g, outer_b] = theme.text.primary.to_srgb_f32();
+    let [inner_r, inner_g, inner_b] = theme.surface.panel.to_srgb_f32();
+    Ok(vec![
+        (outer_mesh, [outer_r, outer_g, outer_b, alpha]),
+        (inner_mesh, [inner_r, inner_g, inner_b, alpha]),
+    ])
 }
 
 /// The mandatory control-outline stroke `border.control`/
@@ -260,7 +574,10 @@ pub fn paint_widget(
         WidgetKind::Tooltip => paint_tooltip(bounds, theme, scales, scale_factor),
         WidgetKind::Menu(_) => paint_menu(bounds, theme, scales, scale_factor),
         WidgetKind::MenuSeparator => paint_menu_separator(bounds, theme, scale_factor),
-        WidgetKind::Container => Ok(vec![]),
+        WidgetKind::ColorPickerPart(state) => {
+            paint_color_picker_markers(tree, id, state, theme, scales, scale_factor)
+        }
+        WidgetKind::ColorPicker(_) | WidgetKind::Container => Ok(vec![]),
     }
 }
 

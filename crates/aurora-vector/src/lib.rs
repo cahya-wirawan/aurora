@@ -46,7 +46,7 @@
 //! evenly spaced multi-stop ramp) build one directly, without `lyon`.
 //! `aurora-widgets`' `GradientPipeline` draws it. The first real
 //! consumer is the colour picker's saturation/value square and hue strip
-//! (planned for 0.125.0); nothing draws one yet. See the `gradient`
+//! (`aurora-widgets`, 0.125.0). See the `gradient`
 //! module's own doc comment for the colour-space contract.
 
 mod error;

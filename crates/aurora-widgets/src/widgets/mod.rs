@@ -12,10 +12,15 @@
 //! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
 //! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), `Dropdown`
 //! ([`DropdownState`], `0.120.0`), `TabBar` ([`TabBarState`],
-//! `0.121.0`), `Tooltip` ([`Tooltip`], `0.122.0`), and now `Menu`
-//! ([`MenuState`], `0.123.0`) followed — **10 of the 12 named
-//! widgets**: button, checkbox, slider, dropdown, scrollbar, colour
-//! swatch, tree, tab bar, tooltip, and menu. (Recounted,
+//! `0.121.0`), `Tooltip` ([`Tooltip`], `0.122.0`), `Menu`
+//! ([`MenuState`], `0.123.0`), and now the colour picker
+//! ([`ColorPickerState`], `0.125.0`) followed — **still 10 of the 12
+//! named widgets**: button, checkbox, slider, dropdown, scrollbar,
+//! colour swatch/picker, tree, tab bar, tooltip, and menu. The picker
+//! takes the swatch's slot rather than adding an eleventh (PLAN.md's
+//! own list reads "colour picker" where the gallery reads "Color
+//! swatch"); [`ColorSwatchState`] stays a primitive, reused by the
+//! picker as its preview. (Recounted,
 //! not carried forward: this sentence said "4 of the 12" through `0.75.1`, a count inherited from
 //! PLAN.md's own stricter transcription of the same list — which reads
 //! "colour picker" where `design/gallery/index.html` has "Color
@@ -72,13 +77,21 @@
 //! arrows, `Home`/`End`, and its whole subtree removed on activate or
 //! cancel — again with **no popover layering**, no pointer support, no
 //! submenus and no text (`menu.rs`'s own doc comment has the full list).
-//! The rest — a number field, the curve editor, and the colour picker
-//! (which replaces `ColorSwatch` in its slot rather than adding a
-//! thirteenth) — need no popover layering (the dropdown's list, the
-//! tooltip and the menu are the ones that lack it, see above), but still
-//! need infrastructure that doesn't exist yet (number semantics for a
-//! number field, `aurora-vector` path rendering for the curve editor),
-//! and are deliberately left open rather than stubbed out half-built.
+//! The colour picker ([`insert_color_picker`]/[`handle_color_picker_key`])
+//! is an HSV saturation/value square, a hue strip and a read-only
+//! preview swatch — the first widget to paint a vertex-coloured
+//! gradient (`0.124.0`'s primitive), exposed to accessibility as two
+//! channel sliders in a group plus a hue slider (`accesskit` has no
+//! two-dimensional role), with no text entry, no alpha and no focus ring
+//! (`color_picker.rs`'s own doc comment has the full list).
+//! The rest — a number field and the curve editor — need no popover
+//! layering (the dropdown's list, the tooltip and the menu are the ones
+//! that lack it, see above), but still need infrastructure that doesn't
+//! exist yet (number semantics for a number field; for the curve
+//! editor, an interactive control-point model — hit-testing, adding and
+//! removing points — and pointer capture for a drag, since
+//! `aurora-vector` path rendering already exists), and are deliberately
+//! left open rather than stubbed out half-built.
 //!
 //! **Every module here is a model, not a painter** — and that is a
 //! division of labour, not a missing feature. A widget module produces
@@ -86,8 +99,11 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **eighteen**
-//! of the [`WidgetKind`] variants below (every one except `Container`,
+//! tessellates real geometry through `aurora-vector` for **nineteen**
+//! of the [`WidgetKind`] variants below (every one except `Container`
+//! and [`WidgetKind::ColorPicker`]'s own root, whose children paint;
+//! [`WidgetKind::ColorPickerPart`] as of `0.125.0`, the first to paint a
+//! gradient through [`crate::paint_widget_ops`],
 //! [`WidgetKind::Dialog`] included as of `0.79.0`,
 //! [`WidgetKind::Dropdown`] and [`WidgetKind::DropdownList`] as of
 //! `0.120.0`, [`WidgetKind::TabBar`] and [`WidgetKind::Tab`] as of
@@ -113,6 +129,7 @@
 
 mod button;
 mod checkbox;
+mod color_picker;
 mod color_swatch;
 mod command_palette;
 mod dialog;
@@ -128,6 +145,13 @@ mod tree_view;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
+pub use color_picker::{
+    ColorPickerKey, ColorPickerOutcome, ColorPickerPart, ColorPickerPartRole, ColorPickerPartState,
+    ColorPickerState, Hsv, color_picker_part_at, color_picker_part_of, color_picker_state,
+    handle_color_picker_key, insert_color_picker, set_color_picker_color,
+    set_color_picker_disabled, set_color_picker_hsv, set_hue_from_point,
+    set_saturation_value_from_point,
+};
 pub use color_swatch::{
     ColorSwatchState, insert_color_swatch, set_color_swatch_color, set_color_swatch_disabled,
 };
@@ -295,6 +319,19 @@ pub enum WidgetKind {
     /// tall, `paint::paint_menu_separator`) is a pure function of its
     /// bounds and the theme.
     MenuSeparator,
+    /// A colour picker's own root — `Role::Group`, inserted by
+    /// `color_picker.rs`'s [`insert_color_picker`]. Paints nothing
+    /// itself; its children do. See `color_picker.rs`'s own module doc
+    /// comment for the structure, the key table, the two-slider
+    /// accessibility shape and what it deliberately does not do.
+    ColorPicker(ColorPickerState),
+    /// One of a [`WidgetKind::ColorPicker`]'s own parts, created only by
+    /// `color_picker.rs`: the saturation/value square (paints a
+    /// `PaintOp::Gradient` plus its marker), its two channel sliders
+    /// (paint nothing), or the hue strip (a gradient plus its marker).
+    /// The gradient colours are *content*, not tokens; the markers are
+    /// tokens.
+    ColorPickerPart(ColorPickerPartState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

@@ -475,7 +475,9 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::TabBar(_)
         | WidgetKind::Tooltip
         | WidgetKind::Menu(_)
-        | WidgetKind::MenuSeparator => false,
+        | WidgetKind::MenuSeparator
+        | WidgetKind::ColorPicker(_)
+        | WidgetKind::ColorPickerPart(_) => false,
     }
 }
 
@@ -793,10 +795,10 @@ mod tests {
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
         CommandEntry, DialogAction, MenuItem, ScrollbarRange, WidgetKind, insert_button,
-        insert_checkbox, insert_color_swatch, insert_command_palette, insert_dialog,
-        insert_dropdown, insert_scrollbar, insert_slider, insert_tab_bar, insert_text_field,
-        insert_tree_item, insert_tree_view, new_tree, open_menu, set_dropdown_open, spacing,
-        tab_bar_state, test_scales, type_size,
+        insert_checkbox, insert_color_picker, insert_color_swatch, insert_command_palette,
+        insert_dialog, insert_dropdown, insert_scrollbar, insert_slider, insert_tab_bar,
+        insert_text_field, insert_tree_item, insert_tree_view, new_tree, open_menu,
+        set_dropdown_open, spacing, tab_bar_state, test_scales, type_size,
     };
     use accesskit::{Action, Role};
     use aurora_theme::Scales;
@@ -1214,6 +1216,8 @@ mod tests {
             WidgetKind::Tooltip => 16,
             WidgetKind::Menu(_) => 17,
             WidgetKind::MenuSeparator => 18,
+            WidgetKind::ColorPicker(_) => 19,
+            WidgetKind::ColorPickerPart(_) => 20,
         }
     }
 
@@ -1246,9 +1250,11 @@ mod tests {
     /// Builds one real widget of every kind — through each module's own
     /// `insert_*` where one exists, `Panel` raw as `paint.rs`'s own tests
     /// do, a real shown tooltip for `Tooltip`, and a real open menu for
-    /// `Menu` and `MenuSeparator` — then asks
+    /// `Menu` and `MenuSeparator`, and a real colour picker for
+    /// `ColorPicker` and `ColorPickerPart` — then asks
     /// [`Tooltip::new`] about every node in the tree.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn new_rejects_a_missing_owner_and_every_disallowed_kind() {
         let (mut tree, root) = new_tree(sized_root());
         let scales = test_scales();
@@ -1320,12 +1326,20 @@ mod tests {
             0,
         ));
         open_a_menu(&mut tree, root, &scales);
+        let white = aurora_theme::Color {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        ok(insert_color_picker(
+            &mut tree, root, &scales, "Colour", white, 64.0,
+        ));
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 19];
+        let mut seen = [false; 21];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1344,7 +1358,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 19], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 21], "every WidgetKind was built and asked");
     }
 
     #[test]

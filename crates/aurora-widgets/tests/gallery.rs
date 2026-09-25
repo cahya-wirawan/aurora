@@ -242,10 +242,13 @@
 //! neither is in its counts.** `Scrollbar` (0.75.1) and now `TreeView`
 //! (0.76.0) each add a per-theme distinct-pixels test in all five
 //! built-in themes plus five `#[ignore]`d golden-diff tests — so this
-//! file now has code for **40** goldens across **eight** widgets, of
-//! which the 30 committed under `tests/golden/` are blessed and the ten
-//! newest (`scrollbar_gallery*.png`, `tree_view_gallery*.png`) do not
-//! exist at all. Backdrops for both were inherited rather than
+//! file had code for **40** goldens across **eight** widgets **as of
+//! 0.76.0**, of which the 30 committed under `tests/golden/` were
+//! blessed and the ten then-newest (`scrollbar_gallery*.png`,
+//! `tree_view_gallery*.png`) did not exist at all. *Historical figure:*
+//! every widget since (through the colour picker, 0.125.0) has added its
+//! own tests, so count the golden-diff functions and `tests/golden/`
+//! rather than trusting a number in this paragraph. Backdrops for both were inherited rather than
 //! re-derived, and the reasoning is recorded on their own per-theme
 //! test groups rather than repeated up here.
 //!
@@ -324,6 +327,10 @@
 
 use accesskit::Orientation;
 use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
+use aurora_widgets::widgets::{
+    ColorPickerPart, Hsv, color_picker_state, insert_color_picker, set_color_picker_disabled,
+    set_color_picker_hsv,
+};
 use aurora_widgets::widgets::{
     CommandEntry, DialogAction, ScrollbarRange, WidgetKind, dropdown_state, insert_button,
     insert_checkbox, insert_color_swatch, insert_command_palette, insert_dialog, insert_dropdown,
@@ -6999,3 +7006,367 @@ fn render_gallery_produces_the_dialogs_own_surface_in_color_critical_theme() {
         "Colour-Critical",
     );
 }
+
+// ---- Colour picker (0.125.0) -------------------------------------------
+
+/// One colour-picker cell: `COLOR_PICKER_PADDING` around a picker
+/// `COLOR_PICKER_SIZE` wide.
+const COLOR_PICKER_CELL: (u32, u32) = (128, 192);
+const COLOR_PICKER_PADDING: u32 = 16;
+const COLOR_PICKER_SIZE: u32 = 96;
+/// Enabled, then disabled. 256 px wide keeps readback rows aligned.
+const COLOR_PICKER_GALLERY_SIZE: (u32, u32) = (COLOR_PICKER_CELL.0 * 2, COLOR_PICKER_CELL.1);
+/// The picked colour: hue 210, near the top-right of the square, so the
+/// marker sits well away from every sampled pixel below.
+const COLOR_PICKER_HSV: Hsv = Hsv {
+    hue: 210.0,
+    saturation: 0.9,
+    value: 0.9,
+};
+
+/// Two pickers side by side over `surface.panel` — enabled and disabled.
+fn color_picker_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let mut root_style = sized_style(COLOR_PICKER_GALLERY_SIZE);
+    root_style.flex_direction = FlexDirection::Row;
+    let (mut tree, root) = new_tree(root_style);
+    let mut pickers = Vec::new();
+    for disabled in [false, true] {
+        let padding = length(COLOR_PICKER_PADDING as f32);
+        let cell = match aurora_widgets::widgets::insert_container(
+            &mut tree,
+            root,
+            Style {
+                flex_direction: FlexDirection::Column,
+                padding: LayoutRect {
+                    left: padding,
+                    right: padding,
+                    top: padding,
+                    bottom: padding,
+                },
+                ..sized_style(COLOR_PICKER_CELL)
+            },
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let black = Color { r: 0, g: 0, b: 0 };
+        let picker = match insert_color_picker(
+            &mut tree,
+            cell,
+            scales,
+            "Colour",
+            black,
+            COLOR_PICKER_SIZE as f32,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_color_picker_hsv(&mut tree, picker, COLOR_PICKER_HSV) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_color_picker_disabled(&mut tree, picker, disabled) {
+            unreachable!("{err:?}");
+        }
+        pickers.push(picker);
+    }
+    tree.compute_layout(
+        COLOR_PICKER_GALLERY_SIZE.0 as f32,
+        COLOR_PICKER_GALLERY_SIZE.1 as f32,
+    );
+    let [enabled, disabled] = pickers.as_slice() else {
+        unreachable!("two pickers");
+    };
+    (tree, [*enabled, *disabled])
+}
+
+/// The square's and the strip's bounds for `picker`.
+fn color_picker_parts(
+    tree: &WidgetTree<WidgetKind>,
+    picker: WidgetId,
+) -> (aurora_core::Rect, aurora_core::Rect) {
+    let Ok(state) = color_picker_state(tree, picker) else {
+        unreachable!("a picker");
+    };
+    let (Some(area), Some(hue)) = (
+        state.area_id().and_then(|id| tree.bounds(id)),
+        state
+            .part_id(ColorPickerPart::Hue)
+            .and_then(|id| tree.bounds(id)),
+    ) else {
+        unreachable!("laid out");
+    };
+    (area, hue)
+}
+
+/// Pixels of the square (as `(px, py)` offsets inside it) and of the
+/// strip (as hues whose pixel column is sampled) that lie well away from
+/// both markers.
+fn color_picker_samples(area: aurora_core::Rect) -> Vec<(u32, u32)> {
+    let (w, h) = (area.width, area.height);
+    vec![
+        (2, 2),
+        (2, h - 3),
+        (w / 2, h - 3),
+        (w - 3, h - 3),
+        (w / 4, h / 2),
+        (w / 2, h / 2 + 8),
+    ]
+}
+const COLOR_PICKER_HUE_SAMPLES: [f32; 5] = [30.0, 90.0, 150.0, 270.0, 330.0];
+
+/// One sampled pixel: where, what was read, and what HSV says it should be.
+type SampledPixel = ((u32, u32), [u8; 4], [u8; 3]);
+
+/// A laid-out coordinate as an image pixel index (never negative here).
+fn to_px(v: i64) -> u32 {
+    u32::try_from(v).unwrap_or(0)
+}
+
+fn to_rgb8(rgb: [f32; 3]) -> [u8; 3] {
+    #[allow(clippy::cast_sign_loss)]
+    rgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn within(pixel: [u8; 4], want: [u8; 3], tolerance: u8) -> bool {
+    pixel
+        .iter()
+        .zip(want)
+        .all(|(&got, want)| got.abs_diff(want) <= tolerance)
+}
+
+/// Every sampled gradient pixel of `picker` (enabled): the square's is
+/// HSV at the pixel's own centre, the strip's the pure hue there — each
+/// within 3 of 255.
+fn color_picker_gradient_pixels(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    picker: WidgetId,
+) -> Vec<SampledPixel> {
+    let (area, strip) = color_picker_parts(tree, picker);
+    let mut out = Vec::new();
+    let (ax, ay) = (to_px(area.x), to_px(area.y));
+    for (dx, dy) in color_picker_samples(area) {
+        let s = (dx as f32 + 0.5) / area.width as f32;
+        let v = 1.0 - (dy as f32 + 0.5) / area.height as f32;
+        let want = to_rgb8(
+            Hsv {
+                hue: 210.0,
+                saturation: s,
+                value: v,
+            }
+            .to_srgb_f32(),
+        );
+        out.push(((ax + dx, ay + dy), sample_at(image, ax + dx, ay + dy), want));
+    }
+    let (sx, sy) = (to_px(strip.x), to_px(strip.y) + strip.height / 2);
+    for hue in COLOR_PICKER_HUE_SAMPLES {
+        #[allow(clippy::cast_sign_loss)]
+        let dx = (hue / 360.0 * strip.width as f32).floor() as u32;
+        let at = (dx as f32 + 0.5) / strip.width as f32 * 360.0;
+        let want = to_rgb8(
+            Hsv {
+                hue: at,
+                saturation: 1.0,
+                value: 1.0,
+            }
+            .to_srgb_f32(),
+        );
+        out.push(((sx + dx, sy), sample_at(image, sx + dx, sy), want));
+    }
+    out
+}
+
+fn assert_color_picker_gallery(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    pickers: [WidgetId; 2],
+    theme_name: &str,
+) {
+    let [enabled, disabled] = pickers;
+    let pixels = color_picker_gradient_pixels(image, tree, enabled);
+    for (at, got, want) in &pixels {
+        assert!(
+            within(*got, *want, 3),
+            "{theme_name}: gradient pixel {at:?} is {got:?}, HSV there is {want:?}"
+        );
+    }
+    // The disabled picker's same pixels are dimmed over the panel.
+    let dimmed = color_picker_gradient_pixels(image, tree, disabled);
+    let differing = pixels
+        .iter()
+        .zip(&dimmed)
+        .filter(|((_, a, _), (_, b, _))| a != b)
+        .count();
+    assert!(
+        differing >= pixels.len() - 1,
+        "{theme_name}: the disabled picker must read differently ({differing})"
+    );
+    // The marker: somewhere in its box a pixel is far from the gradient.
+    let (area, _) = color_picker_parts(tree, enabled);
+    let cx = area.x as f32 + COLOR_PICKER_HSV.saturation * area.width as f32;
+    let cy = area.y as f32 + (1.0 - COLOR_PICKER_HSV.value) * area.height as f32;
+    #[allow(clippy::cast_sign_loss)]
+    let (cx, cy) = (cx as u32, cy as u32);
+    let marked = (cx - 6..=cx + 6)
+        .flat_map(|px| (cy - 6..=cy + 6).map(move |py| (px, py)))
+        .any(|(px, py)| {
+            let s = (px as f32 + 0.5 - area.x as f32) / area.width as f32;
+            let v = 1.0 - (py as f32 + 0.5 - area.y as f32) / area.height as f32;
+            let want = to_rgb8(
+                Hsv {
+                    hue: 210.0,
+                    saturation: s.clamp(0.0, 1.0),
+                    value: v.clamp(0.0, 1.0),
+                }
+                .to_srgb_f32(),
+            );
+            !within(sample_at(image, px, py), want, 40)
+        });
+    assert!(marked, "{theme_name}: the square's marker must be visible");
+}
+
+macro_rules! color_picker_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, pickers) = color_picker_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                COLOR_PICKER_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            assert_color_picker_gallery(&image, &tree, pickers, $theme_name);
+        }
+    };
+}
+
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_dark_theme,
+    dark_theme(),
+    "Dark"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_light_theme,
+    light_theme(),
+    "Light"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+color_picker_distinct_test!(
+    render_gallery_color_picker_paints_hsv_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// The gradient is content, not chrome: the enabled picker's sampled
+/// gradient pixels are byte-identical in every built-in theme.
+#[test]
+fn render_gallery_color_picker_gradient_is_identical_in_every_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, [enabled, _]) = color_picker_gallery_tree(&scales);
+    let mut seen: Option<Vec<[u8; 4]>> = None;
+    for theme in [
+        dark_theme(),
+        light_theme(),
+        high_contrast_dark_theme(),
+        high_contrast_light_theme(),
+        color_critical_theme(),
+    ] {
+        let image = render_gallery(
+            &context,
+            &tree,
+            &theme,
+            &scales,
+            COLOR_PICKER_GALLERY_SIZE,
+            tab_bar_clear(&theme),
+        );
+        let pixels: Vec<[u8; 4]> = color_picker_gradient_pixels(&image, &tree, enabled)
+            .into_iter()
+            .map(|(_, got, _)| got)
+            .collect();
+        match &seen {
+            Some(first) => assert_eq!(&pixels, first, "no theme token reaches the gradient"),
+            None => seen = Some(pixels),
+        }
+    }
+}
+
+/// The colour picker's own five golden-diff tests, against goldens that
+/// **do not exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s
+/// own doc comment records. A human blesses them (`AURORA_BLESS_GOLDEN=1
+/// cargo test -p aurora-widgets --test gallery -- --ignored`) after
+/// confirming each PNG shows two pickers — a white-to-hue-to-black square
+/// with a ring near its top-right, a rainbow strip with a bar at blue,
+/// and a small preview swatch — the right one dimmed.
+macro_rules! color_picker_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, _pickers) = color_picker_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                COLOR_PICKER_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image,
+    dark_theme(),
+    "color_picker_gallery.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "color_picker_gallery_light.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "color_picker_gallery_high_contrast_dark.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "color_picker_gallery_high_contrast_light.png"
+);
+color_picker_golden_test!(
+    color_picker_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "color_picker_gallery_color_critical.png"
+);
