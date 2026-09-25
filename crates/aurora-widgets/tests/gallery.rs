@@ -325,10 +325,11 @@
 use accesskit::Orientation;
 use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, ScrollbarRange, WidgetKind, insert_button, insert_checkbox,
-    insert_color_swatch, insert_command_palette, insert_dialog, insert_scrollbar, insert_slider,
-    insert_text_field, insert_tree_item, insert_tree_view, new_tree, set_button_disabled,
-    set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled, set_scrollbar_disabled,
+    CommandEntry, DialogAction, ScrollbarRange, WidgetKind, dropdown_state, insert_button,
+    insert_checkbox, insert_color_swatch, insert_command_palette, insert_dialog, insert_dropdown,
+    insert_scrollbar, insert_slider, insert_text_field, insert_tree_item, insert_tree_view,
+    new_tree, set_button_disabled, set_button_pressed, set_checkbox_disabled,
+    set_color_swatch_disabled, set_dropdown_disabled, set_dropdown_open, set_scrollbar_disabled,
     set_slider_disabled, set_text_field_disabled, set_tree_item_disabled, set_tree_item_expanded,
     set_tree_item_selected, toggle_checkbox,
 };
@@ -498,6 +499,30 @@ const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = (
 /// leaves a generous band of backdrop above and below it.
 const DIALOG_CELL: (u32, u32) = (256, 192);
 const DIALOG_GALLERY_SIZE: (u32, u32) = DIALOG_CELL;
+
+/// `Dropdown`'s own three cells — closed, open (three options, the
+/// second highlighted), and disabled — each a `DROPDOWN_CELL` square with
+/// a `DROPDOWN_CELL_PADDING` inset, so each control is `128 - 2*16 = 96`
+/// px wide and the open cell's list (three 21 px rows under a 21 px
+/// control) ends at `y = 16 + 21 + 63 = 100`, inside its own cell.
+/// `128 * 3 * 4 = 1536 = 6 * 256`, row-aligned (see
+/// [`BUTTON_GALLERY_SIZE`]).
+const DROPDOWN_CELL: (u32, u32) = (128, 128);
+const DROPDOWN_CELL_PADDING: u32 = 16;
+const DROPDOWN_GALLERY_SIZE: (u32, u32) = (DROPDOWN_CELL.0 * 3, DROPDOWN_CELL.1);
+/// One option row / the control's own height — `widgets::row_height`,
+/// restated as a number and checked against the real layout by
+/// `dropdown_gallery_lays_out_the_list_under_the_control`, the same
+/// "not a second source of truth" arrangement `TREE_VIEW_ROW_HEIGHT` has.
+const DROPDOWN_ROW_HEIGHT: u32 = 21;
+/// Well inside every control and every row horizontally.
+const DROPDOWN_SAMPLE_X: u32 = DROPDOWN_CELL.0 / 2;
+/// Mid-control.
+const DROPDOWN_CONTROL_SAMPLE_Y: u32 = DROPDOWN_CELL_PADDING + DROPDOWN_ROW_HEIGHT / 2;
+/// Mid option row `n` of the open list.
+const fn dropdown_row_sample_y(n: u32) -> u32 {
+    DROPDOWN_CELL_PADDING + DROPDOWN_ROW_HEIGHT * (n + 1) + DROPDOWN_ROW_HEIGHT / 2
+}
 
 /// `render_gallery`'s own clear colour for `CommandPalette`/`TextField`
 /// specifically, not the plain `wgpu::Color::BLACK` every other
@@ -3773,6 +3798,333 @@ tree_view_golden_test!(
     color_critical_theme(),
     COLOR_CRITICAL_CLEAR,
     "tree_view_gallery_color_critical.png"
+);
+
+/// One `Dropdown` gallery cell: a sized, padded `Column` holding a
+/// dropdown over the same three options, optionally opened (highlight on
+/// the selection, option 1) or disabled.
+fn dropdown_gallery_cell(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    open: bool,
+    disabled: bool,
+) -> WidgetId {
+    let pad = length(DROPDOWN_CELL_PADDING as f32);
+    let cell = match aurora_widgets::widgets::insert_container(
+        tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size {
+                width: length(DROPDOWN_CELL.0 as f32),
+                height: length(DROPDOWN_CELL.1 as f32),
+            },
+            padding: LayoutRect {
+                left: pad,
+                right: pad,
+                top: pad,
+                bottom: pad,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let options = ["Normal", "Multiply", "Screen"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let dropdown = match insert_dropdown(tree, cell, scales, "Blend mode", options, Some(1)) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if open && let Err(err) = set_dropdown_open(tree, dropdown, true) {
+        unreachable!("{err:?}");
+    }
+    if disabled && let Err(err) = set_dropdown_disabled(tree, dropdown, true) {
+        unreachable!("{err:?}");
+    }
+    dropdown
+}
+
+/// A real, laid-out `Dropdown` gallery: closed, open, disabled, left to
+/// right. Returns the three dropdowns' own control ids.
+fn dropdown_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let closed = dropdown_gallery_cell(&mut tree, root, scales, false, false);
+    let open = dropdown_gallery_cell(&mut tree, root, scales, true, false);
+    let disabled = dropdown_gallery_cell(&mut tree, root, scales, false, true);
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        DROPDOWN_GALLERY_SIZE.0 as f32,
+        DROPDOWN_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [closed, open, disabled])
+}
+
+/// The rendered-pixel claims every theme's `Dropdown` gallery makes,
+/// shared for the reason [`assert_tree_view_states_are_distinct`] gives.
+fn assert_dropdown_states_are_distinct(
+    image: &aurora_testkit::Image,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, DROPDOWN_GALLERY_SIZE.0);
+    assert_eq!(image.height, DROPDOWN_GALLERY_SIZE.1);
+    let at = |cell: u32, x: u32, y: u32| sample_at(image, cell * DROPDOWN_CELL.0 + x, y);
+    let (closed, open, disabled) = (0, 1, 2);
+
+    // 1. A closed control paints a real well, not backdrop.
+    let closed_control = at(closed, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y);
+    let backdrop = at(closed, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(0));
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+    assert_ne!(
+        closed_control, backdrop,
+        "{theme_name}: a closed dropdown's surface.sunken well must differ from the backdrop"
+    );
+
+    // 2. Opening really builds the list: where the closed cell shows
+    //    backdrop under its control, the open cell shows the list.
+    let open_row0 = at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(0));
+    assert_ne!(
+        open_row0, backdrop,
+        "{theme_name}: an open dropdown's list (surface.raised) must paint below the control"
+    );
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(2)),
+        open_row0,
+        "{theme_name}: the un-highlighted options share the list's own fill"
+    );
+
+    // 3. Exactly the highlighted option is painted accent.primary.
+    let open_row1 = at(open, DROPDOWN_SAMPLE_X, dropdown_row_sample_y(1));
+    assert_ne!(
+        open_row1, open_row0,
+        "{theme_name}: the highlighted option must differ from its neighbours"
+    );
+
+    // 4. The list ends after its three rows.
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, DROPDOWN_CELL.1 - 4),
+        backdrop,
+        "{theme_name}: below the list's last row is backdrop again"
+    );
+
+    // 5. The open control's border differs from the closed one's: some
+    //    pixel of the top-edge band differs, while the fill inside is
+    //    identical. Compared across a band rather than one pixel so the
+    //    claim doesn't hinge on how a 1 px stroke centred on an integer
+    //    edge rasterizes. This proves *a difference*, not which colour:
+    //    it would pass with any token other than `border.default` there.
+    //    That the open border is `border.focus` (and, in High Contrast,
+    //    drawn after the control outline) is pinned only by `paint.rs`'s
+    //    own unit tests, `an_open_dropdowns_border_turns_border_focus`
+    //    and `a_dropdown_and_its_list_each_gain_the_control_outline_in_
+    //    high_contrast`.
+    assert_eq!(
+        at(open, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y),
+        closed_control,
+        "{theme_name}: opening changes the border, not the well"
+    );
+    let band = (DROPDOWN_CELL_PADDING - 2)..=(DROPDOWN_CELL_PADDING + 2);
+    assert!(
+        band.clone()
+            .any(|y| at(open, DROPDOWN_SAMPLE_X, y) != at(closed, DROPDOWN_SAMPLE_X, y)),
+        "{theme_name}: an open dropdown's border (border.focus) must render differently from \
+         a closed one's somewhere in its top-edge band: open {:?} vs closed {:?}",
+        band.clone()
+            .map(|y| at(open, DROPDOWN_SAMPLE_X, y))
+            .collect::<Vec<_>>(),
+        band.map(|y| at(closed, DROPDOWN_SAMPLE_X, y))
+            .collect::<Vec<_>>()
+    );
+
+    // 6. Disabled dims the well.
+    assert_ne!(
+        at(disabled, DROPDOWN_SAMPLE_X, DROPDOWN_CONTROL_SAMPLE_Y),
+        closed_control,
+        "{theme_name}: a disabled dropdown must render dimmer than an enabled one"
+    );
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims: the control one row tall at the cell's padding, the
+/// list directly under it, three rows, all inside the cell.
+#[test]
+fn dropdown_gallery_lays_out_the_list_under_the_control() {
+    let scales = scales();
+    let (tree, [closed, open, disabled]) = dropdown_gallery_tree(&scales);
+    for (cell, id) in [closed, open, disabled].into_iter().enumerate() {
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        let cell = u32::try_from(cell).unwrap_or(0);
+        assert_eq!(
+            bounds.x,
+            i64::from(cell * DROPDOWN_CELL.0 + DROPDOWN_CELL_PADDING)
+        );
+        assert_eq!(bounds.y, i64::from(DROPDOWN_CELL_PADDING));
+        assert_eq!(bounds.width, DROPDOWN_CELL.0 - 2 * DROPDOWN_CELL_PADDING);
+        assert_eq!(bounds.height, DROPDOWN_ROW_HEIGHT);
+    }
+    let state = match dropdown_state(&tree, open) {
+        Ok(state) => state,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert_eq!(state.highlighted(), Some(1));
+    let (Some(list), Some(control)) =
+        (state.list().and_then(|l| tree.bounds(l)), tree.bounds(open))
+    else {
+        unreachable!("open and laid out");
+    };
+    assert_eq!(list.y, control.bottom());
+    assert_eq!(list.height, DROPDOWN_ROW_HEIGHT * 3);
+    assert!(list.bottom() < i64::from(DROPDOWN_CELL.1 - 4), "{list:?}");
+    for (n, &row) in state.rows().iter().enumerate() {
+        let Some(bounds) = tree.bounds(row) else {
+            unreachable!("laid out");
+        };
+        let n = u32::try_from(n).unwrap_or(0);
+        let mid = i64::from(dropdown_row_sample_y(n));
+        assert!(
+            bounds.y <= mid && mid < bounds.bottom(),
+            "row {n}: {bounds:?}"
+        );
+    }
+    for id in [closed, disabled] {
+        assert!(
+            dropdown_state(&tree, id).is_ok_and(|s| s.list().is_none()),
+            "only the middle cell is open"
+        );
+    }
+}
+
+/// `Dropdown`'s own gallery, one distinct-pixels test per built-in
+/// theme. **Every theme uses `NEUTRAL_CLEAR`**, computed rather than
+/// inherited: the open list's `surface.raised` is byte-identical to
+/// Light's `LIGHT_CLEAR` and ≈1.13:1 against Colour-Critical's
+/// `COLOR_CRITICAL_CLEAR` (the same two collisions
+/// `COMMAND_PALETTE_LIGHT_CLEAR`/`COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`
+/// record for the same token), and Dark's `surface.sunken` well is the
+/// near-black `neutral.0` the plain `BLACK` clear would swallow (the
+/// `TextField` history `NEUTRAL_CLEAR`'s own doc comment records). The
+/// two High Contrast themes already use `#808080`. Against it no painted
+/// fill collides in any theme: `surface.sunken`/`surface.raised` are
+/// never `#808080`, and the High Contrast `border.default`
+/// (`hc.mid_gray`, which *is* `#808080`) is always covered by the
+/// control outline or `border.focus` drawn over it.
+macro_rules! dropdown_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let (tree, _ids) = dropdown_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &$theme,
+                &scales,
+                DROPDOWN_GALLERY_SIZE,
+                NEUTRAL_CLEAR,
+            );
+            assert_dropdown_states_are_distinct(&image, NEUTRAL_CLEAR, $theme_name);
+        }
+    };
+}
+
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state,
+    dark_theme(),
+    "Dark"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+dropdown_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_dropdown_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Dropdown`'s own five golden-diff tests, against goldens that **do
+/// not exist** — `#[ignore]`d, Dark included, exactly as
+/// `scrollbar_golden_test!`'s own doc comment records. A human runs
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, opens the five written PNGs, and confirms each shows a
+/// closed well, an open well with an accent-coloured border and a
+/// three-row list under it (middle row highlighted), and a dimmed well —
+/// before any of these attributes come off.
+macro_rules! dropdown_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let (tree, _ids) = dropdown_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &$theme,
+                &scales,
+                DROPDOWN_GALLERY_SIZE,
+                NEUTRAL_CLEAR,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image,
+    dark_theme(),
+    "dropdown_gallery.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "dropdown_gallery_light.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "dropdown_gallery_high_contrast_dark.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "dropdown_gallery_high_contrast_light.png"
+);
+dropdown_golden_test!(
+    dropdown_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "dropdown_gallery_color_critical.png"
 );
 
 /// `Slider`'s own "distinct pixels" proof is shaped differently from

@@ -6,7 +6,8 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, `TreeItem`, `Panel`, and `Dialog` — solid rounded-rect shapes, the simplest of
+//! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`, and
+//! `DropdownList` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -103,8 +104,8 @@ use taffy::Overflow;
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
-    TextFieldState, TreeItemState, WidgetKind, row_height,
+    ButtonState, CheckboxState, ColorSwatchState, DropdownState, ListRowState, ScrollbarState,
+    SliderState, TextFieldState, TreeItemState, WidgetKind, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -202,6 +203,8 @@ pub fn paint_widget(
         WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
+        WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
+        WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -752,6 +755,144 @@ fn paint_dialog(
     Ok(paints)
 }
 
+/// A dropdown's own control: a `scales.radius.sm` rounded rect filled
+/// with `surface.sunken` (`design/tokens/vocabulary.md`: "Inset wells:
+/// ... input backgrounds" — the token `design/gallery/index.html`'s own
+/// `.dropdown` mockup uses), an **unconditional 1 px border** over it,
+/// and the conditional [`control_outline`] on top in a High Contrast
+/// theme. So two shapes in Dark/Light/Colour-Critical, three in the two
+/// High Contrast themes — the same count [`paint_dialog`] has.
+///
+/// **Which of the two strokes draws last depends on state, and that is
+/// load-bearing in High Contrast.** Both strokes are the same path at the
+/// same width, so whichever draws second hides the other completely.
+/// Closed, the mandatory `border.control` outline draws last (the same
+/// order [`paint_dialog`] uses, so `border.default`'s `hc.mid_gray` never
+/// downgrades the theme's full-strength outline). Open, `border.focus`
+/// draws last: with the outline on top, an open and a closed dropdown
+/// were measured pixel-identical in both High Contrast themes, so the
+/// one visual signal this widget has for "open" vanished in exactly the
+/// themes meant to make state *more* visible. Both themes' `border.focus`
+/// (`hc.yellow`/`hc.blue`) is itself a full-strength accent.
+///
+/// The border is `border.default` while closed and `border.focus` while
+/// **open** — the mockup's `.dropdown.state-focus` rule, keyed on the
+/// one state this widget actually knows. It is *not* a keyboard-focus
+/// ring: no widget in this crate paints keyboard focus at all
+/// ([`crate::FocusManager`] tracks it and marks damage, but nothing
+/// reads it at paint time), which is a crate-wide, disclosed gap rather
+/// than a dropdown one.
+///
+/// **An unchecked contrast pair, flagged rather than added**:
+/// `design/check_contrast.py` gates `border.focus` against
+/// `surface.panel`, `surface.canvas` and `surface.raised`, not against
+/// `surface.sunken`, which is what this border sits on the inside of.
+/// Adding a gated pair is a design-owner decision (PRD FR-027
+/// *Ownership*), so it is named here and not done.
+///
+/// The unconditional border is the mockup's own `1px solid
+/// var(--border-default)`, and it is not decoration in Colour-Critical
+/// or High Contrast: a `surface.sunken` well is byte-identical to the
+/// panel behind it in both High Contrast themes. `state.disabled_opacity`
+/// dims all of it, border included. No `▾` indicator: this crate draws
+/// no glyphs, and which token one would use is a design-owner question.
+fn paint_dropdown(
+    state: &DropdownState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px `paint_panel`/`paint_dialog` stroke at: no
+    // "border width" token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let [fr, fg, fb] = theme.surface.sunken.to_srgb_f32();
+    let border = if state.is_open() {
+        theme.border.focus
+    } else {
+        theme.border.default
+    };
+    let [br, bg, bb] = border.to_srgb_f32();
+    let border_paint = (border_mesh, [br, bg, bb, alpha]);
+    let outline = control_outline(&path, theme, alpha, scale_factor)?;
+    let mut paints = vec![(fill_mesh, [fr, fg, fb, alpha])];
+    // Draw order depends on state -- see this function's doc comment.
+    if state.is_open() {
+        paints.extend(outline);
+        paints.push(border_paint);
+    } else {
+        paints.push(border_paint);
+        paints.extend(outline);
+    }
+    Ok(paints)
+}
+
+/// An open dropdown's own list: a `scales.radius.sm` rounded rect filled
+/// with `surface.raised` — `design/tokens/vocabulary.md`'s "Elevation 1:
+/// dropdowns, popovers, context menus", named for exactly this — with an
+/// **unconditional `border.default` outline** over it and the
+/// conditional [`control_outline`] on top. `radius.sm` rather than the
+/// `radius.md` [`paint_command_palette`] uses for a free-floating panel,
+/// so the list's corners match the control it hangs from and the
+/// full-width option highlights ([`paint_list_row`], `radius.sm`)
+/// inside it. Always full opacity: a disabled dropdown is closed first,
+/// so a list never exists for one.
+///
+/// **The unconditional border is load-bearing, the same finding
+/// [`paint_dialog`] records.** Light resolves `surface.raised` and
+/// `surface.panel` to the same `neutral.900`, and both High Contrast
+/// themes resolve `surface.raised`, `surface.panel` *and*
+/// `surface.sunken` to one value each (`hc.black`/`hc.white`) — so over
+/// a panel, a fill alone would make the list byte-identical to what is
+/// behind it. `a_light_theme_dropdown_list_still_paints_a_border`
+/// pins it.
+fn paint_dropdown_list(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [fr, fg, fb] = theme.surface.raised.to_srgb_f32();
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [br, bg, bb] = theme.border.default.to_srgb_f32();
+    let mut paints = vec![
+        (fill_mesh, [fr, fg, fb, 1.0]),
+        (border_mesh, [br, bg, bb, 1.0]),
+    ];
+    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
 /// A colour swatch's own fill: `state.color` itself — the one widget in
 /// this module whose fill colour is *not* a `Theme` token (see this
 /// module's own doc comment and `widgets::color_swatch`'s for why: the
@@ -987,13 +1128,15 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, DialogAction, DialogHandle, ListRowState, ScrollbarRange, ScrollbarState,
-        WidgetKind, command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_container, insert_dialog, insert_scrollbar, insert_slider,
-        insert_text_field, insert_tree_item, insert_tree_view, new_tree, row_height,
-        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
-        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
-        set_text_field_disabled, set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
+        CommandEntry, DialogAction, DialogHandle, DropdownState, ListRowState, ScrollbarRange,
+        ScrollbarState, WidgetKind, command_palette_state, dropdown_state, insert_button,
+        insert_checkbox, insert_color_swatch, insert_command_palette, insert_container,
+        insert_dialog, insert_dropdown, insert_scrollbar, insert_slider, insert_text_field,
+        insert_tree_item, insert_tree_view, new_tree, row_height, set_button_disabled,
+        set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_dropdown_disabled, set_dropdown_open, set_scrollbar_disabled, set_scrollbar_value,
+        set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
+        set_tree_item_selected, toggle_checkbox,
     };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
@@ -3018,6 +3161,235 @@ mod tests {
             "a dialog's message is a plain Container -- this crate draws no glyphs, so \
              there is nothing to paint: {paints:?}"
         );
+    }
+
+    /// A laid-out dropdown in a definitely sized root, optionally open
+    /// and/or disabled. Returns the control and (when open) its list.
+    fn laid_out_dropdown(
+        scales: &Scales,
+        open: bool,
+        disabled: bool,
+    ) -> (WidgetTree<WidgetKind>, WidgetId, Option<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(160.0_f32),
+                height: taffy::style_helpers::length(160.0_f32),
+            },
+            ..Default::default()
+        });
+        let options = vec![
+            "Normal".to_owned(),
+            "Multiply".to_owned(),
+            "Screen".to_owned(),
+        ];
+        let id = match insert_dropdown(&mut tree, root, scales, "Blend mode", options, Some(1)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if open && let Err(err) = set_dropdown_open(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        if disabled && let Err(err) = set_dropdown_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(160.0, 160.0);
+        let list = dropdown_state(&tree, id).ok().and_then(DropdownState::list);
+        (tree, id, list)
+    }
+
+    fn paints_of(tree: &WidgetTree<WidgetKind>, id: WidgetId, theme: &Theme) -> Vec<Paint> {
+        match paint_widget(tree, id, theme, &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn rgba(color: Color, alpha: f32) -> [f32; 4] {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_closed_dropdown_paints_a_sunken_well_with_a_default_border() {
+        let theme = dark_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), false, false);
+        assert_eq!(list, None);
+        let paints = paints_of(&tree, id, &theme);
+        assert_eq!(paints.len(), 2, "a fill and its border: {paints:?}");
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                rgba(theme.border.default, 1.0)
+            ]
+        );
+        for (mesh, _) in &paints {
+            assert!(!mesh.vertices.is_empty() && !mesh.indices.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_open_dropdowns_border_turns_border_focus() {
+        let theme = dark_theme();
+        assert_ne!(
+            theme.border.focus, theme.border.default,
+            "this test only proves anything while the two tokens differ"
+        );
+        let (tree, id, _list) = laid_out_dropdown(&scales(), true, false);
+        let paints = paints_of(&tree, id, &theme);
+        assert_eq!(paints.len(), 2);
+        let Some((_, border)) = paints.get(1) else {
+            unreachable!("two shapes");
+        };
+        assert_eq!(*border, rgba(theme.border.focus, 1.0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_dropdown_dims_its_fill_and_its_border() {
+        let theme = dark_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), true, true);
+        assert_eq!(list, None, "disabling closed the list first");
+        let paints = paints_of(&tree, id, &theme);
+        let alpha = theme.state.disabled_opacity;
+        assert!(alpha < 1.0);
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.sunken, alpha),
+                rgba(theme.border.default, alpha)
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dropdown_and_its_list_each_gain_the_control_outline_in_high_contrast() {
+        let theme = high_contrast_theme();
+        let (tree, id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let outline = rgba(theme.border.control, theme.border.control_opacity);
+        let list_colors: Vec<[f32; 4]> = paints_of(&tree, list, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            list_colors,
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0),
+                outline
+            ],
+            "the list: fill, border, and the control outline drawn last"
+        );
+        // Open: border.focus draws *after* the outline, or the two
+        // coincident strokes would hide the open state entirely.
+        let open_colors: Vec<[f32; 4]> = paints_of(&tree, id, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            open_colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                outline,
+                rgba(theme.border.focus, 1.0)
+            ]
+        );
+        // Closed: the outline draws last, over border.default.
+        let (closed_tree, closed, _) = laid_out_dropdown(&scales(), false, false);
+        let closed_colors: Vec<[f32; 4]> = paints_of(&closed_tree, closed, &theme)
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(
+            closed_colors,
+            vec![
+                rgba(theme.surface.sunken, 1.0),
+                rgba(theme.border.default, 1.0),
+                outline
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_open_dropdown_list_paints_surface_raised_with_a_border() {
+        let theme = dark_theme();
+        let (tree, _id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let paints = paints_of(&tree, list, &theme);
+        let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0)
+            ]
+        );
+        let (Some(bounds), true) = (tree.bounds(list), !paints.is_empty()) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.width > 0 && bounds.height > 0, "{bounds:?}");
+    }
+
+    /// The load-bearing half of `paint_dropdown_list`'s border, pinned
+    /// against the real Light theme: there `surface.raised` *is*
+    /// `surface.panel` and `control_outline` returns `None`, so without
+    /// the unconditional border a list over a panel would be invisible.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_dropdown_list_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.raised, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        assert_eq!(theme.border.control_opacity, 0.0);
+        let (tree, _id, list) = laid_out_dropdown(&scales(), true, false);
+        let Some(list) = list else {
+            unreachable!("open");
+        };
+        let paints = paints_of(&tree, list, &theme);
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        assert!(
+            paints.iter().any(|(_, color)| *color != backdrop),
+            "a Light list must paint something that is not the panel behind it: {paints:?}"
+        );
+        assert_eq!(paints.len(), 2);
+    }
+
+    /// The highlighted option is an ordinary `ListRow`, painted by the
+    /// existing `paint_list_row` in `accent.primary`; the others paint
+    /// nothing.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn only_the_highlighted_option_row_paints_a_highlight() {
+        let theme = dark_theme();
+        let (tree, id, _list) = laid_out_dropdown(&scales(), true, false);
+        let rows = match dropdown_state(&tree, id) {
+            Ok(state) => state.rows().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(rows.len(), 3);
+        for (index, row) in rows.into_iter().enumerate() {
+            let paints = paints_of(&tree, row, &theme);
+            if index == 1 {
+                let colors: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+                assert_eq!(colors, vec![rgba(theme.accent.primary, 1.0)]);
+            } else {
+                assert!(paints.is_empty(), "row {index}: {paints:?}");
+            }
+        }
     }
 
     #[test]

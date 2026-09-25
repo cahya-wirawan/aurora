@@ -260,7 +260,13 @@
       `TextField`/`CommandPalette`. The tree's own rendered gallery is
       two cells, expanded and collapsed; it draws selection highlights
       and indentation only — no disclosure triangle and no row text,
-      since that crate draws no glyphs at all.)
+      since that crate draws no glyphs at all. The Dropdown above has
+      since landed in `aurora-widgets` too, 0.120.0: its rendered
+      gallery is three cells — closed, open with a three-option list
+      and the middle option highlighted, and disabled — and like the
+      tree it draws no text and no ▾ indicator; its "focused" border
+      is keyed on the list being open, since no widget there paints
+      keyboard focus yet.)
     </p>
   </section>
 </main>

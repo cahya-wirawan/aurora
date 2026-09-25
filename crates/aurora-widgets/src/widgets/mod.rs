@@ -10,9 +10,10 @@
 //! pattern every other widget follows; `TextField`
 //! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
 //! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
-//! ([`ScrollbarState`]), and now `Tree` ([`TreeItemState`]) followed —
-//! **6 of the 12 named widgets**: button, checkbox, slider, scrollbar,
-//! colour swatch, and tree. (Recounted, not carried forward: this
+//! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), and now `Dropdown`
+//! ([`DropdownState`], `0.120.0`) followed — **7 of the 12 named
+//! widgets**: button, checkbox, slider, dropdown, scrollbar, colour
+//! swatch, and tree. (Recounted, not carried forward: this
 //! sentence said "4 of the 12" through `0.75.1`, a count inherited from
 //! PLAN.md's own stricter transcription of the same list — which reads
 //! "colour picker" where `design/gallery/index.html` has "Color
@@ -40,11 +41,20 @@
 //! **no in-row content** (a row's own band holds nothing but the row, so
 //! the Layers-panel "thumbnail + checkbox + name on one line" shape
 //! isn't buildable yet — `tree_view.rs`'s own doc comment has the full
-//! list of what it does and doesn't promise). The rest still need
-//! infrastructure that doesn't exist yet
-//! (real text shaping for dropdowns, popover layering for
-//! menus/tooltips, `aurora-vector` path rendering for the curve editor)
-//! and are deliberately left open rather than stubbed out half-built.
+//! list of what it does and doesn't promise). `Dropdown`
+//! ([`insert_dropdown`]/[`handle_dropdown_key`]) is a select-only combo
+//! box: a real `Role::ComboBox` whose open list is a real
+//! `Role::ListBox` child holding [`WidgetKind::ListRow`] options, removed on
+//! close, driven by an exhaustively tested key table — but painted in
+//! ordinary tree order with **no popover layering** (a later sibling
+//! paints over the open list), with options **unreachable by
+//! hit-testing** (they lie outside the control's bounds), and with no
+//! text or `▾` glyph (`dropdown.rs`'s own doc comment has the full
+//! list). The rest still need infrastructure that doesn't exist yet
+//! (popover layering for menus/tooltips — which a dropdown's list also
+//! lacks, see above — number semantics for a number field, and
+//! `aurora-vector` path rendering for the curve editor) and are
+//! deliberately left open rather than stubbed out half-built.
 //!
 //! **Every module here is a model, not a painter** — and that is a
 //! division of labour, not a missing feature. A widget module produces
@@ -52,9 +62,11 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **eleven** of
-//! the [`WidgetKind`] variants below (every one except `Container`,
-//! [`WidgetKind::Dialog`] included as of `0.79.0`). This mirrors
+//! tessellates real geometry through `aurora-vector` for **thirteen**
+//! of the [`WidgetKind`] variants below (every one except `Container`,
+//! [`WidgetKind::Dialog`] included as of `0.79.0`,
+//! [`WidgetKind::Dropdown`] and [`WidgetKind::DropdownList`] as of
+//! `0.120.0`). This mirrors
 //! `WidgetTree` itself: a complete, tested logical model with painting
 //! layered on afterward, not built into the model.
 //!
@@ -77,6 +89,7 @@ mod checkbox;
 mod color_swatch;
 mod command_palette;
 mod dialog;
+mod dropdown;
 mod list_row;
 mod scrollbar;
 mod slider;
@@ -93,6 +106,11 @@ pub use command_palette::{
     move_command_palette_selection, set_command_palette_query,
 };
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
+pub use dropdown::{
+    DropdownKey, DropdownOutcome, DropdownState, dropdown_state, handle_dropdown_key,
+    insert_dropdown, set_dropdown_disabled, set_dropdown_open, set_dropdown_selected,
+    toggle_dropdown,
+};
 pub use list_row::ListRowState;
 pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,
@@ -134,7 +152,8 @@ pub enum WidgetKind {
     CommandPalette(CommandPaletteState),
     ColorSwatch(ColorSwatchState),
     /// A selectable row within some owning widget's own list —
-    /// `CommandPalette`'s own result rows today, see
+    /// `CommandPalette`'s own result rows and `Dropdown`'s option rows
+    /// (0.120.0) today, see
     /// [`ListRowState`]'s own module doc comment for why this is a
     /// deliberately shared, generic variant rather than one per
     /// consumer.
@@ -183,6 +202,22 @@ pub enum WidgetKind {
     /// [`Panel`]: WidgetKind::Panel
     /// [`CommandPalette`]: WidgetKind::CommandPalette
     Dialog,
+    /// A select-only dropdown's own control — `Role::ComboBox`, painted
+    /// as a `surface.sunken` well with a border that turns
+    /// `border.focus` while open (`paint::paint_dropdown`). See
+    /// `dropdown.rs`'s own module doc comment for the transition table,
+    /// the accessibility vocabulary and which adapters read it, and what
+    /// it deliberately does not do (no popover layering, options
+    /// unreachable by hit-testing).
+    Dropdown(DropdownState),
+    /// An open dropdown's own list — the `Role::ListBox` child
+    /// `dropdown.rs` inserts on open and removes on close, holding one
+    /// [`WidgetKind::ListRow`] per option. No state, for the same reason
+    /// [`WidgetKind::Panel`] has none: its paint (`surface.raised`, the
+    /// "Elevation 1: dropdowns, popovers" token, plus an unconditional
+    /// `border.default` outline — `paint::paint_dropdown_list`) is a pure
+    /// function of its bounds and the theme.
+    DropdownList,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]
