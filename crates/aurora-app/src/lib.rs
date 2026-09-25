@@ -29713,8 +29713,9 @@ mod tests {
     ///   CPU-only **as of 0.113.0** — `HardMix` was ported in 0.115.0 and
     ///   `SoftLight` in 0.117.0, so neither is CPU-only any more;
     /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, which are near-misses for
-    ///   other modes rather than this one (`Subtract` was ported in 0.118.0,
-    ///   so `Divide` alone is still rejected);
+    ///   other modes rather than this one (`Subtract` was ported in 0.118.0
+    ///   and `Divide` in 0.119.0, so neither is rejected on GPU-admission
+    ///   grounds any more, only on the near-miss reasoning itself);
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side by
     ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
@@ -29800,7 +29801,9 @@ mod tests {
     ///   below. `SoftLight` was then ported in 0.117.0, so neither of the two is
     ///   CPU-only any more;
     /// - `Subtract` and `Divide`, near-misses for other modes rather than this
-    ///   one (`Subtract` was ported in 0.118.0; `Divide` alone remains);
+    ///   one (`Subtract` was ported in 0.118.0 and `Divide` in 0.119.0; both
+    ///   are on GPU now, so this exclusion is about the near-miss reasoning,
+    ///   not GPU-admission status);
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side. This round deliberately left that const
     ///   alone, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable
@@ -29874,7 +29877,9 @@ mod tests {
     ///   genuinely independent math (its own `soft_light_d`), so nothing this
     ///   round did brings it any closer;
     /// - `Subtract` and `Divide`, near-misses for other modes rather than this
-    ///   one (`Subtract` was ported in 0.118.0; `Divide` alone remains);
+    ///   one (`Subtract` was ported in 0.118.0 and `Divide` in 0.119.0; both
+    ///   are on GPU now, so this exclusion is about the near-miss reasoning,
+    ///   not GPU-admission status);
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side. This round deliberately left that const
     ///   alone, so both PLAN.md-tracked CPU-fallback benchmarks stay comparable
@@ -29957,8 +29962,9 @@ mod tests {
     ///   this one reused two *arms* rather than two *helpers*, and `SoftLight`
     ///   has neither to reuse;
     /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide`, near-misses for other
-    ///   modes rather than this one (`Subtract` was ported in 0.118.0;
-    ///   `Divide` alone remains);
+    ///   modes rather than this one (`Subtract` was ported in 0.118.0 and
+    ///   `Divide` in 0.119.0; both are on GPU now, so this exclusion is about
+    ///   the near-miss reasoning, not GPU-admission status);
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side by
     ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
@@ -30041,9 +30047,9 @@ mod tests {
     /// - `Subtract` (`max(Cb - Cs, 0)`) and `Divide` (a guarded division), at
     ///   the time the **only two separable modes left** and the obvious next
     ///   candidates — neither an overlay-family mode and neither reusing
-    ///   anything that round built. (0.118.0 took `Subtract`, which is why
-    ///   this bullet now reads in the past tense; `Divide` alone remains,
-    ///   and is admitted nowhere.);
+    ///   anything that round built. (0.118.0 took `Subtract` and 0.119.0
+    ///   took `Divide`, which is why this bullet now reads in the past
+    ///   tense throughout; both are admitted on GPU today.);
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side by
     ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
@@ -32628,7 +32634,7 @@ mod tests {
     /// texel is the whole tile.
     ///
     /// This model's faithfulness depends on every roster row's mode-bearing
-    /// layer having texel alpha `1.0` (true of all eighteen today): swapping
+    /// layer having texel alpha `1.0` (true of all nineteen today): swapping
     /// which side is straight vs. premultiplied only reproduces the real
     /// dispatch arm term for term when there is no partial coverage to
     /// un-premultiply differently on each side. A future roster row with a
@@ -32926,11 +32932,11 @@ mod tests {
     /// why red must not be "tidied".
     ///
     /// **Why not simply also exclude `a = 0.5`,** which is what the algebra
-    /// above literally indicts? Because **all eighteen** roster rows carry
+    /// above literally indicts? Because **all nineteen** roster rows carry
     /// their non-unit opacity as exactly `0.5` — checked, not assumed — and
     /// each one's golden is hand-derived from that value and measured on real
     /// GPU hardware. Excluding `0.5` would fail every row at once and demand
-    /// eighteen goldens be re-derived and re-measured, to buy a rule that is
+    /// nineteen goldens be re-derived and re-measured, to buy a rule that is
     /// still a proxy —
     /// blind to any *other* laundering value a future clamped or saturating
     /// mode brings (`a = 0` for `HardMix`-shaped saturation, say). The
@@ -32938,11 +32944,12 @@ mod tests {
     /// opacity rule is kept as the *diagnostic* — it names the likely cause in
     /// its failure message — and the arithmetic is what actually decides.
     ///
-    /// **One** more asymmetric separable mode is still to
-    /// be ported — `Divide`
+    /// **Zero** more asymmetric separable modes remain to
+    /// be ported — 0.119.0 took `Divide`, the last one
     /// (this list was stale by one before 0.117.0 read it and by two after:
     /// it still named `PinLight`, which 0.116.0 had ported, and `SoftLight`,
-    /// which 0.117.0 ported; 0.118.0 removed `Subtract`, which it ported —
+    /// which 0.117.0 ported; 0.118.0 removed `Subtract`, which it ported, and
+    /// 0.119.0 removed `Divide` in turn —
     /// `Overlay` was on it
     /// until 0.110.0 ported it, `HardLight` until 0.111.0 did,
     /// `LinearLight` until 0.113.0 did, and `VividLight` until 0.114.0 did) —

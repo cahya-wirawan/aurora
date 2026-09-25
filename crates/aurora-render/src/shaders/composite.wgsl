@@ -2543,11 +2543,13 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
 // for either order, and for `M` in `(0, 1)` the denominator is negative
 // while the numerator is positive, so **`a*` is negative and no alpha in
 // `[0, 1]` is blind**. (Equivalently: `D0` and `D1` are both positive here,
-// so their convex combination cannot reach zero.) Two exceptions, stated
-// because "no blind alpha at all" would be an overclaim of exactly the kind
-// 0.118.1 had to walk back for `Subtract`:
+// so their convex combination cannot reach zero.) The universal case, then
+// two genuine out-of-gamut exceptions, stated in full because "no blind
+// alpha at all" would be an overclaim of exactly the kind 0.118.1 had to
+// walk back for `Subtract`:
 //
-//   - **`Cb == Cs`** makes `B = 1` both ways, so `D0 = D1 = 0` and the
+//   - **`Cb == Cs`** (not an exception, the universal case every mode in
+//     this file shares) makes `B = 1` both ways, so `D0 = D1 = 0` and the
 //     channel is blind at *every* alpha. That is this mode's whole
 //     transpose-blind set for non-negative operands, and it is the same
 //     universal `Cb == Cs` set every mode in this file has;
