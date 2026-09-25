@@ -473,7 +473,9 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::Dropdown(_)
         | WidgetKind::DropdownList
         | WidgetKind::TabBar(_)
-        | WidgetKind::Tooltip => false,
+        | WidgetKind::Tooltip
+        | WidgetKind::Menu(_)
+        | WidgetKind::MenuSeparator => false,
     }
 }
 
@@ -790,13 +792,14 @@ mod tests {
     use crate::WidgetError;
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, DialogAction, ScrollbarRange, WidgetKind, insert_button, insert_checkbox,
-        insert_color_swatch, insert_command_palette, insert_dialog, insert_dropdown,
-        insert_scrollbar, insert_slider, insert_tab_bar, insert_text_field, insert_tree_item,
-        insert_tree_view, new_tree, set_dropdown_open, spacing, tab_bar_state, test_scales,
-        type_size,
+        CommandEntry, DialogAction, MenuItem, ScrollbarRange, WidgetKind, insert_button,
+        insert_checkbox, insert_color_swatch, insert_command_palette, insert_dialog,
+        insert_dropdown, insert_scrollbar, insert_slider, insert_tab_bar, insert_text_field,
+        insert_tree_item, insert_tree_view, new_tree, open_menu, set_dropdown_open, spacing,
+        tab_bar_state, test_scales, type_size,
     };
     use accesskit::{Action, Role};
+    use aurora_theme::Scales;
     use std::time::{Duration, Instant};
     use taffy::style_helpers::length;
     use taffy::{FlexDirection, Size, Style};
@@ -1209,6 +1212,8 @@ mod tests {
             WidgetKind::TabBar(_) => 14,
             WidgetKind::Tab(_) => 15,
             WidgetKind::Tooltip => 16,
+            WidgetKind::Menu(_) => 17,
+            WidgetKind::MenuSeparator => 18,
         }
     }
 
@@ -1223,9 +1228,25 @@ mod tests {
         }
     }
 
+    /// A real open menu under `root` — one `Menu` and one
+    /// `MenuSeparator` (plus a `ListRow` item) for the test below.
+    fn open_a_menu(tree: &mut WidgetTree<WidgetKind>, root: WidgetId, scales: &Scales) {
+        let items = vec![MenuItem::action("Cut"), MenuItem::separator()];
+        ok(open_menu(
+            tree,
+            root,
+            scales,
+            "Edit",
+            (0.0, 0.0),
+            100.0,
+            items,
+        ));
+    }
+
     /// Builds one real widget of every kind — through each module's own
     /// `insert_*` where one exists, `Panel` raw as `paint.rs`'s own tests
-    /// do, and a real shown tooltip for `Tooltip` — then asks
+    /// do, a real shown tooltip for `Tooltip`, and a real open menu for
+    /// `Menu` and `MenuSeparator` — then asks
     /// [`Tooltip::new`] about every node in the tree.
     #[test]
     fn new_rejects_a_missing_owner_and_every_disallowed_kind() {
@@ -1298,12 +1319,13 @@ mod tests {
             vec!["A".to_owned(), "B".to_owned()],
             0,
         ));
+        open_a_menu(&mut tree, root, &scales);
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 17];
+        let mut seen = [false; 19];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1322,7 +1344,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 17], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 19], "every WidgetKind was built and asked");
     }
 
     #[test]

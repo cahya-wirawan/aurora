@@ -280,7 +280,16 @@
       draws no text, and draws no shadow — nothing there draws shadows
       yet, so the elevation-1 box-shadow above is not rendered. Whether a
       tooltip is Elevation 1 (surface-raised) or Elevation 2
-      (surface-overlay, as above) is an open design question.)
+      (surface-overlay, as above) is an open design question.
+      A Menu has since landed too, 0.123.0, with no mockup here at all:
+      its rendered gallery is three cells, each a bordered surface-raised
+      menu of five rows (Cut, a separator, Copy, a disabled Paste,
+      Delete) over the theme's own panel colour — the first row
+      highlighted, then the third after one Down crosses the separator,
+      then a menu whose every action is disabled and so nothing is
+      highlighted. A separator is a 1 px default-border rule. It draws
+      no text. Every token it uses is provisional until a menu mockup
+      exists.)
     </p>
   </section>
 </main>

@@ -333,7 +333,10 @@ use aurora_widgets::widgets::{
     set_slider_disabled, set_text_field_disabled, set_tree_item_disabled, set_tree_item_expanded,
     set_tree_item_selected, toggle_checkbox,
 };
-use aurora_widgets::widgets::{Tooltip, insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
+use aurora_widgets::widgets::{
+    MenuItem, MenuKey, MenuOutcome, Tooltip, handle_menu_key, insert_tab_bar, menu_state,
+    open_menu, set_tab_bar_disabled, tab_bar_state,
+};
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -4701,6 +4704,378 @@ tooltip_golden_test!(
     tooltip_gallery_matches_the_golden_image_in_color_critical_theme,
     color_critical_theme(),
     "tooltip_gallery_color_critical.png"
+);
+
+/// `Menu`'s own gallery: three cells side by side, each `MENU_CELL`
+/// wide, each holding one open menu of `Cut`, a separator, `Copy`, a
+/// disabled `Paste` and `Delete` at the cell's `MENU_INSET` inset and
+/// `MENU_WIDTH` wide. The states:
+///
+/// 0. freshly opened — the first item, `Cut`, highlighted;
+/// 1. after one `Down` — `Copy` highlighted, the highlight having
+///    crossed the separator;
+/// 2. every action disabled — nothing highlighted at all.
+///
+/// A disabled item is present in the first two. There is **no menu
+/// mockup** in `design/gallery/index.html`, so every token this paints
+/// is provisional (`menu.rs`'s design-owner questions). `384 * 4 =
+/// 1536 = 6 * 256`, row-aligned (see [`BUTTON_GALLERY_SIZE`]). Every
+/// sample point is read from the real layout rather than restated.
+const MENU_GALLERY_SIZE: (u32, u32) = (384, 128);
+const MENU_CELL: u32 = 128;
+const MENU_INSET: u32 = 16;
+const MENU_WIDTH: u32 = 96;
+
+/// The gallery backdrop: the theme's own `surface.panel`, where a menu
+/// really hangs — and where Light and both High Contrast themes collide
+/// `surface.raised` with it, the case the unconditional border is for.
+fn menu_clear(theme: &Theme) -> wgpu::Color {
+    tab_bar_clear(theme)
+}
+
+fn menu_gallery_items(all_disabled: bool) -> Vec<MenuItem> {
+    let item = |label: &str, enabled: bool| MenuItem {
+        enabled: enabled && !all_disabled,
+        ..MenuItem::action(label)
+    };
+    vec![
+        item("Cut", true),
+        MenuItem::separator(),
+        item("Copy", true),
+        item("Paste", false),
+        item("Delete", true),
+    ]
+}
+
+/// The laid-out gallery tree and each cell's menu id.
+fn menu_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(sized_style(MENU_GALLERY_SIZE));
+    let mut open = |cell: u32, all_disabled: bool| {
+        #[allow(clippy::cast_precision_loss)]
+        let at = ((cell * MENU_CELL + MENU_INSET) as f32, MENU_INSET as f32);
+        #[allow(clippy::cast_precision_loss)]
+        let width = MENU_WIDTH as f32;
+        match open_menu(
+            &mut tree,
+            root,
+            scales,
+            "Edit",
+            at,
+            width,
+            menu_gallery_items(all_disabled),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    };
+    let fresh = open(0, false);
+    let moved = open(1, false);
+    let disabled = open(2, true);
+    match handle_menu_key(&mut tree, moved, MenuKey::Down) {
+        Ok(MenuOutcome::Moved(2)) => {}
+        other => unreachable!("Down from Cut crosses the separator to Copy: {other:?}"),
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(MENU_GALLERY_SIZE.0 as f32, MENU_GALLERY_SIZE.1 as f32);
+    (tree, [fresh, moved, disabled])
+}
+
+/// The centre pixel of `id`'s own laid-out box.
+fn menu_centre(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (u32, u32) {
+    let Some(bounds) = tree.bounds(id) else {
+        unreachable!("laid out");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let point = (
+        (bounds.x + i64::from(bounds.width / 2)) as u32,
+        (bounds.y + i64::from(bounds.height / 2)) as u32,
+    );
+    point
+}
+
+/// A headless (no GPU) proof that each menu sits where the samples
+/// below assume, inside its own cell and the image.
+#[test]
+fn menu_gallery_lays_each_menu_out_inside_its_cell() {
+    let (tree, menus) = menu_gallery_tree(&scales());
+    for (cell, &menu) in (0_u32..).zip(&menus) {
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(bounds.x, i64::from(cell * MENU_CELL + MENU_INSET));
+        assert_eq!(bounds.y, i64::from(MENU_INSET));
+        assert_eq!(bounds.width, MENU_WIDTH);
+        assert!(
+            bounds.bottom() + 3 < i64::from(MENU_GALLERY_SIZE.1),
+            "room below the menu for a backdrop sample: {bounds:?}"
+        );
+    }
+}
+
+/// Keeps `assert_menu_separator_rule` on its non-trivial branch: in every
+/// built-in theme the separator's `border.default` must differ from the
+/// menu's `surface.raised` fill, or that check silently degrades to
+/// "the rule is the fill" and proves nothing about the rule being
+/// painted. Headless — no adapter needed.
+#[test]
+fn menu_separator_border_differs_from_the_menu_fill_in_every_built_in_theme() {
+    for (name, theme) in [
+        ("Dark", dark_theme()),
+        ("Light", light_theme()),
+        ("High Contrast Dark", high_contrast_dark_theme()),
+        ("High Contrast Light", high_contrast_light_theme()),
+        ("Colour-Critical", color_critical_theme()),
+    ] {
+        assert_ne!(
+            theme.border.default, theme.surface.raised,
+            "{name}: a separator rule would be invisible against the menu fill"
+        );
+    }
+}
+
+/// `assert_menu_is_distinct`'s step 5: the separator paints its
+/// one-pixel rule on the row nearest its centre, in `border.default` —
+/// visible against the menu's fill exactly where those two tokens
+/// differ.
+fn assert_menu_separator_rule(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    items: &[WidgetId],
+    fill: [u8; 4],
+    theme: &Theme,
+    theme_name: &str,
+) {
+    let Some(&separator) = items.get(1) else {
+        unreachable!("five items");
+    };
+    let Some(sep) = tree.bounds(separator) else {
+        unreachable!("laid out");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (sx, sy) = (
+        (sep.x + i64::from(sep.width / 2)) as u32,
+        (sep.y + i64::from((sep.height - 1) / 2)) as u32,
+    );
+    let rule = sample_at(image, sx, sy);
+    if theme.border.default == theme.surface.raised {
+        assert_eq!(
+            rule, fill,
+            "{theme_name}: the rule's token is the fill's here"
+        );
+    } else {
+        assert_ne!(
+            rule, fill,
+            "{theme_name}: the separator's rule must be painted"
+        );
+    }
+}
+
+/// The rendered-pixel claims every theme's `Menu` gallery makes.
+fn assert_menu_is_distinct(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    menus: [WidgetId; 3],
+    theme: &Theme,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, MENU_GALLERY_SIZE.0);
+    assert_eq!(image.height, MENU_GALLERY_SIZE.1);
+    let backdrop = sample_at(image, 4, 4);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+
+    let items = |menu: WidgetId| match menu_state(tree, menu) {
+        Ok(state) => state.item_ids().to_vec(),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let pixel = |id: WidgetId| {
+        let (x, y) = menu_centre(tree, id);
+        sample_at(image, x, y)
+    };
+    let [fresh, moved, disabled] = menus.map(items);
+    let (Some(&cut), Some(&paste)) = (fresh.first(), fresh.get(3)) else {
+        unreachable!("five items");
+    };
+    // An unhighlighted, disabled row paints nothing: it shows the menu's
+    // own surface.raised fill.
+    let fill = pixel(paste);
+
+    // 1. The fill differs from the panel exactly where the tokens do.
+    if theme.surface.raised == theme.surface.panel {
+        assert_eq!(
+            fill, backdrop,
+            "{theme_name}: surface.raised is surface.panel here, so the fill alone is invisible"
+        );
+    } else {
+        assert_ne!(
+            fill, backdrop,
+            "{theme_name}: the menu's fill must differ from the panel"
+        );
+    }
+
+    // 2. State 0: `Cut` is highlighted; the other rows are plain fill.
+    let highlight = pixel(cut);
+    assert_ne!(
+        highlight, fill,
+        "{theme_name}: the highlighted row must differ from the menu's fill"
+    );
+    for row in [fresh.get(2), fresh.get(4)].into_iter().flatten().copied() {
+        assert_eq!(
+            pixel(row),
+            fill,
+            "{theme_name}: an unhighlighted row is plain fill"
+        );
+    }
+
+    // 3. State 1: the highlight moved across the separator to `Copy`.
+    let (Some(&moved_cut), Some(&moved_copy)) = (moved.first(), moved.get(2)) else {
+        unreachable!("five items");
+    };
+    assert_eq!(
+        pixel(moved_cut),
+        fill,
+        "{theme_name}: Cut is no longer highlighted"
+    );
+    assert_eq!(pixel(moved_copy), highlight, "{theme_name}: Copy now is");
+
+    // 4. State 2: nothing highlighted anywhere.
+    for (index, &row) in disabled.iter().enumerate() {
+        if index != 1 {
+            assert_eq!(
+                pixel(row),
+                fill,
+                "{theme_name}: all-disabled row {index} is plain fill"
+            );
+        }
+    }
+
+    // 5. The separator's rule.
+    assert_menu_separator_rule(image, tree, &fresh, fill, theme, theme_name);
+
+    // 6. The unconditional border (plus the HC outline) is really painted
+    //    along each menu's bottom edge, in every theme, Light included;
+    //    and three pixels below is untouched backdrop.
+    for &menu in &menus {
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, bottom) = (
+            (bounds.x + i64::from(bounds.width / 2)) as u32,
+            bounds.bottom() as u32,
+        );
+        let edge = [bottom - 1, bottom].map(|y| sample_at(image, x, y));
+        assert!(
+            edge.iter().any(|&p| p != backdrop),
+            "{theme_name}: the menu's border must differ from the panel: {edge:?} vs {backdrop:?}"
+        );
+        assert_eq!(
+            sample_at(image, x, bottom + 3),
+            backdrop,
+            "{theme_name}: below the menu is the untouched backdrop"
+        );
+    }
+}
+
+/// `Menu`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`menu_clear`]).
+macro_rules! menu_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = menu_clear(&theme);
+            let (tree, menus) = menu_gallery_tree(&scales);
+            let image = render_gallery(&context, &tree, &theme, &scales, MENU_GALLERY_SIZE, clear);
+            assert_menu_is_distinct(&image, &tree, menus, &theme, clear, $theme_name);
+        }
+    };
+}
+
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state,
+    dark_theme(),
+    "Dark"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+menu_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_menu_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `Menu`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `tab_bar_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows three bordered menus on the panel
+/// colour — the first with its top row highlighted, the second with its
+/// third row highlighted below a thin rule, the third with none —
+/// before these attributes come off.
+macro_rules! menu_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = menu_clear(&theme);
+            let (tree, _menus) = menu_gallery_tree(&scales);
+            let image = render_gallery(&context, &tree, &theme, &scales, MENU_GALLERY_SIZE, clear);
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image,
+    dark_theme(),
+    "menu_gallery.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "menu_gallery_light.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "menu_gallery_high_contrast_dark.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "menu_gallery_high_contrast_light.png"
+);
+menu_golden_test!(
+    menu_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "menu_gallery_color_critical.png"
 );
 
 /// `Slider`'s own "distinct pixels" proof is shaped differently from

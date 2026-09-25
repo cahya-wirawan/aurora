@@ -7,8 +7,8 @@
 //! the second widget *in this crate* to, reusing this exact
 //! [`super::WidgetKind::ListRow`] variant for its option rows' "which
 //! row is highlighted" concept rather than inventing a parallel
-//! mechanism. `Menu` (`design/gallery/index.html`'s own remaining widget
-//! list) is expected to do the same once it exists.
+//! mechanism. `Menu` (`menu.rs`, `0.123.0`) does the same for its
+//! action items, under a `Role::MenuItem` node.
 //!
 //! **`Tree` was on that list and is no longer** — it has its own
 //! [`super::WidgetKind::TreeItem`]/[`super::TreeItemState`] instead
@@ -27,7 +27,7 @@
 //! has no `insert_*`/`set_*` API family of its own, and this module
 //! builds no `accesskit::Node` either: a row's real accessibility role
 //! varies by consumer (`Role::ListBoxOption` for `CommandPalette` and
-//! `Dropdown`, `Role::MenuItem` for a future menu), so each
+//! `Dropdown`, `Role::MenuItem` for `Menu`), so each
 //! owning widget builds its own row node and inserts
 //! `WidgetKind::ListRow(state)` directly. The same "owning widget
 //! controls the node and layout, this module only carries paint-

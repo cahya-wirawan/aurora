@@ -12,9 +12,10 @@
 //! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
 //! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), `Dropdown`
 //! ([`DropdownState`], `0.120.0`), `TabBar` ([`TabBarState`],
-//! `0.121.0`), and now `Tooltip` ([`Tooltip`], `0.122.0`) followed —
-//! **9 of the 12 named widgets**: button, checkbox, slider, dropdown,
-//! scrollbar, colour swatch, tree, tab bar, and tooltip. (Recounted,
+//! `0.121.0`), `Tooltip` ([`Tooltip`], `0.122.0`), and now `Menu`
+//! ([`MenuState`], `0.123.0`) followed — **10 of the 12 named
+//! widgets**: button, checkbox, slider, dropdown, scrollbar, colour
+//! swatch, tree, tab bar, tooltip, and menu. (Recounted,
 //! not carried forward: this sentence said "4 of the 12" through `0.75.1`, a count inherited from
 //! PLAN.md's own stricter transcription of the same list — which reads
 //! "colour picker" where `design/gallery/index.html` has "Color
@@ -64,11 +65,20 @@
 //! in this crate), it never writes the owner's own node, and like the
 //! dropdown's list it paints in ordinary tree order with **no popover
 //! layering**, no viewport flip, and no text measurement
-//! (`tooltip.rs`'s own doc comment has the full list). The rest still
-//! need infrastructure that doesn't exist yet (popover layering for menus — which a dropdown's list and a tooltip
-//! also lack, see above — number semantics for a number field, and
-//! `aurora-vector` path rendering for the curve editor) and are
-//! deliberately left open rather than stubbed out half-built.
+//! (`tooltip.rs`'s own doc comment has the full list). `Menu`
+//! ([`open_menu`]/[`handle_menu_key`]) is a keyboard-driven popup menu: a
+//! real `Role::Menu` holding focus, its highlighted `Role::MenuItem` its
+//! `active_descendant`, with separators, disabled items skipped, wrapping
+//! arrows, `Home`/`End`, and its whole subtree removed on activate or
+//! cancel — again with **no popover layering**, no pointer support, no
+//! submenus and no text (`menu.rs`'s own doc comment has the full list).
+//! The rest — a number field, the curve editor, and the colour picker
+//! (which replaces `ColorSwatch` in its slot rather than adding a
+//! thirteenth) — need no popover layering (the dropdown's list, the
+//! tooltip and the menu are the ones that lack it, see above), but still
+//! need infrastructure that doesn't exist yet (number semantics for a
+//! number field, `aurora-vector` path rendering for the curve editor),
+//! and are deliberately left open rather than stubbed out half-built.
 //!
 //! **Every module here is a model, not a painter** — and that is a
 //! division of labour, not a missing feature. A widget module produces
@@ -76,12 +86,14 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **sixteen**
+//! tessellates real geometry through `aurora-vector` for **eighteen**
 //! of the [`WidgetKind`] variants below (every one except `Container`,
 //! [`WidgetKind::Dialog`] included as of `0.79.0`,
 //! [`WidgetKind::Dropdown`] and [`WidgetKind::DropdownList`] as of
 //! `0.120.0`, [`WidgetKind::TabBar`] and [`WidgetKind::Tab`] as of
-//! `0.121.0`, [`WidgetKind::Tooltip`] as of `0.122.0`). This mirrors
+//! `0.121.0`, [`WidgetKind::Tooltip`] as of `0.122.0`,
+//! [`WidgetKind::Menu`] and [`WidgetKind::MenuSeparator`] as of
+//! `0.123.0`). This mirrors
 //! `WidgetTree` itself: a complete, tested logical model with painting
 //! layered on afterward, not built into the model.
 //!
@@ -106,6 +118,7 @@ mod command_palette;
 mod dialog;
 mod dropdown;
 mod list_row;
+mod menu;
 mod scrollbar;
 mod slider;
 mod tab_bar;
@@ -129,6 +142,10 @@ pub use dropdown::{
     toggle_dropdown,
 };
 pub use list_row::ListRowState;
+pub use menu::{
+    MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, close_menu, handle_menu_key,
+    menu_state, open_menu,
+};
 pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,
 };
@@ -174,8 +191,8 @@ pub enum WidgetKind {
     CommandPalette(CommandPaletteState),
     ColorSwatch(ColorSwatchState),
     /// A selectable row within some owning widget's own list —
-    /// `CommandPalette`'s own result rows and `Dropdown`'s option rows
-    /// (0.120.0) today, see
+    /// `CommandPalette`'s own result rows, `Dropdown`'s option rows
+    /// (0.120.0) and `Menu`'s action items (0.123.0) today, see
     /// [`ListRowState`]'s own module doc comment for why this is a
     /// deliberately shared, generic variant rather than one per
     /// consumer.
@@ -261,6 +278,23 @@ pub enum WidgetKind {
     /// own module doc comment for the transition table and what it
     /// deliberately does not do (no z-layering, no text measurement).
     Tooltip,
+    /// An open popup menu's own root — `Role::Menu`, inserted by
+    /// `menu.rs`'s [`open_menu`] and removed when an item is activated or
+    /// the menu is cancelled (its existence *is* "open"). Holds one child
+    /// per item: a [`WidgetKind::ListRow`] with a `Role::MenuItem` node
+    /// per action, a [`WidgetKind::MenuSeparator`] per separator. Painted
+    /// as `surface.raised` ("Elevation 1: ... context menus") with an
+    /// unconditional `border.default` outline (`paint::paint_menu`). See
+    /// `menu.rs`'s own module doc comment for the key table, the
+    /// `active_descendant` focus model, and what it deliberately does not
+    /// do (no popover layer, no pointer, no submenus).
+    Menu(MenuState),
+    /// A separator between groups of a [`WidgetKind::Menu`]'s items —
+    /// `Role::Splitter`, created only by `menu.rs`, never on its own. No
+    /// state: its paint (one centred `border.default` band at most 1 px
+    /// tall, `paint::paint_menu_separator`) is a pure function of its
+    /// bounds and the theme.
+    MenuSeparator,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

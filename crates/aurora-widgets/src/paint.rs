@@ -96,7 +96,7 @@
 
 use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
-use aurora_theme::{Scales, Theme};
+use aurora_theme::{Color, Scales, Theme};
 use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
 
 use taffy::Overflow;
@@ -208,6 +208,8 @@ pub fn paint_widget(
         WidgetKind::TabBar(state) => paint_tab_bar(state, bounds, theme, scale_factor),
         WidgetKind::Tab(state) => paint_tab(state, bounds, theme, scales, scale_factor),
         WidgetKind::Tooltip => paint_tooltip(bounds, theme, scales, scale_factor),
+        WidgetKind::Menu(_) => paint_menu(bounds, theme, scales, scale_factor),
+        WidgetKind::MenuSeparator => paint_menu_separator(bounds, theme, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -699,15 +701,16 @@ fn paint_command_palette(
 /// the two High Contrast themes, the third drawn last and therefore on
 /// top — coincident with the second, and deliberately so.
 ///
-/// **These are two functions rather than one token-parameterized helper
-/// for a documentation reason, not a testing one.** An earlier version
-/// of this comment said "do not simplify," implying a shared helper
-/// would make some test vacuous; that was imprecise — nothing here
-/// depends on the duplication, and no drift between the two has
-/// occurred. The real reason is narrower: each function carries its own
-/// `vocabulary.md` elevation citation next to the token it actually
-/// resolves, which a shared helper would move away from both call
-/// sites. Worth knowing either way: the two tokens resolve
+/// **The shape lives in [`bordered_surface`]; the token choice stays
+/// here.** Through `0.122.0` this function and its siblings each
+/// duplicated the fill/border/outline sequence, kept apart so each
+/// could carry its own `vocabulary.md` elevation citation next to the
+/// token it resolves. `0.123.0` keeps exactly that — this wrapper still
+/// names `surface.overlay` and `radius.md` itself, with this comment —
+/// and delegates only the shape, so the citation did not move and the
+/// sequence can no longer drift between callers. Worth knowing: this
+/// function's `surface.overlay` and [`paint_command_palette`]'s
+/// `surface.raised` resolve
 /// *byte-identically* in three of the five built-in themes — Light
 /// (both `neutral.900`), High Contrast Dark (both `hc.black`) and High
 /// Contrast Light (both `hc.white`) — so in those three no
@@ -729,9 +732,38 @@ fn paint_dialog(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    // The same 1.0 logical px `paint_panel` strokes its own border at,
-    // and a plain engineering default for the same reason: no "border
-    // width" token exists in `design/tokens/scales.toml` yet.
+    bordered_surface(
+        bounds,
+        theme.surface.overlay,
+        scales.radius.md as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// The one shape [`paint_dialog`], [`paint_dropdown_list`],
+/// [`paint_tooltip`] and [`paint_menu`] share: a `radius` rounded rect
+/// filled with `fill` at full alpha, an **unconditional 1.0 logical px
+/// `border.default` stroke** over it, and the conditional
+/// [`control_outline`] drawn last. Two shapes in Dark/Light/
+/// Colour-Critical, three in the two High Contrast themes.
+///
+/// Every caller keeps its own doc comment and passes its own fill token
+/// and radius, so each `design/tokens/vocabulary.md` elevation citation
+/// still sits next to the call that actually resolves the token; only
+/// the shape itself lives here. Extracted in `0.123.0` as a pure
+/// refactor: the three existing callers' tests pass unedited.
+///
+/// The 1.0 logical px border width is a plain engineering default, the
+/// same one [`paint_panel`] strokes at: no "border width" token exists
+/// in `design/tokens/scales.toml` yet.
+fn bordered_surface(
+    bounds: Rect,
+    fill_color: Color,
+    radius: f32,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
     const BORDER_WIDTH: f32 = 1.0;
 
     let path = rounded_rect(
@@ -739,15 +771,13 @@ fn paint_dialog(
         bounds.y as f32,
         bounds.width as f32,
         bounds.height as f32,
-        scales.radius.md as f32,
+        radius,
     );
     let tolerance = tolerance_for_scale_factor(scale_factor);
     let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
-    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
-
+    let [fr, fg, fb] = fill_color.to_srgb_f32();
     let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
     let [br, bg, bb] = theme.border.default.to_srgb_f32();
-
     let mut paints = vec![
         (fill_mesh, [fr, fg, fb, 1.0]),
         (border_mesh, [br, bg, bb, 1.0]),
@@ -806,7 +836,7 @@ fn paint_dropdown(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    // The same 1.0 logical px `paint_panel`/`paint_dialog` stroke at: no
+    // The same 1.0 logical px `paint_panel`/`bordered_surface` stroke at: no
     // "border width" token exists in `design/tokens/scales.toml` yet.
     const BORDER_WIDTH: f32 = 1.0;
 
@@ -872,28 +902,13 @@ fn paint_dropdown_list(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    const BORDER_WIDTH: f32 = 1.0;
-
-    let path = rounded_rect(
-        bounds.x as f32,
-        bounds.y as f32,
-        bounds.width as f32,
-        bounds.height as f32,
+    bordered_surface(
+        bounds,
+        theme.surface.raised,
         scales.radius.sm as f32,
-    );
-    let tolerance = tolerance_for_scale_factor(scale_factor);
-    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
-    let [fr, fg, fb] = theme.surface.raised.to_srgb_f32();
-    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
-    let [br, bg, bb] = theme.border.default.to_srgb_f32();
-    let mut paints = vec![
-        (fill_mesh, [fr, fg, fb, 1.0]),
-        (border_mesh, [br, bg, bb, 1.0]),
-    ];
-    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
-        paints.push(outline);
-    }
-    Ok(paints)
+        theme,
+        scale_factor,
+    )
 }
 
 /// A shown tooltip: a `scales.radius.sm` rounded rect filled with
@@ -930,30 +945,75 @@ fn paint_tooltip(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    // The same 1.0 logical px `paint_dialog` strokes at: no "border
-    // width" token exists in `design/tokens/scales.toml` yet.
-    const BORDER_WIDTH: f32 = 1.0;
-
-    let path = rounded_rect(
-        bounds.x as f32,
-        bounds.y as f32,
-        bounds.width as f32,
-        bounds.height as f32,
+    bordered_surface(
+        bounds,
+        theme.surface.overlay,
         scales.radius.sm as f32,
-    );
-    let tolerance = tolerance_for_scale_factor(scale_factor);
-    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
-    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
-    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
-    let [br, bg, bb] = theme.border.default.to_srgb_f32();
-    let mut paints = vec![
-        (fill_mesh, [fr, fg, fb, 1.0]),
-        (border_mesh, [br, bg, bb, 1.0]),
-    ];
-    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
-        paints.push(outline);
-    }
-    Ok(paints)
+        theme,
+        scale_factor,
+    )
+}
+
+/// An open menu's own surface: [`bordered_surface`] with
+/// `surface.raised` and `scales.radius.sm`. **Provisional** — there is
+/// no menu mockup in `design/gallery/index.html`, so the tokens are
+/// chosen from `design/tokens/vocabulary.md`, whose `surface.raised`
+/// entry reads "Elevation 1: dropdowns, popovers, context menus" — a
+/// menu is named there outright — and `radius.sm` so the full-width
+/// item highlights ([`paint_list_row`], `radius.sm`) match its corners,
+/// the same reasoning [`paint_dropdown_list`] records. The unconditional
+/// border is load-bearing for the same reason it is there: Light and
+/// both High Contrast themes resolve `surface.raised` to their
+/// `surface.panel`. Always full opacity: a menu has no disabled state.
+///
+/// A highlighted item is full width, so its `accent.primary` fill covers
+/// the inner half of this border beside it — the same as a dropdown's
+/// list, disclosed rather than inset.
+fn paint_menu(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    bordered_surface(
+        bounds,
+        theme.surface.raised,
+        scales.radius.sm as f32,
+        theme,
+        scale_factor,
+    )
+}
+
+/// A menu separator: one filled `border.default` band, the separator's
+/// full width and `min(1.0, height)` logical px tall, vertically centred
+/// in its box (the offset floored so the band lands on a whole logical-pixel
+/// row). `border.default` is decorative and deliberately not gated by
+/// `design/check_contrast.py` — the same status [`paint_tab_bar`]'s rule
+/// has. The token and the separator's own height are provisional: no
+/// mockup exists (a design-owner question, `menu.rs`'s doc comment).
+fn paint_menu_separator(
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px every border here uses: no "border width"
+    // token exists in `design/tokens/scales.toml` yet.
+    const RULE: f32 = 1.0;
+    let height = bounds.height as f32;
+    let rule = RULE.min(height);
+    let top = bounds.y as f32 + ((height - rule) / 2.0).floor();
+    let Some(mesh) = band(
+        bounds.x as f32,
+        top,
+        bounds.width as f32,
+        rule,
+        scale_factor,
+    )?
+    else {
+        return Ok(vec![]);
+    };
+    let [r, g, b] = theme.border.default.to_srgb_f32();
+    Ok(vec![(mesh, [r, g, b, 1.0])])
 }
 
 /// A plain, square-cornered filled rectangle — `rounded_rect` at radius
@@ -1323,7 +1383,10 @@ mod tests {
         set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
         set_tree_item_selected, toggle_checkbox,
     };
-    use crate::widgets::{Tooltip, insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
+    use crate::widgets::{
+        MenuItem, Tooltip, handle_menu_key, insert_tab_bar, menu_state, open_menu,
+        set_tab_bar_disabled, tab_bar_state,
+    };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
     use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
@@ -3882,6 +3945,233 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // ---- Menu --------------------------------------------------------------
+
+    /// A laid-out open menu — `Cut`, a separator, a disabled `Paste`,
+    /// `Delete` — at `(10, 20)`, 120 px wide. Returns the tree, the menu,
+    /// and its item ids.
+    fn laid_out_menu() -> (WidgetTree<WidgetKind>, WidgetId, Vec<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        });
+        let menu = match open_menu(
+            &mut tree,
+            root,
+            &scales(),
+            "Edit",
+            (10.0, 20.0),
+            120.0,
+            vec![
+                MenuItem::action("Cut"),
+                MenuItem::separator(),
+                MenuItem {
+                    enabled: false,
+                    ..MenuItem::action("Paste")
+                },
+                MenuItem::action("Delete"),
+            ],
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 200.0);
+        let ids = match menu_state(&tree, menu) {
+            Ok(state) => state.item_ids().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, menu, ids)
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menu_paints_surface_raised_then_a_default_border_and_the_outline_last() {
+        let (tree, menu, _) = laid_out_menu();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Light", light_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_eq!(theme.border.control_opacity, 0.0, "{name}");
+            assert_eq!(
+                colors_of(&tree, menu, &theme),
+                vec![
+                    rgba(theme.surface.raised, 1.0),
+                    rgba(theme.border.default, 1.0)
+                ],
+                "{name}"
+            );
+        }
+        let theme = high_contrast_theme();
+        assert!(theme.border.control_opacity > 0.0);
+        assert_eq!(
+            colors_of(&tree, menu, &theme),
+            vec![
+                rgba(theme.surface.raised, 1.0),
+                rgba(theme.border.default, 1.0),
+                rgba(theme.border.control, theme.border.control_opacity),
+            ],
+            "fill, border, and the control outline drawn last"
+        );
+    }
+
+    /// `surface.raised`, not the `surface.overlay` a tooltip or dialog
+    /// uses — scoped to the two themes where the tokens differ, each
+    /// guarded so it cannot become a tautology.
+    #[test]
+    fn a_menu_paints_surface_raised_not_surface_overlay() {
+        let (tree, menu, _) = laid_out_menu();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            assert_ne!(
+                theme.surface.overlay, theme.surface.raised,
+                "{name}: only meaningful while the two tokens differ"
+            );
+            let colors = colors_of(&tree, menu, &theme);
+            assert_eq!(
+                colors.first(),
+                Some(&rgba(theme.surface.raised, 1.0)),
+                "{name}"
+            );
+            assert_ne!(
+                colors.first(),
+                Some(&rgba(theme.surface.overlay, 1.0)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Light resolves `surface.raised` to `surface.panel`, so only the
+    /// unconditional border separates a menu from the panel behind it.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_menu_still_paints_a_border() {
+        let theme = light_theme();
+        assert_eq!(
+            theme.surface.raised, theme.surface.panel,
+            "this test is only worth running while Light collides these two"
+        );
+        let (tree, menu, _) = laid_out_menu();
+        let backdrop = rgba(theme.surface.panel, 1.0);
+        let colors = colors_of(&tree, menu, &theme);
+        assert!(
+            colors.iter().any(|color| *color != backdrop),
+            "a Light menu must paint something that is not the panel behind it: {colors:?}"
+        );
+    }
+
+    /// Pins `paint_menu`'s own corner radius to `radius.sm`, the dialog
+    /// radius test's anchor method (`rounded_rect`'s `(x, y + radius)`
+    /// vertex is present and the square corner is not). Guarded so it
+    /// cannot pass for a `radius.md` or `radius.lg` substitution: both
+    /// must differ from `radius.sm` for the anchor to tell them apart.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menus_fill_mesh_has_the_radius_sm_corner_and_not_a_square_one() {
+        let scales = scales();
+        let (tree, menu, _) = laid_out_menu();
+        let Some(bounds) = tree.bounds(menu) else {
+            unreachable!("just laid out");
+        };
+        assert_ne!(scales.radius.sm, scales.radius.md, "radius.md must differ");
+        assert_ne!(scales.radius.sm, scales.radius.lg, "radius.lg must differ");
+        let paints = match paint_widget(&tree, menu, &dark_theme(), &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((fill_mesh, _)) = paints.first() else {
+            unreachable!("a menu paints its fill first");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let (left, top, radius) = (bounds.x as f32, bounds.y as f32, scales.radius.sm as f32);
+        assert!(radius > 0.0, "radius.sm must be non-zero: {radius}");
+        let has = |x: f32, y: f32| fill_mesh.vertices.iter().any(|v| v.x == x && v.y == y);
+        assert!(
+            has(left, top + radius),
+            "the fill must carry the (x, y + radius.sm) anchor: {:?}",
+            fill_mesh.vertices
+        );
+        assert!(
+            !has(left, top),
+            "... and not the square corner a radius of 0 would give: {:?}",
+            fill_mesh.vertices
+        );
+    }
+
+    /// One `border.default` band, the separator's full width, at most
+    /// 1 px tall, on the whole pixel row nearest its centre.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_menu_separator_paints_one_centred_default_rule() {
+        let (tree, _, ids) = laid_out_menu();
+        let Some(&separator) = ids.get(1) else {
+            unreachable!("four items");
+        };
+        let theme = dark_theme();
+        let paints = paints_of(&tree, separator, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.first() else {
+            unreachable!("one paint");
+        };
+        assert_eq!(*color, rgba(theme.border.default, 1.0));
+        let Some(bounds) = tree.bounds(separator) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.height > 1, "a real gap to centre in: {bounds:?}");
+        let (x0, y0, x1, y1) = bbox(mesh);
+        #[allow(clippy::cast_precision_loss)]
+        let (bx, by, bw, bh) = (
+            bounds.x as f32,
+            bounds.y as f32,
+            bounds.width as f32,
+            bounds.height as f32,
+        );
+        assert_eq!((x0, x1), (bx, bx + bw), "full width");
+        assert_eq!(y1 - y0, 1.0, "one logical px tall");
+        assert_eq!(
+            y0,
+            by + ((bh - 1.0) / 2.0).floor(),
+            "centred, on a whole row"
+        );
+    }
+
+    /// Items paint through the shared `ListRow` arm: the highlighted
+    /// one `accent.primary`, the rest nothing — and a highlight follows a
+    /// move.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn only_the_highlighted_menu_item_paints_and_the_highlight_follows_a_move() {
+        let (mut tree, menu, ids) = laid_out_menu();
+        let theme = dark_theme();
+        let Some(&[cut, _, paste, delete]) = Some(ids.as_slice()) else {
+            unreachable!("four items");
+        };
+        assert_eq!(
+            colors_of(&tree, cut, &theme),
+            vec![rgba(theme.accent.primary, 1.0)]
+        );
+        assert!(colors_of(&tree, paste, &theme).is_empty());
+        assert!(colors_of(&tree, delete, &theme).is_empty());
+        if let Err(err) = handle_menu_key(&mut tree, menu, crate::widgets::MenuKey::Down) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+        assert!(colors_of(&tree, cut, &theme).is_empty());
+        assert!(
+            colors_of(&tree, paste, &theme).is_empty(),
+            "disabled is skipped"
+        );
+        assert_eq!(
+            colors_of(&tree, delete, &theme),
+            vec![rgba(theme.accent.primary, 1.0)]
+        );
     }
 
     #[test]
