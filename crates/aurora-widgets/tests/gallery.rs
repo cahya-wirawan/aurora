@@ -337,7 +337,10 @@ use aurora_widgets::widgets::{
     MenuItem, MenuKey, MenuOutcome, Tooltip, handle_menu_key, insert_tab_bar, menu_state,
     open_menu, set_tab_bar_disabled, tab_bar_state,
 };
-use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
+use aurora_widgets::{
+    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline, WidgetId,
+    WidgetTree, draw_paint_ops, paint_widget_ops,
+};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
 use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
@@ -1736,7 +1739,7 @@ fn assert_backdrop_is_the_clear_colour(pixel: [u8; 4], clear: wgpu::Color, theme
 /// double-encode, the same bug in the opposite direction from the one
 /// that conversion exists to prevent for a real sRGB-aware swapchain.
 ///
-/// All `GpuMesh`es are uploaded and collected *before* the render pass
+/// Every `GpuMesh`/`GpuColorMesh` is uploaded and collected *before* the render pass
 /// begins, not inside it — `PathPipeline::draw` needs
 /// `mesh: &'pass GpuMesh`, so every mesh it draws must outlive the
 /// pass, the same constraint `aurora-app`'s own
@@ -1823,17 +1826,26 @@ fn collect_gallery_paints(
     scales: &Scales,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-) -> Vec<(GpuMesh, [f32; 4])> {
+) -> Vec<GpuPaintOp> {
     let mut widget_paints = Vec::new();
     // `1.0`: this harness renders to a headless offscreen target with no
     // real window to derive a DPI scale factor from, so `1.0` (no
     // scaling) is the honest, correct choice -- not a stand-in for a
     // real value this test harness is missing.
     for id in tree.paint_order() {
-        if let Ok(paints) = paint_widget(tree, id, theme, scales, 1.0) {
-            for (mesh, color) in paints {
-                let gpu_mesh = GpuMesh::upload(device, queue, &mesh);
-                widget_paints.push((gpu_mesh, color));
+        if let Ok(ops) = paint_widget_ops(tree, id, theme, scales, 1.0) {
+            for op in ops {
+                // No linearization for either kind: this target is
+                // `Rgba8Unorm` (see `render_gallery`), and the gradient
+                // pipeline picks its own conversion from the format.
+                widget_paints.push(match op {
+                    PaintOp::Solid((mesh, color)) => {
+                        GpuPaintOp::Solid(GpuMesh::upload(device, queue, &mesh), color)
+                    }
+                    PaintOp::Gradient(mesh) => {
+                        GpuPaintOp::Gradient(GpuColorMesh::upload(device, queue, &mesh))
+                    }
+                });
             }
         }
     }
@@ -1847,21 +1859,25 @@ fn draw_gallery_paints<'pass>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     size: (u32, u32),
-    widget_paints: &'pass [(GpuMesh, [f32; 4])],
+    widget_paints: &'pass [GpuPaintOp],
 ) {
     if widget_paints.is_empty() {
         return;
     }
     let mut path = PathPipeline::new(device);
-    let pipeline = path.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
-    pass.set_pipeline(pipeline);
+    let mut gradient = GradientPipeline::new(device);
     #[allow(clippy::cast_precision_loss)]
     let viewport_size = (size.0 as f32, size.1 as f32);
-    for (mesh, color) in widget_paints {
-        let bind_group = path.bind_group(device, queue, viewport_size, *color);
-        pass.set_bind_group(0, &bind_group, &[]);
-        path.draw(pass, mesh);
-    }
+    draw_paint_ops(
+        pass,
+        &mut path,
+        &mut gradient,
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        viewport_size,
+        widget_paints,
+    );
 }
 
 /// [`render_gallery`]'s own final "copy the rendered target back to the

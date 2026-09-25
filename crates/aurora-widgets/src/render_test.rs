@@ -12,9 +12,15 @@
 
 #![cfg(test)]
 
-use crate::render::{GpuMesh, PathPipeline};
+use crate::render::{
+    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
+};
 use crate::test_support::real_context;
-use aurora_vector::{Mesh, Point};
+use aurora_gpu::GpuContext;
+use aurora_vector::{
+    ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Point, bilinear_rect,
+    horizontal_strip,
+};
 
 const TARGET_SIZE: (u32, u32) = (64, 64);
 
@@ -207,5 +213,799 @@ fn path_pipeline_draws_nothing_for_an_empty_mesh() {
         pixel,
         [0, 0, 0, 255],
         "an empty Mesh must draw zero triangles, leaving the clear colour untouched"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Gradient primitive (0.124.0): `GradientPipeline`/`GpuColorMesh`
+// through `draw_paint_ops`, read back as real pixels.
+// ---------------------------------------------------------------------
+
+/// Largest per-channel difference, in 8-bit steps, a gradient probe may
+/// show against its analytic expectation: 8-bit quantization (half a
+/// step), the rasterizer's own interpolation precision, and
+/// `bilinear_rect`'s documented piecewise-linear error (under half a
+/// step at 16 cells) together stay well inside it.
+const GRADIENT_TOLERANCE: i32 = 3;
+
+const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+/// Every channel of every corner differs, and the true bilinear centre
+/// is exactly `(0.5, 0.5, 0.5)`, where a single undivided quad would
+/// show `(0.0, 0.5, 0.5)` (its diagonal runs top-right to bottom-left).
+const CORNERS: GradientCorners = GradientCorners {
+    top_left: RED,
+    top_right: GREEN,
+    bottom_left: BLUE,
+    bottom_right: WHITE,
+};
+
+/// The hue strip a colour picker draws: red, yellow, green, cyan, blue,
+/// magenta, red.
+const HUE_STOPS: [[f32; 4]; 7] = [
+    RED,
+    [1.0, 1.0, 0.0, 1.0],
+    GREEN,
+    [0.0, 1.0, 1.0, 1.0],
+    BLUE,
+    [1.0, 0.0, 1.0, 1.0],
+    RED,
+];
+
+/// The sRGB decode `aurora_color::srgb_to_linear` performs (this crate
+/// does not depend on `aurora-color`), for the solid colours a real
+/// sRGB-target caller linearizes (`aurora-app`'s
+/// `linearize_paint_color`). Sign-symmetric, like the original: a
+/// negative channel decodes to a negative linear value, not a positive
+/// one.
+fn srgb_to_linear(encoded: f32) -> f32 {
+    let magnitude = encoded.abs();
+    let linear = if magnitude <= 0.04045 {
+        magnitude / 12.92
+    } else {
+        ((magnitude + 0.055) / 1.055).powf(2.4)
+    };
+    encoded.signum() * linear
+}
+
+fn linearized(color: [f32; 4]) -> [f32; 4] {
+    let [r, g, b, a] = color;
+    [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a]
+}
+
+/// A solid axis-aligned rectangle as a two-triangle [`Mesh`].
+fn rect_mesh(x: f32, y: f32, width: f32, height: f32) -> Mesh {
+    Mesh {
+        vertices: vec![
+            Point::new(x, y),
+            Point::new(x + width, y),
+            Point::new(x, y + height),
+            Point::new(x + width, y + height),
+        ],
+        indices: vec![0, 1, 2, 1, 3, 2],
+    }
+}
+
+fn solid(context: &GpuContext, mesh: &Mesh, color: [f32; 4]) -> GpuPaintOp {
+    GpuPaintOp::Solid(
+        GpuMesh::upload(context.device(), context.queue(), mesh),
+        color,
+    )
+}
+
+fn gradient(context: &GpuContext, mesh: &ColorMesh) -> GpuPaintOp {
+    GpuPaintOp::Gradient(GpuColorMesh::upload(
+        context.device(),
+        context.queue(),
+        mesh,
+    ))
+}
+
+/// A rendered target, tightly packed RGBA8 rows.
+struct Frame {
+    width: u32,
+    bytes: Vec<u8>,
+}
+
+impl Frame {
+    fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        let offset = (y as usize * self.width as usize + x as usize) * 4;
+        match self.bytes.get(offset..offset + 4) {
+            Some(&[red, green, blue, alpha]) => [red, green, blue, alpha],
+            _ => unreachable!("pixel ({x}, {y}) is outside the {}-wide frame", self.width),
+        }
+    }
+}
+
+/// Clears a `size` target of `format` to black, draws `ops` through
+/// [`draw_paint_ops`] with fresh pipelines, and reads every pixel back.
+/// `size.0 * 4` must be a multiple of `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`
+/// (every caller picks such a width, the same restriction the solid
+/// helper above has). An sRGB target reads back its *encoded* bytes.
+fn render_ops(
+    context: &GpuContext,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    ops: &[GpuPaintOp],
+) -> Frame {
+    #[allow(clippy::cast_precision_loss)]
+    let viewport_size = (size.0 as f32, size.1 as f32);
+    render_ops_with_viewport(context, format, size, viewport_size, ops)
+}
+
+/// [`render_ops`] with an explicit `viewport_size` (the uniform the
+/// mesh's own coordinates are measured against). Passing half the
+/// target's physical size is exactly what `aurora-app` does at a scale
+/// factor of `2.0`: mesh coordinates are logical, the target physical.
+#[allow(clippy::too_many_lines)]
+fn render_ops_with_viewport(
+    context: &GpuContext,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    viewport_size: (f32, f32),
+    ops: &[GpuPaintOp],
+) -> Frame {
+    let device = context.device();
+    let queue = context.queue();
+    let (width, height) = size;
+    assert_eq!((width * 4) % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("gradient-target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut path = PathPipeline::new(device);
+    let mut gradient_pipeline = GradientPipeline::new(device);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gradient-render"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("gradient"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        draw_paint_ops(
+            &mut pass,
+            &mut path,
+            &mut gradient_pipeline,
+            device,
+            queue,
+            format,
+            viewport_size,
+            ops,
+        );
+    }
+
+    let bytes_per_row = width * 4;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gradient-readback"),
+        size: u64::from(bytes_per_row) * u64::from(height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let Ok(Ok(())) = rx.recv() else {
+        unreachable!("map_async must complete once the device has been polled to idle");
+    };
+    let Ok(data) = slice.get_mapped_range() else {
+        unreachable!("the buffer was just confirmed mapped successfully above");
+    };
+    let bytes = data.to_vec();
+    drop(data);
+    readback.unmap();
+    Frame { width, bytes }
+}
+
+fn to_bytes(color: [f32; 4]) -> [i32; 4] {
+    color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as i32)
+}
+
+/// Asserts `pixel`'s RGB is within `tolerance` 8-bit steps of `expected`.
+fn assert_rgb_near(pixel: [u8; 4], expected: [f32; 4], tolerance: i32, what: &str) {
+    let want = to_bytes(expected);
+    for channel in 0..3 {
+        let (Some(&got), Some(&want)) = (pixel.get(channel), want.get(channel)) else {
+            unreachable!("channel {channel} < 4");
+        };
+        assert!(
+            (i32::from(got) - want).abs() <= tolerance,
+            "{what}: pixel {pixel:?} vs expected {:?} (channel {channel}, tolerance {tolerance})",
+            to_bytes(expected)
+        );
+    }
+}
+
+/// The largest RGB difference between two pixels, in 8-bit steps.
+fn max_rgb_diff(a: [u8; 4], b: [u8; 4]) -> i32 {
+    a.iter()
+        .zip(b.iter())
+        .take(3)
+        .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The true bilinear colour of `corners` at normalized `(u, v)`.
+fn bilinear(corners: GradientCorners, u: f32, v: f32) -> [f32; 4] {
+    let mut out = [0.0; 4];
+    for (index, channel) in out.iter_mut().enumerate() {
+        let get = |color: [f32; 4]| color.get(index).copied().unwrap_or(0.0);
+        let top = get(corners.top_left) * (1.0 - u) + get(corners.top_right) * u;
+        let bottom = get(corners.bottom_left) * (1.0 - u) + get(corners.bottom_right) * u;
+        *channel = top * (1.0 - v) + bottom * v;
+    }
+    out
+}
+
+/// The piecewise-linear colour of evenly spaced `stops` at normalized
+/// `t` in `[0, 1]`.
+fn strip_at(stops: &[[f32; 4]], t: f32) -> [f32; 4] {
+    let segments = (stops.len() - 1) as f32;
+    let scaled = (t * segments).clamp(0.0, segments);
+    // `scaled` is clamped to `[0, segments]` above, so the cast loses no sign.
+    #[allow(clippy::cast_sign_loss)]
+    let segment = (scaled.floor() as usize).min(stops.len() - 2);
+    let local = scaled - segment as f32;
+    let (Some(a), Some(b)) = (stops.get(segment), stops.get(segment + 1)) else {
+        unreachable!("segment {segment} has two stops");
+    };
+    let mut out = [0.0; 4];
+    for ((channel, x), y) in out.iter_mut().zip(a).zip(b) {
+        *channel = x * (1.0 - local) + y * local;
+    }
+    out
+}
+
+/// A pixel's centre as a fraction of `extent` pixels.
+fn centre(pixel: u32, extent: u32) -> f32 {
+    (pixel as f32 + 0.5) / extent as f32
+}
+
+// G1
+#[test]
+fn gradient_bilinear_rect_corners_show_their_own_colours() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let mesh = bilinear_rect(0.0, 0.0, 256.0, 256.0, CORNERS, DEFAULT_GRADIENT_CELLS);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (256, 256),
+        &[gradient(&context, &mesh)],
+    );
+    for (x, y, corner) in [
+        (0, 0, RED),
+        (255, 0, GREEN),
+        (0, 255, BLUE),
+        (255, 255, WHITE),
+    ] {
+        assert_rgb_near(frame.pixel(x, y), corner, GRADIENT_TOLERANCE, "corner");
+    }
+}
+
+// G2
+#[test]
+fn gradient_bilinear_rect_centre_is_the_bilinear_mean_not_a_diagonal() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let mesh = bilinear_rect(0.0, 0.0, 256.0, 256.0, CORNERS, DEFAULT_GRADIENT_CELLS);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (256, 256),
+        &[gradient(&context, &mesh)],
+    );
+    for (x, y) in [(127, 127), (128, 128)] {
+        assert_rgb_near(
+            frame.pixel(x, y),
+            [0.5, 0.5, 0.5, 1.0],
+            GRADIENT_TOLERANCE,
+            "centre",
+        );
+    }
+    // And a coarse sweep of the whole square against the true bilinear
+    // surface, not just its centre.
+    for y in (0..256).step_by(17) {
+        for x in (0..256).step_by(17) {
+            let expected = bilinear(CORNERS, centre(x, 256), centre(y, 256));
+            assert_rgb_near(frame.pixel(x, y), expected, GRADIENT_TOLERANCE, "sweep");
+        }
+    }
+}
+
+// G3
+#[test]
+fn gradient_bilinear_rect_top_row_is_monotonic() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let mesh = bilinear_rect(0.0, 0.0, 256.0, 256.0, CORNERS, DEFAULT_GRADIENT_CELLS);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (256, 256),
+        &[gradient(&context, &mesh)],
+    );
+    for x in 1..256 {
+        let (previous, current) = (frame.pixel(x - 1, 0), frame.pixel(x, 0));
+        assert!(current[0] <= previous[0], "red rises at x = {x}");
+        assert!(current[1] >= previous[1], "green falls at x = {x}");
+    }
+    // Monotonic is necessary, not sufficient: every top-row pixel must
+    // also sit on the analytic red-to-green edge at its own centre.
+    for x in 0..256 {
+        assert_rgb_near(
+            frame.pixel(x, 0),
+            bilinear(CORNERS, centre(x, 256), centre(0, 256)),
+            GRADIENT_TOLERANCE,
+            "top row follows the analytic top edge",
+        );
+    }
+}
+
+// G3b
+#[test]
+fn gradient_saturation_value_square_matches_hsv() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let hue = RED;
+    let corners = GradientCorners {
+        top_left: WHITE,
+        top_right: hue,
+        bottom_left: BLACK,
+        bottom_right: BLACK,
+    };
+    let mesh = bilinear_rect(0.0, 0.0, 256.0, 256.0, corners, DEFAULT_GRADIENT_CELLS);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (256, 256),
+        &[gradient(&context, &mesh)],
+    );
+    for y in [64, 128, 192] {
+        for x in [64, 128, 192] {
+            let saturation = centre(x, 256);
+            let value = 1.0 - centre(y, 256);
+            let mut expected = [0.0, 0.0, 0.0, 1.0];
+            for (channel, h) in expected.iter_mut().zip(hue).take(3) {
+                *channel = value * ((1.0 - saturation) + saturation * h);
+            }
+            assert_rgb_near(frame.pixel(x, y), expected, GRADIENT_TOLERANCE, "SV square");
+        }
+    }
+}
+
+fn hue_strip_frame(context: &GpuContext, format: wgpu::TextureFormat) -> Frame {
+    let mesh = horizontal_strip(0.0, 0.0, 384.0, 8.0, &HUE_STOPS);
+    render_ops(context, format, (384, 8), &[gradient(context, &mesh)])
+}
+
+/// Mean green of the two pixels either side of the first segment's
+/// midpoint (x = 32), in 8-bit steps.
+fn first_segment_mid_green(frame: &Frame) -> i32 {
+    i32::midpoint(
+        i32::from(frame.pixel(31, 4)[1]),
+        i32::from(frame.pixel(32, 4)[1]),
+    )
+}
+
+// G4
+#[test]
+fn gradient_hue_strip_hits_every_stop_and_ramps_in_gamma_space() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let frame = hue_strip_frame(&context, wgpu::TextureFormat::Rgba8Unorm);
+    for (k, stop) in HUE_STOPS.iter().enumerate() {
+        let k = k as u32;
+        if k > 0 {
+            assert_rgb_near(
+                frame.pixel(64 * k - 1, 4),
+                *stop,
+                GRADIENT_TOLERANCE,
+                "stop",
+            );
+        }
+        if k < 6 {
+            assert_rgb_near(frame.pixel(64 * k, 4), *stop, GRADIENT_TOLERANCE, "stop");
+        }
+    }
+    for x in 0..384 {
+        let expected = strip_at(&HUE_STOPS, centre(x, 384));
+        assert_rgb_near(frame.pixel(x, 4), expected, GRADIENT_TOLERANCE, "strip");
+    }
+    let mid = first_segment_mid_green(&frame);
+    assert!((mid - 128).abs() <= 2, "red-to-yellow midpoint green {mid}");
+    assert_rgb_near(
+        frame.pixel(31, 4),
+        [1.0, 0.5, 0.0, 1.0],
+        GRADIENT_TOLERANCE,
+        "midpoint",
+    );
+}
+
+// G5
+#[test]
+fn gradient_on_an_srgb_target_interpolates_in_gamma_space_too() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let plain = hue_strip_frame(&context, wgpu::TextureFormat::Rgba8Unorm);
+    let srgb = hue_strip_frame(&context, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mid = first_segment_mid_green(&srgb);
+    assert!(
+        (mid - 128).abs() <= 3,
+        "red-to-yellow midpoint on an sRGB target reads green {mid}; 128 is gamma-space \
+         interpolation, about 188 would be linear-light (the fragment was not linearized)"
+    );
+    for x in 0..384 {
+        let (a, b) = (plain.pixel(x, 4), srgb.pixel(x, 4));
+        assert!(
+            max_rgb_diff(a, b) <= 2,
+            "x = {x}: plain {a:?} vs sRGB {b:?} -- the same mesh must look the same"
+        );
+    }
+}
+
+/// A flat grey gradient must encode to the same byte a solid shape does
+/// when its caller linearizes the colour the way `aurora-app` does.
+/// `0.5` and `0.2`: a `2.2` exponent in place of `2.4` moves `0.2` by
+/// about eight steps.
+#[test]
+fn flat_gradient_matches_a_linearized_solid_on_an_srgb_target() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    for grey in [0.5_f32, 0.2] {
+        let colour = [grey, grey, grey, 1.0];
+        let flat = GradientCorners {
+            top_left: colour,
+            top_right: colour,
+            bottom_left: colour,
+            bottom_right: colour,
+        };
+        let frame = render_ops(
+            &context,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            (64, 8),
+            &[
+                gradient(&context, &bilinear_rect(0.0, 0.0, 32.0, 8.0, flat, 4)),
+                solid(
+                    &context,
+                    &rect_mesh(32.0, 0.0, 32.0, 8.0),
+                    linearized(colour),
+                ),
+            ],
+        );
+        let (from_gradient, from_solid) = (frame.pixel(16, 4), frame.pixel(48, 4));
+        assert!(
+            max_rgb_diff(from_gradient, from_solid) <= 1,
+            "grey {grey}: gradient {from_gradient:?} vs solid {from_solid:?}"
+        );
+        assert_rgb_near(
+            from_gradient,
+            colour,
+            1,
+            "flat gradient encodes back to its grey",
+        );
+    }
+}
+
+// G6
+#[test]
+fn draw_paint_ops_interleaves_solids_and_gradients_in_paint_order() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let green_to_white = horizontal_strip(0.0, 0.0, 64.0, 64.0, &[GREEN, WHITE]);
+    let corner_strip = horizontal_strip(96.0, 48.0, 32.0, 16.0, &[WHITE, WHITE]);
+    // Solid, gradient, solid, gradient: every kind switch happens.
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (128, 64),
+        &[
+            solid(&context, &rect_mesh(0.0, 0.0, 128.0, 64.0), RED),
+            gradient(&context, &green_to_white),
+            solid(&context, &rect_mesh(16.0, 16.0, 32.0, 32.0), BLUE),
+            gradient(&context, &corner_strip),
+        ],
+    );
+    assert_rgb_near(
+        frame.pixel(100, 20),
+        RED,
+        0,
+        "solid red beside the gradient",
+    );
+    assert_rgb_near(
+        frame.pixel(32, 32),
+        BLUE,
+        0,
+        "solid blue on top of the gradient",
+    );
+    assert_rgb_near(
+        frame.pixel(8, 56),
+        strip_at(&[GREEN, WHITE], centre(8, 64)),
+        GRADIENT_TOLERANCE,
+        "gradient over the red, outside the blue",
+    );
+    assert_rgb_near(
+        frame.pixel(60, 4),
+        strip_at(&[GREEN, WHITE], centre(60, 64)),
+        GRADIENT_TOLERANCE,
+        "gradient over the red, outside the blue",
+    );
+    assert_rgb_near(
+        frame.pixel(110, 56),
+        WHITE,
+        0,
+        "the last gradient drew on top",
+    );
+
+    // Gradient first, then a solid on top of it.
+    let full = horizontal_strip(0.0, 0.0, 128.0, 64.0, &[GREEN, WHITE]);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (128, 64),
+        &[
+            gradient(&context, &full),
+            solid(&context, &rect_mesh(16.0, 16.0, 32.0, 32.0), BLUE),
+        ],
+    );
+    assert_rgb_near(frame.pixel(32, 32), BLUE, 0, "solid on top of the gradient");
+    assert_rgb_near(
+        frame.pixel(100, 8),
+        strip_at(&[GREEN, WHITE], centre(100, 128)),
+        GRADIENT_TOLERANCE,
+        "gradient outside the solid",
+    );
+}
+
+// G7
+#[test]
+fn an_empty_gradient_mesh_draws_nothing() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (64, 8),
+        &[gradient(&context, &ColorMesh::default())],
+    );
+    assert!(
+        frame
+            .bytes
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]),
+        "an empty ColorMesh must leave the black clear untouched"
+    );
+}
+
+// G8
+#[test]
+fn gradient_alpha_is_interpolated_and_blended_straight() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let ramp = horizontal_strip(0.0, 0.0, 256.0, 8.0, &[[1.0, 1.0, 1.0, 0.0], WHITE]);
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8Unorm,
+        (256, 8),
+        &[gradient(&context, &ramp)],
+    );
+    for x in [0, 64, 127, 128, 192, 255] {
+        let alpha = centre(x, 256);
+        assert_rgb_near(
+            frame.pixel(x, 4),
+            [alpha, alpha, alpha, 1.0],
+            GRADIENT_TOLERANCE,
+            "white over black at the interpolated alpha",
+        );
+    }
+}
+
+// G8, on an sRGB target: the documented difference, recorded rather than
+// hidden. A translucent gradient blends in the target's own blend space,
+// exactly as a solid fill does -- so the "same bytes on both targets"
+// promise is for opaque fragments only.
+#[test]
+fn translucent_gradient_blends_in_the_targets_own_space_like_a_solid() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let half_white = [1.0, 1.0, 1.0, 0.5];
+    let flat = GradientCorners {
+        top_left: half_white,
+        top_right: half_white,
+        bottom_left: half_white,
+        bottom_right: half_white,
+    };
+    let draw = |format: wgpu::TextureFormat, solid_colour: [f32; 4]| {
+        render_ops(
+            &context,
+            format,
+            (64, 8),
+            &[
+                gradient(&context, &bilinear_rect(0.0, 0.0, 32.0, 8.0, flat, 4)),
+                solid(&context, &rect_mesh(32.0, 0.0, 32.0, 8.0), solid_colour),
+            ],
+        )
+    };
+    // Plain target: blended in gamma space, white at 0.5 over black is 128.
+    let plain = draw(wgpu::TextureFormat::Rgba8Unorm, half_white);
+    assert_rgb_near(
+        plain.pixel(16, 4),
+        [0.5, 0.5, 0.5, 1.0],
+        1,
+        "plain target: half-alpha white over black blends in gamma space",
+    );
+    // sRGB target: blended in linear light, then encoded -- linear 0.5
+    // encodes to about 0.735, byte 188, not 128.
+    let srgb = draw(wgpu::TextureFormat::Rgba8UnormSrgb, linearized(half_white));
+    let (from_gradient, from_solid) = (srgb.pixel(16, 4), srgb.pixel(48, 4));
+    for channel in from_gradient.iter().take(3) {
+        assert!(
+            (i32::from(*channel) - 188).abs() <= 1,
+            "sRGB target: half-alpha white over black must blend in linear light \
+             (about 188), got {from_gradient:?}"
+        );
+    }
+    assert!(
+        max_rgb_diff(from_gradient, from_solid) <= 1,
+        "a translucent gradient blends exactly as a linearized solid does: \
+         gradient {from_gradient:?} vs solid {from_solid:?}"
+    );
+}
+
+// Out-of-range colours: a finite channel outside [0, 1] is decoded with
+// the same sign-symmetric curve the solid path uses, then clamped by the
+// target on store. A negative channel must stay negative (byte 0): the
+// shader's `sign(c) * l` is load-bearing, and dropping the `sign(c)`
+// would decode -1.0 as +1.0 and store 255.
+#[test]
+fn out_of_range_flat_gradient_matches_a_sign_symmetrically_linearized_solid() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let colour = [2.0, -1.0, 0.5, 1.0];
+    let flat = GradientCorners {
+        top_left: colour,
+        top_right: colour,
+        bottom_left: colour,
+        bottom_right: colour,
+    };
+    let frame = render_ops(
+        &context,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        (64, 8),
+        &[
+            gradient(&context, &bilinear_rect(0.0, 0.0, 32.0, 8.0, flat, 4)),
+            solid(
+                &context,
+                &rect_mesh(32.0, 0.0, 32.0, 8.0),
+                linearized(colour),
+            ),
+        ],
+    );
+    let (from_gradient, from_solid) = (frame.pixel(16, 4), frame.pixel(48, 4));
+    assert!(
+        max_rgb_diff(from_gradient, from_solid) <= 1,
+        "out-of-range gradient {from_gradient:?} vs linearized solid {from_solid:?}"
+    );
+    assert_eq!(
+        from_gradient[1], 0,
+        "a negative channel must decode negative and clamp to 0, got {from_gradient:?}"
+    );
+    assert_eq!(
+        from_gradient[0], 255,
+        "a channel above one must clamp to 255"
+    );
+}
+
+// HiDPI: at a scale factor of 2 the app passes a logical viewport half
+// the physical target's size. A solid and a gradient over the same
+// logical rectangle must cover exactly the same physical pixels, and
+// that must be the doubled rectangle.
+#[test]
+fn solid_and_gradient_cover_the_same_physical_pixels_at_scale_factor_two() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let (physical, logical) = ((128, 64), (64.0, 32.0));
+    let (x, y, width, height) = (5.0, 3.0, 21.0, 11.0);
+    let covered = |op: GpuPaintOp| -> Vec<bool> {
+        render_ops_with_viewport(
+            &context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            physical,
+            logical,
+            &[op],
+        )
+        .bytes
+        .chunks_exact(4)
+        .map(|pixel| pixel.iter().take(3).any(|&channel| channel != 0))
+        .collect()
+    };
+    let from_solid = covered(solid(&context, &rect_mesh(x, y, width, height), WHITE));
+    let from_gradient = covered(gradient(
+        &context,
+        &horizontal_strip(x, y, width, height, &[WHITE, WHITE]),
+    ));
+    assert_eq!(
+        from_solid, from_gradient,
+        "solid and gradient must rasterize the same logical rect identically"
+    );
+    let expected: Vec<bool> = (0..physical.1)
+        .flat_map(|row| (0..physical.0).map(move |column| (row, column)))
+        .map(|(row, column)| (10..52).contains(&column) && (6..28).contains(&row))
+        .collect();
+    assert_eq!(
+        from_gradient, expected,
+        "logical (5, 3, 21, 11) at scale 2 must cover physical x 10..52, y 6..28"
     );
 }

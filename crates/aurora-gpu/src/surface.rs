@@ -25,10 +25,50 @@ pub struct GpuSurface<'window> {
     config: wgpu::SurfaceConfiguration,
 }
 
+/// Picks the swapchain format from `formats` (a surface's own
+/// `SurfaceCapabilities::formats`, in the backend's preference order):
+/// the first sRGB-aware format when there is one, otherwise the first
+/// plain 8-bit `*Unorm` format, otherwise the first format of any kind,
+/// otherwise `None`.
+///
+/// Why sRGB first: every colour Aurora draws into the window (the clear
+/// colour, solid widget fills, gradients) is authored as sRGB-encoded
+/// chrome colour, and the app linearizes solids *only* for an sRGB
+/// target (`aurora-app`'s `collect_widget_paints`), so an sRGB-aware
+/// swapchain gives blending in linear light and hardware-exact encode.
+/// `get_default_config` alone takes `formats[0]`, which no graphics API
+/// promises is sRGB (it has been `Bgra8UnormSrgb` on every Metal and
+/// Vulkan adapter this project has run on, but that is observation, not
+/// contract). When no sRGB format is offered, a plain 8-bit UNORM format
+/// is preferred next, because the app's non-sRGB rule ("a plain target
+/// stores what it is given") only holds for a UNORM swapchain: a float
+/// swapchain such as `Rgba16Float` is usually presented as linear light
+/// (scRGB / extended-linear), where gamma-encoded chrome colours would
+/// come out too bright. Only when neither is offered does the backend's
+/// own first choice win — a residual, not a supported configuration.
+#[must_use]
+pub fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .copied()
+        .find(wgpu::TextureFormat::is_srgb)
+        .or_else(|| {
+            formats.iter().copied().find(|format| {
+                matches!(
+                    format,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+        })
+        .or_else(|| formats.first().copied())
+}
+
 impl GpuContext {
     /// Creates and configures a `wgpu::Surface` for `target` at `size`,
     /// matching `spike/vertical-slice`'s own windowed setup
-    /// (`get_default_config`, forced `AutoVsync`).
+    /// (`get_default_config`, forced `AutoVsync`), except that the
+    /// format is [`choose_surface_format`]'s pick — an sRGB-aware format
+    /// whenever the surface offers one.
     ///
     /// `target` accepts anything convertible into `wgpu::SurfaceTarget`
     /// — wgpu's own flexible target type already covers anything
@@ -55,6 +95,11 @@ impl GpuContext {
             return Err(GpuError::SurfaceUnsupported);
         };
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        if let Some(format) =
+            choose_surface_format(&surface.get_capabilities(self.adapter()).formats)
+        {
+            config.format = format;
+        }
         surface.configure(self.device(), &config);
         Ok(GpuSurface { surface, config })
     }
@@ -105,5 +150,45 @@ impl std::fmt::Debug for GpuSurface<'_> {
             .field("format", &self.config.format)
             .field("size", &(self.config.width, self.config.height))
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_surface_format;
+    use wgpu::TextureFormat;
+
+    #[test]
+    fn choose_surface_format_prefers_the_first_srgb_format() {
+        assert_eq!(
+            choose_surface_format(&[
+                TextureFormat::Bgra8Unorm,
+                TextureFormat::Rgba16Float,
+                TextureFormat::Bgra8UnormSrgb,
+                TextureFormat::Rgba8UnormSrgb,
+            ]),
+            Some(TextureFormat::Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            choose_surface_format(&[TextureFormat::Bgra8UnormSrgb, TextureFormat::Bgra8Unorm]),
+            Some(TextureFormat::Bgra8UnormSrgb)
+        );
+    }
+
+    #[test]
+    fn choose_surface_format_prefers_a_plain_unorm_over_a_float_format() {
+        assert_eq!(
+            choose_surface_format(&[TextureFormat::Rgba16Float, TextureFormat::Bgra8Unorm]),
+            Some(TextureFormat::Bgra8Unorm)
+        );
+    }
+
+    #[test]
+    fn choose_surface_format_falls_back_to_the_backends_first_choice() {
+        assert_eq!(
+            choose_surface_format(&[TextureFormat::Rgba16Float, TextureFormat::Rgb10a2Unorm]),
+            Some(TextureFormat::Rgba16Float)
+        );
+        assert_eq!(choose_surface_format(&[]), None);
     }
 }

@@ -2895,6 +2895,12 @@ check licenses` clean with the new `toml` dependency.
   after close stays the caller's job, as already disclosed. Workspace
   1,993 → 2,001 passing, 30 ignored, under `AURORA_REQUIRE_GPU=1` on
   the RTX 3090; the full gate, doctests and `cargo doc -D warnings` clean.
+
+  **0.124.0 (not a widget):** the gradient paint primitive the colour
+  picker needs landed first, as its own step — `PaintOp`/`paint_widget_ops`
+  now carry an optional vertex-coloured gradient beside the solid `Paint`;
+  no widget paints one yet. See the "Vector-first rendering" bullet. The
+  named-widget count is unchanged at 10 of 12.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to
@@ -3007,6 +3013,112 @@ check licenses` clean with the new `toml` dependency.
   `aurora-widgets` for UI chrome (buttons, checkboxes, panels, ...),
   none of which is ever zoomed. Real, separate follow-on once a real
   zoomed vector consumer exists to make that tradeoff for.
+
+  **Gradient primitive landed 2026-09-25 (0.124.0)** — the vertex-coloured
+  paint the colour picker (next, 0.125.0) needs for its saturation/value
+  square and hue strip; no widget consumes it yet. A *separate* pipeline:
+  the solid `PathPipeline`, its shader, vertex layout and uniform, and
+  every widget's `Paint` are untouched.
+  `aurora-vector` gained `gradient.rs`: `ColorVertex`/`ColorMesh` (a colour
+  per vertex, straight sRGB-gamma RGBA), `GradientCorners`,
+  `bilinear_rect` (a four-corner gradient **subdivided** into
+  `DEFAULT_GRADIENT_CELLS` = 16 cells per side, clamped to `1..=256`,
+  because two triangles are piecewise-linear, not bilinear — an undivided
+  quad shows its centre up to half the colour range off; the documented
+  bound is `|k| / (4 * cells^2)` with `k = TL - TR - BL + BR`, at most
+  about `0.00195` at 16 cells, under half an 8-bit step) and
+  `horizontal_strip` (n evenly spaced stops, exactly piecewise-linear,
+  last edge exactly `x + width`). Colour lerps use `a*(1-t) + b*t`, so
+  corners and stops are bit-exact. Degenerate input (non-finite, non-positive
+  size, fewer than two stops, non-finite colour) gives an empty mesh.
+  `aurora-widgets` gained `shaders/gradient.wgsl`, `GpuColorMesh`,
+  `GradientPipeline` (cached by target format; alpha-blended),
+  `GpuPaintOp { Solid, Gradient }` and `draw_paint_ops`, which draws a
+  slice of ops in paint order in one pass, switching pipeline only on a
+  kind change. `paint.rs` gained `PaintOp { Solid(Paint), Gradient(ColorMesh) }`
+  and `paint_widget_ops` (today `paint_widget` wrapped in `Solid`);
+  `aurora-app`'s `collect_widget_paints`/`draw_widget_paints` and the
+  gallery harness now go through it (new `App::gradient_pipeline`).
+  **Colour-space decision, flagged for Cahya as design owner**: gradients
+  interpolate in *gamma-encoded* sRGB on every target, and the pipeline
+  linearizes per *fragment* only when the target is sRGB-aware (entry
+  point chosen from the format, never by the caller; the app therefore
+  does **not** `linearize_paint_color` gradient vertices, while solid
+  colours are linearized exactly as before). Reasons: it is exactly HSV's
+  own space, so the picker shows the colour it reports; for *opaque*
+  fragments the gallery's `Rgba8Unorm` and an sRGB swapchain store the
+  same bytes to within 2 of 255 (a translucent fragment blends in the
+  target's own blend space, linear on sRGB and gamma on a plain target,
+  exactly as a solid fill does — half-alpha white over black is about
+  188 vs 128 on both paths). (Pre-linearized vertices would interpolate in linear light — the
+  red-to-yellow midpoint reads green 188 instead of 128.) It is also the
+  CSS default. Perceptual (e.g. OKLab) interpolation would be a design
+  decision, not attempted. Alpha is straight, so a gradient varying RGB
+  *and* alpha at once fringes toward a transparent stop's RGB (the picker
+  does not do that). Gradient stop colours are *content*, like
+  `ColorSwatch`'s colour, not style.
+  Tests: 9 CPU (`aurora-vector`: counts, bit-exact corners/stops, bilinear
+  centre and every vertex, NaN sweep, degenerate input, cell clamping,
+  one winding) and 13 GPU + 1 CPU in `aurora-widgets` as first landed
+  (15 GPU + 1 CPU after the review revision below) (pixel readback on the RTX
+  3090 under `AURORA_REQUIRE_GPU=1`: corners, the bilinear centre that a
+  two-triangle quad fails, monotonic top row, an HSV saturation/value
+  square, a 7-stop hue strip on `Rgba8Unorm` and on `Rgba8UnormSrgb`
+  (midpoint green 128, not 188, and the two targets within 2 steps
+  everywhere), a flat 0.5/0.2 grey gradient equal to a linearized solid
+  on an sRGB target, solid/gradient interleaving in both orders, an empty
+  mesh drawing nothing, a straight-alpha ramp; plus format-cache,
+  entry-selection, bind-group (since dropped) and upload unit tests). Mutations, each
+  really run and reverted from a sha256-checked backup: sRGB entry not
+  linearizing, inverted entry selection, cells forced to 1, swapped
+  top-right/bottom-left, `a+(b-a)t` lerp, stops at `i/n`, colour
+  attribute offset 0, stride 16, solid pipeline never re-set, gradient
+  pipeline never re-set, no empty-mesh early return, degenerate width
+  accepted, `fs_gradient` alpha forced to 1, and a 2.2 exponent — all 14
+  killed. The "solid pipeline never re-set" kill is by a `wgpu`
+  validation panic (bind group layout mismatch), not a pixel assertion.
+  **Review revision (still 0.124.0; critic, red team on the RTX 3090,
+  external reviewer).** (1) *One colour rule.* Solids had been linearized
+  unconditionally, on the assumption the swapchain is sRGB, while gradients
+  chose from the real format; the red team measured a flat 0.5 grey
+  gradient storing 0.498 against a solid's 0.216 on `Rgba8Unorm`/
+  `Rgba16Float`. `aurora-gpu`'s `create_surface` now picks the first
+  sRGB-aware format the surface offers (`choose_surface_format`, falling
+  back to the backend's first choice; `get_default_config` alone takes
+  `formats[0]`, which no API promises is sRGB), and `aurora-app` converts
+  solid colours and the clear colour from the configured format
+  (`target_paint_color`/`clear_color_for_format`: linearize only when
+  `is_srgb()`), the same choice the gradient pipeline makes per fragment.
+  Both new tests were measured failing on the pre-fix behaviour. The canvas
+  pipeline's own output on a non-sRGB fallback surface was not revisited.
+  (2) The "same bytes on both targets" wording is now "opaque fragments,
+  within 2 steps", with a new `Rgba8UnormSrgb` alpha test recording the
+  188-vs-128 difference and that a translucent gradient still matches a
+  linearized solid. (3) A GPU test pins out-of-range finite colours
+  (`[2.0, -1.0, 0.5, 1.0]`) to the solid path's sign-symmetric decode; the
+  red team's surviving mutation (`sign(c) * l` → `l`) is now killed by
+  exactly that test. (4) HiDPI: a solid and a gradient over the same logical
+  rect at a scale factor of 2 cover the same, doubled, physical pixels.
+  (5) `rect_is_drawable` rejects an absorbed extent (`x + width == x`);
+  `horizontal_strip` caps stops at `MAX_GRADIENT_STOPS` = 4096 (empty mesh
+  past it); the colour varying is `@interpolate(linear)`; the shader's decode
+  is "numerically equivalent for finite inputs", not "exactly"; the top-row
+  test also checks every pixel against the analytic edge; the assertion-free
+  bind-group test was dropped; the app warns instead of silently drawing no
+  widgets if a widget pipeline is ever missing. A zero/NaN/negative viewport
+  was re-examined and left alone: the red team measured 0 px drawn and no
+  panic, and the solid path shares the same maths.
+  Workspace 2,001 → 2,031 passing (2,024 as first landed, +7 from the
+  review revision), 30 ignored, under
+  `AURORA_REQUIRE_GPU=1` on the RTX 3090 (Vulkan); the full gate,
+  doctests and `cargo doc -D warnings` clean. Residuals: no widget paints a
+  gradient yet, so "the app pre-linearizes gradient vertices" is guarded
+  by doc comments and review only, not by any test; gradients are not
+  clipped (0.125.0 must build its gradient from the widget's *unclipped*
+  bounds and decide clipping then, since `clip_to_clipping_ancestors`
+  only shrinks a solid's rect); no live window check — the swapchain path
+  is covered only by the `Rgba8UnormSrgb` offscreen test, not a real
+  macOS/Retina window.
 - [x] **GPU path renderer (`aurora-widgets`)** — done 2026-08-06, the
   direct continuation of the `aurora-vector` bullet above: PRD §8's own
   "custom GPU path renderer" half, the piece that actually uploads a
@@ -27507,6 +27619,18 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-25 (0.124.0) — gradient paint primitive landed, the
+prerequisite for the colour picker (next, 0.125.0).** A separate
+`GradientPipeline` drawing a vertex-coloured `ColorMesh`
+(`aurora_vector::bilinear_rect`/`horizontal_strip`) through a new
+`PaintOp`/`GpuPaintOp` path, in paint order beside the untouched solid
+path. Gradients interpolate in gamma-encoded sRGB on every target — a
+colour-space decision flagged for Cahya. No widget uses it yet; clipping is
+deferred to 0.125.0. A review revision made solids and the clear colour
+follow the same format-driven rule as gradients (linearize only for an
+sRGB target) and made the swapchain prefer an sRGB format. Full account:
+M1.7's "Vector-first rendering" bullet.
 
 **Addendum 2026-09-25 (0.123.0) — `Menu` landed, the fourth of the six
 gallery widgets Cahya asked for in order.** A keyboard-driven popup menu:

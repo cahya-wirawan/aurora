@@ -58,6 +58,14 @@
 //! [`paint_widget`]'s own doc comment for exactly which and why. The
 //! golden-image component gallery this unblocks is still separate,
 //! still-open follow-on work.
+//!
+//! **Gradients (0.124.0).** [`PaintOp`] adds a vertex-coloured gradient
+//! draw beside the solid [`Paint`]: [`paint_widget_ops`] is the entry
+//! point renderers call, and [`draw_paint_ops`] draws a slice of
+//! [`GpuPaintOp`]s through [`PathPipeline`] and the separate
+//! [`GradientPipeline`] in paint order within one pass. No widget
+//! paints a gradient yet; the colour picker is the first planned
+//! consumer.
 
 mod error;
 mod input;
@@ -72,7 +80,9 @@ pub mod widgets;
 
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};
-pub use paint::{Paint, paint_widget};
-pub use render::{GpuMesh, PathPipeline};
+pub use paint::{Paint, PaintOp, paint_widget, paint_widget_ops};
+pub use render::{
+    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
+};
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use tree::{WidgetId, WidgetTree};

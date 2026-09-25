@@ -38,14 +38,29 @@
 //! deliberately deferred: `aurora-vector` is currently only consumed by
 //! `aurora-widgets` for UI chrome, which isn't rendered at variable
 //! zoom, so there is still no real caller to make that tradeoff for.
+//!
+//! **Gradients (0.124.0).** [`ColorMesh`] is [`Mesh`]'s per-vertex-colour
+//! counterpart: [`bilinear_rect`] (a four-corner gradient, subdivided so
+//! the GPU's per-triangle linear interpolation stays within half an
+//! 8-bit step of the true bilinear blend) and [`horizontal_strip`] (an
+//! evenly spaced multi-stop ramp) build one directly, without `lyon`.
+//! `aurora-widgets`' `GradientPipeline` draws it. The first real
+//! consumer is the colour picker's saturation/value square and hue strip
+//! (planned for 0.125.0); nothing draws one yet. See the `gradient`
+//! module's own doc comment for the colour-space contract.
 
 mod error;
+mod gradient;
 mod mesh;
 mod path;
 mod point;
 mod shapes;
 
 pub use error::VectorError;
+pub use gradient::{
+    ColorMesh, ColorVertex, DEFAULT_GRADIENT_CELLS, GradientCorners, MAX_GRADIENT_STOPS,
+    bilinear_rect, horizontal_strip,
+};
 pub use mesh::{DEFAULT_TOLERANCE, Mesh, fill, stroke, tolerance_for_scale_factor};
 pub use path::{Path, PathBuilder};
 pub use point::Point;

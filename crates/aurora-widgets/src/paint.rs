@@ -97,7 +97,9 @@
 use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Color, Scales, Theme};
-use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
+use aurora_vector::{
+    ColorMesh, Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor,
+};
 
 use taffy::Overflow;
 
@@ -115,6 +117,54 @@ use crate::widgets::{
 /// ([`paint_widget`]'s own return type) — see this module's own doc
 /// comment for why a single widget can need more than one.
 pub type Paint = (Mesh, [f32; 4]);
+
+/// One draw in a widget's paint, in paint order: either a solid shape
+/// ([`Paint`], drawn by [`crate::render::PathPipeline`]) or a
+/// vertex-coloured gradient ([`ColorMesh`], drawn by
+/// [`crate::render::GradientPipeline`]). [`paint_widget_ops`] returns
+/// these; renderers should call it rather than [`paint_widget`] so a
+/// widget that starts painting a gradient needs no renderer change.
+///
+/// A `Solid` colour is resolved from a design token (invariant
+/// §7.3.10). A `Gradient`'s vertex colours are *content* — the value a
+/// colour picker shows or a swatch displays, which a theme must not
+/// override — the same carve-out `ColorSwatch`'s own colour already
+/// has. Both are straight sRGB-gamma-encoded RGBA; only `Solid`'s is
+/// ever linearized by a caller for an sRGB-aware target, because the
+/// gradient pipeline chooses its own fragment conversion from the
+/// target format.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaintOp {
+    Solid(Paint),
+    Gradient(ColorMesh),
+}
+
+impl From<Paint> for PaintOp {
+    fn from(paint: Paint) -> Self {
+        Self::Solid(paint)
+    }
+}
+
+/// [`paint_widget`], as [`PaintOp`]s — the entry point renderers use.
+/// Every widget currently paints solid shapes only, so today this wraps
+/// each [`Paint`] in [`PaintOp::Solid`], in the same order; the first
+/// gradient consumer (the colour picker) lands in 0.125.0.
+///
+/// # Errors
+///
+/// Exactly [`paint_widget`]'s.
+pub fn paint_widget_ops(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
+    Ok(paint_widget(tree, id, theme, scales, scale_factor)?
+        .into_iter()
+        .map(PaintOp::Solid)
+        .collect())
+}
 
 /// The mandatory control-outline stroke `border.control`/
 /// `border.control_opacity` describe (`design/tokens/vocabulary.md`) —
