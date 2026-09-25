@@ -22,8 +22,8 @@
 //! [`DropdownKey`] is this module's own four-key vocabulary, and the
 //! choice is a disclosed one: `shortcut::NamedKey` (`shortcut.rs`)
 //! already names all four keys, so a reusable enum *does* exist. It was
-//! not used as the transition input because it is a 22-variant,
-//! `#[non_exhaustive]` enum whose other 18 keys would all be "ignored",
+//! not used as the transition input because it is a 24-variant,
+//! `#[non_exhaustive]` enum whose other 20 keys would all be "ignored",
 //! which would make the transition table below unreadable and its test
 //! non-exhaustive in spirit. [`DropdownKey::from_named_key`] bridges the
 //! two, so `aurora-app`'s existing winit → `NamedKey` translation
@@ -509,10 +509,17 @@ fn list_node(label: &str) -> Node {
     node
 }
 
-fn option_node(text: &str, highlighted: bool) -> Node {
+/// One option row's node. `position_in_set`/`size_of_set` are set
+/// explicitly (1-based position, total option count):
+/// `accesskit_consumer` 0.38 does not compute either from the tree
+/// (`src/node.rs:626-634` only reads what the node declares), so a
+/// screen reader's "3 of 5" is only announced if the node carries it.
+fn option_node(text: &str, index: usize, len: usize, highlighted: bool) -> Node {
     let mut node = Node::new(Role::ListBoxOption);
     node.set_label(text.to_owned());
     node.set_selected(highlighted);
+    node.set_position_in_set(index.saturating_add(1));
+    node.set_size_of_set(len);
     node
 }
 
@@ -925,15 +932,13 @@ fn move_highlight(
             .collect(),
     };
     for (index, row, on) in changes {
-        let text = state(tree, id)?
-            .options
-            .get(index)
-            .cloned()
-            .unwrap_or_default();
+        let options = &state(tree, id)?.options;
+        let len = options.len();
+        let text = options.get(index).cloned().unwrap_or_default();
         if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(row) {
             row_state.selected = on;
         }
-        tree.set_accessibility(row, option_node(&text, on))?;
+        tree.set_accessibility(row, option_node(&text, index, len, on))?;
         tree.mark_dirty(row)?;
     }
     Ok(())
@@ -959,13 +964,14 @@ fn build_list(
         list_node(&label),
         WidgetKind::DropdownList,
     )?;
-    let mut rows = Vec::with_capacity(options.len());
+    let len = options.len();
+    let mut rows = Vec::with_capacity(len);
     for (index, text) in options.iter().enumerate() {
         let on = index == highlighted;
         rows.push(tree.insert(
             list,
             row_style.clone(),
-            option_node(text, on),
+            option_node(text, index, len, on),
             WidgetKind::ListRow(ListRowState {
                 selected: on,
                 disabled: false,
@@ -1796,6 +1802,26 @@ mod tests {
             Some((Role::ListBoxOption, Some("Multiply".to_owned()))),
             "the consumer resolves focus through active_descendant to the highlighted option"
         );
+
+        // `accesskit_consumer` 0.38 computes neither `position_in_set`
+        // nor `size_of_set`; every option declares both itself, and they
+        // survive a highlight move (which rewrites two option nodes).
+        press(&mut tree, id, DropdownKey::Down);
+        let moved = accesskit_consumer::Tree::new(tree.accessibility_update(id), true);
+        let mut positions: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+        let mut pending = vec![moved.state().root()];
+        while let Some(node) = pending.pop() {
+            if node.role() == Role::ListBoxOption {
+                positions.push((node.position_in_set(), node.size_of_set()));
+            }
+            pending.extend(node.children());
+        }
+        let len = snapshot(&tree, id).options.len();
+        let mut expected: Vec<(Option<usize>, Option<usize>)> =
+            (1..=len).map(|p| (Some(p), Some(len))).collect();
+        positions.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(positions, expected, "every option says `i of n`");
 
         let Some(row) = highlighted else {
             unreachable!("open");

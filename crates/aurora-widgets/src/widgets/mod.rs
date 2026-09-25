@@ -10,10 +10,11 @@
 //! pattern every other widget follows; `TextField`
 //! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
 //! `ColorSwatch` ([`ColorSwatchState`]), `Scrollbar`
-//! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), and now `Dropdown`
-//! ([`DropdownState`], `0.120.0`) followed — **7 of the 12 named
-//! widgets**: button, checkbox, slider, dropdown, scrollbar, colour
-//! swatch, and tree. (Recounted, not carried forward: this
+//! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), `Dropdown`
+//! ([`DropdownState`], `0.120.0`), and now `TabBar` ([`TabBarState`],
+//! `0.121.0`) followed — **8 of the 12 named widgets**: button,
+//! checkbox, slider, dropdown, scrollbar, colour swatch, tree, and tab
+//! bar. (Recounted, not carried forward: this
 //! sentence said "4 of the 12" through `0.75.1`, a count inherited from
 //! PLAN.md's own stricter transcription of the same list — which reads
 //! "colour picker" where `design/gallery/index.html` has "Color
@@ -50,7 +51,12 @@
 //! paints over the open list), with options **unreachable by
 //! hit-testing** (they lie outside the control's bounds), and with no
 //! text or `▾` glyph (`dropdown.rs`'s own doc comment has the full
-//! list). The rest still need infrastructure that doesn't exist yet
+//! list). `TabBar` ([`insert_tab_bar`]/[`handle_tab_bar_key`]) is a
+//! real `Role::TabList` holding one real `Role::Tab` per tab, with
+//! automatic activation, wrapping arrow keys, `Home`/`End`, and roving
+//! focus (only the selected tab is focusable) — the bar only, no tab
+//! panels, no label glyphs, and no keyboard-focus ring (`tab_bar.rs`'s
+//! own doc comment has the full list). The rest still need infrastructure that doesn't exist yet
 //! (popover layering for menus/tooltips — which a dropdown's list also
 //! lacks, see above — number semantics for a number field, and
 //! `aurora-vector` path rendering for the curve editor) and are
@@ -62,11 +68,12 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **thirteen**
+//! tessellates real geometry through `aurora-vector` for **fifteen**
 //! of the [`WidgetKind`] variants below (every one except `Container`,
 //! [`WidgetKind::Dialog`] included as of `0.79.0`,
 //! [`WidgetKind::Dropdown`] and [`WidgetKind::DropdownList`] as of
-//! `0.120.0`). This mirrors
+//! `0.120.0`, [`WidgetKind::TabBar`] and [`WidgetKind::Tab`] as of
+//! `0.121.0`). This mirrors
 //! `WidgetTree` itself: a complete, tested logical model with painting
 //! layered on afterward, not built into the model.
 //!
@@ -93,6 +100,7 @@ mod dropdown;
 mod list_row;
 mod scrollbar;
 mod slider;
+mod tab_bar;
 mod text_field;
 mod tree_view;
 
@@ -116,6 +124,10 @@ pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,
 };
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
+pub use tab_bar::{
+    TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key, insert_tab_bar,
+    select_tab, set_tab_bar_disabled, tab_bar_state,
+};
 pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
     set_text_field_disabled, text_field_state, with_text_field_mut,
@@ -218,6 +230,17 @@ pub enum WidgetKind {
     /// `border.default` outline — `paint::paint_dropdown_list`) is a pure
     /// function of its bounds and the theme.
     DropdownList,
+    /// A tab bar's own row — `Role::TabList`, painted as a 1 px
+    /// `border.default` rule along its bottom edge
+    /// (`paint::paint_tab_bar`). See `tab_bar.rs`'s own module doc
+    /// comment for the key table, the roving-focus accessibility shape,
+    /// and what it deliberately does not do (no panels, no focus ring).
+    TabBar(TabBarState),
+    /// One tab of a [`WidgetKind::TabBar`] — `Role::Tab`, created by
+    /// `tab_bar.rs` at insert. The selected tab paints an
+    /// `accent.primary` underline (`paint::paint_tab`); an inactive one
+    /// paints nothing outside High Contrast.
+    Tab(TabState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

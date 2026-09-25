@@ -333,6 +333,7 @@ use aurora_widgets::widgets::{
     set_slider_disabled, set_text_field_disabled, set_tree_item_disabled, set_tree_item_expanded,
     set_tree_item_selected, toggle_checkbox,
 };
+use aurora_widgets::widgets::{insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -4125,6 +4126,314 @@ dropdown_golden_test!(
     dropdown_gallery_matches_the_golden_image_in_color_critical_theme,
     color_critical_theme(),
     "dropdown_gallery_color_critical.png"
+);
+
+/// `TabBar`'s own two cells — enabled and disabled, three tabs each with
+/// the first selected — each a `TAB_BAR_CELL` rectangle with a
+/// `TAB_BAR_CELL_PADDING` inset. So each bar is `192 - 2*16 = 160` px
+/// wide and one row (21 px) tall, from `y = 16` to `y = 37`, and its
+/// three tabs share it equally around two `spacing.xs` (8 px) gaps:
+/// `(160 - 16) / 3 = 48` px each, at cell-relative `x = 16..64`,
+/// `72..120` and `128..176`. `192 * 2 * 4 = 1536 = 6 * 256`,
+/// row-aligned (see [`BUTTON_GALLERY_SIZE`]). All of it is checked
+/// against the real layout by `tab_bar_gallery_lays_out_three_equal_tabs`.
+///
+/// The mockup's fourth state, "focused", has no cell: no widget in this
+/// crate paints a keyboard-focus ring (see `tab_bar.rs`'s own doc
+/// comment).
+const TAB_BAR_CELL: (u32, u32) = (192, 64);
+const TAB_BAR_CELL_PADDING: u32 = 16;
+const TAB_BAR_GALLERY_SIZE: (u32, u32) = (TAB_BAR_CELL.0 * 2, TAB_BAR_CELL.1);
+const TAB_BAR_HEIGHT: u32 = 21;
+const TAB_BAR_TAB_WIDTH: u32 = 48;
+const TAB_BAR_GAP: u32 = 8;
+/// The bar's bottom edge, exclusive: its last pixel row is `- 1`.
+const TAB_BAR_BOTTOM: u32 = TAB_BAR_CELL_PADDING + TAB_BAR_HEIGHT;
+/// Cell-relative horizontal centre of tab `n`.
+const fn tab_centre_x(n: u32) -> u32 {
+    TAB_BAR_CELL_PADDING + n * (TAB_BAR_TAB_WIDTH + TAB_BAR_GAP) + TAB_BAR_TAB_WIDTH / 2
+}
+/// Cell-relative centre of the gap between tabs 0 and 1 — where only the
+/// bar's own rule is painted, never a tab's (High Contrast outlines
+/// included, which straddle each tab's own edge by half a pixel).
+const TAB_BAR_GAP_X: u32 = TAB_BAR_CELL_PADDING + TAB_BAR_TAB_WIDTH + TAB_BAR_GAP / 2;
+
+/// The gallery backdrop for a tab bar: the theme's own `surface.panel`,
+/// computed from the token rather than picked — a tab bar has no
+/// background of its own and sits on a panel, and `accent.primary on
+/// surface.panel` is exactly the pair `design/check_contrast.py` gates
+/// for the selected tab's underline. (`NEUTRAL_CLEAR` would not do:
+/// both High Contrast themes' `border.default` *is* `#808080`, so the
+/// bar's rule would vanish into it.)
+fn tab_bar_clear(theme: &Theme) -> wgpu::Color {
+    let [r, g, b] = theme.surface.panel.to_srgb_f32();
+    wgpu::Color {
+        r: f64::from(r),
+        g: f64::from(g),
+        b: f64::from(b),
+        a: 1.0,
+    }
+}
+
+/// One `TabBar` gallery cell: a sized, padded `Column` holding a
+/// three-tab bar with the first tab selected, optionally disabled.
+fn tab_bar_gallery_cell(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    disabled: bool,
+) -> WidgetId {
+    let pad = length(TAB_BAR_CELL_PADDING as f32);
+    let cell = match aurora_widgets::widgets::insert_container(
+        tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size {
+                width: length(TAB_BAR_CELL.0 as f32),
+                height: length(TAB_BAR_CELL.1 as f32),
+            },
+            padding: LayoutRect {
+                left: pad,
+                right: pad,
+                top: pad,
+                bottom: pad,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let labels = ["Layers", "Channels", "Paths"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let bar = match insert_tab_bar(tree, cell, scales, "Panels", labels, 0) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if disabled && let Err(err) = set_tab_bar_disabled(tree, bar, true) {
+        unreachable!("{err:?}");
+    }
+    bar
+}
+
+/// A real, laid-out `TabBar` gallery: enabled, disabled, left to right.
+fn tab_bar_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let enabled = tab_bar_gallery_cell(&mut tree, root, scales, false);
+    let disabled = tab_bar_gallery_cell(&mut tree, root, scales, true);
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(TAB_BAR_GALLERY_SIZE.0 as f32, TAB_BAR_GALLERY_SIZE.1 as f32);
+    (tree, [enabled, disabled])
+}
+
+/// A headless (no GPU) proof that every sample coordinate above lands
+/// where it claims.
+#[test]
+fn tab_bar_gallery_lays_out_three_equal_tabs() {
+    let scales = scales();
+    let (tree, bars) = tab_bar_gallery_tree(&scales);
+    for (cell, bar) in bars.into_iter().enumerate() {
+        let cell = u32::try_from(cell).unwrap_or(0);
+        let Some(bounds) = tree.bounds(bar) else {
+            unreachable!("laid out");
+        };
+        let origin = i64::from(cell * TAB_BAR_CELL.0 + TAB_BAR_CELL_PADDING);
+        assert_eq!(bounds.x, origin);
+        assert_eq!(bounds.y, i64::from(TAB_BAR_CELL_PADDING));
+        assert_eq!(bounds.width, TAB_BAR_CELL.0 - 2 * TAB_BAR_CELL_PADDING);
+        assert_eq!(bounds.height, TAB_BAR_HEIGHT);
+        let state = match tab_bar_state(&tree, bar) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.selected(), 0);
+        for (n, &tab) in state.tabs().iter().enumerate() {
+            let n = u32::try_from(n).unwrap_or(0);
+            let Some(tab_bounds) = tree.bounds(tab) else {
+                unreachable!("laid out");
+            };
+            assert_eq!(
+                tab_bounds.x,
+                i64::from(cell * TAB_BAR_CELL.0 + tab_centre_x(n) - TAB_BAR_TAB_WIDTH / 2)
+            );
+            assert_eq!(tab_bounds.width, TAB_BAR_TAB_WIDTH);
+            assert_eq!(tab_bounds.bottom(), i64::from(TAB_BAR_BOTTOM));
+        }
+    }
+}
+
+/// The rendered-pixel claims every theme's `TabBar` gallery makes.
+fn assert_tab_bar_states_are_distinct(
+    image: &aurora_testkit::Image,
+    clear: wgpu::Color,
+    theme_name: &str,
+) {
+    assert_eq!(image.width, TAB_BAR_GALLERY_SIZE.0);
+    assert_eq!(image.height, TAB_BAR_GALLERY_SIZE.1);
+    let at = |cell: u32, x: u32, y: u32| sample_at(image, cell * TAB_BAR_CELL.0 + x, y);
+    let (enabled, disabled) = (0, 1);
+    let underline_y = TAB_BAR_BOTTOM - 2;
+    let rule_y = TAB_BAR_BOTTOM - 1;
+    let inside_y = TAB_BAR_BOTTOM - 4;
+
+    // 1. Inside the bar, above the rule, is the panel backdrop.
+    let backdrop = at(enabled, TAB_BAR_GAP_X, inside_y);
+    assert_backdrop_is_the_clear_colour(backdrop, clear, theme_name);
+
+    // 2. The bar's own border.default rule is really painted, in the gap
+    //    between tabs where nothing else draws.
+    assert_ne!(
+        at(enabled, TAB_BAR_GAP_X, rule_y),
+        backdrop,
+        "{theme_name}: the bar's bottom rule (border.default) must differ from the panel"
+    );
+
+    // 3. The selected tab's underline differs from an inactive tab's
+    //    bottom band.
+    let active = at(enabled, tab_centre_x(0), underline_y);
+    assert_ne!(
+        active,
+        at(enabled, tab_centre_x(1), underline_y),
+        "{theme_name}: the selected tab's accent.primary underline must differ from an \
+         inactive tab"
+    );
+    assert_ne!(
+        active, backdrop,
+        "{theme_name}: the selected tab's underline must differ from the panel"
+    );
+    assert_eq!(
+        at(enabled, tab_centre_x(0), inside_y),
+        backdrop,
+        "{theme_name}: the underline is a band at the bottom, not a fill"
+    );
+
+    // 4. Disabled dims the underline.
+    assert_ne!(
+        at(disabled, tab_centre_x(0), underline_y),
+        active,
+        "{theme_name}: a disabled bar's underline must render dimmer than an enabled one's"
+    );
+}
+
+/// `TabBar`'s own gallery, one distinct-pixels test per built-in theme,
+/// each over its own `surface.panel` ([`tab_bar_clear`]).
+macro_rules! tab_bar_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tab_bar_clear(&theme);
+            let (tree, _ids) = tab_bar_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TAB_BAR_GALLERY_SIZE,
+                clear,
+            );
+            assert_tab_bar_states_are_distinct(&image, clear, $theme_name);
+        }
+    };
+}
+
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state,
+    dark_theme(),
+    "Dark"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_light_theme,
+    light_theme(),
+    "Light"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+tab_bar_distinct_test!(
+    render_gallery_produces_distinct_pixels_for_each_tab_bar_state_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// `TabBar`'s own five golden-diff tests, against goldens that **do not
+/// exist** — `#[ignore]`d, exactly as `dropdown_golden_test!`'s own doc
+/// comment records. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows two bars on the panel colour, each with
+/// a 1 px rule along its bottom and a 2 px accent underline under the
+/// first tab only, the right-hand one dimmed — before these attributes
+/// come off.
+macro_rules! tab_bar_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let clear = tab_bar_clear(&theme);
+            let (tree, _ids) = tab_bar_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                TAB_BAR_GALLERY_SIZE,
+                clear,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image,
+    dark_theme(),
+    "tab_bar_gallery.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "tab_bar_gallery_light.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "tab_bar_gallery_high_contrast_dark.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "tab_bar_gallery_high_contrast_light.png"
+);
+tab_bar_golden_test!(
+    tab_bar_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "tab_bar_gallery_color_critical.png"
 );
 
 /// `Slider`'s own "distinct pixels" proof is shaped differently from

@@ -3808,6 +3808,8 @@ fn translate_named_key(named: winit::keyboard::NamedKey) -> Option<NamedKey> {
         Winit::ArrowDown => NamedKey::ArrowDown,
         Winit::ArrowLeft => NamedKey::ArrowLeft,
         Winit::ArrowRight => NamedKey::ArrowRight,
+        Winit::Home => NamedKey::Home,
+        Winit::End => NamedKey::End,
         Winit::F1 => NamedKey::F1,
         Winit::F2 => NamedKey::F2,
         Winit::F3 => NamedKey::F3,
@@ -18433,6 +18435,20 @@ mod tests {
                 winit::keyboard::NamedKey::Escape
             )),
             Some(Key::Named(NamedKey::Escape))
+        );
+    }
+
+    #[test]
+    fn translate_key_maps_home_and_end_for_the_tab_bar() {
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(
+                winit::keyboard::NamedKey::Home
+            )),
+            Some(Key::Named(NamedKey::Home))
+        );
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::End)),
+            Some(Key::Named(NamedKey::End))
         );
     }
 

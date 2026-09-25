@@ -6,8 +6,8 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`, and
-//! `DropdownList` — solid rounded-rect shapes, the simplest of
+//! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`,
+//! `DropdownList`, `TabBar`, and `Tab` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -105,7 +105,7 @@ use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorSwatchState, DropdownState, ListRowState, ScrollbarState,
-    SliderState, TextFieldState, TreeItemState, WidgetKind, row_height,
+    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -205,6 +205,8 @@ pub fn paint_widget(
         WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
         WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
         WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
+        WidgetKind::TabBar(state) => paint_tab_bar(state, bounds, theme, scale_factor),
+        WidgetKind::Tab(state) => paint_tab(state, bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -893,6 +895,128 @@ fn paint_dropdown_list(
     Ok(paints)
 }
 
+/// A plain, square-cornered filled rectangle — `rounded_rect` at radius
+/// `0.0` — or `None` when it has no area, so a degenerate (zero-width or
+/// zero-height) band paints nothing rather than tessellating an empty
+/// path.
+fn band(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    scale_factor: f32,
+) -> Result<Option<Mesh>, WidgetError> {
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(None);
+    }
+    let path = rounded_rect(x, y, width, height, 0.0);
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    fill(&path, tolerance).map(Some).map_err(WidgetError::Paint)
+}
+
+/// A tab bar's own paint: one **filled** 1 px `border.default` rule
+/// along its bottom edge, the full width of the bar — the mockup's
+/// `.tabs { border-bottom: 1px solid var(--border-default) }`. A fill
+/// rather than a stroke, so the band lies exactly inside the bar's own
+/// bottom pixel row instead of straddling its edge. The bar has no
+/// background of its own: it sits on whatever panel holds it.
+/// `state.disabled_opacity` dims the rule when the bar is disabled.
+///
+/// `border.default` is listed but deliberately **not gated** by
+/// `design/check_contrast.py` against `surface.panel` ("decorative");
+/// the rule is not the only way a tab is identified here — the selected
+/// tab's `accent.primary` underline, which *is* gated against
+/// `surface.panel` (3:1), carries the state.
+fn paint_tab_bar(
+    state: &TabBarState,
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px every border here uses: no "border width"
+    // token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    let rule_height = BORDER_WIDTH.min(height);
+    let Some(mesh) = band(
+        bounds.x as f32,
+        bounds.y as f32 + height - rule_height,
+        width,
+        rule_height,
+        scale_factor,
+    )?
+    else {
+        return Ok(vec![]);
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let [r, g, b] = theme.border.default.to_srgb_f32();
+    Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
+/// One tab's own paint. The conditional [`control_outline`] (High
+/// Contrast only) first; then, **only on the selected tab**, a filled
+/// `accent.primary` underline along its bottom edge, drawn **last** so
+/// it lies over both the outline and the bar's own `border.default`
+/// rule beneath it. An inactive tab outside High Contrast paints
+/// nothing (`Ok(vec![])`, the same "nothing to highlight" convention
+/// [`paint_list_row`] uses). `state.disabled_opacity` dims everything.
+///
+/// `accent.primary` is `design/tokens/vocabulary.md`'s "selection
+/// highlight" token, and `accent.primary on surface.panel` is one of
+/// `design/check_contrast.py`'s gated 3:1 pairs — the surface a tab bar
+/// sits on.
+///
+/// **No keyboard-focus ring and no label glyph** — see `tab_bar.rs`'s
+/// own module doc comment.
+fn paint_tab(
+    state: &TabState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    // The mockup's `.tab.active { border-bottom: 2px solid
+    // var(--accent-primary) }`. **Not a token**: `design/tokens/
+    // scales.toml` has no stroke-weight scale at all, the same gap every
+    // `BORDER_WIDTH` above records. Flagged to the design owner (Cahya,
+    // PRD FR-027 *Ownership*) rather than invented as a token here.
+    const UNDERLINE_WIDTH: f32 = 2.0;
+
+    let (left, top) = (bounds.x as f32, bounds.y as f32);
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(vec![]);
+    }
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let path = rounded_rect(left, top, width, height, scales.radius.sm as f32);
+    let mut paints: Vec<Paint> = control_outline(&path, theme, alpha, scale_factor)?
+        .into_iter()
+        .collect();
+    if state.is_selected() {
+        let underline = UNDERLINE_WIDTH.min(height);
+        if let Some(mesh) = band(
+            left,
+            top + height - underline,
+            width,
+            underline,
+            scale_factor,
+        )? {
+            let [r, g, b] = theme.accent.primary.to_srgb_f32();
+            paints.push((mesh, [r, g, b, alpha]));
+        }
+    }
+    Ok(paints)
+}
+
 /// A colour swatch's own fill: `state.color` itself — the one widget in
 /// this module whose fill colour is *not* a `Theme` token (see this
 /// module's own doc comment and `widgets::color_swatch`'s for why: the
@@ -1138,6 +1262,7 @@ mod tests {
         set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
         set_tree_item_selected, toggle_checkbox,
     };
+    use crate::widgets::{insert_tab_bar, set_tab_bar_disabled, tab_bar_state};
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
     use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
@@ -3388,6 +3513,177 @@ mod tests {
                 assert_eq!(colors, vec![rgba(theme.accent.primary, 1.0)]);
             } else {
                 assert!(paints.is_empty(), "row {index}: {paints:?}");
+            }
+        }
+    }
+
+    // ---- TabBar / Tab ----------------------------------------------------
+
+    /// A laid-out tab bar (three tabs, `selected` selected) in a 180 px
+    /// wide column. Returns the tree, the bar, and its three tabs.
+    fn laid_out_tab_bar(
+        selected: usize,
+        disabled: bool,
+    ) -> (WidgetTree<WidgetKind>, WidgetId, Vec<WidgetId>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(180.0_f32),
+                height: taffy::style_helpers::length(100.0_f32),
+            },
+            ..Default::default()
+        });
+        let labels = ["Layers", "Channels", "Paths"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let bar = match insert_tab_bar(&mut tree, root, &scales(), "Panels", labels, selected) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if disabled && let Err(err) = set_tab_bar_disabled(&mut tree, bar, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(180.0, 100.0);
+        let tabs = match tab_bar_state(&tree, bar) {
+            Ok(state) => state.tabs().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, bar, tabs)
+    }
+
+    fn bounds_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Rect {
+        match tree.bounds(id) {
+            Some(bounds) => bounds,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tab_bar_paints_one_border_default_rule_along_its_bottom_pixel_row() {
+        let theme = dark_theme();
+        let (tree, bar, _tabs) = laid_out_tab_bar(0, false);
+        let paints = paints_of(&tree, bar, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.first() else {
+            unreachable!("one shape");
+        };
+        assert_eq!(*color, rgba(theme.border.default, 1.0));
+        let b = bounds_of(&tree, bar);
+        let (x0, y0, x1, y1) = bbox(mesh);
+        assert_eq!((x0, x1), (b.x as f32, (b.x + i64::from(b.width)) as f32));
+        assert_eq!(
+            y1,
+            b.bottom() as f32,
+            "the rule ends at the bar's bottom edge"
+        );
+        assert_eq!(y1 - y0, 1.0, "the rule is 1 px tall");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn the_selected_tab_paints_a_2px_accent_underline_and_an_inactive_one_nothing() {
+        let theme = dark_theme();
+        let (tree, _bar, tabs) = laid_out_tab_bar(1, false);
+        let Some((&first, &second)) = tabs.first().zip(tabs.get(1)) else {
+            unreachable!("three tabs");
+        };
+        assert!(
+            paints_of(&tree, first, &theme).is_empty(),
+            "an inactive tab paints nothing outside High Contrast"
+        );
+        let paints = paints_of(&tree, second, &theme);
+        assert_eq!(paints.len(), 1, "{paints:?}");
+        let Some((mesh, color)) = paints.last() else {
+            unreachable!("one shape");
+        };
+        assert_eq!(*color, rgba(theme.accent.primary, 1.0));
+        let b = bounds_of(&tree, second);
+        let (x0, y0, x1, y1) = bbox(mesh);
+        assert_eq!((x0, x1), (b.x as f32, (b.x + i64::from(b.width)) as f32));
+        assert_eq!(y1, b.bottom() as f32);
+        assert_eq!(y1 - y0, 2.0, "the underline is 2 px tall");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn in_high_contrast_every_tab_gains_the_outline_and_the_underline_draws_last() {
+        let theme = high_contrast_theme();
+        let (tree, _bar, tabs) = laid_out_tab_bar(0, false);
+        let Some((&active, &inactive)) = tabs.first().zip(tabs.get(1)) else {
+            unreachable!("three tabs");
+        };
+        let inactive_paints = paints_of(&tree, inactive, &theme);
+        assert_eq!(inactive_paints.len(), 1, "the outline alone");
+        let active_paints = paints_of(&tree, active, &theme);
+        let colors: Vec<[f32; 4]> = active_paints.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colors,
+            vec![
+                rgba(theme.border.control, theme.border.control_opacity),
+                rgba(theme.accent.primary, 1.0),
+            ],
+            "outline first, underline last so it lies over it"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_tab_bar_dims_its_rule_and_every_tab_shape() {
+        let theme = high_contrast_theme();
+        let alpha = theme.state.disabled_opacity;
+        assert!(alpha < 1.0);
+        let (tree, bar, tabs) = laid_out_tab_bar(0, true);
+        let bar_paints = paints_of(&tree, bar, &theme);
+        assert_eq!(
+            bar_paints.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            vec![rgba(theme.border.default, alpha)]
+        );
+        let Some(&active) = tabs.first() else {
+            unreachable!("three tabs");
+        };
+        assert_eq!(
+            paints_of(&tree, active, &theme)
+                .iter()
+                .map(|(_, c)| *c)
+                .collect::<Vec<_>>(),
+            vec![
+                rgba(theme.border.control, theme.border.control_opacity * alpha),
+                rgba(theme.accent.primary, alpha),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_bar_and_a_tab_with_degenerate_bounds_paint_without_error() {
+        let theme = high_contrast_theme();
+        let (mut tree, bar, tabs) = laid_out_tab_bar(0, false);
+        let Some(&active) = tabs.first() else {
+            unreachable!("three tabs");
+        };
+        for (width, height) in [(0, 0), (40, 0), (0, 21), (40, 1)] {
+            for id in [bar, active] {
+                let rect = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                if let Err(err) = tree.set_bounds(id, rect) {
+                    unreachable!("{err:?}");
+                }
+                let paints = paints_of(&tree, id, &theme);
+                if width == 0 || height == 0 {
+                    assert!(paints.is_empty(), "{width}x{height}: {paints:?}");
+                }
+                for (mesh, _) in &paints {
+                    let (_, y0, _, y1) = bbox(mesh);
+                    assert!(
+                        y0 >= -0.5 && y1 <= height as f32 + 0.5,
+                        "{width}x{height}: a band clamped to the box, not past it"
+                    );
+                }
             }
         }
     }
