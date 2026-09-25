@@ -734,6 +734,57 @@ pub fn set_dropdown_selected(
     with_dropdown_mut(tree, id, |state| Ok(((), state.apply_selected(selected)?)))
 }
 
+/// Commits `row` — one of open dropdown `id`'s own option rows — as the
+/// selection and closes the list: the pointer's equivalent of moving the
+/// highlight onto that row and pressing `Enter`, and implemented as
+/// exactly that (the same pure `Enter` transition the keyboard runs), so
+/// the two paths cannot disagree about what a commit means. Returns the
+/// same [`DropdownOutcome::Committed`] the keyboard would.
+///
+/// A closed dropdown has no rows, so `row` cannot name one; this is then
+/// `UnknownWidget(row)`, like every other id that isn't one of `id`'s
+/// current rows.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`]/[`WidgetError::WrongWidgetKind`] for an
+/// `id` that isn't a dropdown, [`WidgetError::UnknownWidget`] for a `row`
+/// that isn't one of its current rows, and
+/// [`WidgetError::WidgetDisabled`] for a disabled dropdown.
+pub fn commit_dropdown_row(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    row: WidgetId,
+) -> Result<DropdownOutcome, WidgetError> {
+    let index = state(tree, id)?
+        .rows()
+        .iter()
+        .position(|&candidate| candidate == row)
+        .ok_or(WidgetError::UnknownWidget(row))?;
+    with_dropdown_mut(tree, id, |state| {
+        if state.disabled {
+            return Err(WidgetError::WidgetDisabled(id));
+        }
+        state.highlighted = Some(index);
+        outcome_of(state.apply_key(id, DropdownKey::Enter))
+    })
+}
+
+/// The dropdown whose open list `row` is an option row of, if any: `row`'s
+/// parent must be a [`WidgetKind::DropdownList`] whose parent is a
+/// [`WidgetKind::Dropdown`] that lists `row` among its current rows.
+#[must_use]
+pub fn dropdown_of_row(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
+    let list = tree
+        .parent(row)
+        .filter(|&list| matches!(tree.payload(list), Some(WidgetKind::DropdownList)))?;
+    let dropdown = tree.parent(list)?;
+    state(tree, dropdown)
+        .ok()
+        .filter(|state| state.rows().contains(&row))
+        .map(|_| dropdown)
+}
+
 /// Pairs a transition's outcome with whether anything changed, which is
 /// every outcome but `Ignored`.
 fn outcome_of(
@@ -1017,9 +1068,9 @@ fn close_after_failure(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DropdownKey, DropdownOutcome, DropdownState, close_after_failure, dropdown_state,
-        handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
-        set_dropdown_selected, toggle_dropdown,
+        DropdownKey, DropdownOutcome, DropdownState, close_after_failure, commit_dropdown_row,
+        dropdown_of_row, dropdown_state, handle_dropdown_key, insert_dropdown,
+        set_dropdown_disabled, set_dropdown_open, set_dropdown_selected, toggle_dropdown,
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
@@ -2307,5 +2358,43 @@ mod tests {
         assert_eq!(state.list(), None);
         assert!(state.rows().is_empty());
         assert_eq!(state.selected(), Some(0), "nothing was committed");
+    }
+
+    #[test]
+    fn commit_dropdown_row_selects_that_row_and_closes_like_enter() {
+        let (mut tree, id) = inserted(Some(0));
+        press(&mut tree, id, DropdownKey::Down);
+        let rows = snapshot(&tree, id).rows().to_vec();
+        let Some(&second) = rows.get(1) else {
+            unreachable!("three options, three rows");
+        };
+        assert_eq!(dropdown_of_row(&tree, second), Some(id));
+        assert_eq!(dropdown_of_row(&tree, id), None, "the control is no row");
+        match commit_dropdown_row(&mut tree, id, second) {
+            Ok(outcome) => assert_eq!(
+                outcome,
+                DropdownOutcome::Committed {
+                    index: 1,
+                    changed: true
+                }
+            ),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let state = snapshot(&tree, id);
+        assert_eq!(state.selected(), Some(1));
+        assert!(!state.is_open(), "a commit closes the list");
+        assert!(!tree.contains(second), "the rows went with the list");
+        assert_eq!(dropdown_of_row(&tree, second), None);
+    }
+
+    #[test]
+    fn commit_dropdown_row_refuses_an_id_that_is_not_one_of_its_rows() {
+        let (mut tree, id) = inserted(Some(2));
+        // Closed: there are no rows at all, so the control itself is refused.
+        match commit_dropdown_row(&mut tree, id, id) {
+            Err(WidgetError::UnknownWidget(row)) => assert_eq!(row, id),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
+        }
+        assert_eq!(snapshot(&tree, id).selected(), Some(2), "nothing changed");
     }
 }

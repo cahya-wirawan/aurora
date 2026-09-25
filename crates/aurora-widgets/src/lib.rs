@@ -71,6 +71,7 @@ pub mod action;
 mod error;
 mod input;
 mod paint;
+mod pointer;
 pub mod render;
 #[cfg(test)]
 mod render_test;
@@ -85,6 +86,10 @@ pub use input::{FocusManager, FocusOrigin, hit_test};
 pub use paint::{
     FOCUS_RING_INNER_WIDTH, FOCUS_RING_WIDTH, FocusPaint, Paint, PaintOp, paint_widget,
     paint_widget_ops, paint_widget_ops_focused,
+};
+pub use pointer::{
+    ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
+    handle_widget_key, handle_widget_text, is_shortcut_chord,
 };
 pub use render::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,

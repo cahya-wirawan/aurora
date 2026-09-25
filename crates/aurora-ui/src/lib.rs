@@ -30,6 +30,7 @@
 //! in particular).
 
 pub mod canvas_view;
+pub mod gallery_panel;
 pub mod history_panel;
 pub mod layers_panel;
 pub mod panel;
@@ -38,6 +39,11 @@ pub mod tool;
 pub mod workspace;
 
 pub use canvas_view::CanvasView;
+pub use gallery_panel::{
+    GalleryPanel, apply_gallery_outcome, gallery_contains, gallery_content_height, gallery_hover,
+    gallery_light_dismiss, gallery_next_deadline, gallery_tick, insert_gallery_panel,
+    remove_gallery_panel,
+};
 pub use history_panel::populate_history_panel;
 pub use layers_panel::populate_layers_panel;
 pub use panel::{

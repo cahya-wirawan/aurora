@@ -181,9 +181,9 @@ pub use curve_editor::{
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
 pub use dropdown::{
-    DropdownKey, DropdownOutcome, DropdownState, dropdown_state, handle_dropdown_key,
-    insert_dropdown, set_dropdown_disabled, set_dropdown_open, set_dropdown_selected,
-    toggle_dropdown,
+    DropdownKey, DropdownOutcome, DropdownState, commit_dropdown_row, dropdown_of_row,
+    dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
+    set_dropdown_selected, toggle_dropdown,
 };
 pub use list_row::ListRowState;
 pub use menu::{
@@ -199,8 +199,9 @@ pub use tab_bar::{
     select_tab, set_tab_bar_disabled, tab_bar_state,
 };
 pub use text_field::{
-    Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
-    set_text_field_disabled, text_field_state, with_text_field_mut,
+    Composition, TEXT_FIELD_MAX_BYTES, TextFieldKey, TextFieldState, UnderlineStyle,
+    composition_segments, handle_text_field_key, insert_text_field, insert_text_field_text,
+    is_insertable_char, set_text_field_disabled, text_field_state, with_text_field_mut,
 };
 pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{
