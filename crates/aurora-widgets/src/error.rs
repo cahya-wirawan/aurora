@@ -70,6 +70,12 @@ pub enum WidgetError {
     /// geometry into a `Mesh`. In practice unreachable from this crate's
     /// own callers today: `rounded_rect`'s own cubic-Bézier output never
     /// triggers a `lyon` tessellation failure in this module's tests.
+    /// A curve editor was handed control points `aurora_core::ToneCurve`
+    /// refuses (too few or many, non-finite, out of range, endpoints not
+    /// at `x = 0`/`1`, or two points too close) — carried as the model's
+    /// own reason.
+    #[error("invalid tone curve: {0}")]
+    InvalidCurve(#[source] aurora_core::ToneCurveError),
     #[error("failed to tessellate a widget's own paint geometry: {0}")]
     Paint(#[source] aurora_vector::VectorError),
 }

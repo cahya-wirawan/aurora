@@ -62,6 +62,17 @@ impl PathBuilder {
         self
     }
 
+    /// Ends the current sub-path **open** — without connecting it back to
+    /// its start — so it can be [`crate::stroke`]d as a polyline or a
+    /// single line. Every sub-path must be ended (by this or
+    /// [`Self::close`]) before [`Self::build`]: `lyon`'s builder asserts
+    /// it in debug builds. Added in `0.126.0` for the curve editor's
+    /// diagonal and curve, the first open strokes in the workspace.
+    pub fn end(&mut self) -> &mut Self {
+        self.inner.end(false);
+        self
+    }
+
     /// Consumes the builder, producing an immutable, tessellation-ready
     /// [`Path`].
     #[must_use]
@@ -127,6 +138,31 @@ mod tests {
         // Begin + 2 lines + close/end -- exactly the four events this
         // sub-path was built from, in order.
         assert_eq!(path.inner.iter().count(), 4);
+    }
+
+    #[test]
+    fn an_open_polyline_ends_without_a_closing_segment_and_strokes() {
+        let mut builder = PathBuilder::new();
+        builder
+            .move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(10.0, 0.0))
+            .line_to(Point::new(10.0, 10.0))
+            .end();
+        let path = builder.build();
+        // Begin + 2 lines + an open end.
+        assert_eq!(path.inner.iter().count(), 4);
+        assert!(
+            path.inner
+                .iter()
+                .any(|event| matches!(event, lyon::path::PathEvent::End { close: false, .. }))
+        );
+        let Ok(mesh) = crate::stroke(&path, 2.0, crate::DEFAULT_TOLERANCE) else {
+            unreachable!("an open polyline strokes");
+        };
+        assert!(!mesh.indices.is_empty());
+        // No closing segment: nothing is drawn near the (0, 10) corner a
+        // closing line would cut past.
+        assert!(mesh.vertices.iter().all(|p| !(p.x < 4.0 && p.y > 6.0)));
     }
 
     #[test]

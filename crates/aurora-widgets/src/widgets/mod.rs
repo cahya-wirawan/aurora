@@ -13,10 +13,12 @@
 //! ([`ScrollbarState`]), `Tree` ([`TreeItemState`]), `Dropdown`
 //! ([`DropdownState`], `0.120.0`), `TabBar` ([`TabBarState`],
 //! `0.121.0`), `Tooltip` ([`Tooltip`], `0.122.0`), `Menu`
-//! ([`MenuState`], `0.123.0`), and now the colour picker
-//! ([`ColorPickerState`], `0.125.0`) followed — **still 10 of the 12
-//! named widgets**: button, checkbox, slider, dropdown, scrollbar,
-//! colour swatch/picker, tree, tab bar, tooltip, and menu. The picker
+//! ([`MenuState`], `0.123.0`), the colour picker
+//! ([`ColorPickerState`], `0.125.0`) and now the curve editor
+//! ([`CurveEditorState`], `0.126.0`) followed — **11 of the 12 named
+//! widgets**: button, checkbox, slider, dropdown, scrollbar, colour
+//! swatch/picker, tree, tab bar, tooltip, menu, and curve editor; the
+//! number field remains. The picker
 //! takes the swatch's slot rather than adding an eleventh (PLAN.md's
 //! own list reads "colour picker" where the gallery reads "Color
 //! swatch"); [`ColorSwatchState`] stays a primitive, reused by the
@@ -84,14 +86,20 @@
 //! channel sliders in a group plus a hue slider (`accesskit` has no
 //! two-dimensional role), with no text entry, no alpha and no focus ring
 //! (`color_picker.rs`'s own doc comment has the full list).
-//! The rest — a number field and the curve editor — need no popover
-//! layering (the dropdown's list, the tooltip and the menu are the ones
-//! that lack it, see above), but still need infrastructure that doesn't
-//! exist yet (number semantics for a number field; for the curve
-//! editor, an interactive control-point model — hit-testing, adding and
-//! removing points — and pointer capture for a drag, since
-//! `aurora-vector` path rendering already exists), and are deliberately
-//! left open rather than stubbed out half-built.
+//! The curve editor ([`insert_curve_editor`]/[`handle_curve_editor_key`])
+//! edits an `aurora_core::ToneCurve` (a monotone cubic through 2 to 16
+//! control points, the model living in `aurora-core` so the future
+//! Curves adjustment shares it): one root that paints a well, a quarter
+//! grid, the identity diagonal, the curve and a marker per point, and one
+//! `Role::Slider` per point with roving focus (only the selected point is
+//! a tab stop). Points are selected, moved, added and removed from the
+//! keyboard and the pointer (geometric hit-testing, no pointer capture —
+//! a drag is the caller calling a `*_from_point` function per move), with
+//! no histogram, no channel selector and no text (`curve_editor.rs`'s own
+//! doc comment has the full list). The rest — a number field — needs no
+//! popover layering but still needs number semantics that don't exist
+//! yet, and is deliberately left open rather than stubbed out
+//! half-built.
 //!
 //! **Every module here is a model, not a painter** — and that is a
 //! division of labour, not a missing feature. A widget module produces
@@ -99,9 +107,11 @@
 //! invariant §7.3.10, no hardcoded spacing) and accessibility content
 //! (a real `accesskit::Node` with the right role/actions/value); the
 //! pixels are [`crate::paint_widget`]'s job, one layer over, which
-//! tessellates real geometry through `aurora-vector` for **nineteen**
-//! of the [`WidgetKind`] variants below (every one except `Container`
-//! and [`WidgetKind::ColorPicker`]'s own root, whose children paint;
+//! tessellates real geometry through `aurora-vector` for **twenty**
+//! of the [`WidgetKind`] variants below (every one except `Container`,
+//! [`WidgetKind::ColorPicker`]'s own root, whose children paint, and
+//! [`WidgetKind::CurveEditorPoint`], whose root paints;
+//! [`WidgetKind::CurveEditor`] as of `0.126.0`;
 //! [`WidgetKind::ColorPickerPart`] as of `0.125.0`, the first to paint a
 //! gradient through [`crate::paint_widget_ops`],
 //! [`WidgetKind::Dialog`] included as of `0.79.0`,
@@ -132,6 +142,7 @@ mod checkbox;
 mod color_picker;
 mod color_swatch;
 mod command_palette;
+mod curve_editor;
 mod dialog;
 mod dropdown;
 mod list_row;
@@ -159,6 +170,13 @@ pub use command_palette::{
     CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
     move_command_palette_selection, set_command_palette_query,
 };
+pub use curve_editor::{
+    CurveEditorKey, CurveEditorOutcome, CurveEditorPointState, CurveEditorState,
+    add_curve_point_from_point, curve_editor_of, curve_editor_point_at, curve_editor_state,
+    handle_curve_editor_key, insert_curve_editor, move_selected_point_from_point,
+    select_curve_point, set_curve_editor_disabled, set_curve_editor_points,
+};
+pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
 pub use dropdown::{
     DropdownKey, DropdownOutcome, DropdownState, dropdown_state, handle_dropdown_key,
@@ -332,6 +350,18 @@ pub enum WidgetKind {
     /// The gradient colours are *content*, not tokens; the markers are
     /// tokens.
     ColorPickerPart(ColorPickerPartState),
+    /// A curve editor's own root — `Role::Group`, inserted by
+    /// `curve_editor.rs`'s [`insert_curve_editor`]. Paints **everything**
+    /// the editor shows (well, grid, identity diagonal, curve, point
+    /// markers — `paint::paint_curve_editor`); its point children paint
+    /// nothing. See `curve_editor.rs`'s own module doc comment for the
+    /// key table, the roving-focus accessibility shape and what it
+    /// deliberately does not do.
+    CurveEditor(CurveEditorState),
+    /// One control point of a [`WidgetKind::CurveEditor`] — a
+    /// `Role::Slider` over the editor's whole box, created only by
+    /// `curve_editor.rs`. Paints nothing.
+    CurveEditorPoint(CurveEditorPointState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

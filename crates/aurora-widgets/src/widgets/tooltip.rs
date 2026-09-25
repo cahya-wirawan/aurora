@@ -154,7 +154,9 @@
 //! absolutely positioned child in exactly the slot a tooltip would take,
 //! `dropdown.rs`'s `list_style`), a `TabBar` (`tab_bar.rs`'s reconcile
 //! enumerates the bar's children), a `TreeView`/`TreeItem` and a
-//! `CommandPalette` (both walk their children to find rows), and the
+//! `CommandPalette` (both walk their children to find rows), the colour
+//! picker and the curve editor and their parts (each owns and reconciles
+//! its whole subtree), and the
 //! containers `Dialog`, `Panel`, `Container` and `DropdownList`, which
 //! are not controls a tooltip describes.
 //!
@@ -477,7 +479,9 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::Menu(_)
         | WidgetKind::MenuSeparator
         | WidgetKind::ColorPicker(_)
-        | WidgetKind::ColorPickerPart(_) => false,
+        | WidgetKind::ColorPickerPart(_)
+        | WidgetKind::CurveEditor(_)
+        | WidgetKind::CurveEditorPoint(_) => false,
     }
 }
 
@@ -796,8 +800,8 @@ mod tests {
     use crate::widgets::{
         CommandEntry, DialogAction, MenuItem, ScrollbarRange, WidgetKind, insert_button,
         insert_checkbox, insert_color_picker, insert_color_swatch, insert_command_palette,
-        insert_dialog, insert_dropdown, insert_scrollbar, insert_slider, insert_tab_bar,
-        insert_text_field, insert_tree_item, insert_tree_view, new_tree, open_menu,
+        insert_curve_editor, insert_dialog, insert_dropdown, insert_scrollbar, insert_slider,
+        insert_tab_bar, insert_text_field, insert_tree_item, insert_tree_view, new_tree, open_menu,
         set_dropdown_open, spacing, tab_bar_state, test_scales, type_size,
     };
     use accesskit::{Action, Role};
@@ -1218,6 +1222,8 @@ mod tests {
             WidgetKind::MenuSeparator => 18,
             WidgetKind::ColorPicker(_) => 19,
             WidgetKind::ColorPickerPart(_) => 20,
+            WidgetKind::CurveEditor(_) => 21,
+            WidgetKind::CurveEditorPoint(_) => 22,
         }
     }
 
@@ -1250,8 +1256,9 @@ mod tests {
     /// Builds one real widget of every kind — through each module's own
     /// `insert_*` where one exists, `Panel` raw as `paint.rs`'s own tests
     /// do, a real shown tooltip for `Tooltip`, and a real open menu for
-    /// `Menu` and `MenuSeparator`, and a real colour picker for
-    /// `ColorPicker` and `ColorPickerPart` — then asks
+    /// `Menu` and `MenuSeparator`, a real colour picker for
+    /// `ColorPicker` and `ColorPickerPart`, and a real curve editor for
+    /// `CurveEditor` and `CurveEditorPoint` — then asks
     /// [`Tooltip::new`] about every node in the tree.
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -1334,12 +1341,20 @@ mod tests {
         ok(insert_color_picker(
             &mut tree, root, &scales, "Colour", white, 64.0,
         ));
+        ok(insert_curve_editor(
+            &mut tree,
+            root,
+            &scales,
+            "Curve",
+            64.0,
+            aurora_core::ToneCurve::identity(),
+        ));
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 21];
+        let mut seen = [false; 23];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1358,7 +1373,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 21], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 23], "every WidgetKind was built and asked");
     }
 
     #[test]

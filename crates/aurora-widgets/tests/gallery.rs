@@ -344,6 +344,9 @@ use aurora_widgets::widgets::{
     MenuItem, MenuKey, MenuOutcome, Tooltip, handle_menu_key, insert_tab_bar, menu_state,
     open_menu, set_tab_bar_disabled, tab_bar_state,
 };
+use aurora_widgets::widgets::{
+    curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
+};
 use aurora_widgets::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline, WidgetId,
     WidgetTree, draw_paint_ops, paint_widget_ops,
@@ -7369,4 +7372,283 @@ color_picker_golden_test!(
     color_picker_gallery_matches_the_golden_image_in_color_critical_theme,
     color_critical_theme(),
     "color_picker_gallery_color_critical.png"
+);
+
+// ---- Curve editor (0.126.0) --------------------------------------------
+
+/// One curve-editor cell: `CURVE_EDITOR_PADDING` around an editor
+/// `CURVE_EDITOR_SIZE` square.
+const CURVE_EDITOR_CELL: (u32, u32) = (160, 160);
+const CURVE_EDITOR_PADDING: u32 = 16;
+const CURVE_EDITOR_SIZE: u32 = 128;
+/// Enabled, then disabled. 320 px wide keeps readback rows aligned.
+const CURVE_EDITOR_GALLERY_SIZE: (u32, u32) = (CURVE_EDITOR_CELL.0 * 2, CURVE_EDITOR_CELL.1);
+/// A gentle S-curve; point 1 is selected.
+const CURVE_EDITOR_POINTS: [(f32, f32); 4] = [(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)];
+
+/// Two editors side by side over `surface.panel` — enabled and disabled.
+fn curve_editor_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let mut root_style = sized_style(CURVE_EDITOR_GALLERY_SIZE);
+    root_style.flex_direction = FlexDirection::Row;
+    let (mut tree, root) = new_tree(root_style);
+    let points: Vec<aurora_core::CurvePoint> = CURVE_EDITOR_POINTS
+        .iter()
+        .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+        .collect();
+    let Ok(curve) = aurora_core::ToneCurve::new(&points) else {
+        unreachable!("a valid curve");
+    };
+    let mut editors = Vec::new();
+    for disabled in [false, true] {
+        let padding = length(CURVE_EDITOR_PADDING as f32);
+        let cell = match aurora_widgets::widgets::insert_container(
+            &mut tree,
+            root,
+            Style {
+                flex_direction: FlexDirection::Column,
+                padding: LayoutRect {
+                    left: padding,
+                    right: padding,
+                    top: padding,
+                    bottom: padding,
+                },
+                ..sized_style(CURVE_EDITOR_CELL)
+            },
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let editor = match insert_curve_editor(
+            &mut tree,
+            cell,
+            scales,
+            "Curve",
+            CURVE_EDITOR_SIZE as f32,
+            curve.clone(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = select_curve_point(&mut tree, editor, 1) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_curve_editor_disabled(&mut tree, editor, disabled) {
+            unreachable!("{err:?}");
+        }
+        editors.push(editor);
+    }
+    tree.compute_layout(
+        CURVE_EDITOR_GALLERY_SIZE.0 as f32,
+        CURVE_EDITOR_GALLERY_SIZE.1 as f32,
+    );
+    let [enabled, disabled] = editors.as_slice() else {
+        unreachable!("two editors");
+    };
+    (tree, [*enabled, *disabled])
+}
+
+/// `(x, y)` in curve space as an image pixel inside `editor`'s plot —
+/// the plot is the editor inset by `spacing.xs` plus the 1 px ring.
+fn curve_editor_pixel(
+    tree: &WidgetTree<WidgetKind>,
+    editor: WidgetId,
+    scales: &Scales,
+    x: f32,
+    y: f32,
+) -> (u32, u32) {
+    let Some(bounds) = tree.bounds(editor) else {
+        unreachable!("laid out");
+    };
+    let reach = scales.spacing.xs as f32 + 1.0;
+    let side = bounds.width as f32 - 2.0 * reach;
+    let px = bounds.x as f32 + reach + x * side;
+    let py = bounds.y as f32 + reach + (1.0 - y) * side;
+    #[allow(clippy::cast_sign_loss)]
+    (px as u32, py as u32)
+}
+
+fn assert_curve_editor_gallery(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    scales: &Scales,
+    theme: &Theme,
+    editors: [WidgetId; 2],
+    theme_name: &str,
+) {
+    let [enabled, disabled] = editors;
+    let rgb8 = |color: Color| to_rgb8(color.to_srgb_f32());
+    // Empty well, far from the grid, the diagonal, the curve and markers.
+    let (wx, wy) = curve_editor_pixel(tree, enabled, scales, 0.9, 0.1);
+    let well = sample_at(image, wx, wy);
+    assert!(
+        within(well, rgb8(theme.surface.sunken), 3),
+        "{theme_name}: well pixel {well:?} is not surface.sunken"
+    );
+    // The selected point's disc centre is accent.primary.
+    let (x, y) = CURVE_EDITOR_POINTS[1];
+    let (cx, cy) = curve_editor_pixel(tree, enabled, scales, x, y);
+    let disc = sample_at(image, cx, cy);
+    assert!(
+        within(disc, rgb8(theme.accent.primary), 3),
+        "{theme_name}: selected marker {disc:?} is not accent.primary"
+    );
+    // The curve: a text.primary pixel in the column at input 0.375.
+    let Ok(state) = curve_editor_state(tree, enabled) else {
+        unreachable!("an editor");
+    };
+    let at = state.curve().evaluate(0.375);
+    let (qx, qy) = curve_editor_pixel(tree, enabled, scales, 0.375, at);
+    let text = rgb8(theme.text.primary);
+    let hit = (qy - 3..=qy + 3).find(|&py| within(sample_at(image, qx, py), text, 8));
+    let Some(row) = hit else {
+        unreachable!("{theme_name}: no text.primary curve pixel near ({qx}, {qy})");
+    };
+    // The disabled editor's same curve pixel is dimmed — and dimmed by
+    // exactly `state.disabled_opacity`: text.primary blended at that
+    // alpha over the disabled editor's own (itself dimmed) well pixel,
+    // in the sRGB-encoded `Rgba8Unorm` target's own space. Checking
+    // only "not text.primary" would also pass a curve drawn in the well
+    // colour, or not drawn at all.
+    let (dx, _) = curve_editor_pixel(tree, disabled, scales, 0.375, at);
+    let dimmed = sample_at(image, dx, row);
+    assert!(
+        !within(dimmed, text, 8),
+        "{theme_name}: the disabled editor's curve must be dimmed ({dimmed:?})"
+    );
+    let (ux, uy) = curve_editor_pixel(tree, disabled, scales, 0.9, 0.1);
+    let [ur, ug, ub, _] = sample_at(image, ux, uy);
+    let under = [ur, ug, ub];
+    let alpha = theme.state.disabled_opacity;
+    let mut expected = [0_u8; 3];
+    for (i, slot) in expected.iter_mut().enumerate() {
+        let (t, u) = (
+            f32::from(text.get(i).copied().unwrap_or(0)),
+            f32::from(under.get(i).copied().unwrap_or(0)),
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            *slot = (t * alpha + u * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    assert!(
+        within(dimmed, expected, 8),
+        "{theme_name}: the disabled curve {dimmed:?} is not text.primary at \
+         state.disabled_opacity ({alpha}) over the dimmed well {under:?} (want {expected:?})"
+    );
+    assert!(
+        !within(dimmed, under, 8),
+        "{theme_name}: the disabled curve {dimmed:?} must differ from its well {under:?}"
+    );
+}
+
+macro_rules! curve_editor_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, editors) = curve_editor_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            assert_curve_editor_gallery(&image, &tree, &scales, &theme, editors, $theme_name);
+        }
+    };
+}
+
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_dark_theme,
+    dark_theme(),
+    "Dark"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_light_theme,
+    light_theme(),
+    "Light"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+curve_editor_distinct_test!(
+    render_gallery_curve_editor_paints_well_curve_and_marker_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// The curve editor's own five golden-diff tests, against goldens that
+/// **do not exist** — `#[ignore]`d, exactly as `color_picker_golden_test!`'s
+/// own doc comment records. A human blesses them (`AURORA_BLESS_GOLDEN=1
+/// cargo test -p aurora-widgets --test gallery -- --ignored`) after
+/// confirming each PNG shows two square wells with a quarter grid, a
+/// diagonal, an S-shaped curve and four ringed markers (the second one
+/// filled with the accent) — the right editor dimmed. A green headless
+/// run of the tests above proves the sampled pixels only, nothing about
+/// how the editor looks.
+macro_rules! curve_editor_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, _editors) = curve_editor_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image,
+    dark_theme(),
+    "curve_editor_gallery.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "curve_editor_gallery_light.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "curve_editor_gallery_high_contrast_dark.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "curve_editor_gallery_high_contrast_light.png"
+);
+curve_editor_golden_test!(
+    curve_editor_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "curve_editor_gallery_color_critical.png"
 );

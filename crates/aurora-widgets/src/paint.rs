@@ -8,8 +8,10 @@
 //! `ColorSwatch`,
 //! `ListRow`, `TreeItem`, `Panel`, `Dialog`, `Dropdown`,
 //! `DropdownList`, `TabBar`, `Tab`, `Tooltip`, `Menu`, `MenuSeparator`
-//! and (as of `0.125.0`) the colour picker's `ColorPickerPart` markers —
-//! solid rounded-rect shapes, the simplest of the widgets this crate has
+//! (as of `0.125.0`) the colour picker's `ColorPickerPart` markers, and
+//! (as of `0.126.0`) the whole `CurveEditor` — well, grid, diagonal,
+//! curve and markers, the first **open** strokes ([`paint_curve_editor`])
+//! — solid shapes, the simplest of the widgets this crate has
 //! (`widgets`' own doc comment). The colour picker's saturation/value
 //! square and hue strip are the first **gradients**, and reach a
 //! renderer only through [`paint_widget_ops`] (`paint_widget` returns
@@ -56,7 +58,8 @@
 //! window behind it (out of scope, see `widgets::dialog`'s own module
 //! doc comment). Every other
 //! [`WidgetKind`] (`Container` on its own, a dialog's own message node
-//! included) returns `Ok(vec![])` too — a real, deliberate "nothing to
+//! included, and a curve editor's `CurveEditorPoint` sliders) returns
+//! `Ok(vec![])` too — a real, deliberate "nothing to
 //! paint," not an error.
 //!
 //! Every kind's own geometry is built from bounds that
@@ -103,8 +106,8 @@ use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Color, Scales, Theme};
 use aurora_vector::{
-    ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Path, bilinear_rect, fill,
-    horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
+    ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Path, PathBuilder, Point,
+    bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
 };
 
 use taffy::Overflow;
@@ -113,8 +116,9 @@ use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
-    DropdownState, Hsv, ListRowState, ScrollbarState, SliderState, TabBarState, TabState,
-    TextFieldState, TreeItemState, WidgetKind, row_height,
+    CurveEditorState, DropdownState, Hsv, ListRowState, MARKER_RING_WIDTH, ScrollbarState,
+    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind, plot_rect,
+    row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -577,7 +581,12 @@ pub fn paint_widget(
         WidgetKind::ColorPickerPart(state) => {
             paint_color_picker_markers(tree, id, state, theme, scales, scale_factor)
         }
-        WidgetKind::ColorPicker(_) | WidgetKind::Container => Ok(vec![]),
+        WidgetKind::CurveEditor(state) => {
+            paint_curve_editor(tree, id, state, theme, scales, scale_factor)
+        }
+        WidgetKind::ColorPicker(_) | WidgetKind::CurveEditorPoint(_) | WidgetKind::Container => {
+            Ok(vec![])
+        }
     }
 }
 
@@ -1503,6 +1512,233 @@ fn paint_tab(
         }
     }
     Ok(paints)
+}
+
+/// The curve editor's whole paint, in order — see `curve_editor.rs`'s
+/// own module doc comment for the plot rectangle every shape after the
+/// well is drawn through ([`plot_rect`], the same function the pointer
+/// mapping uses):
+///
+/// 1. **The well**: a `scales.radius.sm` rounded rect filled with
+///    `surface.sunken` ("Inset wells", `design/tokens/vocabulary.md` —
+///    the dropdown's own control well), an unconditional
+///    `border.default` stroke, and the conditional [`control_outline`].
+///    Not [`bordered_surface`], which draws at full alpha: every shape
+///    here is dimmed by `state.disabled_opacity` when disabled.
+/// 2. **The grid**: six filled `border.default` bands, one at each
+///    quarter of the plot along each axis (vertical ones first).
+/// 3. **The identity diagonal**: a `border.default` line from the plot's
+///    bottom-left to its top-right.
+/// 4. **The curve**: a polyline through [`curve_polyline_samples`] —
+///    the `CURVE_SEGMENTS + 1` uniform samples merged with every
+///    control point's own input — stroked in `text.primary`.
+/// 5. **The markers**: per point, the colour picker's own two-ring
+///    marker (`text.primary` outside, `surface.panel` inside) around a
+///    circle of radius `spacing.xs` (fixed at insert). The **selected**
+///    point is drawn last, on top of every other marker, with an
+///    `accent.primary` filled disc beneath its rings.
+///
+/// **No curve-specific token exists** (`design/tokens/vocabulary.md` has
+/// no "plot line" or "grid" role), so `text.primary`, `border.default` and
+/// `accent.primary` are this function's own choices from the existing
+/// vocabulary, flagged to the design owner rather than invented here.
+///
+/// **Clipping** (the colour picker's precedent): the clip is applied to
+/// rects before tessellation, and a stroke cannot be cut that way, so if
+/// [`clip_to_clipping_ancestors`] changes the editor's rect at all, only
+/// the rect fills survive — the well's fill and the grid bands, each
+/// intersected with the visible rect — and every stroke (the well's
+/// border and outline, the diagonal, the curve, the markers) is dropped.
+/// A plot with no area (a tiny `size`) paints the well only; a marker
+/// radius too small to hold both rings paints no markers.
+fn paint_curve_editor(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &CurveEditorState,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    /// The grid lines' width. **Not a token**: `design/tokens/scales.toml`
+    /// has no stroke-weight scale, the same gap every `BORDER_WIDTH` in
+    /// this module records.
+    const GRID_LINE_WIDTH: f32 = 1.0;
+    /// The identity diagonal's stroke width — not a token, as above.
+    const DIAGONAL_WIDTH: f32 = 1.0;
+    /// The curve's stroke width — not a token, as above; the tab
+    /// underline's `UNDERLINE_WIDTH` weight, so the curve reads heavier
+    /// than the 1 px chrome under it. Provisional, flagged to the design
+    /// owner (Cahya, PRD FR-027 *Ownership*).
+    const CURVE_WIDTH: f32 = 2.0;
+    /// The well's border width — the same plain 1.0 logical px every
+    /// `BORDER_WIDTH` here uses.
+    const BORDER_WIDTH: f32 = 1.0;
+
+    let Some(full) = tree.bounds(id) else {
+        return Ok(vec![]);
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Ok(vec![]);
+    };
+    let clipped = visible != full;
+    let alpha = if state.disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let rgba = |color: Color| {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let (vx, vy, vw, vh) = rect_f32(visible);
+    let well = rounded_rect(vx, vy, vw, vh, scales.radius.sm as f32);
+    let mut paints = vec![(
+        fill(&well, tolerance).map_err(WidgetError::Paint)?,
+        rgba(theme.surface.sunken),
+    )];
+    if !clipped {
+        let border = stroke(&well, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        paints.push((border, rgba(theme.border.default)));
+        if let Some(outline) = control_outline(&well, theme, alpha, scale_factor)? {
+            paints.push(outline);
+        }
+    }
+    let Some((left, top, width, height)) = plot_rect(full, state.marker_radius()) else {
+        return Ok(paints);
+    };
+    let (right, bottom) = (left + width, top + height);
+    // The six grid bands, each intersected with the visible rect.
+    let half_line = GRID_LINE_WIDTH / 2.0;
+    let quarters = [0.25_f32, 0.5, 0.75];
+    let vertical = quarters.map(|q| (left + q * width - half_line, top, GRID_LINE_WIDTH, height));
+    let horizontal = quarters.map(|q| (left, top + q * height - half_line, width, GRID_LINE_WIDTH));
+    for (x, y, w, h) in vertical.into_iter().chain(horizontal) {
+        let (x0, y0) = (x.max(vx), y.max(vy));
+        let (x1, y1) = ((x + w).min(vx + vw), (y + h).min(vy + vh));
+        if let Some(mesh) = band(x0, y0, x1 - x0, y1 - y0, scale_factor)? {
+            paints.push((mesh, rgba(theme.border.default)));
+        }
+    }
+    if clipped {
+        return Ok(paints);
+    }
+    let to_screen =
+        |p: aurora_core::CurvePoint| Point::new(left + p.x * width, bottom - p.y * height);
+    let mut diagonal = PathBuilder::new();
+    diagonal
+        .move_to(Point::new(left, bottom))
+        .line_to(Point::new(right, top))
+        .end();
+    let diagonal =
+        stroke(&diagonal.build(), DIAGONAL_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    paints.push((diagonal, rgba(theme.border.default)));
+    let curve = state.curve();
+    let mut polyline = PathBuilder::new();
+    for (i, sample) in curve_polyline_samples(curve).into_iter().enumerate() {
+        let at = to_screen(sample);
+        if i == 0 {
+            polyline.move_to(at);
+        } else {
+            polyline.line_to(at);
+        }
+    }
+    polyline.end();
+    let polyline = stroke(&polyline.build(), CURVE_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    paints.push((polyline, rgba(theme.text.primary)));
+    paints.extend(curve_editor_markers(
+        state, theme, alpha, tolerance, to_screen,
+    )?);
+    Ok(paints)
+}
+
+/// [`paint_curve_editor`]'s markers, in draw order — every unselected
+/// point's two rings, then the selected point's `accent.primary` disc and
+/// rings — or none when the marker radius cannot hold both rings.
+fn curve_editor_markers(
+    state: &CurveEditorState,
+    theme: &Theme,
+    alpha: f32,
+    tolerance: f32,
+    to_screen: impl Fn(aurora_core::CurvePoint) -> Point,
+) -> Result<Vec<Paint>, WidgetError> {
+    let rgba = |color: Color| {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, alpha]
+    };
+    let curve = state.curve();
+    let mut paints = Vec::new();
+    let r = state.marker_radius();
+    if !(r.is_finite() && 2.0 * r > 2.0 * MARKER_RING_WIDTH) {
+        return Ok(vec![]);
+    }
+    let selected = state.selected();
+    let order = (0..curve.points().len())
+        .filter(|&i| i != selected)
+        .chain(std::iter::once(selected));
+    for index in order {
+        let Some(&point) = curve.points().get(index) else {
+            continue;
+        };
+        let centre = to_screen(point);
+        let outer = rounded_rect(centre.x - r, centre.y - r, 2.0 * r, 2.0 * r, r);
+        let inner_r = r - MARKER_RING_WIDTH;
+        let inner = rounded_rect(
+            centre.x - inner_r,
+            centre.y - inner_r,
+            2.0 * inner_r,
+            2.0 * inner_r,
+            inner_r,
+        );
+        if index == selected {
+            let disc = fill(&outer, tolerance).map_err(WidgetError::Paint)?;
+            paints.push((disc, rgba(theme.accent.primary)));
+        }
+        let outer = stroke(&outer, MARKER_RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        let inner = stroke(&inner, MARKER_RING_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        paints.push((outer, rgba(theme.text.primary)));
+        paints.push((inner, rgba(theme.surface.panel)));
+    }
+    Ok(paints)
+}
+
+/// How many uniform input steps [`curve_polyline_samples`] samples a
+/// curve at: 256, so a polyline segment spans one 8-bit input level or
+/// less. That alone does **not** bound the polyline's distance from the
+/// spline: a legal curve can hold intervals only `1/256` wide, and a
+/// uniform grid can straddle a whole narrow peak (a knot at `y = 1`
+/// drawn at `y = 0.5`). What makes the drawn curve pass through every
+/// control point is merging each knot's own input into the samples —
+/// between two consecutive samples the spline is one smooth Hermite
+/// piece, which a chord at most `1/256` wide follows to within a
+/// fraction of a pixel at typical panel sizes.
+const CURVE_SEGMENTS: usize = 256;
+
+/// The points [`paint_curve_editor`]'s polyline passes through, in
+/// increasing input order: `i / CURVE_SEGMENTS` for every `i` in
+/// `0..=CURVE_SEGMENTS`, merged with every control point's own `x`,
+/// deduplicated (a knot on the uniform grid adds nothing), each at
+/// `(x, curve.evaluate(x))` — so every knot is a vertex, drawn at its
+/// own exact output. At most `CURVE_SEGMENTS + 1 + MAX_POINTS - 2`
+/// samples (the endpoints are always on the grid).
+pub(crate) fn curve_polyline_samples(
+    curve: &aurora_core::ToneCurve,
+) -> Vec<aurora_core::CurvePoint> {
+    let knots = curve.points();
+    let mut xs: Vec<f32> = Vec::with_capacity(CURVE_SEGMENTS + 1 + knots.len());
+    let mut k = knots.iter().map(|p| p.x).peekable();
+    for i in 0..=CURVE_SEGMENTS {
+        let grid = i as f32 / CURVE_SEGMENTS as f32;
+        while let Some(x) = k.next_if(|&x| x < grid) {
+            xs.push(x);
+        }
+        xs.push(grid);
+    }
+    xs.extend(k);
+    xs.dedup();
+    xs.into_iter()
+        .map(|x| aurora_core::CurvePoint::new(x, curve.evaluate(x)))
+        .collect()
 }
 
 /// A colour swatch's own fill: `state.color` itself — the one widget in
