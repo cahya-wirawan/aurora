@@ -6813,9 +6813,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the nineteen
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the twenty
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no twentieth mode. The nineteen are (count corrected in
+/// no groups, no twenty-first mode. The twenty are (count corrected in
 /// 0.107.1, and again in 0.115.0, which found this sentence reading
 /// "fourteen" against a fifteen-bullet list — 0.114.0 bumped the trailing
 /// clause below to "fifteen" and the opening sentence not at all, exactly the
@@ -6831,8 +6831,9 @@ fn composite_roots_into_tile(
 /// with the `LinearLight` ones, 0.114.0 to fifteen along with the
 /// `VividLight` ones, 0.115.0 to sixteen along with the `HardMix`
 /// ones, 0.116.0 to seventeen along with the `PinLight` ones, and 0.117.0 to
-/// eighteen along with the `SoftLight` ones, and 0.118.0 to nineteen along
-/// with the `Subtract` ones — each of those last
+/// eighteen along with the `SoftLight` ones, 0.118.0 to nineteen along
+/// with the `Subtract` ones, and 0.119.0 to twenty along with the `Divide`
+/// ones — each of those last
 /// rounds bumping this sentence, the trailing clause and the closing
 /// "all N non-`Normal` modes carry a counter" line in the same edit,
 /// which is what the two prior drifts show is the only reliable way):
@@ -7119,7 +7120,7 @@ fn composite_roots_into_tile(
 ///   **all three** channels, and 0.110.0 confirmed by real measurement that
 ///   a transposed binding is observable there at effective alpha `1.0` as
 ///   well as at `0.5`. Non-unit fixture opacity is therefore
-///   sufficient-but-not-necessary for **nine of the eighteen** non-`Normal`
+///   sufficient-but-not-necessary for **ten of the nineteen** non-`Normal`
 ///   admitted modes as of
 ///   0.118.0 — `Subtract` is the ninth and the strongest of all, its
 ///   `D1 = D0` identity leaving no blind alpha to dodge at any opacity
@@ -7418,7 +7419,9 @@ fn composite_roots_into_tile(
 ///   branch-on-the-source overlay family on the GPU** (`Overlay`, `HardLight`,
 ///   `SoftLight`, `VividLight`, `LinearLight`, `PinLight`) and, at the time,
 ///   left only `Subtract` and `Divide` among the separable modes — 0.118.0
-///   ported `Subtract`, so `Divide` alone remains. Its
+///   ported `Subtract` and 0.119.0 `Divide`, so the separable set is now
+///   complete on the GPU apart from `Exclusion`, held back deliberately as
+///   `CPU_ONLY_BLEND_MODE`. Its
 ///   `aurora_render::blend_channel` arm is
 ///   `if Cs <= 0.5 { Cb - (1 - 2*Cs)*Cb*(1 - Cb) } else
 ///   { Cb + (2*Cs - 1)*(D(Cb) - Cb) }` with
@@ -7508,7 +7511,7 @@ fn composite_roots_into_tile(
 ///   of `straight_backdrop`'s `ab > 0.0` guard being deleted — predicted from
 ///   0.110.0's rule and then measured: a `NaN` `cb` survives the subtraction
 ///   and is then laundered by `max(NaN, 0.0)` on this adapter, so the count
-///   stays at six of seventeen. **The one degeneracy that matters is the
+///   stays at six of eighteen. **The one degeneracy that matters is the
 ///   sharpest rival coincidence in the file**: `Subtract` and `Difference` — a
 ///   live arm since 0.104.0 — are *bit-identical* on the entire closed
 ///   half-plane `Cb >= Cs`, because `|Cb - Cs| = max(Cb - Cs, 0)` there. That
@@ -7518,6 +7521,61 @@ fn composite_roots_into_tile(
 ///   carries exactly one such channel, and that channel alone carries its
 ///   `assert_ne!`. It reaches [`begin_gpu_composite_tile`]'s blend dispatch as
 ///   its own arm and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::Divide`] (0.119.0), composited by
+///   `aurora_render::TileCompositor::composite_divide_over_with_opacity`, the
+///   eighteenth mode ported to WGSL — **and the one that completes the
+///   separable set on the GPU apart from `Exclusion`**, which stays on the CPU
+///   path deliberately and permanently as this crate's own
+///   `CPU_ONLY_BLEND_MODE` stand-in. Read that precisely: `Exclusion` *is*
+///   separable and *is* still CPU-only, so "every separable mode is ported" is
+///   the wrong sentence; "every separable mode except `Exclusion`, which is
+///   held back on purpose" is the right one. Its
+///   `aurora_render::blend_channel` arm is
+///   `if Cs == 0 { 1 } else { min(1, Cb/Cs) }`, a single guarded division —
+///   one guard where `ColorBurn` and `ColorDodge` each have two. Its shader is
+///   a real per-channel branch rather than a componentwise `select()`, for the
+///   same reason theirs are: `select()` evaluates both arms, so it would divide
+///   on the very lane the guard exists to exclude.
+///
+///   **Three findings from its round, each stated rather than assumed.** First,
+///   **this is the first ported mode whose guard is load-bearing on *this*
+///   adapter**. Deleting it leaves `min(1, Cb/0)`, which splits three ways on
+///   the sign of `Cb`: `Cb > 0` gives `min(1, +inf) = 1`, the guard's own
+///   value; `Cb == 0` gives `min(1, NaN) = 1` here, the guard's value again;
+///   and `Cb < 0` gives `min(1, -inf) = -inf`, which is simply wrong. Only a
+///   *negative* backdrop channel can see it, so exactly one fixture in the
+///   workspace kills that mutation —
+///   `aurora_render`'s own `composite_divide_over_with_opacity_applies_its_
+///   zero_source_guard_to_a_negative_backdrop`, which reaches a negative
+///   accumulator through the `f16`-source-alpha-above-one route. Every prior
+///   mode's guards were measured *redundant* on this hardware and kept only for
+///   backends where WGSL's indeterminate-value licence might bite; this one is
+///   not. Second, **no blind alpha in `[0, 1]` for any non-negative operand
+///   pair**, and that is a closed form rather than a sweep: off the diagonal
+///   exactly one of the two orders rails to `1.0`, so
+///   `a* = D0/(D0 - D1)` collapses to `a* = M/(M - 1)` with `M = max(Cb, Cs)`,
+///   negative for every `M` in `(0, 1)`. Two exceptions, stated because
+///   0.118.1 had to walk back an unqualified version of this claim for
+///   `Subtract`: `Cb == Cs` is blind at *every* alpha (the universal set every
+///   mode has), and a negative `Cb` breaks the derivation outright and does
+///   admit real interior blind alphas (`Cb = -0.25, Cs = 0.5` is blind at
+///   `a = 1/3`). Third, it is **not** a detector of `straight_backdrop`'s guard
+///   being deleted — predicted from 0.110.0's rule and then measured, `NaN/Cs`
+///   being laundered by `min(1, NaN)` — so the count stays at six of eighteen.
+///   **Its degeneracies are the widest of any mode ported**: `B == 1` on the
+///   entire closed half-plane `Cb >= Cs`, so a railed channel carries no
+///   operand information at all, and a railed channel with `Cb + Cs >= 1` is
+///   simultaneously indistinguishable from `ColorDodge`, `LinearDodge` **and**
+///   `HardMix`, all three live arms. `Divide` also *is* `ColorDodge` wherever a
+///   channel's source is exactly `0.5`. `NORMAL_MULTIPLY_DIVIDE_STACK`'s two
+///   (plain backticks, that const being `cfg(test)` — an intra-doc link to it is
+///   a `rustdoc::private_intra_doc_links` error under CI's `-D warnings`, the
+///   same reason the `SoftLight` and `Subtract` bullets above use them)
+///   railed channels therefore both keep `Cb + Cs < 1` and its unclamped
+///   channel's source is `0.75`, which is what makes its `assert_ne!` against
+///   `ColorDodge` a three-channel claim instead of none. It reaches
+///   [`begin_gpu_composite_tile`]'s blend dispatch as its own arm and shares
+///   the *same single* `spare` ping-pong accumulator.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -7537,7 +7595,7 @@ fn composite_roots_into_tile(
 ///   paths_agree_on_a_dissolve_blend_document` pins that on real
 ///   hardware.
 ///
-/// **All eighteen non-`Normal` modes above carry a GPU dispatch counter**, as
+/// **All nineteen non-`Normal` modes above carry a GPU dispatch counter**, as
 /// of 0.103.0, which retrofitted one onto each of the five admitted then
 /// (and `Difference` has carried one from its own first round in 0.104.0,
 /// `LinearDodge` from its own in 0.105.0, `LinearBurn` from its own in
@@ -7545,22 +7603,25 @@ fn composite_roots_into_tile(
 /// in 0.108.0, `Overlay` from its own in 0.110.0, `HardLight` from its own
 /// in 0.111.0, `LinearLight` from its own in 0.113.0, `VividLight` from its
 /// own in 0.114.0, `HardMix` from its own in 0.115.0, `PinLight` from its own
-/// in 0.116.0, `SoftLight` from its own in 0.117.0 and `Subtract` from its own
-/// in 0.118.0 — deliberately stated
+/// in 0.116.0, `SoftLight` from its own in 0.117.0, `Subtract` from its own
+/// in 0.118.0 and `Divide` from its own in 0.119.0 — deliberately stated
 /// without
 /// ordinals, because "counter acquired Nth" and the bullets' own "Nth
 /// mode ported to WGSL" are two different orderings that disagree by
 /// one, `Normal` being ported but uncounted) — the
 /// per-mode bullets deliberately no longer say so one at
 /// a time, because as of that round it is true of every one of them and
-/// repeating it eighteen times only invites the list to drift out of step
+/// repeating it nineteen times only invites the list to drift out of step
 /// again. `GpuBlendDispatches` is the single place that convention, and
 /// the gap it closes, is documented. `Normal` itself is deliberately
 /// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 8 blend modes — 27 `aurora_doc::BlendMode`
-/// variants minus the nineteen admitted above; the figure was left at 13
+/// layer at any of the other 7 blend modes (`Exclusion` plus the six
+/// non-separable ones, so **every separable mode except `Exclusion` is now
+/// admitted** — `Exclusion` is separable and is still rejected on purpose,
+/// as this crate's own `CPU_ONLY_BLEND_MODE`) — 27 `aurora_doc::BlendMode`
+/// variants minus the twenty admitted above; the figure was left at 13
 /// through 0.114.0, corrected in 0.114.1, and re-derived each round since)
 /// routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
@@ -7604,6 +7665,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                             | aurora_doc::BlendMode::PinLight
                             | aurora_doc::BlendMode::SoftLight
                             | aurora_doc::BlendMode::Subtract
+                            | aurora_doc::BlendMode::Divide
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -8018,6 +8080,7 @@ enum GpuBlendDispatch {
     PinLight,
     SoftLight,
     Subtract,
+    Divide,
     #[cfg(test)]
     Dissolve,
 }
@@ -8040,9 +8103,11 @@ impl GpuBlendDispatch {
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
     /// new variant is added to. The fixed `[Self; 17]` length is part of
-    /// that signal: a nineteenth variant cannot be appended here without
+    /// that signal: a twentieth variant cannot be appended here without
     /// the author also editing the count, and the test asserts the same
-    /// `18` as a literal so the expectation is stated in both places.
+    /// `19` as a literal so the expectation is stated in both places.
+    /// (0.118.0 left that assertion's *message* reading "the seventeen
+    /// variants" against its own `18`; corrected here along with the bump.)
     ///
     /// **As of 0.112.0 this length is no longer the only check on it, and
     /// prose elsewhere should name the two tests below rather than restate
@@ -8076,7 +8141,8 @@ impl GpuBlendDispatch {
     /// `HardMix` in 0.115.0 from `[Self; 14]` to `[Self; 15]`, and `PinLight`
     /// in 0.116.0 from `[Self; 15]` to `[Self; 16]`, and `SoftLight`
     /// in 0.117.0 from `[Self; 16]` to `[Self; 17]`, and `Subtract`
-    /// in 0.118.0 from `[Self; 17]` to `[Self; 18]`, with the
+    /// in 0.118.0 from `[Self; 17]` to `[Self; 18]`, and `Divide`
+    /// in 0.119.0 from `[Self; 18]` to `[Self; 19]`, with the
     /// test's own literal the only other place to touch each time. **Both
     /// halves of that belong in one edit**: 0.107.1 had to correct a round
     /// that left this prose quoting one length while the literal below read
@@ -8089,7 +8155,7 @@ impl GpuBlendDispatch {
     ///
     /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
     /// why that one variant is test-only.
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::Multiply,
         Self::Darken,
         Self::Lighten,
@@ -8107,6 +8173,7 @@ impl GpuBlendDispatch {
         Self::PinLight,
         Self::SoftLight,
         Self::Subtract,
+        Self::Divide,
         Self::Dissolve,
     ];
 }
@@ -8286,6 +8353,7 @@ struct GpuBlendDispatches {
     pin_light: std::sync::atomic::AtomicU64,
     soft_light: std::sync::atomic::AtomicU64,
     subtract: std::sync::atomic::AtomicU64,
+    divide: std::sync::atomic::AtomicU64,
     dissolve: std::sync::atomic::AtomicU64,
 }
 
@@ -8314,6 +8382,7 @@ impl GpuBlendDispatches {
             pin_light: std::sync::atomic::AtomicU64::new(0),
             soft_light: std::sync::atomic::AtomicU64::new(0),
             subtract: std::sync::atomic::AtomicU64::new(0),
+            divide: std::sync::atomic::AtomicU64::new(0),
             dissolve: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -8349,6 +8418,7 @@ impl GpuBlendDispatches {
             GpuBlendDispatch::PinLight => &self.pin_light,
             GpuBlendDispatch::SoftLight => &self.soft_light,
             GpuBlendDispatch::Subtract => &self.subtract,
+            GpuBlendDispatch::Divide => &self.divide,
             GpuBlendDispatch::Dissolve => &self.dissolve,
         }
     }
@@ -10008,7 +10078,7 @@ fn begin_gpu_composite_tile(
             // carries `0.5` on its `ColorDodge` layer, because
             // `TRANSPOSE_COVERAGE`'s guard is deliberately not
             // special-cased for either asymmetric mode: non-unit opacity
-            // is now sufficient-but-not-necessary for eight of the seventeen
+            // is now sufficient-but-not-necessary for ten of the nineteen
             // non-`Normal` admitted modes
             // (`Overlay`, 0.110.0, and `HardLight`, 0.111.0, joined them
             // conditionally; `LinearLight`, 0.113.0, and `VividLight`,
@@ -10086,7 +10156,7 @@ fn begin_gpu_composite_tile(
             // `0.5` on its `Overlay` layer, because `TRANSPOSE_COVERAGE`'s
             // guard is deliberately not special-cased for any of the seven
             // asymmetric modes: non-unit opacity is now
-            // sufficient-but-not-necessary for eight of the seventeen
+            // sufficient-but-not-necessary for ten of the nineteen
             // non-`Normal` admitted modes (`SoftLight`, 0.117.0, being the
             // eighth and the seventeenth), and a
             // conservative guard that still demands it costs nothing.
@@ -10551,12 +10621,77 @@ fn begin_gpu_composite_tile(
                 note_gpu_blend_dispatch(GpuBlendDispatch::Subtract);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // `Divide` (0.119.0), the eighteenth mode ported and the last
+            // separable one to reach the GPU apart from `Exclusion`, which is
+            // held back deliberately as this crate's standing CPU-fallback
+            // fixture (`CPU_ONLY_BLEND_MODE`). Formula:
+            // `if Cs == 0 { 1 } else { min(1, Cb/Cs) }`, a single guarded
+            // division. Same ping-pong shape as every arm above.
+            //
+            // **The wrong-arm hazard here is lexically nil and arithmetically
+            // the widest on this path.** No other `composite_*_over_with_opacity`
+            // name is a plausible typo for this one. What collides is behaviour,
+            // in two nested ways: `composite_color_dodge_over_with_opacity`
+            // computes bit-identical pixels in any channel whose source is
+            // exactly `0.5` (`Cb/Cs` against `Cb/(1 - Cs)`), and -- far wider --
+            // `composite_color_dodge_over_with_opacity`,
+            // `composite_linear_dodge_over_with_opacity` **and**
+            // `composite_hard_mix_over_with_opacity` *all three* return `1.0`
+            // wherever this mode rails with `Cb + Cs >= 1`, which is most of the
+            // upper-right of the unit square. `NORMAL_MULTIPLY_DIVIDE_STACK`'s
+            // two railed channels both have `Cb + Cs < 1` for exactly that
+            // reason, and its unclamped channel's source is `0.75` rather than
+            // `0.5`; `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_
+            // divide_blend_document`'s `assert_ne!` names `ColorDodge`
+            // specifically, the structural rival, rather than a lexical
+            // near-name. Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            //
+            // `&src_view` first, `&current_accumulator.1` second: the
+            // compositor method's signature is `(src, backdrop, dst)`, and
+            // transposing the first two is a live mutation this round runs for
+            // real. **This mode has no blind alpha in `[0, 1]` for any
+            // non-negative operand pair, and that is a closed-form result rather
+            // than a fixture property.** Off the diagonal exactly one of the two
+            // orders rails to `1.0` (`Cb/Cs <= 1` and `Cs/Cb <= 1` can hold
+            // together only at `Cb == Cs`), and substituting that into
+            // `a* = D0/(D0 - D1)` collapses to `a* = M/(M - 1)` with
+            // `M = max(Cb, Cs)` -- negative for every `M` in `(0, 1)`, hence
+            // never a reachable opacity. Two exceptions, stated rather than
+            // elided: `Cb == Cs` is blind at *every* alpha (the universal set
+            // every mode here has, and this fixture has no such channel), and a
+            // *negative* `Cb` -- reachable through `straight_backdrop`'s
+            // deliberate lack of clamping -- breaks the derivation outright and
+            // does admit real interior blind alphas (`Cb = -0.25, Cs = 0.5` is
+            // blind at `a = 1/3`). `NORMAL_MULTIPLY_DIVIDE_STACK` is entirely
+            // in-gamut, so the transpose is caught in all three channels at
+            // `0.5` and at `1.0`; `TRANSPOSE_COVERAGE`'s arithmetic assertion
+            // (0.113.1) is what measures that.
+            aurora_render::BlendMode::Divide => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_divide_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::Divide);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
             // `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
             // `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`,
             // `HardLight`, `LinearLight`, `VividLight`, `HardMix`,
-            // `PinLight`, `SoftLight`, `Subtract`
+            // `PinLight`, `SoftLight`, `Subtract`, `Divide`
             // and `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
@@ -10778,12 +10913,15 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// the other **8** blend modes and group isolation on the GPU. That 8
+/// the other **7** blend modes and group isolation on the GPU. That 7
 /// is the app-level count — 27 real `aurora_doc::BlendMode` variants
-/// minus the nineteen the predicate admits (both figures were stale by one
+/// minus the twenty the predicate admits (both figures were stale by one
 /// before 0.118.0 read them, `SoftLight`'s round having left them at 10 and
-/// seventeen) — and closing it would need the
-/// remaining **9** blend formulas ported to WGSL, which is
+/// seventeen), and it is now exactly `Exclusion` plus the six
+/// non-separable modes: **every separable mode except `Exclusion` is on the
+/// GPU as of 0.119.0**, `Exclusion` being separable and still CPU-only
+/// deliberately, as `CPU_ONLY_BLEND_MODE` — and closing it would need the
+/// remaining **8** blend formulas ported to WGSL, which is
 /// `aurora-render`'s own count over its own 26-variant enum; the one
 /// mode between the two figures is `Normal`, which needs no formula
 /// because the fixed-function unit already expresses it, and `Dissolve`
@@ -28971,14 +29109,17 @@ mod tests {
         );
     }
 
-    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 8 modes the GPU
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 7 modes the GPU
     /// path still cannot express" (27 `aurora_doc::BlendMode` variants
-    /// minus the nineteen admitted as of 0.118.0: `Normal`, `Multiply`,
+    /// minus the twenty admitted as of 0.119.0: `Normal`, `Multiply`,
     /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`,
     /// `LinearBurn`, `ColorBurn`, `ColorDodge`, `Overlay`, `HardLight`,
     /// `LinearLight`, `VividLight`, `HardMix`, `PinLight`, `SoftLight`,
-    /// `Subtract` and
-    /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
+    /// `Subtract`, `Divide` and
+    /// `Dissolve`). **As of 0.119.0 those 7 are `Exclusion` plus the six
+    /// non-separable modes**, so `Exclusion` is the *only* separable mode
+    /// still on the CPU path — and deliberately so, permanently, precisely
+    /// because this const needs one. It has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
     /// `Multiply`, which 0.84.0 moved to the *admitted* side, and then
@@ -29006,7 +29147,11 @@ mod tests {
     /// **0.117.0's `SoftLight` takes it to 9 of 27 against eighteen admitted**,
     /// updated in that port's own commit rather than in a follow-up —
     /// **and 0.118.0's `Subtract` takes it to 8 of 27 against nineteen
-    /// admitted**, likewise in its own commit.
+    /// admitted**, likewise in its own commit. **0.119.0's `Divide` takes it
+    /// to 7 of 27 against twenty admitted**, likewise — and that is where it
+    /// stops moving for the separable modes: the 7 left are `Exclusion` and the
+    /// six non-separable ones, and `Exclusion` stays rejected on purpose so
+    /// this const has something to name.
     #[test]
     fn document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -29948,10 +30093,13 @@ mod tests {
     /// Deliberately `Subtract`, and deliberately none of its neighbours, each of
     /// which must still stay disqualified:
     ///
-    /// - `Divide` (a guarded division), **now the only separable mode left**
-    ///   and the obvious next candidate — it reuses nothing this round built,
-    ///   its formula being the one remaining shape (a guarded reciprocal) that
-    ///   this mode's single subtraction has nothing in common with;
+    /// - `Divide` (a guarded division), **the only separable mode left at the
+    ///   time of that round** and the obvious next candidate — it reuses nothing
+    ///   this round built, its formula being the one remaining shape (a guarded
+    ///   reciprocal) that this mode's single subtraction has nothing in common
+    ///   with. 0.119.0 ported it and admitted it at the predicate, so this
+    ///   bullet is historical: `Divide` is *no longer* on the rejected side,
+    ///   and the `assert!` below does not test it;
     /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
     ///   pinned on the rejected side by
     ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
@@ -30004,6 +30152,81 @@ mod tests {
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
             "a root-level Subtract pixel layer must qualify for the GPU path as of 0.118.0"
+        );
+    }
+
+    /// **The eighteenth ported mode, and the one that completes the separable
+    /// set on the GPU apart from `Exclusion`** (0.119.0): `Divide` is
+    /// expressible on the GPU path (`composite_divide_over_with_opacity`), so a
+    /// root-level `Divide` pixel layer must *not* disqualify the document. Pins
+    /// the twentieth `matches!` alternative directly and headlessly.
+    ///
+    /// **State the milestone precisely, because the obvious short form is
+    /// false.** `Exclusion` *is* a separable mode and *is* still CPU-only, so
+    /// "all separable modes are now on the GPU" and "no separable modes remain"
+    /// are both wrong. The true statement is: **every separable mode except
+    /// `Exclusion` is now admitted at the predicate, and `Exclusion` is held
+    /// back on purpose — permanently — because [`CPU_ONLY_BLEND_MODE`] needs a
+    /// real, 1:1-translatable, genuinely rejected mode to stand in for the CPU
+    /// fallback path.** With `Divide` admitted the set stands at twenty of
+    /// twenty-seven, and the seven rejected are `Exclusion` plus the six
+    /// non-separable modes.
+    ///
+    /// Deliberately `Divide`, and deliberately none of the seven that must still
+    /// stay disqualified:
+    ///
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore already
+    ///   pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as every
+    ///   round since 0.104.0 except `Screen`'s has — so both PLAN.md-tracked
+    ///   CPU-fallback benchmarks stay comparable across it and no fixture needed
+    ///   retargeting. It is now the *only* separable mode on that side, which
+    ///   makes leaving it alone a standing decision rather than a deferral;
+    /// - the six non-separable modes (`Hue`, `Saturation`, `Color`,
+    ///   `Luminosity`, `DarkerColor`, `LighterColor`), which no per-channel
+    ///   blend term can express at all, and which are therefore permanently
+    ///   CPU-only unless a whole-triple shader path is built.
+    ///
+    /// Note `ColorDodge`, `LinearDodge` and `HardMix` are **not** in that list,
+    /// and together they are this round's central hazard rather than a passing
+    /// resemblance. All three have been admitted for rounds, and all three
+    /// return `1.0` wherever this mode rails *and* `Cb + Cs >= 1` — and
+    /// `Divide` is outright bit-identical to `ColorDodge` in any channel whose
+    /// source is exactly `0.5` (`Cb/Cs` against `Cb/(1 - Cs)`). The hazard is a
+    /// wrong `fragment_entry` or a wrong `composite_*` call, not one leaking
+    /// onto the GPU path, and which channels can see it is settled by
+    /// construction: [`NORMAL_MULTIPLY_DIVIDE_STACK`]'s two railed channels keep
+    /// `Cb + Cs` below `1.0` and its unclamped channel's source is `0.75`, which
+    /// is why its `assert_ne!` against `ColorDodge` separates all three channels
+    /// rather than none.
+    ///
+    /// Headless and pure — the GPU-vs-CPU differential
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_
+    /// document` is what checks the resulting composite is actually right, and
+    /// the counter assertion inside it is what checks the GPU arm ran at all.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_divide_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Divide) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Divide pixel layer must qualify for the GPU path as of 0.119.0"
         );
     }
 
@@ -32117,6 +32340,74 @@ mod tests {
         ),
     ];
 
+    /// [`recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_document`]'s
+    /// fixture (0.119.0) — a three-layer `Normal`/`Multiply`/`Divide` root stack,
+    /// the eighteenth mode ported and the last separable one to reach the GPU
+    /// apart from [`CPU_ONLY_BLEND_MODE`].
+    ///
+    /// After `l1` (`Normal`, `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, `0.75`
+    /// grey) the accumulator is `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0`.
+    /// Against `Cs = (0.25, 0.75, 0.03125)` the raw ratios are
+    /// `(2.625, 0.5, 6)`, so `B = (1, 0.5, 1)` — **red and blue railed, green
+    /// unclamped** — and `l3`'s own opacity `0.5` folds that in as
+    /// `0.5*Cb + 0.5*B`, giving the golden
+    /// `(0.828125, 0.4375, 0.59375, 1.0)`: `53/64`, `7/16` and `19/32`, all exact
+    /// in `f16`.
+    ///
+    /// **Chosen against this mode's degeneracies, per channel, and one of those
+    /// choices is load-bearing in a way no prior fixture's was.** `B == 1` on the
+    /// whole closed half-plane `Cb >= Cs`, so a railed channel carries *no*
+    /// operand information at all; worse, a railed channel with `Cb + Cs >= 1` is
+    /// **simultaneously indistinguishable from `ColorDodge`, `LinearDodge` and
+    /// `HardMix`**, all three live GPU dispatch arms returning `1.0` there. Red's
+    /// and blue's sums are `0.90625` and `0.21875`, both strictly below `1.0`, so
+    /// all three rivals are separated in both railed channels. Green, the
+    /// unclamped one, has `Cs = 0.75` rather than `0.5`, which is exactly where
+    /// `Divide` and `ColorDodge` coincide (`Cb/Cs` against `Cb/(1 - Cs)`). No
+    /// channel has `Cb == Cs` (`B == 1` both ways round and blind at every
+    /// alpha), none has `Cs == 1` (a total no-op shared with `Darken` and
+    /// `ColorBurn`), none has `Cb == 0` or `Cs == 0`.
+    ///
+    /// **The transpose is caught in all three channels, at `0.5` and at `1.0`.**
+    /// This mode's blind alpha, where one exists, is
+    /// `a* = M/(M - 1)` with `M = max(Cb, Cs)` — derived by substituting
+    /// `B(Cb, Cs) = 1`, `B(Cs, Cb) = Cs/Cb` (off the diagonal exactly one order
+    /// rails) into `a* = D0/(D0 - D1)` and cancelling `(Cb - Cs)`. For this
+    /// fixture that is `-1.909..`, `-3` and `-0.230..` per channel: all negative,
+    /// so **no reachable opacity is blind**. Measured, not merely derived: the
+    /// correct fold is `(0.828125, 0.4375, 0.59375, 1.0)` and the transposed one
+    /// `(0.31543.., 0.875, 0.09894..)`, per-channel gaps of
+    /// `(+0.5127.., -0.4375, +0.4948..)`, and at opacity `1.0` the two are
+    /// `(1.0, 0.5, 1.0)` against `(0.38086.., 1.0, 0.16663..)`.
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]
+    /// compares magnitudes, folding through `f32::abs`.
+    ///
+    /// **The `Divide` layer sits at opacity `0.5`** because that guard requires
+    /// it and is deliberately not special-cased for this mode. For this fixture
+    /// the demand is sufficient-but-not-necessary — the closed form above says no
+    /// opacity could dodge the transpose here — but it is still what keeps the
+    /// fold itself under test by making the golden differ from `B`.
+    const NORMAL_MULTIPLY_DIVIDE_STACK: [StackEntry; 3] = [
+        (
+            "l1",
+            aurora_doc::BlendMode::Normal,
+            1.0,
+            [0.875, 0.5, 0.25, 1.0],
+        ),
+        (
+            "l2",
+            aurora_doc::BlendMode::Multiply,
+            1.0,
+            [0.75, 0.75, 0.75, 1.0],
+        ),
+        (
+            "l3",
+            aurora_doc::BlendMode::Divide,
+            0.5,
+            [0.25, 0.75, 0.031_25, 1.0],
+        ),
+    ];
+
     /// **Which fixture makes which GPU blend-math dispatch arm's argument
     /// order observable** (0.105.3) — `(mode, the test that composites
     /// this fixture, the fixture itself)`, and the input to
@@ -32222,6 +32513,11 @@ mod tests {
             "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_subtract_blend_document",
             &NORMAL_MULTIPLY_SUBTRACT_STACK,
         ),
+        (
+            aurora_doc::BlendMode::Divide,
+            "recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_document",
+            &NORMAL_MULTIPLY_DIVIDE_STACK,
+        ),
     ];
 
     /// The `aurora_doc` blend mode each [`GpuBlendDispatch`] counter is
@@ -32247,6 +32543,7 @@ mod tests {
             GpuBlendDispatch::PinLight => aurora_doc::BlendMode::PinLight,
             GpuBlendDispatch::SoftLight => aurora_doc::BlendMode::SoftLight,
             GpuBlendDispatch::Subtract => aurora_doc::BlendMode::Subtract,
+            GpuBlendDispatch::Divide => aurora_doc::BlendMode::Divide,
             GpuBlendDispatch::Dissolve => aurora_doc::BlendMode::Dissolve,
         }
     }
@@ -33118,8 +33415,8 @@ mod tests {
         // sources on both sides still has to acknowledge the change here.
         assert_eq!(
             modes.len(),
-            18,
-            "GpuBlendDispatch::ALL no longer has the seventeen variants this test was written \
+            19,
+            "GpuBlendDispatch::ALL no longer has the nineteen variants this test was written \
              against \
              -- if a mode was added, that is expected: bump this literal. If a mode was added to \
              the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
@@ -36731,6 +37028,231 @@ mod tests {
              with the wrong arm running. GREEN ALONE carries this claim: it is the fixture's only \
              channel with Cb < Cs, and red and blue agree with Difference exactly. Expected \
              (0.53125, 0.375, 0.171875, 1.0) from the substituted run."
+        );
+    }
+
+    /// **`Divide` end to end through the real caller** (0.119.0), the eighteenth
+    /// mode ported and the last separable one to reach the GPU apart from
+    /// [`CPU_ONLY_BLEND_MODE`]: a three-layer `Normal`/`Multiply`/`Divide` root
+    /// stack ([`NORMAL_MULTIPLY_DIVIDE_STACK`]) composited on real hardware, with
+    /// the `Divide` layer sampling a backdrop a `Multiply` pass wrote into the
+    /// accumulator and reusing the spare accumulator that pass created.
+    ///
+    /// **The derivation, per channel.** After `l1` (`Normal`, opacity `1.0`,
+    /// `(0.875, 0.5, 0.25)`) and `l2` (`Multiply`, opacity `1.0`, `0.75` grey)
+    /// the accumulator is `Cb = (0.65625, 0.375, 0.1875)` at alpha `1.0`. Against
+    /// `Cs = (0.25, 0.75, 0.03125)`, `B = min(Cb/Cs, 1)` is:
+    ///
+    /// - red: raw ratio `2.625`, **railed**, `B = 1`;
+    /// - green: raw ratio `0.5`, unclamped, `B = 0.5`;
+    /// - blue: raw ratio `6`, **railed**, `B = 1`.
+    ///
+    /// The `Divide` layer's own opacity `0.5` folds that in as `0.5*Cb + 0.5*B`,
+    /// giving the golden `(0.828125, 0.4375, 0.59375, 1.0)` — `53/64`, `7/16` and
+    /// `19/32`, all exact in `f16`.
+    ///
+    /// **Four** independent guards, the same four every sibling carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong arm fails outright;
+    /// - the [`GpuBlendDispatch::Divide`] count, which is what distinguishes "the
+    ///   `Divide` arm ran on the GPU" from "it silently fell back to the CPU,
+    ///   which computes the same correct pixels" — historically the one mutation
+    ///   in a round like this that nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack with
+    ///   `Divide` replaced by **`ColorDodge`** must composite to something
+    ///   *different*. `ColorDodge` is not one choice among several; it is the
+    ///   structural rival. The two modes are bit-identical in any channel whose
+    ///   source is exactly `0.5` (`Cb/Cs` against `Cb/(1 - Cs)`), and — far wider
+    ///   — `ColorDodge`, `LinearDodge` and `HardMix` all return `1.0` wherever
+    ///   this mode rails with `Cb + Cs >= 1`, which is why this fixture's two
+    ///   railed channels both keep that sum below `1.0`. The substitution gives
+    ///   `(0.765625, 0.6875, 0.19055..)` against the golden's
+    ///   `(0.828125, 0.4375, 0.59375)` — **all three channels separate it**, which
+    ///   is only true because of those two fixture choices.
+    ///
+    /// **Every plausible wrong arm, re-derived in exact rationals for this
+    /// fixture** (each is `0.5 * Cb + 0.5 * B` for that mode's own `B`):
+    /// `Normal` `(0.453125, 0.5625, 0.109375)`, `Multiply`
+    /// `(0.41015625, 0.328125, 0.0966796875)`, `Darken`
+    /// `(0.453125, 0.375, 0.109375)`, `Lighten` `(0.65625, 0.5625, 0.1875)`,
+    /// `Screen` `(0.69921875, 0.609375, 0.2001953125)`, `Difference`
+    /// `(0.53125, 0.375, 0.171875)`, `Exclusion`
+    /// `(0.6171875, 0.46875, 0.197265625)`, `Subtract`
+    /// `(0.53125, 0.1875, 0.171875)`, `ColorDodge`
+    /// `(0.765625, 0.6875, 0.19055..)`, `LinearDodge`
+    /// `(0.78125, 0.6875, 0.203125)`, `ColorBurn`
+    /// `(0.328125, 0.27075.., 0.09375)`, `LinearBurn`
+    /// `(0.328125, 0.25, 0.09375)`, `Overlay`
+    /// `(0.5703125, 0.46875, 0.099609375)`, `SoftLight`
+    /// `(0.59961.., 0.43433.., 0.11609..)`, `HardLight`
+    /// `(0.4921875, 0.53125, 0.099609375)`, `VividLight`
+    /// `(0.484375, 0.5625, 0.09375)`, `LinearLight`
+    /// `(0.40625, 0.625, 0.09375)`, `PinLight` `(0.578125, 0.4375, 0.125)` and
+    /// `HardMix` `(0.328125, 0.6875, 0.09375)` — **`PinLight` is the only rival
+    /// that coincides in any channel, and only in green**, where its
+    /// `Lighten(0.375, 0.5)` happens to be this mode's `0.5` too. A **dropped
+    /// `min`** gives `(1.640625, 0.4375, 3.09375)`, out of range in two channels;
+    /// this test sees that because [`read_first_texel`] reads the composited `f16`
+    /// back unclamped, unlike `aurora_render`'s own whole-tile 8-bit comparisons.
+    ///
+    /// **A transposed `src`/`backdrop` dispatch arm is caught in all three
+    /// channels, and this mode has no reachable blind alpha for a non-negative
+    /// operand pair.** Off the diagonal exactly one of the two orders rails
+    /// (`Cb/Cs <= 1` and `Cs/Cb <= 1` can hold together only at `Cb == Cs`), so
+    /// substituting `B(Cb, Cs) = 1` and `B(Cs, Cb) = Cs/Cb` into
+    /// `a* = D0/(D0 - D1)` and cancelling `(Cb - Cs)` gives the closed form
+    /// `a* = M/(M - 1)` with `M = max(Cb, Cs)` — negative for every `M` in
+    /// `(0, 1)`, here `-1.909..`, `-3` and `-0.230..`. **Two exceptions, stated
+    /// because "no blind alpha at all" would be the overclaim 0.118.1 had to walk
+    /// back for `Subtract`:** `Cb == Cs` makes `B = 1` both ways and is blind at
+    /// *every* alpha (the universal set every mode has; this fixture has no such
+    /// channel), and a **negative `Cb`** — reachable because `straight_backdrop`
+    /// does not clamp — breaks the derivation outright, neither order railing, and
+    /// does admit real interior blind alphas (`Cb = -0.25, Cs = 0.5` is blind at
+    /// exactly `a = 1/3`). This fixture is entirely in-gamut.
+    ///
+    /// [`solid_stack_texel_cpu`] folded both ways gives
+    /// `(0.828125, 0.4375, 0.59375, 1.0)` against
+    /// `(0.31543.., 0.875, 0.09894.., 1.0)` — per-channel gaps of
+    /// `(+0.5127.., -0.4375, +0.4948..)`, green's negative — and at opacity `1.0`
+    /// `(1.0, 0.5, 1.0)` against `(0.38086.., 1.0, 0.16663..)`. Magnitudes are
+    /// what
+    /// [`every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`]'s
+    /// third assertion measures, since it folds through `f32::abs`.
+    ///
+    /// Vulkan/NVIDIA only, like every GPU test here. Metal and DX12 remain
+    /// unverified for `fs_composite_divide`, and **for this mode that gap is
+    /// sharper than for any mode since `ColorDodge`**: the `cs == 0.0` guard's
+    /// redundancy at `cb >= 0` rests on this adapter dividing by zero to `+inf`
+    /// and on `min(1.0, NaN)` returning `1.0`, neither of which WGSL specifies —
+    /// it calls the quotient an *indeterminate value* and leaves `min` on a `NaN`
+    /// operand undefined. So on an unverified backend the guard could be
+    /// load-bearing at `cb >= 0` as well. It is genuinely load-bearing *here* at
+    /// `cb < 0`, which is what
+    /// `aurora_render`'s own
+    /// `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_a_negative_backdrop`
+    /// measures — the first guard in this whole porting series that no backend
+    /// could find dispensable.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack = NORMAL_MULTIPLY_DIVIDE_STACK;
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Divide root stack must qualify for the GPU path as of \
+             0.119.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion below
+        // reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Divide);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Divide` layer, dispatched once for the one
+        // tile it actually has content at. `solid_root_stack` fills only tile
+        // `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256 residency viewport marks
+        // four tiles visible at `TILE` = 256, and the other three resolve nothing
+        // at all, taking `begin_gpu_composite_tile`'s `current?` bail before any
+        // blend pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists for** --
+        // see `GpuBlendDispatches`, and PLAN.md's 0.119.0 mutation-testing record.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::Divide),
+            1,
+            "the Divide layer must have dispatched a real GPU blend pass on the one visible tile \
+             that has stored content -- 0 means the dispatch arm is gone and every assertion \
+             below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Divide document (the Divide layer sampling a backdrop \
+             a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.828_125, 0.4375, 0.59375, 1.0),
+            "0.5*Cb + 0.5*min(Cb/Cs, 1) must come out of the GPU path itself: \
+             Cb = (0.65625, 0.375, 0.1875) and Cs = (0.25, 0.75, 0.03125), so the raw ratios are \
+             (2.625, 0.5, 6) and B = (1, 0.5, 1) -- RED AND BLUE ARE THE RAILED CHANNELS, and both \
+             keep Cb + Cs below 1.0 (0.90625 and 0.21875) because a railed channel with \
+             Cb + Cs >= 1 is indistinguishable from ColorDodge, LinearDodge AND HardMix at once. \
+             Green is unclamped with Cs = 0.75, not 0.5, which is exactly where Divide IS \
+             ColorDodge. ColorDodge gives (0.765625, 0.6875, 0.19055, 1.0) -- separated in all \
+             three channels, which is only true because of those two choices. A DROPPED min gives \
+             (1.640625, 0.4375, 3.09375, 1.0), out of range in two channels and visible here only \
+             because this readback is unclamped f16. (0.453125, 0.5625, 0.109375, 1.0) is the \
+             Normal arm, (0.41015625, 0.328125, 0.0966796875, 1.0) Multiply, \
+             (0.453125, 0.375, 0.109375, 1.0) Darken, (0.65625, 0.5625, 0.1875, 1.0) Lighten, \
+             (0.69921875, 0.609375, 0.2001953125, 1.0) Screen, \
+             (0.53125, 0.375, 0.171875, 1.0) Difference, \
+             (0.6171875, 0.46875, 0.197265625, 1.0) Exclusion, \
+             (0.53125, 0.1875, 0.171875, 1.0) Subtract, (0.78125, 0.6875, 0.203125, 1.0) \
+             LinearDodge, (0.328125, 0.27075, 0.09375, 1.0) ColorBurn, \
+             (0.328125, 0.25, 0.09375, 1.0) LinearBurn, \
+             (0.5703125, 0.46875, 0.099609375, 1.0) Overlay, \
+             (0.59961, 0.43433, 0.11609, 1.0) SoftLight, \
+             (0.4921875, 0.53125, 0.099609375, 1.0) HardLight, \
+             (0.484375, 0.5625, 0.09375, 1.0) VividLight, (0.40625, 0.625, 0.09375, 1.0) \
+             LinearLight, (0.578125, 0.4375, 0.125, 1.0) PinLight and \
+             (0.328125, 0.6875, 0.09375, 1.0) HardMix -- PinLight being the ONLY rival that \
+             coincides in any channel, and only in green. A dispatch arm that transposed src and \
+             backdrop folds on the CPU to (0.31543, 0.875, 0.09894, 1.0) -- all three channels, \
+             by gaps of (+0.5127, -0.4375, +0.4948); this mode's blind alpha is \
+             a* = M/(M - 1) with M = max(Cb, Cs), which is -1.909, -3 and -0.230 here, so no \
+             reachable opacity hides the swap. That closed form assumes non-negative operands: \
+             Cb == Cs is blind at every alpha (no channel here has it) and a negative Cb admits \
+             real interior blind alphas (see the doc comment)."
+        );
+
+        // The vacuity guard: the same stack with its `Divide` layer turned into a
+        // `ColorDodge` one. `ColorDodge` rather than a lexical near-name, because
+        // it is the live GPU arm this mode is *bit-identical* to in any channel
+        // whose source is exactly `0.5` -- and, together with `LinearDodge` and
+        // `HardMix`, the arm it agrees with over the whole railed region where
+        // `Cb + Cs >= 1`. It is admitted at the predicate too, so the substituted
+        // stack also composites on the GPU path. All three channels carry this
+        // claim here, which is the payoff of keeping both railed channels' sums
+        // below `1.0` and the unclamped channel's source off `0.5`.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Divide {
+                entry.1 = aurora_doc::BlendMode::ColorDodge;
+            }
+        }
+        let with_color_dodge = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_color_dodge,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_divide_were_color_dodge = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_divide_were_color_dodge,
+            "setup: this fixture must distinguish its Divide layer from a ColorDodge one -- the \
+             live GPU arm Divide is BIT-IDENTICAL to wherever a channel's source is exactly 0.5 \
+             (Cb/Cs against Cb/(1 - Cs)), and which -- together with LinearDodge and HardMix -- \
+             also agrees with it over the entire railed region where Cb + Cs >= 1. That is what a \
+             fragment_entry naming fs_composite_color_dodge or the wrong composite_* method at \
+             the dispatch site computes, and without it the differential above would pass with \
+             the wrong arm running. All three channels carry this claim, which is exactly why \
+             both railed channels keep Cb + Cs below 1.0 and the unclamped one's source is 0.75 \
+             rather than 0.5. Expected (0.765625, 0.6875, 0.19055, 1.0) from the substituted run."
         );
     }
 
@@ -45977,7 +46499,7 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
-        // **All nineteen modes `document_qualifies_for_gpu_compositing`
+        // **All twenty modes `document_qualifies_for_gpu_compositing`
         // admits, and this list has to keep pace with it** -- the test's
         // own name says "every expressible mode", so a mode ported to the
         // GPU path but not added here turns that name into a false claim
@@ -46083,6 +46605,7 @@ mod tests {
             aurora_doc::BlendMode::PinLight,
             aurora_doc::BlendMode::SoftLight,
             aurora_doc::BlendMode::Subtract,
+            aurora_doc::BlendMode::Divide,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(

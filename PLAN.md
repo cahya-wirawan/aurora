@@ -20135,6 +20135,201 @@ severity choice.
   the **negative** one in Finding 3, and it is confined to `aurora-render` and
   relied on nowhere.
 
+- [x] **`Divide` ported to WGSL, admitted at the predicate, and wired through
+  the real dispatch arm — done 2026-09-25 (0.119.0).** The **eighteenth** real
+  blend-math mode on the GPU, and **the one that completes the separable set
+  apart from `Exclusion`**. State that precisely: `Exclusion` *is* separable and
+  *is* still CPU-only, deliberately and permanently, because
+  `CPU_ONLY_BLEND_MODE` needs a real, 1:1-translatable, genuinely rejected mode
+  to stand in for the CPU fallback path. So "every separable mode is now on the
+  GPU" and "no separable modes remain" are both **false**; the true sentence is
+  "every separable mode except `Exclusion`, which is held back on purpose".
+  `blend_channel`'s arm is `if cs == 0.0 { 1.0 } else { (cb / cs).min(1.0) }` — a
+  single guarded division, one guard where `ColorBurn` and `ColorDodge` each have
+  two. The shader is a per-channel helper between 0.109.0's `straight_backdrop`
+  and `fold_over`:
+
+  ```wgsl
+  fn divide_channel(cb: f32, cs: f32) -> f32 {
+      if (cs == 0.0) {
+          return 1.0;
+      }
+      return min(1.0, cb / cs);
+  }
+  ```
+
+  A **real branch, not a `select()`**, for the same reason `color_burn_channel`
+  and `color_dodge_channel` are: `select()` evaluates both arms, so it would
+  divide on the very lane the guard exists to exclude. Cost on the Rust side was
+  the standard set and nothing more: four label consts, one `BlendPass`,
+  `ALL_BLEND_PASSES` `[17] -> [18]`, one wrapper; and in `aurora-app` one
+  predicate arm, one `GpuBlendDispatch` variant (`ALL` `[18] -> [19]`), one
+  counter field/initializer/`counter()` arm, one `dispatch_arm_blend_mode` arm,
+  one dispatch arm, one `TRANSPOSE_COVERAGE` row, one fixture const, one entry in
+  the "every expressible mode" loop, one headless predicate test and one
+  app-level integration test. `composite_blend_over_with_opacity` was not
+  touched — a **fifteenth** consecutive caller added with no line of change to
+  it. `blend_channel`'s own `Divide` arm and its two pre-existing
+  `composite_tile_cpu_divide_*` tests were left untouched; `straight_backdrop`,
+  `fold_over` and `CPU_ONLY_BLEND_MODE` (still `Exclusion`) likewise, so both
+  PLAN.md-tracked CPU-fallback benchmarks stay comparable across this round.
+
+  **One new test helper, and it closes a class 0.118.0 named rather than built.**
+  `read_texel_at(device, queue, texture, x, y)` reads an `f16` texel back at an
+  arbitrary coordinate; `read_first_texel` now delegates to it at `(0, 0)`, so no
+  existing call site changed. `texel_at` is its CPU-side counterpart.
+  **The gap:** every `assert_whole_tile_matches` comparison in `aurora-render`
+  runs both sides through `.clamp(0.0, 1.0)` before quantising to `Rgba8`, so it
+  is structurally blind to out-of-`[0, 1]` shader output. That never mattered for
+  the seventeen range-safe formulas ported before this one. `Divide`'s *correct*
+  output exceeds `1.0` whenever `Cb > Cs`, and in the transparent-backdrop
+  fixture — where the fold collapses to `B` itself — red and blue rail at exactly
+  `1.0` while a dropped `min` computes `6.0` and `8.0`. All four quantise to
+  `255`. Measured, not reasoned: mutation (c) leaves that test's whole-tile
+  assertion green and is caught there **only** by the new
+  `read_texel_at(TILE - 1, 0)` assertion. `read_first_texel` could not have
+  served: `(0, 0)` is in that fixture's *transparent* half.
+
+  **Finding 1 — the first guard in the whole eighteen-round series that is
+  load-bearing on *this* adapter.** `ColorBurn`'s `Cs == 0` guard (0.107.0) and
+  `ColorDodge`'s `Cs == 1` guard (0.108.0) were each *measured* surviving every
+  test in both crates, because this backend divides by zero to `+inf` and their
+  surrounding arithmetic maps `+inf` back onto exactly the value the guard
+  returns; both were kept purely as portability guards. Deleting *this* guard
+  leaves `min(1.0, cb / 0.0)`, which splits three ways on the sign of `cb`:
+
+  | `cb` | `cb / 0.0` | `min(1.0, …)` | vs the guard's `1.0` |
+  |---|---|---|---|
+  | `> 0` | `+inf` | `1.0` | **agrees** (adapter-specific) |
+  | `== 0` | `NaN` | `1.0` | **agrees** (adapter-specific, 0.109.1's probe) |
+  | `< 0` | `-inf` | `-inf` | **wrong**, by well-defined IEEE arithmetic |
+
+  So the guard is observable only through a *negative* backdrop channel, which is
+  reachable from wholly in-gamut colours by the `f16`-source-alpha-above-one route
+  `SoftLight`'s round opened: a `Multiply` layer whose texel carries alpha `2.0`
+  makes `fold_over`'s `inv = -1.0`, leaving the accumulator at
+  `Cb*(2*Cs - 1)` — here `(-0.25, -0.375, -0.125)` at alpha `1.0` — and
+  `straight_backdrop` deliberately does not clamp it.
+  `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_a_negative_backdrop`
+  is built for exactly that, and **mutation (f) was killed by that one test and
+  by nothing else in either crate** — 251 other render tests and all 421 app
+  tests stayed green. The two agreeing rows above rest on this vendor's
+  division-by-zero and `FMin`-on-`NaN` behaviour, neither of which WGSL specifies
+  (it calls the quotient an *indeterminate value* and leaves `min` on a `NaN`
+  operand undefined), so on Metal/DX12 the guard could be load-bearing at
+  `cb >= 0` as well.
+
+  **Finding 2 — no blind alpha in `[0, 1]` for any non-negative operand pair,
+  with two out-of-gamut exceptions, and it is a closed form rather than a sweep.**
+  With `D0 = Cb - Cs` and `D1 = B(Cb, Cs) - B(Cs, Cb)`, a transposed
+  `src`/`backdrop` arm shifts an opaque-backdrop output by
+  `(1 - a)*D0 + a*D1`, zero at `a* = D0/(D0 - D1)`. The structural fact:
+  `Cb/Cs <= 1` and `Cs/Cb <= 1` can hold together only at `Cb == Cs`, so **off
+  the diagonal exactly one order rails to `1.0`**. For `Cb > Cs >= 0` that means
+  `B(Cb, Cs) = 1` and `B(Cs, Cb) = Cs/Cb`, and
+
+  ```
+  a* = (Cb - Cs) / ((Cb - Cs) - (1 - Cs/Cb))
+     = Cb(Cb - Cs) / ((Cb - Cs)(Cb - 1))          [×Cb top and bottom]
+     = Cb / (Cb - 1)
+  ```
+
+  i.e. `a* = M/(M - 1)` with `M = max(Cb, Cs)`, which for `M` in `(0, 1)` has a
+  positive numerator over a negative denominator — **negative, hence never a
+  reachable opacity**. (Equivalently: `D0` and `D1` are both positive there, so
+  their convex combination cannot reach zero.) Spot-checked at
+  `Cb = 0.75, Cs = 0.25`: `a* = -3`. **Three exceptions, stated because the
+  unqualified version of this claim is exactly what 0.118.1 had to walk back for
+  `Subtract`:**
+
+  - **`Cb == Cs`** gives `B = 1` both ways, so `D0 = D1 = 0` and the channel is
+    blind at *every* alpha. That is the universal set every mode in the file has,
+    and no solid-colour fixture here contains it;
+  - **`M > 1`** (a legitimate out-of-gamut accumulator, `straight_backdrop` being
+    unclamped) gives `a* = M/(M - 1) > 1` — a finite positive root, outside
+    reachable opacity, so harmless but not *absent* the way the in-gamut case is;
+  - **`Cb < 0 < Cs`** breaks the derivation outright: *neither* order rails, both
+    ratios being negative, so `D0` and `D1` can carry opposite signs and **real
+    interior blind alphas exist**. Constructed, not swept: `Cb = -0.25, Cs = 0.5`
+    gives `B = -0.5`, `B_T = -2`, `D0 = -0.75`, `D1 = +1.5`, so
+    `gap(a) = -0.75 + 2.25a` and the channel is exactly blind at `a = 1/3`.
+
+  The honest one-line form is therefore "**no blind alpha in `[0, 1]` for any
+  non-negative operand pair (`Cb == Cs` excepted, blind at every alpha); a
+  negative `Cb` creates real interior blind alphas**" — never "no blind alpha at
+  all".
+
+  **Finding 3 — predicted, then measured: this mode is *not* a detector of
+  `straight_backdrop`'s `ab > 0.0` guard being deleted.** By 0.110.0's rule, a
+  `NaN` `cb` divides to `NaN` and is laundered by `min(1.0, NaN)`, which returns
+  `1.0` on this adapter. Mutation (l) was run for real and failed exactly the six
+  established detector suites — `multiply`, `screen`, `difference`, `overlay`,
+  `hard_light`, `soft_light` — with `divide`'s **not** among them. The detector
+  count stays at **six of eighteen**. The denominator in `aurora-render`'s own
+  copies of that figure had been left at sixteen by 0.117.0 and 0.118.0; it is
+  re-derived here rather than incremented.
+
+  **Finding 4 — the widest degeneracies of any mode ported, and two of them
+  dictated fixture design.** `B == 1` on the **entire closed half-plane
+  `Cb >= Cs`**, so a railed channel carries *no* operand information at all —
+  stronger in kind than any prior mode's partial degeneracy, where a clamped
+  `Subtract` channel at least bounded `Cs - Cb`. Worse, **a railed channel with
+  `Cb + Cs >= 1` is simultaneously indistinguishable from `ColorDodge`,
+  `LinearDodge` *and* `HardMix`**, all three live GPU arms returning `1.0` there;
+  so **every railed fixture channel in the round has `Cb + Cs < 1`**. And
+  `Divide == ColorDodge` exactly when `Cs == 0.5` (`Cb/Cs` against
+  `Cb/(1 - Cs)`), so **no unclamped fixture channel sits at `Cs == 0.5`**. Also:
+  `Divide(Cb, 1) = Cb` is a no-op shared with `Darken` and `ColorBurn`;
+  `Divide(0, Cs) = 0` and `Divide(Cb, 0) = 1`; and this is the **first ported
+  mode whose correct output need not be dyadic** (`Cb/Cs` is rational), so every
+  `assert_eq!` in the round is on an `f16`-exact channel and the one non-dyadic
+  reference value in the suite (`1/3`) is compared against the real CPU path
+  instead.
+
+  **Finding 5 — the planner's spatial-fixture seed pair was wrong for this mode,
+  and the reason is worth recording.** `patterned_texels` derives red from
+  `x + seed` and green from `y + seed` in quarters, so the seed *difference* fixes
+  which operand pair each cell carries — and blue has no `seed` term at all, so
+  **no seed pair can stop blue being `Cb == Cs`** (the plan's stated reason for
+  swapping the usual `(0, 1)` to `(1, 0)` does not distinguish them). Measured
+  both: difference `1` puts every cell in `Cb < Cs` or at the `Cs == 0` guard, so
+  **`min` never fires anywhere on the tile** and a dropped clamp is invisible;
+  difference `-1` (i.e. seeds `(1, 0)`) rails or zeroes every cell, so the tile
+  carries **no interior ratio at all**. The round uses seeds `(0, 2)`, which
+  carries all four regimes in one tile: `Cb = 0`, an interior `1/3` whose source
+  is `0.75` (so `ColorDodge` is separated), the `Cs == 0` guard, and a genuinely
+  railed cell where a dropped `min` computes `2.4375` against the reference's
+  `0.9375` — visible even to the 8-bit whole-tile comparison, since the mutant
+  crosses `1.0` there.
+
+  **Mutation matrix: fourteen mutations, every one really run** on
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` with `AURORA_REQUIRE_GPU=1` and
+  `--no-fail-fast` (without it `cargo test` stops after the first failing target
+  and the render crate's kills go unrecorded — a real trap this round hit once
+  and corrected), reverted from an out-of-repo `cp` backup between rows, never
+  `git checkout`. Full table in the 0.119.0 addendum under "Next action". The
+  load-bearing rows: **(c)** dropping `min`, killed by 7 tests and **not** by the
+  negative-backdrop fixture (whose every channel is negative or guarded, so `min`
+  never fires there) — this is the row that measures the comparator blind spot,
+  since the transparent-backdrop test's kill comes from the new `read_texel_at`
+  assertion and not from its whole-tile comparison; **(f)** deleting the
+  `cs == 0.0` guard, killed by **exactly one test in the whole workspace**, which
+  is Finding 1's measurement; **(l)** deleting `straight_backdrop`'s guard,
+  failing exactly the six detector suites with `divide`'s **not** among them,
+  which is Finding 3's; **(i)** a transposed `src`/`backdrop` dispatch arm, killed
+  by the app differential alone (the standing transpose guard stayed green, as it
+  must — it is a static check on the fixture roster and can never see the real arm
+  mutated); and **(j)** deleting the counter call, killed by the counter assertion
+  alone.
+
+  **Verified on one backend only.** Vulkan/NVIDIA. Metal and DX12 are unverified
+  for `fs_composite_divide`, and **for this mode that gap is sharper than for any
+  mode since `ColorDodge`**: two of the three rows in Finding 1's table are
+  adapter-specific, so on another backend the guard could be load-bearing at
+  `cb >= 0` too, and a conforming implementation is free to return an
+  indeterminate *value* rather than `+inf` for the quotient. Unlike `Subtract`'s
+  round, this is not a difference confined to rounding.
+
 - [x] **`SoftLight` ported to WGSL, admitted at the predicate, and wired through
   the real dispatch arm — done 2026-09-19 (0.117.0).** The **sixteenth** real
   blend-math mode on the GPU, and the one that **completes the six-member
@@ -26855,6 +27050,129 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-25 (0.119.0) — `Divide` ported to the GPU compositing path;
+the separable set is now complete apart from the deliberately-held-back
+`Exclusion`.** The **eighteenth** blend-math mode on the GPU.
+`blend_channel`'s arm is `if cs == 0.0 { 1.0 } else { (cb / cs).min(1.0) }`, a
+single guarded division — one guard where `ColorBurn` and `ColorDodge` each have
+two. `blend_channel`'s own `Divide` arm and its two pre-existing
+`composite_tile_cpu_divide_*` tests were left untouched; `straight_backdrop`,
+`fold_over` and `CPU_ONLY_BLEND_MODE` (still `Exclusion`) likewise, so no fixture
+anywhere was retargeted and both PLAN.md-tracked CPU-fallback benchmarks stay
+comparable across this round.
+
+**The milestone, stated precisely — the short forms are false.** `Exclusion` *is*
+a separable mode and *is* still CPU-only. It is held back deliberately and
+permanently, because `CPU_ONLY_BLEND_MODE` needs a real, 1:1-translatable,
+genuinely rejected blend mode to stand in for the CPU fallback path, and after
+this round it is the only separable candidate left. So **do not write** "all
+separable modes are now ported" or "zero separable modes remain". Write "**every
+separable mode except `Exclusion` is now on the GPU; `Exclusion` is separable and
+is still CPU-only on purpose**". The seven modes the predicate rejects are
+`Exclusion` plus the six non-separable ones (`Hue`, `Saturation`, `Color`,
+`Luminosity`, `DarkerColor`, `LighterColor`), and the six are permanently CPU-only
+unless a whole-triple shader path is ever built.
+
+**Counts, recomputed against source rather than incremented.**
+`ALL_BLEND_PASSES` is `[&BlendPass; 18]`, so `BLEND_MATH_PASS_COUNT` is 18;
+`GpuBlendDispatch::ALL` is `[Self; 19]` (18 + `Dissolve`, which has no blend-math
+shader); `document_qualifies_for_gpu_compositing`'s `matches!` admits **20 of
+27** (18 blend-math + `Normal` + `Dissolve`), leaving **7 of 27** CPU-only there;
+and 8 of `aurora_render::BlendMode`'s 26 variants have no blend-math WGSL entry
+point, `Normal` among them and needing none. The one-mode gap between 8 and 7 is
+`Normal`, exactly as every round. **Four figures elsewhere were already stale
+before this round read them, and were corrected rather than incremented:**
+
+1. `every_gpu_blend_dispatch_mode_gets_its_own_counter`'s assertion *message* read
+   "the seventeen variants" against its own literal `18` — 0.118.0 bumped the
+   literal and not the word. Both are now `19`/"nineteen", and
+   `GpuBlendDispatch::ALL`'s doc comment gained the note, since that
+   self-contradiction is exactly what the fixed array length exists to prevent.
+2. `aurora-render`'s "non-unit opacity is sufficient-but-not-necessary for eight
+   of the sixteen blend-math dispatch arms" was left at eight-of-sixteen by
+   0.118.0, which ported the *ninth* such mode. `Divide` is the tenth (off the
+   diagonal exactly one order rails, so its blend term differs at alpha `1.0`
+   too), so the figure is **ten of the eighteen**, and `aurora-app`'s two inline
+   copies — which count the nineteen non-`Normal` *admitted* modes instead — are
+   **ten of the nineteen**.
+3. The `straight_backdrop`-detector denominator read "six of the sixteen per-mode
+   versions of this test" in two places, and "the other ten launder" / "one of the
+   five" in a third, the last of which contradicted its own numerator. All are now
+   six of **eighteen**, twelve laundering, one of the **six**.
+4. The Subtract predicate bullet's copy of the detector figure read "six of
+   seventeen". Now six of eighteen.
+
+**The new test helper, and the class it closes.** `read_texel_at(device, queue,
+texture, x, y)` reads an `f16` texel at an arbitrary coordinate;
+`read_first_texel` now delegates to it at `(0, 0)`, so no pre-existing call site
+changed, and `texel_at` is its CPU-side counterpart. `assert_whole_tile_matches`
+runs both sides through `.clamp(0.0, 1.0)` before quantising to `Rgba8`, so it is
+structurally blind to out-of-`[0, 1]` shader output — harmless for the seventeen
+range-safe formulas ported before this one, and not harmless for `Divide`, whose
+*correct* output exceeds `1.0` whenever `Cb > Cs`. 0.118.0 named this helper as a
+follow-on for "the round that needs it" rather than building it speculatively;
+this is that round.
+
+**Fixtures, every golden hand-derived and then confirmed against the real
+`composite_tile_cpu` inside the test.**
+
+| # | Fixture | Operands | Golden | What only it does |
+|---|---|---|---|---|
+| A | `composite_divide_over_with_opacity_computes_the_clamped_per_channel_ratio` | `Cb = (0.75, 0.375, 0.1875)` opaque, `Cs = (0.125, 0.75, 0.75)` at source alpha `0.5`, opacity `1.0` | **`(0.875, 0.4375, 0.21875, 1.0)`** | the absolute golden; raw ratios `(6, 0.5, 0.25)`, one railed channel with `Cb + Cs = 0.875 < 1`. **Not one of the nineteen rival modes coincides in a single channel** — unusual enough in this file to be worth saying. A dropped `min` gives `3.375` in red |
+| B | `composite_divide_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent` | opaque half `Cb = (0.75, 0.25, 0.5)`, `Cs = (0.125, 0.75, 0.0625)`, both opaque, opacity `1.0` | opaque half **`(1.0, 1/3, 1.0, 1.0)`**, transparent half `(0.125, 0.75, 0.0625, 1.0)` | the comparator blind spot, closed by exhibiting it: red and blue rail at exactly `1.0` and a dropped `min` gives `6.0` and `8.0`; all four quantise to `255`, so the whole-tile assertion cannot see it and `read_texel_at(TILE - 1, 0)` can. Green's `1/3` is the suite's one non-dyadic value and is a differential, not a literal |
+| C | `composite_divide_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile` | `patterned_texels(0, 1.0)` under `patterned_texels(2, 0.75)` | `(1,1) = (0.3125, 0.3125, 0.75, 1.0)`; `(3,2) = (0.9375, 0.875, 0.75, 1.0)` | all four regimes in one tile — `Cb = 0`, an interior `1/3` at `Cs = 0.75`, both non-negative arms of the guard, and a railed cell. See Finding 5 for why the seed difference is `2` and not `±1` |
+| D | `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_a_negative_backdrop` | `l1` `Normal` `(0.5, 0.75, 0.25)`; `l2` `Multiply` grey `0.25` at **`f16` source alpha `2.0`** → accumulator **`(-0.25, -0.375, -0.125, 1.0)`** (asserted as a setup check); `l3` `Divide` `Cs = (0, 0.5, 0.25)`, opacity `1.0` | **`(1.0, -0.75, -0.5, 1.0)`** | the round's headline. Red's `Cs == 0` fires the guard, which returns `1.0` regardless of `cb`'s sign; **deleting the guard makes it `min(1.0, -inf) = -inf`.** Green and blue are the positive control — the *unguarded* path is correct for a negative `cb` — so red's `-inf` is attributable to the guard alone |
+| E | `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_divide_blend_document` (`NORMAL_MULTIPLY_DIVIDE_STACK`) | `l1` `Normal` `(0.875, 0.5, 0.25)`; `l2` `Multiply` grey `0.75` → `Cb = (0.65625, 0.375, 0.1875)`; `l3` `Divide` `Cs = (0.25, 0.75, 0.03125)` at opacity `0.5` | **`(0.828125, 0.4375, 0.59375, 1.0)`** | end to end through the real caller. Raw ratios `(2.625, 0.5, 6)`, two railed channels with sums `0.90625` and `0.21875` — **both below `1.0`, which is load-bearing**: a railed channel with `Cb + Cs >= 1` is indistinguishable from `ColorDodge`, `LinearDodge` and `HardMix` at once. `PinLight` is the only rival coinciding in any channel, and only in green. Cross-checks against 0.118.0's own rival table, which already listed this `Cb`/`Cs` pair's `Divide` value as `(0.828125, 0.4375, 0.59375)` |
+
+Plus the three standard siblings — translucent accumulator (**all three channels
+catch a missing un-premultiply here**, which `Subtract`'s equivalent could not
+manage: red and green shrink and blue *leaves the railed region*), half opacity
+(golden `(0.8125, 0.4375, 0.171875, 1.0)`; `PinLight` coincides in green alone),
+and source alpha above one (golden `(1.25, 0.625, 0.8125, 1.0)`, **red
+deliberately above `1.0`**). One thing that sibling *cannot* do and says so:
+`Cs <= 1` forces `B >= Cb`, so `out = -Cb + 2B >= Cb >= 0` — **this mode has no
+negative-output direction from a non-negative backdrop at all**, which is why
+fixture D has to build its negative accumulator out of an earlier `Multiply`
+layer.
+
+**Mutation matrix — fourteen mutations, every one really run** on
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`, `AURORA_REQUIRE_GPU=1`,
+`cargo test --no-fail-fast -p aurora-render -p aurora-app --lib` (the flag
+matters: without it `cargo test` stops after the first failing target, and the
+first pass of this matrix recorded only the app crate's kills for rows (a)–(e)
+before the run was discarded and redone). Reverted from an out-of-repo `cp`
+backup between rows, never `git checkout`. Baseline: render 252 pass, app 421
+pass.
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| (a) | `fragment_entry` → `"fs_composite_color_dodge"` | killed | 9 tests: all seven `composite_divide_*`, `all_blend_passes_matches_the_shaders_own_blend_math_entry_points`, and the app differential. The registry guard's kill is the established double-kill for this class (0.113.0 row (i) onward), not a discovery |
+| (b) | `fragment_entry` → `"fs_composite_subtract"` | killed | the same 9 |
+| (c) | drop `min(1.0, …)` → bare `cb / cs` | killed | **7** tests: six `composite_divide_*` plus the app differential. **Not** killed by the negative-backdrop fixture — every channel there is negative or guarded, so `min` never fires. In the transparent-backdrop fixture the kill comes from the **new `read_texel_at` assertion only**; that test's `assert_whole_tile_matches` stays green, which is the measured proof of the comparator blind spot |
+| (d) | `max(1.0, cb / cs)` instead of `min` | killed | all 7 `composite_divide_*` + the app differential (8) |
+| (e) | reciprocal transposed, `cs / cb` | killed | all 7 `composite_divide_*` + the app differential (8) |
+| (f) | **delete the `cs == 0.0` guard** | killed, by **exactly one test in the workspace** | `composite_divide_over_with_opacity_applies_its_zero_source_guard_to_a_negative_backdrop` — and nothing else, in either crate. Finding 1's measurement: at `cb > 0` the mutant computes `min(1.0, +inf) = 1.0` and at `cb == 0` `min(1.0, NaN) = 1.0`, both the guard's own value on this adapter, so only a negative `cb` separates them |
+| (g) | guard returns `0.0` instead of `1.0` | killed | 2: the negative-backdrop fixture and the spatially-varying tile (the only other fixture with a `Cs == 0` channel) |
+| (h) | guard tests `cb == 0.0` instead of `cs == 0.0` | killed | the same 2 |
+| (i) | dispatch arm `src`/`backdrop` transposed | killed | the app differential **alone**. The standing transpose guard stayed green, as it must: it is a static check over the fixture roster and can never see the real arm mutated |
+| (j) | delete `note_gpu_blend_dispatch(GpuBlendDispatch::Divide)` | killed | the app differential's **counter assertion alone** — the mode's pixels are identical either way, which is the whole reason the counter exists |
+| (k) | delete the predicate arm | killed | 5: the new headless predicate test, `document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter`, `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument`, the app differential, and `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode` — the last of which is what the same-commit array edit bought |
+| (l) | **delete `straight_backdrop`'s `ab > 0.0` guard** | killed, but **not by this mode** — predicted, then measured | exactly the six established detector suites (`multiply`, `screen`, `difference`, `overlay`, `hard_light`, `soft_light`) plus `recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack`. `composite_divide_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent` is **not** among them: `NaN / cs` is `NaN` and `min(1.0, NaN)` returns `1.0` here. Detector count stays **six of eighteen** |
+| (m) | wrong `composite_*` method at the dispatch site (`composite_color_dodge_over_with_opacity`) | killed | the app differential alone — and it is a three-channel kill only because the fixture keeps both railed sums below `1.0` and its unclamped source off `0.5` |
+| (n) | delete the `TRANSPOSE_COVERAGE` row | killed | `every_gpu_blend_math_dispatch_arm_has_a_fixture_that_could_see_a_transposed_argument` alone, via its `fixtures > 0` assertion |
+
+**Two rows to read as measured non-kills rather than omissions.** (f) is not a
+weak mutation — it is a mutation whose *observable* footprint is one fixture wide,
+because on this adapter the guard is arithmetically redundant for every
+non-negative `cb`; the round built the fixture that makes it observable rather
+than disclosing the gap. (l) is a genuine non-detection *by this mode*, predicted
+from 0.110.0's laundering rule before being run, and it leaves the detector count
+where it was.
+
+**Test counts.** `aurora-render` 245 → **252** (+7 GPU fixtures);
+`aurora-app` 419 → **421** (+1 end-to-end differential, +1 headless predicate
+test).
 
 **Addendum 2026-09-25 (0.118.1) — five documentation defects from 0.118.0's own
 round, no shipped behaviour changed.** Independent review re-derived that round's
