@@ -139,6 +139,32 @@ const GATED_PAIRS: &[GatedPair] = &[
         foreground: |t| t.border.focus,
         background: |t| t.surface.raised,
     },
+    // 0.129.0 review: focus rings also sit on inset wells and the app
+    // chrome, not only on panels, the canvas and raised surfaces.
+    GatedPair {
+        label: "border.focus on surface.sunken",
+        floor: 3.0,
+        foreground: |t| t.border.focus,
+        background: |t| t.surface.sunken,
+    },
+    GatedPair {
+        label: "border.focus on surface.app",
+        floor: 3.0,
+        foreground: |t| t.border.focus,
+        background: |t| t.surface.app,
+    },
+    // The focus ring's second colour (a C40-style two-colour ring, though not C40's 9:1 inter-colour ratio; the argument is per-component — see PLAN.md M1.7): the 1 px
+    // `text.on_accent` line `aurora-widgets` paints on the inner side of
+    // every `border.focus` band. Gated against the band so the two ring
+    // colours always delineate each other; `text.on_accent` on
+    // `accent.primary` (the fill a selected row's ring sits on) is
+    // already gated above.
+    GatedPair {
+        label: "text.on_accent on border.focus",
+        floor: 3.0,
+        foreground: |t| t.text.on_accent,
+        background: |t| t.border.focus,
+    },
     GatedPair {
         label: "accent.primary on surface.panel",
         floor: 3.0,
@@ -246,8 +272,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            17,
-            "expected all 17 gated pairs to be checked"
+            20,
+            "expected all 20 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -282,8 +308,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            17,
-            "expected all 17 gated pairs to be checked"
+            20,
+            "expected all 20 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -318,8 +344,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            17,
-            "expected all 17 gated pairs to be checked"
+            20,
+            "expected all 20 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -354,8 +380,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            17,
-            "expected all 17 gated pairs to be checked"
+            20,
+            "expected all 20 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -390,8 +416,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            17,
-            "expected all 17 gated pairs to be checked"
+            20,
+            "expected all 20 gated pairs to be checked"
         );
         for result in &results {
             assert!(

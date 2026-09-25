@@ -348,8 +348,9 @@ use aurora_widgets::widgets::{
     curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
 };
 use aurora_widgets::{
-    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintLayer, PaintOp, PathPipeline,
-    WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops,
+    FocusManager, FocusOrigin, FocusPaint, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline,
+    PaintLayer, PaintOp, PathPipeline, WidgetId, WidgetTree, draw_paint_ops,
+    paint_widget_ops_focused,
 };
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -1772,10 +1773,28 @@ fn render_gallery(
     size: (u32, u32),
     clear: wgpu::Color,
 ) -> aurora_testkit::Image {
+    render_gallery_focused(context, tree, &[], theme, scales, size, clear)
+}
+
+/// [`render_gallery`] with keyboard focus rings: each widget whose id is
+/// some entry's `FocusPaint::anchor` in `focus` paints that ring
+/// (`paint_widget_ops_focused`). The real app resolves exactly one
+/// `FocusPaint` per frame; a *gallery* passes one per cell so every
+/// kind's focused state shows in one image, the way the mockup's
+/// component sheet does. An empty slice is exactly [`render_gallery`].
+fn render_gallery_focused(
+    context: &GpuTestContext,
+    tree: &WidgetTree<WidgetKind>,
+    focus: &[FocusPaint],
+    theme: &Theme,
+    scales: &Scales,
+    size: (u32, u32),
+    clear: wgpu::Color,
+) -> aurora_testkit::Image {
     let device = context.device();
     let queue = context.queue();
 
-    let widget_paints = collect_gallery_paints(tree, theme, scales, device, queue);
+    let widget_paints = collect_gallery_paints(tree, focus, theme, scales, device, queue);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("gallery"),
@@ -1832,6 +1851,7 @@ fn render_gallery(
 /// just be a closure inline in `render_gallery`.
 fn collect_gallery_paints(
     tree: &WidgetTree<WidgetKind>,
+    focus: &[FocusPaint],
     theme: &Theme,
     scales: &Scales,
     device: &wgpu::Device,
@@ -1843,7 +1863,8 @@ fn collect_gallery_paints(
     // scaling) is the honest, correct choice -- not a stand-in for a
     // real value this test harness is missing.
     for id in tree.paint_order() {
-        if let Ok(ops) = paint_widget_ops(tree, id, theme, scales, 1.0) {
+        let ring = focus.iter().find(|paint| paint.anchor() == id).copied();
+        if let Ok(ops) = paint_widget_ops_focused(tree, id, ring, theme, scales, 1.0) {
             for op in ops {
                 // No linearization for either kind: this target is
                 // `Rgba8Unorm` (see `render_gallery`), and the gradient
@@ -4167,9 +4188,9 @@ dropdown_golden_test!(
 /// row-aligned (see [`BUTTON_GALLERY_SIZE`]). All of it is checked
 /// against the real layout by `tab_bar_gallery_lays_out_three_equal_tabs`.
 ///
-/// The mockup's fourth state, "focused", has no cell: no widget in this
-/// crate paints a keyboard-focus ring (see `tab_bar.rs`'s own doc
-/// comment).
+/// The mockup's fourth state, "focused", is not a cell here: it lives in
+/// the separate focus-ring gallery (`FOCUS_RING_GALLERY_SIZE`), so this
+/// gallery's committed goldens stay byte-for-byte what they were.
 const TAB_BAR_CELL: (u32, u32) = (192, 64);
 const TAB_BAR_CELL_PADDING: u32 = 16;
 const TAB_BAR_GALLERY_SIZE: (u32, u32) = (TAB_BAR_CELL.0 * 2, TAB_BAR_CELL.1);
@@ -7861,4 +7882,462 @@ fn popover_gallery_paints_the_open_list_above_a_later_sibling_and_past_its_panel
     );
     assert_ne!(popover_rgb(p1), popover_rgb(c1));
     assert_ne!(popover_rgb(p2), popover_rgb(c2));
+}
+
+// -- Keyboard focus ring (0.129.0) --
+
+/// One focus-ring cell: a `FOCUS_RING_CELL_PADDING` inset holding one
+/// focused widget, so an *outside* ring (a button's `+2`, a checkbox's
+/// `+1`) has room to show. Seven kinds side by side — button, checkbox,
+/// slider, text field, dropdown, swatch, tab — so the gallery is
+/// `64 * 7 = 448` px wide: `448 * 4 = 1792 = 7 * 256`, row-aligned (see
+/// [`BUTTON_GALLERY_SIZE`]). Kept apart from every per-widget gallery so
+/// none of their committed goldens change.
+const FOCUS_RING_CELL: (u32, u32) = (64, 64);
+const FOCUS_RING_CELL_PADDING: u32 = 16;
+const FOCUS_RING_KINDS: u32 = 7;
+const FOCUS_RING_GALLERY_SIZE: (u32, u32) =
+    (FOCUS_RING_CELL.0 * FOCUS_RING_KINDS, FOCUS_RING_CELL.1);
+/// Every square widget's side, and every row widget's width.
+const FOCUS_RING_WIDGET: u32 = FOCUS_RING_CELL.0 - 2 * FOCUS_RING_CELL_PADDING;
+/// A row widget's (text field, dropdown) height — one text row.
+const FOCUS_RING_ROW_HEIGHT: u32 = 21;
+/// A slider's height (its thumb is a square this tall).
+const FOCUS_RING_SLIDER_HEIGHT: u32 = 12;
+/// The tab's cell index (last).
+const FOCUS_RING_TAB_CELL: u32 = 6;
+
+/// The focus-ring gallery's tree, and each cell's focus target in cell
+/// order (the tab's is its bar's selected tab — roving focus). One flat
+/// list of seven inserts, deliberately not split.
+#[allow(clippy::too_many_lines)]
+fn focus_ring_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, Vec<WidgetId>) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let padding = length(FOCUS_RING_CELL_PADDING as f32);
+    let mut cells = Vec::new();
+    for _ in 0..FOCUS_RING_KINDS {
+        let style = Style {
+            flex_direction: FlexDirection::Column,
+            flex_shrink: 0.0,
+            padding: LayoutRect {
+                left: padding,
+                right: padding,
+                top: padding,
+                bottom: padding,
+            },
+            ..sized_style(FOCUS_RING_CELL)
+        };
+        match tree.insert(
+            root,
+            style,
+            accesskit::Node::new(accesskit::Role::Group),
+            WidgetKind::Container,
+        ) {
+            Ok(id) => cells.push(id),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+    let cell = |i: usize| match cells.get(i) {
+        Some(&id) => id,
+        None => unreachable!("FOCUS_RING_KINDS cells were inserted above"),
+    };
+    let ok = |result: Result<WidgetId, aurora_widgets::WidgetError>| match result {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let square = (FOCUS_RING_WIDGET, FOCUS_RING_WIDGET);
+    let row = (FOCUS_RING_WIDGET, FOCUS_RING_ROW_HEIGHT);
+    let button = ok(insert_button(&mut tree, cell(0), scales, "Focused"));
+    let checkbox = ok(insert_checkbox(&mut tree, cell(1), scales, "Focused"));
+    let slider = ok(insert_slider(
+        &mut tree,
+        cell(2),
+        scales,
+        "Focused",
+        0.5,
+        0.0,
+        1.0,
+    ));
+    let field = ok(insert_text_field(&mut tree, cell(3), scales, "Focused", ""));
+    let dropdown = ok(insert_dropdown(
+        &mut tree,
+        cell(4),
+        scales,
+        "Focused",
+        vec!["One".to_owned()],
+        Some(0),
+    ));
+    let swatch = ok(insert_color_swatch(
+        &mut tree,
+        cell(5),
+        scales,
+        Color {
+            r: 64,
+            g: 128,
+            b: 64,
+        },
+    ));
+    let bar = ok(insert_tab_bar(
+        &mut tree,
+        cell(FOCUS_RING_TAB_CELL as usize),
+        scales,
+        "Focused",
+        vec!["One".to_owned()],
+        0,
+    ));
+    for (id, size) in [
+        (button, square),
+        (checkbox, square),
+        (slider, (FOCUS_RING_WIDGET, FOCUS_RING_SLIDER_HEIGHT)),
+        (field, row),
+        (dropdown, row),
+        (swatch, square),
+    ] {
+        if let Err(err) = tree.set_style(id, sized_style(size)) {
+            unreachable!("{err:?}");
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        FOCUS_RING_GALLERY_SIZE.0 as f32,
+        FOCUS_RING_GALLERY_SIZE.1 as f32,
+    );
+    let tab =
+        match tab_bar_state(&tree, bar).map(aurora_widgets::widgets::TabBarState::selected_tab) {
+            Ok(Some(tab)) => tab,
+            other => unreachable!("a one-tab bar has its tab selected: {other:?}"),
+        };
+    (
+        tree,
+        vec![button, checkbox, slider, field, dropdown, swatch, tab],
+    )
+}
+
+/// One `FocusPaint` per target, each resolved exactly as a frame would
+/// after `Tab` reached it (`FocusOrigin::Keyboard`).
+fn focus_paints(tree: &mut WidgetTree<WidgetKind>, targets: &[WidgetId]) -> Vec<FocusPaint> {
+    targets
+        .iter()
+        .map(|&id| {
+            let mut focus = FocusManager::new();
+            if let Err(err) = focus.focus_with(tree, id, FocusOrigin::Keyboard) {
+                unreachable!("{err:?}");
+            }
+            match FocusPaint::resolve(tree, &focus) {
+                Some(paint) => paint,
+                None => unreachable!("every focus-ring gallery cell resolves a ring"),
+            }
+        })
+        .collect()
+}
+
+/// `color`'s straight sRGB bytes, the way `Rgba8Unorm` stores them.
+fn srgb_bytes(color: Color) -> [u8; 3] {
+    let [r, g, b] = color.to_srgb_f32();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let byte = |c: f32| (c * 255.0).round() as u8;
+    [byte(r), byte(g), byte(b)]
+}
+
+fn assert_rgb_near(actual: [u8; 4], expected: [u8; 3], what: &str) {
+    let near = actual
+        .iter()
+        .zip(expected)
+        .all(|(&a, e)| a.abs_diff(e) <= 1);
+    assert!(near, "{what}: got {actual:?}, expected {expected:?} (±1)");
+}
+
+fn all_themes() -> [(&'static str, Theme); 5] {
+    [
+        ("dark", dark_theme()),
+        ("light", light_theme()),
+        ("high-contrast-dark", high_contrast_dark_theme()),
+        ("high-contrast-light", high_contrast_light_theme()),
+        ("color-critical", color_critical_theme()),
+    ]
+}
+
+#[test]
+fn focus_ring_gallery_lays_out_every_widget_inside_its_padded_cell() {
+    let scales = scales();
+    let (tree, targets) = focus_ring_gallery_tree(&scales);
+    assert_eq!(targets.len(), FOCUS_RING_KINDS as usize);
+    let Some(&button) = targets.first() else {
+        unreachable!("seven targets");
+    };
+    let bounds = tree.bounds(button);
+    assert_eq!(
+        bounds,
+        Some(aurora_core::Rect {
+            x: i64::from(FOCUS_RING_CELL_PADDING),
+            y: i64::from(FOCUS_RING_CELL_PADDING),
+            width: FOCUS_RING_WIDGET,
+            height: FOCUS_RING_WIDGET,
+        })
+    );
+    let Some(&tab) = targets.last() else {
+        unreachable!("seven targets");
+    };
+    let Some(tab_bounds) = tree.bounds(tab) else {
+        unreachable!("the tab exists");
+    };
+    assert_eq!(
+        tab_bounds.x,
+        i64::from(FOCUS_RING_TAB_CELL * FOCUS_RING_CELL.0 + FOCUS_RING_CELL_PADDING)
+    );
+    assert_eq!(tab_bounds.y, i64::from(FOCUS_RING_CELL_PADDING));
+    assert!(
+        tab_bounds.width > 4 && tab_bounds.height > 4,
+        "{tab_bounds:?}"
+    );
+}
+
+/// The ring's pixels, measured — not just its ops. A focused button's
+/// `+2` ring covers the two columns `left - 4 .. left - 2`, so column
+/// `left - 3` at the button's vertical middle is `border.focus` when
+/// focused and the clear colour when not, in every built-in theme.
+#[test]
+fn a_focused_button_paints_border_focus_outside_its_edge_in_every_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (mut tree, targets) = focus_ring_gallery_tree(&scales);
+    let focus = focus_paints(&mut tree, &targets);
+    let x = FOCUS_RING_CELL_PADDING - 3;
+    let y = FOCUS_RING_CELL_PADDING + FOCUS_RING_WIDGET / 2;
+    for (name, theme) in all_themes() {
+        let focused = render_gallery_focused(
+            &context,
+            &tree,
+            &focus,
+            &theme,
+            &scales,
+            FOCUS_RING_GALLERY_SIZE,
+            NEUTRAL_CLEAR,
+        );
+        let plain = render_gallery(
+            &context,
+            &tree,
+            &theme,
+            &scales,
+            FOCUS_RING_GALLERY_SIZE,
+            NEUTRAL_CLEAR,
+        );
+        assert_rgb_near(
+            sample_at(&focused, x, y),
+            srgb_bytes(theme.border.focus),
+            &format!("{name}: focused button's ring"),
+        );
+        assert_backdrop_is_the_clear_colour(sample_at(&plain, x, y), NEUTRAL_CLEAR, name);
+    }
+}
+
+/// A tab's ring is *inside* (`-2`): it covers the tab's own outermost
+/// two pixel columns, so it paints over the High Contrast themes'
+/// mandatory `border.control` outline (a 1 px stroke centred on the
+/// tab's edge) rather than beside it. Columns `left` and `left + 1` at
+/// the tab's vertical middle are `border.focus` when focused; unfocused,
+/// neither is — the ring, not the outline, is what marks a focused tab.
+#[test]
+fn a_focused_tabs_inside_ring_covers_the_high_contrast_control_outline() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (mut tree, targets) = focus_ring_gallery_tree(&scales);
+    let focus = focus_paints(&mut tree, &targets);
+    let Some(tab_bounds) = targets.last().and_then(|&tab| tree.bounds(tab)) else {
+        unreachable!("the tab exists");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (left, y) = (
+        tab_bounds.x as u32,
+        tab_bounds.y as u32 + tab_bounds.height / 2,
+    );
+    for (name, theme) in [
+        ("high-contrast-dark", high_contrast_dark_theme()),
+        ("high-contrast-light", high_contrast_light_theme()),
+    ] {
+        assert_ne!(theme.border.focus, theme.border.control, "{name}");
+        let focused = render_gallery_focused(
+            &context,
+            &tree,
+            &focus,
+            &theme,
+            &scales,
+            FOCUS_RING_GALLERY_SIZE,
+            NEUTRAL_CLEAR,
+        );
+        let plain = render_gallery(
+            &context,
+            &tree,
+            &theme,
+            &scales,
+            FOCUS_RING_GALLERY_SIZE,
+            NEUTRAL_CLEAR,
+        );
+        let focus_rgb = srgb_bytes(theme.border.focus);
+        for x in [left, left + 1] {
+            assert_rgb_near(
+                sample_at(&focused, x, y),
+                focus_rgb,
+                &format!("{name}: focused tab's inside ring at x = {x}"),
+            );
+            let unfocused = sample_at(&plain, x, y);
+            assert!(
+                unfocused
+                    .iter()
+                    .zip(focus_rgb)
+                    .any(|(&a, e)| a.abs_diff(e) > 1),
+                "{name}: an unfocused tab is already border.focus at x = {x}: {unfocused:?}"
+            );
+        }
+    }
+}
+
+/// Review F1 (WCAG 2.4.7 / 1.4.11), measured in pixels: a focused
+/// *selected* tree row's inside ring sits on the row's own
+/// `accent.primary` fill, which `border.focus` equals in every built-in
+/// theme — so the band alone rendered pixel-identical to an unfocused
+/// selected row. The ring's second colour, a 1 px `text.on_accent` line
+/// on the band's inner side (the third pixel row from the row's top
+/// edge), is what makes it visible: that pixel is `text.on_accent` when
+/// focused, `accent.primary` when not, and the two clear 3:1.
+#[test]
+fn a_focused_selected_tree_row_is_visibly_distinct_in_every_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (mut tree, root) = new_tree(Style::default());
+    let view = match insert_tree_view(&mut tree, root, Some("Layers")) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = tree.set_style(view, tree_view_cell_style()) {
+        unreachable!("{err:?}");
+    }
+    let row = match insert_tree_item(&mut tree, view, &scales, "Layer", false) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+        unreachable!("{err:?}");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(TREE_VIEW_CELL.0 as f32, TREE_VIEW_CELL.1 as f32);
+    let focus = focus_paints(&mut tree, &[row]);
+    let Some(bounds) = tree.bounds(row) else {
+        unreachable!("the row exists");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (x, y) = (
+        bounds.x as u32 + bounds.width / 2,
+        bounds.y as u32 + aurora_widgets::FOCUS_RING_WIDTH as u32,
+    );
+    for (name, theme) in all_themes() {
+        assert_eq!(
+            theme.border.focus, theme.accent.primary,
+            "{name}: the premise"
+        );
+        let focused = render_gallery_focused(
+            &context,
+            &tree,
+            &focus,
+            &theme,
+            &scales,
+            TREE_VIEW_CELL,
+            NEUTRAL_CLEAR,
+        );
+        let plain = render_gallery(
+            &context,
+            &tree,
+            &theme,
+            &scales,
+            TREE_VIEW_CELL,
+            NEUTRAL_CLEAR,
+        );
+        assert_rgb_near(
+            sample_at(&plain, x, y),
+            srgb_bytes(theme.accent.primary),
+            &format!("{name}: an unfocused selected row is its accent fill"),
+        );
+        assert_rgb_near(
+            sample_at(&focused, x, y),
+            srgb_bytes(theme.text.on_accent),
+            &format!("{name}: the focused row's inner ring line"),
+        );
+        let ratio =
+            aurora_theme::contrast::contrast_ratio(theme.text.on_accent, theme.accent.primary);
+        assert!(ratio >= 3.0, "{name}: inner line vs fill {ratio:.2}:1");
+    }
+}
+
+/// The focus-ring gallery against a golden per theme — `#[ignore]`d
+/// pending a human bless, the same shape every first golden here took.
+fn focus_ring_gallery_matches_its_golden(theme: &Theme, golden: &str) {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (mut tree, targets) = focus_ring_gallery_tree(&scales);
+    let focus = focus_paints(&mut tree, &targets);
+    let image = render_gallery_focused(
+        &context,
+        &tree,
+        &focus,
+        theme,
+        &scales,
+        FOCUS_RING_GALLERY_SIZE,
+        NEUTRAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(golden);
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+#[test]
+#[ignore = "golden not yet blessed by a human"]
+fn focus_ring_gallery_matches_the_golden_image() {
+    focus_ring_gallery_matches_its_golden(&dark_theme(), "focus_ring_gallery.png");
+}
+
+#[test]
+#[ignore = "golden not yet blessed by a human"]
+fn focus_ring_gallery_matches_the_golden_image_in_light_theme() {
+    focus_ring_gallery_matches_its_golden(&light_theme(), "focus_ring_gallery_light.png");
+}
+
+#[test]
+#[ignore = "golden not yet blessed by a human"]
+fn focus_ring_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
+    focus_ring_gallery_matches_its_golden(
+        &high_contrast_dark_theme(),
+        "focus_ring_gallery_high_contrast_dark.png",
+    );
+}
+
+#[test]
+#[ignore = "golden not yet blessed by a human"]
+fn focus_ring_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    focus_ring_gallery_matches_its_golden(
+        &high_contrast_light_theme(),
+        "focus_ring_gallery_high_contrast_light.png",
+    );
+}
+
+#[test]
+#[ignore = "golden not yet blessed by a human"]
+fn focus_ring_gallery_matches_the_golden_image_in_color_critical_theme() {
+    focus_ring_gallery_matches_its_golden(
+        &color_critical_theme(),
+        "focus_ring_gallery_color_critical.png",
+    );
 }

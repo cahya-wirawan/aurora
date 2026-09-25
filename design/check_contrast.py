@@ -35,6 +35,17 @@ PAIRS = [
     ("border.focus on surface.panel", "border.focus", "surface.panel", 3.0, "UI boundary"),
     ("border.focus on surface.canvas", "border.focus", "surface.canvas", 3.0, "UI boundary"),
     ("border.focus on surface.raised", "border.focus", "surface.raised", 3.0, "UI boundary"),
+    # 0.129.0 review: focus rings also sit on inset wells and the app chrome.
+    ("border.focus on surface.sunken", "border.focus", "surface.sunken", 3.0, "UI boundary"),
+    ("border.focus on surface.app", "border.focus", "surface.app", 3.0, "UI boundary"),
+    # The focus ring's second colour (a C40-style two-colour ring, though not C40's 9:1 inter-colour ratio; the argument is per-component — see PLAN.md M1.7): a 1 px
+    # text.on_accent line on the inner side of every border.focus band, so
+    # a ring on an accent.primary fill (a selected tree row, a clipped
+    # button's inside fallback) still shows -- border.focus IS
+    # accent.primary in every built-in theme. text.on_accent on
+    # accent.primary is already gated above at 4.5; this gates the two
+    # ring colours against each other so the ring delineates itself.
+    ("text.on_accent on border.focus", "text.on_accent", "border.focus", 3.0, "UI boundary"),
     ("accent.primary on surface.panel", "accent.primary", "surface.panel", 3.0, "UI boundary"),
 ]
 

@@ -63,8 +63,9 @@
 //! real `Role::TabList` holding one real `Role::Tab` per tab, with
 //! automatic activation, wrapping arrow keys, `Home`/`End`, and roving
 //! focus (only the selected tab is focusable) — the bar only, no tab
-//! panels, no label glyphs, and no keyboard-focus ring (`tab_bar.rs`'s
-//! own doc comment has the full list). `Tooltip` ([`Tooltip`]) is a
+//! panels and no label glyphs (`tab_bar.rs`'s own doc comment has the
+//! full list); its focused tab paints the crate's keyboard focus ring
+//! (0.129.0, `paint::paint_widget_ops_focused`). `Tooltip` ([`Tooltip`]) is a
 //! caller-owned show/hide controller, not a payload: a pure,
 //! exhaustively tested hover/focus/delay/`Escape` state machine that
 //! inserts a real `Role::Tooltip` child under its owner while shown and
@@ -85,8 +86,9 @@
 //! preview swatch — the first widget to paint a vertex-coloured
 //! gradient (`0.124.0`'s primitive), exposed to accessibility as two
 //! channel sliders in a group plus a hue slider (`accesskit` has no
-//! two-dimensional role), with no text entry, no alpha and no focus ring
-//! (`color_picker.rs`'s own doc comment has the full list).
+//! two-dimensional role), with no text entry and no alpha
+//! (`color_picker.rs`'s own doc comment has the full list); a focused
+//! channel slider rings the square it covers (0.129.0).
 //! The curve editor ([`insert_curve_editor`]/[`handle_curve_editor_key`])
 //! edits an `aurora_core::ToneCurve` (a monotone cubic through 2 to 16
 //! control points, the model living in `aurora-core` so the future
@@ -303,7 +305,7 @@ pub enum WidgetKind {
     /// `border.default` rule along its bottom edge
     /// (`paint::paint_tab_bar`). See `tab_bar.rs`'s own module doc
     /// comment for the key table, the roving-focus accessibility shape,
-    /// and what it deliberately does not do (no panels, no focus ring).
+    /// and what it deliberately does not do (no panels, no glyphs).
     TabBar(TabBarState),
     /// One tab of a [`WidgetKind::TabBar`] — `Role::Tab`, created by
     /// `tab_bar.rs` at insert. The selected tab paints an

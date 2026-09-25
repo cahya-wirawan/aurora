@@ -89,7 +89,7 @@
 use accesskit::{Action, ActionData, ActionRequest, Toggled, TreeId};
 
 use crate::error::WidgetError;
-use crate::input::FocusManager;
+use crate::input::{FocusManager, FocusOrigin};
 use crate::tree::{ACCESSIBILITY_TREE_ID, WidgetId, WidgetTree};
 use crate::widgets::{
     self, ColorPickerKey, ColorPickerOutcome, ColorPickerPart, ColorPickerPartRole, CurveEditorKey,
@@ -431,7 +431,7 @@ fn dispatch(
 ) -> Result<ActionOutcome, ActionRejection> {
     let unsupported = ActionRejection::Unsupported { id, action };
     if action == Action::Focus {
-        focus.focus(tree, id)?;
+        focus.focus_with(tree, id, FocusOrigin::Accessibility)?;
         return Ok(ActionOutcome::Focused(id));
     }
     let target = tree
@@ -1293,6 +1293,22 @@ mod tests {
             ActionOutcome::Focused(f.button)
         );
         assert_eq!(f.focus.focused(), Some(f.button));
+    }
+
+    /// An assistive technology's focus request is its own modality
+    /// (`FocusOrigin::Accessibility`): it shows the focus ring even when
+    /// the last real input was a pointer click, which had hidden it — a
+    /// screen-magnifier user follows that ring.
+    #[test]
+    fn an_accessibility_focus_request_shows_the_focus_ring_after_a_click() {
+        let mut f = fixture();
+        f.focus
+            .note_input(&mut f.tree, crate::input::FocusOrigin::Pointer);
+        assert_eq!(
+            act(f.button, &mut f, Action::Focus, None),
+            ActionOutcome::Focused(f.button)
+        );
+        assert!(f.focus.focus_visible());
     }
 
     #[test]

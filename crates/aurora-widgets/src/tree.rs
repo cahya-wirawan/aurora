@@ -101,6 +101,17 @@ struct WidgetNode<W> {
     bounds: Rect,
     accessibility: AccessibilityNode,
     dirty: bool,
+    /// How far past [`Self::bounds`], in whole pixels on every side, this
+    /// widget's own pixels can reach — `0` for almost every widget, and
+    /// [`crate::paint::FOCUS_RING_MAX_OUTSET`] for the one widget
+    /// [`crate::FocusManager`] currently holds focus on, whose keyboard
+    /// focus ring paints *outside* its bounds (a CSS `outline-offset`).
+    /// Every damage this widget reports ([`WidgetTree::mark_dirty`],
+    /// [`WidgetTree::set_bounds`], removal) is grown by it, so a focused
+    /// slider whose thumb moves, or a focused widget that is re-laid out,
+    /// repaints its ring's overhang rather than leaving stale ring pixels
+    /// behind. Set only via [`WidgetTree::set_damage_outset`].
+    damage_outset: u32,
     /// This widget's *own* paint-layer flag — see [`PaintLayer`] for how
     /// the effective layer is derived from it.
     layer: PaintLayer,
@@ -136,6 +147,23 @@ pub struct WidgetTree<W> {
     popovers: BTreeSet<u64>,
 }
 
+/// `rect` grown by `outset` whole pixels on every side — the damage a
+/// widget with a nonzero `WidgetNode::damage_outset` reports. An empty
+/// rect (a widget not laid out yet) stays exactly as it is: it paints
+/// nothing, so it has no overhang to repaint either, and growing it would
+/// only drag the damage region toward its origin.
+fn outset_rect(rect: Rect, outset: u32) -> Rect {
+    if outset == 0 || rect.width == 0 || rect.height == 0 {
+        return rect;
+    }
+    Rect {
+        x: rect.x - i64::from(outset),
+        y: rect.y - i64::from(outset),
+        width: rect.width.saturating_add(outset.saturating_mul(2)),
+        height: rect.height.saturating_add(outset.saturating_mul(2)),
+    }
+}
+
 impl<W> WidgetTree<W> {
     /// Creates a new tree with `payload` as its root widget, laid out per
     /// `style`, described by `accessibility`. Returns the tree and the
@@ -159,6 +187,7 @@ impl<W> WidgetTree<W> {
                 bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
+                damage_outset: 0,
                 layer: PaintLayer::Base,
                 payload,
             },
@@ -465,6 +494,7 @@ impl<W> WidgetTree<W> {
                 bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
+                damage_outset: 0,
                 layer: PaintLayer::Base,
                 payload,
             },
@@ -509,7 +539,7 @@ impl<W> WidgetTree<W> {
         let Some(node) = self.nodes.remove(&id) else {
             unreachable!("a parent's recorded children must exist in the tree by construction");
         };
-        self.mark_region_dirty(node.bounds);
+        self.mark_region_dirty(outset_rect(node.bounds, node.damage_outset));
         self.popovers.remove(&u64::from(id));
         for child in node.children {
             self.remove_subtree(child);
@@ -615,10 +645,11 @@ impl<W> WidgetTree<W> {
         let old_bounds = node.bounds;
         node.bounds = bounds;
         node.dirty = true;
+        let outset = node.damage_outset;
         // Both the vacated region and the newly occupied one need
         // repainting, not just the new position.
-        self.mark_region_dirty(old_bounds);
-        self.mark_region_dirty(bounds);
+        self.mark_region_dirty(outset_rect(old_bounds, outset));
+        self.mark_region_dirty(outset_rect(bounds, outset));
         Ok(())
     }
 
@@ -708,9 +739,60 @@ impl<W> WidgetTree<W> {
             .get_mut(&id)
             .ok_or(WidgetError::UnknownWidget(id))?;
         node.dirty = true;
-        let bounds = node.bounds;
-        self.mark_region_dirty(bounds);
+        let region = outset_rect(node.bounds, node.damage_outset);
+        self.mark_region_dirty(region);
         Ok(())
+    }
+
+    /// Sets how far past its bounds `id`'s damage reaches — see
+    /// `WidgetNode::damage_outset`. Crate-private: the only caller is
+    /// [`crate::FocusManager`], which grows the focused widget's damage by
+    /// its focus ring's overhang and shrinks it back to `0` on blur.
+    /// Changing it marks nothing dirty by itself; the caller dirties the
+    /// widget afterwards (with the *new* outset) or before (with the old).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist.
+    pub(crate) fn set_damage_outset(
+        &mut self,
+        id: WidgetId,
+        outset: u32,
+    ) -> Result<(), WidgetError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(WidgetError::UnknownWidget(id))?;
+        node.damage_outset = outset;
+        Ok(())
+    }
+
+    /// Resets every node's damage outset to `0`, dirtying each one that
+    /// had a nonzero outset (with that outset, so the old ring's overhang
+    /// is repainted). [`crate::FocusManager`] calls it on every focus
+    /// change before growing the new widget's outset, so an outset left
+    /// behind by a manager that was dropped or replaced without blurring
+    /// — which no later manager knows about — never outlives the next
+    /// focus change. O(widgets), on a focus change only.
+    pub(crate) fn clear_damage_outsets(&mut self) {
+        let mut regions = Vec::new();
+        for node in self.nodes.values_mut() {
+            if node.damage_outset != 0 {
+                node.dirty = true;
+                regions.push(outset_rect(node.bounds, node.damage_outset));
+                node.damage_outset = 0;
+            }
+        }
+        for region in regions {
+            self.mark_region_dirty(region);
+        }
+    }
+
+    /// `id`'s current damage outset — see `WidgetNode::damage_outset`.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn damage_outset(&self, id: WidgetId) -> Option<u32> {
+        self.nodes.get(&id).map(|node| node.damage_outset)
     }
 
     fn mark_region_dirty(&mut self, region: Rect) {
@@ -1123,6 +1205,78 @@ mod tests {
             tree.take_damage(),
             Some(bounds(0, 0, 5, 5).union(&bounds(20, 20, 5, 5))),
             "both the vacated and the newly occupied region must be dirtied"
+        );
+    }
+
+    #[test]
+    fn a_damage_outset_grows_every_damage_the_widget_reports() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let at = |x| Rect {
+            x,
+            y: 10,
+            width: 20,
+            height: 10,
+        };
+        let grown = |rect: Rect| Rect {
+            x: rect.x - 3,
+            y: rect.y - 3,
+            width: rect.width + 6,
+            height: rect.height + 6,
+        };
+        if let Err(err) = tree.set_bounds(a, at(10)) {
+            unreachable!("{err:?}");
+        }
+        tree.take_damage();
+        if let Err(err) = tree.set_damage_outset(a, 3) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.take_damage(), None, "setting it dirties nothing");
+
+        if let Err(err) = tree.mark_dirty(a) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.take_damage(), Some(grown(at(10))));
+
+        if let Err(err) = tree.set_bounds(a, at(50)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.take_damage(),
+            Some(grown(at(10)).union(&grown(at(50))))
+        );
+
+        if let Err(err) = tree.remove(a) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.take_damage(), Some(grown(at(50))));
+        assert!(matches!(
+            tree.set_damage_outset(a, 1),
+            Err(WidgetError::UnknownWidget(id)) if id == a
+        ));
+    }
+
+    #[test]
+    fn a_damage_outset_leaves_a_widget_with_no_area_alone() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.take_damage();
+        if let Err(err) = tree.set_damage_outset(a, 4) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.mark_dirty(a) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.take_damage(),
+            tree.bounds(a),
+            "an unlaid widget paints nothing"
         );
     }
 

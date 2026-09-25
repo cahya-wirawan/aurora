@@ -81,8 +81,11 @@ pub mod widgets;
 
 pub use action::{ALL_ACTIONS, ActionOutcome, ActionRejection, handle_action};
 pub use error::WidgetError;
-pub use input::{FocusManager, hit_test};
-pub use paint::{Paint, PaintOp, paint_widget, paint_widget_ops};
+pub use input::{FocusManager, FocusOrigin, hit_test};
+pub use paint::{
+    FOCUS_RING_INNER_WIDTH, FOCUS_RING_WIDTH, FocusPaint, Paint, PaintOp, paint_widget,
+    paint_widget_ops, paint_widget_ops_focused,
+};
 pub use render::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
 };

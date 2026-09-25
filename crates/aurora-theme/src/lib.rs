@@ -32,7 +32,7 @@
 //! high_contrast_light}_theme_passes_every_gated_pair` test.
 //! Color-Critical is covered by both
 //! `contrast::tests::the_real_color_critical_theme_passes_every_gated_pair`
-//! (its 17 gated pairs, tighter margins than the two High Contrast themes
+//! (its 20 gated pairs, tighter margins than the two High Contrast themes
 //! since this is a genuine mid-tone theme, not pure black/white — but
 //! every pair still clears its floor with real margin) and
 //! `neutrality::tests::the_real_color_critical_theme_has_neutral_surfaces`

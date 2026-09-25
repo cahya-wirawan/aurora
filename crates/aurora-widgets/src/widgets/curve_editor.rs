@@ -191,7 +191,7 @@
 //!
 //! # What it deliberately does not do
 //!
-//! No keyboard-focus ring (crate-wide gap), no text, no histogram, no
+//! No text, no histogram, no
 //! channel selection, no pointer capture, no undo (the owner's history
 //! records curve changes), and no hover state.
 

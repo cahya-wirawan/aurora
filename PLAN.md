@@ -2537,8 +2537,8 @@ check licenses` clean with the new `toml` dependency.
   hit-testers stop at the control's bounds — pinned by a test so the
   fix has to change it), a clipping ancestor clips the list (these
   three: closed 0.127.0 — see the M1.7 popover entry), no text and
-  no `▾` glyph, no keyboard-focus ring (no widget in the crate paints
-  one), no `Space`/`Home`/`End`/type-ahead, options fixed at insert,
+  no `▾` glyph, no keyboard-focus ring (closed 0.129.0 — see the M1.7
+  focus-ring entry), no `Space`/`Home`/`End`/type-ahead, options fixed at insert,
   no human has blessed any of the five goldens, no dismiss on an
   outside click or focus loss, no accessibility `ActionRequest` routed
   to it (`aurora-app` logs and drops every one), and the highlighted
@@ -2626,8 +2626,10 @@ check licenses` clean with the new `toml` dependency.
   headless layout test, a distinct-pixels test in all five themes, and
   five `#[ignore]`d goldens (`tab_bar_gallery*.png`, none exists).
   Rendered on `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` under
-  `AURORA_REQUIRE_GPU=1`. The mockup's "focused" state has **no cell**:
-  no widget in the crate paints a keyboard-focus ring.
+  `AURORA_REQUIRE_GPU=1`. The mockup's "focused" state had **no cell**
+  here: no widget in the crate painted a keyboard-focus ring (closed
+  0.129.0 in a separate focus-ring gallery — see the M1.7 focus-ring
+  entry).
   **Still open and not claimed**: the caller must move `FocusManager`
   focus to `selected_tab()` after a `Selected` (no widget module touches
   focus); a pointer click on an inactive tab needs caller routing
@@ -2635,7 +2637,8 @@ check licenses` clean with the new `toml` dependency.
   focusable there, pinned); no accessibility `ActionRequest` is routed;
   no label glyphs, so tabs share the bar equally (`flex_basis: 0`) as a
   stand-in; no per-tab disabled, no RTL, no owner-driven setter, labels
-  fixed at insert; no focus ring; no human has blessed the goldens.
+  fixed at insert; no focus ring (closed 0.129.0); no human has blessed
+  the goldens.
   Mutations really run: roving focus on every tab (10 tests fail),
   `Left` without wrap (2), underline drawn before the outline (2), no
   `mark_dirty` on a changed tab (1), the bar rule removed (all 5 GPU
@@ -2967,7 +2970,8 @@ check licenses` clean with the new `toml` dependency.
   zero-size guard, emitting a partly clipped marker, transposed s/v on
   pointer, and dropping markers — **all 22 killed**, none surviving.
   Known gaps, disclosed: no text/hex entry, no alpha, no eyedropper, no
-  focus ring, no pointer capture, `ActionRequest`s not routed (a routed
+  focus ring (closed 0.129.0), no pointer capture, `ActionRequest`s not
+  routed (closed 0.128.0; a routed
   `SetValue`/`Increment` would call `set_color_picker_hsv`/
   `handle_color_picker_key`), whether a screen reader announces the value
   change when `Up`/`Down` on the saturation node moves the *value* node is
@@ -3325,6 +3329,158 @@ check licenses` clean with the new `toml` dependency.
   through AT actions (named open item below). +11 tests: workspace
   2,206 passing, 40 ignored, full gate green under
   `AURORA_REQUIRE_GPU=1`.
+
+  **Keyboard focus ring landed 2026-09-25 (0.129.0).** No widget had
+  ever painted keyboard focus. Three pieces, all in `aurora-widgets`:
+  **(1) Focus modality** (CSS `:focus-visible`): `FocusManager` now
+  tracks whether the ring is shown, from a new `FocusOrigin`
+  (`Keyboard`/`Accessibility` show it, `Pointer` hides it,
+  `Programmatic` inherits). `focus_next`/`focus_previous` record
+  `Keyboard`, `focus_at` records `Pointer` (also on the already-focused
+  widget, which is no longer an early return when the modality flips),
+  `handle_action`'s `Action::Focus` records `Accessibility`; every other
+  `focus()` caller is unchanged and inherits. New `focus_with`,
+  `focus_visible`, `note_input`. A fresh manager starts visible
+  (Chrome's autofocus rule — the safe failure). **(2) Ring paint:**
+  `FocusPaint::resolve(tree, &focus)` once per frame picks the focused
+  widget and its *anchor* (a colour picker's S/V slider anchors on the
+  square it covers; a curve point anchors on the editor, ringing that
+  point's marker); `paint_widget_ops_focused` appends the ring (as
+  first landed one `border.focus` 2 px stroke; after review a two-colour
+  ring — see the review revision below) right after the anchor's own
+  ops (CSS `outline`: above its element, beneath later siblings and
+  popovers). Per-kind offsets: button `+2`; checkbox, swatch, picker
+  parts, slider/scrollbar *thumb*, curve marker `+1`; text field and
+  dropdown (open or closed) `-1`; tab, tree row (its own row, not its
+  subtree), anything else `-2`; menus and the command palette get none
+  (their highlighted row is the indicator, APG). A ring that would leave
+  its clip falls back to an inside ring on the visible rect (pre-review
+  wording: "none under 5 px; thumb and marker rings dropped when
+  clipped" — superseded below: every kind now falls back inside, none
+  only under 7 px).
+  `paint_widget_ops` is unchanged (`= …_focused(.., None, ..)`), so only
+  the two frame walkers changed: `aurora-app`'s `target_paint_ops`/
+  `collect_widget_paints` (`App::redraw` resolves the ring) and the
+  gallery harness. **(3) Damage:** a per-node `damage_outset`
+  (crate-private) — `FocusManager` sets `FOCUS_RING_MAX_OUTSET` (4 px as
+  first landed, 5 px after review) on the focused node and clears every
+  other node's outset (`clear_damage_outsets`, after review), so every later
+  `mark_dirty`/`set_bounds`/removal of the focused widget covers its
+  ring's overhang; unfocused widgets keep exact damage.
+  Gallery: a separate seven-cell focus-ring gallery (button, checkbox,
+  slider, text field, dropdown, swatch, tab), so no committed golden
+  changed; five `#[ignore]`d goldens (`focus_ring_gallery*.png`, none
+  blessed), a measured ring-pixel test in all five themes (a focused
+  button's column `left - 3` is `border.focus` ±1, unfocused is the clear
+  colour) and an HC tab test (the inside ring covers the
+  `border.control` outline; `border.focus != border.control` in both HC
+  themes, confirmed). Rendered on `NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)` under `AURORA_REQUIRE_GPU=1`.
+  **Design-owner flags (Cahya, FR-027):** `FOCUS_RING_WIDTH = 2.0` and
+  the four offsets are named consts, not tokens (no stroke-weight
+  scale); `border.focus == accent.primary` in all five built-in themes,
+  so the tab's inside ring covers (and matches) the selected tab's
+  underline — with roving focus the focused tab is always the selected
+  one — and a focused *selected* tree row's inside ring was invisible on
+  its `accent.primary` fill (fixed in review, below); the dropdown's 2 px ring deviates from the
+  mockup's border-only focused dropdown (a 1 px `border.focus` ring
+  would be indistinguishable from the open state's border).
+  **Disclosed, not fixed:** `aurora-app` has no pointer-focus path yet
+  (every app focus move is `Tab` or programmatic), so `Pointer` modality
+  is exercised only by `aurora-widgets` tests and the ring shows on the
+  app's first programmatic focus (a dialog's button, the palette —
+  which itself gets no ring); `WidgetTree::set_accessibility` raises a
+  widget's dirty *flag* but no damage region (pre-existing — nothing
+  consumes `take_damage`, every frame repaints whole), so a slider value
+  change reaches the outset only through a caller's `mark_dirty`; the
+  outset's sufficiency relies on every anchor lying inside its focused
+  node's bounds (true for the S/V sliders, inset over the square, and
+  curve points, inset over the editor); curve marker rings may poke up
+  to 2 px past the editor (covered by the outset, 5 px after review); no human has
+  Tabbed through the app on real hardware, and a green run is not that.
+  +29 tests: workspace 2,235 passing, 45 ignored (the five new
+  unblessed focus-ring goldens), full gate green under
+  `AURORA_REQUIRE_GPU=1`; strict `cargo doc` and `check_contrast.py`
+  clean. Mutations really run (out-of-repo backup, sha256-checked
+  restore), all killed: `focus_at` recording `Keyboard` (6 tests),
+  `Action::Focus` recording `Programmatic` (survived the first pass;
+  killed by a test added for it), the same-id early return restored,
+  the ring inserted *before* the anchor's ops (9), `FOCUS_RING_MAX_OUTSET`
+  3, the old widget's outset not reset, the S/V anchor left on the
+  slider, the inside offset's sign flipped (tab, panel), and the clip
+  fallback removed. Not run: ring as a trailing pass, the
+  `border.default` colour swap, dropping the disabled check (likely
+  redundant with the `Action::Focus` check for every widget that clears
+  it when disabled — the payload-only case is tested), whole-editor curve
+  ring.
+
+  **Review revision (0.129.0, same version, uncommitted round).** A
+  critic BLOCK and a red-team pass with rendered colour measurements
+  found the ring invisible exactly where `border.focus` meets its own
+  colour: a focused *selected* tree row's inside ring and any clipped
+  button's inside fallback sat on `accent.primary`, contrast `1.00`, 0
+  8-bit delta (WCAG 2.4.7 / 1.4.11). **Fixed with a two-colour focus
+  indicator (WCAG technique C40), applied to every ring:** the 2 px
+  `border.focus` band plus a 1 px `text.on_accent` line
+  (`FOCUS_RING_INNER_WIDTH`) directly on the band's inner side — between
+  the band and whatever the widget paints inside it — as a second
+  `PaintOp::Solid`. The line never adds reach (it is always inside the
+  band). **Design-owner flag (Cahya, FR-027):** the second colour reuses
+  the existing `text.on_accent` token rather than inventing a
+  `border.focus_inner`; it is gated at 4.5:1 on `accent.primary`
+  already and now at 3:1 on `border.focus` (8.02 / 6.96 / 19.56 / 8.59
+  / 10.18:1 in Dark / Light / HC Dark / HC Light / Color-Critical). The
+  argument is per-component (band vs the surface outside, line vs the
+  fill inside), not C40's strict 9:1 between the two colours, and the
+  line reads as a near-surface gap outside filled buttons in Dark and
+  Light — a visual change to every ring the owner should review, along
+  with whether a dedicated token is wanted. `check_contrast.py` and
+  `aurora_theme::contrast`'s mirror gained three pairs (17 -> 20): `border.focus` on
+  `surface.sunken` and `surface.app` (rings sit on wells and chrome too)
+  and `text.on_accent` on `border.focus`; all pass in all five themes
+  (lowest: Light's `border.focus` on `surface.sunken`, 4.23:1). Also
+  fixed: a clipped slider/scrollbar thumb ring, or a clipped/too-small
+  curve marker's, now falls back to an inside ring on the control's
+  visible rect like every boxed kind (none only below `2*(W+1)+1` px),
+  and a thumb that spills past a too-narrow control does the same; the
+  damage outset is now **5 px**, not 4 — the widest reach (4) plus one
+  pixel of tessellation slack, since a tiny widget's circular ring
+  measured `+0.02` px past 4, a whole pixel once rounded out to damage
+  (the reported "radius overshoot" was this: `rounded_rect` already
+  clamps its radius); every focus change now resets *every* stale damage
+  outset (`WidgetTree::clear_damage_outsets`), so a `FocusManager`
+  dropped or replaced without a blur no longer leaves one behind. Tests
+  added: ring colour ≥ 3:1 on the accent fill for a selected row and a
+  clipped button in all five themes; the inner line's geometry and
+  colour on every ring any unit test inspects; clipped thumb and curve
+  fallbacks; whole-pixel ring bbox within the outset over 8 sizes (down
+  to 1x1) × 5 scale factors (incl. 1.25/1.5/2.5); the anchor-disabled
+  check (a disabled picker square under an enabled saturation slider,
+  reachable only through `payload_mut`; `node.is_disabled()` is kept
+  beside `kind_disabled` as defense in depth); the stale-outset reset;
+  and a GPU cell, `a_focused_selected_tree_row_is_visibly_distinct_in_every_theme`
+  (RTX 3090, Vulkan). Each was run against its pre-fix mutation
+  (out-of-repo backup, sha256-checked restore) and failed: the accent
+  test at `best 1.00:1`, the GPU test reading `accent.primary`
+  (`[120, 172, 255]` in Dark) where the line should be, the tiny-widget
+  test at `(35, 35, 46, 46)` against a 4 px outset. **Still disclosed,
+  not fixed:** `WidgetTree::set_accessibility` produces no damage region
+  (pre-existing), so a ring that moves or vanishes because a widget
+  setter changed its thumb or state — and that widget itself — lies
+  outside `take_damage` until a caller dirties it; latent only because
+  `aurora-app` repaints whole frames and nothing consumes `take_damage`.
+  A tree row's ring is drawn from its visible rect's `y`, so under a top
+  clip it rings the first *visible* row-height band, not the row's own
+  top. Ring geometry is pixel-aligned only at integer scale factors
+  (fractional factors put its edges on sub-pixel positions; coverage is
+  still bounded, as the tiny-widget test pins). And, restated:
+  `aurora-app` has no pointer path, so in production focus is always
+  visible. The 45 ignored goldens README cites are still exactly the
+  nine unblessed galleries × five themes; the focus-ring goldens will
+  need regenerating with the second colour before any bless. +6 tests:
+  workspace 2,241 passing, 45 ignored, full gate green under
+  `AURORA_REQUIRE_GPU=1` (RTX 3090, Vulkan); doctests, strict
+  `cargo doc` and `check_contrast.py` (all five themes) clean.
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
     `Click` and a closed dropdown declares no `Increment`/`Decrement`, so
@@ -28049,6 +28205,16 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-25 (0.129.0) — keyboard focus ring landed.**
+`FocusManager` tracks focus-visible modality (`FocusOrigin`),
+`FocusPaint::resolve` + `paint_widget_ops_focused` paint a two-colour
+ring (2 px `border.focus` band + 1 px `text.on_accent` inner line)
+inline after its anchor's ops, and a per-node damage
+outset covers the ring's overhang. Full account, design-owner flags and
+disclosures: M1.7's focus-ring entry. **Needs a human:** Tab through the
+real app on real hardware (every theme, HiDPI), and bless the five
+`focus_ring_gallery*.png` goldens.
 
 **Addendum 2026-09-25 (0.128.0) — accessibility action routing
 landed.** `aurora_widgets::handle_action` routes every action a widget

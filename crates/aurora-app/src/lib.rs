@@ -522,8 +522,8 @@ use aurora_widgets::widgets::{
     set_command_palette_query,
 };
 use aurora_widgets::{
-    FocusManager, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline,
-    WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops,
+    FocusManager, FocusPaint, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp,
+    PathPipeline, WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops_focused,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -16049,8 +16049,13 @@ impl App {
 
                 // Built before the render pass below, not inside it --
                 // see `collect_widget_paints`'s own doc comment for why.
+                // The keyboard focus ring, resolved once for the whole
+                // frame (`FocusPaint::resolve`): `None` when focus is not
+                // visible or nothing focused paints one.
+                let focus_paint = FocusPaint::resolve(&self.workspace.tree, &self.focus);
                 let widget_paints = collect_widget_paints(
                     &self.workspace.tree,
+                    focus_paint,
                     &self.theme,
                     &self.scales,
                     gpu,
@@ -16202,6 +16207,7 @@ impl App {
 #[allow(clippy::cast_possible_truncation)]
 fn target_paint_ops(
     tree: &WidgetTree<WidgetKind>,
+    focus: Option<FocusPaint>,
     theme: &Theme,
     scales: &Scales,
     format: wgpu::TextureFormat,
@@ -16210,7 +16216,7 @@ fn target_paint_ops(
     let scale_factor = scale_factor as f32;
     let mut ops = Vec::new();
     for id in tree.paint_order() {
-        match paint_widget_ops(tree, id, theme, scales, scale_factor) {
+        match paint_widget_ops_focused(tree, id, focus, theme, scales, scale_factor) {
             Ok(widget_ops) => {
                 ops.extend(widget_ops.into_iter().map(|op| match op {
                     PaintOp::Solid((mesh, color)) => {
@@ -16244,13 +16250,14 @@ fn target_paint_ops(
 #[must_use]
 fn collect_widget_paints(
     tree: &WidgetTree<WidgetKind>,
+    focus: Option<FocusPaint>,
     theme: &Theme,
     scales: &Scales,
     gpu: &GpuContext,
     format: wgpu::TextureFormat,
     scale_factor: f64,
 ) -> Vec<GpuPaintOp> {
-    target_paint_ops(tree, theme, scales, format, scale_factor)
+    target_paint_ops(tree, focus, theme, scales, format, scale_factor)
         .into_iter()
         .map(|op| match op {
             PaintOp::Solid((mesh, color)) => {
@@ -22973,6 +22980,7 @@ mod tests {
 
         let paints = collect_widget_paints(
             &tree,
+            None,
             &theme,
             &scales,
             &context,
@@ -23026,7 +23034,7 @@ mod tests {
         ) {
             unreachable!("{err:?}");
         }
-        let authored = match super::paint_widget_ops(&tree, button, &theme, &scales, 1.0) {
+        let authored = match aurora_widgets::paint_widget_ops(&tree, button, &theme, &scales, 1.0) {
             Ok(ops) => match ops.into_iter().next() {
                 Some(super::PaintOp::Solid((_, color))) => color,
                 other => unreachable!("a Button paints one solid first: {other:?}"),
@@ -23041,7 +23049,7 @@ mod tests {
             "the fixture needs a channel the sRGB curve actually moves: {authored:?}"
         );
         let solid_colour = |format: wgpu::TextureFormat| -> [f32; 4] {
-            match collect_widget_paints(&tree, &theme, &scales, &context, format, 1.0)
+            match collect_widget_paints(&tree, None, &theme, &scales, &context, format, 1.0)
                 .into_iter()
                 .next()
             {
@@ -23102,7 +23110,7 @@ mod tests {
         tree.compute_layout(200.0, 200.0);
         let mut authored = Vec::new();
         for id in tree.paint_order() {
-            match super::paint_widget_ops(&tree, id, &theme, &scales, 1.0) {
+            match aurora_widgets::paint_widget_ops(&tree, id, &theme, &scales, 1.0) {
                 Ok(ops) => authored.extend(ops),
                 Err(err) => unreachable!("{err:?}"),
             }
@@ -23132,7 +23140,7 @@ mod tests {
             wgpu::TextureFormat::Bgra8UnormSrgb,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         ] {
-            let resolved = super::target_paint_ops(&tree, &theme, &scales, format, 1.0);
+            let resolved = super::target_paint_ops(&tree, None, &theme, &scales, format, 1.0);
             assert_eq!(resolved.len(), authored.len(), "{format:?}");
             for (got, want) in resolved.iter().zip(&authored) {
                 match (got, want) {

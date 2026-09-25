@@ -181,7 +181,7 @@
 //!
 //! # What it deliberately does not do
 //!
-//! No keyboard-focus ring (crate-wide gap), no text, no alpha, no
+//! No text, no alpha, no
 //! numeric fields, no pointer-capture state (a drag is the caller
 //! calling a `*_from_point` function on every move), and no z-layering.
 
