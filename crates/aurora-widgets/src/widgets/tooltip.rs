@@ -87,11 +87,13 @@
 //! between. Calling it again with the same flags is a no-op, so a caller
 //! can report on every pointer move.
 //!
-//! **The caller reports tooltip hover.** [`crate::hit_test`] never
-//! reaches the tooltip — it lies outside its owner's bounds, and
-//! `WidgetTree::hit_test` does not descend into a parent whose bounds
-//! exclude the point — so a caller wanting the hoverable behaviour tests
-//! the pointer against `tree.bounds(tooltip.node())` itself.
+//! **The caller reports tooltip hover.** Since 0.127.0 the shown
+//! tooltip is a [`PaintLayer::Popover`](crate::PaintLayer) root, so
+//! [`crate::hit_test`] (and `WidgetTree::hit_test`) *does* reach it even
+//! though it lies outside its owner's bounds. This module still observes
+//! no pointer itself: a caller derives the `tooltip` flag from a hit
+//! test, e.g. `hit.is_some_and(|h| tree.popover_root_of(h) ==
+//! tooltip.node())`, and reports it through [`Tooltip::set_hover`].
 //!
 //! # The accessibility vocabulary, checked against the pinned sources
 //!
@@ -226,15 +228,23 @@
 //!
 //! # What this does not do, stated rather than implied away
 //!
-//! - **No z-layering.** The tooltip is painted in ordinary tree order —
-//!   after its owner, but *before* every later sibling of the owner — so
-//!   a widget laid out below the owner paints over it. The same missing
-//!   popover layer `dropdown.rs` records for its open list.
+//! - **Layering is creation order, nothing more.** The tooltip is a
+//!   popover root (0.127.0): it paints after every base-layer widget and
+//!   no clipping ancestor of its owner clips it. Between popovers the
+//!   most recently *created* stacks on top, and the tooltip node is
+//!   re-inserted on every show, so a tooltip shown over an open dropdown
+//!   list paints and hit-tests above it.
+//!   The converse holds too, and is not special-cased: a tooltip
+//!   *already showing* when a dropdown list or a menu opens sits under
+//!   it, since that popover is created after the tooltip (pinned by a
+//!   test). A caller that wants the tooltip gone can
+//!   [`Tooltip::dismiss`] it whenever it opens another popover. Like
+//!   every popover, it also stops painting and hit-testing when its
+//!   owner is wholly clipped away.
 //! - **No viewport flip or collision handling**: the tooltip always hangs
-//!   directly below its owner, left-aligned, even when that runs off the
-//!   window's bottom edge; and a clipping ancestor
-//!   (`taffy::Overflow::Hidden`, e.g. a panel body) clips it, the same as
-//!   any other descendant (`paint::clip_to_clipping_ancestors`).
+//!   directly below its owner, left-aligned; the part running past the
+//!   window (the tree root's own bounds) is clamped away rather than the
+//!   tooltip being moved (`paint::clip_to_clipping_ancestors`).
 //! - **No text measurement**: its width is its owner's width
 //!   (`percent(1.0)`), its height one `typography.size.xs` line plus
 //!   `spacing.xxs` padding above and below — a stand-in until text can be
@@ -278,7 +288,7 @@ use taffy::{Position, Rect as LayoutRect, Size, Style};
 
 use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
-use crate::tree::{WidgetId, WidgetTree};
+use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 
 /// Where a [`Tooltip`] is in its show/hide cycle — see this module's own
 /// doc comment for the transition table.
@@ -582,10 +592,11 @@ impl Tooltip {
     }
 
     /// The shown tooltip's own widget id — `Some` exactly while
-    /// [`TooltipPhase::Shown`]. [`crate::hit_test`] never reaches it (it
-    /// lies outside its owner's bounds), so a caller wanting the
-    /// hoverable behaviour tests the pointer against this widget's bounds
-    /// and reports the result through [`Self::set_hover`]'s `tooltip`.
+    /// [`TooltipPhase::Shown`]. It is a popover root, so
+    /// [`crate::hit_test`] reaches it: a caller wanting the hoverable
+    /// behaviour checks whether a hit's
+    /// [`WidgetTree::popover_root_of`] is this id and reports the result
+    /// through [`Self::set_hover`]'s `tooltip`.
     #[must_use]
     pub fn node(&self) -> Option<WidgetId> {
         self.node
@@ -781,14 +792,25 @@ impl Tooltip {
                 tree.set_accessibility(id, expected)?;
                 tree.mark_dirty(id)?;
             }
+            // Idempotent: a no-op (and no damage) when already set, and
+            // repairs a flag a caller reset behind this module's back.
+            tree.set_layer(id, PaintLayer::Popover)?;
             return Ok(id);
         }
-        tree.insert(
+        let id = tree.insert(
             self.owner,
             tooltip_style(self.metrics),
             expected,
             WidgetKind::Tooltip,
-        )
+        )?;
+        // A shown tooltip floats above every base-layer widget (this
+        // module's own doc comment). Unreachable failure (the id was just
+        // inserted and is never the root), but nothing is left behind.
+        if let Err(err) = tree.set_layer(id, PaintLayer::Popover) {
+            let _ = tree.remove(id);
+            return Err(err);
+        }
+        Ok(id)
     }
 }
 
@@ -796,7 +818,7 @@ impl Tooltip {
 mod tests {
     use super::{Model, Tooltip, TooltipPhase};
     use crate::WidgetError;
-    use crate::tree::{WidgetId, WidgetTree};
+    use crate::tree::{PaintLayer, WidgetId, WidgetTree};
     use crate::widgets::{
         CommandEntry, DialogAction, MenuItem, ScrollbarRange, WidgetKind, insert_button,
         insert_checkbox, insert_color_picker, insert_color_swatch, insert_command_palette,
@@ -1538,6 +1560,224 @@ mod tests {
         );
         assert_eq!(tree.is_dirty(id), Some(true));
         assert_eq!(tree.take_damage(), tree.bounds(id));
+    }
+
+    /// A shown tooltip is a popover root: both hit-testers reach it
+    /// outside its owner's bounds, and repeated shows keep the flag.
+    #[test]
+    fn a_shown_tooltip_is_a_hit_testable_popover() {
+        let (mut tree, button, mut tooltip) = fixture();
+        let t0 = Instant::now();
+        let id = show(&mut tree, &mut tooltip, t0);
+        tree.compute_layout(200.0, 120.0);
+        assert_eq!(tree.layer(id), Some(PaintLayer::Popover));
+        assert_eq!(tree.popover_root_of(id), Some(id));
+        assert_eq!(tree.layer(button), Some(PaintLayer::Base));
+        let (Some(owner), Some(bounds)) = (tree.bounds(button), tree.bounds(id)) else {
+            unreachable!("laid out");
+        };
+        assert!(bounds.y >= owner.bottom(), "hangs below its owner");
+        #[allow(clippy::cast_precision_loss)]
+        let centre = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+        let hit = tree.hit_test(centre);
+        assert_eq!(hit, Some(id));
+        assert_eq!(
+            crate::hit_test(&tree, f64::from(centre.0), f64::from(centre.1)),
+            Some(id)
+        );
+        assert!(hit.is_some_and(|h| tree.popover_root_of(h) == tooltip.node()));
+        // Re-reporting while shown reuses the node and keeps the flag.
+        ok(tooltip.set_hover(&mut tree, true, true, t0 + ms(700)));
+        assert_eq!(tooltip.node(), Some(id));
+        assert_eq!(tree.layer(id), Some(PaintLayer::Popover));
+        // A flag reset behind this module's back is repaired on the next
+        // commit that reuses the node.
+        ok(tree.set_layer(id, PaintLayer::Base));
+        ok(tooltip.set_hover(&mut tree, true, false, t0 + ms(800)));
+        assert_eq!(tooltip.node(), Some(id), "reused, not re-inserted");
+        assert_eq!(tree.layer(id), Some(PaintLayer::Popover));
+    }
+
+    /// A tooltip shown after a dropdown opened stacks above the open
+    /// list: it paints after it and wins the hit test where they overlap.
+    #[test]
+    fn a_tooltip_shown_over_an_open_dropdown_list_stacks_above_it() {
+        let (mut tree, root) = new_tree(sized_root());
+        let dropdown = ok(insert_dropdown(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Blend",
+            vec![
+                "A".to_owned(),
+                "B".to_owned(),
+                "C".to_owned(),
+                "D".to_owned(),
+            ],
+            Some(0),
+        ));
+        let button = ok(insert_button(&mut tree, root, &test_scales(), "Apply"));
+        let mut tooltip = ok(Tooltip::new(
+            &tree,
+            button,
+            &test_scales(),
+            "Apply the change",
+            DELAY,
+        ));
+        ok(set_dropdown_open(&mut tree, dropdown, true));
+        let id = show(&mut tree, &mut tooltip, Instant::now());
+        tree.compute_layout(200.0, 120.0);
+        let Some(list) = tree.children(dropdown).and_then(|c| c.first().copied()) else {
+            unreachable!("open");
+        };
+        assert_eq!(tree.layer(list), Some(PaintLayer::Popover));
+        assert_eq!(tree.popover_roots(), vec![list, id]);
+        let (Some(list_bounds), Some(tip)) = (tree.bounds(list), tree.bounds(id)) else {
+            unreachable!("laid out");
+        };
+        let overlap_top = list_bounds.y.max(tip.y);
+        let overlap_bottom = list_bounds.bottom().min(tip.bottom());
+        assert!(
+            overlap_bottom > overlap_top,
+            "the fixture must overlap: list {list_bounds:?}, tooltip {tip:?}"
+        );
+        let order = tree.paint_order();
+        assert_eq!(order.last(), Some(&id), "the tooltip is painted last");
+        #[allow(clippy::cast_precision_loss)]
+        let point = (tip.x as f32 + 2.0, overlap_top as f32 + 1.0);
+        assert_eq!(tree.hit_test(point), Some(id));
+        assert_eq!(
+            crate::hit_test(&tree, f64::from(point.0), f64::from(point.1)),
+            Some(id)
+        );
+    }
+
+    /// The disclosed flip side of creation-order stacking: a tooltip
+    /// already showing when a dropdown list opens sits *under* that
+    /// list, because the list is created (rebuilt) on open, after the
+    /// tooltip. Pinned so a change to the stacking rule is deliberate.
+    #[test]
+    fn a_dropdown_list_opened_after_a_tooltip_stacks_above_it() {
+        let (mut tree, root) = new_tree(sized_root());
+        let dropdown = ok(insert_dropdown(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Blend",
+            vec![
+                "A".to_owned(),
+                "B".to_owned(),
+                "C".to_owned(),
+                "D".to_owned(),
+            ],
+            Some(0),
+        ));
+        let button = ok(insert_button(&mut tree, root, &test_scales(), "Apply"));
+        let mut tooltip = ok(Tooltip::new(
+            &tree,
+            button,
+            &test_scales(),
+            "Apply the change",
+            DELAY,
+        ));
+        let id = show(&mut tree, &mut tooltip, Instant::now());
+        ok(set_dropdown_open(&mut tree, dropdown, true));
+        tree.compute_layout(200.0, 120.0);
+        let Some(list) = tree.children(dropdown).and_then(|c| c.first().copied()) else {
+            unreachable!("open");
+        };
+        assert_eq!(tree.popover_roots(), vec![id, list]);
+        let (Some(list_bounds), Some(tip)) = (tree.bounds(list), tree.bounds(id)) else {
+            unreachable!("laid out");
+        };
+        let overlap_top = list_bounds.y.max(tip.y);
+        let overlap_bottom = list_bounds.bottom().min(tip.bottom());
+        assert!(
+            overlap_bottom > overlap_top,
+            "the fixture must overlap: list {list_bounds:?}, tooltip {tip:?}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let point = (tip.x as f32 + 2.0, overlap_top as f32 + 1.0);
+        let hit = tree.hit_test(point);
+        assert!(
+            hit.is_some_and(|hit| tree.popover_root_of(hit) == Some(list)),
+            "the later list wins: {hit:?}"
+        );
+    }
+
+    /// `PaintLayer`'s contract, checked on all three shipped popovers:
+    /// every popover root either hides its own overflow or lays every
+    /// descendant out inside its own bounds — otherwise an overhang would
+    /// paint on top while clicks on it fell through to the base layer.
+    #[test]
+    fn every_shipped_popover_root_contains_its_descendants() {
+        let (mut tree, root) = new_tree(sized_root());
+        let dropdown = ok(insert_dropdown(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Blend",
+            vec!["A".to_owned(), "B".to_owned(), "C".to_owned()],
+            Some(0),
+        ));
+        let button = ok(insert_button(&mut tree, root, &test_scales(), "Apply"));
+        let mut tooltip = ok(Tooltip::new(
+            &tree,
+            button,
+            &test_scales(),
+            "Apply the change",
+            DELAY,
+        ));
+        ok(set_dropdown_open(&mut tree, dropdown, true));
+        let menu = ok(open_menu(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Edit",
+            (10.0, 10.0),
+            80.0,
+            vec![
+                MenuItem::action("Cut"),
+                MenuItem::separator(),
+                MenuItem::action("Copy"),
+            ],
+        ));
+        let tip = show(&mut tree, &mut tooltip, Instant::now());
+        tree.compute_layout(200.0, 120.0);
+        let roots = tree.popover_roots();
+        assert_eq!(roots.len(), 3, "list, menu and tooltip: {roots:?}");
+        assert!(roots.contains(&menu) && roots.contains(&tip));
+        let mut checked = 0;
+        for popover in roots {
+            let Some(outer) = tree.bounds(popover) else {
+                unreachable!("live");
+            };
+            let mut stack: Vec<WidgetId> = tree.children(popover).unwrap_or(&[]).to_vec();
+            while let Some(id) = stack.pop() {
+                stack.extend_from_slice(tree.children(id).unwrap_or(&[]));
+                let Some(inner) = tree.bounds(id) else {
+                    unreachable!("live");
+                };
+                if inner.width == 0 || inner.height == 0 {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    inner.x >= outer.x
+                        && inner.y >= outer.y
+                        && inner.x + i64::from(inner.width) <= outer.x + i64::from(outer.width)
+                        && inner.bottom() <= outer.bottom(),
+                    "{id:?} {inner:?} escapes popover {popover:?} {outer:?}"
+                );
+            }
+        }
+        assert!(
+            checked >= 6,
+            "the list's and menu's rows were checked: {checked}"
+        );
     }
 
     #[test]

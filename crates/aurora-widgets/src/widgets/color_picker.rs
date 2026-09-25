@@ -89,10 +89,13 @@
 //! writes the preview through `set_color_swatch_*` is overwriting a
 //! picker-owned node; the next picker call repairs it.
 //!
-//! **Accessibility `ActionRequest`s are not routed** — the same crate-wide
-//! gap every widget here has (`aurora-app` logs and drops them). A routed
-//! `SetValue`/`Increment`/`Decrement` on a channel slider would call
-//! [`set_color_picker_hsv`] or [`handle_color_picker_key`] respectively.
+//! **Accessibility requests are routed** (0.128.0) by
+//! `crate::action::handle_action`: `SetValue` on a channel slider takes
+//! the number in that slider's own announced unit (percent for
+//! saturation and value, degrees for hue — read from the node's own
+//! maximum) and calls [`set_color_picker_hsv`]; `Increment`/`Decrement`
+//! call [`handle_color_picker_key`] with that channel's fine-step key
+//! (`Right`/`Left` for saturation and hue, `Up`/`Down` for value).
 //!
 //! Every accessible name below the picker's own label (`"Saturation and
 //! value"`, `"Saturation"`, `"Value"`, `"Hue"`, `"Colour"`) is an English
@@ -178,7 +181,7 @@
 //!
 //! # What it deliberately does not do
 //!
-//! No keyboard-focus ring (crate-wide gap), no text, no alpha, no
+//! No text, no alpha, no
 //! numeric fields, no pointer-capture state (a drag is the caller
 //! calling a `*_from_point` function on every move), and no z-layering.
 

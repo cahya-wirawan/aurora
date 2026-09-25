@@ -265,13 +265,17 @@
       gallery is three cells — closed, open with a three-option list
       and the middle option highlighted, and disabled — and like the
       tree it draws no text and no ▾ indicator; its "focused" border
-      is keyed on the list being open, since no widget there paints
-      keyboard focus yet. The Tab bar has since landed too, 0.121.0:
+      is keyed on the list being open (a 1 px border.focus line); keyboard
+      focus is a separate 2 px ring since 0.129.0, straddling that border
+      in both the open and closed state — a deviation from this mockup's
+      border-only focused dropdown, flagged to the design owner. The Tab bar has since landed too, 0.121.0:
       its rendered gallery is two cells, enabled and disabled, each three
       tabs with the first selected, painted over the theme's own panel
       colour — a 1 px rule under the bar and a 2 px accent underline under
-      the selected tab. It draws no tab labels, and there is no "focused"
-      cell at all, because nothing there paints a keyboard-focus ring.
+      the selected tab. It draws no tab labels. Its "focused" state is
+      rendered separately, 0.129.0, in the keyboard focus-ring gallery
+      (seven focused widgets in one row, every theme; goldens pending a
+      human bless), so the tab bar's own committed images did not change.
       The Tooltip has since landed too, 0.122.0: its rendered gallery is
       one cell, a button with its tooltip shown directly below it, as wide
       as the button, over the theme's own panel colour. It paints the

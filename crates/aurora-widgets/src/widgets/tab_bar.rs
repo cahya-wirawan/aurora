@@ -119,14 +119,20 @@
 //!   not stop on it (and the bar above it is not focusable either). A
 //!   caller that wants click-to-select hit-tests, maps the hit tab with
 //!   [`TabBarState::index_of`], and calls [`select_tab`].
-//! - **No accessibility action is routed here** — the same workspace-wide
-//!   gap `dropdown.rs` records: `aurora-app`'s `ActionRequested` handler
-//!   logs and drops every request. [`select_tab`] is what a routed
-//!   `Click` would call.
-//! - **No keyboard-focus ring is painted** — a crate-wide gap (nothing in
-//!   `paint.rs` reads `FocusManager`), so the mockup's "focused" gallery
-//!   state is not rendered here and the gallery has no cell for it. There
-//!   is no `focused` field on purpose.
+//! - **Accessibility `Click` and `Focus` are routed** (0.128.0) by
+//!   `crate::action::handle_action`: a `Click` on a tab calls
+//!   [`select_tab`] and, if focus sat on the previously selected tab,
+//!   moves it to the new one (roving focus). Nothing else is declared,
+//!   so nothing else is accepted.
+//! - **The keyboard focus ring** (0.129.0) is painted by
+//!   `paint::paint_widget_ops_focused`, not by this module: 2 px of
+//!   `border.focus` *inside* the focused tab's own bounds (tabs tile
+//!   flush, so an outside ring would paint onto the neighbour). With
+//!   roving focus the focused tab is always the selected one, so the ring
+//!   covers its 2 px `accent.primary` underline — which is the same colour
+//!   in every built-in theme; the underline shows again on blur. Flagged to
+//!   the design owner. There is still no `focused` field: focus lives in
+//!   `FocusManager`, and its visibility (`:focus-visible`) with it.
 //! - **No glyphs**: tab labels reach the accessibility tree only. Tabs
 //!   therefore share the bar's width **equally** (`flex_grow: 1`,
 //!   `flex_basis: 0`) — a stand-in until text can be measured, not a

@@ -46,10 +46,10 @@
 //! `PageDown`, `Alt+Down`, and type-ahead — the APG lists all of them.
 //! Nothing here handles a pointer click on an option either (see "Hit
 //! testing" below); [`toggle_dropdown`] is the whole pointer story, for
-//! a click on the control itself. And nothing in the workspace routes an
-//! assistive technology's `Expand`/`Collapse`/`Click` action request to
-//! these functions yet (see "No accessibility action is routed here"
-//! below), so the keys above are the only input path that is real today.
+//! a click on the control itself. An assistive technology's
+//! `Expand`/`Collapse`/`Click` request reaches [`set_dropdown_open`] and
+//! [`toggle_dropdown`] through `crate::action::handle_action` (0.128.0;
+//! see "Accessibility actions" below).
 //!
 //! # The accessibility vocabulary, checked against the pinned sources
 //!
@@ -137,23 +137,19 @@
 //!
 //! # What this does not do, stated rather than implied away
 //!
-//! - **No popover layering.** The list is painted in ordinary
-//!   `WidgetTree::paint_order`, right after its own control, so **any
-//!   later sibling of the dropdown (or of any of its ancestors) paints
-//!   over the open list**. A real popover needs a top layer this crate
-//!   does not have yet — `widgets`' own module doc comment names it as
-//!   missing infrastructure for menus, and it is missing here (and for
-//!   `tooltip.rs`'s shown tooltip, `0.122.0`) too.
-//! - **Hit testing never reaches an option.** Both `WidgetTree::
-//!   hit_test` and `input::hit_test` refuse to descend into a widget
-//!   whose own bounds exclude the point, and the list lies entirely
-//!   *below* the control's bounds — so a pointer over an open option
-//!   hits whatever is behind it, never the option. Pinned by
-//!   `hit_testing_an_open_option_does_not_reach_the_option`, so the day
-//!   popover hit-testing lands this test is what has to change.
-//! - **An ancestor with a clipping `Overflow` clips the open list**
-//!   (`paint::clip_to_clipping_ancestors`), so a dropdown near the
-//!   bottom of a panel body opens into nothing visible.
+//! - **The list is a popover, clamped to the window and nothing
+//!   smarter** (0.127.0). The list is inserted as a
+//!   [`PaintLayer::Popover`](crate::PaintLayer) root, so it paints after
+//!   every base-layer widget (a later sibling of the dropdown no longer
+//!   paints over it), both `WidgetTree::hit_test` and `crate::hit_test`
+//!   reach its options (pinned by
+//!   `hit_testing_an_open_option_reaches_the_option`), and a clipping
+//!   `Overflow` ancestor no longer clips it — a dropdown near the bottom
+//!   of a panel body opens past the body's edge. What it still does
+//!   *not* do is **flip or reposition**: the list always hangs below the
+//!   control, and the part that would fall outside the tree root's own
+//!   bounds (the window) is simply clamped away, unreachable and
+//!   unpainted.
 //! - **No glyphs**: neither the selected option's text, nor the option
 //!   rows' text, nor the `▾` indicator `design/gallery/index.html`
 //!   shows is drawn — this crate draws no glyphs at all, and which
@@ -165,13 +161,15 @@
 //!   [`toggle_dropdown`], [`set_dropdown_open`], disabling); nothing
 //!   here observes a click elsewhere or focus moving away, so a caller
 //!   that wants either must call [`set_dropdown_open`] itself.
-//! - **No accessibility action is routed here.** The control declares
-//!   `Focus`/`Click`/`Expand`/`Collapse`, but nothing in the workspace
-//!   turns an incoming `accesskit::ActionRequest` into a call on this
-//!   module: `aurora-app`'s own `ActionRequested` handler
-//!   (`crates/aurora-app/src/lib.rs`, `user_event`) logs every request
-//!   and drops it, for every widget. [`toggle_dropdown`] and
-//!   [`set_dropdown_open`] are what such routing would call.
+//! - **Accessibility actions: the control only.** The control's
+//!   `Focus`/`Click`/`Expand`/`Collapse` are routed (0.128.0) by
+//!   `crate::action::handle_action` to [`toggle_dropdown`] and
+//!   [`set_dropdown_open`] — `Collapse` closes without committing, like
+//!   `Escape`. **Choosing an option is not possible through an assistive
+//!   technology's actions**: option rows declare no `Click`, so the
+//!   dispatcher refuses one; a screen-reader user picks an option with
+//!   the arrow keys and `Enter`, and whether a real screen reader lets
+//!   them do that has not been checked by a human.
 //! - **The highlighted option covers part of the list's border.** A
 //!   highlighted row is the list's full width (`paint_list_row` fills
 //!   the row's whole box), so its `accent.primary` fill lies over the
@@ -194,7 +192,7 @@ use taffy::{AlignItems, FlexDirection, Position, Rect as LayoutRect, Size, Style
 use super::{ListRowState, WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
-use crate::tree::{WidgetId, WidgetTree};
+use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 
 /// The four keys a dropdown responds to — see this module's own doc
 /// comment for the transition table and for why this is not
@@ -964,6 +962,11 @@ fn build_list(
         list_node(&label),
         WidgetKind::DropdownList,
     )?;
+    // The open list floats above every base-layer widget and escapes its
+    // control's clipping ancestors — see this module's own doc comment.
+    // On an error the half-built list is removed by `sync_structure`,
+    // exactly as a failed row insert already is.
+    tree.set_layer(list, PaintLayer::Popover)?;
     let len = options.len();
     let mut rows = Vec::with_capacity(len);
     for (index, text) in options.iter().enumerate() {
@@ -1020,7 +1023,7 @@ mod tests {
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
-    use crate::tree::{WidgetId, WidgetTree};
+    use crate::tree::{PaintLayer, WidgetId, WidgetTree};
     use crate::widgets::{
         ListRowState, WidgetKind, insert_button, new_tree, row_height, test_scales,
     };
@@ -1911,33 +1914,78 @@ mod tests {
         assert_eq!(tree.bounds(button), closed);
     }
 
-    /// Pins a disclosed limitation, not a feature: both hit-testers
-    /// refuse to descend into a widget whose bounds exclude the point,
-    /// and the open list lies entirely below the control — so a pointer
-    /// over an option never reaches it. When popover hit-testing lands,
-    /// this is the test that has to change.
+    /// The open list is a popover root: both hit-testers reach an
+    /// option even though it lies entirely below the control's own
+    /// bounds (it replaces 0.121.0's
+    /// `hit_testing_an_open_option_does_not_reach_the_option`, which
+    /// pinned the opposite as a disclosed limitation), and `focus_at`
+    /// over it climbs row -> list -> control and focuses the control.
     #[test]
-    fn hit_testing_an_open_option_does_not_reach_the_option() {
-        let (tree, id, state) = laid_out_open();
+    fn hit_testing_an_open_option_reaches_the_option() {
+        let (mut tree, id, state) = laid_out_open();
+        let Some(list) = state.list() else {
+            unreachable!("open");
+        };
+        assert_eq!(tree.layer(list), Some(PaintLayer::Popover));
+        assert_eq!(tree.popover_root_of(list), Some(list));
         let Some(&row) = state.rows().get(1) else {
             unreachable!("three rows");
         };
+        assert_eq!(tree.popover_root_of(row), Some(list));
         let Some(bounds) = tree.bounds(row) else {
             unreachable!("laid out");
         };
         #[allow(clippy::cast_precision_loss)]
         let (x, y) = (bounds.x as f32 + 5.0, bounds.y as f32 + 5.0);
-        let hit = tree.hit_test((x, y));
-        assert_ne!(hit, Some(row));
-        assert_ne!(hit, Some(id));
-        assert_eq!(
-            hit,
-            Some(tree.root()),
-            "the pointer falls through to what is behind"
-        );
+        assert_eq!(tree.hit_test((x, y)), Some(row));
         assert_eq!(
             crate::hit_test(&tree, f64::from(x), f64::from(y)),
-            Some(tree.root())
+            Some(row)
+        );
+        let mut focus = crate::FocusManager::new();
+        assert_eq!(
+            focus.focus_at(&mut tree, f64::from(x), f64::from(y)),
+            Some(id),
+            "an option declares no Focus action, so the click bubbles to the control"
+        );
+    }
+
+    /// The list subtree is the last thing painted, after a later sibling
+    /// button that the open list overlaps.
+    #[test]
+    fn the_open_list_paints_after_a_later_sibling() {
+        let (mut tree, id) = inserted(Some(0));
+        let root = tree.root();
+        let button = match insert_button(&mut tree, root, &test_scales(), "OK") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        press(&mut tree, id, DropdownKey::Down);
+        tree.compute_layout(200.0, 200.0);
+        let state = snapshot(&tree, id);
+        let Some(list) = state.list() else {
+            unreachable!("open");
+        };
+        let order = tree.paint_order();
+        let mut expected_tail = vec![list];
+        expected_tail.extend_from_slice(state.rows());
+        assert!(
+            order.ends_with(&expected_tail),
+            "{order:?} must end with {expected_tail:?}"
+        );
+        let position = |w: WidgetId| order.iter().position(|&x| x == w);
+        assert!(position(button) < position(list));
+        assert_eq!(order.len(), tree.len(), "every widget exactly once");
+        // The button sits where the list hangs, so the list must win.
+        let Some(button_bounds) = tree.bounds(button) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = (button_bounds.x as f32 + 2.0, button_bounds.y as f32 + 2.0);
+        let hit = tree.hit_test(point);
+        assert!(
+            hit.is_some_and(|h| tree.popover_root_of(h) == Some(list)),
+            "the button under the open list is not what a click reaches: {hit:?}"
         );
     }
 

@@ -102,7 +102,7 @@
 //! not a design decision made by Cahya (PRD FR-027 *Ownership*); revisit
 //! if/when real per-widget radius tokens are added.
 
-use accesskit::{Orientation, Toggled};
+use accesskit::{Action, Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Color, Scales, Theme};
 use aurora_vector::{
@@ -110,9 +110,8 @@ use aurora_vector::{
     bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
 };
 
-use taffy::Overflow;
-
 use crate::error::WidgetError;
+use crate::input::FocusManager;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
@@ -178,16 +177,432 @@ pub fn paint_widget_ops(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<PaintOp>, WidgetError> {
+    paint_widget_ops_focused(tree, id, None, theme, scales, scale_factor)
+}
+
+/// [`paint_widget_ops`] plus the keyboard focus ring: when `focus` is
+/// `Some` and its [`FocusPaint::anchor`] is `id`, the ring is appended as
+/// one [`PaintOp::Solid`] **right after `id`'s own ops** — the CSS
+/// `outline` rule: above the element it outlines, beneath every widget
+/// painted after it (a later overlapping sibling, a popover). Any other
+/// `id` gets exactly [`paint_widget_ops`]' output. A frame walker
+/// resolves `focus` once per frame with [`FocusPaint::resolve`] and
+/// passes it to every widget it paints; everything else keeps calling
+/// [`paint_widget_ops`].
+///
+/// The ring is **two colours** (a C40-style two-colour ring, though not C40's 9:1 inter-colour ratio; the argument is per-component — see PLAN.md M1.7), appended as two
+/// ops: a [`FOCUS_RING_WIDTH`]-wide `border.focus` band (full opacity —
+/// it is state, not decoration) around a per-kind reference shape at a
+/// per-kind offset, then a [`FOCUS_RING_INNER_WIDTH`]-wide
+/// `text.on_accent` line directly on the band's inner side. The second
+/// colour is what keeps the ring visible where the band alone would
+/// vanish: `border.focus` *is* `accent.primary` in every built-in theme,
+/// so a band on an accent fill (a selected tree row's inside ring, a
+/// clipped button's inside fallback) has contrast `1.00`, while
+/// `text.on_accent` is gated at 4.5:1 against `accent.primary` and at
+/// 3:1 against `border.focus` (`design/check_contrast.py`). See
+/// `focus_ring_target` for the per-kind table and the reasons. A ring
+/// that would leave the anchor's clip falls back to an inside ring on
+/// the anchor's visible rect, or to none when that rect is too small to
+/// hold one.
+///
+/// # Errors
+///
+/// Exactly [`paint_widget`]'s, plus [`WidgetError::Paint`] if the ring's
+/// own tessellation fails.
+pub fn paint_widget_ops_focused(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    focus: Option<FocusPaint>,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
     let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
     let gradients = match tree.payload(id) {
         Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
         _ => Vec::new(),
     };
-    Ok(gradients
+    let mut ops: Vec<PaintOp> = gradients
         .into_iter()
         .map(PaintOp::Gradient)
         .chain(solids.into_iter().map(PaintOp::Solid))
-        .collect())
+        .collect();
+    if let Some(focus) = focus
+        && focus.anchor == id
+        && let Some([band, line]) = focus_ring(tree, focus, theme, scales, scale_factor)?
+    {
+        ops.push(PaintOp::Solid(band));
+        ops.push(PaintOp::Solid(line));
+    }
+    Ok(ops)
+}
+
+/// The keyboard focus ring's stroke width, in logical pixels — the
+/// mockup's `outline: 2px solid var(--border-focus)`. **Not a token**:
+/// `design/tokens/scales.toml` has no stroke-weight scale, the same gap
+/// the tab underline's `UNDERLINE_WIDTH` records. Flagged to the design
+/// owner (Cahya, PRD FR-027 *Ownership*) rather than invented here.
+pub const FOCUS_RING_WIDTH: f32 = 2.0;
+
+/// The focus ring's second-colour line, in logical pixels: `text.on_accent`
+/// directly on the inner side of the `border.focus` band (C40-style, not
+/// C40's 9:1 ratio — see [`paint_widget_ops_focused`]). Always inside the band, so it
+/// never adds to the ring's reach past a widget's bounds. **Not a token**
+/// either, for [`FOCUS_RING_WIDTH`]'s reason; the colour choice
+/// (`text.on_accent`, an existing token) is flagged to the design owner
+/// in PLAN.md.
+pub const FOCUS_RING_INNER_WIDTH: f32 = 1.0;
+
+/// The ring sits this far *outside* a filled button (CSS
+/// `outline-offset: 2px`), leaving a gap so it reads against the
+/// `accent.primary` fill it would otherwise touch (`border.focus` and
+/// `accent.primary` resolve to the same colour in every built-in theme).
+const RING_OFFSET_CLEAR: f32 = 2.0;
+/// One pixel outside: small handles and boxes (checkbox, slider and
+/// scrollbar thumbs, swatch, colour-picker parts, curve markers), whose
+/// own edge the ring must not merge into.
+const RING_OFFSET_ADJACENT: f32 = 1.0;
+/// One pixel *inside*, straddling the control's own 1 px border line:
+/// text-entry wells (text field, dropdown), where the ring replaces the
+/// border the way a focused `<input>` does.
+const RING_OFFSET_ON_BORDER: f32 = -1.0;
+/// Fully inside: rows and regions that tile flush against their
+/// neighbours (tabs, tree rows, panels), where an outside ring would
+/// paint onto the next widget — and the clip fallback for every kind.
+const RING_OFFSET_INSIDE: f32 = -2.0;
+
+/// The largest `offset + FOCUS_RING_WIDTH` of any ring (`4`) plus one
+/// pixel of tessellation slack, in whole pixels — how far past its
+/// bounds [`crate::FocusManager`] grows the focused widget's damage
+/// (`WidgetTree::set_damage_outset`) so a ring's overhang is always
+/// repainted. The slack is real, not caution (0.129.0 review F4): a
+/// stroke's flattened outer edge bulges past the ideal curve by up to
+/// the tessellation tolerance where a vertex sits on an axis extreme —
+/// a tiny widget whose ring is a circle measured `+0.02` px past the
+/// ideal `4`, one whole pixel further once rounded out to damage.
+/// `ring_offsets_fit_the_damage_outset` pins it against every offset
+/// above, and `every_ring_stays_within_the_damage_outset_even_on_tiny_widgets`
+/// against real tessellated rings.
+pub(crate) const FOCUS_RING_MAX_OUTSET: u32 = 5;
+
+/// The per-frame focus-ring decision: which widget is focused, and which
+/// widget's paint carries its ring (the *anchor*). Resolved once per
+/// frame by [`Self::resolve`] and handed to
+/// [`paint_widget_ops_focused`] for every widget.
+///
+/// The anchor is the focused widget itself except where the focused
+/// node paints nothing of its own: a colour picker's saturation/value
+/// slider (inset over the square) anchors on the square, and a curve
+/// editor's point slider anchors on the editor, whose paint draws the
+/// ring around that point's marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusPaint {
+    focused: WidgetId,
+    anchor: WidgetId,
+}
+
+impl FocusPaint {
+    /// The ring to paint this frame, or `None` when there is none: focus
+    /// not visible ([`FocusManager::focus_visible`] — a pointer click
+    /// hides it), the focused widget gone or no longer focusable, it or
+    /// its anchor disabled, a kind that shows focus another way (a menu
+    /// or command palette's highlighted row, APG's `aria-activedescendant`
+    /// pattern; dropdown lists, rows, tooltips, dialogs and separators are
+    /// never focus stops at all), or an anchor wholly clipped away.
+    #[must_use]
+    pub fn resolve(tree: &WidgetTree<WidgetKind>, focus: &FocusManager) -> Option<Self> {
+        if !focus.focus_visible() {
+            return None;
+        }
+        let focused = focus.focused()?;
+        let node = tree.accessibility(focused)?;
+        if !node.supports_action(Action::Focus) || node.is_disabled() {
+            return None;
+        }
+        let kind = tree.payload(focused)?;
+        if kind_disabled(kind) {
+            return None;
+        }
+        let anchor = match kind {
+            WidgetKind::ColorPickerPart(part)
+                if matches!(
+                    part.role(),
+                    ColorPickerPartRole::Saturation | ColorPickerPartRole::Value
+                ) =>
+            {
+                let parent = tree.parent(focused)?;
+                match tree.payload(parent) {
+                    Some(WidgetKind::ColorPickerPart(area))
+                        if area.role() == ColorPickerPartRole::Area =>
+                    {
+                        parent
+                    }
+                    _ => return None,
+                }
+            }
+            WidgetKind::CurveEditorPoint(_) => {
+                let parent = tree.parent(focused)?;
+                match tree.payload(parent) {
+                    Some(WidgetKind::CurveEditor(_)) => parent,
+                    _ => return None,
+                }
+            }
+            kind if !gets_focus_ring(kind) => return None,
+            _ => focused,
+        };
+        if anchor != focused && kind_disabled(tree.payload(anchor)?) {
+            return None;
+        }
+        tree.visible_rect(anchor, tree.bounds(anchor)?)?;
+        Some(Self { focused, anchor })
+    }
+
+    /// The focused widget.
+    #[must_use]
+    pub fn focused(&self) -> WidgetId {
+        self.focused
+    }
+
+    /// The widget whose paint carries the ring.
+    #[must_use]
+    pub fn anchor(&self) -> WidgetId {
+        self.anchor
+    }
+}
+
+/// Whether `kind`'s paint is dimmed as disabled — the paint-side truth
+/// [`FocusPaint::resolve`] checks beside the accessibility node's own
+/// flag, since a caller can reach a payload through
+/// `WidgetTree::payload_mut` without touching the node.
+fn kind_disabled(kind: &WidgetKind) -> bool {
+    match kind {
+        WidgetKind::Button(state) => state.disabled,
+        WidgetKind::Checkbox(state) => state.disabled,
+        WidgetKind::Slider(state) => state.disabled,
+        WidgetKind::Scrollbar(state) => state.disabled,
+        WidgetKind::TextField(state) => state.disabled,
+        WidgetKind::ColorSwatch(state) => state.disabled,
+        WidgetKind::TreeItem(state) => state.disabled,
+        WidgetKind::Dropdown(state) => state.is_disabled(),
+        WidgetKind::TabBar(state) => state.is_disabled(),
+        WidgetKind::Tab(state) => state.is_disabled(),
+        WidgetKind::ColorPicker(state) => state.disabled(),
+        WidgetKind::ColorPickerPart(state) => state.is_disabled(),
+        WidgetKind::CurveEditor(state) => state.disabled(),
+        WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
+        WidgetKind::Container
+        | WidgetKind::CommandPalette(_)
+        | WidgetKind::ListRow(_)
+        | WidgetKind::Panel
+        | WidgetKind::Dialog
+        | WidgetKind::DropdownList
+        | WidgetKind::Tooltip
+        | WidgetKind::Menu(_)
+        | WidgetKind::MenuSeparator => false,
+    }
+}
+
+/// Whether a focused widget of `kind` shows a focus ring on itself.
+/// `false` for kinds that indicate focus another way (a menu's or command
+/// palette's highlighted row) or are never focus stops.
+fn gets_focus_ring(kind: &WidgetKind) -> bool {
+    !matches!(
+        kind,
+        WidgetKind::Menu(_)
+            | WidgetKind::CommandPalette(_)
+            | WidgetKind::DropdownList
+            | WidgetKind::ListRow(_)
+            | WidgetKind::Tooltip
+            | WidgetKind::Dialog
+            | WidgetKind::MenuSeparator
+    )
+}
+
+/// What a ring is drawn around: a reference rect `(x, y, w, h)`, its own
+/// corner radius, and the ring's offset from it (CSS `outline-offset`:
+/// the band covers `[offset, offset + FOCUS_RING_WIDTH]` outward from the
+/// reference edge). Whenever that band would leave the anchor's clip,
+/// every kind — boxes and handles (a thumb, a curve marker) alike —
+/// falls back to an inside ring on the anchor's own visible rect: a
+/// slider flush against a clipping edge always overhangs by its thumb
+/// ring's reach, and dropping the ring there would leave a focused
+/// control with no visible focus at all (WCAG 2.4.7).
+struct RingTarget {
+    rect: (f32, f32, f32, f32),
+    radius: f32,
+    offset: f32,
+}
+
+/// The per-kind ring table (see [`paint_widget_ops_focused`]):
+///
+/// | Kind | Reference | Offset | Radius |
+/// |---|---|---|---|
+/// | `Button` | bounds | `+2` | `radius.sm` |
+/// | `Checkbox`, `ColorSwatch` | bounds | `+1` | `radius.sm` |
+/// | `Slider`, `Scrollbar` | thumb | `+1` | `radius.pill` |
+/// | `TextField`, `Dropdown` (open or closed) | bounds | `-1` | `radius.sm` |
+/// | `Tab`, `TreeItem` (its own row), anything else | bounds | `-2` | `radius.sm` |
+/// | `ColorPickerPart` (square, hue strip) | bounds | `+1` | `0` |
+/// | `CurveEditor` | the focused point's marker circle | `+1` | circle |
+///
+/// `visible` is the anchor's own rect after `clip_to_clipping_ancestors`
+/// — the same rect its paint is built from, so a thumb ring and the
+/// thumb it circles can never disagree.
+fn focus_ring_target(
+    tree: &WidgetTree<WidgetKind>,
+    focus: FocusPaint,
+    full: Rect,
+    visible: Rect,
+    scales: &Scales,
+) -> Option<RingTarget> {
+    let sm = scales.radius.sm as f32;
+    let pill = scales.radius.pill as f32;
+    let boxed = |rect, offset, radius| RingTarget {
+        rect,
+        radius,
+        offset,
+    };
+    let handle = |rect, radius| RingTarget {
+        rect,
+        radius,
+        offset: RING_OFFSET_ADJACENT,
+    };
+    let vis = rect_f32(visible);
+    // A thumb that spills past its own control (a slider narrower than
+    // its thumb) would carry its ring past the damage outset too; the
+    // control's own box carries an inside ring instead, or none.
+    let thumb = |rect: (f32, f32, f32, f32)| {
+        let (x, y, w, h) = rect;
+        let (vx, vy, vw, vh) = vis;
+        if x >= vx && y >= vy && x + w <= vx + vw && y + h <= vy + vh {
+            handle(rect, pill)
+        } else {
+            boxed(vis, RING_OFFSET_INSIDE, sm)
+        }
+    };
+    Some(match tree.payload(focus.anchor)? {
+        WidgetKind::Button(_) => boxed(vis, RING_OFFSET_CLEAR, sm),
+        WidgetKind::Checkbox(_) | WidgetKind::ColorSwatch(_) => {
+            boxed(vis, RING_OFFSET_ADJACENT, sm)
+        }
+        WidgetKind::Slider(state) => thumb(slider_thumb_rect(state, visible)),
+        WidgetKind::Scrollbar(state) => thumb(scrollbar_thumb_rect(state, visible)),
+        WidgetKind::TextField(_) | WidgetKind::Dropdown(_) => boxed(vis, RING_OFFSET_ON_BORDER, sm),
+        WidgetKind::ColorPickerPart(_) => boxed(vis, RING_OFFSET_ADJACENT, 0.0),
+        WidgetKind::TreeItem(_) => {
+            let (x, y, w, h) = vis;
+            boxed((x, y, w, row_height(scales).min(h)), RING_OFFSET_INSIDE, sm)
+        }
+        WidgetKind::CurveEditor(state) => {
+            let index = (0..state.curve().points().len())
+                .find(|&i| state.point_id(i) == Some(focus.focused))?;
+            // The markers are strokes, dropped whole when the editor is
+            // clipped at all (`paint_curve_editor`) or too small to draw
+            // (a marker no wider than its own outline). With no marker to
+            // circle, the focused point's editor carries an inside ring on
+            // its visible rect instead — focus must stay visible.
+            let r = state.marker_radius();
+            if visible != full || !(r.is_finite() && 2.0 * r > 2.0 * MARKER_RING_WIDTH) {
+                return Some(boxed(vis, RING_OFFSET_INSIDE, sm));
+            }
+            let point = *state.curve().points().get(index)?;
+            let centre = curve_to_screen(plot_rect(full, r)?, point);
+            handle((centre.x - r, centre.y - r, 2.0 * r, 2.0 * r), r)
+        }
+        kind if !gets_focus_ring(kind) => return None,
+        _ => boxed(vis, RING_OFFSET_INSIDE, sm),
+    })
+}
+
+/// Whether a ring of `offset` around `rect` stays wholly inside the
+/// anchor's clip: its band's whole-pixel bounding box (grown outward, so
+/// a fractional thumb's ring is tested against every pixel it can
+/// touch) must survive `WidgetTree::visible_rect` unchanged, and the
+/// ring — its inner line included — must not have collapsed onto itself.
+fn ring_fits(
+    tree: &WidgetTree<WidgetKind>,
+    anchor: WidgetId,
+    rect: (f32, f32, f32, f32),
+    offset: f32,
+) -> bool {
+    let (x, y, w, h) = rect;
+    let inner = offset - FOCUS_RING_INNER_WIDTH;
+    if !(w + 2.0 * inner > 0.0 && h + 2.0 * inner > 0.0) {
+        return false;
+    }
+    let reach = offset + FOCUS_RING_WIDTH;
+    let (left, top) = ((x - reach).floor(), (y - reach).floor());
+    let (right, bottom) = ((x + w + reach).ceil(), (y + h + reach).ceil());
+    if !(left.is_finite() && top.is_finite() && right > left && bottom > top) {
+        return false;
+    }
+    // Both extents are positive whole numbers here (checked above).
+    #[allow(clippy::cast_sign_loss)]
+    let bbox = Rect {
+        x: left as i64,
+        y: top as i64,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    };
+    tree.visible_rect(anchor, bbox) == Some(bbox)
+}
+
+/// The ring itself — see [`paint_widget_ops_focused`] and
+/// [`focus_ring_target`]: the `border.focus` band, then the
+/// `text.on_accent` line on its inner side. `None` when there is
+/// nothing to draw.
+fn focus_ring(
+    tree: &WidgetTree<WidgetKind>,
+    focus: FocusPaint,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Option<[Paint; 2]>, WidgetError> {
+    let Some(full) = tree.bounds(focus.anchor) else {
+        return Ok(None);
+    };
+    let Some(visible) = tree.visible_rect(focus.anchor, full) else {
+        return Ok(None);
+    };
+    let Some(target) = focus_ring_target(tree, focus, full, visible, scales) else {
+        return Ok(None);
+    };
+    let (rect, radius, offset) = if ring_fits(tree, focus.anchor, target.rect, target.offset) {
+        (target.rect, target.radius, target.offset)
+    } else {
+        let (x, y, w, h) = rect_f32(visible);
+        // Too small to hold an inside ring (band and inner line, both
+        // sides) that doesn't meet itself.
+        let least = 2.0 * (FOCUS_RING_WIDTH + FOCUS_RING_INNER_WIDTH) + 1.0;
+        if w < least || h < least {
+            return Ok(None);
+        }
+        ((x, y, w, h), scales.radius.sm as f32, RING_OFFSET_INSIDE)
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    // A stroke of `width` whose centreline sits `grow` outside the
+    // reference edge (`rounded_rect` clamps the radius to the box).
+    let band_at = |grow: f32, width: f32| {
+        let (left, top, w, h) = rect;
+        let (pw, ph) = (w + 2.0 * grow, h + 2.0 * grow);
+        let path = rounded_rect(left - grow, top - grow, pw, ph, (radius + grow).max(0.0));
+        stroke(&path, width, tolerance).map_err(WidgetError::Paint)
+    };
+    // The band covers `[offset, offset + W]` outward from the reference
+    // edge; the inner line `[offset - 1, offset]`, between the band and
+    // whatever the widget paints inside it.
+    let band = band_at(offset + FOCUS_RING_WIDTH / 2.0, FOCUS_RING_WIDTH)?;
+    let line = band_at(
+        offset - FOCUS_RING_INNER_WIDTH / 2.0,
+        FOCUS_RING_INNER_WIDTH,
+    )?;
+    let [red, green, blue] = theme.border.focus.to_srgb_f32();
+    let [lr, lg, lb] = theme.text.on_accent.to_srgb_f32();
+    Ok(Some([
+        (band, [red, green, blue, 1.0]),
+        (line, [lr, lg, lb, 1.0]),
+    ]))
 }
 
 /// `a * (1 - t) + b * t` per channel — `aurora_vector`'s own lerp form,
@@ -626,50 +1041,30 @@ pub fn paint_widget(
 /// already refuses to descend into a parent whose bounds exclude the
 /// point: a row fully past the bottom of its panel is now both
 /// unreachable *and* invisible, rather than unreachable but drawn.
+///
+/// **Popovers (0.127.0).** A widget inside a popover
+/// ([`WidgetTree::popover_root_of`] is `Some`) is clipped only by
+/// clipping ancestors *up to and including* its popover root — so a
+/// dropdown list escapes the panel body that contains its control,
+/// while the popover's own `Overflow::Hidden` still clips its rows —
+/// and then clamped to the tree root's own bounds (the window), the
+/// same window gate `WidgetTree::hit_test` applies. A consequence: a
+/// popover painted before any `compute_layout`/`set_bounds` has run is
+/// clamped to a still-zero root and paints nothing.
+///
+/// **A popover whose owner is wholly clipped away paints nothing**
+/// (0.127.0 review): its owner (the popover root's parent) is run
+/// through this same clip, and if nothing of it is left the whole
+/// popover subtree clips to `None` — as it did before popovers existed —
+/// rather than floating with no visible owner. The rule lives in
+/// `WidgetTree::visible_rect` so `WidgetTree::hit_test` skips exactly
+/// the popovers this refuses to paint.
 fn clip_to_clipping_ancestors(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
     bounds: Rect,
 ) -> Option<Rect> {
-    let mut left = bounds.x;
-    let mut top = bounds.y;
-    let mut right = bounds.x.saturating_add(i64::from(bounds.width));
-    let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
-    let mut clipped = false;
-    let mut current = tree.parent(id);
-    while let Some(ancestor) = current {
-        if let (Some(style), Some(clip)) = (tree.style(ancestor), tree.bounds(ancestor)) {
-            if style.overflow.x != Overflow::Visible {
-                clipped = true;
-                left = left.max(clip.x);
-                right = right.min(clip.x.saturating_add(i64::from(clip.width)));
-            }
-            if style.overflow.y != Overflow::Visible {
-                clipped = true;
-                top = top.max(clip.y);
-                bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
-            }
-        }
-        current = tree.parent(ancestor);
-    }
-    // Returned untouched, not merely unchanged, when no ancestor clips
-    // at all: a widget whose bounds are still the default zero rect
-    // (every test in this module that paints without a
-    // `compute_layout`/`set_bounds` first) must keep painting the
-    // degenerate shape it always did, rather than being turned into an
-    // `Ok(vec![])` by an empty intersection with itself.
-    if !clipped {
-        return Some(bounds);
-    }
-    if right <= left || bottom <= top {
-        return None;
-    }
-    Some(Rect {
-        x: left,
-        y: top,
-        width: u32::try_from(right - left).ok()?,
-        height: u32::try_from(bottom - top).ok()?,
-    })
+    tree.visible_rect(id, bounds)
 }
 
 fn paint_button(
@@ -783,23 +1178,12 @@ fn paint_slider(
     let [r, g, b] = theme.surface.sunken.to_srgb_f32();
     let track = (track_mesh, [r, g, b, alpha]);
 
-    // `range <= 0.0` is a degenerate slider (`min == max`, or a caller
-    // that ignored `insert_slider`'s own "assumes min <= max"
-    // documented precondition) -- parked at the track's own left edge
-    // rather than dividing by zero/producing a NaN position.
-    let range = state.max - state.min;
-    let fraction = if range > 0.0 {
-        ((state.value - state.min) / range).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let thumb_size = bounds.height as f32;
-    let thumb_travel = (bounds.width as f32 - thumb_size).max(0.0);
+    let (thumb_x, thumb_y, thumb_w, thumb_h) = slider_thumb_rect(state, bounds);
     let thumb_path = rounded_rect(
-        bounds.x as f32 + fraction as f32 * thumb_travel,
-        bounds.y as f32,
-        thumb_size,
-        thumb_size,
+        thumb_x,
+        thumb_y,
+        thumb_w,
+        thumb_h,
         scales.radius.pill as f32,
     );
     let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
@@ -814,6 +1198,31 @@ fn paint_slider(
         paints.push(outline);
     }
     Ok(paints)
+}
+
+/// A slider's thumb `(x, y, w, h)` within `bounds`: a `bounds.height`
+/// square at `state.value`'s proportional offset along
+/// `state.min..=state.max` — shared by [`paint_slider`] and the focus
+/// ring, so the ring always circles the thumb actually drawn.
+fn slider_thumb_rect(state: &SliderState, bounds: Rect) -> (f32, f32, f32, f32) {
+    // `range <= 0.0` is a degenerate slider (`min == max`, or a caller
+    // that ignored `insert_slider`'s own "assumes min <= max"
+    // documented precondition) -- parked at the track's own left edge
+    // rather than dividing by zero/producing a NaN position.
+    let range = state.max - state.min;
+    let fraction = if range > 0.0 {
+        ((state.value - state.min) / range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let thumb_size = bounds.height as f32;
+    let thumb_travel = (bounds.width as f32 - thumb_size).max(0.0);
+    (
+        bounds.x as f32 + fraction as f32 * thumb_travel,
+        bounds.y as f32,
+        thumb_size,
+        thumb_size,
+    )
 }
 
 /// `value` if it is finite, `fallback` otherwise — the one-line guard
@@ -876,6 +1285,33 @@ fn paint_scrollbar(
     let tolerance = tolerance_for_scale_factor(scale_factor);
     let radius = scales.radius.pill as f32;
 
+    let (left, top) = (bounds.x as f32, bounds.y as f32);
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    let track_path = rounded_rect(left, top, width, height, radius);
+    let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+    let track = (track_mesh, [r, g, b, alpha]);
+
+    let (thumb_left, thumb_top, thumb_width, thumb_height) = scrollbar_thumb_rect(state, bounds);
+    let thumb_path = rounded_rect(thumb_left, thumb_top, thumb_width, thumb_height, radius);
+    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let thumb = (thumb_mesh, [r, g, b, alpha]);
+
+    let mut paints = vec![track, thumb];
+    // The thumb, not the track -- the same reasoning `paint_slider`
+    // already records: the track is a groove, the thumb is the handle.
+    if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
+/// A scrollbar's thumb `(x, y, w, h)` within `bounds` — see
+/// [`paint_scrollbar`] for the proportional-length and non-finite rules.
+/// Shared by it and the focus ring, so the ring always circles the thumb
+/// actually drawn.
+fn scrollbar_thumb_rect(state: &ScrollbarState, bounds: Rect) -> (f32, f32, f32, f32) {
     let left = bounds.x as f32;
     let top = bounds.y as f32;
     let width = bounds.width as f32;
@@ -886,11 +1322,6 @@ fn paint_scrollbar(
     } else {
         (width, height)
     };
-
-    let track_path = rounded_rect(left, top, width, height, radius);
-    let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
-    let track = (track_mesh, [r, g, b, alpha]);
 
     // The whole scrollable extent is the travel *plus* one page -- a bar
     // whose page covers the entire content (`max == min`) is a
@@ -920,23 +1351,11 @@ fn paint_scrollbar(
     let position_fraction = finite_or(position_fraction, 0.0);
     let offset = position_fraction as f32 * (track_len - thumb_len).max(0.0);
 
-    let (thumb_left, thumb_top, thumb_width, thumb_height) = if vertical {
+    if vertical {
         (left, top + offset, thickness, thumb_len)
     } else {
         (left + offset, top, thumb_len, thickness)
-    };
-    let thumb_path = rounded_rect(thumb_left, thumb_top, thumb_width, thumb_height, radius);
-    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.accent.primary.to_srgb_f32();
-    let thumb = (thumb_mesh, [r, g, b, alpha]);
-
-    let mut paints = vec![track, thumb];
-    // The thumb, not the track -- the same reasoning `paint_slider`
-    // already records: the track is a groove, the thumb is the handle.
-    if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
-        paints.push(outline);
     }
-    Ok(paints)
 }
 
 fn paint_text_field(
@@ -1468,8 +1887,9 @@ fn paint_tab_bar(
 /// `design/check_contrast.py`'s gated 3:1 pairs — the surface a tab bar
 /// sits on.
 ///
-/// **No keyboard-focus ring and no label glyph** — see `tab_bar.rs`'s
-/// own module doc comment.
+/// **No label glyph** — see `tab_bar.rs`'s own module doc comment. The
+/// keyboard focus ring is not painted here but appended after these ops
+/// by [`paint_widget_ops_focused`].
 fn paint_tab(
     state: &TabState,
     bounds: Rect,
@@ -1623,8 +2043,8 @@ fn paint_curve_editor(
     if clipped {
         return Ok(paints);
     }
-    let to_screen =
-        |p: aurora_core::CurvePoint| Point::new(left + p.x * width, bottom - p.y * height);
+    let plot = (left, top, width, height);
+    let to_screen = |p: aurora_core::CurvePoint| curve_to_screen(plot, p);
     let mut diagonal = PathBuilder::new();
     diagonal
         .move_to(Point::new(left, bottom))
@@ -1700,6 +2120,14 @@ fn curve_editor_markers(
         paints.push((inner, rgba(theme.surface.panel)));
     }
     Ok(paints)
+}
+
+/// Where curve-space `p` lands inside plot rect `(left, top, width,
+/// height)` ([`plot_rect`]) — `y` up. Shared by [`paint_curve_editor`]
+/// and the focus ring, so a ring circles the marker actually drawn.
+fn curve_to_screen(plot: (f32, f32, f32, f32), p: aurora_core::CurvePoint) -> Point {
+    let (left, top, width, height) = plot;
+    Point::new(left + p.x * width, (top + height) - p.y * height)
 }
 
 /// How many uniform input steps [`curve_polyline_samples`] samples a
@@ -3436,6 +3864,232 @@ mod tests {
         );
     }
 
+    // -- popover layer (0.127.0) --
+
+    /// A tree whose root is a 200x200 window, every widget placed with
+    /// `set_bounds` so each test states its geometry exactly.
+    fn window() -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        place(&mut tree, root, 0, 0, 200, 200);
+        (tree, root)
+    }
+
+    fn place(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, x: i64, y: i64, w: u32, h: u32) {
+        let rect = Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        if let Err(err) = tree.set_bounds(id, rect) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    fn selected_row(tree: &mut WidgetTree<WidgetKind>, parent: WidgetId) -> WidgetId {
+        match tree.insert(
+            parent,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::ListItem),
+            WidgetKind::ListRow(ListRowState {
+                selected: true,
+                disabled: false,
+            }),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn popover(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) {
+        if let Err(err) = tree.set_layer(id, crate::PaintLayer::Popover) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    /// A popover inside a panel body that hides its overflow paints its
+    /// full bounds: no ancestor outside the popover clips it.
+    #[test]
+    fn a_popover_inside_a_clipping_body_paints_its_full_bounds() {
+        let (mut tree, root) = window();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = selected_row(&mut tree, body);
+        place(&mut tree, body, 0, 0, 200, 13);
+        place(&mut tree, row, 0, 0, 200, 21);
+        let theme = dark_theme();
+        let scales = scales();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 13.0).abs() < 0.5,
+            "precondition: as a base widget the row is clipped by the body: {top} -> {bottom}"
+        );
+        popover(&mut tree, row);
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 21.0).abs() < 0.5,
+            "a popover escapes the body: {top} -> {bottom}"
+        );
+        let _ = root;
+    }
+
+    /// The clip walk stops *at* the popover root, not before it: a
+    /// popover root that hides its own overflow still clips its rows,
+    /// while the shorter clipping body around the popover does not.
+    #[test]
+    fn a_popovers_own_overflow_still_clips_its_descendants() {
+        let (mut tree, root) = window();
+        let Ok(outer) = insert_container(&mut tree, root, clipping_body(5.0)) else {
+            unreachable!("the root was just built");
+        };
+        let Ok(list) = insert_container(&mut tree, outer, clipping_body(13.0)) else {
+            unreachable!("outer was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, outer, 0, 0, 200, 5);
+        place(&mut tree, list, 0, 0, 200, 13);
+        place(&mut tree, row, 0, 0, 200, 21);
+        popover(&mut tree, list);
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 13.0).abs() < 0.5,
+            "clipped by the popover's own 13px, not the outer 5px or the row's 21px: \
+             {top} -> {bottom}"
+        );
+    }
+
+    /// A popover hanging past the window is clamped to the root's bounds,
+    /// and one wholly outside it paints nothing.
+    #[test]
+    fn a_popover_past_the_window_is_clamped_to_the_root() {
+        let (mut tree, root) = window();
+        let row = selected_row(&mut tree, root);
+        place(&mut tree, row, 10, 190, 50, 21);
+        popover(&mut tree, row);
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (top - 190.0).abs() < 0.5 && (bottom - 200.0).abs() < 0.5,
+            "clamped to the window's 200px: {top} -> {bottom}"
+        );
+        place(&mut tree, row, 10, 205, 50, 21);
+        let paints = match paint_widget(&tree, row, &dark_theme(), &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints.is_empty(), "wholly off-window: {paints:?}");
+    }
+
+    /// The disclosed consequence of the window clamp: a popover painted
+    /// before anything has laid out the (still zero-sized) root paints
+    /// nothing, where a base widget keeps its old degenerate shape.
+    #[test]
+    fn a_popover_before_any_layout_paints_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let row = selected_row(&mut tree, root);
+        popover(&mut tree, row);
+        let paints = match paint_widget(&tree, row, &dark_theme(), &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints.is_empty(), "{paints:?}");
+    }
+
+    /// The window clamp covers a popover's *descendants*, not only its
+    /// root: a row inside a popover (whose own overflow is `Visible`)
+    /// crossing the window's right and bottom edges is clamped to them.
+    /// Clamping only the popover root survived every other test.
+    #[test]
+    fn a_popover_descendant_past_the_window_is_clamped_to_the_root() {
+        let (mut tree, root) = window();
+        let Ok(list) = insert_container(&mut tree, root, taffy::Style::default()) else {
+            unreachable!("the root was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, list, 100, 100, 150, 150);
+        place(&mut tree, row, 180, 190, 30, 30);
+        popover(&mut tree, list);
+        let full = Rect {
+            x: 180,
+            y: 190,
+            width: 30,
+            height: 30,
+        };
+        assert_eq!(
+            super::clip_to_clipping_ancestors(&tree, row, full),
+            Some(Rect {
+                x: 180,
+                y: 190,
+                width: 20,
+                height: 10,
+            })
+        );
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (left, top, right, bottom) = bbox(&mesh);
+        assert!(
+            (left - 180.0).abs() < 0.5
+                && (top - 190.0).abs() < 0.5
+                && (right - 200.0).abs() < 0.5
+                && (bottom - 200.0).abs() < 0.5,
+            "clamped to the 200x200 window: {left},{top} -> {right},{bottom}"
+        );
+    }
+
+    /// A popover whose owner is wholly clipped away (scrolled or
+    /// collapsed out of a clipping panel body) paints nothing at all and
+    /// is not hit — the base widget beneath it is — while a partly
+    /// visible owner keeps its popover whole.
+    #[test]
+    fn a_popover_whose_owner_is_clipped_away_neither_paints_nor_hits() {
+        let (mut tree, root) = window();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(20.0)) else {
+            unreachable!("the root was just built");
+        };
+        let under = selected_row(&mut tree, root);
+        let owner = selected_row(&mut tree, body);
+        let Ok(list) = insert_container(&mut tree, owner, taffy::Style::default()) else {
+            unreachable!("owner was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, body, 0, 0, 200, 20);
+        place(&mut tree, under, 0, 60, 200, 100);
+        place(&mut tree, owner, 0, 40, 200, 21);
+        place(&mut tree, list, 0, 60, 200, 50);
+        place(&mut tree, row, 0, 60, 200, 21);
+        popover(&mut tree, list);
+        let theme = dark_theme();
+        let scales = scales();
+        let popover_ops = |tree: &WidgetTree<WidgetKind>| -> usize {
+            tree.paint_order()
+                .into_iter()
+                .filter(|&id| tree.popover_root_of(id) == Some(list))
+                .map(|id| match paint_widget(tree, id, &theme, &scales, 1.0) {
+                    Ok(paints) => paints.len(),
+                    Err(err) => unreachable!("{err:?}"),
+                })
+                .sum()
+        };
+        assert_eq!(popover_ops(&tree), 0, "the owner is wholly clipped away");
+        assert_eq!(tree.hit_test((5.0, 65.0)), Some(under));
+        assert_eq!(crate::hit_test(&tree, 5.0, 65.0), Some(under));
+        // Partly visible (10..31 against the body's 0..20): the popover
+        // paints its row whole and is hit again.
+        place(&mut tree, owner, 0, 10, 200, 21);
+        assert!(popover_ops(&tree) > 0, "a partly visible owner keeps it");
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (top - 60.0).abs() < 0.5 && (bottom - 81.0).abs() < 0.5,
+            "the popover's row is not clipped by the body: {top} -> {bottom}"
+        );
+        assert_eq!(tree.hit_test((5.0, 65.0)), Some(row));
+        assert_eq!(crate::hit_test(&tree, 5.0, 65.0), Some(row));
+    }
+
     /// The same clip, taken to its end: a row laid out entirely past the
     /// bottom of its clipping body paints nothing at all. That makes
     /// paint agree with `WidgetTree::hit_test`, which already refuses to
@@ -4805,5 +5459,1042 @@ mod tests {
             result.is_err(),
             "an id that was never inserted must not resolve"
         );
+    }
+
+    /// The keyboard focus ring (0.129.0): geometry per kind, paint
+    /// order, roving anchors, clipping, and when there is no ring at all.
+    mod focus_ring {
+        use super::super::{
+            FOCUS_RING_MAX_OUTSET, FOCUS_RING_WIDTH, FocusPaint, PaintOp, RING_OFFSET_ADJACENT,
+            RING_OFFSET_CLEAR, RING_OFFSET_INSIDE, RING_OFFSET_ON_BORDER, curve_to_screen,
+            paint_widget_ops, paint_widget_ops_focused, plot_rect, scrollbar_thumb_rect,
+            slider_thumb_rect,
+        };
+        use super::{Bbox, bbox, dark_theme, scales};
+        use crate::input::{FocusManager, FocusOrigin};
+        use crate::tree::{PaintLayer, WidgetId, WidgetTree};
+        use crate::widgets::{
+            ColorPickerPart, CommandEntry, WidgetKind, color_picker_state, curve_editor_state,
+            insert_button, insert_checkbox, insert_color_picker, insert_color_swatch,
+            insert_command_palette, insert_container, insert_curve_editor, insert_dropdown,
+            insert_scrollbar, insert_slider, insert_tab_bar, insert_text_field, insert_tree_item,
+            insert_tree_view, new_tree, row_height, select_curve_point, set_button_disabled,
+            set_dropdown_open, tab_bar_state,
+        };
+        use crate::widgets::{MenuItem, ScrollbarRange, open_menu};
+        use accesskit::{Action, Node, Orientation, Role};
+        use aurora_core::{CurvePoint, Rect, ToneCurve};
+        use aurora_theme::Color;
+        use taffy::Style;
+
+        fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+            match result {
+                Ok(value) => value,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn place(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, x: i64, y: i64, w: u32, h: u32) {
+            ok(tree.set_bounds(
+                id,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            ));
+        }
+
+        /// A 400x400 root, laid out by hand.
+        fn root_tree() -> (WidgetTree<WidgetKind>, WidgetId) {
+            let (mut tree, root) = new_tree(Style::default());
+            place(&mut tree, root, 0, 0, 400, 400);
+            (tree, root)
+        }
+
+        /// Focuses `id` the way `Tab` would and resolves the frame's ring.
+        fn keyboard_focus(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) -> Option<FocusPaint> {
+            let mut focus = FocusManager::new();
+            ok(focus.focus_with(tree, id, FocusOrigin::Keyboard));
+            FocusPaint::resolve(tree, &focus)
+        }
+
+        /// `id`'s ring band: the first of the two ops
+        /// `paint_widget_ops_focused` adds over `paint_widget_ops`. The
+        /// second — checked here for every ring any test asks about — is
+        /// the `text.on_accent` line exactly on the band's inner side.
+        fn ring(
+            tree: &WidgetTree<WidgetKind>,
+            id: WidgetId,
+            focus: FocusPaint,
+        ) -> Option<(Bbox, [f32; 4])> {
+            let (theme, scales) = (dark_theme(), scales());
+            let plain = ok(paint_widget_ops(tree, id, &theme, &scales, 1.0));
+            let focused = ok(paint_widget_ops_focused(
+                tree,
+                id,
+                Some(focus),
+                &theme,
+                &scales,
+                1.0,
+            ));
+            assert_eq!(
+                focused.get(..plain.len()),
+                Some(plain.as_slice()),
+                "the ring never changes a widget's own ops"
+            );
+            match focused.get(plain.len()..) {
+                Some([]) => None,
+                Some(
+                    [
+                        PaintOp::Solid((band, band_color)),
+                        PaintOp::Solid((line, line_color)),
+                    ],
+                ) => {
+                    let (outer, inner) = (bbox(band), bbox(line));
+                    let w = FOCUS_RING_WIDTH;
+                    assert_bbox(
+                        inner,
+                        (outer.0 + w, outer.1 + w, outer.2 - w, outer.3 - w),
+                        "the inner line sits directly inside the band",
+                    );
+                    let [r, g, b] = theme.text.on_accent.to_srgb_f32();
+                    #[allow(clippy::float_cmp)]
+                    {
+                        assert_eq!(*line_color, [r, g, b, 1.0], "text.on_accent, opaque");
+                    }
+                    Some((outer, *band_color))
+                }
+                other => unreachable!("the ring is two solid ops: {other:?}"),
+            }
+        }
+
+        fn grown(rect: (f32, f32, f32, f32), by: f32) -> Bbox {
+            let (x, y, w, h) = rect;
+            (x - by, y - by, x + w + by, y + h + by)
+        }
+
+        fn rect_tuple(rect: Rect) -> (f32, f32, f32, f32) {
+            (
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+            )
+        }
+
+        fn assert_bbox(actual: Bbox, expected: Bbox, what: &str) {
+            let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+            assert!(
+                close(actual.0, expected.0)
+                    && close(actual.1, expected.1)
+                    && close(actual.2, expected.2)
+                    && close(actual.3, expected.3),
+                "{what}: ring bbox {actual:?}, expected {expected:?}"
+            );
+        }
+
+        /// Asserts `id`'s ring is `border.focus` at full opacity around
+        /// `reference` at `offset`, and returns nothing else.
+        fn assert_ring(
+            tree: &mut WidgetTree<WidgetKind>,
+            id: WidgetId,
+            reference: (f32, f32, f32, f32),
+            offset: f32,
+            what: &str,
+        ) {
+            let Some(focus) = keyboard_focus(tree, id) else {
+                unreachable!("{what}: a focused {what} resolves a ring");
+            };
+            assert_eq!(focus.anchor(), id, "{what}");
+            let Some((bounds, color)) = ring(tree, id, focus) else {
+                unreachable!("{what}: no ring op");
+            };
+            assert_bbox(bounds, grown(reference, offset + FOCUS_RING_WIDTH), what);
+            let [r, g, b] = dark_theme().border.focus.to_srgb_f32();
+            // Exact: the ring's colour is the token's own bytes, unmixed.
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(color, [r, g, b, 1.0], "{what}: border.focus, full opacity");
+            }
+        }
+
+        #[test]
+        fn ring_offsets_fit_the_damage_outset() {
+            let reaches = [
+                RING_OFFSET_CLEAR,
+                RING_OFFSET_ADJACENT,
+                RING_OFFSET_ON_BORDER,
+                RING_OFFSET_INSIDE,
+            ]
+            .map(|offset| offset + FOCUS_RING_WIDTH);
+            let widest = reaches.iter().copied().fold(0.0_f32, f32::max);
+            #[allow(clippy::cast_precision_loss)]
+            let outset = FOCUS_RING_MAX_OUTSET as f32;
+            assert!(widest < outset, "{widest} >= {outset}");
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(
+                    widest.ceil() + 1.0,
+                    outset,
+                    "the outset is the widest reach plus one pixel of tessellation slack"
+                );
+            }
+        }
+
+        #[test]
+        fn a_button_ring_sits_two_pixels_outside_it() {
+            let (mut tree, root) = root_tree();
+            let button = ok(insert_button(&mut tree, root, &scales(), "b"));
+            place(&mut tree, button, 40, 40, 60, 24);
+            assert_ring(
+                &mut tree,
+                button,
+                (40.0, 40.0, 60.0, 24.0),
+                RING_OFFSET_CLEAR,
+                "button",
+            );
+        }
+
+        #[test]
+        fn checkbox_and_swatch_rings_sit_one_pixel_outside() {
+            let (mut tree, root) = root_tree();
+            let checkbox = ok(insert_checkbox(&mut tree, root, &scales(), "c"));
+            place(&mut tree, checkbox, 40, 40, 16, 16);
+            assert_ring(
+                &mut tree,
+                checkbox,
+                (40.0, 40.0, 16.0, 16.0),
+                RING_OFFSET_ADJACENT,
+                "checkbox",
+            );
+            let swatch = ok(insert_color_swatch(
+                &mut tree,
+                root,
+                &scales(),
+                Color { r: 1, g: 2, b: 3 },
+            ));
+            place(&mut tree, swatch, 100, 40, 24, 24);
+            assert_ring(
+                &mut tree,
+                swatch,
+                (100.0, 40.0, 24.0, 24.0),
+                RING_OFFSET_ADJACENT,
+                "swatch",
+            );
+        }
+
+        #[test]
+        fn slider_and_scrollbar_rings_circle_the_thumb_not_the_track() {
+            let (mut tree, root) = root_tree();
+            let slider = ok(insert_slider(
+                &mut tree,
+                root,
+                &scales(),
+                "s",
+                0.25,
+                0.0,
+                1.0,
+            ));
+            place(&mut tree, slider, 40, 40, 120, 16);
+            let thumb = match tree.payload(slider) {
+                Some(WidgetKind::Slider(state)) => {
+                    slider_thumb_rect(state, ok(tree.bounds(slider).ok_or(())))
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                thumb.0 > 40.0,
+                "a quarter-way thumb is off the track's start"
+            );
+            assert_ring(&mut tree, slider, thumb, RING_OFFSET_ADJACENT, "slider");
+
+            let range = ScrollbarRange {
+                min: 0.0,
+                max: 100.0,
+                page_size: 25.0,
+            };
+            let bar = ok(insert_scrollbar(
+                &mut tree,
+                root,
+                &scales(),
+                Orientation::Vertical,
+                Some("v"),
+                50.0,
+                range,
+            ));
+            place(&mut tree, bar, 300, 40, 12, 200);
+            let thumb = match tree.payload(bar) {
+                Some(WidgetKind::Scrollbar(state)) => {
+                    scrollbar_thumb_rect(state, ok(tree.bounds(bar).ok_or(())))
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                thumb.3 < 200.0,
+                "a quarter-page thumb is shorter than its track"
+            );
+            assert_ring(&mut tree, bar, thumb, RING_OFFSET_ADJACENT, "scrollbar");
+        }
+
+        #[test]
+        fn a_moved_slider_thumb_is_what_the_ring_follows_and_damage_covers() {
+            let (mut tree, root) = root_tree();
+            let slider = ok(insert_slider(
+                &mut tree,
+                root,
+                &scales(),
+                "s",
+                0.0,
+                0.0,
+                1.0,
+            ));
+            place(&mut tree, slider, 40, 40, 120, 16);
+            let mut focus = FocusManager::new();
+            ok(focus.focus_with(&mut tree, slider, FocusOrigin::Keyboard));
+            tree.take_damage();
+            ok(crate::widgets::set_slider_value(&mut tree, slider, 1.0));
+            // `set_slider_value` (via `WidgetTree::set_accessibility`)
+            // raises only the widget's dirty *flag*, not a damage region
+            // -- a pre-existing gap no renderer notices yet, since nothing
+            // consumes `take_damage` (every frame repaints whole). A
+            // damage-driven caller repaints a flagged widget with
+            // `mark_dirty`, which is what carries the outset.
+            assert_eq!(tree.is_dirty(slider), Some(true));
+            ok(tree.mark_dirty(slider));
+            let reach = i64::from(FOCUS_RING_MAX_OUTSET);
+            assert_eq!(
+                tree.take_damage(),
+                Some(Rect {
+                    x: 40 - reach,
+                    y: 40 - reach,
+                    width: 120 + 2 * FOCUS_RING_MAX_OUTSET,
+                    height: 16 + 2 * FOCUS_RING_MAX_OUTSET,
+                }),
+                "the thumb ring's overhang above and below the slider is repainted"
+            );
+        }
+
+        #[test]
+        fn text_field_and_dropdown_rings_straddle_their_border() {
+            let (mut tree, root) = root_tree();
+            let field = ok(insert_text_field(&mut tree, root, &scales(), "f", ""));
+            place(&mut tree, field, 40, 40, 120, 21);
+            assert_ring(
+                &mut tree,
+                field,
+                (40.0, 40.0, 120.0, 21.0),
+                RING_OFFSET_ON_BORDER,
+                "text field",
+            );
+            let dropdown = ok(insert_dropdown(
+                &mut tree,
+                root,
+                &scales(),
+                "d",
+                vec!["a".to_owned()],
+                Some(0),
+            ));
+            place(&mut tree, dropdown, 40, 100, 120, 21);
+            assert_ring(
+                &mut tree,
+                dropdown,
+                (40.0, 100.0, 120.0, 21.0),
+                RING_OFFSET_ON_BORDER,
+                "dropdown",
+            );
+        }
+
+        #[test]
+        fn an_open_dropdowns_ring_is_on_the_control_and_beneath_its_list() {
+            let (mut tree, root) = new_tree(Style::default());
+            let dropdown = ok(insert_dropdown(
+                &mut tree,
+                root,
+                &scales(),
+                "d",
+                vec!["a".to_owned(), "b".to_owned()],
+                Some(0),
+            ));
+            tree.compute_layout(400.0, 400.0);
+            ok(set_dropdown_open(&mut tree, dropdown, true));
+            tree.compute_layout(400.0, 400.0);
+            let Some(focus) = keyboard_focus(&mut tree, dropdown) else {
+                unreachable!("an open dropdown keeps its ring");
+            };
+            assert_eq!(focus.anchor(), dropdown);
+            let (theme, scales) = (dark_theme(), scales());
+            let mut ring_at = None;
+            let mut list_at = None;
+            let mut index = 0;
+            for id in tree.paint_order() {
+                let ops = ok(paint_widget_ops_focused(
+                    &tree,
+                    id,
+                    Some(focus),
+                    &theme,
+                    &scales,
+                    1.0,
+                ));
+                if id == dropdown {
+                    ring_at = Some(index + ops.len() - 1);
+                }
+                if matches!(tree.payload(id), Some(WidgetKind::DropdownList)) {
+                    list_at = Some(index);
+                }
+                index += ops.len();
+            }
+            match (ring_at, list_at) {
+                (Some(ring), Some(list)) => {
+                    assert!(ring < list, "ring {ring} must precede list {list}");
+                }
+                other => unreachable!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn tab_and_tree_row_rings_sit_inside_them() {
+            let (mut tree, root) = new_tree(Style::default());
+            let bar = ok(insert_tab_bar(
+                &mut tree,
+                root,
+                &scales(),
+                "t",
+                vec!["a".to_owned(), "b".to_owned()],
+                1,
+            ));
+            tree.compute_layout(400.0, 400.0);
+            let Some(tab) = ok(tab_bar_state(&tree, bar)).selected_tab() else {
+                unreachable!("tab 1 is selected");
+            };
+            let bounds = rect_tuple(ok(tree.bounds(tab).ok_or(())));
+            assert_ring(&mut tree, tab, bounds, RING_OFFSET_INSIDE, "tab");
+            // Its ring comes after its own underline.
+            let Some(focus) = keyboard_focus(&mut tree, tab) else {
+                unreachable!();
+            };
+            let ops = ok(paint_widget_ops_focused(
+                &tree,
+                tab,
+                Some(focus),
+                &dark_theme(),
+                &scales(),
+                1.0,
+            ));
+            assert!(ops.len() >= 2, "underline, then ring: {}", ops.len());
+
+            let (mut tree, root) = root_tree();
+            let view = ok(insert_tree_view(&mut tree, root, Some("v")));
+            let row = ok(insert_tree_item(&mut tree, view, &scales(), "row", true));
+            let child = ok(insert_tree_item(&mut tree, row, &scales(), "child", false));
+            place(&mut tree, view, 0, 0, 200, 200);
+            place(&mut tree, row, 10, 10, 180, 60);
+            place(&mut tree, child, 10, 40, 180, 21);
+            let height = row_height(&scales());
+            assert!(height < 60.0);
+            assert_ring(
+                &mut tree,
+                row,
+                (10.0, 10.0, 180.0, height),
+                RING_OFFSET_INSIDE,
+                "tree row",
+            );
+        }
+
+        #[test]
+        fn any_other_focusable_widget_gets_an_inside_ring_on_its_bounds() {
+            let (mut tree, root) = root_tree();
+            let mut node = Node::new(Role::Group);
+            node.add_action(Action::Focus);
+            let region = ok(tree.insert(root, Style::default(), node, WidgetKind::Panel));
+            place(&mut tree, region, 20, 20, 100, 80);
+            assert_ring(
+                &mut tree,
+                region,
+                (20.0, 20.0, 100.0, 80.0),
+                RING_OFFSET_INSIDE,
+                "panel",
+            );
+        }
+
+        #[test]
+        fn a_colour_pickers_channel_sliders_ring_the_square_and_the_hue_rings_itself() {
+            let (mut tree, root) = new_tree(Style::default());
+            let picker = ok(insert_color_picker(
+                &mut tree,
+                root,
+                &scales(),
+                "p",
+                Color {
+                    r: 200,
+                    g: 50,
+                    b: 50,
+                },
+                120.0,
+            ));
+            tree.compute_layout(400.0, 400.0);
+            let state = ok(color_picker_state(&tree, picker));
+            let (Some(area), Some(saturation), Some(value), Some(hue)) = (
+                state.area_id(),
+                state.focus_target(),
+                state.value_slider_id(),
+                state.part_id(ColorPickerPart::Hue),
+            ) else {
+                unreachable!("a fresh picker has every part");
+            };
+            let area_bounds = ok(tree.bounds(area).ok_or(()));
+            // The channel sliders are inset over the whole square.
+            assert_eq!(tree.bounds(saturation), Some(area_bounds));
+            assert_eq!(tree.bounds(value), Some(area_bounds));
+            let Some(focus) = keyboard_focus(&mut tree, saturation) else {
+                unreachable!("the saturation slider resolves a ring");
+            };
+            assert_eq!((focus.focused(), focus.anchor()), (saturation, area));
+            assert_eq!(
+                ring(&tree, saturation, focus),
+                None,
+                "the slider paints nothing"
+            );
+            let Some((bounds, _)) = ring(&tree, area, focus) else {
+                unreachable!("the square carries the ring");
+            };
+            assert_bbox(
+                bounds,
+                grown(
+                    rect_tuple(area_bounds),
+                    RING_OFFSET_ADJACENT + FOCUS_RING_WIDTH,
+                ),
+                "square",
+            );
+            let hue_bounds = rect_tuple(ok(tree.bounds(hue).ok_or(())));
+            assert_ring(
+                &mut tree,
+                hue,
+                hue_bounds,
+                RING_OFFSET_ADJACENT,
+                "hue strip",
+            );
+        }
+
+        #[test]
+        fn a_curve_point_rings_its_own_marker_on_the_editor() {
+            let (mut tree, root) = new_tree(Style::default());
+            let points = [
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.25, y: 0.6 },
+                CurvePoint { x: 0.75, y: 0.3 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ];
+            let curve = ok(ToneCurve::new(&points));
+            let editor = ok(insert_curve_editor(
+                &mut tree,
+                root,
+                &scales(),
+                "c",
+                200.0,
+                curve,
+            ));
+            tree.compute_layout(400.0, 400.0);
+            for index in [1_usize, 2] {
+                ok(select_curve_point(&mut tree, editor, index));
+                let state = ok(curve_editor_state(&tree, editor));
+                let Some(point) = state.focus_target() else {
+                    unreachable!("a selected point is the tab stop");
+                };
+                let r = state.marker_radius();
+                let full = ok(tree.bounds(editor).ok_or(()));
+                let Some(plot) = plot_rect(full, r) else {
+                    unreachable!("a 200 px editor has a plot");
+                };
+                let Some(&at) = points.get(index) else {
+                    unreachable!()
+                };
+                let centre = curve_to_screen(plot, at);
+                let Some(focus) = keyboard_focus(&mut tree, point) else {
+                    unreachable!("a focused point resolves a ring");
+                };
+                assert_eq!((focus.focused(), focus.anchor()), (point, editor));
+                assert_eq!(
+                    ring(&tree, point, focus),
+                    None,
+                    "the point slider paints nothing"
+                );
+                let Some((bounds, _)) = ring(&tree, editor, focus) else {
+                    unreachable!("the editor carries the ring");
+                };
+                assert_bbox(
+                    bounds,
+                    grown(
+                        (centre.x - r, centre.y - r, 2.0 * r, 2.0 * r),
+                        RING_OFFSET_ADJACENT + FOCUS_RING_WIDTH,
+                    ),
+                    "curve marker",
+                );
+            }
+        }
+
+        #[test]
+        fn menus_and_command_palettes_show_focus_by_their_highlight_not_a_ring() {
+            let (mut tree, root) = new_tree(Style::default());
+            tree.compute_layout(400.0, 400.0);
+            let menu = ok(open_menu(
+                &mut tree,
+                root,
+                &scales(),
+                "m",
+                (10.0, 10.0),
+                120.0,
+                vec![MenuItem::action("a")],
+            ));
+            tree.compute_layout(400.0, 400.0);
+            assert_eq!(keyboard_focus(&mut tree, menu), None);
+            let palette = ok(insert_command_palette(
+                &mut tree,
+                root,
+                vec![CommandEntry {
+                    id: "x".to_owned(),
+                    title: "X".to_owned(),
+                    shortcut: None,
+                }],
+            ));
+            tree.compute_layout(400.0, 400.0);
+            assert_eq!(keyboard_focus(&mut tree, palette), None);
+        }
+
+        #[test]
+        fn a_later_overlapping_sibling_and_a_popover_paint_over_the_ring() {
+            let (mut tree, root) = root_tree();
+            let button = ok(insert_button(&mut tree, root, &scales(), "b"));
+            let cover = ok(insert_button(&mut tree, root, &scales(), "cover"));
+            let popover = ok(insert_container(&mut tree, root, Style::default()));
+            ok(tree.set_layer(popover, PaintLayer::Popover));
+            let inner = ok(insert_button(&mut tree, popover, &scales(), "inner"));
+            let behind = ok(insert_button(&mut tree, root, &scales(), "behind"));
+            place(&mut tree, button, 40, 40, 60, 24);
+            place(&mut tree, cover, 90, 40, 60, 24);
+            place(&mut tree, popover, 200, 200, 100, 100);
+            place(&mut tree, inner, 210, 210, 60, 24);
+            place(&mut tree, behind, 220, 220, 60, 24);
+            let (theme, scales) = (dark_theme(), scales());
+            let walk = |tree: &WidgetTree<WidgetKind>, focus: FocusPaint| {
+                let mut spans = Vec::new();
+                let mut index = 0;
+                for id in tree.paint_order() {
+                    let ops = ok(paint_widget_ops_focused(
+                        tree,
+                        id,
+                        Some(focus),
+                        &theme,
+                        &scales,
+                        1.0,
+                    ));
+                    spans.push((id, index, index + ops.len()));
+                    index += ops.len();
+                }
+                spans
+            };
+            let span =
+                |spans: &[(WidgetId, usize, usize)], id| match spans.iter().find(|s| s.0 == id) {
+                    Some(&(_, start, end)) => (start, end),
+                    None => unreachable!("{id:?} is painted"),
+                };
+            let Some(focus) = keyboard_focus(&mut tree, button) else {
+                unreachable!()
+            };
+            let spans = walk(&tree, focus);
+            let (_, button_end) = span(&spans, button);
+            let (cover_start, _) = span(&spans, cover);
+            assert!(
+                button_end <= cover_start,
+                "the ring is inline, before the next sibling"
+            );
+            let Some(focus) = keyboard_focus(&mut tree, inner) else {
+                unreachable!()
+            };
+            let spans = walk(&tree, focus);
+            let (_, inner_end) = span(&spans, inner);
+            let (_, behind_end) = span(&spans, behind);
+            assert!(
+                inner_end > behind_end,
+                "a popover widget's ring is above every base op, even one inserted later"
+            );
+        }
+
+        fn clipped_button(visible_width: u32) -> (WidgetTree<WidgetKind>, WidgetId) {
+            let (mut tree, root) = root_tree();
+            let clip = ok(insert_container(
+                &mut tree,
+                root,
+                Style {
+                    overflow: taffy::Point {
+                        x: taffy::Overflow::Hidden,
+                        y: taffy::Overflow::Hidden,
+                    },
+                    ..Default::default()
+                },
+            ));
+            place(&mut tree, clip, 0, 0, 100, 100);
+            let button = ok(insert_button(&mut tree, clip, &scales(), "b"));
+            place(
+                &mut tree,
+                button,
+                i64::from(100 - visible_width),
+                40,
+                60,
+                24,
+            );
+            (tree, button)
+        }
+
+        #[test]
+        fn a_ring_that_would_leave_its_clip_falls_back_inside_the_visible_part() {
+            let (mut tree, button) = clipped_button(30);
+            let Some(focus) = keyboard_focus(&mut tree, button) else {
+                unreachable!("a partly visible button keeps a ring");
+            };
+            let Some((bounds, _)) = ring(&tree, button, focus) else {
+                unreachable!("the fallback ring");
+            };
+            assert_bbox(
+                bounds,
+                (70.0, 40.0, 100.0, 64.0),
+                "inside ring on the visible rect",
+            );
+
+            // Flush against the clip edge but wholly visible: the outside
+            // ring would still leave the clip, so it falls back too.
+            let (mut tree, button) = clipped_button(60);
+            let Some(focus) = keyboard_focus(&mut tree, button) else {
+                unreachable!()
+            };
+            let Some((bounds, _)) = ring(&tree, button, focus) else {
+                unreachable!()
+            };
+            assert_bbox(bounds, (40.0, 40.0, 100.0, 64.0), "flush button");
+        }
+
+        #[test]
+        fn a_sliver_or_a_wholly_clipped_widget_gets_no_ring() {
+            let (mut tree, button) = clipped_button(3);
+            let Some(focus) = keyboard_focus(&mut tree, button) else {
+                unreachable!("3 px are still visible");
+            };
+            assert_eq!(
+                ring(&tree, button, focus),
+                None,
+                "too thin for an inside ring"
+            );
+            let (mut tree, button) = clipped_button(0);
+            assert_eq!(keyboard_focus(&mut tree, button), None);
+        }
+
+        const HIGH_CONTRAST_DARK_TOML: &str =
+            include_str!("../../../design/themes/high-contrast-dark.toml");
+        const HIGH_CONTRAST_LIGHT_TOML: &str =
+            include_str!("../../../design/themes/high-contrast-light.toml");
+
+        /// Every built-in theme, resolved from its committed TOML.
+        fn builtin_themes() -> Vec<(&'static str, aurora_theme::Theme)> {
+            let palette = ok(aurora_theme::Palette::from_toml_str(super::PALETTE_TOML));
+            let mut themes = aurora_theme::ThemeSet::new();
+            for toml in [
+                super::DARK_THEME_TOML,
+                super::LIGHT_THEME_TOML,
+                HIGH_CONTRAST_DARK_TOML,
+                HIGH_CONTRAST_LIGHT_TOML,
+                super::COLOR_CRITICAL_THEME_TOML,
+            ] {
+                ok(themes.register(toml));
+            }
+            [
+                "Dark",
+                "Light",
+                "High Contrast Dark",
+                "High Contrast Light",
+                "Color-Critical",
+            ]
+            .into_iter()
+            .map(|name| (name, ok(themes.resolve(name, &palette))))
+            .collect()
+        }
+
+        /// An op colour back as 8-bit sRGB, for a contrast ratio.
+        fn to_color([r, g, b, _]: [f32; 4]) -> Color {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let byte = |c: f32| (c * 255.0).round().clamp(0.0, 255.0) as u8;
+            Color {
+                r: byte(r),
+                g: byte(g),
+                b: byte(b),
+            }
+        }
+
+        /// The 0.129.0 review's blocker (WCAG 2.4.7 / 1.4.11): a ring
+        /// that sits *on* an `accent.primary` fill — a focused selected
+        /// tree row's inside ring, a clipped button's inside fallback —
+        /// must still carry a colour with at least 3:1 against that fill,
+        /// in every built-in theme. `border.focus` alone is
+        /// `accent.primary` in all five (contrast `1.00`); the ring's
+        /// second colour is what this measures.
+        #[test]
+        fn a_ring_on_an_accent_fill_carries_a_contrasting_colour_in_every_theme() {
+            let scales = scales();
+            let (mut row_tree, root) = root_tree();
+            let view = ok(insert_tree_view(&mut row_tree, root, Some("v")));
+            let row = ok(insert_tree_item(&mut row_tree, view, &scales, "row", false));
+            place(&mut row_tree, view, 0, 0, 200, 200);
+            place(&mut row_tree, row, 10, 10, 180, 21);
+            ok(crate::widgets::set_tree_item_selected(
+                &mut row_tree,
+                row,
+                true,
+            ));
+            let (mut button_tree, button) = clipped_button(30);
+            for (what, tree, id) in [
+                ("selected tree row", &mut row_tree, row),
+                ("clipped button", &mut button_tree, button),
+            ] {
+                let Some(focus) = keyboard_focus(tree, id) else {
+                    unreachable!("{what}: a focused {what} resolves a ring");
+                };
+                for (name, theme) in builtin_themes() {
+                    let fill = theme.accent.primary;
+                    let plain = ok(paint_widget_ops(tree, id, &theme, &scales, 1.0));
+                    let [fr, fg, fb] = fill.to_srgb_f32();
+                    // Exact: a fill is the token's own bytes, unmixed.
+                    #[allow(clippy::float_cmp)]
+                    let filled = plain
+                        .iter()
+                        .any(|op| matches!(op, PaintOp::Solid((_, c)) if *c == [fr, fg, fb, 1.0]));
+                    assert!(filled, "{name}: the {what} is filled with accent.primary");
+                    let focused = ok(paint_widget_ops_focused(
+                        tree,
+                        id,
+                        Some(focus),
+                        &theme,
+                        &scales,
+                        1.0,
+                    ));
+                    let ring = focused.get(plain.len()..).unwrap_or_default();
+                    assert!(!ring.is_empty(), "{name}: {what} has a ring");
+                    let best = ring
+                        .iter()
+                        .filter_map(|op| match op {
+                            PaintOp::Solid((_, c)) => {
+                                Some(aurora_theme::contrast::contrast_ratio(to_color(*c), fill))
+                            }
+                            PaintOp::Gradient(_) => None,
+                        })
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        best >= 3.0,
+                        "{name}: the {what}'s ring has no colour at 3:1 against its \
+                         accent.primary fill (best {best:.2}:1)"
+                    );
+                }
+            }
+        }
+
+        /// A slider flush against a clipping edge overhangs it by its
+        /// thumb ring's reach; it falls back to an inside ring on the
+        /// slider's visible rect rather than losing its ring (review F3).
+        #[test]
+        fn a_clipped_thumb_or_curve_marker_falls_back_to_an_inside_ring() {
+            let (mut tree, root) = root_tree();
+            let clip = ok(insert_container(
+                &mut tree,
+                root,
+                Style {
+                    overflow: taffy::Point {
+                        x: taffy::Overflow::Hidden,
+                        y: taffy::Overflow::Hidden,
+                    },
+                    ..Default::default()
+                },
+            ));
+            place(&mut tree, clip, 0, 0, 100, 100);
+            let slider = ok(insert_slider(
+                &mut tree,
+                clip,
+                &scales(),
+                "s",
+                1.0,
+                0.0,
+                1.0,
+            ));
+            place(&mut tree, slider, 20, 40, 80, 16);
+            let Some(focus) = keyboard_focus(&mut tree, slider) else {
+                unreachable!("a visible slider resolves a ring");
+            };
+            let Some((bounds, _)) = ring(&tree, slider, focus) else {
+                unreachable!("the clipped thumb's ring falls back, not away");
+            };
+            assert_bbox(bounds, (20.0, 40.0, 100.0, 56.0), "slider fallback");
+
+            let points = [CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 1.0 }];
+            let editor = ok(insert_curve_editor(
+                &mut tree,
+                clip,
+                &scales(),
+                "c",
+                200.0,
+                ok(ToneCurve::new(&points)),
+            ));
+            place(&mut tree, editor, 0, 0, 200, 200);
+            ok(select_curve_point(&mut tree, editor, 1));
+            let Some(point) = ok(curve_editor_state(&tree, editor)).focus_target() else {
+                unreachable!("a selected point is the tab stop");
+            };
+            let Some(focus) = keyboard_focus(&mut tree, point) else {
+                unreachable!("a partly visible editor resolves a ring");
+            };
+            assert_eq!(focus.anchor(), editor);
+            let Some((bounds, _)) = ring(&tree, editor, focus) else {
+                unreachable!("the clipped marker's ring falls back to the editor");
+            };
+            assert_bbox(bounds, (0.0, 0.0, 100.0, 100.0), "curve editor fallback");
+        }
+
+        /// Review F4: no ring — band or inner line — ever reaches past its
+        /// anchor's bounds by more than `FOCUS_RING_MAX_OUTSET`, the
+        /// damage outset `FocusManager` grants, however small the widget
+        /// and at fractional scale factors too (a 1x1 button's
+        /// ring, a circle, bulged `0.02` px past the ideal reach of `4`,
+        /// a whole pixel once rounded out, and a slider narrower than its
+        /// own thumb carried the thumb's ring past its bounds). Measured
+        /// the way damage is: the ring's bbox rounded out to whole pixels.
+        #[test]
+        fn every_ring_stays_within_the_damage_outset_even_on_tiny_widgets() {
+            let (theme, scales) = (dark_theme(), scales());
+            for (w, h) in [
+                (1, 1),
+                (1, 9),
+                (2, 2),
+                (3, 7),
+                (5, 5),
+                (7, 7),
+                (8, 3),
+                (13, 13),
+            ] {
+                for scale_factor in [1.0_f32, 1.25, 1.5, 2.0, 2.5] {
+                    #[allow(clippy::cast_precision_loss)]
+                    let outset = FOCUS_RING_MAX_OUTSET as f32;
+                    let (mut tree, root) = root_tree();
+                    let button = ok(insert_button(&mut tree, root, &scales, "b"));
+                    let checkbox = ok(insert_checkbox(&mut tree, root, &scales, "c"));
+                    let slider = ok(insert_slider(&mut tree, root, &scales, "s", 0.5, 0.0, 1.0));
+                    let mut node = Node::new(Role::Group);
+                    node.add_action(Action::Focus);
+                    let panel = ok(tree.insert(root, Style::default(), node, WidgetKind::Panel));
+                    for (i, id) in [button, checkbox, slider, panel].into_iter().enumerate() {
+                        let x = 40 + 60 * i64::try_from(i).unwrap_or_default();
+                        place(&mut tree, id, x, 40, w, h);
+                        let Some(focus) = keyboard_focus(&mut tree, id) else {
+                            continue;
+                        };
+                        let plain = ok(paint_widget_ops(&tree, id, &theme, &scales, scale_factor));
+                        let focused = ok(paint_widget_ops_focused(
+                            &tree,
+                            id,
+                            Some(focus),
+                            &theme,
+                            &scales,
+                            scale_factor,
+                        ));
+                        #[allow(clippy::cast_precision_loss)]
+                        let limit = (
+                            x as f32 - outset,
+                            40.0 - outset,
+                            (x + i64::from(w)) as f32 + outset,
+                            40.0 + h as f32 + outset,
+                        );
+                        for op in focused.get(plain.len()..).unwrap_or_default() {
+                            let PaintOp::Solid((mesh, _)) = op else {
+                                unreachable!("ring ops are solid");
+                            };
+                            let b = bbox(mesh);
+                            let b = (b.0.floor(), b.1.floor(), b.2.ceil(), b.3.ceil());
+                            assert!(
+                                b.0 >= limit.0
+                                    && b.1 >= limit.1
+                                    && b.2 <= limit.2
+                                    && b.3 <= limit.3,
+                                "widget {i} at {w}x{h}, scale {scale_factor}: ring {b:?} \
+                                 exceeds {limit:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Review F5: an anchor disabled out from under an enabled focused
+        /// part — reachable only through `WidgetTree::payload_mut`, which
+        /// bypasses `set_color_picker_disabled`'s all-parts update — shows
+        /// no ring, the same as a disabled focused widget.
+        #[test]
+        fn a_disabled_anchor_with_an_enabled_focused_part_shows_no_ring() {
+            let (mut tree, root) = new_tree(Style::default());
+            let picker = ok(insert_color_picker(
+                &mut tree,
+                root,
+                &scales(),
+                "p",
+                Color { r: 9, g: 9, b: 9 },
+                120.0,
+            ));
+            tree.compute_layout(400.0, 400.0);
+            let state = ok(color_picker_state(&tree, picker));
+            let (Some(area), Some(saturation)) = (state.area_id(), state.focus_target()) else {
+                unreachable!("a fresh picker has every part");
+            };
+            assert!(keyboard_focus(&mut tree, saturation).is_some(), "control");
+            ok(crate::widgets::set_color_picker_disabled(
+                &mut tree, picker, true,
+            ));
+            let Some(disabled_area) = tree.payload(area).cloned() else {
+                unreachable!("the square exists");
+            };
+            ok(crate::widgets::set_color_picker_disabled(
+                &mut tree, picker, false,
+            ));
+            let Some(slot) = tree.payload_mut(area) else {
+                unreachable!("the square exists");
+            };
+            *slot = disabled_area;
+            assert!(
+                matches!(tree.payload(saturation), Some(WidgetKind::ColorPickerPart(p)) if !p.is_disabled())
+            );
+            assert_eq!(keyboard_focus(&mut tree, saturation), None);
+        }
+
+        #[test]
+        fn no_ring_after_a_click_when_disabled_or_when_focus_is_stale() {
+            let (mut tree, root) = root_tree();
+            let button = ok(insert_button(&mut tree, root, &scales(), "b"));
+            place(&mut tree, button, 40, 40, 60, 24);
+            let mut focus = FocusManager::new();
+            assert_eq!(focus.focus_at(&mut tree, 50.0, 50.0), Some(button));
+            assert_eq!(FocusPaint::resolve(&tree, &focus), None, "pointer modality");
+            focus.note_input(&mut tree, FocusOrigin::Keyboard);
+            assert!(FocusPaint::resolve(&tree, &focus).is_some());
+
+            ok(set_button_disabled(&mut tree, button, true));
+            assert_eq!(FocusPaint::resolve(&tree, &focus), None, "disabled");
+            ok(set_button_disabled(&mut tree, button, false));
+            // Disabled through the payload alone, the node untouched.
+            if let Some(WidgetKind::Button(state)) = tree.payload_mut(button) {
+                state.disabled = true;
+            }
+            assert_eq!(FocusPaint::resolve(&tree, &focus), None, "payload disabled");
+            if let Some(WidgetKind::Button(state)) = tree.payload_mut(button) {
+                state.disabled = false;
+            }
+            assert!(FocusPaint::resolve(&tree, &focus).is_some());
+
+            ok(tree.remove(button));
+            assert_eq!(FocusPaint::resolve(&tree, &focus), None, "stale focus");
+        }
     }
 }

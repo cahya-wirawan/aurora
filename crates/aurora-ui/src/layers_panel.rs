@@ -15,13 +15,13 @@
 //! announces it — and an `expanded` state with exactly one of
 //! `Action::Expand`/`Action::Collapse` on every group row.
 //!
-//! **Nothing routes those expand/collapse requests yet.** The actions
-//! are declared and the state is announced, but no code in `aurora-app`
-//! turns an incoming `accesskit::ActionRequest` for `Action::Expand` or
-//! `Action::Collapse` on a layer row into a
-//! `set_tree_item_expanded` call — that is separate, still-open work,
-//! and until it lands a screen-reader user can be told a group is
-//! collapsible without being able to collapse it.
+//! **Those expand/collapse requests are routed** (0.128.0):
+//! `aurora_widgets::handle_action` calls `set_tree_item_expanded`, and
+//! `aurora-app` then reconciles its own row map — pruning the removed
+//! rows on a collapse, and on an expand repopulating this whole panel
+//! (the only way rows are built), which reopens every other collapsed
+//! group too. A `Click` on a row selects that layer exactly as a pointer
+//! press does.
 //!
 //! **The `VoiceOver` navigation bug PLAN.md records for this panel is
 //! neither fixed nor claimed fixed here.** No display server exists in
