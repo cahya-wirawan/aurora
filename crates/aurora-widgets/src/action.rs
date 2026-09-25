@@ -351,7 +351,7 @@ fn acceptable_text(text: &str) -> bool {
 
 /// Whether `kind`'s own state says it is disabled — the payload half of
 /// step 4 (the node half is `Node::is_disabled`).
-fn payload_disabled(kind: &WidgetKind) -> bool {
+pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
     match kind {
         WidgetKind::Button(state) => state.disabled,
         WidgetKind::Checkbox(state) => state.disabled,
@@ -628,7 +628,7 @@ fn click_tab(
 
 /// The picker a channel slider belongs to — its nearest
 /// [`WidgetKind::ColorPicker`] ancestor that also tracks it.
-fn owning_picker(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<WidgetId> {
+pub(crate) fn owning_picker(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<WidgetId> {
     let mut current = tree.parent(id);
     while let Some(candidate) = current {
         if matches!(tree.payload(candidate), Some(WidgetKind::ColorPicker(_))) {

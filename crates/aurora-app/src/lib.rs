@@ -522,6 +522,10 @@ use aurora_widgets::widgets::{
     set_command_palette_query,
 };
 use aurora_widgets::{
+    ClickTracker, FocusOrigin, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase,
+    handle_pointer, handle_widget_key,
+};
+use aurora_widgets::{
     FocusManager, FocusPaint, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp,
     PathPipeline, WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops_focused,
 };
@@ -2512,18 +2516,6 @@ enum AccessibilityReaction {
     Rejected(aurora_widgets::ActionRejection),
 }
 
-/// Whether `id` is `ancestor` or lies anywhere below it.
-fn is_within(tree: &WidgetTree<WidgetKind>, ancestor: WidgetId, id: WidgetId) -> bool {
-    let mut current = Some(id);
-    while let Some(candidate) = current {
-        if candidate == ancestor {
-            return true;
-        }
-        current = tree.parent(candidate);
-    }
-    false
-}
-
 /// Routes one assistive-technology `request` (PLAN.md M1.8, 0.128.0):
 /// the modal gate first, then `aurora_widgets::handle_action` (which owns
 /// the declared-action security gate and every widget-level mutation),
@@ -2539,7 +2531,7 @@ fn route_accessibility_action(
     request: &accesskit::ActionRequest,
 ) -> AccessibilityReaction {
     if let Some(handle) = dialog
-        && !is_within(&workspace.tree, handle.root, request.target_node)
+        && !workspace.tree.is_within(handle.root, request.target_node)
     {
         return AccessibilityReaction::BlockedByModal(request.target_node);
     }
@@ -2643,6 +2635,10 @@ struct AccessibilityContext<'a> {
     undo_order: &'a mut UndoOrder,
     composite_cache: &'a mut CompositeCache,
     drag: &'a mut Option<Drag>,
+    /// The Widget Gallery while open: an assistive technology's action on
+    /// one of its widgets gets the same [`aurora_ui::apply_gallery_outcome`]
+    /// reaction the pointer and keyboard paths give it (critic C1).
+    gallery: &'a mut Option<aurora_ui::GalleryPanel>,
 }
 
 /// What the caller of [`apply_accessibility_action`] still has to do —
@@ -2704,10 +2700,15 @@ fn apply_accessibility_action(
     cx: &mut AccessibilityContext<'_>,
     request: &accesskit::ActionRequest,
 ) -> AccessibilityEffects {
+    // Decided before routing: a menu item's `Click` removes the menu, so
+    // the target is gone by the time the outcome comes back.
+    let in_gallery = cx.gallery.as_ref().is_some_and(|gallery| {
+        aurora_ui::gallery_contains(&cx.workspace.tree, gallery, request.target_node)
+    });
     let reaction = match cx.palette {
         Some(palette)
             if cx.dialog.is_none()
-                && !is_within(&cx.workspace.tree, palette, request.target_node) =>
+                && !cx.workspace.tree.is_within(palette, request.target_node) =>
         {
             AccessibilityReaction::BlockedByModal(request.target_node)
         }
@@ -2750,6 +2751,20 @@ fn apply_accessibility_action(
                 row,
                 expanded,
             );
+        }
+        AccessibilityReaction::Handled(outcome) if in_gallery => {
+            tracing::debug!(?outcome, "accessibility action on the widget gallery");
+            if let Some(gallery) = cx.gallery.as_mut()
+                && let Err(err) = aurora_ui::apply_gallery_outcome(
+                    &mut cx.workspace.tree,
+                    cx.focus,
+                    gallery,
+                    cx.scales,
+                    &PointerOutcome::Action(outcome),
+                )
+            {
+                tracing::warn!(?err, "gallery failed to apply an accessibility outcome");
+            }
         }
         AccessibilityReaction::Handled(outcome) => {
             if outcome_is_widget_local(&outcome) {
@@ -2973,6 +2988,11 @@ enum ActivatedCommand {
     SaveFile(PathBuf),
     Undo,
     Redo,
+    /// Open or close the Widget Gallery panel (0.130.0) — returned rather
+    /// than done inline because building the gallery needs `App`'s own
+    /// `Scales` and click tracker, neither of which `activate_command`
+    /// takes. See [`toggle_gallery`].
+    ToggleWidgetGallery,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -2992,6 +3012,7 @@ const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
 const COMMAND_REDO: &str = "edit.redo";
+const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -3041,6 +3062,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
         CommandEntry::new(COMMAND_REDO, "Redo"),
+        CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
     ]
 }
 
@@ -3144,8 +3166,212 @@ fn activate_command(
     if id == COMMAND_REDO {
         return Some(ActivatedCommand::Redo);
     }
+    if id == COMMAND_TOGGLE_WIDGET_GALLERY {
+        return Some(ActivatedCommand::ToggleWidgetGallery);
+    }
     tracing::warn!(command = id, "unknown command activated");
     None
+}
+
+// -- Widget Gallery (0.130.0) --
+//
+// The in-app gallery panel (`aurora_ui::gallery_panel`): one live
+// instance of every toolkit widget, toggled by `Toggle Widget Gallery`.
+// These three free functions are the whole of its app-side routing, kept
+// out of `App` so they are tested headlessly. Every outcome is logged and
+// otherwise dropped: the gallery touches no document.
+
+/// Opens the gallery if closed, closes it if open. Opening builds it as
+/// the workspace root's last child; closing removes the whole subtree,
+/// forgets any click armed inside it and validates focus, so with the
+/// gallery closed the tree is exactly the workspace as built. The caller
+/// re-runs layout.
+fn toggle_gallery(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    gallery: &mut Option<aurora_ui::GalleryPanel>,
+    click: &mut ClickTracker,
+    scales: &Scales,
+) {
+    if let Some(open) = gallery.take() {
+        click.reset();
+        if let Err(err) = aurora_ui::remove_gallery_panel(&mut workspace.tree, open) {
+            tracing::warn!(?err, "failed to remove the widget gallery");
+        }
+        focus.validate(&workspace.tree);
+        return;
+    }
+    match aurora_ui::insert_gallery_panel(&mut workspace.tree, workspace.root, scales) {
+        Ok(opened) => *gallery = Some(opened),
+        Err(err) => tracing::warn!(?err, "failed to build the widget gallery"),
+    }
+}
+
+/// What [`route_gallery_pointer`] did with one event.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct GalleryPointer {
+    /// `Some` when the event was the gallery's (the caller stops routing
+    /// it); `None` when the caller goes on routing it.
+    outcome: Option<PointerOutcome>,
+    /// A `Down` light-dismissed the gallery's open menu or dropdown list.
+    /// Independent of [`Self::outcome`]: a press on the canvas both
+    /// closes the menu and paints, and the caller must still re-run
+    /// layout, re-announce and redraw for the close (critic C3).
+    dismissed: bool,
+}
+
+/// Routes one primary-button pointer event to the gallery, if it is the
+/// gallery's: `outcome` is `None` (the caller goes on routing it) unless
+/// the gallery is open **and** — for a `Down` — the press lands inside it,
+/// or — for an `Up` — a gallery press is armed. A `Down` first
+/// light-dismisses the gallery's open menu or dropdown list when it lands
+/// outside them (reported as `dismissed`), and then keeps routing
+/// normally (a press on the canvas both closes the menu and paints). A
+/// refused press (a disabled widget) is consumed and logged, not passed
+/// on to whatever lies under the gallery.
+///
+/// **`modal_open`** (a dialog or the command palette): a `Down` is not
+/// the gallery's at all — no light dismiss, nothing armed — and an `Up`
+/// that would release a press armed *before* the modal opened cancels it
+/// instead of activating (red-team RT-1 / critic C4): the press is
+/// forgotten, its pressed look undone, and the outcome is
+/// [`PointerOutcome::Cancelled`].
+#[allow(clippy::too_many_arguments)]
+fn route_gallery_pointer(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    gallery: &mut Option<aurora_ui::GalleryPanel>,
+    click: &mut ClickTracker,
+    scales: &Scales,
+    modal_open: bool,
+    phase: PointerPhase,
+    position: (f32, f32),
+) -> GalleryPointer {
+    let Some(open) = gallery.as_mut() else {
+        return GalleryPointer::default();
+    };
+    let mut dismissed = false;
+    match phase {
+        PointerPhase::Down if modal_open => return GalleryPointer::default(),
+        PointerPhase::Up if modal_open => {
+            let Some(armed) = click.pressed() else {
+                return GalleryPointer::default();
+            };
+            click.reset();
+            // Not a button, disabled or already gone: then there is no
+            // pressed look to undo, so the refusal is moot.
+            let _ = aurora_widgets::widgets::set_button_pressed(&mut workspace.tree, armed, false);
+            return GalleryPointer {
+                outcome: Some(PointerOutcome::Cancelled(armed)),
+                dismissed: false,
+            };
+        }
+        PointerPhase::Down => {
+            match aurora_ui::gallery_light_dismiss(&mut workspace.tree, focus, open, position) {
+                Ok(closed) => dismissed = closed,
+                Err(err) => tracing::warn!(?err, "gallery light dismiss failed"),
+            }
+            let inside = workspace
+                .tree
+                .hit_test(position)
+                .is_some_and(|hit| aurora_ui::gallery_contains(&workspace.tree, open, hit));
+            if !inside {
+                // A gallery press whose release never arrived (it happened
+                // outside the window) must not claim this press's release.
+                if let Some(stale) = click.pressed() {
+                    click.reset();
+                    // Not a button, disabled or already gone: then there
+                    // is no pressed look to undo, so the refusal is moot.
+                    let _ = aurora_widgets::widgets::set_button_pressed(
+                        &mut workspace.tree,
+                        stale,
+                        false,
+                    );
+                }
+                return GalleryPointer {
+                    outcome: None,
+                    dismissed,
+                };
+            }
+        }
+        PointerPhase::Up => {
+            if click.pressed().is_none() {
+                return GalleryPointer::default();
+            }
+        }
+    }
+    let event = PointerEvent { phase, position };
+    let outcome = match handle_pointer(&mut workspace.tree, focus, click, event) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::debug!(?err, "gallery refused a pointer event");
+            PointerOutcome::Ignored
+        }
+    };
+    if let Err(err) =
+        aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, &outcome)
+    {
+        tracing::warn!(?err, "gallery failed to apply an outcome");
+    }
+    GalleryPointer {
+        outcome: Some(outcome),
+        dismissed,
+    }
+}
+
+/// Whether a key press should show the focus ring again
+/// (`:focus-visible`), app-wide (critic C8): only a key the widgets
+/// could act on — `key` is `None` for a modifier-only press or a key this
+/// crate does not translate — and never a `Ctrl`/`Alt`/`Meta` chord, which
+/// is a shortcut, not keyboard navigation. `Shift` is allowed
+/// (`Shift+Tab` is navigation).
+fn key_shows_focus_ring(key: Option<&Key>, modifiers: Modifiers) -> bool {
+    key.is_some() && !(modifiers.control || modifiers.alt || modifiers.meta)
+}
+
+/// Routes one key to the focused gallery widget, **after** the modal
+/// dialog and the command palette and **before** the shortcut registry:
+/// `None` when a dialog or the palette is open, the gallery is closed,
+/// the key is not a named key, or focus is outside the gallery. A
+/// [`KeyOutcome::Ignored`] tells the caller to go on to its shortcuts
+/// (`Tab` still moves focus off a focused gallery button). A refused key
+/// is logged and treated as `Ignored`.
+#[allow(clippy::too_many_arguments)]
+fn route_gallery_key(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    gallery: &mut Option<aurora_ui::GalleryPanel>,
+    scales: &Scales,
+    dialog_open: bool,
+    palette_open: bool,
+    modifiers: Modifiers,
+    key: Key,
+) -> Option<KeyOutcome> {
+    if dialog_open || palette_open {
+        return None;
+    }
+    let open = gallery.as_mut()?;
+    let Key::Named(named) = key else {
+        return None;
+    };
+    let focused = focus.focused()?;
+    if !aurora_ui::gallery_contains(&workspace.tree, open, focused) {
+        return None;
+    }
+    let outcome = match handle_widget_key(&mut workspace.tree, focus, named, modifiers) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::debug!(?err, "gallery refused a key");
+            KeyOutcome::Ignored
+        }
+    };
+    if let KeyOutcome::Handled(handled) = &outcome
+        && let Err(err) =
+            aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, handled)
+    {
+        tracing::warn!(?err, "gallery failed to apply an outcome");
+    }
+    Some(outcome)
 }
 
 // -- Native menu bar (macOS only) --
@@ -3283,6 +3509,13 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_CLOSE_HISTORY, "Close History Panel", true, None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(
+                COMMAND_TOGGLE_WIDGET_GALLERY,
+                "Toggle Widget Gallery",
+                true,
+                None,
+            ),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -14110,6 +14343,12 @@ struct App {
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
     pointer_position: Option<(f32, f32)>,
+    /// The Widget Gallery panel while open (0.130.0) — `None` means it is
+    /// not in the tree at all. See [`toggle_gallery`].
+    gallery: Option<aurora_ui::GalleryPanel>,
+    /// The gallery's armed click, if a primary press inside it is still
+    /// waiting for its release.
+    gallery_click: ClickTracker,
     /// An in-progress pointer drag (Pan, Marquee Select, Brush, or
     /// Eraser), if any — `None` is "not dragging," the same "no separate
     /// flag" shape `command_palette`/`dialog` above
@@ -14346,6 +14585,8 @@ impl App {
             path_pipeline: None,
             gradient_pipeline: None,
             pointer_position: None,
+            gallery: None,
+            gallery_click: ClickTracker::default(),
             drag: None,
             rail_resize: None,
             #[cfg(target_os = "macos")]
@@ -14404,6 +14645,7 @@ impl App {
                 undo_order: &mut self.undo_order,
                 composite_cache: &mut self.composite_cache,
                 drag: &mut self.drag,
+                gallery: &mut self.gallery,
             },
             request,
         );
@@ -14436,9 +14678,33 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
-        let Some(key) = translate_key(&event.logical_key) else {
+        // A navigation-capable key press shows the focus ring again
+        // (`:focus-visible`), app-wide -- the counterpart of the pointer
+        // press hiding it. Not a modifier-only press and not a shortcut
+        // chord: see `key_shows_focus_ring`.
+        let key = translate_key(&event.logical_key);
+        if key_shows_focus_ring(key.as_ref(), self.modifiers) {
+            self.focus
+                .note_input(&mut self.workspace.tree, FocusOrigin::Keyboard);
+        }
+        let Some(key) = key else {
             return;
         };
+        let gallery = route_gallery_key(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.gallery,
+            &self.scales,
+            self.dialog.is_some(),
+            self.command_palette.is_some(),
+            self.modifiers,
+            key,
+        );
+        if let Some(KeyOutcome::Handled(outcome)) = gallery {
+            tracing::debug!(?outcome, "widget gallery key");
+            self.relayout_after_gallery();
+            return;
+        }
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
@@ -14462,6 +14728,7 @@ impl App {
             Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
+            Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -15287,6 +15554,10 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+        // Any pointer press hides the focus ring (`:focus-visible`),
+        // app-wide, whatever the press lands on.
+        self.focus
+            .note_input(&mut self.workspace.tree, FocusOrigin::Pointer);
 
         // A modal dialog, if open, owns every pointer press
         // the same way it already owns the keyboard (`handle_key`'s own
@@ -15300,6 +15571,13 @@ impl App {
             position,
         ) {
             self.push_accessibility();
+            return;
+        }
+
+        // The Widget Gallery (0.130.0), when open, owns a primary press
+        // that lands inside it -- after the modal dialog, before the
+        // Layers rows and the canvas it sits beside.
+        if button == PointerButton::Primary && self.route_gallery(PointerPhase::Down, position) {
             return;
         }
 
@@ -15729,7 +16007,16 @@ impl App {
     /// further to record for that one; `aurora_ui::set_rail_width` has
     /// already applied every intermediate width live, on each move
     /// event, not just the final one.
-    fn handle_pointer_released(&mut self) {
+    fn handle_pointer_released(&mut self, button: winit::event::MouseButton) {
+        if translate_pointer_button(button) == Some(PointerButton::Primary)
+            && let Some(position) = self.pointer_position
+        {
+            self.route_gallery(PointerPhase::Up, position);
+        }
+        // Not an early return above, deliberately: ending a rail resize or
+        // committing a canvas drag is a no-op when none is live, and
+        // running them unconditionally means a release can never strand
+        // one behind a gallery click.
         self.rail_resize = None;
         let ending = self.drag.take();
         self.commit_drag(ending);
@@ -15812,6 +16099,7 @@ impl App {
             Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
+            Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             None => {}
         }
         self.push_accessibility();
@@ -15894,6 +16182,69 @@ impl App {
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
         run_shutdown_cleanup(self);
+    }
+
+    /// Routes one primary-button event to the Widget Gallery
+    /// ([`route_gallery_pointer`]); `true` when the gallery took it, after
+    /// re-running layout, re-announcing and requesting a redraw.
+    ///
+    /// A light dismiss that closed something re-runs layout, re-announces
+    /// and redraws even when the press itself goes on to the canvas
+    /// (critic C3). A gallery `Down` first commits any live drag (a
+    /// middle-button pan still in progress, critic C5) — a press is a
+    /// second gesture, the same rule [`Self::handle_pointer_pressed`]
+    /// applies to its layer-row and canvas branches.
+    fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
+        let routed = route_gallery_pointer(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.gallery,
+            &mut self.gallery_click,
+            &self.scales,
+            self.dialog.is_some() || self.command_palette.is_some(),
+            phase,
+            position,
+        );
+        let Some(outcome) = routed.outcome else {
+            if routed.dismissed {
+                self.relayout_after_gallery();
+            }
+            return false;
+        };
+        tracing::debug!(?outcome, ?phase, "widget gallery pointer event");
+        if phase == PointerPhase::Down {
+            let interrupted = self.drag.take();
+            self.commit_drag(interrupted);
+        }
+        self.relayout_after_gallery();
+        true
+    }
+
+    /// Opens or closes the Widget Gallery ([`toggle_gallery`]), then
+    /// re-runs layout (the canvas area narrows or widens by the gallery's
+    /// width), re-announces the tree and redraws.
+    fn toggle_widget_gallery(&mut self) {
+        toggle_gallery(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.gallery,
+            &mut self.gallery_click,
+            &self.scales,
+        );
+        self.relayout_after_gallery();
+    }
+
+    /// Layout, accessibility push and a redraw after a gallery event —
+    /// the same `apply_resize`-from-the-window's-own-size re-layout
+    /// [`Self::handle_key_event`] runs, since a dropdown or menu opening
+    /// adds widgets that need bounds before the next hit test.
+    fn relayout_after_gallery(&mut self) {
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -16526,8 +16877,9 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             } => self.handle_pointer_pressed(button),
             WindowEvent::MouseInput {
                 state: ElementState::Released,
+                button,
                 ..
-            } => self.handle_pointer_released(),
+            } => self.handle_pointer_released(button),
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_position = None;
@@ -16786,10 +17138,16 @@ mod tests {
     // run on.
     #[cfg(unix)]
     use super::create_dir_owner_only;
+    use super::{
+        COMMAND_TOGGLE_WIDGET_GALLERY, GalleryPointer, key_shows_focus_ring, route_gallery_key,
+        route_gallery_pointer, toggle_gallery,
+    };
     use aurora_doc::SelectionSet;
+    use aurora_theme::Scales;
     use aurora_theme::{Palette, ThemeSet};
     use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::widgets::{DialogHandle, insert_button, new_tree};
+    use aurora_widgets::{ClickTracker, KeyOutcome, PointerOutcome, PointerPhase};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
 
@@ -17497,6 +17855,7 @@ mod tests {
             undo_order: UndoOrder,
             composite_cache: CompositeCache,
             drag: Option<Drag>,
+            gallery: Option<aurora_ui::GalleryPanel>,
         }
 
         impl AtState {
@@ -17536,6 +17895,7 @@ mod tests {
                     undo_order: UndoOrder::default(),
                     composite_cache: CompositeCache::default(),
                     drag: None,
+                    gallery: None,
                 }
             }
 
@@ -17559,6 +17919,7 @@ mod tests {
                         undo_order: &mut self.undo_order,
                         composite_cache: &mut self.composite_cache,
                         drag: &mut self.drag,
+                        gallery: &mut self.gallery,
                     },
                     request,
                 );
@@ -17567,6 +17928,80 @@ mod tests {
                 }
                 effects
             }
+
+            /// Opens the Widget Gallery, as the palette command does.
+            fn open_gallery(&mut self) -> &aurora_ui::GalleryPanel {
+                toggle_gallery(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    &mut ClickTracker::default(),
+                    &self.scales,
+                );
+                self.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                match self.gallery.as_ref() {
+                    Some(gallery) => gallery,
+                    None => unreachable!("the gallery opened"),
+                }
+            }
+        }
+
+        /// Critic C1: an assistive technology's `Click` on the gallery's
+        /// "Open menu" button opens the menu (and focuses it), and its
+        /// `Click` on a menu item hands focus back to the button — the
+        /// same `apply_gallery_outcome` reaction the pointer path gets.
+        #[test]
+        fn an_at_click_on_the_gallery_menu_button_opens_the_menu() {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            let button = state.open_gallery().menu_button;
+            let effects = state.act(&a11y_request(button, accesskit::Action::Click));
+            assert_eq!(effects, BOTH);
+            let Some(menu) = state.gallery.as_ref().and_then(|g| g.open_menu) else {
+                unreachable!("the AT click opened the menu");
+            };
+            assert_eq!(state.focus.focused(), Some(menu));
+            let Some(&item) = state
+                .workspace
+                .tree
+                .children(menu)
+                .and_then(<[WidgetId]>::first)
+            else {
+                unreachable!("the menu has items");
+            };
+            state.act(&a11y_request(item, accesskit::Action::Click));
+            assert!(
+                !state.workspace.tree.contains(menu),
+                "the item closed its menu"
+            );
+            assert_eq!(state.gallery.as_ref().and_then(|g| g.open_menu), None);
+            assert_eq!(state.focus.focused(), Some(button), "focus handed back");
+        }
+
+        /// Critic C1/C2: an assistive technology's `Click` on a gallery
+        /// tree row single-selects it, exactly as a pointer click does.
+        #[test]
+        fn an_at_click_on_a_gallery_tree_row_single_selects_it() {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            let [parent, first, _] = state.open_gallery().tree_rows;
+            let selected = |state: &AtState, id: WidgetId| {
+                matches!(
+                    state.workspace.tree.payload(id),
+                    Some(aurora_widgets::widgets::WidgetKind::TreeItem(row)) if row.selected
+                )
+            };
+            state.act(&a11y_request(first, accesskit::Action::Click));
+            assert!(selected(&state, first));
+            state.act(&a11y_request(parent, accesskit::Action::Click));
+            assert!(selected(&state, parent));
+            assert!(!selected(&state, first), "single selection");
         }
 
         const BOTH: AccessibilityEffects = AccessibilityEffects {
@@ -17649,7 +18084,7 @@ mod tests {
             );
             let hit = state.workspace.tree.hit_test(centre);
             assert!(
-                hit.is_some_and(|hit| is_within(&state.workspace.tree, child_row, hit)),
+                hit.is_some_and(|hit| state.workspace.tree.is_within(child_row, hit)),
                 "the rebuilt child row cannot be hit: {hit:?}"
             );
         }
@@ -17704,7 +18139,7 @@ mod tests {
             let inside = state
                 .focus
                 .focused()
-                .filter(|&id| is_within(&state.workspace.tree, palette, id));
+                .filter(|&id| state.workspace.tree.is_within(palette, id));
             let Some(inside) = inside else {
                 unreachable!("the palette took no focus");
             };
@@ -47964,5 +48399,507 @@ mod tests {
             1,
             "and it must cost the ordinary one submit, exactly like any other stored tile"
         );
+    }
+
+    // -- Widget Gallery (0.130.0) ------------------------------------------
+
+    const GALLERY_WIDE: f32 = 2400.0;
+    const GALLERY_TALL: f32 = 1600.0;
+
+    struct GalleryRig {
+        workspace: aurora_ui::Workspace,
+        focus: FocusManager,
+        gallery: Option<aurora_ui::GalleryPanel>,
+        click: ClickTracker,
+        scales: Scales,
+    }
+
+    impl GalleryRig {
+        fn open() -> Self {
+            let scales = match load_scales() {
+                Ok(scales) => scales,
+                Err(err) => unreachable!("{err}"),
+            };
+            let mut rig = Self {
+                workspace: aurora_ui::build_workspace(),
+                focus: FocusManager::default(),
+                gallery: None,
+                click: ClickTracker::default(),
+                scales,
+            };
+            rig.toggle();
+            rig
+        }
+
+        fn toggle(&mut self) {
+            toggle_gallery(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.gallery,
+                &mut self.click,
+                &self.scales,
+            );
+            self.workspace
+                .tree
+                .compute_layout(GALLERY_WIDE, GALLERY_TALL);
+        }
+
+        fn g(&self) -> &aurora_ui::GalleryPanel {
+            match self.gallery.as_ref() {
+                Some(gallery) => gallery,
+                None => unreachable!("the gallery is open"),
+            }
+        }
+
+        fn centre(&self, id: WidgetId) -> (f32, f32) {
+            let Some(b) = self.workspace.tree.bounds(id) else {
+                unreachable!("{id:?} is laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (
+                b.x as f32 + b.width as f32 / 2.0,
+                b.y as f32 + b.height as f32 / 2.0,
+            );
+            centre
+        }
+
+        fn pointer(&mut self, phase: PointerPhase, at: (f32, f32)) -> Option<PointerOutcome> {
+            self.routed(phase, at, false).outcome
+        }
+
+        fn routed(
+            &mut self,
+            phase: PointerPhase,
+            at: (f32, f32),
+            modal_open: bool,
+        ) -> GalleryPointer {
+            let routed = route_gallery_pointer(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.gallery,
+                &mut self.click,
+                &self.scales,
+                modal_open,
+                phase,
+                at,
+            );
+            self.workspace
+                .tree
+                .compute_layout(GALLERY_WIDE, GALLERY_TALL);
+            routed
+        }
+
+        fn button_pressed(&self, id: WidgetId) -> bool {
+            matches!(
+                self.workspace.tree.payload(id),
+                Some(aurora_widgets::widgets::WidgetKind::Button(state)) if state.pressed
+            )
+        }
+
+        fn key(&mut self, key: Key, dialog_open: bool) -> Option<KeyOutcome> {
+            let outcome = route_gallery_key(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.gallery,
+                &self.scales,
+                dialog_open,
+                false,
+                Modifiers::none(),
+                key,
+            );
+            self.workspace
+                .tree
+                .compute_layout(GALLERY_WIDE, GALLERY_TALL);
+            outcome
+        }
+
+        fn checked(&self) -> Option<accesskit::Toggled> {
+            match self.workspace.tree.payload(self.g().checkbox) {
+                Some(aurora_widgets::widgets::WidgetKind::Checkbox(state)) => Some(state.checked),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_widget_gallery_is_a_palette_command_that_activation_returns() {
+        assert!(
+            palette_commands()
+                .iter()
+                .any(|entry| entry.id == COMMAND_TOGGLE_WIDGET_GALLERY
+                    && entry.title == "Toggle Widget Gallery")
+        );
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let picked = activate_command(
+            &mut workspace,
+            &mut focus,
+            COMMAND_TOGGLE_WIDGET_GALLERY,
+            &mut FakeFileDialog::default(),
+        );
+        assert_eq!(picked, Some(ActivatedCommand::ToggleWidgetGallery));
+    }
+
+    #[test]
+    fn toggling_the_gallery_builds_it_then_removes_every_trace_of_it() {
+        let mut rig = GalleryRig::open();
+        let root = rig.workspace.root;
+        let gallery_root = rig.g().panel.root;
+        let checkbox = rig.g().checkbox;
+        assert_eq!(
+            rig.workspace.tree.children(root).map(<[WidgetId]>::len),
+            Some(4),
+            "canvas, divider, rail, gallery"
+        );
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, checkbox) {
+            unreachable!("{err:?}");
+        }
+        rig.toggle();
+        assert!(rig.gallery.is_none());
+        assert!(!rig.workspace.tree.contains(gallery_root));
+        assert!(!rig.workspace.tree.contains(checkbox));
+        assert_eq!(
+            rig.workspace.tree.children(root),
+            Some(
+                [
+                    rig.workspace.canvas_area,
+                    rig.workspace.divider,
+                    rig.workspace.rail
+                ]
+                .as_slice()
+            ),
+            "back to the workspace as built"
+        );
+        assert_eq!(rig.focus.focused(), None, "focus is not left dangling");
+        rig.toggle();
+        assert!(rig.gallery.is_some(), "and it opens again");
+    }
+
+    #[test]
+    fn a_click_on_the_gallery_checkbox_toggles_it_on_release_and_hides_the_ring() {
+        let mut rig = GalleryRig::open();
+        // Start from a *visible* ring (critic C9): otherwise "hides the
+        // ring" could not fail.
+        let button = rig.g().button;
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, button) {
+            unreachable!("{err:?}");
+        }
+        assert!(rig.focus.focus_visible(), "keyboard-style focus shows it");
+        let at = rig.centre(rig.g().checkbox);
+        let down = rig.pointer(PointerPhase::Down, at);
+        assert!(matches!(down, Some(PointerOutcome::Pressed(_))), "{down:?}");
+        assert_eq!(
+            rig.checked(),
+            Some(accesskit::Toggled::False),
+            "not on down"
+        );
+        let up = rig.pointer(PointerPhase::Up, at);
+        assert!(
+            matches!(
+                up,
+                Some(PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::Toggled { .. }
+                ))
+            ),
+            "{up:?}"
+        );
+        assert_eq!(rig.checked(), Some(accesskit::Toggled::True));
+        assert_eq!(rig.focus.focused(), Some(rig.g().checkbox));
+        assert!(!rig.focus.focus_visible(), "a click shows no focus ring");
+    }
+
+    #[test]
+    fn a_press_outside_the_gallery_is_not_the_gallerys() {
+        let mut rig = GalleryRig::open();
+        let layers = rig.centre(rig.workspace.layers.root);
+        let canvas = rig.centre(rig.workspace.canvas_area);
+        assert_eq!(rig.pointer(PointerPhase::Down, layers), None);
+        assert_eq!(rig.pointer(PointerPhase::Down, canvas), None);
+        assert_eq!(
+            rig.pointer(PointerPhase::Up, canvas),
+            None,
+            "nothing armed: the release is not the gallery's either"
+        );
+        rig.toggle();
+        assert_eq!(
+            rig.pointer(PointerPhase::Down, layers),
+            None,
+            "closed: nothing is routed at all"
+        );
+    }
+
+    #[test]
+    fn gallery_dropdown_keys_commit_but_not_while_a_dialog_is_open() {
+        let mut rig = GalleryRig::open();
+        let dropdown = rig.g().dropdown;
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, dropdown) {
+            unreachable!("{err:?}");
+        }
+        let selected = |rig: &GalleryRig| {
+            aurora_widgets::widgets::dropdown_state(&rig.workspace.tree, dropdown)
+                .ok()
+                .and_then(aurora_widgets::widgets::DropdownState::selected)
+        };
+        for key in [NamedKey::ArrowDown, NamedKey::ArrowDown, NamedKey::Enter] {
+            assert_eq!(
+                rig.key(Key::Named(key), true),
+                None,
+                "the dialog comes first"
+            );
+        }
+        assert_eq!(selected(&rig), Some(0), "unchanged behind a dialog");
+        for key in [NamedKey::ArrowDown, NamedKey::ArrowDown, NamedKey::Enter] {
+            assert!(matches!(
+                rig.key(Key::Named(key), false),
+                Some(KeyOutcome::Handled(_))
+            ));
+        }
+        assert_eq!(selected(&rig), Some(1));
+    }
+
+    #[test]
+    fn a_key_the_focused_gallery_widget_ignores_still_reaches_the_shortcuts() {
+        let mut rig = GalleryRig::open();
+        let button = rig.g().button;
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, button) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            rig.key(Key::Named(NamedKey::Tab), false),
+            Some(KeyOutcome::Ignored)
+        );
+        assert_eq!(
+            rig.key(Key::Character('b'), false),
+            None,
+            "a character key is never the gallery's"
+        );
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let shortcuts = default_shortcuts();
+        handle_key(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &mut dialog,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Named(NamedKey::Tab),
+            None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
+        );
+        assert_ne!(rig.focus.focused(), Some(button), "Tab moved focus on");
+    }
+
+    #[test]
+    fn clicking_the_menu_button_opens_a_menu_inside_the_gallery() {
+        let mut rig = GalleryRig::open();
+        let at = rig.centre(rig.g().menu_button);
+        rig.pointer(PointerPhase::Down, at);
+        rig.pointer(PointerPhase::Up, at);
+        let Some(menu) = rig.g().open_menu else {
+            unreachable!("the menu opened");
+        };
+        assert!(aurora_ui::gallery_contains(
+            &rig.workspace.tree,
+            rig.g(),
+            menu
+        ));
+        assert_eq!(rig.focus.focused(), Some(menu));
+        // A press on the canvas light-dismisses it and is still not the
+        // gallery's, so the canvas gets it too.
+        let canvas = rig.centre(rig.workspace.canvas_area);
+        assert_eq!(rig.pointer(PointerPhase::Down, canvas), None);
+        assert_eq!(rig.g().open_menu, None);
+        assert!(!rig.workspace.tree.contains(menu));
+    }
+
+    #[test]
+    fn a_release_after_the_gallery_was_closed_and_reopened_routes_to_no_stale_id() {
+        let mut rig = GalleryRig::open();
+        let at = rig.centre(rig.g().checkbox);
+        rig.pointer(PointerPhase::Down, at);
+        rig.toggle();
+        rig.toggle();
+        let at = rig.centre(rig.g().checkbox);
+        assert_eq!(rig.pointer(PointerPhase::Up, at), None, "nothing armed");
+        assert_eq!(rig.checked(), Some(accesskit::Toggled::False));
+    }
+
+    /// Critic C3: a press outside the gallery that light-dismisses its
+    /// menu is still not the gallery's, but it *reports* the dismissal so
+    /// the `App` wrapper re-runs layout, re-announces and redraws.
+    #[test]
+    fn a_dismiss_outside_the_gallery_reports_that_it_closed_something() {
+        let mut rig = GalleryRig::open();
+        let at = rig.centre(rig.g().menu_button);
+        rig.pointer(PointerPhase::Down, at);
+        rig.pointer(PointerPhase::Up, at);
+        assert!(rig.g().open_menu.is_some());
+        let canvas = rig.centre(rig.workspace.canvas_area);
+        assert_eq!(
+            rig.routed(PointerPhase::Down, canvas, false),
+            GalleryPointer {
+                outcome: None,
+                dismissed: true
+            }
+        );
+        assert_eq!(
+            rig.routed(PointerPhase::Down, canvas, false),
+            GalleryPointer::default(),
+            "nothing left to dismiss"
+        );
+        assert_eq!(
+            rig.focus.focused(),
+            Some(rig.g().menu_button),
+            "focus from the dismissed menu goes back to its opener (critic C11)"
+        );
+    }
+
+    /// Red-team RT-1 / critic C4: a gallery press armed *before* a modal
+    /// opened must not activate on its release — it is cancelled and its
+    /// pressed look undone.
+    #[test]
+    fn a_release_while_a_modal_is_open_cancels_a_press_armed_before_it() {
+        let mut rig = GalleryRig::open();
+        let button = rig.g().button;
+        let at = rig.centre(button);
+        assert!(matches!(
+            rig.pointer(PointerPhase::Down, at),
+            Some(PointerOutcome::Pressed(id)) if id == button
+        ));
+        assert!(rig.button_pressed(button));
+        assert_eq!(
+            rig.routed(PointerPhase::Up, at, true).outcome,
+            Some(PointerOutcome::Cancelled(button))
+        );
+        assert!(!rig.button_pressed(button), "pressed look undone");
+        assert_eq!(rig.click.pressed(), None);
+        let checkbox = rig.centre(rig.g().checkbox);
+        rig.pointer(PointerPhase::Down, checkbox);
+        rig.routed(PointerPhase::Up, checkbox, true);
+        assert_eq!(
+            rig.checked(),
+            Some(accesskit::Toggled::False),
+            "not toggled"
+        );
+    }
+
+    /// Red-team RT-1 / critic C4: with a modal (the command palette) open,
+    /// a press on the gallery is not the gallery's — nothing is armed,
+    /// nothing light-dismissed.
+    #[test]
+    fn a_press_on_the_gallery_while_a_modal_is_open_is_not_routed() {
+        let mut rig = GalleryRig::open();
+        let at = rig.centre(rig.g().checkbox);
+        assert_eq!(
+            rig.routed(PointerPhase::Down, at, true),
+            GalleryPointer::default()
+        );
+        assert_eq!(rig.click.pressed(), None, "nothing armed");
+        assert_eq!(rig.pointer(PointerPhase::Up, at), None);
+        assert_eq!(rig.checked(), Some(accesskit::Toggled::False));
+    }
+
+    /// Critic C7: `Ctrl+Home` on a focused gallery slider is a shortcut,
+    /// not the slider's `Home` — it falls through untouched.
+    #[test]
+    fn a_ctrl_chord_on_a_focused_gallery_slider_falls_through() {
+        let mut rig = GalleryRig::open();
+        let slider = rig.g().slider;
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, slider) {
+            unreachable!("{err:?}");
+        }
+        let outcome = route_gallery_key(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &mut rig.gallery,
+            &rig.scales,
+            false,
+            false,
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            },
+            Key::Named(NamedKey::Home),
+        );
+        assert_eq!(outcome, Some(KeyOutcome::Ignored));
+        assert!(matches!(
+            rig.workspace.tree.payload(slider),
+            Some(aurora_widgets::widgets::WidgetKind::Slider(state)) if (state.value - 50.0).abs() < f64::EPSILON
+        ));
+    }
+
+    /// Critic C8/C9: the ring comes back for a navigation-capable key,
+    /// not for a modifier-only press or a shortcut chord — tested from a
+    /// *hidden* ring, so each case can fail.
+    #[test]
+    fn only_a_plain_or_shifted_key_shows_the_focus_ring() {
+        let mut rig = GalleryRig::open();
+        let button = rig.g().button;
+        if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, button) {
+            unreachable!("{err:?}");
+        }
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::none()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        };
+        for (key, modifiers, shows) in [
+            (None, Modifiers::none(), false),
+            (Some(Key::Character('z')), ctrl, false),
+            (Some(Key::Named(NamedKey::Tab)), ctrl, false),
+            (
+                Some(Key::Named(NamedKey::Home)),
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::none()
+                },
+                false,
+            ),
+            (
+                Some(Key::Named(NamedKey::End)),
+                Modifiers {
+                    meta: true,
+                    ..Modifiers::none()
+                },
+                false,
+            ),
+            (Some(Key::Named(NamedKey::Tab)), shift, true),
+            (
+                Some(Key::Named(NamedKey::ArrowDown)),
+                Modifiers::none(),
+                true,
+            ),
+            (Some(Key::Character('b')), Modifiers::none(), true),
+        ] {
+            rig.focus.note_input(
+                &mut rig.workspace.tree,
+                aurora_widgets::FocusOrigin::Pointer,
+            );
+            assert!(!rig.focus.focus_visible(), "starts hidden");
+            assert_eq!(key_shows_focus_ring(key.as_ref(), modifiers), shows);
+            if key_shows_focus_ring(key.as_ref(), modifiers) {
+                rig.focus.note_input(
+                    &mut rig.workspace.tree,
+                    aurora_widgets::FocusOrigin::Keyboard,
+                );
+            }
+            assert_eq!(rig.focus.focus_visible(), shows, "{key:?} {modifiers:?}");
+        }
     }
 }

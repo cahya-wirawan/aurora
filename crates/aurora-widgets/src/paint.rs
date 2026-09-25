@@ -1311,7 +1311,7 @@ fn paint_scrollbar(
 /// [`paint_scrollbar`] for the proportional-length and non-finite rules.
 /// Shared by it and the focus ring, so the ring always circles the thumb
 /// actually drawn.
-fn scrollbar_thumb_rect(state: &ScrollbarState, bounds: Rect) -> (f32, f32, f32, f32) {
+pub(crate) fn scrollbar_thumb_rect(state: &ScrollbarState, bounds: Rect) -> (f32, f32, f32, f32) {
     let left = bounds.x as f32;
     let top = bounds.y as f32;
     let width = bounds.width as f32;

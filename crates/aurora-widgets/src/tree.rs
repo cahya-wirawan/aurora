@@ -551,6 +551,26 @@ impl<W> WidgetTree<W> {
         self.nodes.get(&id).and_then(|node| node.parent)
     }
 
+    /// Whether `id` is `ancestor` or lies anywhere below it, walking
+    /// [`Self::parent`] upward. A popover (`PaintLayer::Popover`) is
+    /// still an ordinary child of whatever it was inserted under, so a
+    /// menu or dropdown list is "within" its owner here even though it
+    /// paints and hit-tests above everything else. `false` for an `id`
+    /// that doesn't exist (unless it *is* `ancestor`, which is then
+    /// compared by value alone). Moved down from `aurora-app` in
+    /// 0.130.0 so `aurora-ui`'s gallery panel can share it.
+    #[must_use]
+    pub fn is_within(&self, ancestor: WidgetId, id: WidgetId) -> bool {
+        let mut current = Some(id);
+        while let Some(candidate) = current {
+            if candidate == ancestor {
+                return true;
+            }
+            current = self.parent(candidate);
+        }
+        false
+    }
+
     /// `None` both when `id` doesn't exist and when it exists but has no
     /// children — callers that need to tell those apart should check
     /// [`Self::contains`] first, matching `aurora_doc::LayerTree`'s own

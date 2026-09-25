@@ -3482,6 +3482,107 @@ check licenses` clean with the new `toml` dependency.
   `AURORA_REQUIRE_GPU=1` (RTX 3090, Vulkan); doctests, strict
   `cargo doc` and `check_contrast.py` (all five themes) clean.
 
+  **Widget Gallery panel, round 1, landed 2026-09-25 (0.130.0).** The
+  toolkit's widgets could only be exercised in headless tests; now a
+  live instance of every interactive one can be clicked and keyed
+  through in the real app. Three pieces. **(1) `aurora_widgets::pointer`
+  (new):** click-level pointer routing (`ClickTracker`, `handle_pointer`)
+  and focused-widget key routing (`handle_widget_key`) for the whole
+  vocabulary. No new mutation logic: every change is a synthesized
+  `ActionRequest` through `handle_action` (the AT gate), or — for the
+  three inputs it has no words for — the widget's own mutator
+  (`set_saturation_value_from_point`/`set_hue_from_point`,
+  `select_curve_point`/`add_curve_point_from_point`, and a new
+  `commit_dropdown_row` that runs the keyboard's own `Enter` transition,
+  plus `dropdown_of_row`). A click is `Down` then `Up` over the same
+  widget (an `Up` elsewhere cancels and un-presses); activation widgets
+  act on `Up`, value widgets (slider, scrollbar, picker, curve editor)
+  on `Down`. Tree-row selection is the gallery owner's policy, applied on
+  `Activated` (see G3). `WidgetTree::is_within`
+  moved down from `aurora-app` (pure refactor). **(2)
+  `aurora_ui::gallery_panel` (new):** `insert_gallery_panel` builds a
+  fixed-width, two-column panel as the workspace root's last child
+  (right of the dock rail; the canvas narrows while it is open) —
+  button (owning a `Tooltip`, created but never shown), checkbox,
+  slider, text field, scrollbar, swatch, dropdown, tab bar, an "Open
+  menu" button, a three-row tree view, colour picker and curve editor.
+  Sizes derive from `row_height(scales)` and spacing tokens only
+  (`GALLERY_EDITOR_ROWS = 8`, `GALLERY_TREE_ROWS = 3` are row counts);
+  `remove_gallery_panel` takes the whole subtree out, so a closed
+  gallery leaves the tree byte-for-byte the workspace as built.
+  `apply_gallery_outcome` opens the demo menu below its button and
+  hands focus back on activate/`Escape`; `gallery_light_dismiss`
+  closes the menu or dropdown list on a press outside them. **(3)
+  `aurora-app`:** a `Toggle Widget Gallery` command (palette, and the
+  macOS View menu), `toggle_gallery`/`route_gallery_pointer`/
+  `route_gallery_key` free functions, a gallery press routed after the
+  modal dialog and before the Layers rows and canvas, gallery keys after
+  the dialog and palette and before the shortcut registry (an `Ignored`
+  key falls through, so `Tab` still moves focus), and app-wide
+  `note_input` — any pointer press hides the focus ring, any key shows
+  it. Tests: +21 `aurora-widgets` (pointer 19, dropdown 2), +6
+  `aurora-ui`, +8 `aurora-app`. **Disclosed, not done (0.131.0):** no
+  drags or pointer capture (a slider set on `Down` does not follow the
+  pointer), no hover so the tooltip never shows, no text-field caret or
+  typing (letters typed with the gallery's text field focused still fire
+  single-key tool shortcuts), tree rows expand/collapse from the
+  keyboard only, and the slider's pointer mapping spans the widget's
+  whole bounds, not the thumb-inset track (the scrollbar maps to its
+  thumb's centre, G5). No text is drawn
+  anywhere in this toolkit, so every gallery label is blank on screen.
+  Below the gallery's content height (422 logical px with the default
+  scales — under `MIN_WINDOW_HEIGHT`, so unreachable at default scales)
+  the tree rows clip and cannot be clicked; nothing scrolls. At the
+  640 px minimum window width the canvas area is left very narrow while
+  the gallery is open. **Needs a human:** open it on real hardware and
+  click/key through every widget (hit accuracy on Retina/HiDPI, feel,
+  and that every widget paints where it hit-tests); a green run is not
+  that evidence.
+
+  **Review revision (still 0.130.0, not a separate version).** A critic
+  BLOCK and a 17,657-event red-team fuzz (no crash, no leak) fed thirteen
+  fixes. **G1**: an assistive technology's action on a gallery widget now
+  reaches `apply_gallery_outcome` — `AccessibilityContext` carries the
+  gallery, so an AT `Click` on "Open menu" opens the menu, an AT menu-item
+  `Click` hands focus back, and an AT row `Click` single-selects
+  (`an_at_click_on_the_gallery_menu_button_opens_the_menu`,
+  `an_at_click_on_a_gallery_tree_row_single_selects_it`). **G2**:
+  `route_gallery_pointer` returns a `GalleryPointer { outcome, dismissed }`
+  and the `App` wrapper relayouts, re-announces and redraws on a light
+  dismiss even when the press goes on to the canvas. **G4**: a dialog or
+  the command palette open means a gallery `Down` is not routed at all,
+  and an `Up` releasing a press armed before the modal opened is
+  `Cancelled` with its pressed look undone. **G3**: single selection
+  moved out of the generic `aurora-widgets` pointer router into the
+  gallery's own `apply_gallery_outcome` (on `Activated`, so only after a
+  `Click` that succeeded, shared by pointer/keyboard/AT), and it now
+  deselects a *disabled* selected row too (briefly re-enabling it, since
+  `set_tree_item_selected` refuses disabled rows); `pointer.rs`'s "no new
+  mutation logic" doc claim is accurate again. **G5**: a slider maps over
+  `width - 1` and a scrollbar maps the pointer to the thumb's centre using
+  the painter's own `page_size`-proportional thumb, so the last hittable
+  pixel reaches `max`. **G6**: Shift is tested as the curve editor's coarse
+  step. **G7**: `handle_widget_key` ignores any `Ctrl`/`Alt`/`Meta` chord.
+  **G8**: the app shows the focus ring only for a translated key with no
+  `Ctrl`/`Alt`/`Meta` (`key_shows_focus_ring`), tested from a hidden ring;
+  the checkbox "hides the ring" test now starts from a visible one.
+  **G9**: `remove_gallery_panel` always removes the panel root, then
+  reports a tooltip-detach error. **G10**: light-dismissing the menu
+  hands focus inside it back to "Open menu". **G11**: `tree_rows` child
+  handles are documented as valid only while the parent is expanded;
+  re-expanding rebuilds the two children under new ids and
+  `apply_gallery_outcome` writes them back. **G12**: the gallery's minimum
+  window height is pinned at 422 logical px, and a 640 x 480 layout test
+  asserts the gallery stays inside the window — **disclosed, not fixed**:
+  at that size the canvas is 18 px wide, because the gallery does not
+  shrink. **G13**: a gallery `Down` commits any live drag (e.g. a
+  middle-button pan) before re-running layout — no headless test, since
+  it lives in the `App` wrapper that needs a window. Measured after the revision: full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,291 passed, 0 failed, 45 ignored, 0
+  skipped; doctests and strict rustdoc clean; the G4 `Up`-guard
+  mutation was re-run by name and killed.
+
+
   - [ ] **Dropdown options through AT actions.** Option rows declare no
     `Click` and a closed dropdown declares no `Increment`/`Decrement`, so
     a screen-reader user can open a dropdown but not choose an option.
@@ -28205,6 +28306,18 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-25 (0.130.0) — in-app Widget Gallery, round 1.**
+`Toggle Widget Gallery` (command palette, `Ctrl+Shift+P`; macOS View
+menu) docks a panel with one live instance of every interactive widget
+right of the rail; `aurora_widgets::pointer` routes clicks and keys to
+them through `handle_action` and the widgets' own mutators. Full account
+and disclosures: M1.7's gallery-panel entry. **Needs a human:** click
+and key through every widget on real hardware. **Suggested next
+(0.131.0):** drags with pointer capture (slider, picker, curve point,
+scrollbar), the tooltip's hover timer, and text-field caret editing and
+typing (which also stops single-key tool shortcuts firing while a text
+field is focused).
 
 **Addendum 2026-09-25 (0.129.0) — keyboard focus ring landed.**
 `FocusManager` tracks focus-visible modality (`FocusOrigin`),

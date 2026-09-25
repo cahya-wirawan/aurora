@@ -181,9 +181,9 @@ pub use curve_editor::{
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
 pub use dropdown::{
-    DropdownKey, DropdownOutcome, DropdownState, dropdown_state, handle_dropdown_key,
-    insert_dropdown, set_dropdown_disabled, set_dropdown_open, set_dropdown_selected,
-    toggle_dropdown,
+    DropdownKey, DropdownOutcome, DropdownState, commit_dropdown_row, dropdown_of_row,
+    dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
+    set_dropdown_selected, toggle_dropdown,
 };
 pub use list_row::ListRowState;
 pub use menu::{
