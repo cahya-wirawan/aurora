@@ -110,8 +110,6 @@ use aurora_vector::{
     bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
 };
 
-use taffy::Overflow;
-
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
@@ -626,50 +624,30 @@ pub fn paint_widget(
 /// already refuses to descend into a parent whose bounds exclude the
 /// point: a row fully past the bottom of its panel is now both
 /// unreachable *and* invisible, rather than unreachable but drawn.
+///
+/// **Popovers (0.127.0).** A widget inside a popover
+/// ([`WidgetTree::popover_root_of`] is `Some`) is clipped only by
+/// clipping ancestors *up to and including* its popover root — so a
+/// dropdown list escapes the panel body that contains its control,
+/// while the popover's own `Overflow::Hidden` still clips its rows —
+/// and then clamped to the tree root's own bounds (the window), the
+/// same window gate `WidgetTree::hit_test` applies. A consequence: a
+/// popover painted before any `compute_layout`/`set_bounds` has run is
+/// clamped to a still-zero root and paints nothing.
+///
+/// **A popover whose owner is wholly clipped away paints nothing**
+/// (0.127.0 review): its owner (the popover root's parent) is run
+/// through this same clip, and if nothing of it is left the whole
+/// popover subtree clips to `None` — as it did before popovers existed —
+/// rather than floating with no visible owner. The rule lives in
+/// `WidgetTree::visible_rect` so `WidgetTree::hit_test` skips exactly
+/// the popovers this refuses to paint.
 fn clip_to_clipping_ancestors(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
     bounds: Rect,
 ) -> Option<Rect> {
-    let mut left = bounds.x;
-    let mut top = bounds.y;
-    let mut right = bounds.x.saturating_add(i64::from(bounds.width));
-    let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
-    let mut clipped = false;
-    let mut current = tree.parent(id);
-    while let Some(ancestor) = current {
-        if let (Some(style), Some(clip)) = (tree.style(ancestor), tree.bounds(ancestor)) {
-            if style.overflow.x != Overflow::Visible {
-                clipped = true;
-                left = left.max(clip.x);
-                right = right.min(clip.x.saturating_add(i64::from(clip.width)));
-            }
-            if style.overflow.y != Overflow::Visible {
-                clipped = true;
-                top = top.max(clip.y);
-                bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
-            }
-        }
-        current = tree.parent(ancestor);
-    }
-    // Returned untouched, not merely unchanged, when no ancestor clips
-    // at all: a widget whose bounds are still the default zero rect
-    // (every test in this module that paints without a
-    // `compute_layout`/`set_bounds` first) must keep painting the
-    // degenerate shape it always did, rather than being turned into an
-    // `Ok(vec![])` by an empty intersection with itself.
-    if !clipped {
-        return Some(bounds);
-    }
-    if right <= left || bottom <= top {
-        return None;
-    }
-    Some(Rect {
-        x: left,
-        y: top,
-        width: u32::try_from(right - left).ok()?,
-        height: u32::try_from(bottom - top).ok()?,
-    })
+    tree.visible_rect(id, bounds)
 }
 
 fn paint_button(
@@ -3434,6 +3412,232 @@ mod tests {
             top >= 0.0 && bottom <= 13.0,
             "a 21px row in a 13px clipping body must paint only inside it: {top} -> {bottom}"
         );
+    }
+
+    // -- popover layer (0.127.0) --
+
+    /// A tree whose root is a 200x200 window, every widget placed with
+    /// `set_bounds` so each test states its geometry exactly.
+    fn window() -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        place(&mut tree, root, 0, 0, 200, 200);
+        (tree, root)
+    }
+
+    fn place(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, x: i64, y: i64, w: u32, h: u32) {
+        let rect = Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        if let Err(err) = tree.set_bounds(id, rect) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    fn selected_row(tree: &mut WidgetTree<WidgetKind>, parent: WidgetId) -> WidgetId {
+        match tree.insert(
+            parent,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::ListItem),
+            WidgetKind::ListRow(ListRowState {
+                selected: true,
+                disabled: false,
+            }),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn popover(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) {
+        if let Err(err) = tree.set_layer(id, crate::PaintLayer::Popover) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    /// A popover inside a panel body that hides its overflow paints its
+    /// full bounds: no ancestor outside the popover clips it.
+    #[test]
+    fn a_popover_inside_a_clipping_body_paints_its_full_bounds() {
+        let (mut tree, root) = window();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = selected_row(&mut tree, body);
+        place(&mut tree, body, 0, 0, 200, 13);
+        place(&mut tree, row, 0, 0, 200, 21);
+        let theme = dark_theme();
+        let scales = scales();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 13.0).abs() < 0.5,
+            "precondition: as a base widget the row is clipped by the body: {top} -> {bottom}"
+        );
+        popover(&mut tree, row);
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 21.0).abs() < 0.5,
+            "a popover escapes the body: {top} -> {bottom}"
+        );
+        let _ = root;
+    }
+
+    /// The clip walk stops *at* the popover root, not before it: a
+    /// popover root that hides its own overflow still clips its rows,
+    /// while the shorter clipping body around the popover does not.
+    #[test]
+    fn a_popovers_own_overflow_still_clips_its_descendants() {
+        let (mut tree, root) = window();
+        let Ok(outer) = insert_container(&mut tree, root, clipping_body(5.0)) else {
+            unreachable!("the root was just built");
+        };
+        let Ok(list) = insert_container(&mut tree, outer, clipping_body(13.0)) else {
+            unreachable!("outer was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, outer, 0, 0, 200, 5);
+        place(&mut tree, list, 0, 0, 200, 13);
+        place(&mut tree, row, 0, 0, 200, 21);
+        popover(&mut tree, list);
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top.abs() < 0.5 && (bottom - 13.0).abs() < 0.5,
+            "clipped by the popover's own 13px, not the outer 5px or the row's 21px: \
+             {top} -> {bottom}"
+        );
+    }
+
+    /// A popover hanging past the window is clamped to the root's bounds,
+    /// and one wholly outside it paints nothing.
+    #[test]
+    fn a_popover_past_the_window_is_clamped_to_the_root() {
+        let (mut tree, root) = window();
+        let row = selected_row(&mut tree, root);
+        place(&mut tree, row, 10, 190, 50, 21);
+        popover(&mut tree, row);
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (top - 190.0).abs() < 0.5 && (bottom - 200.0).abs() < 0.5,
+            "clamped to the window's 200px: {top} -> {bottom}"
+        );
+        place(&mut tree, row, 10, 205, 50, 21);
+        let paints = match paint_widget(&tree, row, &dark_theme(), &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints.is_empty(), "wholly off-window: {paints:?}");
+    }
+
+    /// The disclosed consequence of the window clamp: a popover painted
+    /// before anything has laid out the (still zero-sized) root paints
+    /// nothing, where a base widget keeps its old degenerate shape.
+    #[test]
+    fn a_popover_before_any_layout_paints_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let row = selected_row(&mut tree, root);
+        popover(&mut tree, row);
+        let paints = match paint_widget(&tree, row, &dark_theme(), &scales(), 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints.is_empty(), "{paints:?}");
+    }
+
+    /// The window clamp covers a popover's *descendants*, not only its
+    /// root: a row inside a popover (whose own overflow is `Visible`)
+    /// crossing the window's right and bottom edges is clamped to them.
+    /// Clamping only the popover root survived every other test.
+    #[test]
+    fn a_popover_descendant_past_the_window_is_clamped_to_the_root() {
+        let (mut tree, root) = window();
+        let Ok(list) = insert_container(&mut tree, root, taffy::Style::default()) else {
+            unreachable!("the root was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, list, 100, 100, 150, 150);
+        place(&mut tree, row, 180, 190, 30, 30);
+        popover(&mut tree, list);
+        let full = Rect {
+            x: 180,
+            y: 190,
+            width: 30,
+            height: 30,
+        };
+        assert_eq!(
+            super::clip_to_clipping_ancestors(&tree, row, full),
+            Some(Rect {
+                x: 180,
+                y: 190,
+                width: 20,
+                height: 10,
+            })
+        );
+        let (mesh, _) = single_paint(&tree, row, &dark_theme(), &scales(), 1.0);
+        let (left, top, right, bottom) = bbox(&mesh);
+        assert!(
+            (left - 180.0).abs() < 0.5
+                && (top - 190.0).abs() < 0.5
+                && (right - 200.0).abs() < 0.5
+                && (bottom - 200.0).abs() < 0.5,
+            "clamped to the 200x200 window: {left},{top} -> {right},{bottom}"
+        );
+    }
+
+    /// A popover whose owner is wholly clipped away (scrolled or
+    /// collapsed out of a clipping panel body) paints nothing at all and
+    /// is not hit — the base widget beneath it is — while a partly
+    /// visible owner keeps its popover whole.
+    #[test]
+    fn a_popover_whose_owner_is_clipped_away_neither_paints_nor_hits() {
+        let (mut tree, root) = window();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(20.0)) else {
+            unreachable!("the root was just built");
+        };
+        let under = selected_row(&mut tree, root);
+        let owner = selected_row(&mut tree, body);
+        let Ok(list) = insert_container(&mut tree, owner, taffy::Style::default()) else {
+            unreachable!("owner was just built");
+        };
+        let row = selected_row(&mut tree, list);
+        place(&mut tree, body, 0, 0, 200, 20);
+        place(&mut tree, under, 0, 60, 200, 100);
+        place(&mut tree, owner, 0, 40, 200, 21);
+        place(&mut tree, list, 0, 60, 200, 50);
+        place(&mut tree, row, 0, 60, 200, 21);
+        popover(&mut tree, list);
+        let theme = dark_theme();
+        let scales = scales();
+        let popover_ops = |tree: &WidgetTree<WidgetKind>| -> usize {
+            tree.paint_order()
+                .into_iter()
+                .filter(|&id| tree.popover_root_of(id) == Some(list))
+                .map(|id| match paint_widget(tree, id, &theme, &scales, 1.0) {
+                    Ok(paints) => paints.len(),
+                    Err(err) => unreachable!("{err:?}"),
+                })
+                .sum()
+        };
+        assert_eq!(popover_ops(&tree), 0, "the owner is wholly clipped away");
+        assert_eq!(tree.hit_test((5.0, 65.0)), Some(under));
+        assert_eq!(crate::hit_test(&tree, 5.0, 65.0), Some(under));
+        // Partly visible (10..31 against the body's 0..20): the popover
+        // paints its row whole and is hit again.
+        place(&mut tree, owner, 0, 10, 200, 21);
+        assert!(popover_ops(&tree) > 0, "a partly visible owner keeps it");
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (top - 60.0).abs() < 0.5 && (bottom - 81.0).abs() < 0.5,
+            "the popover's row is not clipped by the body: {top} -> {bottom}"
+        );
+        assert_eq!(tree.hit_test((5.0, 65.0)), Some(row));
+        assert_eq!(crate::hit_test(&tree, 5.0, 65.0), Some(row));
     }
 
     /// The same clip, taken to its end: a row laid out entirely past the

@@ -20,6 +20,12 @@ pub enum WidgetError {
     /// it would leave the tree without one rather than a smaller tree.
     #[error("cannot remove {0:?}: it is this tree's root")]
     CannotRemoveRoot(WidgetId),
+    /// [`crate::WidgetTree::set_layer`] was called on a tree's own root.
+    /// The root is the window itself: there is nothing beneath it for it
+    /// to float above, and making it a popover root would detach the
+    /// base layer's own paint/hit-test pass from it.
+    #[error("cannot change the paint layer of {0:?}: it is this tree's root")]
+    CannotLayerRoot(WidgetId),
     /// [`crate::FocusManager::focus`] was asked to focus a widget whose
     /// own `accesskit::Node` doesn't declare `Action::Focus` — reusing
     /// `accesskit`'s own vocabulary for "focusable" rather than a second,

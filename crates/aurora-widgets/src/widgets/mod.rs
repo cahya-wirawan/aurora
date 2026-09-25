@@ -54,12 +54,12 @@
 //! ([`insert_dropdown`]/[`handle_dropdown_key`]) is a select-only combo
 //! box: a real `Role::ComboBox` whose open list is a real
 //! `Role::ListBox` child holding [`WidgetKind::ListRow`] options, removed on
-//! close, driven by an exhaustively tested key table — but painted in
-//! ordinary tree order with **no popover layering** (a later sibling
-//! paints over the open list), with options **unreachable by
-//! hit-testing** (they lie outside the control's bounds), and with no
-//! text or `▾` glyph (`dropdown.rs`'s own doc comment has the full
-//! list). `TabBar` ([`insert_tab_bar`]/[`handle_tab_bar_key`]) is a
+//! close, driven by an exhaustively tested key table, the open list a
+//! [`crate::PaintLayer::Popover`] root (0.127.0: painted above every
+//! base-layer widget, unclipped by the control's ancestors, its options
+//! reachable by hit-testing, clamped to the window but never flipped) —
+//! with no text or `▾` glyph (`dropdown.rs`'s own doc comment has the
+//! full list). `TabBar` ([`insert_tab_bar`]/[`handle_tab_bar_key`]) is a
 //! real `Role::TabList` holding one real `Role::Tab` per tab, with
 //! automatic activation, wrapping arrow keys, `Home`/`End`, and roving
 //! focus (only the selected tab is focusable) — the bar only, no tab
@@ -70,15 +70,16 @@
 //! inserts a real `Role::Tooltip` child under its owner while shown and
 //! removes it when hidden — the caller supplies every `Instant` (no clock
 //! in this crate), it never writes the owner's own node, and like the
-//! dropdown's list it paints in ordinary tree order with **no popover
-//! layering**, no viewport flip, and no text measurement
+//! dropdown's list it is a popover root (painted and hit-tested above
+//! the base layer, clamped to the window) with no viewport flip and no
+//! text measurement
 //! (`tooltip.rs`'s own doc comment has the full list). `Menu`
 //! ([`open_menu`]/[`handle_menu_key`]) is a keyboard-driven popup menu: a
 //! real `Role::Menu` holding focus, its highlighted `Role::MenuItem` its
 //! `active_descendant`, with separators, disabled items skipped, wrapping
 //! arrows, `Home`/`End`, and its whole subtree removed on activate or
-//! cancel — again with **no popover layering**, no pointer support, no
-//! submenus and no text (`menu.rs`'s own doc comment has the full list).
+//! cancel — a popover root like the dropdown's list, with no pointer
+//! routing, no submenus and no text (`menu.rs`'s own doc comment has the full list).
 //! The colour picker ([`insert_color_picker`]/[`handle_color_picker_key`])
 //! is an HSV saturation/value square, a hue strip and a read-only
 //! preview swatch — the first widget to paint a vertex-coloured
@@ -96,9 +97,8 @@
 //! keyboard and the pointer (geometric hit-testing, no pointer capture —
 //! a drag is the caller calling a `*_from_point` function per move), with
 //! no histogram, no channel selector and no text (`curve_editor.rs`'s own
-//! doc comment has the full list). The rest — a number field — needs no
-//! popover layering but still needs number semantics that don't exist
-//! yet, and is deliberately left open rather than stubbed out
+//! doc comment has the full list). The rest — a number field — still
+//! needs number semantics that don't exist yet, and is deliberately left open rather than stubbed out
 //! half-built.
 //!
 //! **Every module here is a model, not a painter** — and that is a
@@ -288,8 +288,8 @@ pub enum WidgetKind {
     /// `border.focus` while open (`paint::paint_dropdown`). See
     /// `dropdown.rs`'s own module doc comment for the transition table,
     /// the accessibility vocabulary and which adapters read it, and what
-    /// it deliberately does not do (no popover layering, options
-    /// unreachable by hit-testing).
+    /// it deliberately does not do (no viewport flip, no light-dismiss;
+    /// its open list is a popover root since 0.127.0).
     Dropdown(DropdownState),
     /// An open dropdown's own list — the `Role::ListBox` child
     /// `dropdown.rs` inserts on open and removes on close, holding one
@@ -329,7 +329,8 @@ pub enum WidgetKind {
     /// unconditional `border.default` outline (`paint::paint_menu`). See
     /// `menu.rs`'s own module doc comment for the key table, the
     /// `active_descendant` focus model, and what it deliberately does not
-    /// do (no popover layer, no pointer, no submenus).
+    /// do (no pointer routing, no submenus; a popover root since
+    /// 0.127.0).
     Menu(MenuState),
     /// A separator between groups of a [`WidgetKind::Menu`]'s items —
     /// `Role::Splitter`, created only by `menu.rs`, never on its own. No

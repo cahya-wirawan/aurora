@@ -22,23 +22,15 @@ use crate::tree::{WidgetId, WidgetTree};
 /// `None` only when `(x, y)` falls outside the tree's own root bounds
 /// (e.g. layout hasn't run yet, so the root is still zero-sized, or the
 /// point is genuinely off-window).
+///
+/// Popover roots ([`crate::PaintLayer::Popover`]) are tried first,
+/// topmost first, each gated only by its own bounds — this delegates to
+/// the same single traversal [`WidgetTree::hit_test`] uses, with this
+/// function's own `f64` containment predicate, so the two can never
+/// disagree about layering. See that method for the full rule.
 #[must_use]
 pub fn hit_test<W>(tree: &WidgetTree<W>, x: f64, y: f64) -> Option<WidgetId> {
-    hit_test_node(tree, tree.root(), x, y)
-}
-
-fn hit_test_node<W>(tree: &WidgetTree<W>, id: WidgetId, x: f64, y: f64) -> Option<WidgetId> {
-    let bounds = tree.bounds(id)?;
-    if !contains(bounds, x, y) {
-        return None;
-    }
-    let children = tree.children(id)?;
-    for &child in children.iter().rev() {
-        if let Some(hit) = hit_test_node(tree, child, x, y) {
-            return Some(hit);
-        }
-    }
-    Some(id)
+    tree.hit_test_by(|bounds| contains(bounds, x, y))
 }
 
 fn contains(bounds: Rect, x: f64, y: f64) -> bool {
@@ -565,5 +557,98 @@ mod tests {
         }
         assert!(!manager.validate(&tree));
         assert_eq!(manager.focused(), Some(a));
+    }
+
+    // -- popover layer (0.127.0) --
+
+    /// A focusable owner whose non-focusable popover child hangs wholly
+    /// outside it, over a later base sibling.
+    fn popover_scene() -> (WidgetTree<&'static str>, [crate::WidgetId; 4]) {
+        let column = Style {
+            flex_direction: taffy::FlexDirection::Column,
+            ..sized(100.0, 100.0)
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), column, "root");
+        let owner = match tree.insert(root, sized(100.0, 20.0), focusable("owner"), "owner") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let below = match tree.insert(root, sized(100.0, 40.0), focusable("below"), "below") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let list = match tree.insert(owner, Style::default(), label("list"), "list") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(100.0, 100.0);
+        let place = aurora_core::Rect {
+            x: 10,
+            y: 20,
+            width: 50,
+            height: 90,
+        };
+        if let Err(err) = tree.set_bounds(list, place) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_layer(list, crate::PaintLayer::Popover) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.bounds(below),
+            Some(aurora_core::Rect {
+                x: 0,
+                y: 20,
+                width: 100,
+                height: 40
+            }),
+            "the base sibling sits under the popover"
+        );
+        (tree, [root, owner, below, list])
+    }
+
+    #[test]
+    fn both_hit_testers_agree_everywhere_over_a_popover_scene() {
+        let (tree, [root, owner, below, list]) = popover_scene();
+        let mut seen = std::collections::HashSet::new();
+        // Every half-pixel step: pixel centres *and* integer coordinates,
+        // which land exactly on every widget's edges, where the two
+        // testers' half-open containment rules must still agree.
+        for yi in -8..=217 {
+            for xi in -8..=217 {
+                let (x, y) = (f64::from(xi) * 0.5, f64::from(yi) * 0.5);
+                #[allow(clippy::cast_possible_truncation)]
+                let tree_hit = tree.hit_test((x as f32, y as f32));
+                assert_eq!(hit_test(&tree, x, y), tree_hit, "at ({x}, {y})");
+                seen.insert(tree_hit);
+            }
+        }
+        assert_eq!(hit_test(&tree, 10.0, 20.0), Some(list), "the list's corner");
+        assert_eq!(
+            hit_test(&tree, 60.0, 30.0),
+            Some(below),
+            "the list's right edge is half-open"
+        );
+        assert_eq!(hit_test(&tree, 30.0, 100.0), None, "the window's edge");
+        for expected in [None, Some(root), Some(owner), Some(below), Some(list)] {
+            assert!(seen.contains(&expected), "{expected:?} never hit");
+        }
+        assert_eq!(
+            hit_test(&tree, 30.5, 50.5),
+            Some(list),
+            "over the base sibling"
+        );
+        assert_eq!(hit_test(&tree, 30.5, 99.5), Some(list), "past the owner");
+        assert_eq!(hit_test(&tree, 30.5, 100.5), None, "past the window");
+    }
+
+    #[test]
+    fn focus_at_over_a_popover_bubbles_to_its_owner() {
+        let (mut tree, [_, owner, below, _]) = popover_scene();
+        let mut manager = FocusManager::new();
+        assert_eq!(manager.focus_at(&mut tree, 30.0, 50.0), Some(owner));
+        assert_eq!(manager.focus_at(&mut tree, 80.0, 50.0), Some(below));
+        // Tab order stays structural: the popover changes nothing there.
+        assert_eq!(manager.focus_next(&mut tree), Some(owner));
     }
 }

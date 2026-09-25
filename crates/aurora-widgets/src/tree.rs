@@ -2,11 +2,11 @@
 //! a required accessibility node per widget (invariant §7.3.9). PLAN.md
 //! M1.7's first deliverable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use accesskit::{Node as AccessibilityNode, NodeId, Tree, TreeId, TreeUpdate};
 use aurora_core::Rect;
-use taffy::{AvailableSpace, Size as LayoutSize, Style as LayoutStyle, TaffyTree};
+use taffy::{AvailableSpace, Overflow, Size as LayoutSize, Style as LayoutStyle, TaffyTree};
 
 use crate::error::WidgetError;
 
@@ -26,6 +26,58 @@ const UNLAID_OUT: Rect = Rect {
     width: 0,
     height: 0,
 };
+
+/// Which paint layer a widget's subtree belongs to — the popover
+/// (overlay) layer 0.127.0 added, so a dropdown's open list, a menu or a
+/// tooltip paints and hit-tests *above* every ordinary widget instead of
+/// in its own structural position among its siblings.
+///
+/// Set per widget with [`WidgetTree::set_layer`]; the flag is *not*
+/// copied to descendants. A widget's effective layer is
+/// [`PaintLayer::Popover`] if *any* ancestor-or-self's own flag is
+/// `Popover`, else [`PaintLayer::Base`]: a `Base` flag on a widget
+/// inside a popover has no effect. A non-root widget whose **own** flag
+/// is `Popover` is a *popover root* ([`WidgetTree::popover_root_of`]),
+/// and its parent is the popover's *owner*. The accessibility tree and
+/// `Tab` order are unaffected — both stay structural, so a popover is
+/// still announced and focused as its owner's child.
+///
+/// **A popover follows its owner out of sight** (0.127.0 review): when
+/// the owner is wholly clipped away by its own clipping ancestors (a
+/// control scrolled or collapsed out of a panel body that hides its
+/// overflow), its whole popover subtree neither paints nor hit-tests —
+/// exactly what the pre-0.127.0 structural clip did — rather than
+/// floating with no visible owner. A partly visible owner keeps its
+/// popover whole. **Damage gap, disclosed:** no damage is raised when a
+/// popover hides or reappears *solely* because its owner's clipping
+/// ancestors changed (a panel collapsing while the owner's own bounds
+/// stay put) — only the ancestor's old and new bounds are dirtied, so a
+/// part of the popover outside them repaints only if the popover's own
+/// bounds also change. Harmless while `aurora-app` repaints every frame
+/// in full (it never consumes `take_damage`).
+///
+/// **Contract: a popover root must contain its descendants.** Hit-testing
+/// a popover descends only through widgets whose own bounds contain the
+/// point, starting at the popover root, while painting clips a
+/// popover's descendants only by the popover root's own overflow (and
+/// the window). So a descendant overflowing a popover root whose
+/// overflow is `Visible` would paint on top of the base layer while
+/// clicks on the overhang fall through to the widget beneath it. The
+/// three shipped popovers (a dropdown's open list, a menu, a tooltip)
+/// all lay their children out inside their own bounds, pinned by a
+/// test; a new popover must too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PaintLayer {
+    /// Painted and hit-tested in the widget's own structural position.
+    #[default]
+    Base,
+    /// This widget roots a popover: its subtree is painted after every
+    /// [`PaintLayer::Base`] widget (and after every popover root created
+    /// before it), is not clipped by any ancestor outside the popover —
+    /// only by the tree root's own bounds (the window) — and is
+    /// hit-tested before everything painted beneath it.
+    Popover,
+}
 
 struct WidgetNode<W> {
     parent: Option<WidgetId>,
@@ -49,6 +101,9 @@ struct WidgetNode<W> {
     bounds: Rect,
     accessibility: AccessibilityNode,
     dirty: bool,
+    /// This widget's *own* paint-layer flag — see [`PaintLayer`] for how
+    /// the effective layer is derived from it.
+    layer: PaintLayer,
     payload: W,
 }
 
@@ -72,6 +127,13 @@ pub struct WidgetTree<W> {
     /// [`aurora_core::Rect::union`] accumulation idiom
     /// `aurora_tile::Tile::mark_dirty`/`take_dirty` already use.
     damage: Option<Rect>,
+    /// Every popover root (a non-root widget whose own flag is
+    /// [`PaintLayer::Popover`]), keyed by its raw id so iteration is
+    /// already [`Self::popover_roots`]' stacking order. Maintained by
+    /// [`Self::set_layer`] and [`Self::remove`] (the only two places a
+    /// flag or a node can change), so neither [`Self::paint_order`] nor a
+    /// per-hover [`Self::hit_test`] has to scan every node for it.
+    popovers: BTreeSet<u64>,
 }
 
 impl<W> WidgetTree<W> {
@@ -97,6 +159,7 @@ impl<W> WidgetTree<W> {
                 bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
+                layer: PaintLayer::Base,
                 payload,
             },
         );
@@ -106,6 +169,7 @@ impl<W> WidgetTree<W> {
                 root,
                 next_id: 1,
                 damage: None,
+                popovers: BTreeSet::new(),
             },
             root,
         )
@@ -134,14 +198,27 @@ impl<W> WidgetTree<W> {
     /// Every widget in this tree, in paint order: root first, then each
     /// child subtree (in [`Self::children`]'s own first-inserted-to-last
     /// order) before the next sibling's own — the same traversal
-    /// [`Self::hit_test`] already walks (in reverse, for "topmost wins"),
+    /// [`Self::hit_test`] already walks (in reverse, for "topmost wins",
+    /// apart from its popover pass — see below),
     /// exposed as a real method rather than requiring every caller that
     /// needs "every widget, correctly ordered" (a real per-frame paint
     /// pass, most notably) to reimplement tree descent themselves.
+    ///
+    /// **Popover roots are deferred** (0.127.0): the structural walk does
+    /// not descend into a child whose own [`PaintLayer`] is
+    /// [`PaintLayer::Popover`]; instead each popover root's subtree is
+    /// appended afterwards, in [`Self::popover_roots`]' stacking order
+    /// (creation order, bottom to top), by the same rule — so a popover
+    /// nested inside another popover is painted in its own turn, after
+    /// its container. Every widget still appears exactly once, and a tree
+    /// with no popover roots gets exactly the pre-0.127.0 order.
     #[must_use]
     pub fn paint_order(&self) -> Vec<WidgetId> {
         let mut order = Vec::with_capacity(self.nodes.len());
         self.collect_paint_order(self.root, &mut order);
+        for popover in self.popover_stack() {
+            self.collect_paint_order(popover, &mut order);
+        }
         order
     }
 
@@ -151,8 +228,208 @@ impl<W> WidgetTree<W> {
             return;
         };
         for &child in &node.children {
+            if self.layer(child) == Some(PaintLayer::Popover) {
+                continue;
+            }
             self.collect_paint_order(child, order);
         }
+    }
+
+    /// `id`'s *own* [`PaintLayer`] flag, as last set by
+    /// [`Self::set_layer`] (not the effective layer it inherits — see
+    /// [`Self::popover_root_of`] for that). `None` if `id` doesn't exist.
+    #[must_use]
+    pub fn layer(&self, id: WidgetId) -> Option<PaintLayer> {
+        self.nodes.get(&id).map(|node| node.layer)
+    }
+
+    /// Sets `id`'s own [`PaintLayer`] flag. Setting the flag it already
+    /// has is a no-op (no damage); a real change dirties the union of the
+    /// (non-empty) bounds of every widget in `id`'s subtree, since the whole subtree
+    /// now paints at a different depth (and, for a popover, unclipped by
+    /// its former clipping ancestors).
+    ///
+    /// Stacking between popover roots is by creation order, **not** by
+    /// when this was called — see [`Self::popover_roots`]. A popover root
+    /// must lay its descendants out inside its own bounds — see
+    /// [`PaintLayer`]'s contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+    /// [`WidgetError::CannotLayerRoot`] if `id` is this tree's root (the
+    /// root is the window: there is nothing beneath it to float above).
+    /// Nothing is changed when this happens.
+    pub fn set_layer(&mut self, id: WidgetId, layer: PaintLayer) -> Result<(), WidgetError> {
+        if id == self.root {
+            return Err(WidgetError::CannotLayerRoot(id));
+        }
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(WidgetError::UnknownWidget(id))?;
+        if node.layer == layer {
+            return Ok(());
+        }
+        node.layer = layer;
+        node.dirty = true;
+        match layer {
+            PaintLayer::Popover => self.popovers.insert(u64::from(id)),
+            PaintLayer::Base => self.popovers.remove(&u64::from(id)),
+        };
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            let Some(node) = self.nodes.get(&current) else {
+                continue;
+            };
+            let (bounds, children) = (node.bounds, node.children.clone());
+            // A widget with no area yet (not laid out) occupies no pixels;
+            // unioning its zero rect would only drag the damage region
+            // toward its origin.
+            if bounds.width > 0 && bounds.height > 0 {
+                self.mark_region_dirty(bounds);
+            }
+            stack.extend(children);
+        }
+        Ok(())
+    }
+
+    /// The nearest ancestor-or-self of `id` whose own flag is
+    /// [`PaintLayer::Popover`] — the popover `id` paints and hit-tests
+    /// as part of — or `None` if `id` is in the base layer (or doesn't
+    /// exist). The tree root is never a popover root.
+    #[must_use]
+    pub fn popover_root_of(&self, id: WidgetId) -> Option<WidgetId> {
+        let mut current = Some(id);
+        while let Some(candidate) = current {
+            if candidate == self.root {
+                return None;
+            }
+            let node = self.nodes.get(&candidate)?;
+            if node.layer == PaintLayer::Popover {
+                return Some(candidate);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// Every popover root in this tree (every non-root widget whose own
+    /// flag is [`PaintLayer::Popover`]), in stacking order, bottom to
+    /// top: ascending [`WidgetId`], i.e. creation order. So a popover
+    /// nested inside another always stacks above its container, and the
+    /// most recently *created* popover wins an overlap — which is why the
+    /// dropdown rebuilds its list on every open and the tooltip
+    /// re-inserts its node on every show. A widget created long ago and
+    /// flagged later stacks by its creation, not by the flagging.
+    #[must_use]
+    pub fn popover_roots(&self) -> Vec<WidgetId> {
+        self.popover_stack().collect()
+    }
+
+    /// [`Self::popover_roots`] without the allocation: iterates the
+    /// maintained set directly, bottom to top.
+    fn popover_stack(&self) -> impl DoubleEndedIterator<Item = WidgetId> + '_ {
+        self.popovers.iter().map(|&id| WidgetId::from(id))
+    }
+
+    /// Whether `popover`'s *owner* (its parent) is wholly clipped away,
+    /// by the same rule [`Self::visible_rect`] clips a widget's paint —
+    /// in which case the popover neither paints nor hit-tests (see
+    /// [`PaintLayer`]). Recursive through nested popovers: an owner that
+    /// itself sits inside a hidden popover is clipped away too. `false`
+    /// for a widget with no parent or unknown bounds. A zero-area owner
+    /// under any clipping ancestor counts as clipped away (its popover
+    /// is hidden); one with no clipping ancestor at all is left alone —
+    /// irrelevant for the shipped widgets, whose owners are laid-out
+    /// controls, but a future zero-size anchor inside a clipped panel
+    /// would lose its popover.
+    pub(crate) fn popover_owner_hidden(&self, popover: WidgetId) -> bool {
+        let Some(owner) = self.parent(popover) else {
+            return false;
+        };
+        let Some(owner_bounds) = self.bounds(owner) else {
+            return false;
+        };
+        self.visible_rect(owner, owner_bounds).is_none()
+    }
+
+    /// `bounds` (normally `id`'s own) intersected with every clipping
+    /// ancestor of `id` — the one clip rule both paint
+    /// (`paint::clip_to_clipping_ancestors`, which documents it in full)
+    /// and, through [`Self::popover_owner_hidden`], [`Self::hit_test`]
+    /// use, so the two cannot disagree about whether a popover's owner
+    /// is visible. `None` when nothing is left, or when `id` sits inside
+    /// a popover whose owner is wholly clipped away.
+    ///
+    /// A widget inside a popover is clipped only by clipping ancestors
+    /// up to and including its popover root, then clamped to the tree
+    /// root's own bounds (the window). `bounds` is returned untouched
+    /// when nothing clips it at all.
+    pub(crate) fn visible_rect(&self, id: WidgetId, bounds: Rect) -> Option<Rect> {
+        let popover = self.popover_root_of(id);
+        if popover.is_some_and(|popover| self.popover_owner_hidden(popover)) {
+            return None;
+        }
+        let mut left = bounds.x;
+        let mut top = bounds.y;
+        let mut right = bounds.x.saturating_add(i64::from(bounds.width));
+        let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
+        let mut clipped = false;
+        // A popover root is not clipped by anything above it: its walk
+        // starts with no ancestor at all.
+        let mut current = if self.layer(id) == Some(PaintLayer::Popover) {
+            None
+        } else {
+            self.parent(id)
+        };
+        while let Some(ancestor) = current {
+            if let (Some(style), Some(clip)) = (self.style(ancestor), self.bounds(ancestor)) {
+                if style.overflow.x != Overflow::Visible {
+                    clipped = true;
+                    left = left.max(clip.x);
+                    right = right.min(clip.x.saturating_add(i64::from(clip.width)));
+                }
+                if style.overflow.y != Overflow::Visible {
+                    clipped = true;
+                    top = top.max(clip.y);
+                    bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
+                }
+            }
+            // A popover root's own `Overflow::Hidden` still clips its
+            // descendants (processed just above); nothing above it does.
+            if self.layer(ancestor) == Some(PaintLayer::Popover) {
+                break;
+            }
+            current = self.parent(ancestor);
+        }
+        // Every popover is clamped to the tree root's own bounds (the
+        // window) instead — the same gate `Self::hit_test` applies.
+        if popover.is_some()
+            && let Some(window) = self.bounds(self.root)
+        {
+            clipped = true;
+            left = left.max(window.x);
+            top = top.max(window.y);
+            right = right.min(window.x.saturating_add(i64::from(window.width)));
+            bottom = bottom.min(window.y.saturating_add(i64::from(window.height)));
+        }
+        // Returned untouched, not merely unchanged, when nothing clips at
+        // all: a widget whose bounds are still the default zero rect must
+        // keep painting the degenerate shape it always did, rather than
+        // being turned into nothing by an empty intersection with itself.
+        if !clipped {
+            return Some(bounds);
+        }
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Rect {
+            x: left,
+            y: top,
+            width: u32::try_from(right - left).ok()?,
+            height: u32::try_from(bottom - top).ok()?,
+        })
     }
 
     /// Adds a new widget as the last child of `parent`, laid out per
@@ -188,6 +465,7 @@ impl<W> WidgetTree<W> {
                 bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
+                layer: PaintLayer::Base,
                 payload,
             },
         );
@@ -232,6 +510,7 @@ impl<W> WidgetTree<W> {
             unreachable!("a parent's recorded children must exist in the tree by construction");
         };
         self.mark_region_dirty(node.bounds);
+        self.popovers.remove(&u64::from(id));
         for child in node.children {
             self.remove_subtree(child);
         }
@@ -271,18 +550,54 @@ impl<W> WidgetTree<W> {
     /// `point` is not descended into at all, on the assumption
     /// (already true of every widget this crate builds via flex layout)
     /// that a child never paints outside its parent's own bounds.
+    ///
+    /// **Popovers are the one exception to that assumption** (0.127.0):
+    /// a point outside the tree root's own bounds (the window) hits
+    /// nothing, exactly as a popover is clamped to the window when
+    /// painted; otherwise every popover root is tried first, topmost
+    /// ([`Self::popover_roots`]' last) first, gated only by its *own*
+    /// bounds — never its owner's or any other ancestor's — and only
+    /// then the base layer. A popover whose owner is wholly clipped away
+    /// is skipped entirely, exactly as it is not painted (see
+    /// [`PaintLayer`]). The structural descent skips children that
+    /// root a popover, so each widget is reached through exactly one
+    /// route, the same one [`Self::paint_order`] paints it by.
+    /// [`crate::hit_test`] delegates to the same traversal, so the two
+    /// hit-testers cannot disagree about layering.
     #[must_use]
     pub fn hit_test(&self, point: (f32, f32)) -> Option<WidgetId> {
-        self.hit_test_from(self.root, point)
+        self.hit_test_by(|bounds| bounds_contain(bounds, point))
     }
 
-    fn hit_test_from(&self, id: WidgetId, point: (f32, f32)) -> Option<WidgetId> {
+    /// The single hit-test traversal behind both [`Self::hit_test`] and
+    /// [`crate::hit_test`]: each passes its own containment predicate
+    /// (`f32` vs `f64` point), and everything about layering lives here.
+    pub(crate) fn hit_test_by(&self, contains: impl Fn(Rect) -> bool) -> Option<WidgetId> {
+        let root = self.nodes.get(&self.root)?;
+        if !contains(root.bounds) {
+            return None;
+        }
+        for popover in self.popover_stack().rev() {
+            if self.popover_owner_hidden(popover) {
+                continue;
+            }
+            if let Some(hit) = self.hit_test_from(popover, &contains) {
+                return Some(hit);
+            }
+        }
+        self.hit_test_from(self.root, &contains)
+    }
+
+    fn hit_test_from(&self, id: WidgetId, contains: &impl Fn(Rect) -> bool) -> Option<WidgetId> {
         let node = self.nodes.get(&id)?;
-        if !bounds_contain(node.bounds, point) {
+        if !contains(node.bounds) {
             return None;
         }
         for &child in node.children.iter().rev() {
-            if let Some(hit) = self.hit_test_from(child, point) {
+            if self.layer(child) == Some(PaintLayer::Popover) {
+                continue;
+            }
+            if let Some(hit) = self.hit_test_from(child, contains) {
                 return Some(hit);
             }
         }
@@ -609,7 +924,7 @@ impl<W> std::fmt::Debug for WidgetTree<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::WidgetTree;
+    use super::{PaintLayer, WidgetId, WidgetTree};
     use crate::WidgetError;
     use accesskit::{Node, Role};
     use aurora_core::Rect;
@@ -1147,5 +1462,258 @@ mod tests {
             "exactly on the bottom edge"
         );
         assert_eq!(tree.hit_test((9.999, 9.999)), Some(root), "just inside");
+    }
+
+    // -- popover layer (0.127.0) --
+
+    fn ins(tree: &mut WidgetTree<&'static str>, parent: WidgetId, name: &'static str) -> WidgetId {
+        match tree.insert(parent, Style::default(), label(name), name) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn place(tree: &mut WidgetTree<&'static str>, id: WidgetId, rect: Rect) {
+        if let Err(err) = tree.set_bounds(id, rect) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    fn pop(tree: &mut WidgetTree<&'static str>, id: WidgetId) {
+        if let Err(err) = tree.set_layer(id, PaintLayer::Popover) {
+            unreachable!("{err:?}");
+        }
+    }
+
+    #[test]
+    fn paint_order_defers_a_popover_subtree_after_the_whole_base_layer() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = ins(&mut tree, root, "a");
+        let p = ins(&mut tree, a, "p");
+        let p1 = ins(&mut tree, p, "p1");
+        let b = ins(&mut tree, root, "b");
+        assert_eq!(
+            tree.paint_order(),
+            vec![root, a, p, p1, b],
+            "no popovers yet"
+        );
+        pop(&mut tree, p);
+        assert_eq!(tree.paint_order(), vec![root, a, b, p, p1]);
+        assert_eq!(tree.popover_roots(), vec![p]);
+        assert_eq!(tree.popover_root_of(p1), Some(p));
+        assert_eq!(tree.popover_root_of(p), Some(p));
+        assert_eq!(tree.popover_root_of(a), None);
+        assert_eq!(tree.popover_root_of(root), None);
+        assert_eq!(
+            tree.layer(p1),
+            Some(PaintLayer::Base),
+            "the flag is not copied"
+        );
+    }
+
+    fn nested_scene() -> (WidgetTree<&'static str>, [WidgetId; 6]) {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = ins(&mut tree, root, "a");
+        let p1 = ins(&mut tree, a, "p1");
+        let p2 = ins(&mut tree, p1, "p2");
+        let q = ins(&mut tree, p2, "q");
+        let p3 = ins(&mut tree, root, "p3");
+        for id in [p1, p2, p3] {
+            pop(&mut tree, id);
+        }
+        place(&mut tree, root, bounds(0, 0, 100, 100));
+        place(&mut tree, a, bounds(0, 0, 20, 20));
+        place(&mut tree, p1, bounds(10, 30, 40, 40));
+        place(&mut tree, p2, bounds(15, 35, 10, 10));
+        place(&mut tree, q, bounds(16, 36, 5, 5));
+        place(&mut tree, p3, bounds(40, 60, 40, 30));
+        (tree, [root, a, p1, p2, q, p3])
+    }
+
+    #[test]
+    fn nested_popovers_paint_each_in_their_own_turn_exactly_once() {
+        let (tree, [root, a, p1, p2, q, p3]) = nested_scene();
+        assert_eq!(tree.popover_roots(), vec![p1, p2, p3]);
+        let order = tree.paint_order();
+        assert_eq!(order, vec![root, a, p1, p2, q, p3]);
+        assert_eq!(order.len(), tree.len(), "every widget exactly once");
+        assert_eq!(tree.popover_root_of(q), Some(p2));
+    }
+
+    #[test]
+    fn the_later_popover_wins_an_overlap() {
+        let (tree, [_, _, p1, _, _, p3]) = nested_scene();
+        // (45, 65) lies in both p1 (10..50 x 30..70) and p3 (40..80 x 60..90).
+        assert_eq!(tree.hit_test((45.0, 65.0)), Some(p3));
+        assert_eq!(tree.hit_test((12.0, 32.0)), Some(p1));
+    }
+
+    #[test]
+    fn a_popover_is_hit_outside_its_owners_bounds() {
+        let (tree, [root, a, p1, p2, q, _]) = nested_scene();
+        // q (16..21 x 36..41) lies wholly outside a (0..20 x 0..20).
+        assert_eq!(tree.hit_test((17.0, 37.0)), Some(q));
+        assert_eq!(tree.hit_test((23.0, 43.0)), Some(p2));
+        assert_eq!(tree.hit_test((5.0, 5.0)), Some(a));
+        assert_eq!(tree.hit_test((90.0, 10.0)), Some(root));
+        let _ = p1;
+    }
+
+    #[test]
+    fn a_popover_past_the_root_is_not_hit_there() {
+        let (mut tree, [_, _, _, _, _, p3]) = nested_scene();
+        place(&mut tree, p3, bounds(80, 80, 50, 50));
+        assert_eq!(tree.hit_test((90.0, 90.0)), Some(p3), "inside the window");
+        assert_eq!(tree.hit_test((110.0, 110.0)), None, "outside the window");
+        assert_eq!(
+            tree.hit_test((100.0, 90.0)),
+            None,
+            "the root's edge is half-open"
+        );
+    }
+
+    /// The hit-test half of "a popover follows its owner out of sight",
+    /// through nested popovers: an owner scrolled wholly out of a
+    /// clipping body hides its popover *and* a popover nested inside it,
+    /// so the base widget beneath is hit instead.
+    #[test]
+    fn a_popover_whose_owner_is_clipped_away_is_not_hit() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let clipping = Style {
+            overflow: taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            },
+            ..Style::default()
+        };
+        let body = match tree.insert(root, clipping, label("body"), "body") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let under = ins(&mut tree, root, "under");
+        let owner = ins(&mut tree, body, "owner");
+        let list = ins(&mut tree, owner, "list");
+        let sub = ins(&mut tree, list, "sub");
+        place(&mut tree, root, bounds(0, 0, 100, 100));
+        place(&mut tree, body, bounds(0, 0, 100, 20));
+        place(&mut tree, under, bounds(0, 50, 100, 50));
+        place(&mut tree, owner, bounds(0, 30, 50, 10));
+        place(&mut tree, list, bounds(0, 50, 50, 20));
+        place(&mut tree, sub, bounds(60, 50, 30, 20));
+        pop(&mut tree, list);
+        pop(&mut tree, sub);
+        assert_eq!(tree.hit_test((5.0, 55.0)), Some(under), "owner hidden");
+        assert_eq!(tree.hit_test((65.0, 55.0)), Some(under), "nested too");
+        place(&mut tree, owner, bounds(0, 15, 50, 10));
+        assert_eq!(tree.hit_test((5.0, 55.0)), Some(list), "owner partly shown");
+        assert_eq!(tree.hit_test((65.0, 55.0)), Some(sub));
+    }
+
+    /// The maintained popover set always equals a fresh scan of every
+    /// live, non-root node flagged `Popover`, in ascending id order,
+    /// across a long pseudo-random run of inserts, removals and flag
+    /// changes.
+    #[test]
+    fn the_popover_set_tracks_every_flag_and_removal() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let mut live = vec![root];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: usize| -> usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % u64::try_from(n).unwrap_or(1)).unwrap_or(0)
+        };
+        for _ in 0..4000 {
+            let Some(&target) = live.get(next(live.len())) else {
+                unreachable!("the root is always live");
+            };
+            match next(4) {
+                0 | 1 => live.push(ins(&mut tree, target, "n")),
+                2 if target != root => {
+                    if let Err(err) = tree.remove(target) {
+                        unreachable!("{err:?}");
+                    }
+                    live.retain(|&id| tree.contains(id));
+                }
+                _ if target != root => {
+                    let layer = if next(2) == 0 {
+                        PaintLayer::Popover
+                    } else {
+                        PaintLayer::Base
+                    };
+                    if let Err(err) = tree.set_layer(target, layer) {
+                        unreachable!("{err:?}");
+                    }
+                }
+                _ => {}
+            }
+            let mut scanned: Vec<WidgetId> = tree
+                .nodes
+                .iter()
+                .filter(|&(&id, node)| id != root && node.layer == PaintLayer::Popover)
+                .map(|(&id, _)| id)
+                .collect();
+            scanned.sort_by_key(|&id| u64::from(id));
+            assert_eq!(tree.popover_roots(), scanned);
+        }
+    }
+
+    #[test]
+    fn set_layer_dirties_the_whole_subtree_once_and_is_idempotent() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let p = ins(&mut tree, root, "p");
+        let child = ins(&mut tree, p, "child");
+        place(&mut tree, root, bounds(0, 0, 100, 100));
+        place(&mut tree, p, bounds(10, 10, 10, 10));
+        place(&mut tree, child, bounds(30, 40, 5, 5));
+        let _ = tree.take_damage();
+        pop(&mut tree, p);
+        assert_eq!(tree.is_dirty(p), Some(true));
+        assert_eq!(tree.take_damage(), Some(bounds(10, 10, 25, 35)));
+        pop(&mut tree, p);
+        assert_eq!(tree.take_damage(), None, "same layer again: no damage");
+        if let Err(err) = tree.set_layer(p, PaintLayer::Base) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.take_damage(), Some(bounds(10, 10, 25, 35)));
+        assert!(tree.popover_roots().is_empty());
+    }
+
+    #[test]
+    fn set_layer_rejects_the_root_and_an_unknown_id_and_changes_nothing() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = ins(&mut tree, root, "a");
+        place(&mut tree, root, bounds(0, 0, 10, 10));
+        let _ = tree.take_damage();
+        assert!(matches!(
+            tree.set_layer(root, PaintLayer::Popover),
+            Err(WidgetError::CannotLayerRoot(id)) if id == root
+        ));
+        assert_eq!(tree.layer(root), Some(PaintLayer::Base));
+        assert!(tree.popover_roots().is_empty());
+        assert_eq!(tree.take_damage(), None);
+        if let Err(err) = tree.remove(a) {
+            unreachable!("{err:?}");
+        }
+        let _ = tree.take_damage();
+        assert!(matches!(
+            tree.set_layer(a, PaintLayer::Popover),
+            Err(WidgetError::UnknownWidget(id)) if id == a
+        ));
+        assert_eq!(tree.layer(a), None);
+        assert_eq!(tree.take_damage(), None);
+    }
+
+    #[test]
+    fn removing_a_popover_dirties_its_bounds_and_drops_it_from_the_stack() {
+        let (mut tree, [_, _, p1, p2, q, p3]) = nested_scene();
+        let _ = tree.take_damage();
+        if let Err(err) = tree.remove(p1) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.take_damage(), Some(bounds(10, 30, 40, 40)));
+        assert_eq!(tree.popover_roots(), vec![p3]);
+        assert!(!tree.contains(p2) && !tree.contains(q));
     }
 }

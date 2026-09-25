@@ -85,4 +85,4 @@ pub use render::{
     GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
-pub use tree::{WidgetId, WidgetTree};
+pub use tree::{PaintLayer, WidgetId, WidgetTree};

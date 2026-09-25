@@ -140,19 +140,22 @@
 //!
 //! # What this deliberately does not do
 //!
-//! - **No popover layer.** The menu paints in tree order: a later
-//!   sibling of `parent`'s subtree paints over it, and a clipping
-//!   ancestor clips it.
-//! - **No pointer support.** `WidgetTree::hit_test` *does* reach the
-//!   menu and its items wherever they lie inside `parent`'s bounds (it
-//!   descends into children, `tree.rs`'s `hit_test`), but nothing routes
-//!   a pointer press or hover to this module, and any part of the menu
-//!   overflowing `parent` is unreachable by hit-testing at all. There is
-//!   no hover highlight, so a pointer-opened menu on macOS (where no item
-//!   is highlighted initially) is not modelled either: the keyboard is
-//!   the only driver.
+//! - **A popover, clamped to the window and nothing smarter**
+//!   (0.127.0). The menu is a [`PaintLayer::Popover`](crate::PaintLayer)
+//!   root: it paints after every base-layer widget, no clipping
+//!   ancestor of `parent` clips it, and both `WidgetTree::hit_test` and
+//!   `crate::hit_test` reach every item wherever it lies — including
+//!   the part overflowing `parent`'s own bounds — clamped only to the
+//!   tree root's bounds (the window). It is never flipped or moved to
+//!   stay on screen.
+//! - **No pointer routing.** Hit-testing reaches the items, but nothing
+//!   routes a pointer press or hover to this module. There is no hover
+//!   highlight, so a pointer-opened menu on macOS (where no item is
+//!   highlighted initially) is not modelled either: the keyboard is the
+//!   only driver.
 //! - **No submenus**, no check/radio items, no glyphs (labels, shortcut
-//!   hints, arrows), no viewport clamp or flip near a window edge, and
+//!   hints, arrows), no viewport flip near a window edge (only the
+//!   window clamp above), and
 //!   no routing of `accesskit::ActionRequest`s (a screen reader's
 //!   `Click` on an item reaches no code here yet).
 //!
@@ -173,7 +176,7 @@ use super::list_row::ListRowState;
 use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
-use crate::tree::{WidgetId, WidgetTree};
+use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 
 /// What one entry of a menu is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -568,14 +571,20 @@ pub fn open_menu(
         menu_node(&state),
         WidgetKind::Menu(state),
     )?;
-    let built = build_children(tree, menu).and_then(|ids| {
-        let Some(WidgetKind::Menu(state)) = tree.payload_mut(menu) else {
-            return Err(WidgetError::WrongWidgetKind(menu));
-        };
-        state.item_ids = ids;
-        let node = menu_node(state);
-        tree.set_accessibility(menu, node)
-    });
+    // A menu floats above every base-layer widget and escapes `parent`'s
+    // clipping ancestors (this module's own doc comment); a failure here
+    // takes the same cleanup path as a failed child build.
+    let built = tree
+        .set_layer(menu, PaintLayer::Popover)
+        .and_then(|()| build_children(tree, menu))
+        .and_then(|ids| {
+            let Some(WidgetKind::Menu(state)) = tree.payload_mut(menu) else {
+                return Err(WidgetError::WrongWidgetKind(menu));
+            };
+            state.item_ids = ids;
+            let node = menu_node(state);
+            tree.set_accessibility(menu, node)
+        });
     if let Err(err) = built {
         // Best effort, and unreachable today (every id here was just
         // inserted): nothing is left behind on failure.
@@ -854,7 +863,7 @@ mod tests {
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
-    use crate::tree::{WidgetId, WidgetTree};
+    use crate::tree::{PaintLayer, WidgetId, WidgetTree};
     use crate::widgets::{
         ListRowState, WidgetKind, insert_button, insert_dropdown, new_tree, row_height, test_scales,
     };
@@ -1195,6 +1204,60 @@ mod tests {
                 "a menu item is never `selected`"
             );
         }
+    }
+
+    /// A menu is a popover root, so the part of it overflowing a small,
+    /// clipping `parent` is still reached by both hit-testers.
+    #[test]
+    fn a_menu_overflowing_its_parent_is_a_reachable_popover() {
+        let (mut tree, root) = new_tree(sized_root());
+        let panel = ok(tree.insert(
+            root,
+            Style {
+                size: Size {
+                    width: length(150.0_f32),
+                    height: length(30.0_f32),
+                },
+                overflow: taffy::Point {
+                    x: taffy::Overflow::Hidden,
+                    y: taffy::Overflow::Hidden,
+                },
+                ..Default::default()
+            },
+            accesskit::Node::new(Role::Group),
+            WidgetKind::Container,
+        ));
+        let menu = ok(open_menu(
+            &mut tree,
+            panel,
+            &test_scales(),
+            "Edit",
+            (10.0, 5.0),
+            120.0,
+            items(),
+        ));
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.layer(menu), Some(PaintLayer::Popover));
+        let state = snapshot(&tree, menu);
+        let Some(&last) = state.item_ids().last() else {
+            unreachable!("five items");
+        };
+        assert_eq!(tree.popover_root_of(last), Some(menu));
+        let (Some(panel_bounds), Some(item)) = (tree.bounds(panel), tree.bounds(last)) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            item.y >= panel_bounds.bottom(),
+            "the last item lies wholly below the panel: {item:?} vs {panel_bounds:?}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let (x, y) = (item.x as f32 + 3.0, item.y as f32 + 3.0);
+        assert_eq!(tree.hit_test((x, y)), Some(last));
+        assert_eq!(
+            crate::hit_test(&tree, f64::from(x), f64::from(y)),
+            Some(last)
+        );
+        assert_eq!(tree.paint_order().last(), Some(&last));
     }
 
     #[test]

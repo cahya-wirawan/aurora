@@ -348,8 +348,8 @@ use aurora_widgets::widgets::{
     curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
 };
 use aurora_widgets::{
-    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp, PathPipeline, WidgetId,
-    WidgetTree, draw_paint_ops, paint_widget_ops,
+    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintLayer, PaintOp, PathPipeline,
+    WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops,
 };
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -7652,3 +7652,213 @@ curve_editor_golden_test!(
     color_critical_theme(),
     "curve_editor_gallery_color_critical.png"
 );
+
+/// The popover layer's (0.127.0) own gallery scene: a fixed-height panel
+/// body that hides its overflow, holding an open dropdown near its bottom
+/// edge and then a later sibling button the open list overlaps — the two
+/// ways a base-layer list used to go wrong at once (the later sibling
+/// painted over it, and the panel clipped the part hanging below it).
+/// 192 px wide: `read_rgba8` needs 256-byte-aligned rows (a multiple of 64 px).
+const POPOVER_GALLERY_SIZE: (u32, u32) = (192, 160);
+const POPOVER_PANEL_PADDING: u32 = 16;
+const POPOVER_BUTTON_HEIGHT: u32 = 33;
+/// The panel ends exactly at the button's bottom edge.
+const POPOVER_PANEL_HEIGHT: u32 =
+    POPOVER_PANEL_PADDING + DROPDOWN_ROW_HEIGHT + POPOVER_BUTTON_HEIGHT;
+const POPOVER_SAMPLE_X: u32 = POPOVER_GALLERY_SIZE.0 / 2;
+/// The middle of option row `n`, the list starting at the control's own
+/// bottom edge.
+const fn popover_row_sample_y(n: u32) -> u32 {
+    POPOVER_PANEL_PADDING + DROPDOWN_ROW_HEIGHT * (n + 1) + DROPDOWN_ROW_HEIGHT / 2
+}
+
+/// Builds and lays out the popover scene: `[panel, dropdown, button,
+/// list]`. Option 2 (the last) is selected, so the highlighted row is
+/// the one hanging wholly below the panel and row 0 (plain
+/// `surface.raised`) is the one lying over the button.
+fn popover_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 4]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Column,
+        size: Size {
+            width: length(POPOVER_GALLERY_SIZE.0 as f32),
+            height: length(POPOVER_GALLERY_SIZE.1 as f32),
+        },
+        ..Default::default()
+    });
+    let pad = length(POPOVER_PANEL_PADDING as f32);
+    let panel = match aurora_widgets::widgets::insert_container(
+        &mut tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            flex_shrink: 0.0,
+            size: Size {
+                width: length(POPOVER_GALLERY_SIZE.0 as f32),
+                height: length(POPOVER_PANEL_HEIGHT as f32),
+            },
+            padding: LayoutRect {
+                left: pad,
+                right: pad,
+                top: pad,
+                bottom: length(0.0_f32),
+            },
+            overflow: taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let options = ["Normal", "Multiply", "Screen"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let dropdown = match insert_dropdown(&mut tree, panel, scales, "Blend mode", options, Some(2)) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let button = match insert_button(&mut tree, panel, scales, "Apply") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    // A fixture size, not a button design: full width and a known height
+    // so the panel ends exactly at the button's bottom edge.
+    if let Err(err) = tree.set_style(
+        button,
+        Style {
+            flex_shrink: 0.0,
+            size: Size {
+                width: taffy::style_helpers::percent(1.0_f32),
+                height: length(POPOVER_BUTTON_HEIGHT as f32),
+            },
+            ..Default::default()
+        },
+    ) {
+        unreachable!("{err:?}");
+    }
+    if let Err(err) = set_dropdown_open(&mut tree, dropdown, true) {
+        unreachable!("{err:?}");
+    }
+    let Some(list) = dropdown_state(&tree, dropdown)
+        .ok()
+        .and_then(aurora_widgets::widgets::DropdownState::list)
+    else {
+        unreachable!("just opened");
+    };
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(POPOVER_GALLERY_SIZE.0 as f32, POPOVER_GALLERY_SIZE.1 as f32);
+    (tree, [panel, dropdown, button, list])
+}
+
+/// A headless (no GPU) proof that the popover scene's probes land where
+/// they claim: row 0 over the button inside the panel, row 2 wholly below
+/// the panel, the list a popover root.
+#[test]
+fn popover_gallery_lays_the_list_over_the_button_and_past_the_panel() {
+    let (tree, [panel, dropdown, button, list]) = popover_gallery_tree(&scales());
+    assert_eq!(tree.layer(list), Some(PaintLayer::Popover));
+    assert_eq!(tree.popover_root_of(dropdown), None);
+    let (Some(panel_b), Some(button_b), Some(list_b)) =
+        (tree.bounds(panel), tree.bounds(button), tree.bounds(list))
+    else {
+        unreachable!("laid out");
+    };
+    assert_eq!(panel_b.bottom(), i64::from(POPOVER_PANEL_HEIGHT));
+    assert_eq!(button_b.bottom(), panel_b.bottom(), "{button_b:?}");
+    let (x, y0, y2) = (
+        i64::from(POPOVER_SAMPLE_X),
+        i64::from(popover_row_sample_y(0)),
+        i64::from(popover_row_sample_y(2)),
+    );
+    let inside = |r: aurora_core::Rect, x: i64, y: i64| {
+        r.x <= x && x < r.right() && r.y <= y && y < r.bottom()
+    };
+    assert!(
+        inside(button_b, x, y0),
+        "probe 1 lies on the button: {button_b:?}"
+    );
+    assert!(inside(list_b, x, y0) && inside(list_b, x, y2), "{list_b:?}");
+    assert!(y2 >= panel_b.bottom(), "probe 2 lies below the panel");
+    #[allow(clippy::cast_precision_loss)]
+    let hit = tree.hit_test((x as f32, y0 as f32));
+    assert!(hit.is_some_and(|h| tree.popover_root_of(h) == Some(list)));
+}
+
+fn popover_rgb(pixel: [u8; 4]) -> [u8; 3] {
+    [pixel[0], pixel[1], pixel[2]]
+}
+
+/// The popover layer on a real GPU: where the open list overlaps the
+/// later sibling button, the list's own `surface.raised` row is what
+/// renders, and the highlighted row hanging below the clipping panel
+/// renders `accent.primary` rather than backdrop. The control forces
+/// the list back into the base layer with `set_layer` and shows both
+/// probes flip — to the button's `accent.primary` and to the backdrop —
+/// so the claims are about layering, not about the scene.
+#[test]
+fn popover_gallery_paints_the_open_list_above_a_later_sibling_and_past_its_panel() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let raised = theme.surface.raised;
+    let accent = theme.accent.primary;
+    let raised = [raised.r, raised.g, raised.b];
+    let accent = [accent.r, accent.g, accent.b];
+    let backdrop = [128_u8, 128, 128];
+    assert!(
+        raised != accent && raised != backdrop && accent != backdrop,
+        "the three probe colours must be distinct to prove anything"
+    );
+    let (mut tree, [_, _, _, list]) = popover_gallery_tree(&scales);
+    let probe1 = (POPOVER_SAMPLE_X, popover_row_sample_y(0));
+    let probe2 = (POPOVER_SAMPLE_X, popover_row_sample_y(2));
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        POPOVER_GALLERY_SIZE,
+        NEUTRAL_CLEAR,
+    );
+    let p1 = sample_at(&image, probe1.0, probe1.1);
+    let p2 = sample_at(&image, probe2.0, probe2.1);
+    assert!(
+        within(p1, raised, 1),
+        "probe 1: the list's row paints over the later button: got {p1:?}, want {raised:?}"
+    );
+    assert!(
+        within(p2, accent, 1),
+        "probe 2: the highlighted row paints below the clipping panel: got {p2:?}, \
+         want {accent:?}"
+    );
+
+    if let Err(err) = tree.set_layer(list, PaintLayer::Base) {
+        unreachable!("{err:?}");
+    }
+    let control = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        POPOVER_GALLERY_SIZE,
+        NEUTRAL_CLEAR,
+    );
+    let c1 = sample_at(&control, probe1.0, probe1.1);
+    let c2 = sample_at(&control, probe2.0, probe2.1);
+    assert!(
+        within(c1, accent, 1),
+        "control: in the base layer the later button paints over the list: got {c1:?}"
+    );
+    assert!(
+        within(c2, backdrop, 1),
+        "control: in the base layer the panel clips the list: got {c2:?}"
+    );
+    assert_ne!(popover_rgb(p1), popover_rgb(c1));
+    assert_ne!(popover_rgb(p2), popover_rgb(c2));
+}
