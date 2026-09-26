@@ -348,9 +348,9 @@ use aurora_widgets::widgets::{
     curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
 };
 use aurora_widgets::{
-    FocusManager, FocusOrigin, FocusPaint, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline,
-    PaintLayer, PaintOp, PathPipeline, WidgetId, WidgetTree, draw_paint_ops,
-    paint_widget_ops_focused,
+    FocusManager, FocusOrigin, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp,
+    GradientPipeline, PaintLayer, PaintOp, PathPipeline, TextPipeline, WidgetId, WidgetTree,
+    draw_paint_ops, paint_widget_ops_focused,
 };
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -1876,6 +1876,11 @@ fn collect_gallery_paints(
                     PaintOp::Gradient(mesh) => {
                         GpuPaintOp::Gradient(GpuColorMesh::upload(device, queue, &mesh))
                     }
+                    // Filtered out (0.132.0): the blessed goldens predate
+                    // text and keep meaning "every widget's shapes"; text
+                    // pixels are covered by `render`'s own GPU tests and
+                    // `aurora-app`'s wiring tests instead.
+                    PaintOp::Text(_) => continue,
                 });
             }
         }
@@ -1897,12 +1902,18 @@ fn draw_gallery_paints<'pass>(
     }
     let mut path = PathPipeline::new(device);
     let mut gradient = GradientPipeline::new(device);
+    // Text is filtered out of this harness (`collect_gallery_paints`), so
+    // this atlas stays empty; `draw_paint_ops` needs one regardless.
+    let mut text = TextPipeline::new(device);
+    let atlas = GlyphAtlas::new(device);
     #[allow(clippy::cast_precision_loss)]
     let viewport_size = (size.0 as f32, size.1 as f32);
     draw_paint_ops(
         pass,
         &mut path,
         &mut gradient,
+        &mut text,
+        &atlas,
         device,
         queue,
         wgpu::TextureFormat::Rgba8Unorm,

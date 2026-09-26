@@ -77,6 +77,8 @@ pub mod render;
 mod render_test;
 pub mod shortcut;
 mod test_support;
+mod text;
+mod text_render;
 mod tree;
 pub mod widgets;
 
@@ -92,7 +94,10 @@ pub use pointer::{
     handle_widget_key, handle_widget_text, is_shortcut_chord,
 };
 pub use render::{
-    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
+    AtlasLayout, AtlasSlot, GlyphAtlas, GlyphBatch, GpuColorMesh, GpuGlyphMesh, GpuMesh,
+    GpuPaintOp, GradientPipeline, PathPipeline, TextPipeline, draw_paint_ops, upload_glyph_meshes,
+    upload_paint_ops,
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
+pub use text::{HAlign, QuadGlyph, TextRun, label_style, resolve_text, text_runs};
 pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};

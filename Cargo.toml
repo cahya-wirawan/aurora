@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.131.1"
+version = "0.132.0"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -198,6 +198,21 @@ tiff = "0.11"
 # which aren't pre-compressed) -- no encryption, no bzip2/lzma/zstd/ppmd,
 # none of which `.aur` needs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Text shaping and glyph rasterization for `aurora-text` (0.132.0). These
+# are the two engines `cosmic-text` 0.19 itself shapes and rasterizes with
+# (CLAUDE.md's stack names `cosmic-text`); Aurora depends on them directly
+# because `cosmic-text` also requires `fontdb`, and every `fontdb` release
+# (0.23 and 0.24 alike) pulls in `ttf-parser` -- RUSTSEC-2026-0192
+# (unmaintained, no safe upgrade), the same advisory the `winit` entry
+# above routes around rather than adding a deny.toml exception. One
+# bundled UI font needs no font database. Both are `skrifa`/`read-fonts`
+# based (Google Fonts' `fontations`), MIT OR Apache-2.0.
+harfrust = "0.5"
+# Default features (`std`, `scale`, `render`): outline scaling and
+# 8-bit coverage rasterization. Nothing here loads a system font.
+swash = "0.2"
+# Dev-dependency only: pins the bundled font file's exact bytes.
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

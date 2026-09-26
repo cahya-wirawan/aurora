@@ -10,6 +10,14 @@ ignore = []
 
 [licenses]
 version = 2
+# Not every licence in the shipped binary passes through this list:
+# `aurora-text` embeds the Inter UI font with `include_bytes!`
+# (crates/aurora-text/fonts/Inter-Regular.ttf, SIL OFL 1.1, licence text
+# alongside as OFL.txt). cargo-deny only sees crate licences, so OFL-1.1
+# is deliberately *not* added below -- no crate uses it, and allowing it
+# would let a future OFL-licensed crate through unreviewed. OFL permits
+# bundling a font with software under any licence provided the licence
+# travels with it and the font is not sold alone.
 # Permissive licences only. Aurora is MIT (PRD §14); anything copyleft that ends
 # up statically linked would impose terms we have not agreed to.
 allow = [

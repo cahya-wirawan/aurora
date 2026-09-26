@@ -13,7 +13,8 @@
 #![cfg(test)]
 
 use crate::render::{
-    GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, draw_paint_ops,
+    GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PathPipeline, TextPipeline,
+    draw_paint_ops,
 };
 use crate::test_support::real_context;
 use aurora_gpu::GpuContext;
@@ -306,13 +307,13 @@ fn gradient(context: &GpuContext, mesh: &ColorMesh) -> GpuPaintOp {
 }
 
 /// A rendered target, tightly packed RGBA8 rows.
-struct Frame {
+pub(crate) struct Frame {
     width: u32,
     bytes: Vec<u8>,
 }
 
 impl Frame {
-    fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+    pub(crate) fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let offset = (y as usize * self.width as usize + x as usize) * 4;
         match self.bytes.get(offset..offset + 4) {
             Some(&[red, green, blue, alpha]) => [red, green, blue, alpha],
@@ -341,13 +342,27 @@ fn render_ops(
 /// mesh's own coordinates are measured against). Passing half the
 /// target's physical size is exactly what `aurora-app` does at a scale
 /// factor of `2.0`: mesh coordinates are logical, the target physical.
-#[allow(clippy::too_many_lines)]
 fn render_ops_with_viewport(
     context: &GpuContext,
     format: wgpu::TextureFormat,
     size: (u32, u32),
     viewport_size: (f32, f32),
     ops: &[GpuPaintOp],
+) -> Frame {
+    let atlas = GlyphAtlas::new(context.device());
+    render_ops_with_atlas(context, format, size, viewport_size, ops, &atlas)
+}
+
+/// [`render_ops_with_viewport`] against a caller's own glyph atlas — the
+/// one its `GpuPaintOp::Text` ops were prepared against.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn render_ops_with_atlas(
+    context: &GpuContext,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    viewport_size: (f32, f32),
+    ops: &[GpuPaintOp],
+    atlas: &GlyphAtlas,
 ) -> Frame {
     let device = context.device();
     let queue = context.queue();
@@ -371,6 +386,7 @@ fn render_ops_with_viewport(
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
     let mut path = PathPipeline::new(device);
     let mut gradient_pipeline = GradientPipeline::new(device);
+    let mut text_pipeline = TextPipeline::new(device);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("gradient-render"),
@@ -396,6 +412,8 @@ fn render_ops_with_viewport(
             &mut pass,
             &mut path,
             &mut gradient_pipeline,
+            &mut text_pipeline,
+            atlas,
             device,
             queue,
             format,
@@ -1008,4 +1026,542 @@ fn solid_and_gradient_cover_the_same_physical_pixels_at_scale_factor_two() {
         from_gradient, expected,
         "logical (5, 3, 21, 11) at scale 2 must cover physical x 10..52, y 6..28"
     );
+}
+
+// ---- Text (0.132.0) -------------------------------------------------
+
+mod text {
+    use super::{Frame, rect_mesh, render_ops_with_atlas, solid};
+    use crate::paint::{PaintOp, paint_widget_ops};
+    use crate::render::{GlyphAtlas, GpuPaintOp, TextPipeline, upload_paint_ops};
+    use crate::test_support::real_context;
+    use crate::text::{HAlign, TextRun, label_style, resolve_text};
+    use crate::widgets::{insert_button, new_tree, test_scales};
+    use aurora_core::Rect;
+    use aurora_gpu::GpuContext;
+    use aurora_text::TextEngine;
+    use aurora_theme::{Palette, Theme, ThemeSet};
+
+    const SIZE: (u32, u32) = (128, 64);
+    const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+    fn engine() -> TextEngine {
+        match TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn dark_theme() -> Theme {
+        let Ok(palette) =
+            Palette::from_toml_str(include_str!("../../../design/tokens/palette.toml"))
+        else {
+            unreachable!()
+        };
+        let mut themes = ThemeSet::new();
+        if themes
+            .register(include_str!("../../../design/themes/dark.toml"))
+            .is_err()
+        {
+            unreachable!()
+        }
+        match themes.resolve("Dark", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn run(text: &str, rect: (f32, f32, f32, f32), clip: Rect) -> TextRun {
+        TextRun {
+            text: text.to_owned(),
+            style: label_style(&test_scales()),
+            color: WHITE,
+            rect,
+            align: HAlign::Start,
+            clip,
+        }
+    }
+
+    fn whole() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: SIZE.0,
+            height: SIZE.1,
+        }
+    }
+
+    fn render(context: &GpuContext, atlas: &mut GlyphAtlas, ops: Vec<PaintOp>) -> Frame {
+        let mut engine = engine();
+        let gpu = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            atlas,
+            ops,
+            1.0,
+            |c| c,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let viewport = (SIZE.0 as f32, SIZE.1 as f32);
+        render_ops_with_atlas(
+            context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            SIZE,
+            viewport,
+            &gpu,
+            atlas,
+        )
+    }
+
+    fn lit(frame: &Frame, x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
+        let mut count = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if frame.pixel(x, y)[0] > 0 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Renders `text` white-on-black at `scale` (a 128x64 physical
+    /// target, logical viewport `SIZE / scale`) clipped to `clip`
+    /// (logical), and compares every pixel against the CPU coverage mask
+    /// of the glyph quad it falls in — `engine.glyph(key).alpha`, trimmed
+    /// by the quad's `src_offset` exactly as the shader must read it.
+    /// Returns (pixels compared inside quads, of which unlit, of which
+    /// nearly fully covered).
+    fn assert_glyph_pixels_match_the_cpu_masks(
+        context: &GpuContext,
+        text: &str,
+        scale: f32,
+        clip: Rect,
+    ) -> (usize, usize, usize) {
+        let mut engine = engine();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let label = run(text, (4.0, 4.0, 100.0, 20.0), clip);
+        let quads = resolve_text(&mut engine, &label, scale);
+        assert!(!quads.is_empty(), "{text} at {scale} draws something");
+        let gpu = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            vec![PaintOp::Text(label)],
+            scale,
+            |c| c,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let viewport = (SIZE.0 as f32 / scale, SIZE.1 as f32 / scale);
+        let frame = render_ops_with_atlas(
+            context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            SIZE,
+            viewport,
+            &gpu,
+            &atlas,
+        );
+        let mut expected = vec![None::<u8>; (SIZE.0 * SIZE.1) as usize];
+        for quad in &quads {
+            let Some(mask) = engine.glyph(quad.key) else {
+                unreachable!("a quad is only emitted for an inked glyph")
+            };
+            let [x0, y0, x1, y1] = quad.dst;
+            let [ox, oy] = quad.src_offset;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (Ok(px), Ok(py)) = (u32::try_from(x), u32::try_from(y)) else {
+                        continue;
+                    };
+                    if px >= SIZE.0 || py >= SIZE.1 {
+                        continue;
+                    }
+                    let (Ok(mx), Ok(my)) = (u32::try_from(x - x0), u32::try_from(y - y0)) else {
+                        unreachable!()
+                    };
+                    let index = ((my + oy) * mask.width + (mx + ox)) as usize;
+                    let Some(&coverage) = mask.alpha.get(index) else {
+                        unreachable!("src window inside the mask")
+                    };
+                    if let Some(slot) = expected.get_mut((py * SIZE.0 + px) as usize) {
+                        // Overlapping quads (never in these strings) would
+                        // blend; keep the larger coverage as a bound.
+                        *slot = Some(slot.map_or(coverage, |c| c.max(coverage)));
+                    }
+                }
+            }
+        }
+        let (mut compared, mut unlit, mut full) = (0, 0, 0);
+        for y in 0..SIZE.1 {
+            for x in 0..SIZE.0 {
+                let got = frame.pixel(x, y)[0];
+                match expected.get((y * SIZE.0 + x) as usize).copied().flatten() {
+                    Some(want) => {
+                        assert!(
+                            got.abs_diff(want) <= 2,
+                            "{text} @{scale}: pixel ({x}, {y}) is {got}, mask says {want}"
+                        );
+                        compared += 1;
+                        if want == 0 {
+                            unlit += 1;
+                        }
+                        if want >= 200 {
+                            full += 1;
+                        }
+                    }
+                    None => assert_eq!(
+                        got, 0,
+                        "{text} @{scale}: ink at ({x}, {y}) outside every quad"
+                    ),
+                }
+            }
+        }
+        (compared, unlit, full)
+    }
+
+    #[test]
+    fn glyph_pixels_match_the_cpu_coverage_mask_texel_for_texel() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        for scale in [1.0, 2.0] {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let clip = Rect {
+                x: 0,
+                y: 0,
+                width: (SIZE.0 as f32 / scale) as u32,
+                height: (SIZE.1 as f32 / scale) as u32,
+            };
+            for text in ["A", "HAWK"] {
+                let (compared, unlit, full) =
+                    assert_glyph_pixels_match_the_cpu_masks(&context, text, scale, clip);
+                assert!(compared > 50, "{text} @{scale}: {compared} pixels compared");
+                assert!(
+                    unlit > 5,
+                    "{text} @{scale}: an A's counter and corners stay unlit"
+                );
+                assert!(
+                    full > 5,
+                    "{text} @{scale}: some stem pixels are fully covered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_clip_through_a_glyph_reads_the_trimmed_part_of_its_mask() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        for scale in [1.0, 2.0] {
+            // A narrow window starting inside "H", "A" and "W": every quad
+            // is trimmed on the left (and "HAWK"'s tops by the y clip).
+            let clip = Rect {
+                x: 7,
+                y: 9,
+                width: 14,
+                height: 20,
+            };
+            let (compared, _, full) =
+                assert_glyph_pixels_match_the_cpu_masks(&context, "HAWK", scale, clip);
+            assert!(
+                compared > 20,
+                "@{scale}: {compared} clipped pixels compared"
+            );
+            assert!(full > 0, "@{scale}: the clipped stem still draws");
+        }
+    }
+
+    #[test]
+    fn a_frames_runs_share_one_glyph_buffer_and_an_empty_run_uploads_nothing() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut engine = engine();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let grey = [0.25, 0.25, 0.25, 1.0];
+        let mut ops = vec![PaintOp::Text(run("One", (4.0, 4.0, 100.0, 20.0), whole()))];
+        ops.push(PaintOp::Text(run("   ", (4.0, 24.0, 100.0, 20.0), whole())));
+        ops.push(PaintOp::Solid((rect_mesh(0.0, 40.0, 10.0, 50.0), grey)));
+        ops.push(PaintOp::Text(run("Two", (4.0, 40.0, 100.0, 20.0), whole())));
+        let gpu = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            ops,
+            1.0,
+            |c| c,
+        );
+        let meshes: Vec<&crate::render::GpuGlyphMesh> = gpu
+            .iter()
+            .filter_map(|op| match op {
+                GpuPaintOp::Text(mesh, _) => Some(mesh),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gpu.len(), 3, "the all-space run uploads no op");
+        assert!(
+            matches!(gpu.get(1), Some(GpuPaintOp::Solid(..))),
+            "paint order kept"
+        );
+        let [first, second] = meshes.as_slice() else {
+            unreachable!("two inked runs")
+        };
+        assert!(
+            first.shares_buffers_with(second),
+            "one vertex + index buffer per frame"
+        );
+        assert_eq!(first.indices(), 0..18);
+        assert_eq!(second.indices(), 18..36);
+        // A frame of nothing but spaces uploads no text op at all.
+        let spaces = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            vec![PaintOp::Text(run("  ", (4.0, 4.0, 100.0, 20.0), whole()))],
+            1.0,
+            |c| c,
+        );
+        assert!(spaces.is_empty());
+    }
+
+    #[test]
+    fn warm_frame_text_collect_time_is_reported() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut engine = engine();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let labels: Vec<PaintOp> = (0..60)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let y = (i % 3) as f32 * 20.0;
+                PaintOp::Text(run(&format!("Label {i}"), (4.0, y, 120.0, 20.0), whole()))
+            })
+            .collect();
+        let mut collect = || {
+            engine.begin_frame();
+            let start = std::time::Instant::now();
+            let ops = upload_paint_ops(
+                context.device(),
+                context.queue(),
+                &mut engine,
+                &mut atlas,
+                labels.clone(),
+                1.0,
+                |c| c,
+            );
+            (start.elapsed(), ops.len())
+        };
+        let (cold, n) = collect();
+        let (warm, m) = collect();
+        assert_eq!(n, m);
+        // Informational only -- no budget is claimed or asserted.
+        eprintln!("text collect: 60 labels, cold {cold:?}, warm {warm:?}");
+    }
+
+    #[test]
+    fn text_pipeline_builds_for_every_target_format() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut text = TextPipeline::new(context.device());
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ] {
+            let _ = text.pipeline(context.device(), format);
+        }
+        assert_eq!(text.cached_pipelines(), 4);
+    }
+
+    #[test]
+    fn a_text_run_draws_coverage_inside_its_rect() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(context.device());
+        let frame = render(
+            &context,
+            &mut atlas,
+            vec![PaintOp::Text(run(
+                "Hello",
+                (4.0, 4.0, 100.0, 20.0),
+                whole(),
+            ))],
+        );
+        let inside = lit(&frame, 4, 4, 60, 24);
+        assert!(inside > 40, "only {inside} lit pixels for \"Hello\"");
+        assert!(
+            (4..24).any(|y| (4..60).any(|x| frame.pixel(x, y)[0] >= 200)),
+            "a stem of H is (nearly) fully covered"
+        );
+        assert_eq!(
+            lit(&frame, 0, 30, SIZE.0, SIZE.1),
+            0,
+            "nothing below the line"
+        );
+    }
+
+    #[test]
+    fn no_text_pixels_outside_the_clip_rect() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(context.device());
+        let clip = Rect {
+            x: 12,
+            y: 0,
+            width: 14,
+            height: 16,
+        };
+        let frame = render(
+            &context,
+            &mut atlas,
+            vec![PaintOp::Text(run("Hello", (4.0, 4.0, 100.0, 20.0), clip))],
+        );
+        let total = lit(&frame, 0, 0, SIZE.0, SIZE.1);
+        let inside = lit(&frame, 12, 0, 26, 16);
+        assert!(inside > 0, "some ink survives inside the clip");
+        assert_eq!(total, inside, "no ink outside the clip rect");
+    }
+
+    #[test]
+    fn text_draws_after_its_background_and_under_a_later_popover() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut engine = engine();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let grey = [0.25, 0.25, 0.25, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let label = run("HHHH", (4.0, 4.0, 100.0, 20.0), whole());
+        let ops = vec![PaintOp::Text(label)];
+        let text_ops = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            ops,
+            1.0,
+            |c| c,
+        );
+        let mut gpu = vec![solid(&context, &rect_mesh(0.0, 0.0, 128.0, 32.0), grey)];
+        gpu.extend(text_ops);
+        // A "popover" covering the right half of the label.
+        gpu.push(solid(&context, &rect_mesh(20.0, 0.0, 108.0, 32.0), blue));
+        let frame = render_ops_with_atlas(
+            &context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            SIZE,
+            (128.0, 64.0),
+            &gpu,
+            &atlas,
+        );
+        let white_on_left = (4..24).any(|y| (4..20).any(|x| frame.pixel(x, y)[0] > 200));
+        assert!(white_on_left, "the label draws over its grey background");
+        for y in 0..32 {
+            for x in 20..128 {
+                let [r, g, b, _] = frame.pixel(x, y);
+                assert_eq!(
+                    (r, g, b),
+                    (0, 0, 255),
+                    "popover covers the label at ({x}, {y})"
+                );
+            }
+        }
+        assert!(matches!(gpu.get(1), Some(GpuPaintOp::Text(..))));
+    }
+
+    #[test]
+    fn atlas_reset_on_full_still_draws_the_current_frame() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::with_size(context.device(), 32);
+        let _ = render(
+            &context,
+            &mut atlas,
+            vec![PaintOp::Text(run("MWQ", (4.0, 4.0, 100.0, 20.0), whole()))],
+        );
+        let frame = render(
+            &context,
+            &mut atlas,
+            vec![PaintOp::Text(run("BDKR", (4.0, 4.0, 100.0, 20.0), whole()))],
+        );
+        assert!(atlas.layout().resets() >= 1, "the small atlas really reset");
+        assert!(
+            lit(&frame, 4, 4, 60, 24) > 40,
+            "the post-reset frame still draws"
+        );
+    }
+
+    #[test]
+    fn button_label_pixels_differ_from_the_fill_inside_the_label_rect() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let place = |tree: &mut crate::tree::WidgetTree<crate::widgets::WidgetKind>, id, w, h| {
+            if tree
+                .set_bounds(
+                    id,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: w,
+                        height: h,
+                    },
+                )
+                .is_err()
+            {
+                unreachable!()
+            }
+        };
+        place(&mut tree, root, 128, 64);
+        let Ok(button) = insert_button(&mut tree, root, &scales, "Apply") else {
+            unreachable!()
+        };
+        place(&mut tree, button, 128, 32);
+        let theme = dark_theme();
+        let Ok(ops) = paint_widget_ops(&tree, button, &theme, &scales, 1.0) else {
+            unreachable!()
+        };
+        let without_text: Vec<PaintOp> = ops
+            .iter()
+            .filter(|op| !matches!(op, PaintOp::Text(_)))
+            .cloned()
+            .collect();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let with = render(&context, &mut atlas, ops);
+        let without = render(&context, &mut atlas, without_text);
+        let mut differing = 0;
+        let mut outside_differing = 0;
+        for y in 0..32 {
+            for x in 0..128 {
+                if with.pixel(x, y) != without.pixel(x, y) {
+                    if (40..88).contains(&x) {
+                        differing += 1;
+                    } else {
+                        outside_differing += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            differing > 40,
+            "only {differing} label pixels in the centred label box"
+        );
+        assert_eq!(
+            outside_differing, 0,
+            "a centred 'Apply' stays near the middle"
+        );
+    }
 }

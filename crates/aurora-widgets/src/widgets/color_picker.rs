@@ -2774,7 +2774,7 @@ mod tests {
         ops.iter()
             .filter_map(|op| match op {
                 PaintOp::Gradient(mesh) => Some(mesh),
-                PaintOp::Solid(_) => None,
+                PaintOp::Solid(_) | PaintOp::Text(_) => None,
             })
             .collect()
     }
@@ -2903,6 +2903,7 @@ mod tests {
                         );
                     }
                     PaintOp::Solid((_, color)) => assert_eq!(color.get(3), Some(&alpha)),
+                    PaintOp::Text(run) => unreachable!("a colour picker part drew text {run:?}"),
                 }
             }
         }
@@ -3050,7 +3051,7 @@ mod tests {
         all.iter()
             .filter_map(|op| match op {
                 PaintOp::Solid((mesh, _)) => Some(mesh),
-                PaintOp::Gradient(_) => None,
+                PaintOp::Gradient(_) | PaintOp::Text(_) => None,
             })
             .flat_map(|mesh| mesh.vertices.iter())
             .fold(
@@ -3196,7 +3197,7 @@ mod tests {
                 .iter()
                 .filter_map(|op| match op {
                     PaintOp::Solid(paint) => Some(paint.clone()),
-                    PaintOp::Gradient(_) => None,
+                    PaintOp::Gradient(_) | PaintOp::Text(_) => None,
                 })
                 .collect();
             assert_eq!(solids, ok(paint_widget(&tree, id, &theme, &scales, 1.0)));

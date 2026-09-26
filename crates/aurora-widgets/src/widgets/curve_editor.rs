@@ -2125,6 +2125,7 @@ mod tests {
         .map(|op| match op {
             PaintOp::Solid(paint) => paint,
             PaintOp::Gradient(_) => unreachable!("the editor paints no gradient"),
+            PaintOp::Text(_) => unreachable!("the editor paints no text"),
         })
         .collect()
     }

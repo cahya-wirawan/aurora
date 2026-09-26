@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.131.1`: roughly 145,000 lines across 20 crates, 2,339 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.132.0`: roughly 145,000 lines across 20 crates, 2,397 tests passing (measured, `AURORA_REQUIRE_GPU=1` on an RTX 3090), and the full CI gate green. Widget labels are real text as of 0.132.0 (bundled Inter, a provisional stand-in for the undecided `type.family` token). The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
-Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
+Four crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
 **[PLAN.md](PLAN.md) is the progress tracker** — task-level status per milestone, every `[x]` backed by linked evidence. Check it before starting work, and update the relevant checkbox in the same commit as the work. Its "Where we are" and "Next action" sections are the maintained, current summary; this file's summary is deliberately shorter and goes stale faster, so **PLAN.md wins on any disagreement**. README.md's status paragraph is also kept current, aimed at outside readers.
 
@@ -22,7 +22,7 @@ Five crates are still skeletons holding only a placeholder `crate_name()` and on
 
 Five, all outside the workspace so they can never become dependencies of real code: `vertical-slice` (performance, [FINDINGS](spike/FINDINGS.md) — read before touching tile, render, or brush code), `a11y-ime`, `psd-write`, `raw-icc`, `lgpl-packaging`.
 
-Two constraints from the a11y spike still shape real code: **windows must be created hidden, adapted, then shown** (`accesskit_winit` panics otherwise — this is why `aurora-app` manages windows the way it does), and the text stack sets the toolchain floor (`cosmic-text` needs ≥1.89, which is why the pin is 1.97).
+Two constraints from the a11y spike still shape real code: **windows must be created hidden, adapted, then shown** (`accesskit_winit` panics otherwise — this is why `aurora-app` manages windows the way it does), and the text stack sets the toolchain floor (`cosmic-text` needs ≥1.89, which is why the pin is 1.97). As of 0.132.0 the workspace shapes with `harfrust` and rasterizes with `swash` directly — the engines `cosmic-text` uses internally — rather than depending on `cosmic-text` itself, whose `fontdb` pulls in `ttf-parser` (RUSTSEC-2026-0192); the 1.97 pin is unchanged.
 
 ### The lesson from the last round
 
@@ -132,7 +132,7 @@ device type on every successful creation so a CI log records what was actually
 tested. What it asserts is that a real adapter *exists*, not that any particular
 test body ran — an `#[ignore]`d test still contributes a silent pass.
 
-Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
+Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor; the workspace currently uses `harfrust` + `swash` directly rather than `cosmic-text`, see "Spikes" above, and the pin was not lowered). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
 
 ## Lints worth knowing
 
@@ -140,7 +140,7 @@ The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.131.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.132.0`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
@@ -188,7 +188,7 @@ Rust end to end (edition 2024, stable). `wgpu` + WGSL for GPU across Vulkan/Meta
 
 Two deliberate changes from the original C++ plan: plugins are **WASM via `wasmtime`** (native dylibs can't meet the sandbox requirement), and scripting is **Lua in-process + Python out-of-process over IPC**, with the JavaScript API deferred.
 
-**UI: Aurora builds its own retained-mode widget toolkit on `wgpu`** (PRD §8.3) — no third-party toolkit. Supporting crates: `cosmic-text` (shared by UI fields and canvas text), `winit` (input + platform IME), `accesskit` (accessibility), `rfd` (native dialogs), `aurora-vector` (resolution-independent UI geometry).
+**UI: Aurora builds its own retained-mode widget toolkit on `wgpu`** (PRD §8.3) — no third-party toolkit. Supporting crates: `cosmic-text` (shared by UI fields and canvas text — in practice, as of 0.132.0, its shaping and rasterizing engines `harfrust` + `swash` used directly, since `cosmic-text`'s `fontdb` pulls in `ttf-parser`, RUSTSEC-2026-0192), `winit` (input + platform IME), `accesskit` (accessibility), `rfd` (native dialogs), `aurora-vector` (resolution-independent UI geometry).
 
 The consequence to keep in mind when writing UI code: text editing, IME, accessibility, DPI scaling, native menus, drag & drop, and clipboard are **our** work, not inherited. They are Phase 1 scope and gate the phase — don't defer them as polish.
 

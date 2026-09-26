@@ -37,7 +37,10 @@
 //! per-vertex colour or textures in *this* pipeline: gradients (0.124.0)
 //! are a separate [`GradientPipeline`] drawing a [`GpuColorMesh`], so
 //! the solid path is byte-for-byte what it was. [`draw_paint_ops`]
-//! interleaves both in paint order within one pass. No textures yet.
+//! interleaves both in paint order within one pass — and, since 0.132.0,
+//! glyph runs too: [`TextPipeline`] draws [`GpuGlyphMesh`] quads from an
+//! `R8Unorm` [`GlyphAtlas`], the first texture any widget pipeline samples
+//! (`crate::text_render` has the account).
 //! `aurora_vector::stroke`
 //! already produces a real `Mesh` this pipeline can draw exactly the
 //! same way a fill's `Mesh` is drawn — nothing here is fill-specific —
@@ -74,6 +77,11 @@
 
 use aurora_gpu::{Blend, PipelineCache, PipelineKey};
 use aurora_vector::{ColorMesh, Mesh};
+
+pub use crate::text_render::{
+    AtlasLayout, AtlasSlot, GlyphAtlas, GlyphBatch, GpuGlyphMesh, PendingUpload, TextPipeline,
+    upload_glyph_meshes, upload_paint_ops,
+};
 
 const PATH_SHADER: &str = include_str!("shaders/path.wgsl");
 const LABEL: &str = "path";
@@ -611,16 +619,24 @@ impl std::fmt::Debug for GradientPipeline {
 /// `Gradient`'s vertex colours are never linearized by a caller; see
 /// [`GradientPipeline`].
 #[derive(Debug)]
+///
+/// `Text` (0.132.0) is one run's glyph quads plus its colour, which a
+/// caller linearizes exactly as it does a `Solid`'s. The colour is already
+/// baked into the mesh's vertices by [`upload_paint_ops`]; the field
+/// records it for inspection and is not re-read when drawing.
 pub enum GpuPaintOp {
     Solid(GpuMesh, [f32; 4]),
     Gradient(GpuColorMesh),
+    Text(GpuGlyphMesh, [f32; 4]),
 }
 
 /// Draws `ops` in order within `pass`, switching between `path` and
 /// `gradient` only when consecutive ops differ in kind (a switch resets
 /// the pipeline, which is also why a gradient's bind group is re-set on
-/// every switch back). The gradient bind group is built at most once per
-/// call, and only if `ops` contains a gradient. `viewport_size` is the
+/// every switch back). A `Text` op binds [`TextPipeline`] with one bind
+/// group over `atlas`, which must already hold every glyph those ops use
+/// ([`GlyphAtlas::prepare`]). The gradient and text bind groups are each
+/// built at most once per call, and only if `ops` contains that kind. `viewport_size` is the
 /// target's size in the meshes' own pixel units, as for
 /// [`PathPipeline::bind_group`].
 // Two pipelines, the device/queue pair, and the target's format and size
@@ -630,6 +646,8 @@ pub fn draw_paint_ops<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
     path: &mut PathPipeline,
     gradient: &mut GradientPipeline,
+    text: &mut TextPipeline,
+    atlas: &GlyphAtlas,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
@@ -641,9 +659,11 @@ pub fn draw_paint_ops<'pass>(
         Nothing,
         Solid,
         Gradient,
+        Text,
     }
     let mut bound = Bound::Nothing;
     let mut gradient_bind_group: Option<wgpu::BindGroup> = None;
+    let mut text_bind_group: Option<wgpu::BindGroup> = None;
     for op in ops {
         match op {
             GpuPaintOp::Solid(mesh, color) => {
@@ -664,6 +684,17 @@ pub fn draw_paint_ops<'pass>(
                     bound = Bound::Gradient;
                 }
                 gradient.draw(pass, mesh);
+            }
+            GpuPaintOp::Text(mesh, _) => {
+                if bound != Bound::Text {
+                    pass.set_pipeline(text.pipeline(device, format));
+                    let bind_group = text_bind_group.get_or_insert_with(|| {
+                        text.bind_group(device, queue, viewport_size, atlas)
+                    });
+                    pass.set_bind_group(0, &*bind_group, &[]);
+                    bound = Bound::Text;
+                }
+                text.draw(pass, mesh);
             }
         }
     }
