@@ -4480,9 +4480,17 @@ fn handle_palette_key(
         // shortcut attempt, not text -- left unhandled rather than
         // typed literally, the same restraint a real text field would
         // apply.
-        Key::Character(_)
+        // `translate_key` maps the space bar to `NamedKey::Space`, never
+        // `Key::Character(' ')`, so it needs its own arm here or a
+        // multi-word query ("widget gallery") silently loses its spaces
+        // and matches nothing (0.131.1).
+        Key::Character(_) | Key::Named(NamedKey::Space)
             if !chord.modifiers.control && !chord.modifiers.alt && !chord.modifiers.meta =>
         {
+            let text = match chord.key {
+                Key::Named(NamedKey::Space) => Some(text.unwrap_or(" ")),
+                _ => text,
+            };
             if let (Ok(state), Some(text)) = (command_palette_state(&workspace.tree, root), text) {
                 let query = format!("{}{text}", state.query());
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
@@ -21381,6 +21389,52 @@ mod tests {
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
         );
+    }
+
+    #[test]
+    fn a_space_typed_into_the_palette_keeps_a_multi_word_query_matching() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard::default();
+        let mut file_dialog = FakeFileDialog::default();
+        for ch in "widget gallery".chars() {
+            // What `translate_key` really produces: the space bar is a
+            // named key, every other letter a character.
+            let key = if ch == ' ' {
+                Key::Named(NamedKey::Space)
+            } else {
+                Key::Character(ch)
+            };
+            handle_palette_key(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                KeyChord::new(Modifiers::none(), key),
+                Some(&ch.to_string()),
+                &mut clipboard,
+                &mut file_dialog,
+            );
+        }
+        let Some(root) = palette else {
+            unreachable!("typing must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.query(), "widget gallery");
+        let picked = handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+        assert_eq!(picked, Some(ActivatedCommand::ToggleWidgetGallery));
     }
 
     #[test]

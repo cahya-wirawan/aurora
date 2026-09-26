@@ -3712,6 +3712,16 @@ check licenses` clean with the new `toml` dependency.
   release on disable, control filter removed, `Wait` → `WaitUntil(now)`,
   deadline read before tick, character suppression removed) were each
   killed, files restored sha256-identical. Judge: PASS, 0.92.
+  **0.131.1 (bug fix, found by the first human run).** Typing a
+  multi-word query into the command palette ("widget gallery") matched
+  nothing: `translate_key` maps the space bar to `NamedKey::Space`, and
+  `handle_palette_key` only appended `Key::Character`, so the query became
+  `widgetgallery` and Enter closed the palette with no selection. The
+  palette now appends a space for an unmodified `Space`. Pre-existing since
+  the palette landed, not introduced by the gallery. New test
+  `a_space_typed_into_the_palette_keeps_a_multi_word_query_matching`
+  (types the query as real key events and asserts Enter toggles the
+  gallery) fails with the fix removed.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
