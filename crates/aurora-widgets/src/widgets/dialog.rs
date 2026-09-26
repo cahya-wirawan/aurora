@@ -75,12 +75,11 @@
 //! real, and identical to what a `Panel` already gets in that
 //! deliberately close-valued theme.
 //!
-//! What is genuinely still missing: this crate draws no glyphs
-//! anywhere, so the **title and the message are still invisible** —
-//! the message node is deliberately still a
-//! [`WidgetKind::Container`] (it has nothing to draw but the text
-//! nothing can shape yet), and both strings reach the accessibility
-//! tree only. There is also **no scrim/backdrop**: nothing dims or
+//! What is genuinely still missing: the **title is still invisible**
+//! (it has no layout slot; it reaches the accessibility tree only). The
+//! **message is drawn** since 0.133.0 — `crate::text::text_runs` draws a
+//! `Role::Label` container's label under a `Dialog` in `text.primary`,
+//! on one line, clipped, not wrapped. There is also **no scrim/backdrop**: nothing dims or
 //! covers the rest of the window behind a modal dialog. That is
 //! explicitly out of scope here rather than forgotten — a scrim is a
 //! window-sized surface owned by whoever hosts the dialog, and giving

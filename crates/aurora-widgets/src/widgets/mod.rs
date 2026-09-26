@@ -153,6 +153,7 @@ mod scrollbar;
 mod slider;
 mod tab_bar;
 mod text_field;
+pub(crate) use text_field::floor_char_boundary;
 mod tooltip;
 mod tree_view;
 

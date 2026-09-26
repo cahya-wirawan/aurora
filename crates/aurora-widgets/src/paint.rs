@@ -21,15 +21,14 @@
 //! widget labels, 0.132.0 — see "Text" below); `Toggled::True` and
 //! `Toggled::Mixed` currently render identically (both
 //! `accent.primary`) since nothing yet exists to tell them apart
-//! visually. `TextField` paints its own background only — no content,
-//! no caret, no selection highlight, no composition underline
-//! (`composition_segments`' own byte-range *data* now *has* a pixel
-//! position to map to — `aurora_text::ShapedLine::caret_x`, 0.132.0 —
-//! but wiring the field's content and caret is 0.133.0's work; `content`/`cursor`/`selection_anchor`/`composition`
-//! don't affect its paint at all today, only `disabled` does).
-//! `CommandPalette` paints its own outer panel only — its query field's
-//! own text still isn't drawn (the same not-yet-wired gap `TextField`
-//! has). Its result rows now are painted, though: each is a
+//! visually. `TextField`'s own solids are its background and outline
+//! only; its content, caret, selection highlight and IME composition
+//! underlines (0.133.0) are one [`PaintOp::Text`] run carrying a
+//! `crate::text::FieldDecor`, resolved into glyph passes and solid rects
+//! by `crate::text::resolve_run` (see "Text" below).
+//! `CommandPalette` paints its own outer panel; its body's first child,
+//! the query strip, draws the query as text (0.133.0). Its result rows
+//! are painted too: each is a
 //! real `WidgetKind::ListRow` (`command_palette::rebuild_rows`), and
 //! [`paint_list_row`] highlights the selected one with `accent.primary`
 //! — an unselected row still paints nothing, the same "nothing to
@@ -63,14 +62,17 @@
 //! `Ok(vec![])` too — a real, deliberate "nothing to
 //! paint," not an error.
 //!
-//! **Text (0.132.0).** [`paint_widget_ops_focused`] appends a widget's
-//! label as a [`PaintOp::Text`] run after its own shapes and before its
-//! focus ring (`crate::text::text_runs`): `Button`, `Tab`, `TreeItem`, a
-//! `Menu`'s action rows, a `Dropdown`'s current value and an open
-//! dropdown list's option rows. Not yet: `Checkbox` (its box *is* its
-//! layout box), `TextField` content, the command palette's query and
-//! rows, tooltip and dialog text. [`paint_widget`] itself still returns
-//! solids only.
+//! **Text (0.132.0, 0.133.0).** [`paint_widget_ops_frame`] (and
+//! [`paint_widget_ops_focused`], which is it with no focused widget)
+//! appends a widget's text as a [`PaintOp::Text`] run after its own
+//! shapes and before its focus ring (`crate::text::text_runs`): `Button`,
+//! `Tab`, `TreeItem`, a `Menu`'s action rows, a `Dropdown`'s current value
+//! and an open dropdown list's option rows (0.132.0); `TextField` content
+//! with its caret (focused only), selection and IME preedit underlines,
+//! the command palette's query strip and result rows, a tooltip's text,
+//! and a dialog's message (0.133.0). Not yet: `Checkbox` (its box *is*
+//! its layout box) and a dialog's title (no layout slot).
+//! [`paint_widget`] itself still returns solids only.
 //!
 //! Every kind's own geometry is built from bounds that
 //! [`clip_to_clipping_ancestors`] has already intersected with any
@@ -235,6 +237,29 @@ pub fn paint_widget_ops_focused(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<PaintOp>, WidgetError> {
+    paint_widget_ops_frame(tree, id, focus, None, theme, scales, scale_factor)
+}
+
+/// [`paint_widget_ops_focused`] plus the widget holding keyboard focus
+/// (0.133.0), which a text field needs to draw its caret and the command
+/// palette's query strip needs to draw its own. `focused` is
+/// `FocusManager::focused()` — **any** focus origin, pointer included
+/// (a caret is where typing goes, not a keyboard-only indicator like the
+/// ring). [`paint_widget_ops_focused`] is exactly this with `focused =
+/// None`: no caret anywhere, everything else identical.
+///
+/// # Errors
+///
+/// Exactly [`paint_widget_ops_focused`]'s.
+pub fn paint_widget_ops_frame(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    focus: Option<FocusPaint>,
+    focused: Option<WidgetId>,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
     let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
     let gradients = match tree.payload(id) {
         Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
@@ -251,7 +276,7 @@ pub fn paint_widget_ops_focused(
         && let Some(clip) = clip_to_clipping_ancestors(tree, id, bounds)
     {
         ops.extend(
-            text_runs(tree, id, bounds, clip, theme, scales)
+            text_runs(tree, id, bounds, clip, focused, theme, scales)
                 .into_iter()
                 .map(PaintOp::Text),
         );
@@ -941,14 +966,18 @@ fn paint_color_picker_markers(
 /// window's own DPI scale factor (`winit::window::Window::scale_factor`)
 /// — see [`aurora_vector::tolerance_for_scale_factor`] for why this
 /// stroke's tolerance depends on it.
+/// The logical stroke width of [`control_outline`] (`TextField`,
+/// `Checkbox`, ...), centred on the control's own bounds edge.
+/// `crate::text` insets a text field's decor clip by it so a caret or
+/// selection never paints over the outline.
+pub(crate) const CONTROL_BORDER_WIDTH: f32 = 1.0;
+
 fn control_outline(
     path: &Path,
     theme: &Theme,
     alpha: f32,
     scale_factor: f32,
 ) -> Result<Option<Paint>, WidgetError> {
-    const CONTROL_BORDER_WIDTH: f32 = 1.0;
-
     if theme.border.control_opacity <= 0.0 {
         return Ok(None);
     }
@@ -1433,8 +1462,8 @@ fn paint_text_field(
 /// modals, dialogs" — a command palette is the former, a floating,
 /// dismissable popover, not a blocking modal.
 ///
-/// Still a real, honest gap: the query field's own text isn't drawn
-/// (no text shaping in this crate yet, the same gap `TextField` has).
+/// The query's text is drawn by the body's query strip (0.133.0,
+/// `crate::text::text_runs`), not here.
 fn paint_command_palette(
     bounds: Rect,
     theme: &Theme,
@@ -3599,7 +3628,8 @@ mod tests {
         let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
-        let Some(&second_row) = rows.get(1) else {
+        // `rows[0]` is the query strip (0.133.0).
+        let Some(&second_row) = rows.get(2) else {
             unreachable!("two commands were inserted, so a second row exists");
         };
         let theme = dark_theme();

@@ -1079,6 +1079,7 @@ mod text {
             rect,
             align: HAlign::Start,
             clip,
+            field: None,
         }
     }
 
@@ -1563,5 +1564,332 @@ mod text {
             outside_differing, 0,
             "a centred 'Apply' stays near the middle"
         );
+    }
+
+    // ---- Text fields (0.133.0) ----------------------------------------
+
+    /// `to_srgb_f32` of a token, quantized the way an `Rgba8Unorm` target
+    /// stores it.
+    fn token_u8(color: aurora_theme::Color) -> [u8; 3] {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        color
+            .to_srgb_f32()
+            .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+    }
+
+    fn near(pixel: [u8; 4], want: [u8; 3], tolerance: u8) -> bool {
+        pixel
+            .iter()
+            .zip(want)
+            .all(|(have, want)| have.abs_diff(want) <= tolerance)
+    }
+
+    /// A focused text field holding `content`, laid out at logical
+    /// (4, 4, 56, 24), painted by `paint_widget_ops_frame` at `scale`,
+    /// rendered, and resolved again on the CPU for the expected geometry.
+    fn render_field(
+        context: &aurora_gpu::GpuContext,
+        content: &str,
+        cursor: usize,
+        anchor: Option<usize>,
+        scale: f32,
+    ) -> (Frame, Vec<crate::text::Resolved>, [i32; 4]) {
+        use crate::widgets::{insert_text_field, with_text_field_mut};
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let theme = dark_theme();
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        if tree.set_bounds(root, rect(0, 0, 64, 32)).is_err() {
+            unreachable!()
+        }
+        let Ok(id) = insert_text_field(&mut tree, root, &scales, "Field", content) else {
+            unreachable!()
+        };
+        // The field's real laid-out height (`insert_text_field`'s style
+        // is `row_height` tall), not an arbitrary taller box (C3).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let height = crate::widgets::row_height(&scales) as u32;
+        if tree.set_bounds(id, rect(4, 4, 56, height)).is_err()
+            || with_text_field_mut(&mut tree, id, |s| {
+                s.cursor = cursor;
+                s.selection_anchor = anchor;
+            })
+            .is_err()
+        {
+            unreachable!()
+        }
+        let Ok(ops) =
+            crate::paint::paint_widget_ops_frame(&tree, id, None, Some(id), &theme, &scales, scale)
+        else {
+            unreachable!()
+        };
+        let mut engine = engine();
+        let pieces: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PaintOp::Text(run) => Some(crate::text::resolve_run(&mut engine, run, scale)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let mut atlas = GlyphAtlas::new(context.device());
+        let gpu = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            ops,
+            scale,
+            |c| c,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let viewport = (SIZE.0 as f32 / scale, SIZE.1 as f32 / scale);
+        let frame = render_ops_with_atlas(
+            context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            SIZE,
+            viewport,
+            &gpu,
+            &atlas,
+        );
+        let pad = scales.spacing.sm;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        let clip = [
+            ((4 + pad) as f32 * scale).round() as i32,
+            // Inset by the 1 px control outline vertically.
+            (5.0 * scale).round() as i32,
+            ((60 - pad) as f32 * scale).round() as i32,
+            ((4 + height - 1) as f32 * scale).round() as i32,
+        ];
+        (frame, pieces, clip)
+    }
+
+    fn last_rect(pieces: &[crate::text::Resolved]) -> [i32; 4] {
+        match pieces.last() {
+            Some(crate::text::Resolved::Rect(rect, _)) => *rect,
+            _ => unreachable!("the caret is the last piece"),
+        }
+    }
+
+    fn pixels(rect: [i32; 4]) -> impl Iterator<Item = (u32, u32)> {
+        let [x0, y0, x1, y1] = rect.map(|v| u32::try_from(v).unwrap_or(0));
+        (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y)))
+    }
+
+    /// The caret really reaches the screen: every pixel of the caret's
+    /// column (at the physical x `resolve_run` computes from the shaped
+    /// line's `caret_x`) is `text.primary`, and the column just right of
+    /// it — past the end of the line — is the field's `surface.sunken`
+    /// fill, at scale 1 and 2.
+    #[test]
+    fn a_focused_fields_caret_column_is_text_primary_on_surface_sunken() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let primary = token_u8(theme.text.primary);
+        let sunken = token_u8(theme.surface.sunken);
+        for scale in [1.0_f32, 2.0] {
+            let (frame, pieces, _) = render_field(&context, "Hi", 2, None, scale);
+            let caret = last_rect(&pieces);
+            #[allow(clippy::cast_possible_truncation)]
+            let width = (scale.round()) as i32;
+            assert_eq!(caret[2] - caret[0], width, "scale {scale}");
+            let mut count = 0;
+            for (x, y) in pixels(caret) {
+                count += 1;
+                assert!(
+                    near(frame.pixel(x, y), primary, 2),
+                    "caret pixel ({x},{y}) at scale {scale}: {:?}",
+                    frame.pixel(x, y)
+                );
+            }
+            assert!(count >= 10, "a caret of real height: {count}");
+            for (x, y) in pixels([caret[2], caret[1], caret[2] + 1, caret[3]]) {
+                assert!(
+                    near(frame.pixel(x, y), sunken, 2),
+                    "right of the caret ({x},{y}) at scale {scale}: {:?}",
+                    frame.pixel(x, y)
+                );
+            }
+        }
+    }
+
+    /// Inside the selection highlight every pixel lies on the
+    /// `accent.primary` → `text.on_accent` blend line (the fill, or the
+    /// selected glyphs redrawn over it), some of them are inked, and the
+    /// highlight really is `accent.primary` where there is no ink.
+    #[test]
+    fn a_selection_is_accent_primary_with_on_accent_glyphs() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let accent = token_u8(theme.accent.primary).map(f32::from);
+        let on_accent = token_u8(theme.text.on_accent).map(f32::from);
+        for scale in [1.0_f32, 2.0] {
+            let (frame, pieces, _) = render_field(&context, "Hello", 4, Some(0), scale);
+            let Some(&crate::text::Resolved::Rect(fill, _)) = pieces.get(1) else {
+                unreachable!("the selection highlight follows the line");
+            };
+            let (mut plain, mut inked) = (0, 0);
+            for (x, y) in pixels(fill) {
+                let [red, green, blue, _] = frame.pixel(x, y);
+                let pixel = [f32::from(red), f32::from(green), f32::from(blue)];
+                // Distance from the accent→on_accent segment.
+                let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+                let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+                let d = sub(on_accent, accent);
+                let v = sub(pixel, accent);
+                let t = (dot(v, d) / dot(d, d)).clamp(0.0, 1.0);
+                let rest = sub(v, d.map(|c| c * t));
+                let off = dot(rest, rest).sqrt();
+                assert!(
+                    off <= 6.0,
+                    "({x},{y}) at {scale} is off the blend line: {pixel:?}"
+                );
+                if t < 0.02 {
+                    plain += 1;
+                } else if t > 0.3 {
+                    inked += 1;
+                }
+            }
+            assert!(
+                plain > 0 && inked > 0,
+                "scale {scale}: {plain} plain, {inked} inked"
+            );
+        }
+    }
+
+    /// A line wider than its field is scrolled so the caret at its end
+    /// sits inside the inner box's right edge, and no pixel left of the
+    /// inner box (the field's own padding) is inked.
+    #[test]
+    fn an_overflowing_field_shows_its_caret_inside_and_no_ink_in_its_padding() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let sunken = token_u8(theme.surface.sunken);
+        let text = "The quick brown fox jumps";
+        for scale in [1.0_f32, 2.0] {
+            let (frame, pieces, clip) = render_field(&context, text, text.len(), None, scale);
+            let caret = last_rect(&pieces);
+            assert!(
+                caret[2] <= clip[2] && caret[0] >= clip[0],
+                "{caret:?} in {clip:?}"
+            );
+            assert!(
+                caret[2] >= clip[2] - (2.0 * scale) as i32,
+                "pinned to the right edge: {caret:?} {clip:?}"
+            );
+            // The padding strip left of the inner box, inside the field's
+            // outline: only the field's own fill.
+            let inset = (2.0 * scale) as i32;
+            for (x, y) in pixels([clip[0] - inset, caret[1], clip[0], caret[3]]) {
+                assert!(
+                    near(frame.pixel(x, y), sunken, 2),
+                    "padding ({x},{y}) at {scale}: {:?}",
+                    frame.pixel(x, y)
+                );
+            }
+            for (x, y) in pixels(caret) {
+                assert!(near(frame.pixel(x, y), token_u8(theme.text.primary), 2));
+            }
+        }
+    }
+
+    /// M18b: `upload_paint_ops` makes the whole frame's glyphs resident in
+    /// ONE `prepare`. A per-run prepare would, on a frame whose second run
+    /// overflows an atlas still holding the previous frame's glyphs,
+    /// reset the atlas and strand the first run's glyphs; with one
+    /// prepare every run's glyph maps to a slot and draws.
+    #[test]
+    fn one_prepare_per_frame_keeps_every_runs_glyphs_across_an_atlas_reset() {
+        use crate::render::AtlasLayout;
+        use aurora_text::GlyphKey;
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut engine = engine();
+        let style = aurora_text::TextStyle {
+            size_px: 40.0,
+            ..label_style(&test_scales())
+        };
+        let run = |text: &str| TextRun {
+            text: text.to_owned(),
+            style,
+            color: WHITE,
+            rect: (0.0, 0.0, 2000.0, 60.0),
+            align: HAlign::Start,
+            clip: Rect {
+                x: 0,
+                y: 0,
+                width: 2000,
+                height: 60,
+            },
+            field: None,
+        };
+        let (stale, a, b) = ("ABCDEFGHIJKLMNOP", "abcdefgh", "qrstuvwxyz");
+        let keys = |engine: &mut TextEngine, text: &str| -> Vec<GlyphKey> {
+            resolve_text(engine, &run(text), 1.0)
+                .iter()
+                .map(|q| q.key)
+                .collect()
+        };
+        let (ks, ka, kb) = (
+            keys(&mut engine, stale),
+            keys(&mut engine, a),
+            keys(&mut engine, b),
+        );
+        let kab: Vec<GlyphKey> = ka.iter().chain(&kb).copied().collect();
+        let resident = |l: &AtlasLayout, k: &[GlyphKey]| k.iter().all(|k| l.slot(*k).is_some());
+        // The smallest atlas where: the stale frame fits; the stale
+        // frame plus run A fits (so a per-run prepare places A without
+        // resetting); run B then does not (so a per-run prepare resets
+        // and evicts A); yet A and B together fit a fresh atlas.
+        let size = (64..=2048).step_by(8).find(|&size| {
+            let mut per_run = AtlasLayout::new(size);
+            let fits_stale = per_run.place_all(&mut engine, &ks).1;
+            let fits_a = per_run.place_all(&mut engine, &ka).1 && resident(&per_run, &ks);
+            let _ = per_run.place_all(&mut engine, &kb);
+            let a_evicted = !resident(&per_run, &ka);
+            let mut fresh = AtlasLayout::new(size);
+            fits_stale && fits_a && a_evicted && fresh.place_all(&mut engine, &kab).1
+        });
+        let Some(size) = size else {
+            unreachable!("some atlas size separates per-run from per-frame prepare")
+        };
+        let mut atlas = GlyphAtlas::with_size(context.device(), size);
+        let upload = |engine: &mut TextEngine, atlas: &mut GlyphAtlas, texts: &[&str]| {
+            upload_paint_ops(
+                context.device(),
+                context.queue(),
+                engine,
+                atlas,
+                texts.iter().map(|t| PaintOp::Text(run(t))).collect(),
+                1.0,
+                |c| c,
+            )
+        };
+        let _ = upload(&mut engine, &mut atlas, &[stale]);
+        assert!(resident(atlas.layout(), &ks));
+        let ops = upload(&mut engine, &mut atlas, &[a, b]);
+        let counts: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                GpuPaintOp::Text(mesh, _) => Some(mesh.index_count()),
+                _ => None,
+            })
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = vec![ka.len() as u32 * 6, kb.len() as u32 * 6];
+        assert_eq!(counts, expected, "atlas {size}: every run's glyphs draw");
+        assert!(resident(atlas.layout(), &kab));
     }
 }

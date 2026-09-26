@@ -6247,6 +6247,18 @@ fn command_palette_style_positions_the_panel_with_a_real_margin() {
 /// already confirmed) at the panel's centre and one pixel inside its
 /// left edge (`x=33`) — the margin boundary lands exactly where
 /// `COMMAND_PALETTE_MARGIN` predicts, same as every prior bless.
+///
+/// **Blessed a fifth time, 0.133.0** (with its four other-theme
+/// siblings): the palette's body gained a *query strip* as its first
+/// child (`CommandPaletteState::query_strip`), sharing the body's height
+/// with the one result row, so the `accent.primary` row now fills only
+/// the panel's lower half. Decoded from the new golden down its centre
+/// column: `NEUTRAL_CLEAR` to `y=31`, `surface.raised` `[49,49,54]` (the
+/// strip, on the panel fill) for `y=32..96`, `accent.primary`
+/// `[120,172,255]` (the row) for `y=96..160`, `NEUTRAL_CLEAR` after —
+/// and still `x=31` clear / `x=33` accent on the row. Text is filtered
+/// out of every golden, so the strip's query and the row's title are
+/// not in it.
 #[test]
 fn command_palette_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {

@@ -42,7 +42,9 @@ use aurora_text::{GlyphKey, ShelfPacker, TextEngine};
 
 use crate::paint::PaintOp;
 use crate::render::{GpuColorMesh, GpuMesh, GpuPaintOp};
-use crate::text::{QuadGlyph, resolve_text};
+use aurora_vector::{Mesh, Point};
+
+use crate::text::{QuadGlyph, Resolved, resolve_run};
 
 const TEXT_SHADER: &str = include_str!("shaders/text.wgsl");
 const LABEL: &str = "text";
@@ -248,7 +250,11 @@ impl AtlasLayout {
 }
 
 /// Uploads a frame's [`PaintOp`]s, in order, as [`GpuPaintOp`]s: every
-/// text run is resolved ([`resolve_text`]), *all* of the frame's glyphs are
+/// text run is resolved ([`resolve_run`] — one run can yield several
+/// glyph passes and solid rects, e.g. a text field's selection and caret,
+/// each rect uploading as an ordinary [`GpuPaintOp::Solid`] via
+/// `rect_mesh` and so converted by `color` like any solid), *all* of
+/// the frame's glyphs are
 /// made resident in `atlas` in one [`GlyphAtlas::prepare`], and only then
 /// are the glyph meshes built — so an atlas reset can never strand a mesh
 /// built earlier in the same frame. `color` converts a `Solid`'s or a
@@ -272,14 +278,29 @@ pub fn upload_paint_ops(
     }
     let staged: Vec<Staged> = ops
         .into_iter()
-        .map(|op| match op {
+        .flat_map(|op| match op {
             PaintOp::Solid((mesh, c)) => {
-                Staged::Solid(GpuMesh::upload(device, queue, &mesh), color(c))
+                vec![Staged::Solid(
+                    GpuMesh::upload(device, queue, &mesh),
+                    color(c),
+                )]
             }
-            PaintOp::Gradient(mesh) => Staged::Gradient(GpuColorMesh::upload(device, queue, &mesh)),
-            PaintOp::Text(run) => {
-                Staged::Text(resolve_text(engine, &run, scale_factor), color(run.color))
+            PaintOp::Gradient(mesh) => {
+                vec![Staged::Gradient(GpuColorMesh::upload(device, queue, &mesh))]
             }
+            // One run can be several ops (a field's line, selection,
+            // selected glyphs, underlines, caret): each rect is an
+            // ordinary solid, drawn by the path pipeline in paint order.
+            PaintOp::Text(run) => resolve_run(engine, &run, scale_factor)
+                .into_iter()
+                .map(|piece| match piece {
+                    Resolved::Glyphs(quads, c) => Staged::Text(quads, color(c)),
+                    Resolved::Rect(rect, c) => Staged::Solid(
+                        GpuMesh::upload(device, queue, &rect_mesh(rect, scale_factor)),
+                        color(c),
+                    ),
+                })
+                .collect(),
         })
         .collect();
     let all_quads: Vec<QuadGlyph> = staged
@@ -312,6 +333,30 @@ pub fn upload_paint_ops(
                 .map(|mesh| GpuPaintOp::Text(mesh, c)),
         })
         .collect()
+}
+
+/// A two-triangle mesh covering physical rect `[x0, y0, x1, y1]`, its
+/// vertices in logical px (physical ÷ `scale_factor`, like
+/// [`AtlasLayout::mesh_data`]'s), so it rasterizes onto exactly those
+/// whole pixels.
+#[must_use]
+pub fn rect_mesh(rect: [i32; 4], scale_factor: f32) -> Mesh {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let [x0, y0, x1, y1] = rect.map(|v| v as f32 / scale);
+    Mesh {
+        vertices: vec![
+            Point { x: x0, y: y0 },
+            Point { x: x1, y: y0 },
+            Point { x: x1, y: y1 },
+            Point { x: x0, y: y1 },
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
 }
 
 /// One frame's glyph geometry, every run packed into one vertex and one
@@ -775,6 +820,7 @@ mod tests {
                 width: 400,
                 height: 20,
             },
+            field: None,
         };
         resolve_text(engine, &run, scale)
     }
