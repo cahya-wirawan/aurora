@@ -21,8 +21,21 @@
 //! matching) — real, separate follow-on work if a plain substring match
 //! turns out not to be good enough in practice.
 //!
-//! **No rendering**: same boundary every widget in this crate keeps —
-//! layout + accessibility content only.
+//! **Rendering** lives in `crate::paint`/`crate::text`, like every
+//! widget's: the root paints its panel, and since 0.133.0 the body's
+//! first child — a presentational *query strip*
+//! ([`CommandPaletteState::query_strip`]) sharing the body's height with
+//! the rows — draws the typed query with a caret at its end, and each
+//! result row draws its command's title
+//! ([`CommandPaletteState::row_title`]). With many results every row
+//! (and the strip) gets an even share of the body's height, which can
+//! fall below one text line — the text is then clipped, not scrolled. This
+//! includes the query strip itself (0.133.0 review, C5): it is a flex
+//! sibling of the rows inside the `ListBox`, so it shrinks as the result
+//! count grows. Moving it out of the body, as a fixed row-height sibling,
+//! is a known follow-up (it changes every committed palette golden), not
+//! done in 0.133.0. The strip's caret shows while focus is anywhere
+//! within the palette (the palette itself or one of its rows).
 
 use accesskit::{Action, Node, Role};
 use taffy::style_helpers::{auto, percent};
@@ -74,6 +87,8 @@ impl CommandEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandPaletteState {
     body: WidgetId,
+    /// The body's first child, drawing the query (0.133.0).
+    query_strip: WidgetId,
     commands: Vec<CommandEntry>,
     query: String,
     /// Indices into `commands` that matched the current `query`, in
@@ -126,6 +141,31 @@ impl CommandPaletteState {
     #[must_use]
     pub fn body(&self) -> WidgetId {
         self.body
+    }
+
+    /// The query strip: the body's first child, sharing the body's
+    /// height with the rows (the same `flex_grow` share each row gets) and
+    /// drawing the query text with a caret at its end. It stays when no
+    /// command matches (then it has the whole body).
+    #[must_use]
+    pub fn query_strip(&self) -> WidgetId {
+        self.query_strip
+    }
+
+    /// The result rows, in display order (the body's children after the
+    /// query strip).
+    #[must_use]
+    pub fn rows(&self) -> &[WidgetId] {
+        &self.rows
+    }
+
+    /// The title of the command result row `row` shows, or `None` if
+    /// `row` is not one of this palette's current rows.
+    #[must_use]
+    pub fn row_title(&self, row: WidgetId) -> Option<&str> {
+        let position = self.rows.iter().position(|id| *id == row)?;
+        let &command = self.filtered.get(position)?;
+        self.commands.get(command).map(|entry| entry.title.as_str())
     }
 }
 
@@ -209,12 +249,21 @@ pub fn insert_command_palette(
     let mut body_node = Node::new(Role::ListBox);
     body_node.set_label("Results");
     let body = tree.insert(root, body_style(), body_node, WidgetKind::Container)?;
+    // Presentational: the root's own `Role::TextInput` value already is
+    // the query, so a labelled strip would announce it twice.
+    let query_strip = tree.insert(
+        body,
+        row_style(),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
 
     let Some(payload) = tree.payload_mut(root) else {
         unreachable!("root was just inserted above");
     };
     *payload = WidgetKind::CommandPalette(CommandPaletteState {
         body,
+        query_strip,
         commands,
         query: String::new(),
         filtered: Vec::new(),
@@ -279,6 +328,7 @@ fn rebuild_rows(
 ) -> Result<(), WidgetError> {
     let current = state(tree, root)?;
     let body = current.body;
+    let query_strip = current.query_strip;
     let commands = current.commands.clone();
     let old_rows = current.rows.clone();
 
@@ -314,6 +364,8 @@ fn rebuild_rows(
     }
 
     tree.set_accessibility(root, root_node(&query))?;
+    // The strip draws the query: repaint it.
+    tree.mark_dirty(query_strip)?;
 
     let Some(WidgetKind::CommandPalette(state)) = tree.payload_mut(root) else {
         unreachable!("state(tree, root) above already confirmed this is a command palette");
@@ -427,7 +479,7 @@ mod tests {
         assert_eq!(state.results().len(), 3);
         assert_eq!(state.selected().map(|c| c.id.as_str()), Some("view.layers"));
 
-        let Some(rows) = tree.children(state.body()) else {
+        let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
             unreachable!("just inserted");
         };
         assert_eq!(rows.len(), 3);
@@ -496,7 +548,11 @@ mod tests {
         };
         assert!(state.results().is_empty());
         assert_eq!(state.selected(), None);
-        assert_eq!(tree.children(state.body()), Some([].as_slice()));
+        // Only the query strip is left: it stays visible with no results.
+        assert_eq!(
+            tree.children(state.body()),
+            Some([state.query_strip()].as_slice())
+        );
     }
 
     #[test]
@@ -510,14 +566,15 @@ mod tests {
             Ok(state) => state.body(),
             Err(err) => unreachable!("{err:?}"),
         };
-        assert_eq!(tree.children(body).map(<[_]>::len), Some(3));
+        // The query strip plus one row per result.
+        assert_eq!(tree.children(body).map(<[_]>::len), Some(4));
 
         if let Err(err) = set_command_palette_query(&mut tree, palette, "focus") {
             unreachable!("{err:?}");
         }
         // "Undo" doesn't match "focus" -- its row must be gone, not just
         // unlisted in `results()`.
-        assert_eq!(tree.children(body).map(<[_]>::len), Some(2));
+        assert_eq!(tree.children(body).map(<[_]>::len), Some(3));
     }
 
     #[test]
@@ -575,7 +632,7 @@ mod tests {
                 Ok(state) => state,
                 Err(err) => unreachable!("{err:?}"),
             };
-            let Some(rows) = tree.children(state.body()) else {
+            let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
                 unreachable!("just inserted");
             };
             let (Some(&a), Some(&b)) = (rows.first(), rows.get(1)) else {
@@ -634,7 +691,7 @@ mod tests {
             Ok(state) => state.body(),
             Err(err) => unreachable!("{err:?}"),
         };
-        let Some(rows) = tree.children(body) else {
+        let Some(rows) = tree.children(body).and_then(|c| c.get(1..)) else {
             unreachable!("just inserted");
         };
         let (Some(&first), Some(&second)) = (rows.first(), rows.get(1)) else {
@@ -668,7 +725,7 @@ mod tests {
                 Ok(state) => state,
                 Err(err) => unreachable!("{err:?}"),
             };
-            let Some(rows) = tree.children(state.body()) else {
+            let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
                 unreachable!("just inserted");
             };
             let (Some(&a), Some(&b)) = (rows.first(), rows.get(1)) else {
@@ -737,7 +794,11 @@ mod tests {
         let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
-        assert_eq!(rows.len(), 3, "all 3 commands match the empty query");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the query strip plus all 3 commands matching the empty query"
+        );
 
         let mut previous_bottom = None;
         for &row in rows {

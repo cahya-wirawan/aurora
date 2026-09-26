@@ -26,7 +26,18 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-26, 0.132.0): real text rendering.** Widget labels
+**Latest (2026-09-26, 0.133.0): text round 2 — editable text.** A text
+field now draws its content, a caret while focused (any focus origin),
+its selection (`accent.primary` highlight, selected glyphs in
+`text.on_accent`) and IME preedit underlines, scrolled to keep the caret
+visible; the command palette draws its typed query (a new query strip)
+and its result titles; tooltips and dialog messages draw their text.
+Caret width/colour are provisional, flagged to the design owner. The
+user confirmed on macOS (2026-09-26) that 0.132.0's widget labels are
+visible — visibility only; crispness/HiDPI not assessed. Details and
+disclosures: M1.7's 0.133.0 entry.
+
+**Previously (2026-09-26, 0.132.0): real text rendering.** Widget labels
 (buttons, tabs, tree rows, menu rows, dropdown values and open options)
 are drawn as real glyphs: `aurora-text` is no longer a skeleton — it
 shapes with `harfrust` and rasterizes with `swash` a bundled, provisional
@@ -3862,6 +3873,148 @@ check licenses` clean with the new `toml` dependency.
   `DropdownList` and `Menu` arms of `row_label`, a menu row ignoring
   `enabled`, and the shader ignoring coverage), all now killed, files
   restored sha256-identical. Judge: PASS, 0.91.
+
+  **Text round 2, landed 2026-09-26 (0.133.0).** **User confirmation
+  first:** Cahya confirmed on macOS on 2026-09-26 that 0.132.0's widget
+  labels are visible — visibility only; crispness/HiDPI was not
+  assessed. **What now draws text:** a `TextField`'s content (always), a
+  caret at the cursor while it holds focus (`FocusManager::focused()`,
+  any origin — pointer focus included) and is enabled, its selection
+  (`accent.primary` highlight, the selected glyphs redrawn over it in
+  `text.on_accent`, gated 4.5:1), and an IME preedit spliced in at the
+  cursor with `Plain` (1 logical px) / `Target` (2 logical px)
+  underlines in `text.primary`, the caret at the preedit's end; the
+  command palette's typed query, in a new *query strip* (the body's
+  first child, a presentational `Role::GenericContainer` because the
+  palette root's `TextInput` value already carries the query) with a
+  caret at its end while the palette is focused, visible with zero
+  results; each palette result row's title (`text.on_accent` when
+  selected); a tooltip's text (read from its accessibility label, the
+  one copy `Tooltip::set_text` keeps current, in `type.size.xs` — the
+  line its layout is sized for); and a dialog's message
+  (`text.primary`, one line). **Mechanism:** paint stays pure — a field's
+  run carries a `FieldDecor` (caret byte, selection range, underline
+  ranges, colours); `resolve_run` shapes once and emits, in order, the
+  line, the highlight rect, the selected glyphs clipped to it,
+  underlines, the caret; `upload_paint_ops` uploads each rect as an
+  ordinary `GpuPaintOp::Solid` (two-triangle mesh on whole physical
+  pixels) — no shader or vertex-format change, and the second glyph pass
+  joins the frame's single atlas `prepare`. Horizontal scroll is
+  stateless and caret-pinned (`field_scroll`): none while the line fits,
+  otherwise the least scroll keeping the caret inside the `spacing.sm`
+  inset box. New `paint_widget_ops_frame` takes the focused widget;
+  `paint_widget_ops_focused` is it with none (unchanged for every
+  existing caller); the app's frame walker passes `self.focus.focused()`
+  and converts every decor colour for the target (`TextRun::map_colors`).
+  `CARET_WIDTH = 1.0` is **not a token**, like `FOCUS_RING_WIDTH`.
+  **Tests:** 15 headless (`text::field_tests`: caret only when focused
+  and enabled, content colour and disabled alpha, empty field caret-only,
+  selection from either anchor side, `field_scroll` cases incl.
+  non-finite, resolve order, caret x on the snapped `caret_x` at scale
+  1/2, overflow clip, preedit splice + underline thickness, byte-length
+  preserving control-character sanitising, `paint_widget_ops_focused` ==
+  frame-with-none, tooltip text follows `set_text`, palette row titles in
+  result order, query strip incl. zero results, dialog message), 3 GPU
+  (`render_test::text`: caret column is `text.primary` with
+  `surface.sunken` right of it at scale 1/2; selection pixels lie on the
+  `accent.primary`→`text.on_accent` blend line with both plain and inked
+  pixels; an overflowing field's caret is pinned inside the right edge
+  and its left padding is clean), 1 app
+  (`collect_widget_paints_uploads_a_focused_fields_selection_and_caret_in_order`,
+  sRGB-linearized decor colours). **Goldens:** the five
+  `command_palette_gallery*.png` were re-blessed with
+  `AURORA_BLESS_GOLDEN=1` on the RTX 3090 — the query strip now takes
+  the upper half of the body, so the one selected row's `accent.primary`
+  fill covers only the lower half (decoded: strip `[49,49,54]` y 32..96,
+  row `[120,172,255]` y 96..160). Shapes only: text is filtered out of
+  every golden. Existing palette tests that counted body children now
+  account for the strip. **Disclosures:** no caret blink; caret-pinned
+  (not sticky) scroll; caret/selection colours provisional (caret colour,
+  width and blink tokens flagged to Cahya); no placeholder
+  (`TextFieldState` has none); no click-to-place caret (a click focuses
+  the field but does not move `cursor`); dialog title still not drawn (no
+  layout slot); checkbox label deferred (needs a measure-func layout
+  pass); tooltip and dialog message are one line, no wrap, no ellipsis;
+  (the text field box was one `type.size.md` tall -- fixed in the review
+  revision below); palette rows and the strip split the body evenly,
+  so with many results each can be shorter than a line (clipped), and
+  with zero results the strip fills the whole body (query vertically
+  centred there); the selected glyphs are drawn twice (overdraw);
+  0.132.0's limits still hold (no font fallback — a CJK preedit shows
+  boxes; no bidi; linear-light blending). A byte-length-preserving
+  sanitiser keeps offsets valid, but a combining mark after a control
+  character merges graphemes, and the caret then falls back to the
+  previous boundary. **Needs a human:** caret and selection legibility
+  and crispness on a real HiDPI display.
+  **Review revision (0.133.0, same version).** *Fixed:* the text field is
+  now `row_height` tall (`type.size.md` + `spacing.xxs` above and below,
+  padding `xxs`), so the font's content area and the caret fit inside
+  the 1 px outline (it was 13 px of layout, which taffy's border-box
+  grew to 16 px against a 15.7 px content area; caret and selection
+  covered the border rows, the two preedit underline styles could
+  collapse); a field's decor clip is additionally inset vertically by
+  the control outline width (`paint::CONTROL_BORDER_WIDTH`, now a
+  crate-level const) so caret/selection/underlines can never paint over
+  the border -- the text box itself is not inset, so glyphs do not move.
+  `field_scroll` treats the line as fitting only when
+  `line_width + CARET_WIDTH <= inner_width`, so an end-of-line caret is
+  never clipped away when the text nearly fills the field. The palette
+  query caret shows while focus is anywhere within the palette
+  (`WidgetTree::is_within`), not only on its root. A cursor or selection
+  end that is not a char boundary now falls back to the *previous*
+  boundary (it fell back to the end); selection ends are snapped the same
+  way. `composition_segments` and `set_composition` clamp the IME's
+  target range to the preedit text and snap it to char boundaries.
+  `glyph_quads` skips a glyph whose pen is more than two ems outside the
+  clip before its atlas lookup. *New tests:*
+  `a_laid_out_field_is_one_row_tall_and_its_decor_stays_inside_the_outline`
+  (real `insert_text_field` layout at scale 1/1.5/2: height ==
+  `row_height`, caret spans ascent..descent, caret/selection/underlines
+  inside the outline's inner rows, `Target` thicker than `Plain`,
+  underline `y0 == baseline + 1 logical px`),
+  `a_caret_after_a_line_that_nearly_fills_the_field_stays_visible` (72
+  real fields swept around `ceil(line.width)` at scale 1/1.5/2),
+  `a_caret_outside_its_clip_is_dropped_and_one_straddling_it_is_cut`,
+  `a_non_char_boundary_cursor_or_selection_snaps_to_the_previous_boundary`,
+  `the_query_caret_follows_focus_anywhere_inside_the_palette_only`,
+  `composition_segments_clamp_an_out_of_range_or_mid_char_target`, and
+  GPU `one_prepare_per_frame_keeps_every_runs_glyphs_across_an_atlas_reset`
+  (an atlas size is searched on the CPU where a per-run `prepare` would
+  evict the first run; measured: a per-run mutation draws `[60]` indices
+  instead of `[48, 60]`). The GPU `render_field` fixture now uses the
+  field's real `row_height` height and the outline-inset clip. `field_scroll`'s
+  unit test was updated (`(100, 100, 100)` now scrolls by `CARET_WIDTH`).
+  **Goldens:** none changed -- the committed `text_field_gallery*` goldens
+  size their fields explicitly (`sized_style`), and no committed golden
+  shows text (glyphs are filtered out of every golden), so **no golden
+  is evidence for any text claim**; every text claim above rests on the
+  headless and GPU tests named. *Still disclosed:* the preedit caret sits
+  at the end of the preedit, ignoring the IME's own cursor position
+  (`Composition` keeps only the target clause); at scale 1.5 a caret
+  pinned to the right edge can lose one of its two physical columns to
+  rounding (the sweep asserts it stays visible, not full width); the
+  query strip still shares the `ListBox`'s flex with the rows and shrinks
+  as results grow (moving it out changes every palette golden -- a
+  follow-up); a long field still reshapes the whole line on every
+  keystroke and walks every glyph each frame (the off-clip glyphs now
+  cost a comparison, not a lookup). Typed/pasted/committed text is capped
+  at `TEXT_FIELD_MAX_BYTES` (4096), but `insert_text_field`'s initial
+  content and direct `TextFieldState::content` writes are **not** capped,
+  so programmatic content can still be arbitrarily long and slow
+  (~200 ms/keystroke measured at 100k chars in review) -- not truncated,
+  since silently truncating a caller's text would lose data.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,423 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. The
+  coordinator re-ran five of the red team's survivors or reviewers'
+  predicted survivors (underline y-offset dropped, query caret on any
+  focus, query caret only on the root, caret rect unclipped, the old
+  `line_width <= inner_width` fit condition), all now killed, files
+  restored sha256-identical. Judge: PASS, 0.906. Judge follow-ups
+  carried: move the query strip out of the `ListBox` flex (C5), IME
+  cursor inside the preedit (C7), drop `resolve_run`'s double placement
+  (RT133-02), and note that the vertical outline inset also clips glyph
+  ink touching the outline rows.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
@@ -28587,6 +28740,19 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-26 (0.133.0) — editable text.** Text fields draw
+content, a focused caret, selection and IME preedit underlines, scrolled
+to keep the caret visible; the command palette draws its query (new
+query strip) and result titles; tooltips and dialog messages draw text.
+The user confirmed on macOS on 2026-09-26 that 0.132.0's labels are
+visible (visibility only; crispness/HiDPI not assessed). Full account:
+M1.7's 0.133.0 entry. **Needs a human:** caret/selection legibility on a
+real Retina display. **Design-owner decisions raised:** caret colour,
+width and blink tokens; selection colours are `accent.primary` /
+`text.on_accent` provisionally. **Suggested next:** checkbox labels (a
+measure-func layout pass), dialog titles, click-to-place caret, sticky
+scroll.
 
 **Addendum 2026-09-26 (0.132.0) — real text rendering.** Widget labels
 are real glyphs: `aurora-text` shapes (`harfrust`) and rasterizes

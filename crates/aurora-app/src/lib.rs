@@ -529,7 +529,7 @@ use aurora_widgets::{
 use aurora_widgets::{
     FocusManager, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline,
     PaintOp, PathPipeline, TextPipeline, WidgetId, WidgetTree, draw_paint_ops,
-    paint_widget_ops_focused, upload_paint_ops,
+    paint_widget_ops_frame, upload_paint_ops,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -16841,6 +16841,7 @@ impl App {
                 let widget_paints = collect_widget_paints(
                     &self.workspace.tree,
                     focus_paint,
+                    self.focus.focused(),
                     &self.theme,
                     &self.scales,
                     gpu,
@@ -17002,6 +17003,7 @@ impl App {
 fn target_paint_ops(
     tree: &WidgetTree<WidgetKind>,
     focus: Option<FocusPaint>,
+    focused: Option<WidgetId>,
     theme: &Theme,
     scales: &Scales,
     format: wgpu::TextureFormat,
@@ -17010,7 +17012,7 @@ fn target_paint_ops(
     let scale_factor = scale_factor as f32;
     let mut ops = Vec::new();
     for id in tree.paint_order() {
-        match paint_widget_ops_focused(tree, id, focus, theme, scales, scale_factor) {
+        match paint_widget_ops_frame(tree, id, focus, focused, theme, scales, scale_factor) {
             Ok(widget_ops) => {
                 ops.extend(widget_ops.into_iter().map(|op| match op {
                     PaintOp::Solid((mesh, color)) => {
@@ -17018,10 +17020,11 @@ fn target_paint_ops(
                     }
                     gradient @ PaintOp::Gradient(_) => gradient,
                     // A label's colour is a token colour exactly like a
-                    // solid's, so it is converted the same way.
-                    PaintOp::Text(mut run) => {
-                        run.color = target_paint_color(run.color, format);
-                        PaintOp::Text(run)
+                    // solid's, so it is converted the same way — and so is
+                    // every caret, selection and underline colour a text
+                    // field's run carries (0.133.0).
+                    PaintOp::Text(run) => {
+                        PaintOp::Text(run.map_colors(|c| target_paint_color(c, format)))
                     }
                 }));
             }
@@ -17060,6 +17063,7 @@ fn target_paint_ops(
 fn collect_widget_paints(
     tree: &WidgetTree<WidgetKind>,
     focus: Option<FocusPaint>,
+    focused: Option<WidgetId>,
     theme: &Theme,
     scales: &Scales,
     gpu: &GpuContext,
@@ -17067,7 +17071,7 @@ fn collect_widget_paints(
     scale_factor: f64,
     text: Option<(&mut TextEngine, &mut GlyphAtlas)>,
 ) -> Vec<GpuPaintOp> {
-    let ops = target_paint_ops(tree, focus, theme, scales, format, scale_factor);
+    let ops = target_paint_ops(tree, focus, focused, theme, scales, format, scale_factor);
     if let Some((engine, atlas)) = text {
         #[allow(clippy::cast_possible_truncation)]
         let scale = scale_factor as f32;
@@ -23969,6 +23973,7 @@ mod tests {
         let paints = collect_widget_paints(
             &tree,
             None,
+            None,
             &theme,
             &scales,
             &context,
@@ -24042,6 +24047,7 @@ mod tests {
         let paints = collect_widget_paints(
             &tree,
             None,
+            None,
             &theme,
             &scales,
             &context,
@@ -24070,6 +24076,7 @@ mod tests {
         let without = collect_widget_paints(
             &tree,
             None,
+            None,
             &theme,
             &scales,
             &context,
@@ -24080,13 +24087,102 @@ mod tests {
         assert_eq!(without.len(), 1);
     }
 
+    /// A focused text field with a selection uploads, after its own
+    /// fill: the line's glyphs, the selection highlight as a solid, the
+    /// selected glyphs again, and the caret as a solid — with the caret's
+    /// and highlight's token colours linearized for an sRGB target exactly
+    /// as a solid's are (0.133.0). Unfocused, the caret op is gone.
+    #[test]
+    fn collect_widget_paints_uploads_a_focused_fields_selection_and_caret_in_order() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (Ok(scales), Ok(theme)) = (load_scales(), load_theme()) else {
+            unreachable!("the committed tokens load");
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let rect = |x, y, width, height| aurora_core::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let Ok(field) =
+            aurora_widgets::widgets::insert_text_field(&mut tree, root, &scales, "Name", "Hello")
+        else {
+            unreachable!()
+        };
+        if tree.set_bounds(root, rect(0, 0, 200, 100)).is_err()
+            || tree.set_bounds(field, rect(4, 4, 120, 24)).is_err()
+            || aurora_widgets::widgets::with_text_field_mut(&mut tree, field, |s| {
+                s.cursor = 2;
+                s.selection_anchor = Some(0);
+            })
+            .is_err()
+        {
+            unreachable!()
+        }
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads");
+        };
+        let mut atlas = super::GlyphAtlas::new(context.device());
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let mut run = |focused| {
+            collect_widget_paints(
+                &tree,
+                None,
+                focused,
+                &theme,
+                &scales,
+                &context,
+                format,
+                1.0,
+                Some((&mut engine, &mut atlas)),
+            )
+        };
+        let tail = |paints: &[GpuPaintOp]| -> Vec<(&str, [f32; 4])> {
+            let first_text = paints
+                .iter()
+                .position(|op| matches!(op, GpuPaintOp::Text(..)))
+                .unwrap_or(paints.len());
+            paints
+                .get(first_text..)
+                .unwrap_or_default()
+                .iter()
+                .map(|op| match op {
+                    GpuPaintOp::Solid(_, c) => ("solid", *c),
+                    GpuPaintOp::Gradient(_) => ("gradient", [0.0; 4]),
+                    GpuPaintOp::Text(_, c) => ("text", *c),
+                })
+                .collect()
+        };
+        let token = |color: aurora_theme::Color| {
+            let [r, g, b] = color.to_srgb_f32();
+            super::target_paint_color([r, g, b, 1.0], format)
+        };
+        let focused = run(Some(field));
+        assert_eq!(
+            tail(&focused),
+            vec![
+                ("text", token(theme.text.primary)),
+                ("solid", token(theme.accent.primary)),
+                ("text", token(theme.text.on_accent)),
+                ("solid", token(theme.text.primary)),
+            ],
+            "line, highlight, selected glyphs, caret"
+        );
+        let unfocused = run(None);
+        let kinds: Vec<&str> = tail(&unfocused).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, vec!["text", "solid", "text"], "no caret unfocused");
+    }
+
     #[test]
     fn text_colour_is_linearized_for_an_srgb_target_like_solids() {
         let (tree, theme, scales) = text_fixture();
         let mut authored = Vec::new();
         for id in tree.paint_order() {
             if let Ok(widget_ops) =
-                super::paint_widget_ops_focused(&tree, id, None, &theme, &scales, 1.0)
+                aurora_widgets::paint_widget_ops_focused(&tree, id, None, &theme, &scales, 1.0)
             {
                 authored.extend(widget_ops);
             }
@@ -24105,7 +24201,7 @@ mod tests {
             wgpu::TextureFormat::Bgra8UnormSrgb,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         ] {
-            let resolved = super::target_paint_ops(&tree, None, &theme, &scales, format, 1.0);
+            let resolved = super::target_paint_ops(&tree, None, None, &theme, &scales, format, 1.0);
             assert_eq!(
                 text_color(&resolved).map(|c| c.map(f32::to_bits)),
                 Some(super::target_paint_color(authored_color, format).map(f32::to_bits)),
@@ -24114,6 +24210,7 @@ mod tests {
         }
         let srgb = super::target_paint_ops(
             &tree,
+            None,
             None,
             &theme,
             &scales,
@@ -24171,9 +24268,11 @@ mod tests {
             "the fixture needs a channel the sRGB curve actually moves: {authored:?}"
         );
         let solid_colour = |format: wgpu::TextureFormat| -> [f32; 4] {
-            match collect_widget_paints(&tree, None, &theme, &scales, &context, format, 1.0, None)
-                .into_iter()
-                .next()
+            match collect_widget_paints(
+                &tree, None, None, &theme, &scales, &context, format, 1.0, None,
+            )
+            .into_iter()
+            .next()
             {
                 Some(GpuPaintOp::Solid(_, color)) => color,
                 other => unreachable!("expected a solid: {other:?}"),
@@ -24262,7 +24361,7 @@ mod tests {
             wgpu::TextureFormat::Bgra8UnormSrgb,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         ] {
-            let resolved = super::target_paint_ops(&tree, None, &theme, &scales, format, 1.0);
+            let resolved = super::target_paint_ops(&tree, None, None, &theme, &scales, format, 1.0);
             assert_eq!(resolved.len(), authored.len(), "{format:?}");
             for (got, want) in resolved.iter().zip(&authored) {
                 match (got, want) {

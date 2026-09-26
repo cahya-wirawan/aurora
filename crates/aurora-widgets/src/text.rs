@@ -19,21 +19,35 @@
 //! clip rect, trimming the source rectangle with it. The GPU half (the
 //! glyph atlas and text pipeline) lives in `crate::render`.
 //!
-//! **Which widgets draw text in 0.132.0**: `Button` (label, centred),
+//! **Which widgets draw text**: since 0.132.0 `Button` (label, centred),
 //! `Tab` (label, centred), `TreeItem` (label, one row tall), a `Menu`'s
 //! action rows, a `Dropdown`'s current value, and an open dropdown list's
-//! option rows. **Not yet**: `Checkbox` (its layout box *is* the 13 px
-//! square box — the label needs a layout change to sit beside it),
-//! `TextField` content and caret, the command palette's query and result
-//! rows, tooltip text (its payload carries no string), and dialog text.
-//! There is no ellipsis: a label wider than its box is clipped.
+//! option rows. Since 0.133.0 also a `TextField`'s content — with its
+//! caret while focused ([`CARET_WIDTH`], no blink), its selection
+//! (`accent.primary` highlight, selected glyphs redrawn in
+//! `text.on_accent`) and its IME preedit spliced in at the cursor and
+//! underlined ([`FieldDecor`], [`resolve_run`]), horizontally scrolled
+//! to keep the caret visible ([`field_scroll`], caret-pinned, not
+//! sticky) — the command palette's query strip (query plus caret) and
+//! result rows, a tooltip's text (its accessibility label, the one copy
+//! `Tooltip::set_text` keeps current), and a dialog's message (one
+//! line). **Not yet**: `Checkbox` (its layout box *is* the 13 px square
+//! box — the label needs a measure-func layout pass to sit beside it), a
+//! dialog's title (no layout slot), and a text field's placeholder
+//! (`TextFieldState` has none). There is no ellipsis and no wrapping: a
+//! line wider than its box is clipped.
+
+use std::ops::Range;
 
 use aurora_core::Rect;
-use aurora_text::{GlyphKey, TextEngine, TextStyle, snap_glyph_origin};
+use aurora_text::{GlyphKey, ShapedLine, TextEngine, TextStyle, snap_glyph_origin};
 use aurora_theme::{Color, Scales, Theme};
 
 use crate::tree::{WidgetId, WidgetTree};
-use crate::widgets::{WidgetKind, row_height};
+use crate::widgets::{
+    TextFieldState, UnderlineStyle, WidgetKind, composition_segments, floor_char_boundary,
+    row_height,
+};
 
 /// Horizontal alignment of a run inside its content box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +78,75 @@ pub struct TextRun {
     /// Nothing outside this rect (logical px) is drawn — the widget's
     /// visible rect after every clipping ancestor.
     pub clip: Rect,
+    /// An editable line's caret, selection and IME underlines (0.133.0):
+    /// `Some` only for a text field's content and the command palette's
+    /// query. A run with decor is placed flush left in `rect` (whatever
+    /// `align` says) and scrolled horizontally so its caret stays inside
+    /// `rect` ([`field_scroll`]).
+    pub field: Option<FieldDecor>,
+}
+
+impl TextRun {
+    /// Applies `f` to every colour this run carries — its text colour and
+    /// every [`FieldDecor`] colour — e.g. to linearize them all for an
+    /// sRGB-aware target in one place.
+    #[must_use]
+    pub fn map_colors(mut self, f: impl Fn([f32; 4]) -> [f32; 4]) -> Self {
+        self.color = f(self.color);
+        if let Some(field) = self.field.as_mut() {
+            field.caret_color = f(field.caret_color);
+            field.selection_fill = f(field.selection_fill);
+            field.selected_text = f(field.selected_text);
+            field.underline_color = f(field.underline_color);
+        }
+        self
+    }
+}
+
+/// The caret's width in logical pixels (rounded to at least one physical
+/// pixel). **Not a token**: `design/tokens/scales.toml` has no
+/// stroke-weight scale — the same gap [`crate::paint::FOCUS_RING_WIDTH`]
+/// records. Its width, colour (`text.primary`, provisional) and the
+/// absence of a blink are flagged to the design owner (Cahya, PRD
+/// FR-027 *Ownership*) rather than invented here.
+pub const CARET_WIDTH: f32 = 1.0;
+
+/// An editable line's decorations. Every byte offset indexes
+/// [`TextRun::text`] (for a field mid-composition that is the *display*
+/// text — content with the preedit spliced in at the cursor).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecor {
+    /// The byte the horizontal scroll keeps visible — the cursor, whether
+    /// or not a caret is drawn there (so a field does not jump when it
+    /// loses focus).
+    pub scroll_anchor: usize,
+    /// Where the caret is drawn, or `None` for no caret (unfocused or
+    /// disabled). Not a grapheme boundary: drawn at the previous one.
+    pub caret: Option<usize>,
+    /// The caret's colour (`text.primary`, provisional).
+    pub caret_color: [f32; 4],
+    /// The selected byte range, if any and non-empty.
+    pub selection: Option<Range<usize>>,
+    /// The selection highlight (`accent.primary`).
+    pub selection_fill: [f32; 4],
+    /// Selected glyphs are redrawn over the highlight in this colour
+    /// (`text.on_accent`, gated at 4.5:1 against `accent.primary`).
+    pub selected_text: [f32; 4],
+    /// IME preedit underlines ([`composition_segments`], shifted into the
+    /// display text).
+    pub underlines: Vec<(Range<usize>, UnderlineStyle)>,
+    /// The underlines' colour (`text.primary`).
+    pub underline_color: [f32; 4],
+}
+
+/// One drawable piece of a resolved run, in paint order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resolved {
+    /// Glyph quads, drawn in one colour (not yet target-converted).
+    Glyphs(Vec<QuadGlyph>, [f32; 4]),
+    /// A solid rectangle `[x0, y0, x1, y1]` in whole physical pixels
+    /// (exclusive max) — a selection highlight, underline or caret.
+    Rect([i32; 4], [f32; 4]),
 }
 
 /// One glyph of a resolved run: which atlas image to sample, where to put
@@ -126,8 +209,8 @@ fn inset_x(rect: (f32, f32, f32, f32), pad: f32) -> (f32, f32, f32, f32) {
     (rect.0 + pad, rect.1, (rect.2 - 2.0 * pad).max(0.0), rect.3)
 }
 
-/// The label a menu's or an open dropdown list's option row shows, with
-/// whether that entry is enabled.
+/// The label a menu's, an open dropdown list's or a command palette's
+/// option row shows, with whether that entry is enabled.
 fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bool)> {
     let parent = tree.parent(row)?;
     match tree.payload(parent)? {
@@ -145,20 +228,109 @@ fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bo
             let option = state.options().get(index)?;
             Some((option.clone(), !state.is_disabled()))
         }
+        WidgetKind::Container => {
+            // A command palette's result row: body container, then root.
+            let Some(WidgetKind::CommandPalette(state)) = tree.payload(tree.parent(parent)?) else {
+                return None;
+            };
+            state.row_title(row).map(|title| (title.to_owned(), true))
+        }
         _ => None,
     }
+}
+
+/// The intersection of two rects, or `None` when they do not overlap.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + i64::from(a.width)).min(b.x + i64::from(b.width));
+    let y1 = (a.y + i64::from(a.height)).min(b.y + i64::from(b.height));
+    Some(Rect {
+        x: x0,
+        y: y0,
+        width: u32::try_from(x1.checked_sub(x0)?).ok().filter(|w| *w > 0)?,
+        height: u32::try_from(y1.checked_sub(y0)?).ok().filter(|h| *h > 0)?,
+    })
+}
+
+/// `rect` inset horizontally by `pad` logical px on both sides, as an
+/// integer [`Rect`] (tokens are whole pixels).
+fn inset_rect(rect: Rect, pad: u32) -> Option<Rect> {
+    let width = rect.width.checked_sub(pad.checked_mul(2)?)?;
+    (width > 0).then_some(Rect {
+        x: rect.x + i64::from(pad),
+        width,
+        ..rect
+    })
+}
+
+/// The colours every [`FieldDecor`] takes from the theme.
+fn decor(theme: &Theme, scroll_anchor: usize) -> FieldDecor {
+    FieldDecor {
+        scroll_anchor,
+        caret: None,
+        caret_color: rgba(theme.text.primary, 1.0),
+        selection: None,
+        selection_fill: rgba(theme.accent.primary, 1.0),
+        selected_text: rgba(theme.text.on_accent, 1.0),
+        underlines: Vec::new(),
+        underline_color: rgba(theme.text.primary, 1.0),
+    }
+}
+
+/// A text field's display text and decorations: the content with any IME
+/// preedit spliced in at the cursor (underlined per
+/// [`composition_segments`], caret at the preedit's end), otherwise the
+/// content with its selection. The caret is drawn only when `focused`
+/// and not disabled.
+fn field_text(state: &TextFieldState, focused: bool, theme: &Theme) -> (String, FieldDecor) {
+    // A cursor (or selection end) that is not a char boundary falls back
+    // to the previous boundary, as `caret_at` does for a grapheme; one
+    // past the end falls back to the end.
+    let cursor = floor_char_boundary(&state.content, state.cursor);
+    let show_caret = focused && !state.disabled;
+    if let Some(composition) = state.composition.as_ref().filter(|c| !c.text.is_empty()) {
+        let mut text = String::with_capacity(state.content.len() + composition.text.len());
+        text.push_str(state.content.get(..cursor).unwrap_or_default());
+        text.push_str(&composition.text);
+        text.push_str(state.content.get(cursor..).unwrap_or_default());
+        let end = cursor + composition.text.len();
+        let mut decor = decor(theme, end);
+        decor.caret = show_caret.then_some(end);
+        decor.underlines = composition_segments(composition)
+            .into_iter()
+            .map(|(range, style)| (range.start + cursor..range.end + cursor, style))
+            .collect();
+        return (sanitize_field(&text), decor);
+    }
+    let mut decor = decor(theme, cursor);
+    decor.caret = show_caret.then_some(cursor);
+    decor.selection = state
+        .selection_range()
+        .map(|range| {
+            floor_char_boundary(&state.content, range.start)
+                ..floor_char_boundary(&state.content, range.end)
+        })
+        .filter(|range| range.start < range.end);
+    (sanitize_field(&state.content), decor)
 }
 
 /// The text runs widget `id` draws, in paint order (at most one today).
 /// `bounds` is the widget's own layout box and `clip` its visible rect
 /// (`WidgetTree::visible_rect`); a widget with no visible rect draws no
-/// text, which the caller guarantees by not calling this.
+/// text, which the caller guarantees by not calling this. `focused` is
+/// the widget holding keyboard focus (any origin, pointer included): a
+/// text field draws its caret only when it is `id`, the command
+/// palette's query strip only when it is the palette or inside it
+/// (`WidgetTree::is_within`) -- a focused result row keeps the caret.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn text_runs(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
     bounds: Rect,
     clip: Rect,
+    focused: Option<WidgetId>,
     theme: &Theme,
     scales: &Scales,
 ) -> Vec<TextRun> {
@@ -175,6 +347,30 @@ pub fn text_runs(
         rect,
         align,
         clip,
+        field: None,
+    };
+    // An editable line: flush left in `bounds` inset by `spacing.sm`,
+    // clipped to that inset box so scrolled-away text never reaches the
+    // padding. `outline` further insets the clip (not the text box, so
+    // the baseline does not move) vertically by a control outline's
+    // width: a text field's caret, selection and underlines then never
+    // paint over its own border rows or rounded corners.
+    let field_run = |text: String, color: [f32; 4], decor: FieldDecor, outline: u32| {
+        let inner = inset_rect(bounds, scales.spacing.sm)?;
+        let clip_box = Rect {
+            y: inner.y + i64::from(outline),
+            height: inner.height.checked_sub(outline.checked_mul(2)?)?,
+            ..inner
+        };
+        Some(TextRun {
+            text,
+            style,
+            color,
+            rect: rect_f32(inner),
+            align: HAlign::Start,
+            clip: intersect(clip, clip_box)?,
+            field: Some(decor),
+        })
     };
     let runs = match kind {
         WidgetKind::Button(state) => vec![run(
@@ -240,9 +436,120 @@ pub fn text_runs(
             })
             .into_iter()
             .collect(),
+        WidgetKind::TextField(state) => {
+            let (text, decor) = field_text(state, focused == Some(id), theme);
+            let color = rgba(theme.text.primary, opacity(state.disabled, theme));
+            // The outline is `CONTROL_BORDER_WIDTH` logical px, centred
+            // on the edge; a whole logical px covers its inner half at
+            // every scale factor.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let outline = crate::paint::CONTROL_BORDER_WIDTH.ceil() as u32;
+            field_run(text, color, decor, outline).into_iter().collect()
+        }
+        // The text lives in the tooltip's own accessibility label (the
+        // one copy `Tooltip::set_text` keeps current), drawn in the
+        // `type.size.xs` line the tooltip's layout is sized for, inset
+        // by its own `spacing.xs` horizontal padding.
+        WidgetKind::Tooltip => tree
+            .accessibility(id)
+            .and_then(|node| node.label())
+            .map(|label| {
+                let small = TextStyle {
+                    size_px: token_px(scales.typography.size.xs),
+                    ..style
+                };
+                TextRun {
+                    style: small,
+                    ..run(
+                        label,
+                        rgba(theme.text.primary, 1.0),
+                        inset_x(full, token_px(scales.spacing.xs)),
+                        HAlign::Start,
+                    )
+                }
+            })
+            .into_iter()
+            .collect(),
+        WidgetKind::Container => container_text(tree, id, focused, theme)
+            .map(|(text, decor)| match decor {
+                Some(decor) => {
+                    // The query strip has no outline of its own.
+                    field_run(
+                        sanitize_field(&text),
+                        rgba(theme.text.primary, 1.0),
+                        decor,
+                        0,
+                    )
+                }
+                None => Some(run(
+                    &text,
+                    rgba(theme.text.primary, 1.0),
+                    full,
+                    HAlign::Start,
+                )),
+            })
+            .into_iter()
+            .flatten()
+            .collect(),
         _ => Vec::new(),
     };
-    runs.into_iter().filter(|r| !r.text.is_empty()).collect()
+    runs.into_iter()
+        .filter(|r| {
+            !r.text.is_empty() || r.field.as_ref().is_some_and(|field| field.caret.is_some())
+        })
+        .collect()
+}
+
+/// The text a plain container draws: a dialog's message (its
+/// `Role::Label` child's label, one line, no decor), or a command
+/// palette's query strip (the query, with a caret at its end while the
+/// palette holds focus).
+fn container_text(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    focused: Option<WidgetId>,
+    theme: &Theme,
+) -> Option<(String, Option<FieldDecor>)> {
+    let parent = tree.parent(id)?;
+    match tree.payload(parent)? {
+        WidgetKind::Dialog => {
+            let node = tree.accessibility(id)?;
+            (node.role() == accesskit::Role::Label)
+                .then(|| node.label().map(str::to_owned))
+                .flatten()
+                .map(|label| (label, None))
+        }
+        WidgetKind::Container => {
+            let root = tree.parent(parent)?;
+            let WidgetKind::CommandPalette(state) = tree.payload(root)? else {
+                return None;
+            };
+            (state.query_strip() == id).then(|| {
+                let query = state.query().to_owned();
+                let mut decor = decor(theme, query.len());
+                // Focus anywhere in the palette (itself, or one of its
+                // rows) is focus on the query.
+                decor.caret = focused
+                    .is_some_and(|f| tree.is_within(root, f))
+                    .then_some(query.len());
+                (query, Some(decor))
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`sanitize_label`] for an editable line, **byte-length preserving**:
+/// each control character becomes as many spaces as it has UTF-8 bytes,
+/// so every cursor, selection and preedit byte offset still lands on the
+/// same character.
+fn sanitize_field(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            let n = if c.is_control() { c.len_utf8() } else { 0 };
+            std::iter::repeat_n(' ', n).chain((n == 0).then_some(c))
+        })
+        .collect()
 }
 
 /// `text` with every control character (C0, DEL, C1 — tab and newline
@@ -287,34 +594,86 @@ fn to_phys(logical: f32, scale_factor: f32) -> i32 {
 /// rect or scale is non-finite, or whose physical size exceeds
 /// `MAX_GLYPH_SIZE_PHYS`.
 pub fn resolve_text(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) -> Vec<QuadGlyph> {
-    let (x, y, w, h) = run.rect;
-    if ![x, y, w, h, scale_factor].iter().all(|v| v.is_finite()) || scale_factor <= 0.0 {
+    let Some(placed) = place(engine, run, scale_factor, 0.0) else {
         return Vec::new();
+    };
+    glyph_quads(engine, &placed, clip_phys(run.clip, scale_factor))
+}
+
+/// A shaped line positioned for drawing.
+struct Placed {
+    line: std::sync::Arc<ShapedLine>,
+    /// The pen origin's x, logical px (after alignment and scroll).
+    origin_x: f32,
+    /// The baseline, logical px (unsnapped).
+    baseline_logical: f32,
+    /// The baseline, whole physical px.
+    baseline: i32,
+    scale_factor: f32,
+}
+
+/// Shapes and positions `run`, its pen origin moved left by `scroll`
+/// logical px. `None` for a non-finite rect or scale, or a size past
+/// [`MAX_GLYPH_SIZE_PHYS`].
+fn place(engine: &mut TextEngine, run: &TextRun, scale_factor: f32, scroll: f32) -> Option<Placed> {
+    let (x, y, w, h) = run.rect;
+    if ![x, y, w, h, scale_factor, scroll]
+        .iter()
+        .all(|v| v.is_finite())
+        || scale_factor <= 0.0
+    {
+        return None;
     }
     let line = engine.shape(&run.text, &run.style, scale_factor);
-    if line.glyphs.is_empty() || line.size_phys.is_nan() || line.size_phys > MAX_GLYPH_SIZE_PHYS {
-        return Vec::new();
+    if line.size_phys.is_nan() || line.size_phys > MAX_GLYPH_SIZE_PHYS {
+        return None;
     }
     let start_x = match run.align {
         HAlign::Start => x,
         HAlign::Center => x + (w - line.width) / 2.0,
-    };
+    } - scroll;
     let baseline_logical = y + h / 2.0 + (line.ascent - line.descent) / 2.0;
-    let origin_x = start_x * scale_factor;
-    if !(baseline_logical * scale_factor).is_finite() || !origin_x.is_finite() {
-        return Vec::new();
+    if !(baseline_logical * scale_factor).is_finite() || !(start_x * scale_factor).is_finite() {
+        return None;
     }
-    let baseline = to_phys(baseline_logical, scale_factor);
+    Some(Placed {
+        baseline: to_phys(baseline_logical, scale_factor),
+        line,
+        origin_x: start_x,
+        baseline_logical,
+        scale_factor,
+    })
+}
 
-    let clip_x0 = to_phys(rect_f32(run.clip).0, scale_factor);
-    let clip_y0 = to_phys(rect_f32(run.clip).1, scale_factor);
-    let (cx, cy, cw, ch) = rect_f32(run.clip);
-    let clip_x1 = to_phys(cx + cw, scale_factor);
-    let clip_y1 = to_phys(cy + ch, scale_factor);
+/// `clip` (logical) on the physical grid, `[x0, y0, x1, y1]`.
+fn clip_phys(clip: Rect, scale_factor: f32) -> [i32; 4] {
+    let (cx, cy, cw, ch) = rect_f32(clip);
+    [
+        to_phys(cx, scale_factor),
+        to_phys(cy, scale_factor),
+        to_phys(cx + cw, scale_factor),
+        to_phys(cy + ch, scale_factor),
+    ]
+}
 
-    let mut quads = Vec::with_capacity(line.glyphs.len());
+/// Every inked glyph of `placed`, clipped to `clip` (physical px).
+fn glyph_quads(engine: &mut TextEngine, placed: &Placed, clip: [i32; 4]) -> Vec<QuadGlyph> {
+    let [clip_x0, clip_y0, clip_x1, clip_y1] = clip;
+    let origin_x = placed.origin_x * placed.scale_factor;
+    let line = &placed.line;
+    // A glyph's ink lies within two ems of its pen position (bearings and
+    // advances of the bundled font are well under one em), so a glyph
+    // whose pen is further than that outside `clip` is skipped before
+    // its atlas lookup: a long, scrolled field then costs one float
+    // comparison per off-screen glyph, not a hash lookup.
+    #[allow(clippy::cast_possible_truncation)]
+    let margin = (line.size_phys * 2.0).ceil() as i32;
+    let mut quads = Vec::new();
     for glyph in &line.glyphs {
         let (pixel_x, bin) = snap_glyph_origin(origin_x + glyph.x_phys);
+        if pixel_x.saturating_add(margin) < clip_x0 || pixel_x.saturating_sub(margin) > clip_x1 {
+            continue;
+        }
         let key = GlyphKey::new(glyph.glyph_id, line.size_phys, bin);
         let Some(mask) = engine.glyph(key) else {
             continue;
@@ -322,7 +681,10 @@ pub fn resolve_text(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) -
         #[allow(clippy::cast_possible_truncation)]
         let y_offset = glyph.y_phys.round() as i32;
         let x0 = pixel_x.saturating_add(mask.left);
-        let y0 = baseline.saturating_add(y_offset).saturating_sub(mask.top);
+        let y0 = placed
+            .baseline
+            .saturating_add(y_offset)
+            .saturating_sub(mask.top);
         let x1 = x0.saturating_add(i32::try_from(mask.width).unwrap_or(i32::MAX));
         let y1 = y0.saturating_add(i32::try_from(mask.height).unwrap_or(i32::MAX));
         let (qx0, qy0) = (x0.max(clip_x0), y0.max(clip_y0));
@@ -341,6 +703,135 @@ pub fn resolve_text(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) -
         });
     }
     quads
+}
+
+/// The logical x of a caret before `byte` in `line`; a byte that is not
+/// a grapheme boundary falls back to the previous boundary.
+fn caret_at(line: &ShapedLine, byte: usize) -> f32 {
+    line.caret_x(byte).unwrap_or_else(|| {
+        let index = line.carets.partition_point(|(b, _)| *b <= byte);
+        index
+            .checked_sub(1)
+            .and_then(|i| line.carets.get(i))
+            .map_or(0.0, |(_, x)| *x)
+    })
+}
+
+/// The horizontal scroll (logical px, `>= 0`) that keeps a caret at
+/// `caret_x` inside an `inner_width`-wide box showing a `line_width`-wide
+/// line: none while the line *and a caret after it* fit
+/// (`line_width + CARET_WIDTH <= inner_width` -- a line that fits but
+/// leaves less than a caret's width would clip an end-of-line caret);
+/// otherwise the least scroll putting the
+/// caret's right edge ([`CARET_WIDTH`]) at the box's right edge, clamped
+/// to `[0, line_width + CARET_WIDTH - inner_width]`. **Caret-pinned, not
+/// sticky**: recomputed from the caret every frame, with no memory of the
+/// previous scroll (a real editor keeps its scroll until the caret
+/// leaves the box; this one shows the caret at the right edge whenever
+/// the line overflows and the caret is past the first box-width).
+#[must_use]
+pub fn field_scroll(line_width: f32, caret_x: f32, inner_width: f32) -> f32 {
+    if ![line_width, caret_x, inner_width]
+        .iter()
+        .all(|v| v.is_finite())
+        || line_width + CARET_WIDTH <= inner_width
+    {
+        return 0.0;
+    }
+    let upper = (line_width + CARET_WIDTH - inner_width).max(0.0);
+    (caret_x + CARET_WIDTH - inner_width).max(0.0).min(upper)
+}
+
+/// `[x0, y0, x1, y1] ∩ clip`, or `None` when empty.
+fn clip_box(rect: [i32; 4], clip: [i32; 4]) -> Option<[i32; 4]> {
+    let r = [
+        rect[0].max(clip[0]),
+        rect[1].max(clip[1]),
+        rect[2].min(clip[2]),
+        rect[3].min(clip[3]),
+    ];
+    (r[0] < r[2] && r[1] < r[3]).then_some(r)
+}
+
+/// Resolves `run` into its drawable pieces, in paint order. A run without
+/// [`FieldDecor`] is exactly [`resolve_text`]'s quads (none when it has
+/// no inked glyph). A decorated run is scrolled ([`field_scroll`]) and
+/// resolves to: the whole line in `run.color`; the selection highlight;
+/// the selected glyphs again, clipped to the highlight, in
+/// `selected_text`; each preedit underline (one physical-pixel-rounded
+/// logical px below the baseline, a `Target` clause twice as thick); and
+/// last the caret, [`CARET_WIDTH`] wide (at least one physical px) from
+/// the font's ascent to its descent. Every piece is clipped to
+/// `run.clip`, and the glyph passes share the frame's one atlas
+/// `prepare` (the caller's).
+pub fn resolve_run(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) -> Vec<Resolved> {
+    let Some(field) = run.field.as_ref() else {
+        let quads = resolve_text(engine, run, scale_factor);
+        return if quads.is_empty() {
+            Vec::new()
+        } else {
+            vec![Resolved::Glyphs(quads, run.color)]
+        };
+    };
+    let Some(unscrolled) = place(engine, run, scale_factor, 0.0) else {
+        return Vec::new();
+    };
+    let scroll = field_scroll(
+        unscrolled.line.width,
+        caret_at(&unscrolled.line, field.scroll_anchor),
+        run.rect.2,
+    );
+    let Some(placed) = place(engine, run, scale_factor, scroll) else {
+        return Vec::new();
+    };
+    let clip = clip_phys(run.clip, scale_factor);
+    let x_at = |byte: usize| to_phys(placed.origin_x + caret_at(&placed.line, byte), scale_factor);
+    let top = to_phys(placed.baseline_logical - placed.line.ascent, scale_factor);
+    let bottom = to_phys(placed.baseline_logical + placed.line.descent, scale_factor);
+    #[allow(clippy::cast_possible_truncation)]
+    let px = |logical: f32| ((logical * scale_factor).round() as i32).max(1);
+
+    let mut out = Vec::new();
+    let all = glyph_quads(engine, &placed, clip);
+    if !all.is_empty() {
+        out.push(Resolved::Glyphs(all, run.color));
+    }
+    if let Some(selection) = field.selection.as_ref()
+        && let Some(highlight) = clip_box(
+            [x_at(selection.start), top, x_at(selection.end), bottom],
+            clip,
+        )
+    {
+        out.push(Resolved::Rect(highlight, field.selection_fill));
+        let inside = glyph_quads(engine, &placed, highlight);
+        if !inside.is_empty() {
+            out.push(Resolved::Glyphs(inside, field.selected_text));
+        }
+    }
+    for (range, style) in &field.underlines {
+        let thickness = match style {
+            UnderlineStyle::Plain => px(1.0),
+            UnderlineStyle::Target => px(2.0),
+        };
+        let y0 = placed.baseline.saturating_add(px(1.0));
+        let rect = [
+            x_at(range.start),
+            y0,
+            x_at(range.end),
+            y0.saturating_add(thickness),
+        ];
+        if let Some(rect) = clip_box(rect, clip) {
+            out.push(Resolved::Rect(rect, field.underline_color));
+        }
+    }
+    if let Some(caret) = field.caret {
+        let x0 = x_at(caret);
+        let rect = [x0, top, x0.saturating_add(px(CARET_WIDTH)), bottom];
+        if let Some(rect) = clip_box(rect, clip) {
+            out.push(Resolved::Rect(rect, field.caret_color));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -531,7 +1022,7 @@ mod tests {
             width: 200,
             height: 90,
         };
-        let runs = text_runs(&tree, row, bounds, bounds, &theme, &scales);
+        let runs = text_runs(&tree, row, bounds, bounds, None, &theme, &scales);
         let run = runs.first();
         let pad = scales.spacing.sm as f32;
         assert!(
@@ -540,7 +1031,7 @@ mod tests {
                 && r.color == rgba(theme.text.primary, 1.0))
         );
         ok(set_tree_item_selected(&mut tree, row, true));
-        let runs = text_runs(&tree, row, bounds, bounds, &theme, &scales);
+        let runs = text_runs(&tree, row, bounds, bounds, None, &theme, &scales);
         assert_eq!(
             runs.first().map(|r| r.color),
             Some(rgba(theme.text.on_accent, 1.0))
@@ -710,7 +1201,7 @@ mod tests {
             height: 24,
         };
         rows.iter()
-            .flat_map(|row| text_runs(tree, *row, bounds, bounds, theme, scales))
+            .flat_map(|row| text_runs(tree, *row, bounds, bounds, None, theme, scales))
             .map(|r| (r.text, r.color))
             .collect()
     }
@@ -832,7 +1323,7 @@ mod tests {
         };
         let scales = test_scales();
         let run_colour = |tree: &WidgetTree<WidgetKind>, id| {
-            text_runs(tree, id, bounds, bounds, &theme, &scales)
+            text_runs(tree, id, bounds, bounds, None, &theme, &scales)
                 .first()
                 .map(|r| r.color)
         };
@@ -937,6 +1428,7 @@ mod tests {
             rect: (10.0, 10.0, 100.0, 20.0),
             align: HAlign::Start,
             clip,
+            field: None,
         }
     }
 
@@ -1015,5 +1507,805 @@ mod tests {
             at_two.first().map(|q| q.key.bin),
             Some(aurora_text::snap_glyph_origin(20.6).1)
         );
+    }
+}
+
+/// Text fields, the command palette's query and rows, tooltips and
+/// dialog messages (0.133.0).
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod field_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        CARET_WIDTH, FieldDecor, HAlign, Resolved, TextRun, field_scroll, label_style, resolve_run,
+        text_runs, to_phys,
+    };
+    use crate::paint::{PaintOp, paint_widget_ops_focused, paint_widget_ops_frame};
+    use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::{
+        CommandEntry, DialogAction, Tooltip, UnderlineStyle, WidgetKind, command_palette_state,
+        insert_button, insert_command_palette, insert_dialog, insert_text_field, new_tree,
+        set_command_palette_query, set_text_field_disabled, test_scales, with_text_field_mut,
+    };
+    use aurora_core::Rect;
+    use aurora_text::TextEngine;
+    use aurora_theme::{Palette, Scales, Theme, ThemeSet};
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn dark_theme() -> Theme {
+        let palette = ok(Palette::from_toml_str(include_str!(
+            "../../../design/tokens/palette.toml"
+        )));
+        let mut themes = ThemeSet::new();
+        ok(themes.register(include_str!("../../../design/themes/dark.toml")));
+        ok(themes.resolve("Dark", &palette))
+    }
+
+    fn rgba(color: aurora_theme::Color, a: f32) -> [f32; 4] {
+        let [r, g, b] = color.to_srgb_f32();
+        [r, g, b, a]
+    }
+
+    fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A text field holding `content`, laid out at (20, 10) 120x24.
+    fn field(content: &str) -> (WidgetTree<WidgetKind>, WidgetId, Scales) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        ok(tree.set_bounds(root, rect(0, 0, 400, 300)));
+        let id = ok(insert_text_field(&mut tree, root, &scales, "Name", content));
+        ok(tree.set_bounds(id, rect(20, 10, 120, 24)));
+        (tree, id, scales)
+    }
+
+    fn field_run(
+        tree: &WidgetTree<WidgetKind>,
+        id: WidgetId,
+        focused: Option<WidgetId>,
+    ) -> Option<TextRun> {
+        let bounds = tree.bounds(id)?;
+        text_runs(
+            tree,
+            id,
+            bounds,
+            bounds,
+            focused,
+            &dark_theme(),
+            &test_scales(),
+        )
+        .into_iter()
+        .next()
+    }
+
+    fn decor(run: &TextRun) -> &FieldDecor {
+        match run.field.as_ref() {
+            Some(decor) => decor,
+            None => unreachable!("a text field's run carries decor"),
+        }
+    }
+
+    #[test]
+    fn a_focused_field_draws_its_caret_at_the_cursor_and_only_then() {
+        let (mut tree, id, _) = field("Hello");
+        ok(with_text_field_mut(&mut tree, id, |s| s.cursor = 2));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!("a field with content draws");
+        };
+        assert_eq!(run.text, "Hello");
+        assert_eq!(decor(&run).caret, Some(2));
+        assert_eq!(decor(&run).scroll_anchor, 2);
+
+        // Unfocused (or another widget focused): no caret, but the same
+        // scroll anchor, so the field does not jump.
+        for focused in [None, Some(tree.root())] {
+            let Some(run) = field_run(&tree, id, focused) else {
+                unreachable!("content still draws unfocused");
+            };
+            assert_eq!(decor(&run).caret, None, "{focused:?}");
+            assert_eq!(decor(&run).scroll_anchor, 2);
+        }
+
+        // Disabled: no caret even when focused.
+        ok(set_text_field_disabled(&mut tree, id, true));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!("a disabled field still shows its content");
+        };
+        assert_eq!(decor(&run).caret, None);
+    }
+
+    #[test]
+    fn field_content_is_text_primary_dimmed_when_disabled_and_clipped_to_the_padding() {
+        let (mut tree, id, scales) = field("Hello");
+        let theme = dark_theme();
+        let Some(run) = field_run(&tree, id, None) else {
+            unreachable!()
+        };
+        assert_eq!(run.color, rgba(theme.text.primary, 1.0));
+        let pad = scales.spacing.sm;
+        // Inset horizontally by the padding and vertically by the
+        // control outline, so decor never covers the border rows.
+        assert_eq!(run.clip, rect(20 + i64::from(pad), 11, 120 - 2 * pad, 22));
+        assert_eq!(run.rect, (32.0, 10.0, 96.0, 24.0));
+        assert_eq!(run.align, HAlign::Start);
+        let d = decor(&run);
+        assert_eq!(d.caret_color, rgba(theme.text.primary, 1.0));
+        assert_eq!(d.selection_fill, rgba(theme.accent.primary, 1.0));
+        assert_eq!(d.selected_text, rgba(theme.text.on_accent, 1.0));
+
+        ok(set_text_field_disabled(&mut tree, id, true));
+        let Some(run) = field_run(&tree, id, None) else {
+            unreachable!()
+        };
+        assert_eq!(
+            run.color,
+            rgba(theme.text.primary, theme.state.disabled_opacity)
+        );
+    }
+
+    #[test]
+    fn an_empty_field_draws_only_when_it_has_a_caret() {
+        let (tree, id, _) = field("");
+        assert!(field_run(&tree, id, None).is_none());
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!("an empty focused field still has a caret");
+        };
+        assert_eq!(decor(&run).caret, Some(0));
+    }
+
+    #[test]
+    fn the_selection_is_the_same_range_from_either_anchor_side() {
+        let (mut tree, id, _) = field("Hello world");
+        for (cursor, anchor) in [(2, 7), (7, 2)] {
+            ok(with_text_field_mut(&mut tree, id, |s| {
+                s.cursor = cursor;
+                s.selection_anchor = Some(anchor);
+            }));
+            let Some(run) = field_run(&tree, id, Some(id)) else {
+                unreachable!()
+            };
+            assert_eq!(decor(&run).selection, Some(2..7));
+            assert_eq!(decor(&run).caret, Some(cursor));
+        }
+        // An empty selection (anchor == cursor) draws no highlight.
+        ok(with_text_field_mut(&mut tree, id, |s| {
+            s.selection_anchor = Some(s.cursor);
+        }));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!()
+        };
+        assert_eq!(decor(&run).selection, None);
+    }
+
+    #[test]
+    fn field_scroll_is_zero_while_the_line_fits_and_pins_the_caret_otherwise() {
+        assert_eq!(field_scroll(50.0, 50.0, 100.0), 0.0);
+        assert_eq!(field_scroll(99.0, 99.0, 100.0), 0.0);
+        // Fits, but a caret after it would not: scroll by the shortfall
+        // (RT133-01).
+        assert_eq!(field_scroll(100.0, 100.0, 100.0), CARET_WIDTH);
+        assert_eq!(field_scroll(99.5, 99.5, 100.0), 0.5);
+        // Overflowing, caret at the end: its right edge on the box's.
+        let s = field_scroll(300.0, 300.0, 100.0);
+        assert_eq!(s, 300.0 + CARET_WIDTH - 100.0);
+        assert!(300.0 - s >= 100.0 - CARET_WIDTH && 300.0 - s <= 100.0);
+        // Caret near the start: no scroll (clamped at zero).
+        assert_eq!(field_scroll(300.0, 10.0, 100.0), 0.0);
+        // Middle: the least scroll keeping the caret inside.
+        assert_eq!(
+            field_scroll(300.0, 150.0, 100.0),
+            150.0 + CARET_WIDTH - 100.0
+        );
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert_eq!(field_scroll(bad, 1.0, 100.0), 0.0);
+            assert_eq!(field_scroll(300.0, bad, 100.0), 0.0);
+            assert_eq!(field_scroll(300.0, 1.0, bad), 0.0);
+        }
+    }
+
+    fn a_field_run(text: &str, width: f32, decor: FieldDecor) -> TextRun {
+        TextRun {
+            text: text.to_owned(),
+            style: label_style(&test_scales()),
+            color: [1.0, 1.0, 1.0, 1.0],
+            rect: (10.0, 10.0, width, 24.0),
+            align: HAlign::Start,
+            clip: Rect {
+                x: 10,
+                y: 10,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                width: width as u32,
+                height: 24,
+            },
+            field: Some(decor),
+        }
+    }
+
+    const PRIMARY: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const CARET: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
+    const FILL: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    const ON_FILL: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
+    const UNDERLINE: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
+
+    fn plain_decor(cursor: usize) -> FieldDecor {
+        FieldDecor {
+            scroll_anchor: cursor,
+            caret: Some(cursor),
+            caret_color: CARET,
+            selection: None,
+            selection_fill: FILL,
+            selected_text: ON_FILL,
+            underlines: Vec::new(),
+            underline_color: UNDERLINE,
+        }
+    }
+
+    fn rects(pieces: &[Resolved]) -> Vec<([i32; 4], [f32; 4])> {
+        pieces
+            .iter()
+            .filter_map(|p| match p {
+                Resolved::Rect(r, c) => Some((*r, *c)),
+                Resolved::Glyphs(..) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_selection_resolves_line_then_fill_then_selected_glyphs_then_caret() {
+        let mut engine = ok(TextEngine::new());
+        let mut decor = plain_decor(4);
+        decor.selection = Some(1..4);
+        let pieces = resolve_run(&mut engine, &a_field_run("Hello", 200.0, decor), 1.0);
+        let kinds: Vec<_> = pieces
+            .iter()
+            .map(|p| match p {
+                Resolved::Glyphs(_, c) => ("glyphs", *c),
+                Resolved::Rect(_, c) => ("rect", *c),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("glyphs", PRIMARY),
+                ("rect", FILL),
+                ("glyphs", ON_FILL),
+                ("rect", CARET),
+            ]
+        );
+        // The selected pass is clipped to the highlight.
+        let (Some(Resolved::Rect(fill, _)), Some(Resolved::Glyphs(inside, _))) =
+            (pieces.get(1), pieces.get(2))
+        else {
+            unreachable!("order asserted above");
+        };
+        for quad in inside {
+            let [x0, y0, x1, y1] = quad.dst;
+            assert!(x0 >= fill[0] && x1 <= fill[2] && y0 >= fill[1] && y1 <= fill[3]);
+        }
+    }
+
+    #[test]
+    fn the_caret_sits_on_the_snapped_caret_x_and_is_one_logical_px_wide() {
+        let mut engine = ok(TextEngine::new());
+        for scale in [1.0_f32, 2.0] {
+            let run = a_field_run("Hello", 200.0, plain_decor(2));
+            let line = engine.shape("Hello", &run.style, scale);
+            let Some(x) = line.caret_x(2) else {
+                unreachable!("2 is a boundary of Hello");
+            };
+            let pieces = resolve_run(&mut engine, &run, scale);
+            let [(caret, color)] = rects(&pieces)[..] else {
+                unreachable!("exactly one rect: the caret");
+            };
+            assert_eq!(color, CARET);
+            assert_eq!(caret[0], to_phys(10.0 + x, scale), "scale {scale}");
+            #[allow(clippy::cast_possible_truncation)]
+            let width = (CARET_WIDTH * scale).round() as i32;
+            assert_eq!(caret[2] - caret[0], width, "scale {scale}");
+            assert!(caret[3] > caret[1]);
+        }
+    }
+
+    #[test]
+    fn an_overflowing_field_keeps_its_caret_inside_and_draws_nothing_outside_its_clip() {
+        let mut engine = ok(TextEngine::new());
+        let text = "The quick brown fox jumps over the lazy dog";
+        for scale in [1.0_f32, 2.0] {
+            let run = a_field_run(text, 60.0, plain_decor(text.len()));
+            let clip = [
+                to_phys(10.0, scale),
+                to_phys(10.0, scale),
+                to_phys(70.0, scale),
+                to_phys(34.0, scale),
+            ];
+            let pieces = resolve_run(&mut engine, &run, scale);
+            let Some(&(caret, _)) = rects(&pieces).last() else {
+                unreachable!("a caret is drawn");
+            };
+            assert_eq!(caret[2] - caret[0], to_phys(CARET_WIDTH, scale));
+            assert!(caret[2] <= clip[2] && caret[0] >= clip[2] - to_phys(2.0, scale));
+            let mut glyphs = 0;
+            for piece in &pieces {
+                let (r, _) = match piece {
+                    Resolved::Rect(r, c) => (vec![*r], c),
+                    Resolved::Glyphs(q, c) => (q.iter().map(|q| q.dst).collect(), c),
+                };
+                for [x0, y0, x1, y1] in r {
+                    glyphs += 1;
+                    assert!(x0 >= clip[0] && y0 >= clip[1] && x1 <= clip[2] && y1 <= clip[3]);
+                }
+            }
+            assert!(glyphs > 2, "the tail of the line is visible");
+            // Scrolled: the first glyph ("T") is not drawn at the start.
+            let unscrolled = resolve_run(
+                &mut engine,
+                &TextRun {
+                    field: Some(plain_decor(0)),
+                    ..run.clone()
+                },
+                scale,
+            );
+            assert_ne!(pieces.first(), unscrolled.first());
+        }
+    }
+
+    #[test]
+    fn a_preedit_is_spliced_in_at_the_cursor_and_underlined_target_thicker() {
+        let (mut tree, id, _) = field("ab");
+        ok(with_text_field_mut(&mut tree, id, |s| {
+            s.cursor = 1;
+            s.set_composition("xyz", Some((1, 2)));
+        }));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!()
+        };
+        assert_eq!(run.text, "axyzb");
+        let d = decor(&run);
+        assert_eq!(d.caret, Some(4), "at the preedit's end");
+        assert_eq!(d.selection, None);
+        assert_eq!(
+            d.underlines,
+            vec![
+                (1..2, UnderlineStyle::Plain),
+                (2..3, UnderlineStyle::Target),
+                (3..4, UnderlineStyle::Plain),
+            ]
+        );
+        let mut engine = ok(TextEngine::new());
+        let pieces = resolve_run(&mut engine, &run, 2.0);
+        let rects = rects(&pieces);
+        assert_eq!(rects.len(), 4, "three underlines and the caret");
+        let height = |i: usize| rects.get(i).map(|(r, _)| r[3] - r[1]);
+        assert_eq!(height(0), Some(2), "plain: one logical px at scale 2");
+        assert_eq!(height(1), Some(4), "target: twice as thick");
+        assert_eq!(height(2), Some(2));
+    }
+
+    #[test]
+    fn a_control_character_keeps_every_byte_offset() {
+        let (mut tree, id, _) = field("a\u{85}b");
+        ok(with_text_field_mut(&mut tree, id, |s| s.cursor = 3));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!()
+        };
+        assert_eq!(run.text, "a  b");
+        assert_eq!(decor(&run).caret, Some(3));
+    }
+
+    #[test]
+    fn paint_widget_ops_focused_never_draws_a_caret_frame_does_for_the_focused_field() {
+        let (tree, id, scales) = field("Hello");
+        let theme = dark_theme();
+        let caret = |ops: &[PaintOp]| {
+            ops.iter().any(|op| {
+                matches!(op, PaintOp::Text(run) if run.field.as_ref().is_some_and(|f| f.caret.is_some()))
+            })
+        };
+        let plain = ok(paint_widget_ops_focused(
+            &tree, id, None, &theme, &scales, 1.0,
+        ));
+        let unfocused = ok(paint_widget_ops_frame(
+            &tree, id, None, None, &theme, &scales, 1.0,
+        ));
+        assert_eq!(plain, unfocused);
+        assert!(!caret(&plain));
+        let focused = ok(paint_widget_ops_frame(
+            &tree,
+            id,
+            None,
+            Some(id),
+            &theme,
+            &scales,
+            1.0,
+        ));
+        assert!(caret(&focused));
+    }
+
+    #[test]
+    fn a_tooltip_draws_its_accessibility_label_and_follows_set_text() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let theme = dark_theme();
+        let owner = ok(insert_button(&mut tree, root, &scales, "Owner"));
+        let mut tooltip = ok(Tooltip::new(
+            &tree,
+            owner,
+            &scales,
+            "Brush size",
+            Duration::from_millis(500),
+        ));
+        let t0 = Instant::now();
+        ok(tooltip.set_hover(&mut tree, true, false, t0));
+        ok(tooltip.tick(&mut tree, t0 + Duration::from_secs(1)));
+        let Some(node) = tooltip.node() else {
+            unreachable!("shown after its delay");
+        };
+        let bounds = rect(0, 30, 120, 20);
+        let runs = |tree: &WidgetTree<WidgetKind>| {
+            text_runs(tree, node, bounds, bounds, None, &theme, &scales)
+        };
+        let [run] = &runs(&tree)[..] else {
+            unreachable!("one run");
+        };
+        assert_eq!(run.text, "Brush size");
+        assert_eq!(run.color, rgba(theme.text.primary, 1.0));
+        assert_eq!(run.style.size_px, 11.0, "type.size.xs");
+        ok(tooltip.set_text(&mut tree, "Brush hardness"));
+        let texts: Vec<String> = runs(&tree).into_iter().map(|r| r.text).collect();
+        assert_eq!(texts, vec!["Brush hardness".to_owned()]);
+    }
+
+    fn palette() -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let palette = ok(insert_command_palette(
+            &mut tree,
+            root,
+            vec![
+                CommandEntry::new("a", "Undo"),
+                CommandEntry::new("b", "Redo"),
+                CommandEntry::new("c", "Toggle Layers"),
+            ],
+        ));
+        (tree, palette)
+    }
+
+    fn texts_of(
+        tree: &WidgetTree<WidgetKind>,
+        id: WidgetId,
+        focused: Option<WidgetId>,
+    ) -> Vec<TextRun> {
+        let bounds = rect(0, 0, 300, 24);
+        text_runs(
+            tree,
+            id,
+            bounds,
+            bounds,
+            focused,
+            &dark_theme(),
+            &test_scales(),
+        )
+    }
+
+    #[test]
+    fn palette_rows_draw_their_titles_in_result_order_selected_on_accent() {
+        let (mut tree, palette) = palette();
+        let theme = dark_theme();
+        let rows = ok(command_palette_state(&tree, palette)).rows().to_vec();
+        let titles: Vec<(String, [f32; 4])> = rows
+            .iter()
+            .flat_map(|row| texts_of(&tree, *row, None))
+            .map(|r| (r.text, r.color))
+            .collect();
+        let on_accent = rgba(theme.text.on_accent, 1.0);
+        let primary = rgba(theme.text.primary, 1.0);
+        assert_eq!(
+            titles,
+            vec![
+                ("Undo".to_owned(), on_accent),
+                ("Redo".to_owned(), primary),
+                ("Toggle Layers".to_owned(), primary),
+            ]
+        );
+        ok(set_command_palette_query(&mut tree, palette, "o"));
+        ok(set_command_palette_query(&mut tree, palette, "red"));
+        let state = ok(command_palette_state(&tree, palette));
+        let titles: Vec<String> = state
+            .rows()
+            .iter()
+            .flat_map(|row| texts_of(&tree, *row, None))
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(titles, vec!["Redo".to_owned()]);
+    }
+
+    #[test]
+    fn the_palette_query_strip_draws_the_query_with_a_caret_while_the_palette_is_focused() {
+        let (mut tree, palette) = palette();
+        let theme = dark_theme();
+        ok(set_command_palette_query(&mut tree, palette, "zzz"));
+        let state = ok(command_palette_state(&tree, palette));
+        assert!(state.rows().is_empty(), "nothing matches");
+        let strip = state.query_strip();
+        let [run] = &texts_of(&tree, strip, Some(palette))[..] else {
+            unreachable!("the strip draws with zero results");
+        };
+        assert_eq!(run.text, "zzz");
+        assert_eq!(run.color, rgba(theme.text.primary, 1.0));
+        assert_eq!(decor(run).caret, Some(3));
+        let [run] = &texts_of(&tree, strip, None)[..] else {
+            unreachable!("the query still draws unfocused");
+        };
+        assert_eq!(decor(run).caret, None);
+        // An empty query with the palette focused is just a caret.
+        ok(set_command_palette_query(&mut tree, palette, ""));
+        let [run] = &texts_of(&tree, strip, Some(palette))[..] else {
+            unreachable!("an empty focused query still has a caret");
+        };
+        assert_eq!(decor(run).caret, Some(0));
+        // The body and the root themselves draw nothing.
+        let body = ok(command_palette_state(&tree, palette)).body();
+        assert!(texts_of(&tree, body, Some(palette)).is_empty());
+        assert!(texts_of(&tree, palette, Some(palette)).is_empty());
+    }
+
+    #[test]
+    fn a_dialog_draws_its_message_in_text_primary_and_nothing_on_its_root() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let theme = dark_theme();
+        let handle = ok(insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Title",
+            "Something happened.",
+            vec![DialogAction::new("ok", "OK")],
+        ));
+        let [run] = &texts_of(&tree, handle.message, None)[..] else {
+            unreachable!("the message draws");
+        };
+        assert_eq!(run.text, "Something happened.");
+        assert_eq!(run.color, rgba(theme.text.primary, 1.0));
+        assert!(run.field.is_none());
+        assert!(texts_of(&tree, handle.root, None).is_empty());
+    }
+
+    /// A text field holding `content`, laid out by the real layout
+    /// (`insert_text_field`'s own style) in a 200 px column at (0, 0),
+    /// focused, with `f` applied to its state; returns its bounds and
+    /// resolved pieces at `scale`.
+    fn laid_out_field(
+        content: &str,
+        scale: f32,
+        f: impl FnOnce(&mut crate::widgets::TextFieldState),
+    ) -> (Rect, Vec<Resolved>) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::auto(),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let id = ok(insert_text_field(&mut tree, root, &scales, "Name", content));
+        ok(with_text_field_mut(&mut tree, id, f));
+        tree.compute_layout(200.0, 100.0);
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out")
+        };
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!("a field draws a run: {bounds:?}")
+        };
+        let mut engine = ok(TextEngine::new());
+        (bounds, resolve_run(&mut engine, &run, scale))
+    }
+
+    #[test]
+    fn a_laid_out_field_is_one_row_tall_and_its_decor_stays_inside_the_outline() {
+        // C1: the field's real layout height is `row_height`, so the
+        // caret, the selection and both preedit underline styles fit
+        // strictly inside the 1 px outline's inner rows at every scale.
+        let scales = test_scales();
+        for scale in [1.0_f32, 1.5, 2.0] {
+            // Selection + caret.
+            let (bounds, pieces) = laid_out_field("Hello gyp", scale, |s| {
+                s.cursor = 9;
+                s.selection_anchor = Some(0);
+            });
+            #[allow(clippy::cast_precision_loss)]
+            let (y, h) = (bounds.y as f32, bounds.height as f32);
+            assert_eq!(h, crate::widgets::row_height(&scales), "scale {scale}");
+            let inner_top = to_phys(y + 1.0, scale);
+            let inner_bottom = to_phys(y + h - 1.0, scale);
+            let solids = rects(&pieces);
+            assert_eq!(solids.len(), 2, "selection and caret, scale {scale}");
+            for (r, _) in &solids {
+                assert!(
+                    r[1] >= inner_top && r[3] <= inner_bottom,
+                    "{r:?} outside rows {inner_top}..{inner_bottom} at scale {scale}"
+                );
+            }
+            // The caret spans the font's full content area (not clipped
+            // shorter than ascent + descent by a too-short box).
+            let mut engine = ok(TextEngine::new());
+            let line = engine.shape("Hello gyp", &label_style(&scales), scale);
+            let Some(&(caret, _)) = solids.last() else {
+                unreachable!()
+            };
+            let top = to_phys(
+                y + h / 2.0 + (line.ascent - line.descent) / 2.0 - line.ascent,
+                scale,
+            );
+            let bottom = to_phys(
+                y + h / 2.0 + (line.ascent - line.descent) / 2.0 + line.descent,
+                scale,
+            );
+            assert_eq!((caret[1], caret[3]), (top, bottom), "scale {scale}");
+
+            // Preedit: a Target clause is thicker than a Plain one, and
+            // both sit one logical px below the baseline, inside the rows.
+            let (_, pieces) = laid_out_field("ab", scale, |s| {
+                s.cursor = 2;
+                s.set_composition("nihao", Some((2, 5)));
+            });
+            let underlines: Vec<[i32; 4]> = rects(&pieces)
+                .into_iter()
+                .filter(|(_, c)| *c == rgba(dark_theme().text.primary, 1.0))
+                .map(|(r, _)| r)
+                .collect();
+            // Plain "ni", Target "hao", then the caret (same colour).
+            let [plain, target, _caret] = underlines[..] else {
+                unreachable!("two underlines and a caret: {underlines:?}")
+            };
+            assert!(
+                target[3] - target[1] > plain[3] - plain[1],
+                "Target {target:?} not thicker than Plain {plain:?} at scale {scale}"
+            );
+            let baseline = to_phys(y + h / 2.0 + (line.ascent - line.descent) / 2.0, scale);
+            #[allow(clippy::cast_possible_truncation)]
+            let one = (scale.round() as i32).max(1);
+            assert_eq!(plain[1], baseline + one, "C2: y offset, scale {scale}");
+            assert_eq!(target[1], baseline + one, "C2: y offset, scale {scale}");
+            for r in [plain, target] {
+                assert!(
+                    r[1] >= inner_top && r[3] <= inner_bottom,
+                    "{r:?} at {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_caret_after_a_line_that_nearly_fills_the_field_stays_visible() {
+        // RT133-01: sweep the inner width around the line's own width at
+        // several scales; an end-of-line caret must always be drawn.
+        let scales = test_scales();
+        let pad = scales.spacing.sm;
+        let mut engine = ok(TextEngine::new());
+        let mut checked = 0;
+        for scale in [1.0_f32, 1.5, 2.0] {
+            for content in ["Hello", "Layer 12", "gauntlet", "Wwww", "Aurora image", "x"] {
+                let line = engine.shape(content, &label_style(&scales), scale);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ceil = line.width.ceil() as u32;
+                for inner in ceil.saturating_sub(1)..=ceil + 2 {
+                    let (mut tree, root) = new_tree(taffy::Style::default());
+                    ok(tree.set_bounds(root, rect(0, 0, 400, 300)));
+                    let id = ok(insert_text_field(&mut tree, root, &scales, "N", content));
+                    ok(tree.set_bounds(id, rect(20, 10, inner + 2 * pad, 24)));
+                    let Some(run) = field_run(&tree, id, Some(id)) else {
+                        unreachable!()
+                    };
+                    let clip = super::clip_phys(run.clip, scale);
+                    let pieces = resolve_run(&mut engine, &run, scale);
+                    let Some(&(caret, _)) = rects(&pieces).last() else {
+                        unreachable!("no caret: {content:?} inner {inner} scale {scale}");
+                    };
+                    assert!(
+                        caret[0] >= clip[0] && caret[2] <= clip[2] && caret[2] > caret[0],
+                        "{content:?} inner {inner} scale {scale}: {caret:?} vs {clip:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 6 * 4);
+    }
+
+    #[test]
+    fn a_caret_outside_its_clip_is_dropped_and_one_straddling_it_is_cut() {
+        // M10: a focused field partially clipped by an ancestor.
+        let (tree, id, _) = field("Hi");
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!()
+        };
+        let theme = dark_theme();
+        let scales = test_scales();
+        let caret_color = rgba(theme.text.primary, 1.0);
+        let runs_in = |clip: Rect| {
+            let run = text_runs(&tree, id, bounds, clip, Some(id), &theme, &scales);
+            let mut engine = ok(TextEngine::new());
+            run.iter()
+                .flat_map(|r| resolve_run(&mut engine, r, 1.0))
+                .collect::<Vec<_>>()
+        };
+        // Clip ends just right of the padding: "Hi"'s end caret is past it.
+        let left = runs_in(rect(20, 10, 14, 24));
+        assert!(
+            rects(&left).iter().all(|(_, c)| *c != caret_color),
+            "a caret outside the clip is not drawn"
+        );
+        // Clip is the field's lower half: the caret is cut, not dropped.
+        let lower = runs_in(rect(20, 22, 120, 12));
+        let Some(&(caret, _)) = rects(&lower).last() else {
+            unreachable!("the caret straddles the clip")
+        };
+        assert_eq!(caret[1], 22);
+        assert!(caret[3] <= 33 && caret[3] > 22);
+    }
+
+    #[test]
+    fn a_non_char_boundary_cursor_or_selection_snaps_to_the_previous_boundary() {
+        // C6/C8: "é" is two bytes; byte 1 is inside it.
+        let (mut tree, id, _) = field("aé");
+        ok(with_text_field_mut(&mut tree, id, |s| {
+            s.cursor = 2;
+            s.selection_anchor = None;
+        }));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!()
+        };
+        assert_eq!(decor(&run).caret, Some(1), "previous boundary, not len");
+        ok(with_text_field_mut(&mut tree, id, |s| {
+            s.cursor = 99;
+            s.selection_anchor = Some(2);
+        }));
+        let Some(run) = field_run(&tree, id, Some(id)) else {
+            unreachable!()
+        };
+        assert_eq!(decor(&run).caret, Some(3), "past the end is the end");
+        assert_eq!(decor(&run).selection, Some(1..3));
+    }
+
+    #[test]
+    fn the_query_caret_follows_focus_anywhere_inside_the_palette_only() {
+        // M15a/M15b/C4.
+        let (mut tree, palette) = palette();
+        ok(set_command_palette_query(&mut tree, palette, "o"));
+        let state = ok(command_palette_state(&tree, palette));
+        let strip = state.query_strip();
+        let Some(&row) = state.rows().first() else {
+            unreachable!("\"o\" matches Undo")
+        };
+        let other = ok(insert_button(&mut tree, palette, &test_scales(), "x"));
+        let Some(unrelated) = tree.parent(palette) else {
+            unreachable!()
+        };
+        let other_root = ok(insert_button(&mut tree, unrelated, &test_scales(), "y"));
+        let caret = |focused| {
+            texts_of(&tree, strip, focused)
+                .first()
+                .and_then(|r| r.field.as_ref())
+                .and_then(|d| d.caret)
+        };
+        assert_eq!(caret(Some(palette)), Some(1));
+        assert_eq!(caret(Some(row)), Some(1), "focus on a palette row");
+        assert_eq!(caret(Some(other)), Some(1), "any descendant counts");
+        assert_eq!(caret(Some(other_root)), None, "an unrelated widget");
+        assert_eq!(caret(None), None);
     }
 }

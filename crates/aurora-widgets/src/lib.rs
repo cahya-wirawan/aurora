@@ -87,7 +87,7 @@ pub use error::WidgetError;
 pub use input::{FocusManager, FocusOrigin, hit_test};
 pub use paint::{
     FOCUS_RING_INNER_WIDTH, FOCUS_RING_WIDTH, FocusPaint, Paint, PaintOp, paint_widget,
-    paint_widget_ops, paint_widget_ops_focused,
+    paint_widget_ops, paint_widget_ops_focused, paint_widget_ops_frame,
 };
 pub use pointer::{
     ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
@@ -99,5 +99,8 @@ pub use render::{
     upload_paint_ops,
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
-pub use text::{HAlign, QuadGlyph, TextRun, label_style, resolve_text, text_runs};
+pub use text::{
+    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_scroll, label_style,
+    resolve_run, resolve_text, text_runs,
+};
 pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};

@@ -2,9 +2,11 @@
 //! word, grapheme-cluster aware), clipboard-shaped operations,
 //! per-field undo/redo, and IME composition state.
 //!
-//! **No pixel rendering, no real clipboard** — this is the logical text
-//! buffer only, the same "no rendering yet" scope every widget in this
-//! module has (see `widgets`' own doc comment). "Clipboard" here means
+//! **No real clipboard, and rendering lives elsewhere** — this is the
+//! logical text buffer; since 0.133.0 `crate::text::text_runs` draws its
+//! content, a caret at `cursor` while focused, the selection and any IME
+//! preedit (spliced in at `cursor`, underlined per
+//! [`composition_segments`]). "Clipboard" here means
 //! [`TextFieldState::copy`]/[`TextFieldState::cut`]/[`TextFieldState::paste`]
 //! as pure text-buffer operations returning/taking a plain `String` —
 //! actually reading/writing the OS clipboard is platform-specific and
@@ -24,11 +26,22 @@
 //! style each should render with ([`UnderlineStyle::Plain`] for
 //! unconverted text, [`UnderlineStyle::Target`] for the clause the
 //! candidate window is acting on — the distinction Windows TSF, macOS,
-//! and `IBus` each draw under different names). Actually drawing either
-//! style is an `aurora-text`/`aurora-vector` concern (both still
-//! skeletons); this is the styled-segment *data* a future renderer would
-//! consume — "rendering" in the same data-not-pixels sense every widget
-//! in this module already uses.
+//! and `IBus` each draw under different names). Since 0.133.0 both
+//! are drawn (`crate::text::resolve_run`): `Plain` one logical px thick
+//! and `Target` two, one logical px below the baseline, in
+//! `text.primary`. **The preedit caret ignores the IME's own cursor**:
+//! while composing, the caret is drawn at the *end* of the preedit, not
+//! at the cursor position `winit::event::Ime::Preedit` reports inside
+//! it — [`Composition`] keeps only the target clause, so an IME that
+//! moves its cursor within the preedit (left/right arrows while
+//! composing) is not reflected until it commits.
+//!
+//! **Layout height** (0.133.0 review revision): a field is
+//! [`super::row_height`] tall — `type.size.md` plus `spacing.xxs` above
+//! and below — so the font's whole content area (ascent + descent,
+//! ~15.7 px at 13 px) and the caret spanning it fit inside the 1 px
+//! control outline. It was `type.size.md` alone, shorter than the
+//! content area, so the caret and selection covered the outline.
 //!
 //! `accesskit::TextSelection` isn't exposed yet — `spike/a11y-ime`
 //! already named that as unverified/open on its own (`FINDINGS.md`:
@@ -47,7 +60,7 @@ use taffy::style_helpers::{auto, length};
 use taffy::{Rect as LayoutRect, Size, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{WidgetKind, spacing, type_size};
+use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
 use crate::tree::{WidgetId, WidgetTree};
@@ -95,8 +108,20 @@ pub enum UnderlineStyle {
 /// underline style each should render with.
 #[must_use]
 pub fn composition_segments(composition: &Composition) -> Vec<(Range<usize>, UnderlineStyle)> {
-    let len = composition.text.len();
-    let target = composition.target_range.filter(|(start, end)| start < end);
+    let text = composition.text.as_str();
+    let len = text.len();
+    // `target_range` comes from the platform IME: clamp it to the text
+    // and snap both ends down to a char boundary, so every segment is a
+    // valid, in-bounds byte range of `text` whatever the IME reported.
+    let target = composition
+        .target_range
+        .map(|(start, end)| {
+            (
+                floor_char_boundary(text, start),
+                floor_char_boundary(text, end),
+            )
+        })
+        .filter(|(start, end)| start < end);
     let Some((start, end)) = target else {
         // No target, or a degenerate empty one (conveys no distinct
         // clause) -- either way, one plain segment for the whole text.
@@ -373,6 +398,12 @@ impl TextFieldState {
             self.cursor = range.start;
             self.selection_anchor = None;
         }
+        let target_range = target_range.map(|(start, end)| {
+            (
+                floor_char_boundary(&text, start),
+                floor_char_boundary(&text, end),
+            )
+        });
         self.composition = Some(Composition { text, target_range });
     }
 
@@ -386,6 +417,18 @@ impl TextFieldState {
         self.composition = None;
         self.insert_str(text);
     }
+}
+
+/// The greatest char boundary of `text` at or below `at` (`text.len()`
+/// when `at` is past the end).
+pub(crate) fn floor_char_boundary(text: &str, at: usize) -> usize {
+    if at >= text.len() {
+        return text.len();
+    }
+    (0..=at)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0)
 }
 
 /// Whether byte offset `at` is a grapheme-cluster boundary of `content`
@@ -456,13 +499,16 @@ fn style(scales: &Scales) -> Style {
         padding: LayoutRect {
             left: length(spacing(scales.spacing.sm)),
             right: length(spacing(scales.spacing.sm)),
-            top: length(spacing(scales.spacing.xs)),
-            bottom: length(spacing(scales.spacing.xs)),
+            top: length(spacing(scales.spacing.xxs)),
+            bottom: length(spacing(scales.spacing.xxs)),
         },
         flex_grow: 1.0,
+        // One row tall: `type.size.md` plus `spacing.xxs` above and below
+        // (the padding), so the font's content area and the caret fit
+        // inside the outline. See the module doc's "Layout height".
         size: Size {
             width: auto(),
-            height: length(type_size(scales.typography.size.md)),
+            height: length(row_height(scales)),
         },
         ..Default::default()
     }
@@ -1214,6 +1260,49 @@ mod tests {
         assert_eq!(
             composition_segments(&composition),
             vec![(0..5, UnderlineStyle::Plain)]
+        );
+    }
+
+    #[test]
+    fn composition_segments_clamp_an_out_of_range_or_mid_char_target() {
+        // "日本" is two 3-byte chars: bytes 0..6. An IME reporting a target
+        // past the end, or ending mid-char, must still yield in-bounds,
+        // char-boundary segments covering the text exactly once.
+        let text = "日本";
+        for (target, expected) in [
+            (
+                (3, 99),
+                vec![
+                    (0..3, UnderlineStyle::Plain),
+                    (3..6, UnderlineStyle::Target),
+                ],
+            ),
+            (
+                (1, 4),
+                vec![
+                    (0..3, UnderlineStyle::Target),
+                    (3..6, UnderlineStyle::Plain),
+                ],
+            ),
+            ((7, 9), vec![(0..6, UnderlineStyle::Plain)]),
+            ((4, 5), vec![(0..6, UnderlineStyle::Plain)]),
+        ] {
+            let composition = Composition {
+                text: text.to_owned(),
+                target_range: Some(target),
+            };
+            let segments = composition_segments(&composition);
+            assert_eq!(segments, expected, "target {target:?}");
+            for (range, _) in &segments {
+                assert!(text.get(range.clone()).is_some(), "{range:?}");
+            }
+        }
+        // `set_composition` stores the same clamped range.
+        let mut state = TextFieldState::new(String::new(), String::new());
+        state.set_composition(text, Some((1, 99)));
+        assert_eq!(
+            state.composition.as_ref().and_then(|c| c.target_range),
+            Some((0, 6))
         );
     }
 
