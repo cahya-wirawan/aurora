@@ -514,6 +514,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
+use aurora_text::TextEngine;
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
@@ -526,8 +527,9 @@ use aurora_widgets::{
     handle_pointer, handle_widget_key, handle_widget_text,
 };
 use aurora_widgets::{
-    FocusManager, FocusPaint, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline, PaintOp,
-    PathPipeline, WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops_focused,
+    FocusManager, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline,
+    PaintOp, PathPipeline, TextPipeline, WidgetId, WidgetTree, draw_paint_ops,
+    paint_widget_ops_focused, upload_paint_ops,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -14604,6 +14606,17 @@ struct App {
     /// in the same pass — built in `resumed` under the same "needs only a
     /// real device" rule.
     gradient_pipeline: Option<GradientPipeline>,
+    /// The glyph renderer (`aurora_widgets::TextPipeline`, 0.132.0) that
+    /// draws a widget's `PaintOp::Text` runs in the same pass, and the
+    /// glyph atlas it samples — both built in `resumed` beside
+    /// `path_pipeline`, under the same "needs only a real device" rule.
+    text_pipeline: Option<TextPipeline>,
+    glyph_atlas: Option<GlyphAtlas>,
+    /// Shapes and rasterizes widget labels (`aurora_text::TextEngine`,
+    /// the bundled UI font). CPU-only; built in `resumed` too. `None` only
+    /// if the bundled font failed to parse, which is logged — widgets
+    /// then draw without their labels rather than not at all.
+    text_engine: Option<TextEngine>,
     /// The pointer's last known position, in the *window's* own logical
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
@@ -14864,6 +14877,9 @@ impl App {
             compositor: None,
             path_pipeline: None,
             gradient_pipeline: None,
+            text_pipeline: None,
+            glyph_atlas: None,
+            text_engine: None,
             pointer_position: None,
             gallery: None,
             gallery_click: ClickTracker::default(),
@@ -16818,6 +16834,10 @@ impl App {
                 // frame (`FocusPaint::resolve`): `None` when focus is not
                 // visible or nothing focused paints one.
                 let focus_paint = FocusPaint::resolve(&self.workspace.tree, &self.focus);
+                if let Some(engine) = self.text_engine.as_mut() {
+                    engine.begin_frame();
+                }
+                let text = self.text_engine.as_mut().zip(self.glyph_atlas.as_mut());
                 let widget_paints = collect_widget_paints(
                     &self.workspace.tree,
                     focus_paint,
@@ -16826,6 +16846,7 @@ impl App {
                     gpu,
                     surface.format(),
                     self.scale_factor,
+                    text,
                 );
 
                 // Sync before drawing, so this frame shows the latest
@@ -16903,11 +16924,15 @@ impl App {
                     if !widget_paints.is_empty()
                         && let Some(path_pipeline) = self.path_pipeline.as_mut()
                         && let Some(gradient_pipeline) = self.gradient_pipeline.as_mut()
+                        && let Some(text_pipeline) = self.text_pipeline.as_mut()
+                        && let Some(glyph_atlas) = self.glyph_atlas.as_ref()
                     {
                         draw_widget_paints(
                             &mut pass,
                             path_pipeline,
                             gradient_pipeline,
+                            text_pipeline,
+                            glyph_atlas,
                             gpu,
                             surface.format(),
                             surface.size(),
@@ -16923,6 +16948,7 @@ impl App {
                             paints = widget_paints.len(),
                             path_pipeline = self.path_pipeline.is_some(),
                             gradient_pipeline = self.gradient_pipeline.is_some(),
+                            text_pipeline = self.text_pipeline.is_some(),
                             "widget pipelines missing; no widgets drawn this frame"
                         );
                     }
@@ -16991,6 +17017,12 @@ fn target_paint_ops(
                         PaintOp::Solid((mesh, target_paint_color(color, format)))
                     }
                     gradient @ PaintOp::Gradient(_) => gradient,
+                    // A label's colour is a token colour exactly like a
+                    // solid's, so it is converted the same way.
+                    PaintOp::Text(mut run) => {
+                        run.color = target_paint_color(run.color, format);
+                        PaintOp::Text(run)
+                    }
                 }));
             }
             Err(err) => {
@@ -17015,7 +17047,16 @@ fn target_paint_ops(
 /// iteration, before the pass (borrowed for `'pass`) is done with it.
 /// Building the whole list first, then only borrowing from it inside
 /// the pass ([`draw_widget_paints`]), is the shape that forces.
+///
+/// **Text (0.132.0).** With `text` present, every `PaintOp::Text` run is
+/// shaped and resolved at `scale_factor`, the frame's glyphs are made
+/// resident in the atlas in one go, and each run uploads as a
+/// `GpuPaintOp::Text` in paint order (`aurora_widgets::upload_paint_ops`).
+/// With `text` absent (no engine — the bundled font failed to load — or
+/// no atlas yet) text runs are dropped and everything else draws as
+/// before.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 fn collect_widget_paints(
     tree: &WidgetTree<WidgetKind>,
     focus: Option<FocusPaint>,
@@ -17024,16 +17065,27 @@ fn collect_widget_paints(
     gpu: &GpuContext,
     format: wgpu::TextureFormat,
     scale_factor: f64,
+    text: Option<(&mut TextEngine, &mut GlyphAtlas)>,
 ) -> Vec<GpuPaintOp> {
-    target_paint_ops(tree, focus, theme, scales, format, scale_factor)
-        .into_iter()
-        .map(|op| match op {
-            PaintOp::Solid((mesh, color)) => {
-                GpuPaintOp::Solid(GpuMesh::upload(gpu.device(), gpu.queue(), &mesh), color)
-            }
-            PaintOp::Gradient(mesh) => {
-                GpuPaintOp::Gradient(GpuColorMesh::upload(gpu.device(), gpu.queue(), &mesh))
-            }
+    let ops = target_paint_ops(tree, focus, theme, scales, format, scale_factor);
+    if let Some((engine, atlas)) = text {
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = scale_factor as f32;
+        // Colours were already converted for `format` above.
+        return upload_paint_ops(gpu.device(), gpu.queue(), engine, atlas, ops, scale, |c| c);
+    }
+    ops.into_iter()
+        .filter_map(|op| match op {
+            PaintOp::Solid((mesh, color)) => Some(GpuPaintOp::Solid(
+                GpuMesh::upload(gpu.device(), gpu.queue(), &mesh),
+                color,
+            )),
+            PaintOp::Gradient(mesh) => Some(GpuPaintOp::Gradient(GpuColorMesh::upload(
+                gpu.device(),
+                gpu.queue(),
+                &mesh,
+            ))),
+            PaintOp::Text(_) => None,
         })
         .collect()
 }
@@ -17056,14 +17108,17 @@ fn collect_widget_paints(
 /// with logical, not physical, size — a fraction of the window is the
 /// same fraction regardless of which pixel unit measures it, so this is
 /// correct at any DPI scale, not just `1.0`.
-// One more than clippy's default: the gradient pipeline joined the
-// path pipeline as a second, separately owned renderer, and bundling the
-// two `&mut` borrows into a struct would only move the same fields.
+// Over clippy's default: the gradient pipeline and then (0.132.0) the
+// text pipeline and its glyph atlas joined the path pipeline as
+// separately owned renderers, and bundling the borrows into a struct
+// would only move the same fields.
 #[allow(clippy::too_many_arguments)]
 fn draw_widget_paints<'pass>(
     pass: &mut wgpu::RenderPass<'pass>,
     path_pipeline: &mut PathPipeline,
     gradient_pipeline: &mut GradientPipeline,
+    text_pipeline: &mut TextPipeline,
+    glyph_atlas: &GlyphAtlas,
     gpu: &GpuContext,
     format: wgpu::TextureFormat,
     physical_size: (u32, u32),
@@ -17085,6 +17140,8 @@ fn draw_widget_paints<'pass>(
         pass,
         path_pipeline,
         gradient_pipeline,
+        text_pipeline,
+        glyph_atlas,
         gpu.device(),
         gpu.queue(),
         format,
@@ -17201,6 +17258,16 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // never skipped here.
         self.path_pipeline = Some(PathPipeline::new(gpu.device()));
         self.gradient_pipeline = Some(GradientPipeline::new(gpu.device()));
+        self.text_pipeline = Some(TextPipeline::new(gpu.device()));
+        self.glyph_atlas = Some(GlyphAtlas::new(gpu.device()));
+        if self.text_engine.is_none() {
+            match TextEngine::new() {
+                Ok(engine) => self.text_engine = Some(engine),
+                Err(err) => {
+                    tracing::error!(?err, "UI font failed to load; widget labels are not drawn");
+                }
+            }
+        }
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -23907,6 +23974,7 @@ mod tests {
             &context,
             wgpu::TextureFormat::Bgra8UnormSrgb,
             1.0,
+            None,
         );
         assert_eq!(
             paints.len(),
@@ -23926,6 +23994,139 @@ mod tests {
     /// linearized unconditionally, so on a non-sRGB swapchain a 0.5
     /// grey solid stored about 0.216 while a 0.5 grey gradient stored
     /// 0.5.
+    /// 0.132.0: with a text engine and atlas, a button uploads its fill,
+    /// then its label as a `GpuPaintOp::Text`, in paint order — and the
+    /// label's colour is converted for the target exactly like a solid's.
+    fn text_fixture() -> (
+        super::WidgetTree<super::WidgetKind>,
+        super::Theme,
+        super::Scales,
+    ) {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let button = match insert_button(&mut tree, root, &scales, "Apply") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            button,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 32,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        (tree, theme, scales)
+    }
+
+    #[test]
+    fn collect_widget_paints_uploads_text_ops_in_paint_order() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (tree, theme, scales) = text_fixture();
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads");
+        };
+        let mut atlas = super::GlyphAtlas::new(context.device());
+        let paints = collect_widget_paints(
+            &tree,
+            None,
+            &theme,
+            &scales,
+            &context,
+            wgpu::TextureFormat::Bgra8Unorm,
+            2.0,
+            Some((&mut engine, &mut atlas)),
+        );
+        let kinds: Vec<&str> = paints
+            .iter()
+            .map(|op| match op {
+                GpuPaintOp::Solid(..) => "solid",
+                GpuPaintOp::Gradient(_) => "gradient",
+                GpuPaintOp::Text(..) => "text",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["solid", "text"], "fill first, then its label");
+        let Some(GpuPaintOp::Text(mesh, _)) = paints.last() else {
+            unreachable!("checked above");
+        };
+        assert_eq!(mesh.index_count(), 5 * 6, "five inked glyphs in \"Apply\"");
+        assert!(
+            atlas.layout().len() >= 4,
+            "the label's glyphs are resident (the two p may share a key)"
+        );
+        // Without a text engine the label is dropped, nothing else is.
+        let without = collect_widget_paints(
+            &tree,
+            None,
+            &theme,
+            &scales,
+            &context,
+            wgpu::TextureFormat::Bgra8Unorm,
+            2.0,
+            None,
+        );
+        assert_eq!(without.len(), 1);
+    }
+
+    #[test]
+    fn text_colour_is_linearized_for_an_srgb_target_like_solids() {
+        let (tree, theme, scales) = text_fixture();
+        let mut authored = Vec::new();
+        for id in tree.paint_order() {
+            if let Ok(widget_ops) =
+                super::paint_widget_ops_focused(&tree, id, None, &theme, &scales, 1.0)
+            {
+                authored.extend(widget_ops);
+            }
+        }
+        let text_color = |ops: &[super::PaintOp]| {
+            ops.iter().find_map(|op| match op {
+                super::PaintOp::Text(run) => Some(run.color),
+                _ => None,
+            })
+        };
+        let Some(authored_color) = text_color(&authored) else {
+            unreachable!("the button has a label");
+        };
+        for format in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ] {
+            let resolved = super::target_paint_ops(&tree, None, &theme, &scales, format, 1.0);
+            assert_eq!(
+                text_color(&resolved).map(|c| c.map(f32::to_bits)),
+                Some(super::target_paint_color(authored_color, format).map(f32::to_bits)),
+                "{format:?}"
+            );
+        }
+        let srgb = super::target_paint_ops(
+            &tree,
+            None,
+            &theme,
+            &scales,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1.0,
+        );
+        assert_ne!(
+            text_color(&srgb).map(|c| c.map(f32::to_bits)),
+            Some(authored_color.map(f32::to_bits)),
+            "the on-accent label colour is really moved by linearization"
+        );
+    }
+
     #[test]
     fn collect_widget_paints_linearizes_solids_only_for_an_srgb_target() {
         let Some(context) = real_gpu_context() else {
@@ -23970,7 +24171,7 @@ mod tests {
             "the fixture needs a channel the sRGB curve actually moves: {authored:?}"
         );
         let solid_colour = |format: wgpu::TextureFormat| -> [f32; 4] {
-            match collect_widget_paints(&tree, None, &theme, &scales, &context, format, 1.0)
+            match collect_widget_paints(&tree, None, &theme, &scales, &context, format, 1.0, None)
                 .into_iter()
                 .next()
             {
@@ -24040,7 +24241,7 @@ mod tests {
             .iter()
             .filter_map(|op| match op {
                 super::PaintOp::Gradient(mesh) => Some(mesh.clone()),
-                super::PaintOp::Solid(_) => None,
+                super::PaintOp::Solid(_) | super::PaintOp::Text(_) => None,
             })
             .collect();
         assert_eq!(authored_gradients.len(), 2, "the square and the strip");
@@ -24085,6 +24286,14 @@ mod tests {
                         assert_eq!(
                             got.map(f32::to_bits),
                             super::target_paint_color(*want, format).map(f32::to_bits),
+                            "{format:?}"
+                        );
+                    }
+                    (super::PaintOp::Text(got), super::PaintOp::Text(want)) => {
+                        assert_eq!(got.text, want.text);
+                        assert_eq!(
+                            got.color.map(f32::to_bits),
+                            super::target_paint_color(want.color, format).map(f32::to_bits),
                             "{format:?}"
                         );
                     }

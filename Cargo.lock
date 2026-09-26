@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ai"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-app"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-brush"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-cli"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-ai",
  "aurora-brush",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-color"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "lcms2",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-core"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "postcard",
  "serde",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-doc"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-filters"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-gpu"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-graph"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-io"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-plugin"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-render"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-testkit"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "png 0.17.16",
  "tempfile",
@@ -643,17 +643,21 @@ dependencies = [
 
 [[package]]
 name = "aurora-text"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "aurora-vector",
+ "harfrust",
+ "sha2",
+ "swash",
  "thiserror 2.0.19",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]
 name = "aurora-theme"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -665,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-tile"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "criterion",
@@ -682,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ui"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "accesskit",
  "aurora-ai",
@@ -708,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-vector"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "aurora-core",
  "lyon",
@@ -718,13 +722,14 @@ dependencies = [
 
 [[package]]
 name = "aurora-widgets"
-version = "0.131.1"
+version = "0.132.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
  "aurora-core",
  "aurora-gpu",
  "aurora-testkit",
+ "aurora-text",
  "aurora-theme",
  "aurora-vector",
  "taffy",
@@ -768,6 +773,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -1042,6 +1056,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "core_maths"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1150,6 +1182,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "crypto-common"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+dependencies = [
+ "generic-array",
+ "typenum",
+]
+
+[[package]]
 name = "cstr"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1174,6 +1216,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -1422,6 +1474,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "font-types"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "font-types"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8eb065f3251655b3c90e22e5e363f310fc5332fb3402e37bbc94752283248f6"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1523,6 +1593,16 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "generic-array"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
+dependencies = [
+ "typenum",
+ "version_check",
 ]
 
 [[package]]
@@ -1631,6 +1711,19 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da2e5ae821f6e96664977bf974d6d6a2d6682f9ccee23e62ec1d134246845f9"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "core_maths",
+ "read-fonts 0.37.0",
+ "smallvec",
 ]
 
 [[package]]
@@ -2843,6 +2936,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-fonts"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
+dependencies = [
+ "bytemuck",
+ "core_maths",
+ "font-types 0.11.3",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.5",
+ "once_cell",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3092,6 +3207,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3143,6 +3269,16 @@ name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
+name = "skrifa"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.41.0",
+]
 
 [[package]]
 name = "slab"
@@ -3219,6 +3355,17 @@ name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
+
+[[package]]
+name = "swash"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
+dependencies = [
+ "skrifa",
+ "yazi",
+ "zeno",
+]
 
 [[package]]
 name = "syn"
@@ -3500,6 +3647,12 @@ name = "twox-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
+
+[[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uds_windows"
@@ -4319,6 +4472,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
+name = "yazi"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
+
+[[package]]
 name = "yeslogic-fontconfig-sys"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4426,6 +4585,12 @@ dependencies = [
  "zbus_names",
  "zvariant",
 ]
+
+[[package]]
+name = "zeno"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"

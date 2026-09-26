@@ -13,9 +13,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-# aurora-text is allowed here (see scripts/layering.json) for the
-# still-open "vector-first rendering" M1.7 bullet, but nothing in this
-# crate uses it yet -- add it back exactly when that work starts.
+# aurora-text (0.132.0): shaping and glyph rasterization for widget
+# labels (`text` module); the glyph atlas and text pipeline that draw
+# them are here in `render`, since aurora-text may not depend on
+# aurora-gpu (scripts/layering.json).
 #
 # aurora-gpu/aurora-vector, and the `wgpu` this pulls in transitively,
 # are real now (2026-08-06) -- the GPU path renderer (`render` module).
@@ -29,6 +30,7 @@ workspace = true
 # exception carved out for this one.
 aurora-core = { workspace = true }
 aurora-gpu = { workspace = true }
+aurora-text = { workspace = true }
 aurora-theme = { workspace = true }
 aurora-vector = { workspace = true }
 thiserror = { workspace = true }

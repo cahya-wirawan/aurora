@@ -17,19 +17,19 @@
 //! renderer only through [`paint_widget_ops`] (`paint_widget` returns
 //! exactly its solid subset). `Checkbox`'s
 //! own box has no check/dash
-//! *glyph* drawn inside it yet (this crate draws no glyphs at all —
-//! solid fills only, `render`'s own doc comment); `Toggled::True` and
+//! *glyph* drawn inside it yet (the only glyphs this crate draws are
+//! widget labels, 0.132.0 — see "Text" below); `Toggled::True` and
 //! `Toggled::Mixed` currently render identically (both
 //! `accent.primary`) since nothing yet exists to tell them apart
-//! visually. `TextField` paints its own background only — no caret, no
-//! selection highlight, no composition underline
-//! (`composition_segments`' own byte-range *data* has no pixel
-//! position to map to without real text shaping, which doesn't exist
-//! in this crate; `content`/`cursor`/`selection_anchor`/`composition`
+//! visually. `TextField` paints its own background only — no content,
+//! no caret, no selection highlight, no composition underline
+//! (`composition_segments`' own byte-range *data* now *has* a pixel
+//! position to map to — `aurora_text::ShapedLine::caret_x`, 0.132.0 —
+//! but wiring the field's content and caret is 0.133.0's work; `content`/`cursor`/`selection_anchor`/`composition`
 //! don't affect its paint at all today, only `disabled` does).
 //! `CommandPalette` paints its own outer panel only — its query field's
-//! own text still isn't drawn (the same "no real text shaping yet" gap
-//! `TextField` has). Its result rows now are painted, though: each is a
+//! own text still isn't drawn (the same not-yet-wired gap `TextField`
+//! has). Its result rows now are painted, though: each is a
 //! real `WidgetKind::ListRow` (`command_palette::rebuild_rows`), and
 //! [`paint_list_row`] highlights the selected one with `accent.primary`
 //! — an unselected row still paints nothing, the same "nothing to
@@ -44,9 +44,10 @@
 //! its children, so the fill is clamped to one row's height
 //! ([`paint_tree_item`]) — a selected group would otherwise paint over
 //! every descendant beneath it. It draws no disclosure triangle and no
-//! label (this crate draws no glyphs at all), so a collapsed row and an
+//! glyph for its expanded state, so a collapsed row and an
 //! expanded one are pixel-identical apart from what their descendants
-//! do; `expanded` reaches the accessibility node only. `Dialog` paints
+//! do; `expanded` reaches the accessibility node only. (Its label *is*
+//! drawn since 0.132.0, as a text run — see "Text" below.) `Dialog` paints
 //! a modal's own surface — a `surface.overlay` rounded rect with an
 //! unconditional `border.default` outline, the same fill-plus-border
 //! shape `Panel` already has and for the same measured reason (without
@@ -54,13 +55,22 @@
 //! [`paint_dialog`] has the full account, the vocabulary citation for
 //! `surface.overlay` over `surface.raised`, and the honest
 //! Colour-Critical residual) — and **nothing else**: no title glyph, no
-//! message glyph (this crate draws no glyphs), and no scrim dimming the
+//! message text (dialog text is not yet emitted as a text run), and no scrim dimming the
 //! window behind it (out of scope, see `widgets::dialog`'s own module
 //! doc comment). Every other
 //! [`WidgetKind`] (`Container` on its own, a dialog's own message node
 //! included, and a curve editor's `CurveEditorPoint` sliders) returns
 //! `Ok(vec![])` too — a real, deliberate "nothing to
 //! paint," not an error.
+//!
+//! **Text (0.132.0).** [`paint_widget_ops_focused`] appends a widget's
+//! label as a [`PaintOp::Text`] run after its own shapes and before its
+//! focus ring (`crate::text::text_runs`): `Button`, `Tab`, `TreeItem`, a
+//! `Menu`'s action rows, a `Dropdown`'s current value and an open
+//! dropdown list's option rows. Not yet: `Checkbox` (its box *is* its
+//! layout box), `TextField` content, the command palette's query and
+//! rows, tooltip and dialog text. [`paint_widget`] itself still returns
+//! solids only.
 //!
 //! Every kind's own geometry is built from bounds that
 //! [`clip_to_clipping_ancestors`] has already intersected with any
@@ -112,6 +122,7 @@ use aurora_vector::{
 
 use crate::error::WidgetError;
 use crate::input::FocusManager;
+use crate::text::{TextRun, text_runs};
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
@@ -143,10 +154,16 @@ pub type Paint = (Mesh, [f32; 4]);
 /// ever linearized by a caller for an sRGB-aware target, because the
 /// gradient pipeline chooses its own fragment conversion from the
 /// target format.
+///
+/// A `Text` run (0.132.0) is one line of a widget's label, coloured from
+/// a `text.*` token like a `Solid`, and linearized by a caller the same
+/// way; its glyphs are resolved on the CPU by [`crate::resolve_text`] and
+/// drawn by [`crate::render::TextPipeline`] from a glyph atlas.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaintOp {
     Solid(Paint),
     Gradient(ColorMesh),
+    Text(TextRun),
 }
 
 impl From<Paint> for PaintOp {
@@ -228,6 +245,17 @@ pub fn paint_widget_ops_focused(
         .map(PaintOp::Gradient)
         .chain(solids.into_iter().map(PaintOp::Solid))
         .collect();
+    // Text after the widget's own shapes (its label sits on its fill),
+    // before its focus ring (the ring outlines the whole widget).
+    if let Some(bounds) = tree.bounds(id)
+        && let Some(clip) = clip_to_clipping_ancestors(tree, id, bounds)
+    {
+        ops.extend(
+            text_runs(tree, id, bounds, clip, theme, scales)
+                .into_iter()
+                .map(PaintOp::Text),
+        );
+    }
     if let Some(focus) = focus
         && focus.anchor == id
         && let Some([band, line]) = focus_ring(tree, focus, theme, scales, scale_factor)?
@@ -4664,7 +4692,7 @@ mod tests {
         };
         assert!(
             paints.is_empty(),
-            "a dialog's message is a plain Container -- this crate draws no glyphs, so \
+            "a dialog's message is a plain Container -- this crate emits no dialog text yet, so \
              there is nothing to paint: {paints:?}"
         );
     }
@@ -6284,7 +6312,7 @@ mod tests {
                             PaintOp::Solid((_, c)) => {
                                 Some(aurora_theme::contrast::contrast_ratio(to_color(*c), fill))
                             }
-                            PaintOp::Gradient(_) => None,
+                            PaintOp::Gradient(_) | PaintOp::Text(_) => None,
                         })
                         .fold(0.0_f32, f32::max);
                     assert!(

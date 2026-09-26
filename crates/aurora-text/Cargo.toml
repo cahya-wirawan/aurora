@@ -16,4 +16,11 @@ workspace = true
 aurora-core = { workspace = true }
 aurora-vector = { workspace = true }
 thiserror = { workspace = true }
+harfrust = { workspace = true }
+swash = { workspace = true }
+unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Pins the bundled font file's exact bytes (see `font.rs`'s own test).
+sha2 = { workspace = true }
