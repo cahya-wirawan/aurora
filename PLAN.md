@@ -26,7 +26,29 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.140.0): checkbox labels, via text-aware
+**Latest (2026-09-28, 0.141.0): dialog titles are drawn.** A dialog's
+title now has its own one-row slot above the message, so the crash-
+recovery prompt and every other app dialog show their title as well as
+their message, in `text.primary` Regular (a heavier title weight is a
+design-owner call). The slot is presentational to assistive tech — the
+dialog itself still carries the title as its one label, so it is
+announced once. The dialog is 33 px taller (122 px), which moved the
+smallest window in which its button stays clickable from ~34 px to 68 px
+(both short-window tests re-bracketed, measured). No golden changed —
+there are no dialog goldens, and goldens are text-free. Details: M1.7's
+widget-set "Update 0.141.0".
+  **Judge (same version):** PASS, 0.915. Its doc fixes are applied:
+  `aurora-app`'s `MIN_WINDOW_HEIGHT` doc now names the 68 px threshold
+  and a ~7x margin (was 34 px and "an order of magnitude"), a test doc's
+  "sub-~34px" is updated, and a joined comment line in `dialog.rs`
+  re-wrapped. Full gate green on the RTX 3090 with `AURORA_REQUIRE_GPU=1`
+  — 2,573 passed, 0 failed, 0 skipped; doctests, strict rustdoc and
+  `cargo deny check` clean. Carried: `dialog_title` keys on "a
+  `GenericContainer` child of a `Dialog`", so a future `GenericContainer`
+  wrapper under a dialog (e.g. an actions row) would also draw the title
+  — tie it to the first child, or document it, when one is added.
+
+**Previously (2026-09-28, 0.140.0): checkbox labels, via text-aware
 layout.** Layout can now size a widget from its own text: the app lays
 the workspace out through `aurora_widgets::compute_text_layout`, which
 measures each checkbox's label with the same text engine and scale
@@ -4457,7 +4479,7 @@ check licenses` clean with the new `toml` dependency.
   width and blink tokens flagged to Cahya); no placeholder
   (`TextFieldState` has none); no click-to-place caret (a click focuses
   the field but does not move `cursor`); dialog title still not drawn (no
-  layout slot); checkbox label deferred (needs a measure-func layout
+  layout slot — closed in 0.141.0); checkbox label deferred (needs a measure-func layout
   pass — closed in 0.140.0); tooltip and dialog message are one line, no wrap, no ellipsis;
   (the text field box was one `type.size.md` tall -- fixed in the review
   revision below); palette rows and the strip split the body evenly,
@@ -4584,6 +4606,74 @@ check licenses` clean with the new `toml` dependency.
   thumb (`text.primary`, gated) and fill (`accent.primary`, gated 3:1
   on the panel) carry the value. Whether a slider track should be a
   gated pair is a design-owner question, not added here.
+
+  **Update 0.141.0 — dialog titles.** Closes the "dialog title still not
+  drawn (no layout slot)" disclosure carried since 0.133.0. *Dialog*
+  (`widgets/dialog.rs`): `insert_dialog` inserts a **title slot as the
+  root's first child** (`DialogHandle::title`, new field), styled by a
+  new `title_style` — full content width (`TITLE_WIDTH_FRACTION`) and a
+  definite one-`row_height` height (a title is one line by design; the
+  message keeps its `min_size` floor). Its accessibility node is an
+  **unlabelled `Role::GenericContainer`**: the root keeps the title as
+  its own label, so the title is announced once; `accesskit_consumer`
+  0.38.0's common filter (`filters.rs:32`) excludes a `GenericContainer`
+  node from the platform tree, the same presentational pattern the
+  command palette's query strip already uses. *Text* (`text.rs`): a new
+  `dialog_title` helper recognises a `Dialog`'s own `GenericContainer`
+  child, and a guarded `Container` arm in `text_runs` draws the
+  parent's label there — one line, flush left, clipped, `text.primary`,
+  Regular weight, the same box treatment as the message. The message is
+  drawn exactly as before, now one row lower. *Layout numbers
+  (measured, default scales, 800 px wide):* content height 89 → 122 px
+  (+ one `row_height` 21 + one `spacing.sm` gap 12); the short-window
+  floor at which the button's centre stays hit-testable 34 → **68 px**
+  (67 fails, 68 passes, both in `aurora-widgets` and on the real
+  `aurora-app` workspace at 1000 px wide). Both short-window tests
+  (`the_dialogs_action_stays_hit_testable_in_a_very_short_window`,
+  `a_dialogs_action_is_still_clickable_in_a_very_short_window`) were
+  re-bracketed to 68/80/96/108 — all still below the ≈111 px the
+  pre-0.77.7 top-pinned style would need for today's content, so they
+  still separate the two layouts; the old 40/58 px rows now genuinely
+  fail, which is the documented `root_style` residue, not a centring
+  regression. Doc numbers updated in `dialog.rs`, `tests/gallery.rs`
+  (the surface sample, 41 px down, now lands in the gap between the
+  title and message rows) and `docs/taffy-behaviors.md`. App dialogs
+  (crash recovery, unsaved changes, and every `open_dialog` caller) get
+  titles with no app code change. **Tests (+4, 2,573 total):** dialog
+  (title slot is the first child, before message and actions; unlabelled
+  `GenericContainer`; root label unchanged; not an action), dialog layout
+  (the renamed `the_title_the_message_and_every_action_get_a_real_hittable_box`
+  now also asserts the title spans the message's width, is exactly one
+  row, and sits wholly above the message), text (title run text, colour
+  `text.primary`, `Start`, rect and clip = the slot's laid-out box,
+  message below it, root draws nothing; only a dialog's own slot draws
+  and an empty title draws no run), GPU `render_test` (title inks only its
+  own row, the message only its row below, neither paints a fill), and
+  the paint test now covers the title slot too. **Goldens:** none
+  changed and none re-blessed — **there are no dialog golden PNGs**
+  (the dialog gallery tests assert sampled pixels only), and every
+  golden is text-free anyway; `git status` shows no `.png` change.
+  **Mutations (all really run, RTX 3090, `AURORA_REQUIRE_GPU=1`, backup
+  and sha256-verified restore):** title arm removed (killed, 2 — text
+  and GPU ink); title in `text.secondary` (killed, 1); title slot
+  labelled — double announce (killed, 1, the a11y test); title inserted
+  as last child (killed, 3); title height 0 (killed, 1); the
+  `GenericContainer` role check in `dialog_title` loosened so the
+  message also draws the title (killed, 2); root `FlexDirection::Row`
+  (killed, 2 `aurora-widgets` + 2 `aurora-app` — the old "only one test
+  can see this field" note in `root_style` was re-measured and
+  corrected). **Disclosures:** Regular weight only, same size and colour
+  as the message — the title is distinguished by position alone until
+  the design owner picks a title style (no title-weight or title-size
+  token exists; none invented); one line, clipped, no ellipsis; message
+  wrapping still deferred; `Label` still does not size itself to its
+  text; no font fallback; the 68 px short-window floor is higher than
+  before (nothing clamps a dialog to the window, as before); the slot's
+  exclusion from the platform tree rests on `accesskit_consumer`'s
+  filter, verified by reading its source, not by a screen reader.
+  **Needs a human:** the crash-recovery dialog on real hardware at scale
+  1.0 and 2.0 (title legibility and spacing), and a screen reader
+  confirming the title is announced once.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
@@ -29531,6 +29621,23 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-28 (0.141.0) — dialog titles.** A dialog's title now
+has its own one-row slot above the message (an unlabelled
+`GenericContainer`, so the title is still announced once, by the
+dialog), drawn through `text_runs` in `text.primary`. The dialog is
+122 px tall; its short-window floor moved to 68 px and both short-window
+tests were re-bracketed. No golden changed (none exist for the dialog).
+Full account: M1.7's widget-set "Update 0.141.0". **Needs a human:** the
+crash-recovery dialog on real hardware at scale 1.0 and 2.0, and a
+screen reader confirming a single title announcement; Cahya to decide
+whether a dialog title gets its own weight or size token. The text
+follow-ups named since 0.133.0 are now done except message wrapping,
+`Label` auto-sizing, ellipsis and font fallback. **Suggested next
+(0.142.0):** double-click word selection (queued since 0.139.0); after
+that the M1.10 gate work — the 60 FPS canvas budget (`recomposite` is
+~73% of the GPU-path frame, the only stage where the gap can plausibly
+close) is the largest engineering item still open there.
 
 **Addendum 2026-09-28 (0.140.0) — text-aware layout; checkbox labels.**
 `compute_text_layout` sizes each checkbox to box + gap + label with the

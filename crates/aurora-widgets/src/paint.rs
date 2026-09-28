@@ -4843,15 +4843,19 @@ mod tests {
         let (tree, handle) = laid_out_dialog(&scales);
         let theme = dark_theme();
 
-        let paints = match paint_widget(&tree, handle.message, &theme, &scales, 1.0) {
-            Ok(paints) => paints,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        assert!(
-            paints.is_empty(),
-            "a dialog's message is a plain Container -- this crate emits no dialog text yet, so \
-             there is nothing to paint: {paints:?}"
-        );
+        // The title slot (0.141.0) is a plain Container too: its text is
+        // a `crate::text` run, never a paint.
+        for node in [handle.message, handle.title] {
+            let paints = match paint_widget(&tree, node, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert!(
+                paints.is_empty(),
+                "a dialog's message and title slot are plain Containers -- their text is drawn \
+                 by `crate::text`, so there is nothing to paint: {paints:?}"
+            );
+        }
     }
 
     /// A laid-out dropdown in a definitely sized root, optionally open

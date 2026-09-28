@@ -517,6 +517,18 @@ pub fn text_runs(
             };
             vec![run(&state.text, rgba(color, 1.0), full, HAlign::Start)]
         }
+        // A dialog's title (0.141.0): its presentational first child
+        // draws the dialog's own label -- the one copy of the title --
+        // on one line, flush left, clipped, in `text.primary`, exactly
+        // like the message below it. Regular weight: no heavier title
+        // weight exists in the type tokens, and inventing one is the
+        // design owner's call.
+        WidgetKind::Container if let Some(title) = dialog_title(tree, id) => vec![run(
+            title,
+            rgba(theme.text.primary, 1.0),
+            full,
+            HAlign::Start,
+        )],
         WidgetKind::Container => container_text(tree, id, focused, theme)
             .map(|(text, decor)| match decor {
                 Some(decor) => {
@@ -545,6 +557,19 @@ pub fn text_runs(
             !r.text.is_empty() || r.field.as_ref().is_some_and(|field| field.caret.is_some())
         })
         .collect()
+}
+
+/// The title a dialog's title slot draws: its parent `Dialog`'s own
+/// accessibility label, when `id` is that dialog's unlabelled
+/// `Role::GenericContainer` child (`widgets::dialog::insert_dialog`
+/// builds exactly one, first). `None` for any other widget.
+fn dialog_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
+    let parent = tree.parent(id)?;
+    let is_slot = matches!(tree.payload(parent)?, WidgetKind::Dialog)
+        && tree.accessibility(id)?.role() == accesskit::Role::GenericContainer;
+    is_slot
+        .then(|| tree.accessibility(parent)?.label())
+        .flatten()
 }
 
 /// The text a plain container draws: a dialog's message (its
@@ -2385,6 +2410,82 @@ mod field_tests {
         assert_eq!(run.color, rgba(theme.text.primary, 1.0));
         assert!(run.field.is_none());
         assert!(texts_of(&tree, handle.root, None).is_empty());
+    }
+
+    /// 0.141.0: the title slot draws the root's own label -- the title
+    /// -- in `text.primary`, flush left, inside the slot's own laid-out
+    /// box, and the message draws below it in its own box.
+    #[test]
+    fn a_dialog_draws_its_title_in_its_own_row_above_the_message() {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(800.0_f32),
+                height: taffy::style_helpers::length(600.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let theme = dark_theme();
+        let handle = ok(insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Aurora Didn't Close Properly",
+            "Something happened.",
+            vec![DialogAction::new("ok", "OK")],
+        ));
+        tree.compute_layout(800.0, 600.0);
+        let runs_in = |id| {
+            let Some(bounds) = tree.bounds(id) else {
+                unreachable!("laid out")
+            };
+            (
+                bounds,
+                text_runs(&tree, id, bounds, bounds, None, &theme, &scales),
+            )
+        };
+        let (title_box, title_runs) = runs_in(handle.title);
+        let [title] = &title_runs[..] else {
+            unreachable!("the title draws exactly one run: {title_runs:?}");
+        };
+        assert_eq!(title.text, "Aurora Didn't Close Properly");
+        assert_eq!(title.color, rgba(theme.text.primary, 1.0));
+        assert_eq!(title.align, HAlign::Start);
+        assert!(title.field.is_none());
+        assert_eq!(title.rect, super::rect_f32(title_box));
+        assert_eq!(title.clip, title_box);
+
+        let (message_box, message_runs) = runs_in(handle.message);
+        let [message] = &message_runs[..] else {
+            unreachable!("the message still draws: {message_runs:?}");
+        };
+        assert_eq!(message.text, "Something happened.");
+        assert!(
+            message.rect.1 >= title.rect.1 + title.rect.3,
+            "the message draws below the title: {message:?} vs {title:?}"
+        );
+        assert_eq!(message.rect, super::rect_f32(message_box));
+        // The root itself still draws nothing: the title is drawn once.
+        let (_, root_runs) = runs_in(handle.root);
+        assert!(root_runs.is_empty(), "{root_runs:?}");
+    }
+
+    /// Only a dialog's own unlabelled `GenericContainer` child is a title
+    /// slot: the same presentational node anywhere else draws nothing,
+    /// and an empty title draws no run at all.
+    #[test]
+    fn only_a_dialogs_own_slot_draws_the_title_and_an_empty_title_draws_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let stray = ok(tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::GenericContainer),
+            WidgetKind::Container,
+        ));
+        assert!(texts_of(&tree, stray, None).is_empty());
+        let handle = ok(insert_dialog(&mut tree, root, &scales, "", "M", vec![]));
+        assert!(texts_of(&tree, handle.title, None).is_empty());
     }
 
     /// A text field holding `content`, laid out by the real layout

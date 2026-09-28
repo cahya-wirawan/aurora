@@ -18627,15 +18627,16 @@ const MUDA_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// for this class of value.
 ///
 /// This is the guard the dialog-overlay round (`0.77.6`/`0.77.7`) named but
-/// didn't add: below roughly 34 logical px of window height, an open
+/// didn't add: below roughly 68 logical px of window height (34 px before
+/// 0.141.0 added the dialog title row), an open
 /// dialog's own action button falls outside `workspace.root`'s bounds and
 /// stops being hit-testable, while `handle_dialog_pointer` still swallows
 /// every click — the app going mouse-dead with only `Escape`/`Enter` left.
 /// `RAIL_MIN_WIDTH` (`aurora_ui::workspace`, 150px) is the closest existing
 /// precedent for "the rail alone needs at least this much"; `MIN_WINDOW_WIDTH`
 /// leaves real room for the canvas and divider beside it, and
-/// `MIN_WINDOW_HEIGHT` sits an order of magnitude above the dialog
-/// threshold rather than merely above it, so ordinary DPI/scale rounding
+/// `MIN_WINDOW_HEIGHT` sits about 7x above the dialog threshold (it was
+/// ~14x before the title row) rather than merely above it, so ordinary DPI/scale rounding
 /// can't erode the margin back down to the reachable-but-uncomfortable range.
 const MIN_WINDOW_WIDTH: f64 = 640.0;
 const MIN_WINDOW_HEIGHT: f64 = 480.0;
@@ -45982,9 +45983,21 @@ mod tests {
     /// a real `compute_layout` at the small size, then a real
     /// `handle_dialog_pointer` press at the button's own centre, which
     /// must actually close the dialog.
+    ///
+    /// **Re-bracketed in 0.141.0**, when the dialog's title got its own
+    /// row (33 px: one `row_height` plus one `spacing.sm` gap) and the
+    /// content grew from 89 px to 122 px. The button now sits 33 px
+    /// further below the dialog's centre, so the centred layout's own
+    /// floor moved from ~34 px to 68 px -- measured here on the real
+    /// workspace at 1000 px wide: 67 fails, 68 passes -- and the old 58 px
+    /// row genuinely fails, which is `aurora_widgets`' documented
+    /// `root_style` residue, not a centring regression. 68, 80, 96 and
+    /// 108 are all still below the ~111 px the pre-0.77.7 top-pinned
+    /// style would need for today's content, so the test still separates
+    /// the two layouts.
     #[test]
     fn a_dialogs_action_is_still_clickable_in_a_very_short_window() {
-        for height in [58.0_f32, 72.0, 90.0] {
+        for height in [68.0_f32, 80.0, 96.0, 108.0] {
             let mut workspace = aurora_ui::build_workspace();
             let mut focus = FocusManager::default();
             let mut dialog = None;
@@ -46033,7 +46046,7 @@ mod tests {
 
     /// `MIN_WINDOW_WIDTH`/`MIN_WINDOW_HEIGHT` are the guard the round above
     /// disclosed but didn't add: a floor on the real window itself, so the
-    /// sub-~34px case `0.77.7`'s own module doc names as still-unfixable
+    /// sub-~68px case (sub-~34px before 0.141.0's title row) `0.77.7`'s own module doc names as still-unfixable
     /// (no scrolling, no text measurement) is unreachable through the real
     /// window rather than merely documented. Proves the floor is
     /// comfortably safe for the same real dialog every other test in this

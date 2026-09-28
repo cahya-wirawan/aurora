@@ -15,9 +15,9 @@
 //! an unconditional `border.default` outline over it, added in `0.79.1`
 //! and the part that actually makes the surface visible (see the "what
 //! this does not do" paragraph below for what `0.79.0` alone got
-//! wrong). The dialog's *message* node stays a plain
-//! `WidgetKind::Container` and still draws nothing, for the reason that
-//! same paragraph gives.
+//! wrong). The dialog's *title* slot and *message* node stay plain
+//! `WidgetKind::Container`s and paint no fill; their text is drawn by
+//! `crate::text` (below).
 //!
 //! `Role::AlertDialog`, not the plainer `Role::Dialog` — every dialog
 //! this crate can build today is an urgent, blocking prompt (a crash
@@ -75,11 +75,18 @@
 //! real, and identical to what a `Panel` already gets in that
 //! deliberately close-valued theme.
 //!
-//! What is genuinely still missing: the **title is still invisible**
-//! (it has no layout slot; it reaches the accessibility tree only). The
+//! The **title is drawn** since 0.141.0: it has its own one-row layout
+//! slot, the root's first child (`DialogHandle::title`), an unlabelled
+//! `Role::GenericContainer` into which `crate::text::text_runs` draws
+//! the root's own label — so the title stays in the accessibility tree
+//! exactly once, on the root, and the slot itself is pruned from the
+//! platform tree by `accesskit_consumer`'s common filter. It is Regular
+//! weight in `text.primary`, like the message: a heavier title weight
+//! is not in the type tokens and is the design owner's call. The
 //! **message is drawn** since 0.133.0 — `crate::text::text_runs` draws a
 //! `Role::Label` container's label under a `Dialog` in `text.primary`,
-//! on one line, clipped, not wrapped. There is also **no scrim/backdrop**: nothing dims or
+//! on one line, clipped, not wrapped (wrapping is still deferred; so is
+//! an ellipsis for a title or message too long for its row). There is also **no scrim/backdrop**: nothing dims or
 //! covers the rest of the window behind a modal dialog. That is
 //! explicitly out of scope here rather than forgotten — a scrim is a
 //! window-sized surface owned by whoever hosts the dialog, and giving
@@ -122,6 +129,10 @@ const WIDTH_FRACTION: f32 = 0.5;
 /// bare literal there.
 const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 
+/// The share of the dialog's own content width its title spans — all
+/// of it, for the same reason as [`MESSAGE_WIDTH_FRACTION`].
+const TITLE_WIDTH_FRACTION: f32 = 1.0;
+
 /// A dialog root's own layout: a centred overlay, **out of its parent's
 /// flow entirely**.
 ///
@@ -163,8 +174,10 @@ const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 /// *usable in a short window*, which through `0.77.6` it was not. The
 /// old style pinned the top edge 15% of the way down the window and let
 /// the box grow downward from there; the content height is fixed (~89 px
-/// at the default scales, since nothing measures text), so below roughly
-/// 72 logical pixels of window height the action button fell past
+/// at the default scales back then, since nothing measures text; 122 px
+/// since 0.141.0 gave the title its own row), so below roughly
+/// 72 logical pixels of window height (≈111 with today's 122 px) the
+/// action button fell past
 /// `workspace.root`'s own bottom edge — and
 /// [`crate::WidgetTree::hit_test`] refuses to descend into a node whose
 /// parent's bounds don't contain the point, so the button became
@@ -174,8 +187,12 @@ const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 /// buttons (the only part that is actually interactive) on screen far
 /// longer. Measured with the default scales at 800 px wide: the button's
 /// own centre is hit-testable down to a window about 34 px tall, against
-/// 73 px before. Note the two `auto` vertical margins are *not* what
-/// centres it — taffy floors an auto margin's free space at zero, so
+/// 73 px before — and, since 0.141.0 added the title row (33 px: one
+/// `row_height` plus one `spacing.sm` gap), down to 68 px, against the
+/// ≈111 px the top-pinned style would now need. The threshold is roughly
+/// twice the distance from the dialog's centre to the button's.
+///
+/// Note the two `auto` vertical margins are *not* what centres it — taffy floors an auto margin's free space at zero, so
 /// they resolve to 0 exactly when the dialog overflows, which is the
 /// case that matters; they are there so a parent laid out as a
 /// `Column` (where vertical is the *main* axis and `align_self` is
@@ -186,7 +203,7 @@ const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 ///
 /// **What it still does not do**: nothing clamps the dialog to the
 /// window, so at some small enough size the buttons do leave it anyway
-/// (~34 px tall, above). No `min_inner_size` is set on the real window
+/// (~68 px tall since 0.141.0, above). No `min_inner_size` is set on the real window
 /// either. Clamping properly needs either a scrollable dialog body or a
 /// measured text stack that can reflow the message — neither exists —
 /// so this is a documented residue, not a fixed problem.
@@ -201,17 +218,19 @@ const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 /// absolute size here (the padding, the gap, both `min_size` floors)
 /// goes through the token scales, per invariant §7.3.10.
 ///
-/// `FlexDirection::Column` because the message belongs *above* the
-/// actions, not beside them — `Style::default()` is `Row`, which would
-/// lay the message out as a first column next to the buttons. **Its
-/// coverage is thin, and worth knowing**: the only test that can fail if
-/// this field is dropped is this module's own
-/// `the_message_and_every_action_get_a_real_hittable_box`, because it is
-/// the only one that builds a *two*-action dialog. Every dialog
-/// `aurora-app` actually opens has exactly one action, so that crate's
-/// suite — real dialogs, real workspace — cannot see this field at all.
-/// Adding an app-level two-action test would be testing a dialog no
-/// caller constructs; the honest fix is this note.
+/// `FlexDirection::Column` because the title and message belong *above*
+/// the actions, not beside them — `Style::default()` is `Row`, which
+/// would lay them out as columns next to the buttons. Through 0.140.0
+/// its coverage was thin (one two-action test here). **Re-measured in
+/// 0.141.0**, with the title slot in place: switching this field to
+/// `Row` fails `the_title_the_message_and_every_action_get_a_real_hittable_box`
+/// and `crate::text`'s
+/// `a_dialog_draws_its_title_in_its_own_row_above_the_message` here,
+/// and two `aurora-app` tests on real dialogs
+/// (`clicking_the_dialogs_action_button_closes_it_under_real_layout`,
+/// `each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay`).
+/// Whether those app tests would also have caught it *before* the title
+/// row existed was not re-measured.
 fn root_style(scales: &Scales) -> Style {
     Style {
         position: Position::Absolute,
@@ -259,6 +278,25 @@ fn root_style(scales: &Scales) -> Style {
         gap: Size {
             width: length(spacing(scales.spacing.sm)),
             height: length(spacing(scales.spacing.sm)),
+        },
+        ..Default::default()
+    }
+}
+
+/// A dialog title's own layout (0.141.0): the full dialog width and
+/// exactly one [`row_height`] tall — a definite height rather than the
+/// message's `min_size` floor, because a title is one line by design
+/// and never wraps. It is the root's first child, so it sits above the
+/// message in the root's `Column`.
+///
+/// It can never be squeezed below that row: the root's own height is
+/// `auto`, so the `Column` sizes to its content and never has negative
+/// free space to distribute through `flex_shrink`.
+fn title_style(scales: &Scales) -> Style {
+    Style {
+        size: Size {
+            width: percent(TITLE_WIDTH_FRACTION),
+            height: length(row_height(scales)),
         },
         ..Default::default()
     }
@@ -324,6 +362,10 @@ impl DialogAction {
 pub struct DialogHandle {
     /// The dialog's own root — a labeled, modal `Role::AlertDialog`.
     pub root: WidgetId,
+    /// The title's own one-row layout slot, the root's first child — an
+    /// unlabelled `Role::GenericContainer`, since the title text lives
+    /// in the root's own label (drawn here by `crate::text`).
+    pub title: WidgetId,
     /// A plain text node holding the dialog's own message body.
     pub message: WidgetId,
     /// Each action's own id (as passed to [`insert_dialog`]) paired with
@@ -400,6 +442,19 @@ pub fn insert_dialog(
     root_node.set_modal();
     let root = tree.insert(parent, root_style(scales), root_node, WidgetKind::Dialog)?;
 
+    // The title's own layout slot (0.141.0), first so it sits above
+    // the message. Presentational: the root's own label already *is*
+    // the title, so a labelled node here would announce it twice; an
+    // unlabelled `GenericContainer` is dropped from the platform tree
+    // by `accesskit_consumer`'s common filter. `crate::text` draws the
+    // parent's label into it.
+    let title_id = tree.insert(
+        root,
+        title_style(scales),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
+
     let mut message_node = Node::new(Role::Label);
     message_node.set_label(message.into());
     let message_id = tree.insert(
@@ -417,6 +472,7 @@ pub fn insert_dialog(
 
     Ok(DialogHandle {
         root,
+        title: title_id,
         message: message_id,
         actions: action_ids,
     })
@@ -479,6 +535,49 @@ mod tests {
 
         assert_eq!(handle.first_action(), Some(*first_button));
         assert_eq!(handle.action_id(*first_button), Some("recover"));
+    }
+
+    /// The title's slot (0.141.0) is the root's first child, ahead of
+    /// the message and every action, and it is presentational: an
+    /// unlabelled `GenericContainer`, so the title is announced once, by
+    /// the root, and never a second time by its own slot.
+    #[test]
+    fn the_title_slot_is_the_first_child_and_carries_no_label_of_its_own() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Unsaved Changes",
+            "Save before closing?",
+            vec![DialogAction::new("ok", "OK")],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((_, button)) = handle.actions.first() else {
+            unreachable!("one action was inserted");
+        };
+        assert_eq!(
+            tree.children(handle.root),
+            Some(&[handle.title, handle.message, *button][..]),
+            "title, then message, then actions"
+        );
+        let Some(title) = tree.accessibility(handle.title) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(title.role(), accesskit::Role::GenericContainer);
+        assert_eq!(
+            title.label(),
+            None,
+            "a labelled slot would announce the title twice"
+        );
+        let Some(root_accessibility) = tree.accessibility(handle.root) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(root_accessibility.label(), Some("Unsaved Changes"));
+        assert_eq!(handle.action_id(handle.title), None);
     }
 
     #[test]
@@ -560,9 +659,11 @@ mod tests {
         // truncates an `f32` origin to an `i64`, so a window whose
         // free space is odd centres to two gaps that differ by a pixel.
         // That is correct behaviour, and the vertical pair below really
-        // does hit it here (600 - 89 is odd), which is exactly why an
-        // exact-equality assertion would have been an accident of the
-        // numbers rather than a statement about centring.
+        // did hit it here through 0.140.0 (600 - 89 is odd). Since the
+        // title row made the content 122 px, 600 - 122 is even and it
+        // no longer does -- which is exactly why an exact-equality
+        // assertion would be an accident of the numbers rather than a
+        // statement about centring.
         let right_gap = 800 - (bounds.x + i64::from(bounds.width));
         assert!(
             (bounds.x - right_gap).abs() <= 1,
@@ -586,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn the_message_and_every_action_get_a_real_hittable_box() {
+    fn the_title_the_message_and_every_action_get_a_real_hittable_box() {
         let (mut tree, root) = sized_tree();
         let scales = test_scales();
         let handle = match insert_dialog(
@@ -618,6 +719,22 @@ mod tests {
             message.height >= row,
             "the message must be at least one row of text tall ({row}), since \
              nothing measures its actual text: {message:?}"
+        );
+
+        // The title (0.141.0): the message's own width, exactly one row
+        // tall, and wholly above the message.
+        let Some(title) = tree.bounds(handle.title) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            (title.x, title.width),
+            (message.x, message.width),
+            "the title spans the message's own width: {title:?}"
+        );
+        assert_eq!(title.height, row, "the title is exactly one row: {title:?}");
+        assert!(
+            title.y + i64::from(title.height) <= message.y,
+            "the title sits above the message: {title:?} vs {message:?}"
         );
 
         let mut previous_bottom = None;
@@ -662,10 +779,22 @@ mod tests {
     /// The heights are chosen to bracket the old threshold, and the
     /// window is far shorter than any real one — the point is that the
     /// failure mode is gone at the boundary, not that anyone runs Aurora
-    /// in a 58 px window.
+    /// in a 68 px window.
+    ///
+    /// **Re-bracketed in 0.141.0.** The title row (one `row_height` plus
+    /// one `spacing.sm` gap, 33 px at the default scales) grew the
+    /// content from 89 px to 122 px and pushed the button 33 px further
+    /// below the dialog's centre, so the centred layout's own floor
+    /// moved from ~34 px to 68 px (measured: 67 fails, 68 passes) and
+    /// the old 40 px and 58 px rows now genuinely fail — that is the
+    /// residue `root_style` documents, not a regression in centring.
+    /// The heights are now 68 (the new floor itself), 80, 96 and 108;
+    /// every one of them is below the ≈111 px the top-pinned 0.77.6
+    /// style would need for today's content (`0.15 * h + 94 < h`), so
+    /// the test still separates the two layouts.
     #[test]
     fn the_dialogs_action_stays_hit_testable_in_a_very_short_window() {
-        for height in [40.0_f32, 58.0, 72.0, 90.0] {
+        for height in [68.0_f32, 80.0, 96.0, 108.0] {
             let (mut tree, root) = new_tree(Style {
                 size: taffy::Size {
                     width: taffy::style_helpers::length(WINDOW.0),

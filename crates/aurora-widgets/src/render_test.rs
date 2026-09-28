@@ -1036,7 +1036,7 @@ mod text {
     use crate::render::{GlyphAtlas, GpuPaintOp, TextPipeline, upload_paint_ops};
     use crate::test_support::real_context;
     use crate::text::{HAlign, TextRun, label_style, resolve_text};
-    use crate::widgets::{insert_button, new_tree, test_scales};
+    use crate::widgets::{DialogAction, insert_button, insert_dialog, new_tree, test_scales};
     use aurora_core::Rect;
     use aurora_gpu::GpuContext;
     use aurora_text::TextEngine;
@@ -1563,6 +1563,65 @@ mod text {
         assert_eq!(
             outside_differing, 0,
             "a centred 'Apply' stays near the middle"
+        );
+    }
+
+    /// 0.141.0: a dialog's title slot really inks its title, inside its
+    /// own row and nowhere else, and the message inks only its own row
+    /// below it. The boxes are placed by hand (like the button test
+    /// above) so the whole dialog fits this 128x64 target.
+    #[test]
+    fn a_dialogs_title_inks_its_own_row_and_the_message_the_row_below() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let Ok(handle) = insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Title",
+            "Message",
+            vec![DialogAction::new("ok", "OK")],
+        ) else {
+            unreachable!()
+        };
+        let mut place = |id, y, h| {
+            let bounds = Rect {
+                x: 0,
+                y,
+                width: 128,
+                height: h,
+            };
+            if tree.set_bounds(id, bounds).is_err() {
+                unreachable!()
+            }
+        };
+        place(root, 0, 64);
+        place(handle.root, 0, 64);
+        place(handle.title, 0, 24);
+        place(handle.message, 32, 24);
+        let theme = dark_theme();
+        let text_only = |id| {
+            let Ok(ops) = paint_widget_ops(&tree, id, &theme, &scales, 1.0) else {
+                unreachable!()
+            };
+            assert!(
+                ops.iter().all(|op| matches!(op, PaintOp::Text(_))),
+                "a dialog's text slots paint no fill: {ops:?}"
+            );
+            ops
+        };
+        let mut atlas = GlyphAtlas::new(context.device());
+        let title = render(&context, &mut atlas, text_only(handle.title));
+        assert!(lit(&title, 0, 0, 128, 24) > 20, "the title inks its row");
+        assert_eq!(lit(&title, 0, 24, 128, 64), 0, "and nothing below it");
+        let message = render(&context, &mut atlas, text_only(handle.message));
+        assert_eq!(lit(&message, 0, 0, 128, 32), 0, "no message ink above");
+        assert!(
+            lit(&message, 0, 32, 128, 56) > 20,
+            "the message inks its row"
         );
     }
 
