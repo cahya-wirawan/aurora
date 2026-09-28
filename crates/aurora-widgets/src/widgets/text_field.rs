@@ -510,6 +510,12 @@ fn style(scales: &Scales) -> Style {
             width: auto(),
             height: length(row_height(scales)),
         },
+        // `flex_grow` is for a row parent; in a column it would grow the
+        // height (the slider's 0.133.1 bug). Cap it at one row.
+        max_size: Size {
+            width: auto(),
+            height: length(row_height(scales)),
+        },
         ..Default::default()
     }
 }

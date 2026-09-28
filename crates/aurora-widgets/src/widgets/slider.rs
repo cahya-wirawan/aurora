@@ -41,11 +41,21 @@ fn style(scales: &Scales) -> Style {
     // by its container, not by its own content) with a track height
     // grounded in the type scale -- see `type_size`'s own doc comment on
     // why, same reasoning `checkbox::style` already uses.
+    //
+    // `flex_grow` is for a *row* parent. In a column parent it grows the
+    // height instead, and the thumb (as tall as the slider) grew with the
+    // window — 45 px in the Widget Gallery at 1280x480 (0.133.1). The
+    // `max_size` height caps that without changing the row behaviour.
+    let height = length(type_size(scales.typography.size.md));
     Style {
         flex_grow: 1.0,
         size: Size {
             width: taffy::style_helpers::auto(),
-            height: length(type_size(scales.typography.size.md)),
+            height,
+        },
+        max_size: Size {
+            width: taffy::style_helpers::auto(),
+            height,
         },
         ..Default::default()
     }
