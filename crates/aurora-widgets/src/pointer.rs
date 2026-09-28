@@ -53,15 +53,32 @@
 //! [`handle_widget_key`], and typed characters from
 //! [`handle_widget_text`].
 //!
+//! # Placing the caret (0.138.0)
+//!
+//! [`handle_pointer_with`] also takes the held [`Modifiers`] and a
+//! [`TextHit`] — the one engine-dependent step, injected so this module
+//! stays free of shaped text. A `Down` in a text field then places its
+//! caret at the byte under the pointer ([`widgets::set_text_field_caret`]),
+//! `Shift` extending the selection from its existing anchor (or the
+//! pre-click caret), and **captures** the field: every `Move` moves the
+//! caret, selecting back to the anchor, until the `Up` releases it. A
+//! field mid-composition, or a hit with no answer ([`NoTextHit`], which
+//! [`handle_pointer`] uses), is focused and nothing more.
+//!
 //! # What this deliberately does not do
 //!
 //! - **No hover.** Tooltips are never shown from here (the owner drives
 //!   them from its own pointer-move handling).
 //! - **No escape-to-revert on a drag, and no grab offset**: a scrollbar
 //!   drag re-centres the thumb on the pointer at the first `Move`.
-//! - **A click does not place a text field's caret**, and word motion,
-//!   select-all and the clipboard chords are not routed (a chord is
-//!   never a widget's key — below).
+//! - **No double- or triple-click word/line selection** (winit reports no
+//!   click count), and **no timed autoscroll** while a caret drag runs
+//!   past a text field's edge: the caret goes to the (hidden) byte
+//!   nearest the pointer and the field's caret-pinned scroll
+//!   ([`crate::field_scroll`]) jumps to show it — only when the pointer
+//!   moves, never while it is held still.
+//!   Word motion, select-all and the clipboard chords are not routed here
+//!   (a chord is never a widget's key — below; the app routes them).
 //! - **Tree rows expand and collapse from the keyboard only** — a click
 //!   on a row *activates* it (`handle_action`'s `Click`, which is all an
 //!   assistive technology's `Click` does too); there is no
@@ -153,6 +170,14 @@ enum Capture {
         point: usize,
         count: usize,
     },
+    /// A text field's caret drag (0.138.0): `anchor` is the byte the
+    /// selection stays anchored at while every `Move` moves the caret —
+    /// where the `Down` put the caret, or, for a `Shift`+click, the
+    /// selection's existing anchor (or the pre-click caret).
+    TextField {
+        id: WidgetId,
+        anchor: usize,
+    },
 }
 
 impl Capture {
@@ -161,7 +186,8 @@ impl Capture {
             Self::Range(id)
             | Self::PickerArea { picker: id }
             | Self::PickerHue { picker: id }
-            | Self::CurvePoint { editor: id, .. } => id,
+            | Self::CurvePoint { editor: id, .. }
+            | Self::TextField { id, .. } => id,
         }
     }
 }
@@ -175,7 +201,8 @@ impl ClickTracker {
     }
 
     /// The widget a `Down` captured for a drag (a slider, scrollbar,
-    /// colour picker or curve editor), if no `Up` has released it yet.
+    /// colour picker, curve editor or — 0.138.0, when the `Down` placed
+    /// its caret — text field), if no `Up` has released it yet.
     #[must_use]
     pub fn captured(&self) -> Option<WidgetId> {
         self.captured.map(Capture::id)
@@ -365,10 +392,49 @@ fn release_button(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) -> Result<(),
     }
 }
 
+/// Maps a pointer to a text field's caret (0.138.0) — the one piece of
+/// caret placement that needs shaped text, injected so this module stays
+/// free of any text engine. The real implementation
+/// ([`crate::field_offset_at`]) reuses exactly the geometry
+/// [`crate::resolve_run`] draws; a test passes a fake.
+pub trait TextHit {
+    /// The byte offset in text field `id`'s content whose caret lies
+    /// nearest `point` (logical px, window space), or `None` when there
+    /// is no answer — no engine, the field not laid out or not visible,
+    /// or an IME composition in progress (what is drawn is then not the
+    /// content). `None` leaves a click placing nothing: the field is
+    /// focused exactly as before 0.138.0.
+    fn offset_at(
+        &mut self,
+        tree: &WidgetTree<WidgetKind>,
+        id: WidgetId,
+        point: (f32, f32),
+    ) -> Option<usize>;
+}
+
+/// A [`TextHit`] that never answers: a click focuses a text field
+/// without placing its caret — [`handle_pointer`]'s behaviour, and the
+/// app's while it has no text engine yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoTextHit;
+
+impl TextHit for NoTextHit {
+    fn offset_at(
+        &mut self,
+        _tree: &WidgetTree<WidgetKind>,
+        _id: WidgetId,
+        _point: (f32, f32),
+    ) -> Option<usize> {
+        None
+    }
+}
+
 /// Routes one primary-button pointer event — see this module's own doc
 /// comment for what each widget does on `Down` and on `Up`.
 /// `focus.validate` runs after every event, so a click that removed the
 /// focused widget (a menu item's activation) never leaves focus dangling.
+/// [`handle_pointer_with`] with no modifiers and [`NoTextHit`]: a click
+/// in a text field focuses it without placing the caret.
 ///
 /// # Errors
 ///
@@ -381,10 +447,33 @@ pub fn handle_pointer(
     click: &mut ClickTracker,
     event: PointerEvent,
 ) -> Result<PointerOutcome, ActionRejection> {
+    handle_pointer_with(tree, focus, click, event, Modifiers::none(), &mut NoTextHit)
+}
+
+/// [`handle_pointer`], plus text-field caret placement (0.138.0): a
+/// `Down` in a text field places its caret at the byte `hit` maps the
+/// pointer to — extending the selection from its existing anchor (or the
+/// pre-click caret) when `modifiers.shift` — and captures the field, so
+/// every later `Move` moves the caret and selects from that anchor back
+/// to it, until the `Up` releases it ([`PointerOutcome::Released`]).
+/// Only `Shift` is read; a field mid-composition (or a `hit` with no
+/// answer) is focused and nothing more.
+///
+/// # Errors
+///
+/// As [`handle_pointer`].
+pub fn handle_pointer_with(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    click: &mut ClickTracker,
+    event: PointerEvent,
+    modifiers: Modifiers,
+    hit: &mut dyn TextHit,
+) -> Result<PointerOutcome, ActionRejection> {
     let result = match event.phase {
-        PointerPhase::Down => pointer_down(tree, focus, click, event.position),
+        PointerPhase::Down => pointer_down(tree, focus, click, event.position, modifiers, hit),
         PointerPhase::Up => pointer_up(tree, focus, click, event.position),
-        PointerPhase::Move => pointer_move(tree, focus, click, event.position),
+        PointerPhase::Move => pointer_move(tree, focus, click, event.position, hit),
     };
     focus.validate(tree);
     result
@@ -395,6 +484,8 @@ fn pointer_down(
     focus: &mut FocusManager,
     click: &mut ClickTracker,
     point: (f32, f32),
+    modifiers: Modifiers,
+    hit: &mut dyn TextHit,
 ) -> Result<PointerOutcome, ActionRejection> {
     focus.note_input(tree, FocusOrigin::Pointer);
     // A `Down` without an `Up` in between (the release happened outside
@@ -432,12 +523,49 @@ fn pointer_down(
         }
         Interactive::TextField => {
             focus_pointer(tree, focus, id)?;
+            text_field_down(tree, click, id, point, modifiers, hit)?;
             Ok(PointerOutcome::Focused(id))
         }
         Interactive::Range => range_down(tree, focus, click, id, point),
         Interactive::Picker => picker_down(tree, focus, click, id, point),
         Interactive::Curve => curve_down(tree, focus, click, id, point),
     }
+}
+
+/// A text field's `Down` after focusing it: places the caret where `hit`
+/// maps `point` and captures the field for a drag. Nothing more while
+/// the field is composing (the drawn text is then content plus preedit,
+/// so a byte offset into it is not one into the content) or when `hit`
+/// has no answer.
+fn text_field_down(
+    tree: &mut WidgetTree<WidgetKind>,
+    click: &mut ClickTracker,
+    id: WidgetId,
+    point: (f32, f32),
+    modifiers: Modifiers,
+    hit: &mut dyn TextHit,
+) -> Result<(), WidgetError> {
+    if widgets::text_field_state(tree, id)?.is_composing() {
+        return Ok(());
+    }
+    let Some(offset) = hit.offset_at(tree, id, point) else {
+        return Ok(());
+    };
+    let state = widgets::text_field_state(tree, id)?;
+    let anchor = if modifiers.shift {
+        state.selection_anchor.unwrap_or(state.cursor)
+    } else {
+        offset
+    };
+    widgets::set_text_field_caret(tree, id, offset, Some(anchor))?;
+    // The anchor as stored (clamped, floored), or the caret itself when
+    // the click collapsed the selection.
+    let state = widgets::text_field_state(tree, id)?;
+    click.captured = Some(Capture::TextField {
+        id,
+        anchor: state.selection_anchor.unwrap_or(state.cursor),
+    });
+    Ok(())
 }
 
 fn focus_pointer(
@@ -626,6 +754,7 @@ fn pointer_move(
     focus: &mut FocusManager,
     click: &mut ClickTracker,
     point: (f32, f32),
+    hit: &mut dyn TextHit,
 ) -> Result<PointerOutcome, ActionRejection> {
     let Some(capture) = click.captured else {
         return Ok(PointerOutcome::Ignored);
@@ -674,6 +803,23 @@ fn pointer_move(
                         PointerOutcome::Action(ActionOutcome::CurveChanged { editor })
                     }
                     CurveEditorOutcome::Ignored => PointerOutcome::Ignored,
+                },
+            )
+        }
+        Capture::TextField { id, anchor } => {
+            // An IME composition begun mid-drag freezes the caret: the
+            // drawn text is no longer the content (`TextHit::offset_at`).
+            if widgets::text_field_state(tree, id)?.is_composing() {
+                return Ok(PointerOutcome::Ignored);
+            }
+            let Some(offset) = hit.offset_at(tree, id, point) else {
+                return Ok(PointerOutcome::Ignored);
+            };
+            Ok(
+                if widgets::set_text_field_caret(tree, id, offset, Some(anchor))? {
+                    PointerOutcome::Changed(id)
+                } else {
+                    PointerOutcome::Ignored
                 },
             )
         }
@@ -2396,5 +2542,393 @@ mod tests {
         assert_eq!(value(&f).as_deref(), Some("ab"));
         type_text(&mut f, "Z", Modifiers::none());
         assert_eq!(value(&f).as_deref(), Some("abZ"));
+    }
+
+    // -- caret placement (0.138.0) --
+
+    /// A fake [`super::TextHit`]: byte `(x - field left) / STEP`, rounded
+    /// to the nearest, clamped to the content; every call recorded.
+    struct FakeHit {
+        calls: usize,
+        answers: bool,
+    }
+
+    const STEP: f32 = 10.0;
+
+    impl super::TextHit for FakeHit {
+        fn offset_at(
+            &mut self,
+            tree: &WidgetTree<WidgetKind>,
+            id: WidgetId,
+            point: (f32, f32),
+        ) -> Option<usize> {
+            self.calls += 1;
+            if !self.answers {
+                return None;
+            }
+            let left = tree.bounds(id)?.x;
+            let len = widgets::text_field_state(tree, id).ok()?.content.len();
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let byte = ((point.0 - left as f32) / STEP).round().max(0.0) as usize;
+            Some(byte.min(len))
+        }
+    }
+
+    fn hit() -> FakeHit {
+        FakeHit {
+            calls: 0,
+            answers: true,
+        }
+    }
+
+    /// The point in the text field the fake maps to byte `byte`.
+    fn byte_x(f: &Fixture, byte: usize) -> (f32, f32) {
+        let (_, y) = centre(&f.tree, f.text_field);
+        let Some(b) = f.tree.bounds(f.text_field) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let x = b.x as f32 + byte as f32 * STEP;
+        (x, y)
+    }
+
+    const SHIFT: Modifiers = Modifiers {
+        control: false,
+        shift: true,
+        alt: false,
+        meta: false,
+    };
+
+    impl Fixture {
+        fn with_hit(
+            &mut self,
+            phase: PointerPhase,
+            position: (f32, f32),
+            modifiers: Modifiers,
+            hit: &mut FakeHit,
+        ) -> PointerOutcome {
+            ok(super::handle_pointer_with(
+                &mut self.tree,
+                &mut self.focus,
+                &mut self.click,
+                PointerEvent { phase, position },
+                modifiers,
+                hit,
+            ))
+        }
+
+        fn caret(&self) -> (usize, Option<usize>) {
+            let state = ok(widgets::text_field_state(&self.tree, self.text_field));
+            (state.cursor, state.selection_anchor)
+        }
+
+        fn selected(&self) -> String {
+            ok(widgets::text_field_state(&self.tree, self.text_field))
+                .selected_text()
+                .to_owned()
+        }
+    }
+
+    /// A focused field holding "Hello world", caret at the end.
+    fn hello() -> Fixture {
+        focused_field("Hello world")
+    }
+
+    #[test]
+    fn a_click_places_the_caret_and_the_up_releases_the_field() {
+        let mut f = hello();
+        let mut h = hit();
+        let down = f.with_hit(PointerPhase::Down, byte_x(&f, 3), Modifiers::none(), &mut h);
+        assert_eq!(down, PointerOutcome::Focused(f.text_field));
+        assert_eq!(f.caret(), (3, None));
+        assert_eq!(f.click.captured(), Some(f.text_field));
+        assert_eq!(f.focus.focused(), Some(f.text_field));
+        let up = f.with_hit(PointerPhase::Up, byte_x(&f, 3), Modifiers::none(), &mut h);
+        assert_eq!(up, PointerOutcome::Released(f.text_field));
+        assert_eq!(f.click.captured(), None);
+        assert_eq!(f.caret(), (3, None));
+        // A later move is nobody's.
+        let calls = h.calls;
+        let moved = f.with_hit(PointerPhase::Move, byte_x(&f, 8), Modifiers::none(), &mut h);
+        assert_eq!(moved, PointerOutcome::Ignored);
+        assert_eq!(h.calls, calls, "no capture, no hit test");
+        assert_eq!(f.caret(), (3, None));
+        // A plain click collapses an existing selection.
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            1,
+            Some(9),
+        ));
+        f.with_hit(PointerPhase::Down, byte_x(&f, 5), Modifiers::none(), &mut h);
+        assert_eq!(f.caret(), (5, None));
+    }
+
+    #[test]
+    fn a_click_also_focuses_an_unfocused_field() {
+        let mut f = fixture();
+        ok(widgets::with_text_field_mut(
+            &mut f.tree,
+            f.text_field,
+            |s| {
+                s.insert_str("abcdef");
+            },
+        ));
+        let mut h = hit();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        assert_eq!(f.focus.focused(), Some(f.text_field));
+        assert_eq!(f.caret(), (2, None));
+    }
+
+    #[test]
+    fn shift_click_extends_from_a_collapsed_caret() {
+        let mut f = hello();
+        let mut h = hit();
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            2,
+            None,
+        ));
+        f.with_hit(PointerPhase::Down, byte_x(&f, 7), SHIFT, &mut h);
+        assert_eq!(f.caret(), (7, Some(2)));
+        assert_eq!(f.selected(), "llo w");
+        // Leftwards of the pre-click caret too.
+        f.with_hit(PointerPhase::Up, byte_x(&f, 7), SHIFT, &mut h);
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            6,
+            None,
+        ));
+        f.with_hit(PointerPhase::Down, byte_x(&f, 1), SHIFT, &mut h);
+        assert_eq!(f.caret(), (1, Some(6)));
+        assert_eq!(f.selected(), "ello ");
+    }
+
+    #[test]
+    fn shift_click_keeps_an_existing_selections_anchor() {
+        let mut f = hello();
+        let mut h = hit();
+        // Selected 2..5 with the caret at 5; Shift+click at 9 keeps 2.
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            5,
+            Some(2),
+        ));
+        f.with_hit(PointerPhase::Down, byte_x(&f, 9), SHIFT, &mut h);
+        assert_eq!(f.caret(), (9, Some(2)));
+        // And across the anchor: the selection flips, the anchor stays.
+        f.with_hit(PointerPhase::Up, byte_x(&f, 9), SHIFT, &mut h);
+        f.with_hit(PointerPhase::Down, byte_x(&f, 0), SHIFT, &mut h);
+        assert_eq!(f.caret(), (0, Some(2)));
+        assert_eq!(f.selected(), "He");
+        // A Shift+drag then extends from that same anchor.
+        f.with_hit(PointerPhase::Move, byte_x(&f, 4), SHIFT, &mut h);
+        assert_eq!(f.caret(), (4, Some(2)));
+    }
+
+    /// Critic C4 (0.138.0 review): a `Shift`+click landing *inside* the
+    /// selection keeps its anchor and shrinks it to the click.
+    #[test]
+    fn shift_click_inside_a_selection_keeps_the_anchor_and_shrinks_it() {
+        let mut f = hello();
+        let mut h = hit();
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            9,
+            Some(2),
+        ));
+        assert_eq!(f.selected(), "llo wor");
+        f.with_hit(PointerPhase::Down, byte_x(&f, 5), SHIFT, &mut h);
+        assert_eq!(f.caret(), (5, Some(2)));
+        assert_eq!(f.selected(), "llo");
+    }
+
+    /// Critic C3 (0.138.0 review), kept and pinned: a `Shift`+click on
+    /// an *unfocused* field focuses it and extends from the caret and
+    /// anchor it kept while unfocused (Chromium's behaviour), rather
+    /// than starting a fresh selection at the click.
+    #[test]
+    fn shift_click_on_an_unfocused_field_extends_from_its_stored_caret() {
+        let mut f = hello();
+        let mut h = hit();
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            6,
+            Some(3),
+        ));
+        let button = centre(&f.tree, f.button);
+        f.event(PointerPhase::Down, button);
+        f.event(PointerPhase::Up, button);
+        assert_eq!(f.focus.focused(), Some(f.button));
+        let (cursor, anchor) = f.caret();
+        let from = anchor.unwrap_or(cursor);
+        f.with_hit(PointerPhase::Down, byte_x(&f, 9), SHIFT, &mut h);
+        assert_eq!(f.focus.focused(), Some(f.text_field));
+        assert_eq!(f.caret(), (9, Some(from)));
+        assert_eq!(from, 3, "losing focus kept the selection's anchor");
+    }
+
+    /// Critic C4 (0.138.0 review): a `Move` whose hit has no answer (an
+    /// engine that cannot shape, a field scrolled out of view) changes
+    /// nothing and is `Ignored`, and the drag goes on — the next
+    /// answering `Move` still selects from the press.
+    #[test]
+    fn a_move_with_no_hit_mid_drag_is_ignored_and_keeps_the_capture() {
+        let mut f = hello();
+        let mut h = hit();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        let mut none = FakeHit {
+            calls: 0,
+            answers: false,
+        };
+        assert_eq!(
+            f.with_hit(
+                PointerPhase::Move,
+                byte_x(&f, 7),
+                Modifiers::none(),
+                &mut none
+            ),
+            PointerOutcome::Ignored
+        );
+        assert_eq!(none.calls, 1);
+        assert_eq!(f.caret(), (2, None));
+        assert_eq!(
+            f.with_hit(PointerPhase::Move, byte_x(&f, 7), Modifiers::none(), &mut h),
+            PointerOutcome::Changed(f.text_field)
+        );
+        assert_eq!(f.caret(), (7, Some(2)));
+    }
+
+    #[test]
+    fn a_drag_selects_from_the_press_and_back_to_it_collapses() {
+        let mut f = hello();
+        let mut h = hit();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        let moved = f.with_hit(PointerPhase::Move, byte_x(&f, 5), Modifiers::none(), &mut h);
+        assert_eq!(moved, PointerOutcome::Changed(f.text_field));
+        assert_eq!(f.caret(), (5, Some(2)));
+        assert_eq!(f.selected(), "llo");
+        // Moving within the same byte changes nothing.
+        let same = f.with_hit(PointerPhase::Move, byte_x(&f, 5), Modifiers::none(), &mut h);
+        assert_eq!(same, PointerOutcome::Ignored);
+        // Past the anchor, leftwards: the anchor has not moved.
+        f.with_hit(PointerPhase::Move, byte_x(&f, 0), Modifiers::none(), &mut h);
+        assert_eq!(f.caret(), (0, Some(2)));
+        assert_eq!(f.selected(), "He");
+        // Beyond the end (the fake clamps, as the real hit does).
+        f.with_hit(
+            PointerPhase::Move,
+            byte_x(&f, 40),
+            Modifiers::none(),
+            &mut h,
+        );
+        assert_eq!(f.caret(), (11, Some(2)));
+        // Back onto the anchor: a bare caret, no empty selection.
+        f.with_hit(PointerPhase::Move, byte_x(&f, 2), Modifiers::none(), &mut h);
+        assert_eq!(f.caret(), (2, None));
+        // And off it again: the anchor is still the press's.
+        f.with_hit(PointerPhase::Move, byte_x(&f, 3), Modifiers::none(), &mut h);
+        assert_eq!(f.caret(), (3, Some(2)));
+        let up = f.with_hit(PointerPhase::Up, byte_x(&f, 3), Modifiers::none(), &mut h);
+        assert_eq!(up, PointerOutcome::Released(f.text_field));
+        assert_eq!(f.selected(), "l");
+    }
+
+    #[test]
+    fn a_field_removed_or_disabled_mid_drag_cancels_it() {
+        let mut f = hello();
+        let mut h = hit();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        f.with_hit(PointerPhase::Move, byte_x(&f, 4), Modifiers::none(), &mut h);
+        ok(widgets::set_text_field_disabled(
+            &mut f.tree,
+            f.text_field,
+            true,
+        ));
+        let moved = f.with_hit(PointerPhase::Move, byte_x(&f, 8), Modifiers::none(), &mut h);
+        assert_eq!(moved, PointerOutcome::Cancelled(f.text_field));
+        assert_eq!(f.caret(), (4, Some(2)), "kept what the drag last set");
+        assert_eq!(f.click.captured(), None);
+        ok(widgets::set_text_field_disabled(
+            &mut f.tree,
+            f.text_field,
+            false,
+        ));
+        let later = f.with_hit(PointerPhase::Move, byte_x(&f, 8), Modifiers::none(), &mut h);
+        assert_eq!(later, PointerOutcome::Ignored, "not resumed");
+
+        let mut f = hello();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        let field = f.text_field;
+        ok(f.tree.remove(field));
+        let moved = f.with_hit(PointerPhase::Move, (0.0, 0.0), Modifiers::none(), &mut h);
+        assert_eq!(moved, PointerOutcome::Cancelled(field));
+        assert_eq!(f.click.captured(), None);
+    }
+
+    #[test]
+    fn composing_blocks_placement_and_freezes_a_drag() {
+        let mut f = hello();
+        // A hit that answers even while composing: the pointer's own
+        // guard is what refuses.
+        let mut h = hit();
+        ok(widgets::set_text_field_caret(
+            &mut f.tree,
+            f.text_field,
+            5,
+            None,
+        ));
+        ok(widgets::with_text_field_mut(
+            &mut f.tree,
+            f.text_field,
+            |s| {
+                s.set_composition("ni", None);
+            },
+        ));
+        let down = f.with_hit(PointerPhase::Down, byte_x(&f, 1), Modifiers::none(), &mut h);
+        assert_eq!(down, PointerOutcome::Focused(f.text_field));
+        assert_eq!(f.caret(), (5, None), "the preedit's anchor did not move");
+        assert_eq!(f.click.captured(), None);
+
+        // Composition beginning mid-drag freezes the caret.
+        let mut f = hello();
+        f.with_hit(PointerPhase::Down, byte_x(&f, 2), Modifiers::none(), &mut h);
+        ok(widgets::with_text_field_mut(
+            &mut f.tree,
+            f.text_field,
+            |s| {
+                s.set_composition("ni", None);
+            },
+        ));
+        let moved = f.with_hit(PointerPhase::Move, byte_x(&f, 6), Modifiers::none(), &mut h);
+        assert_eq!(moved, PointerOutcome::Ignored);
+        assert_eq!(f.caret(), (2, None));
+    }
+
+    #[test]
+    fn no_answer_focuses_only_as_before() {
+        let mut f = hello();
+        let mut h = FakeHit {
+            calls: 0,
+            answers: false,
+        };
+        let down = f.with_hit(PointerPhase::Down, byte_x(&f, 1), Modifiers::none(), &mut h);
+        assert_eq!(down, PointerOutcome::Focused(f.text_field));
+        assert_eq!(h.calls, 1);
+        assert_eq!(f.caret(), (11, None));
+        assert_eq!(f.click.captured(), None);
+        // `handle_pointer` is exactly `NoTextHit`.
+        f.event(PointerPhase::Down, byte_x(&f, 1));
+        assert_eq!(f.caret(), (11, None));
+        assert_eq!(f.click.captured(), None);
     }
 }

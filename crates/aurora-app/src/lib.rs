@@ -523,8 +523,8 @@ use aurora_widgets::widgets::{
     set_command_palette_query,
 };
 use aurora_widgets::{
-    ClickTracker, FocusOrigin, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase,
-    handle_pointer, handle_widget_key, handle_widget_text,
+    ClickTracker, FocusOrigin, KeyOutcome, NoTextHit, PointerEvent, PointerOutcome, PointerPhase,
+    TextHit, handle_pointer_with, handle_widget_key, handle_widget_text,
 };
 use aurora_widgets::{
     FocusManager, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp, GradientPipeline,
@@ -3460,8 +3460,49 @@ fn route_gallery_pointer(
     position: (f32, f32),
 ) -> WidgetPointer {
     route_widget_pointer(
-        workspace, focus, gallery, None, None, click, scales, modal_open, phase, position,
+        workspace,
+        focus,
+        gallery,
+        None,
+        None,
+        click,
+        scales,
+        modal_open,
+        phase,
+        position,
+        Modifiers::none(),
+        &mut NoTextHit,
     )
+}
+
+/// The real [`TextHit`] (0.138.0): [`aurora_widgets::field_offset_at`]
+/// against the app's own text engine, theme, scales and scale factor —
+/// the same four inputs the frame draws text fields with, so a click
+/// lands on the caret the user sees.
+struct EngineTextHit<'a> {
+    engine: &'a mut TextEngine,
+    theme: &'a Theme,
+    scales: &'a Scales,
+    scale_factor: f32,
+}
+
+impl TextHit for EngineTextHit<'_> {
+    fn offset_at(
+        &mut self,
+        tree: &WidgetTree<WidgetKind>,
+        id: WidgetId,
+        point: (f32, f32),
+    ) -> Option<usize> {
+        aurora_widgets::field_offset_at(
+            self.engine,
+            tree,
+            id,
+            self.theme,
+            self.scales,
+            self.scale_factor,
+            point.0,
+        )
+    }
 }
 
 /// Routes one primary-button pointer event to an app-owned widget — the
@@ -3492,6 +3533,12 @@ fn route_gallery_pointer(
 /// **`Move`** (0.131.0) is routed only while a widget is captured (a drag
 /// in progress); otherwise it is `None`, so the app's own pointer-move
 /// handling runs.
+///
+/// **`modifiers` and `hit`** (0.138.0) are [`handle_pointer_with`]'s: the
+/// held modifiers (only `Shift` is read — a `Shift`+click extends a text
+/// field's selection) and the [`TextHit`] that maps a pointer to a text
+/// field's caret ([`EngineTextHit`]; [`NoTextHit`] with no text engine,
+/// when a click in a field focuses it and places nothing).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn route_widget_pointer(
     workspace: &mut aurora_ui::Workspace,
@@ -3504,6 +3551,8 @@ fn route_widget_pointer(
     modal_open: bool,
     phase: PointerPhase,
     position: (f32, f32),
+    modifiers: Modifiers,
+    hit: &mut dyn TextHit,
 ) -> WidgetPointer {
     if gallery.is_none() && layer_controls.is_none() && tool_controls.is_none() {
         return WidgetPointer::default();
@@ -3612,13 +3661,14 @@ fn route_widget_pointer(
         }
     };
     let event = PointerEvent { phase, position };
-    let outcome = match handle_pointer(&mut workspace.tree, focus, click, event) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            tracing::debug!(?err, "a widget refused a pointer event");
-            PointerOutcome::Ignored
-        }
-    };
+    let outcome =
+        match handle_pointer_with(&mut workspace.tree, focus, click, event, modifiers, hit) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::debug!(?err, "a widget refused a pointer event");
+                PointerOutcome::Ignored
+            }
+        };
     if owner == Some(WidgetOwner::Gallery)
         && let Some(open) = gallery.as_mut()
         && let Err(err) =
@@ -17606,6 +17656,18 @@ impl App {
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut engine_hit = self.text_engine.as_mut().map(|engine| EngineTextHit {
+            engine,
+            theme: &self.theme,
+            scales: &self.scales,
+            scale_factor: self.scale_factor as f32,
+        });
+        let mut no_hit = NoTextHit;
+        let hit: &mut dyn TextHit = match engine_hit.as_mut() {
+            Some(engine_hit) => engine_hit,
+            None => &mut no_hit,
+        };
         let routed = route_widget_pointer(
             &mut self.workspace,
             &mut self.focus,
@@ -17617,6 +17679,8 @@ impl App {
             self.dialog.is_some() || self.command_palette.is_some(),
             phase,
             position,
+            self.modifiers,
+            hit,
         );
         if routed.owner == Some(WidgetOwner::LayerControls)
             && let Some(outcome) = routed.outcome.as_ref()
@@ -18044,6 +18108,20 @@ impl App {
                 let focus_paint = FocusPaint::resolve(&self.workspace.tree, &self.focus);
                 if let Some(engine) = self.text_engine.as_mut() {
                     engine.begin_frame();
+                    // Each text field's sticky horizontal scroll (0.138.0
+                    // review), stored before anything is drawn: the frame
+                    // draws it, and the next click is mapped against it
+                    // (`EngineTextHit`, at the same `as f32` scale), so
+                    // the two always agree.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let scale_factor = self.scale_factor as f32;
+                    aurora_widgets::update_field_scrolls(
+                        engine,
+                        &mut self.workspace.tree,
+                        &self.theme,
+                        &self.scales,
+                        scale_factor,
+                    );
                 }
                 let text = self.text_engine.as_mut().zip(self.glyph_atlas.as_mut());
                 let widget_paints = collect_widget_paints(
@@ -20124,6 +20202,8 @@ mod tests {
                     false,
                     phase,
                     at,
+                    crate::Modifiers::none(),
+                    &mut crate::NoTextHit,
                 );
                 if let Some(outcome) = routed.outcome.as_ref() {
                     let captured = state.gallery_click.captured();
@@ -51050,6 +51130,103 @@ mod tests {
             field
         }
 
+        /// `App::route_gallery` with a real text engine (0.138.0): the
+        /// [`crate::EngineTextHit`] the app builds, at `scale`.
+        fn pointer_with_engine(
+            &mut self,
+            engine: &mut aurora_text::TextEngine,
+            scale: f32,
+            phase: PointerPhase,
+            at: (f32, f32),
+            modifiers: Modifiers,
+        ) -> Option<PointerOutcome> {
+            let theme = match crate::load_theme() {
+                Ok(theme) => theme,
+                Err(err) => unreachable!("{err}"),
+            };
+            // The frame drawn before this event stored each field's
+            // scroll (`App::redraw`); the click is mapped against it.
+            aurora_widgets::update_field_scrolls(
+                engine,
+                &mut self.workspace.tree,
+                &theme,
+                &self.scales,
+                scale,
+            );
+            let mut hit = crate::EngineTextHit {
+                engine,
+                theme: &theme,
+                scales: &self.scales,
+                scale_factor: scale,
+            };
+            let routed = crate::route_widget_pointer(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.gallery,
+                None,
+                None,
+                &mut self.click,
+                &self.scales,
+                false,
+                phase,
+                at,
+                modifiers,
+                &mut hit,
+            );
+            self.workspace
+                .tree
+                .compute_layout(GALLERY_WIDE, GALLERY_TALL);
+            routed.outcome
+        }
+
+        /// The gallery text field's caret and selection anchor.
+        fn caret(&self) -> (usize, Option<usize>) {
+            match self.workspace.tree.payload(self.g().text_field) {
+                Some(aurora_widgets::widgets::WidgetKind::TextField(state)) => {
+                    (state.cursor, state.selection_anchor)
+                }
+                other => unreachable!("{other:?}"),
+            }
+        }
+
+        /// A point in the text field that a click maps to `byte` — the
+        /// leftmost such x, found by asking the same hit the click uses.
+        fn x_for_byte(
+            &self,
+            engine: &mut aurora_text::TextEngine,
+            scale: f32,
+            byte: usize,
+        ) -> (f32, f32) {
+            let field = self.g().text_field;
+            let (_, y) = self.centre(field);
+            let Some(b) = self.workspace.tree.bounds(field) else {
+                unreachable!("laid out");
+            };
+            let theme = match crate::load_theme() {
+                Ok(theme) => theme,
+                Err(err) => unreachable!("{err}"),
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let (left, width) = (b.x as f32, b.width as f32);
+            let mut x = left;
+            while x < left + width {
+                if aurora_widgets::field_offset_at(
+                    engine,
+                    &self.workspace.tree,
+                    field,
+                    &theme,
+                    &self.scales,
+                    scale,
+                    x,
+                ) == Some(byte)
+                {
+                    return (x, y);
+                }
+                x += 0.5;
+            }
+            unreachable!("no x in the field maps to byte {byte}")
+        }
+
         /// `App::handle_key_event` end to end: the widget router first,
         /// and — only when it did not handle the key — [`handle_key`]
         /// against a fresh, empty document with the real
@@ -51872,6 +52049,120 @@ mod tests {
         assert_eq!(rig.text(), "hihi !");
     }
 
+    /// A string typed into the focused gallery field, one key at a time.
+    fn type_into(rig: &mut GalleryRig, text: &str) {
+        for c in text.chars() {
+            let key = if c == ' ' {
+                Key::Named(NamedKey::Space)
+            } else {
+                Key::Character(c)
+            };
+            rig.typed(key, Some(&c.to_string()), Modifiers::none());
+        }
+    }
+
+    fn engine() -> aurora_text::TextEngine {
+        match aurora_text::TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    const SHIFT_ONLY: Modifiers = Modifiers {
+        control: false,
+        shift: true,
+        alt: false,
+        meta: false,
+    };
+
+    /// 0.138.0: with the app's real text engine, a click in the gallery's
+    /// text field puts the caret under the pointer, and a `Shift`+click
+    /// extends the selection from it — at scale 1 and 2.
+    #[test]
+    fn a_click_places_the_gallery_fields_caret_and_shift_click_extends() {
+        for scale in [1.0_f32, 2.0] {
+            let mut rig = GalleryRig::open();
+            let mut engine = engine();
+            let field = rig.focus_text_field();
+            type_into(&mut rig, "hello world");
+            assert_eq!(rig.caret(), (11, None));
+            for byte in [0, 5, 3, 11] {
+                let at = rig.x_for_byte(&mut engine, scale, byte);
+                let down = rig.pointer_with_engine(
+                    &mut engine,
+                    scale,
+                    PointerPhase::Down,
+                    at,
+                    Modifiers::none(),
+                );
+                assert_eq!(down, Some(PointerOutcome::Focused(field)));
+                let up = rig.pointer_with_engine(
+                    &mut engine,
+                    scale,
+                    PointerPhase::Up,
+                    at,
+                    Modifiers::none(),
+                );
+                assert_eq!(up, Some(PointerOutcome::Released(field)));
+                assert_eq!(rig.caret(), (byte, None), "scale {scale}");
+            }
+            let at = rig.x_for_byte(&mut engine, scale, 5);
+            rig.pointer_with_engine(&mut engine, scale, PointerPhase::Down, at, SHIFT_ONLY);
+            rig.pointer_with_engine(&mut engine, scale, PointerPhase::Up, at, SHIFT_ONLY);
+            assert_eq!(rig.caret(), (5, Some(11)), "scale {scale}");
+            assert_eq!(rig.text(), "hello world", "placing a caret edits nothing");
+        }
+    }
+
+    /// Critic C6 (0.138.0 review): the same *logical* point lands on the
+    /// same byte at scale factor 1 and 2 — each probe the centre of a
+    /// byte's catchment at scale 1, so hinting's sub-pixel differences
+    /// between the two scales cannot flip it.
+    #[test]
+    fn the_same_logical_point_places_the_same_byte_at_scale_one_and_two() {
+        let mut rig = GalleryRig::open();
+        let mut engine = engine();
+        rig.focus_text_field();
+        type_into(&mut rig, "hello world");
+        let none = Modifiers::none();
+        for byte in [1, 4, 6, 10] {
+            let (from, y) = rig.x_for_byte(&mut engine, 1.0, byte);
+            let (to, _) = rig.x_for_byte(&mut engine, 1.0, byte + 1);
+            let at = (f32::midpoint(from, to), y);
+            let mut placed = Vec::new();
+            for scale in [1.0_f32, 2.0] {
+                rig.pointer_with_engine(&mut engine, scale, PointerPhase::Down, at, none);
+                rig.pointer_with_engine(&mut engine, scale, PointerPhase::Up, at, none);
+                placed.push(rig.caret());
+            }
+            assert_eq!(placed, vec![(byte, None), (byte, None)], "byte {byte}");
+        }
+    }
+
+    /// 0.138.0 into 0.137.0: a drag selects, and the primary+C chord then
+    /// copies exactly the dragged selection.
+    #[test]
+    fn a_drag_selects_and_the_copy_chord_copies_the_dragged_text() {
+        let mut rig = GalleryRig::open();
+        let mut engine = engine();
+        rig.focus_text_field();
+        type_into(&mut rig, "hello world");
+        let from = rig.x_for_byte(&mut engine, 1.0, 6);
+        let to = rig.x_for_byte(&mut engine, 1.0, 11);
+        let none = Modifiers::none();
+        rig.pointer_with_engine(&mut engine, 1.0, PointerPhase::Down, from, none);
+        let moved = rig.pointer_with_engine(&mut engine, 1.0, PointerPhase::Move, to, none);
+        assert!(
+            matches!(moved, Some(PointerOutcome::Changed(_))),
+            "a captured caret drag is routed: {moved:?}"
+        );
+        rig.pointer_with_engine(&mut engine, 1.0, PointerPhase::Up, to, none);
+        assert_eq!(rig.caret(), (11, Some(6)));
+        rig.key_event(Key::Character('c'), None, primary());
+        assert_eq!(rig.clipboard.contents.as_deref(), Some("world"));
+        assert_eq!(rig.text(), "hello world");
+    }
+
     #[test]
     fn word_motion_moves_the_caret_in_a_focused_field() {
         let mut rig = GalleryRig::open();
@@ -52306,6 +52597,8 @@ mod tests {
                     modal_open,
                     phase,
                     at,
+                    crate::Modifiers::none(),
+                    &mut crate::NoTextHit,
                 );
                 let captured = self.click.captured();
                 let invalidation = if routed.owner == Some(WidgetOwner::LayerControls)
@@ -53201,6 +53494,8 @@ mod tests {
                     false,
                     phase,
                     at,
+                    crate::Modifiers::none(),
+                    &mut crate::NoTextHit,
                 );
                 if routed.owner == Some(WidgetOwner::ToolControls)
                     && let Some(outcome) = routed.outcome.as_ref()

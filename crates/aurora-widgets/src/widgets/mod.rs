@@ -208,7 +208,8 @@ pub use text_field::{
     ChordEffect, Composition, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldKey, TextFieldState,
     UnderlineStyle, composition_segments, handle_text_field_chord, handle_text_field_key,
     insert_text_field, insert_text_field_text, is_insertable_char, push_graphemes_capped,
-    set_text_field_disabled, single_line_paste, text_field_state, with_text_field_mut,
+    set_text_field_caret, set_text_field_disabled, set_text_field_scroll, single_line_paste,
+    text_field_state, with_text_field_mut,
 };
 pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{

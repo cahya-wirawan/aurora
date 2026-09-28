@@ -26,7 +26,22 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.137.0): keyboard chords in a focused text
+**Latest (2026-09-28, 0.138.0): placing the caret with the pointer.**
+A click in a text field now puts the caret under the pointer, a
+`Shift`+click extends the selection, and a drag selects (dragging back
+onto the press point collapses it); what a drag selected copies with the
+0.137.0 chords. The hit test reuses exactly the geometry the field draws
+(same run, same stored scroll, same scale factor), so the byte
+chosen is the caret the user sees nearest the pointer. Review revision:
+a text field's horizontal scroll is now sticky and stored per field
+(it was caret-pinned, which made a click shift the text under the
+pointer and a drag in a long line run away). Not done:
+double-click word selection (winit reports no click count) and timed
+autoscroll past the field's edge. The only real text field is still the
+Widget Gallery's demo field. Details and disclosures: M1.7's "Text
+field" 0.138.0 update.
+
+**Previously (2026-09-28, 0.137.0): keyboard chords in a focused text
 field.** Select-all, copy, cut, paste, per-field undo/redo and word
 motion now work in a focused text field on the platform's primary
 modifier (`Cmd` on macOS, `Ctrl` elsewhere; word motion `Alt+Arrow` on
@@ -2245,6 +2260,139 @@ check licenses` clean with the new `toml` dependency.
   characters are still neither filtered nor capped (only its paste is);
   the rig mirrors `App::handle_key_event`'s router-then-`handle_key`
   order rather than calling it.
+
+  **Update 0.138.0 — placing the caret with the pointer.** Closes
+  0.131.0's "a click does not place a text field's caret". New in
+  `aurora-widgets`: `set_text_field_caret(tree, id, offset, anchor)`
+  (`text_field.rs` — clamps to the content, floors both ends to a
+  grapheme-cluster boundary, collapses an anchor on the caret, not an
+  undo step, through `with_text_field_mut` so the accessibility node
+  follows); `field_offset_at(engine, tree, id, theme, scales,
+  scale_factor, x)` (`text.rs` — builds the field's own `text_runs` run,
+  shapes it at the display's scale, applies the same scroll
+  `resolve_run` draws with (caret-pinned `field_scroll` as first built;
+  sticky and stored since the review revision below), and returns the grapheme
+  boundary whose caret is nearest `x`; exact ties go to the lower byte;
+  `None` mid-composition, since the drawn text is then content plus
+  preedit); and in `pointer.rs` a `TextHit` trait (the one
+  engine-dependent step, injected so the router stays engine-free),
+  `NoTextHit`, and `handle_pointer_with(.., modifiers, hit)`, which
+  `handle_pointer` now delegates to with no modifiers and `NoTextHit`
+  (its behaviour unchanged). A text field's `Down` places the caret —
+  `Shift` extending from the existing anchor, or from the pre-click
+  caret — and **captures** the field (`Capture::TextField { id, anchor
+  }`): each `Move` moves the caret with the selection anchored at the
+  press, a `Move` back onto the anchor leaves a bare caret, the `Up`
+  releases it, and a field removed or disabled mid-drag cancels it
+  through the existing capture check. Composition blocks placement at
+  both levels (the pointer refuses even a `TextHit` that answers). In
+  `aurora-app`, `route_widget_pointer` takes the app's tracked modifiers
+  (`ModifiersChanged`) and an `EngineTextHit` over the app's own text
+  engine, theme, scales and scale factor; with no engine yet it passes
+  `NoTextHit` (focus only, as before). New tests: 8 pointer tests with a
+  fake hit (click, Shift+click from a caret and from a selection, drag
+  and collapse, removal/disable mid-drag, composition, no answer), 4
+  `field_offset_at` tests against a real `TextEngine` (every caret
+  `resolve_run` draws — and a point a quarter px left of it — maps back
+  to its byte, in a short and an overflowing (scrolled) field, at scale
+  1 and 2; both ends clamp; the tie rule; composition), 4
+  `set_text_field_caret` tests, and 2 app tests in the Gallery rig with
+  the real engine (click at scale 1 and 2 and Shift+click; drag then
+  primary+C copies exactly the dragged text). Mutations, each really run
+  and reverted (sha256-checked): scroll 0 in `field_offset_at`, nearest
+  caret replaced by floor, Shift dropped, no capture, the anchor
+  overwritten on `Move`, each of the three composition guards removed,
+  and no grapheme floor in `set_text_field_caret` — all 9 killed.
+  **Disclosed:** no double-/triple-click word/line selection (winit has
+  no click count; a timing-based detector is future work); no
+  autoscroll at all since the review revision — a drag past the edge
+  stops at the last visible caret (before it, the hidden byte nearest
+  the pointer was picked and the caret-pinned scroll jumped to it); `App::route_gallery`'s own call site (engine vs. `NoTextHit`,
+  its modifiers) is not exercised by a test — the rig calls
+  `route_widget_pointer` with the same `EngineTextHit` directly, as
+  every prior gallery test does; the app test finds its click points
+  with `field_offset_at` itself, so the geometry is proved in
+  `aurora-widgets` and the app test proves only the wiring; the app
+  test's field text is short, so the scroll mutation is caught only by
+  the widgets test. Headless, Linux only. **Needs a human:** click,
+  Shift+click and drag in the Widget Gallery's field on a real Retina
+  display (the scale-2 mapping is tested, not seen), including a long
+  overflowing line.
+
+  **Review revision (0.138.0, critic BLOCK C1-C6).** *C1 (high):* the
+  caret-pinned scroll this entry was built on (disclosed since 0.133.0)
+  broke pointer placement in an overflowing field: every drag `Move`
+  re-scrolled from the caret the previous `Move` had set, so the
+  selection ran away leftward, and a plain click moved the text under
+  the pointer on the next frame. A text field's scroll is now **sticky
+  and stored**: `TextFieldState` carries a private `scroll` (logical px,
+  compared by bits so the state keeps `Eq`; read with `scroll()`; view
+  state — not an undo step, not in the accessibility node, stored even
+  on a disabled field) written only by the new
+  `set_text_field_scroll` (marks the widget dirty only on a real
+  change). New pure `sticky_scroll(prev, line_width, caret_x,
+  inner_width)`: `0` while the line and an end caret fit; else `prev`
+  while the caret lies in `[prev, prev + inner - CARET_WIDTH]`, else the
+  least change bringing it just inside; clamped to `[0, line +
+  CARET_WIDTH - inner]`; non-finite gives `0`. New
+  `update_field_scrolls(engine, tree, theme, scales, scale_factor)`
+  shapes each visible field's own run and stores its sticky scroll;
+  `App::redraw` calls it once per frame, right after the text engine's
+  `begin_frame` and before widget paints are collected. `FieldDecor`
+  gains `scroll: Option<f32>`: `Some(stored)` for a text field (sticky),
+  `None` for the command palette's query (still caret-pinned
+  `field_scroll`, whose caret is always at the line's end, where the two
+  rules agree); `resolve_run`, `field_offset_at` and
+  `update_field_scrolls` share one placement (`place_field`). *C2
+  (medium):* `field_offset_at` clamps `x` to the padded text box and
+  considers only carets wholly inside the window `sticky_scroll` keeps
+  still (every caret if none is), so a press in the padding or at the
+  edge of a scrolled field picks the nearest *visible* caret and placing
+  it never scrolls. *C3 (low), kept:* `Shift`+click on an unfocused
+  field extends from the caret/anchor it kept (Chromium-like), now
+  pinned by a test. *C5:* one `TextFieldState::is_composing()` (preedit
+  non-empty) used by both pointer guards and `field_offset_at` —
+  behaviour-identical, since `set_composition` never stores an empty
+  preedit. **Tests (+6 `aurora-widgets`, +1 `aurora-app`):**
+  `a_click_and_a_still_drag_in_an_overflowing_field_stay_under_the_pointer`
+  (real `TextEngine`, scale 1 and 2: a click mid-way along an
+  overflowing line and six still `Move`s, a frame update between each —
+  cursor stable, no selection, the stored scroll unchanged, the byte
+  under the pointer unchanged); `sticky_scroll_keeps_its_window_until_the_caret_leaves_it`;
+  `the_stored_scroll_is_view_state`; pointer tests
+  `shift_click_inside_a_selection_keeps_the_anchor_and_shrinks_it`,
+  `shift_click_on_an_unfocused_field_extends_from_its_stored_caret`,
+  `a_move_with_no_hit_mid_drag_is_ignored_and_keeps_the_capture` (C4);
+  app `the_same_logical_point_places_the_same_byte_at_scale_one_and_two`
+  (C6). **Changed tests:** `a_point_past_either_end_clamps` became
+  `a_point_past_either_end_clamps_to_the_nearest_visible_caret` — its old
+  claim (a point far right of `LONG` with the caret at `0` gives the
+  content's length, 55) is exactly the invisible pick C2 forbids; it now
+  asserts `0`/length only for a line that fits or is scrolled to that
+  end, the first/last *visible* caret otherwise (14 in that case),
+  padding points included, and that placing either pick leaves the
+  stored scroll unchanged. `drawn_caret_x` and the app rig's
+  `pointer_with_engine` now run `update_field_scrolls` first, as the
+  app's frame does. `field_tests::plain_decor` sets `scroll: None`
+  (those tests pin drawing, not scroll policy). **Evidence:** the C1
+  test, run against the pre-revision `text.rs` with its frame hook a
+  no-op (there was no stored scroll), failed at scale 1, frame 0 — the
+  byte under the pointer went from 48 to 40 after the click. Mutations
+  on the revised `text.rs`, each run and restored from a scratchpad
+  backup with sha256 checked: text fields back on caret-pinned
+  (killed, 2 tests); no visible-caret filter (killed, 1);
+  `update_field_scrolls` writing nothing (killed, 1); the pointer clamp
+  to the padded box removed — **survives**: with the visible-caret
+  filter in place, a point outside the window already picks the edge
+  caret, so the clamp is output-equivalent and kept only as defence in
+  depth. **Disclosed:** no drag auto-scroll; the redraw call site of
+  `update_field_scrolls` is not itself exercised by a test (the rig
+  calls it the same way); a keyboard edit between two frames moves the
+  stored scroll only at the next frame, and a click in that gap is
+  mapped against the scroll the next frame will draw (`sticky_scroll`
+  of the stored value for the current caret), not the stale frame.
+  **Needs a human:** a long line in the Widget Gallery field — click,
+  drag and Shift+click with the text scrolled — on real hardware.
 - [x] **IME composition rendering (platform underline styles)** — done
   2026-08-02, `crates/aurora-widgets/src/widgets/text_field.rs`
   (`Composition`, `UnderlineStyle`, `composition_segments`,
@@ -3068,6 +3216,12 @@ check licenses` clean with the new `toml` dependency.
   after close stays the caller's job, as already disclosed. Workspace
   1,993 → 2,001 passing, 30 ignored, under `AURORA_REQUIRE_GPU=1` on
   the RTX 3090; the full gate, doctests and `cargo doc -D warnings` clean.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,539 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. Judge:
+  PASS, 0.917. Carried: a test (or debug assertion) that `App::redraw`
+  calls `update_field_scrolls` before paint collection; timed drag
+  autoscroll; double/triple-click selection.
 
   **0.124.0 (not a widget):** the gradient paint primitive the colour
   picker needs landed first, as its own step — `PaintOp`/`paint_widget_ops`
@@ -4048,7 +4202,9 @@ check licenses` clean with the new `toml` dependency.
   joins the frame's single atlas `prepare`. Horizontal scroll is
   stateless and caret-pinned (`field_scroll`): none while the line fits,
   otherwise the least scroll keeping the caret inside the `spacing.sm`
-  inset box. New `paint_widget_ops_frame` takes the focused widget;
+  inset box. (Superseded for text fields by 0.138.0's review revision:
+  sticky, stored per field, `sticky_scroll`/`update_field_scrolls`; the
+  palette query is still caret-pinned.) New `paint_widget_ops_frame` takes the focused widget;
   `paint_widget_ops_focused` is it with none (unchanged for every
   existing caller); the app's frame walker passes `self.focus.focused()`
   and converts every decor colour for the target (`TextRun::map_colors`).
@@ -4075,7 +4231,8 @@ check licenses` clean with the new `toml` dependency.
   row `[120,172,255]` y 96..160). Shapes only: text is filtered out of
   every golden. Existing palette tests that counted body children now
   account for the strip. **Disclosures:** no caret blink; caret-pinned
-  (not sticky) scroll; caret/selection colours provisional (caret colour,
+  (not sticky) scroll (closed for text fields in 0.138.0's review
+  revision); caret/selection colours provisional (caret colour,
   width and blink tokens flagged to Cahya); no placeholder
   (`TextFieldState` has none); no click-to-place caret (a click focuses
   the field but does not move `cursor`); dialog title still not drawn (no
@@ -29154,6 +29311,16 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-28 (0.138.0) — placing the caret with the pointer.**
+Click, `Shift`+click and drag-select in a text field, hit-tested against
+the same geometry the field draws. Full account: M1.7's "Text field"
+0.138.0 update. **Needs a human:** click/drag in the Widget Gallery's
+field on a real Retina display, with a line long enough to scroll.
+**Suggested next:** 0.139.0 caret blink (reset on edit, an
+`about_to_wait` deadline, off under reduced motion); then double-click
+word selection (a click-count detector) and the measure-func layout
+round (checkbox labels, dialog titles).
+
 **Addendum 2026-09-28 (0.137.0) — text-field keyboard chords.**
 Clipboard trio, select-all, field undo/redo and word motion in a
 focused text field; palette paste filtered/capped and on the primary
@@ -29197,7 +29364,7 @@ real Retina display. **Design-owner decisions raised:** caret colour,
 width and blink tokens; selection colours are `accent.primary` /
 `text.on_accent` provisionally. **Suggested next:** checkbox labels (a
 measure-func layout pass), dialog titles, click-to-place caret, sticky
-scroll.
+scroll (both done in 0.138.0).
 
 **Addendum 2026-09-26 (0.132.0) — real text rendering.** Widget labels
 are real glyphs: `aurora-text` shapes (`harfrust`) and rasterizes

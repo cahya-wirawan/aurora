@@ -154,7 +154,24 @@ pub struct TextFieldState {
     pub composition: Option<Composition>,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    /// The line's horizontal scroll (0.138.0 review) — view state kept
+    /// by [`crate::update_field_scrolls`], never an undo step and not in
+    /// the accessibility node. [`Self::scroll`].
+    scroll: ViewScroll,
 }
+
+/// A text field's horizontal scroll, logical px: an `f32` compared by
+/// its bits, so [`TextFieldState`] keeps its `Eq`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ViewScroll(f32);
+
+impl PartialEq for ViewScroll {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for ViewScroll {}
 
 impl TextFieldState {
     fn new(label: String, content: String) -> Self {
@@ -168,7 +185,31 @@ impl TextFieldState {
             composition: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            scroll: ViewScroll::default(),
         }
+    }
+
+    /// The line's horizontal scroll, logical px (`>= 0`; 0.138.0 review):
+    /// how far the drawn line is shifted left inside the field's padded
+    /// box. Sticky — it changes only when the caret would otherwise leave
+    /// that box, or the line shrinks ([`crate::text::sticky_scroll`]) —
+    /// and kept by [`crate::update_field_scrolls`] once per frame, so a
+    /// click is mapped against exactly the scroll on screen.
+    #[must_use]
+    pub fn scroll(&self) -> f32 {
+        self.scroll.0
+    }
+
+    /// Whether an IME composition with visible preedit is in progress —
+    /// the drawn text is then the content with the preedit spliced in,
+    /// so no pointer position maps to a content offset. The one test
+    /// shared by pointer placement ([`crate::handle_pointer_with`]) and
+    /// [`crate::field_offset_at`] (0.138.0 review, critic C5).
+    #[must_use]
+    pub fn is_composing(&self) -> bool {
+        self.composition
+            .as_ref()
+            .is_some_and(|c| !c.text.is_empty())
     }
 
     /// The selected byte range (`min(cursor, anchor)..max(cursor,
@@ -694,6 +735,87 @@ pub fn handle_text_field_key(
         }
         state.snapshot() != before
     })
+}
+
+/// Places text field `id`'s caret at byte `offset` with the selection
+/// anchored at `anchor` (`None`: a bare caret) — the pointer's half of
+/// caret motion (0.138.0: a click, a `Shift`+click, a drag). Each offset
+/// is clamped to the content's length and then floored to a
+/// grapheme-cluster boundary, so a caller mapping a pointer to a byte
+/// (whose shaped line may segment differently from the content — a
+/// control character is drawn as spaces) can never put the caret inside
+/// a cluster; an anchor that lands on the caret collapses to no
+/// selection. Caret motion, so never an undo step; goes through
+/// [`with_text_field_mut`], so the accessibility node follows. Returns
+/// whether the caret or selection actually changed.
+///
+/// # Errors
+///
+/// Whatever [`with_text_field_mut`] refuses — a disabled field included.
+pub fn set_text_field_caret(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    offset: usize,
+    anchor: Option<usize>,
+) -> Result<bool, WidgetError> {
+    with_text_field_mut(tree, id, |state| {
+        let before = state.snapshot();
+        let cursor = floor_grapheme_boundary(&state.content, offset);
+        let anchor = anchor
+            .map(|at| floor_grapheme_boundary(&state.content, at))
+            .filter(|&at| at != cursor);
+        state.cursor = cursor;
+        state.selection_anchor = anchor;
+        state.snapshot() != before
+    })
+}
+
+/// Stores text field `id`'s horizontal scroll (logical px; a negative or
+/// non-finite value stores `0.0`) — [`crate::update_field_scrolls`]'s
+/// write-back (0.138.0 review). View state, so deliberately *not*
+/// through [`with_text_field_mut`]: never an undo step, never refused
+/// for a disabled field (whose text still scrolls), and the
+/// accessibility node is left alone. Marks the widget dirty only when
+/// the value actually changed, and returns whether it did.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] or [`WidgetError::WrongWidgetKind`].
+pub fn set_text_field_scroll(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    scroll: f32,
+) -> Result<bool, WidgetError> {
+    let scroll = if scroll.is_finite() {
+        scroll.max(0.0)
+    } else {
+        0.0
+    };
+    let kind = tree.payload_mut(id).ok_or(WidgetError::UnknownWidget(id))?;
+    let WidgetKind::TextField(state) = kind else {
+        return Err(WidgetError::WrongWidgetKind(id));
+    };
+    let next = ViewScroll(scroll);
+    if state.scroll == next {
+        return Ok(false);
+    }
+    state.scroll = next;
+    tree.mark_dirty(id)?;
+    Ok(true)
+}
+
+/// The greatest grapheme-cluster boundary of `content` at or below `at`
+/// (`content.len()` when `at` is at or past the end).
+fn floor_grapheme_boundary(content: &str, at: usize) -> usize {
+    if at >= content.len() {
+        return content.len();
+    }
+    content
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= at)
+        .last()
+        .unwrap_or(0)
 }
 
 /// The editing chords a focused text field consumes (0.137.0): the
@@ -2001,5 +2123,161 @@ mod chord_tests {
             other => unreachable!("expected WidgetDisabled, got {other:?}"),
         }
         assert_eq!(state(&tree, id).content, "abc");
+    }
+}
+
+#[cfg(test)]
+mod caret_tests {
+    use super::{
+        insert_text_field, set_text_field_caret, set_text_field_disabled, text_field_state,
+        with_text_field_mut,
+    };
+    use crate::WidgetError;
+    use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::{WidgetKind, new_tree, test_scales};
+    use taffy::Style;
+
+    fn tree_with(content: &str) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(Style::default());
+        match insert_text_field(&mut tree, root, &test_scales(), "Name", content) {
+            Ok(id) => (tree, id),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn caret(
+        tree: &mut WidgetTree<WidgetKind>,
+        id: WidgetId,
+        at: usize,
+        anchor: Option<usize>,
+    ) -> bool {
+        match set_text_field_caret(tree, id, at, anchor) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn cursor_and_anchor(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (usize, Option<usize>) {
+        match text_field_state(tree, id) {
+            Ok(state) => (state.cursor, state.selection_anchor),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn places_the_caret_and_the_anchor_and_reports_a_change() {
+        let (mut tree, id) = tree_with("Hello");
+        assert!(caret(&mut tree, id, 2, None));
+        assert_eq!(cursor_and_anchor(&tree, id), (2, None));
+        assert!(!caret(&mut tree, id, 2, None), "nothing moved");
+        assert!(caret(&mut tree, id, 4, Some(1)));
+        assert_eq!(cursor_and_anchor(&tree, id), (4, Some(1)));
+        let Ok(state) = text_field_state(&tree, id) else {
+            unreachable!()
+        };
+        assert_eq!(state.selected_text(), "ell");
+        // An anchor on the caret is no selection.
+        assert!(caret(&mut tree, id, 3, Some(3)));
+        assert_eq!(cursor_and_anchor(&tree, id), (3, None));
+    }
+
+    #[test]
+    fn clamps_past_the_end_and_floors_to_a_grapheme_boundary() {
+        // "e" + U+0301 is one cluster spanning bytes 1..4; "\r\n" is one
+        // cluster too, which a shaped (sanitized) line draws as two
+        // spaces with a caret between them.
+        let (mut tree, id) = tree_with("ae\u{301}b\r\nc");
+        assert!(caret(&mut tree, id, 0, None));
+        assert!(caret(&mut tree, id, 99, Some(1000)));
+        let len = "ae\u{301}b\r\nc".len();
+        assert_eq!(cursor_and_anchor(&tree, id), (len, None));
+        for (inside, floor) in [(2, 1), (3, 1), (6, 5)] {
+            assert!(caret(&mut tree, id, inside, Some(0)));
+            assert_eq!(cursor_and_anchor(&tree, id), (floor, Some(0)), "{inside}");
+            assert!(caret(&mut tree, id, 0, Some(inside)));
+            assert_eq!(cursor_and_anchor(&tree, id), (0, Some(floor)), "{inside}");
+        }
+        // A floored anchor that lands on the caret collapses.
+        assert!(caret(&mut tree, id, 1, Some(3)));
+        assert_eq!(cursor_and_anchor(&tree, id), (1, None));
+    }
+
+    #[test]
+    fn is_not_an_undo_step_and_marks_the_field_dirty() {
+        let (mut tree, id) = tree_with("Hello");
+        tree.take_damage();
+        assert!(caret(&mut tree, id, 1, Some(4)));
+        assert_eq!(tree.is_dirty(id), Some(true));
+        let Some(node) = tree.accessibility(id) else {
+            unreachable!("inserted")
+        };
+        assert_eq!(node.value(), Some("Hello"));
+        match with_text_field_mut(&mut tree, id, super::TextFieldState::undo) {
+            Ok(undid) => assert!(!undid, "caret placement is not undoable"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert_eq!(cursor_and_anchor(&tree, id), (1, Some(4)));
+    }
+
+    #[test]
+    fn a_disabled_field_refuses_it() {
+        let (mut tree, id) = tree_with("Hello");
+        if let Err(err) = set_text_field_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        match set_text_field_caret(&mut tree, id, 1, None) {
+            Err(WidgetError::WidgetDisabled(got)) => assert_eq!(got, id),
+            other => unreachable!("expected WidgetDisabled, got {other:?}"),
+        }
+        assert_eq!(cursor_and_anchor(&tree, id), (5, None));
+    }
+
+    /// `set_text_field_scroll` (0.138.0 review): view state — stored
+    /// even on a disabled field, sanitized, never an undo step, the
+    /// accessibility node untouched, dirty only on a real change.
+    #[test]
+    // Stored values are compared bit-exactly: nothing is computed.
+    #[allow(clippy::float_cmp)]
+    fn the_stored_scroll_is_view_state() {
+        use super::set_text_field_scroll;
+        let (mut tree, id) = tree_with("Hello");
+        let scroll = |tree: &WidgetTree<WidgetKind>| match text_field_state(tree, id) {
+            Ok(state) => state.scroll(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let set = |tree: &mut WidgetTree<WidgetKind>, value: f32| match set_text_field_scroll(
+            tree, id, value,
+        ) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(scroll(&tree), 0.0);
+        let node_before = tree.accessibility(id).cloned();
+        tree.take_damage();
+        assert!(set(&mut tree, 12.5));
+        assert_eq!(scroll(&tree), 12.5);
+        assert_eq!(tree.is_dirty(id), Some(true));
+        assert_eq!(tree.accessibility(id).cloned(), node_before);
+        tree.take_damage();
+        assert!(!set(&mut tree, 12.5), "unchanged");
+        assert_eq!(tree.is_dirty(id), Some(false));
+        match with_text_field_mut(&mut tree, id, super::TextFieldState::undo) {
+            Ok(undid) => assert!(!undid, "a scroll is not undoable"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        for bad in [f32::NAN, f32::INFINITY, -3.0] {
+            set(&mut tree, 12.5);
+            set(&mut tree, bad);
+            assert_eq!(scroll(&tree), 0.0, "{bad}");
+        }
+        if let Err(err) = set_text_field_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        assert!(set(&mut tree, 4.0), "a disabled field's text still scrolls");
+        let root = tree.root();
+        assert!(matches!(
+            set_text_field_scroll(&mut tree, root, 1.0),
+            Err(WidgetError::WrongWidgetKind(_))
+        ));
     }
 }

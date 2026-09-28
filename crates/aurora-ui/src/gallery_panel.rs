@@ -31,8 +31,10 @@
 //! focus, with no warm-up, and draws its text (0.133.0); a press on the
 //! button dismisses it. Drags and text-field typing are routed (see
 //! `aurora_widgets`' pointer module doc comment), and since 0.133.0 the
-//! field draws its content, a caret while focused, and its selection —
-//! but a click does not yet place the caret under the pointer. The panel never shrinks: on a narrow window
+//! field draws its content, a caret while focused, and its selection;
+//! since 0.138.0 a click places its caret under the pointer, `Shift`+click
+//! extends the selection and a drag selects (the app's `EngineTextHit`).
+//! The panel never shrinks: on a narrow window
 //! (640 x 480) it and the dock rail leave the canvas a sliver (18 px),
 //! pinned by a test rather than fixed. Nothing here touches a document: every outcome
 //! is a widget-state change only.

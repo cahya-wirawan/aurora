@@ -91,8 +91,8 @@ pub use paint::{
     paint_widget_ops_frame,
 };
 pub use pointer::{
-    ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
-    handle_widget_key, handle_widget_text, is_shortcut_chord,
+    ClickTracker, KeyOutcome, NoTextHit, PointerEvent, PointerOutcome, PointerPhase, TextHit,
+    handle_pointer, handle_pointer_with, handle_widget_key, handle_widget_text, is_shortcut_chord,
 };
 pub use render::{
     AtlasLayout, AtlasSlot, GlyphAtlas, GlyphBatch, GpuColorMesh, GpuGlyphMesh, GpuMesh,
@@ -101,7 +101,7 @@ pub use render::{
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use text::{
-    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_scroll, label_style,
-    resolve_run, resolve_text, text_runs,
+    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_offset_at, field_scroll,
+    label_style, resolve_run, resolve_text, sticky_scroll, text_runs, update_field_scrolls,
 };
 pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};
