@@ -23,12 +23,15 @@
 //! `Tab` (label, centred), `TreeItem` (label, one row tall), a `Menu`'s
 //! action rows, a `Dropdown`'s current value, and an open dropdown list's
 //! option rows. Since 0.133.0 also a `TextField`'s content — with its
-//! caret while focused ([`CARET_WIDTH`], no blink), its selection
-//! (`accent.primary` highlight, selected glyphs redrawn in
-//! `text.on_accent`) and its IME preedit spliced in at the cursor and
-//! underlined ([`FieldDecor`], [`resolve_run`]), horizontally scrolled
-//! to keep the caret visible ([`field_scroll`], caret-pinned, not
-//! sticky) — the command palette's query strip (query plus caret) and
+//! caret while focused ([`CARET_WIDTH`]; blinking since 0.139.0,
+//! [`crate::CaretBlink`]), its selection (`accent.primary` highlight,
+//! selected glyphs redrawn in `text.on_accent`) and its IME preedit
+//! spliced in at the cursor and underlined ([`FieldDecor`],
+//! [`resolve_run`]), horizontally scrolled
+//! to keep the caret visible (since 0.138.0's review a text field's
+//! scroll is sticky and stored — [`sticky_scroll`],
+//! [`update_field_scrolls`]; the palette query stays caret-pinned,
+//! [`field_scroll`]) — the command palette's query strip (query plus caret) and
 //! result rows, a tooltip's text (its accessibility label, the one copy
 //! `Tooltip::set_text` keeps current), and a dialog's message (one
 //! line). **Not yet**: `Checkbox` (its layout box *is* the 13 px square
@@ -45,8 +48,8 @@ use aurora_theme::{Color, Scales, Theme};
 
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    TextFieldState, UnderlineStyle, WidgetKind, composition_segments, floor_char_boundary,
-    row_height,
+    TextFieldState, UnderlineStyle, WidgetKind, checkbox_metrics, composition_segments,
+    floor_char_boundary, row_height,
 };
 
 /// Horizontal alignment of a run inside its content box.
@@ -82,7 +85,7 @@ pub struct TextRun {
     /// `Some` only for a text field's content and the command palette's
     /// query. A run with decor is placed flush left in `rect` (whatever
     /// `align` says) and scrolled horizontally so its caret stays inside
-    /// `rect` ([`field_scroll`]).
+    /// `rect` ([`FieldDecor::scroll`]).
     pub field: Option<FieldDecor>,
 }
 
@@ -106,9 +109,10 @@ impl TextRun {
 /// The caret's width in logical pixels (rounded to at least one physical
 /// pixel). **Not a token**: `design/tokens/scales.toml` has no
 /// stroke-weight scale — the same gap [`crate::paint::FOCUS_RING_WIDTH`]
-/// records. Its width, colour (`text.primary`, provisional) and the
-/// absence of a blink are flagged to the design owner (Cahya, PRD
-/// FR-027 *Ownership*) rather than invented here.
+/// records. Its width and colour (`text.primary`, provisional) are
+/// flagged to the design owner (Cahya, PRD FR-027 *Ownership*) rather
+/// than invented here, as is its blink cadence
+/// ([`crate::CARET_BLINK_INTERVAL`], 0.139.0).
 pub const CARET_WIDTH: f32 = 1.0;
 
 /// An editable line's decorations. Every byte offset indexes
@@ -120,6 +124,12 @@ pub struct FieldDecor {
     /// or not a caret is drawn there (so a field does not jump when it
     /// loses focus).
     pub scroll_anchor: usize,
+    /// How the line scrolls (0.138.0 review). `Some(previous)` — a text
+    /// field's stored [`TextFieldState::scroll`] — is **sticky**
+    /// ([`sticky_scroll`]): kept until the caret would leave the box.
+    /// `None` — the command palette's query, whose caret is always at the
+    /// end of its line — is **caret-pinned** ([`field_scroll`]).
+    pub scroll: Option<f32>,
     /// Where the caret is drawn, or `None` for no caret (unfocused or
     /// disabled). Not a grapheme boundary: drawn at the previous one.
     pub caret: Option<usize>,
@@ -240,7 +250,7 @@ fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bo
 }
 
 /// The intersection of two rects, or `None` when they do not overlap.
-fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
     let x1 = (a.x + i64::from(a.width)).min(b.x + i64::from(b.width));
@@ -268,6 +278,7 @@ fn inset_rect(rect: Rect, pad: u32) -> Option<Rect> {
 fn decor(theme: &Theme, scroll_anchor: usize) -> FieldDecor {
     FieldDecor {
         scroll_anchor,
+        scroll: None,
         caret: None,
         caret_color: rgba(theme.text.primary, 1.0),
         selection: None,
@@ -296,6 +307,7 @@ fn field_text(state: &TextFieldState, focused: bool, theme: &Theme) -> (String, 
         text.push_str(state.content.get(cursor..).unwrap_or_default());
         let end = cursor + composition.text.len();
         let mut decor = decor(theme, end);
+        decor.scroll = Some(state.scroll());
         decor.caret = show_caret.then_some(end);
         decor.underlines = composition_segments(composition)
             .into_iter()
@@ -304,6 +316,7 @@ fn field_text(state: &TextFieldState, focused: bool, theme: &Theme) -> (String, 
         return (sanitize_field(&text), decor);
     }
     let mut decor = decor(theme, cursor);
+    decor.scroll = Some(state.scroll());
     decor.caret = show_caret.then_some(cursor);
     decor.selection = state
         .selection_range()
@@ -470,6 +483,52 @@ pub fn text_runs(
             })
             .into_iter()
             .collect(),
+        // A checkbox's label (0.140.0): one line, flush left, just past
+        // the box and a `spacing.sm` gap (`checkbox_metrics`), in
+        // `text.primary` — it names a control the user acts on, not
+        // supporting text — faded by the same disabled opacity the box
+        // itself carries. Only a *measured* checkbox (laid out through
+        // `crate::compute_text_layout`) draws one: an unmeasured one's
+        // bounds are all box (`checkbox_box_rect`), so no run is produced
+        // — every golden (laid out with no text engine) stays text-free
+        // exactly as before. A measured checkbox squeezed to no room past
+        // its box draws none either.
+        WidgetKind::Checkbox(state) if tree.is_measured(id) == Some(true) => {
+            let (side, gap) = checkbox_metrics(scales);
+            let (x, y, w, h) = full;
+            let width = w - side - gap;
+            if width > 0.0 {
+                vec![run(
+                    &state.label,
+                    rgba(theme.text.primary, opacity(state.disabled, theme)),
+                    (x + side + gap, y, width, h),
+                    HAlign::Start,
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+        // A static label: one line, flush left, supporting text.
+        WidgetKind::Label(state) => {
+            let color = if state.disabled {
+                theme.text.disabled
+            } else {
+                theme.text.secondary
+            };
+            vec![run(&state.text, rgba(color, 1.0), full, HAlign::Start)]
+        }
+        // A dialog's title (0.141.0): its presentational first child
+        // draws the dialog's own label -- the one copy of the title --
+        // on one line, flush left, clipped, in `text.primary`, exactly
+        // like the message below it. Regular weight: no heavier title
+        // weight exists in the type tokens, and inventing one is the
+        // design owner's call.
+        WidgetKind::Container if let Some(title) = dialog_title(tree, id) => vec![run(
+            title,
+            rgba(theme.text.primary, 1.0),
+            full,
+            HAlign::Start,
+        )],
         WidgetKind::Container => container_text(tree, id, focused, theme)
             .map(|(text, decor)| match decor {
                 Some(decor) => {
@@ -498,6 +557,19 @@ pub fn text_runs(
             !r.text.is_empty() || r.field.as_ref().is_some_and(|field| field.caret.is_some())
         })
         .collect()
+}
+
+/// The title a dialog's title slot draws: its parent `Dialog`'s own
+/// accessibility label, when `id` is that dialog's unlabelled
+/// `Role::GenericContainer` child (`widgets::dialog::insert_dialog`
+/// builds exactly one, first). `None` for any other widget.
+fn dialog_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
+    let parent = tree.parent(id)?;
+    let is_slot = matches!(tree.payload(parent)?, WidgetKind::Dialog)
+        && tree.accessibility(id)?.role() == accesskit::Role::GenericContainer;
+    is_slot
+        .then(|| tree.accessibility(parent)?.label())
+        .flatten()
 }
 
 /// The text a plain container draws: a dialog's message (its
@@ -556,7 +628,7 @@ fn sanitize_field(text: &str) -> String {
 /// included) replaced by a space. Labels are one line, shaped left to
 /// right in one bundled font with no fallback: a control character has no
 /// glyph to draw and would otherwise shape as a `.notdef` box.
-fn sanitize_label(text: &str) -> String {
+pub(crate) fn sanitize_label(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -724,11 +796,12 @@ fn caret_at(line: &ShapedLine, byte: usize) -> f32 {
 /// leaves less than a caret's width would clip an end-of-line caret);
 /// otherwise the least scroll putting the
 /// caret's right edge ([`CARET_WIDTH`]) at the box's right edge, clamped
-/// to `[0, line_width + CARET_WIDTH - inner_width]`. **Caret-pinned, not
-/// sticky**: recomputed from the caret every frame, with no memory of the
-/// previous scroll (a real editor keeps its scroll until the caret
-/// leaves the box; this one shows the caret at the right edge whenever
-/// the line overflows and the caret is past the first box-width).
+/// to `[0, line_width + CARET_WIDTH - inner_width]`. **Caret-pinned**:
+/// recomputed from the caret alone, with no memory of the previous
+/// scroll. Since 0.138.0's review only the command palette's query uses
+/// it (its caret is always at the end of its line, where pinned and
+/// sticky agree); a text field scrolls by [`sticky_scroll`], because a
+/// pinned scroll moves the text under a click and runs a drag away.
 #[must_use]
 pub fn field_scroll(line_width: f32, caret_x: f32, inner_width: f32) -> f32 {
     if ![line_width, caret_x, inner_width]
@@ -740,6 +813,105 @@ pub fn field_scroll(line_width: f32, caret_x: f32, inner_width: f32) -> f32 {
     }
     let upper = (line_width + CARET_WIDTH - inner_width).max(0.0);
     (caret_x + CARET_WIDTH - inner_width).max(0.0).min(upper)
+}
+
+/// A text field's sticky horizontal scroll (logical px, `>= 0`; 0.138.0
+/// review): `0` while the line and a caret after it fit (as
+/// [`field_scroll`]); otherwise `prev` itself while the caret at
+/// `caret_x` lies in the visible window `[prev, prev + inner_width -
+/// CARET_WIDTH]`, else the least change that brings it just inside
+/// (caret at the window's left edge, or its right edge flush with the
+/// box's). Always clamped to `[0, line_width + CARET_WIDTH -
+/// inner_width]`, so a line that shrank never leaves blank space at the
+/// right. Any non-finite input gives `0`.
+///
+/// Sticky is what makes pointer placement stable: a click or a drag
+/// puts the caret on a byte inside the window, which then does not move
+/// the window — the text stays under the pointer.
+#[must_use]
+pub fn sticky_scroll(prev: f32, line_width: f32, caret_x: f32, inner_width: f32) -> f32 {
+    if ![prev, line_width, caret_x, inner_width]
+        .iter()
+        .all(|v| v.is_finite())
+        || line_width + CARET_WIDTH <= inner_width
+    {
+        return 0.0;
+    }
+    let upper = (line_width + CARET_WIDTH - inner_width).max(0.0);
+    let mut scroll = prev.clamp(0.0, upper);
+    if caret_x < scroll {
+        scroll = caret_x;
+    } else if caret_x + CARET_WIDTH > scroll + inner_width {
+        scroll = caret_x + CARET_WIDTH - inner_width;
+    }
+    scroll.clamp(0.0, upper)
+}
+
+/// The scroll `field`'s line takes in a `inner_width`-wide box, given
+/// the line placed unscrolled: sticky from a text field's stored scroll,
+/// caret-pinned for the palette query ([`FieldDecor::scroll`]).
+fn decor_scroll(unscrolled: &Placed, field: &FieldDecor, inner_width: f32) -> f32 {
+    let caret_x = caret_at(&unscrolled.line, field.scroll_anchor);
+    match field.scroll {
+        Some(prev) => sticky_scroll(prev, unscrolled.line.width, caret_x, inner_width),
+        None => field_scroll(unscrolled.line.width, caret_x, inner_width),
+    }
+}
+
+/// `run` shaped and placed at its [`decor_scroll`] — the one placement
+/// [`resolve_run`], [`field_offset_at`] and [`update_field_scrolls`]
+/// share. `None` for a run without decor or one [`place`] refuses.
+fn place_field(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) -> Option<(Placed, f32)> {
+    let field = run.field.as_ref()?;
+    let unscrolled = place(engine, run, scale_factor, 0.0)?;
+    let scroll = decor_scroll(&unscrolled, field, run.rect.2);
+    Some((place(engine, run, scale_factor, scroll)?, scroll))
+}
+
+/// Updates every visible text field's stored horizontal scroll
+/// ([`TextFieldState::scroll`], via [`crate::widgets::set_text_field_scroll`])
+/// to its [`sticky_scroll`] for the current content and cursor, shaped
+/// at `scale_factor` from exactly the run [`text_runs`] builds (0.138.0
+/// review). The app calls it once per frame before collecting widget
+/// paints, so what is drawn — and what the next click is mapped against
+/// ([`field_offset_at`]) — is the stored value. A field that is not laid
+/// out or not visible keeps what it had. Returns how many fields
+/// changed (each marked dirty).
+pub fn update_field_scrolls(
+    engine: &mut TextEngine,
+    tree: &mut WidgetTree<WidgetKind>,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> usize {
+    let fields: Vec<WidgetId> = tree
+        .paint_order()
+        .into_iter()
+        .filter(|&id| matches!(tree.payload(id), Some(WidgetKind::TextField(_))))
+        .collect();
+    let mut changed = 0;
+    for id in fields {
+        let Some(bounds) = tree.bounds(id) else {
+            continue;
+        };
+        let Some(clip) = tree.visible_rect(id, bounds) else {
+            continue;
+        };
+        // Focus draws a caret but never moves the scroll anchor.
+        let Some(run) = text_runs(tree, id, bounds, clip, None, theme, scales)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let Some((_, scroll)) = place_field(engine, &run, scale_factor) else {
+            continue;
+        };
+        if crate::widgets::set_text_field_scroll(tree, id, scroll).unwrap_or(false) {
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// `[x0, y0, x1, y1] ∩ clip`, or `None` when empty.
@@ -755,7 +927,7 @@ fn clip_box(rect: [i32; 4], clip: [i32; 4]) -> Option<[i32; 4]> {
 
 /// Resolves `run` into its drawable pieces, in paint order. A run without
 /// [`FieldDecor`] is exactly [`resolve_text`]'s quads (none when it has
-/// no inked glyph). A decorated run is scrolled ([`field_scroll`]) and
+/// no inked glyph). A decorated run is scrolled ([`FieldDecor::scroll`]) and
 /// resolves to: the whole line in `run.color`; the selection highlight;
 /// the selected glyphs again, clipped to the highlight, in
 /// `selected_text`; each preedit underline (one physical-pixel-rounded
@@ -773,15 +945,7 @@ pub fn resolve_run(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) ->
             vec![Resolved::Glyphs(quads, run.color)]
         };
     };
-    let Some(unscrolled) = place(engine, run, scale_factor, 0.0) else {
-        return Vec::new();
-    };
-    let scroll = field_scroll(
-        unscrolled.line.width,
-        caret_at(&unscrolled.line, field.scroll_anchor),
-        run.rect.2,
-    );
-    let Some(placed) = place(engine, run, scale_factor, scroll) else {
+    let Some((placed, _)) = place_field(engine, run, scale_factor) else {
         return Vec::new();
     };
     let clip = clip_phys(run.clip, scale_factor);
@@ -832,6 +996,94 @@ pub fn resolve_run(engine: &mut TextEngine, run: &TextRun, scale_factor: f32) ->
         }
     }
     out
+}
+
+/// The byte offset of text field `id`'s content whose caret lies nearest
+/// logical window x `x` (0.138.0) — where a click at `x` puts the caret.
+/// Built from exactly the geometry [`resolve_run`] draws: the field's own
+/// [`text_runs`] run (`bounds`, clipped to its visible rect), shaped at
+/// `scale_factor`, scrolled by the field's stored sticky scroll
+/// ([`FieldDecor::scroll`], kept by [`update_field_scrolls`]), so the
+/// answer is the caret the user sees under the pointer. `x` is first
+/// clamped to the field's padded text box (0.138.0 review, critic C2) —
+/// its right edge less [`CARET_WIDTH`], where the rightmost visible
+/// caret is drawn — and only carets wholly inside the visible window are
+/// candidates (the window [`sticky_scroll`] keeps still), so a press in
+/// the padding or at the edge of a scrolled field picks the nearest
+/// *visible* caret, never one scrolled or clipped out of view, and
+/// placing it never scrolls the text (a drag past the edge therefore
+/// stops at the last visible caret: no drag auto-scroll). Nearest by
+/// distance to each grapheme boundary's caret; an exact tie goes to the
+/// lower byte; a point past either end of a line that fits (or is
+/// scrolled to that end) gives `0` or the content's length. `theme` is
+/// only the run's colours, which cannot move anything.
+///
+/// `None` for a widget that is not a text field, is not laid out or
+/// visible, or is mid-composition — the drawn text is then the content
+/// with the preedit spliced in, so none of its offsets is one into the
+/// content. A returned offset is a grapheme boundary of the *drawn*
+/// (control-character-sanitized, byte-length-preserving) text, which may
+/// split a content cluster such as `"\r\n"`;
+/// [`crate::widgets::set_text_field_caret`] floors it.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn field_offset_at(
+    engine: &mut TextEngine,
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+    x: f32,
+) -> Option<usize> {
+    let Some(WidgetKind::TextField(state)) = tree.payload(id) else {
+        return None;
+    };
+    if state.is_composing() || !x.is_finite() {
+        return None;
+    }
+    let bounds = tree.bounds(id)?;
+    let clip = tree.visible_rect(id, bounds)?;
+    let run = text_runs(tree, id, bounds, clip, Some(id), theme, scales)
+        .into_iter()
+        .next()?;
+    let (placed, scroll) = place_field(engine, &run, scale_factor)?;
+    let inner = run.rect.2;
+    let left = run.rect.0;
+    let x = x.clamp(left, (left + inner - CARET_WIDTH).max(left));
+    // Only a caret inside the window `sticky_scroll` keeps still — the
+    // same comparison — so placing the pick never moves the text; every
+    // caret when none is (a box narrower than one glyph).
+    let visible: Vec<(usize, f32)> = placed
+        .line
+        .carets
+        .iter()
+        .copied()
+        .filter(|&(_, cx)| cx >= scroll && cx + CARET_WIDTH <= scroll + inner)
+        .collect();
+    let carets = if visible.is_empty() {
+        placed.line.carets.as_slice()
+    } else {
+        visible.as_slice()
+    };
+    nearest_caret(carets, x - placed.origin_x)
+}
+
+/// The byte of the caret in `carets` (ascending `(byte, x)`) nearest `x`,
+/// both relative to the line's pen origin; an exact tie goes to the
+/// lower byte. `None` for no carets or a non-finite `x`.
+fn nearest_caret(carets: &[(usize, f32)], x: f32) -> Option<usize> {
+    if !x.is_finite() {
+        return None;
+    }
+    let mut best: Option<(usize, f32)> = None;
+    for &(byte, caret_x) in carets {
+        let distance = (caret_x - x).abs();
+        if best.is_none_or(|(_, nearest)| distance < nearest) {
+            best = Some((byte, distance));
+        }
+    }
+    best.map(|(byte, _)| byte)
 }
 
 #[cfg(test)]
@@ -1004,6 +1256,41 @@ mod tests {
                 rgba(theme.text.primary, 1.0)
             ]
         );
+    }
+
+    #[test]
+    fn a_label_draws_its_text_flush_left_in_secondary_and_disabled_in_text_disabled() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let label = ok(crate::widgets::insert_label(
+            &mut tree,
+            root,
+            &scales,
+            "Size 24 px",
+        ));
+        let theme = dark_theme();
+        let bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 21,
+        };
+        let runs = text_runs(&tree, label, bounds, bounds, None, &theme, &scales);
+        assert_eq!(runs.len(), 1);
+        assert!(runs.first().is_some_and(|r| r.text == "Size 24 px"
+            && r.align == HAlign::Start
+            && r.color == rgba(theme.text.secondary, 1.0)
+            && r.field.is_none()));
+        ok(crate::widgets::set_label_disabled(&mut tree, label, true));
+        let runs = text_runs(&tree, label, bounds, bounds, None, &theme, &scales);
+        assert_eq!(
+            runs.first().map(|r| r.color),
+            Some(rgba(theme.text.disabled, 1.0))
+        );
+        // It paints no solids of its own: the text is everything.
+        place(&mut tree, label, 10, 20, 200, 21);
+        let paints = ok(crate::paint_widget(&tree, label, &theme, &scales, 1.0));
+        assert!(paints.is_empty(), "{paints:?}");
     }
 
     #[test]
@@ -1519,7 +1806,7 @@ mod field_tests {
 
     use super::{
         CARET_WIDTH, FieldDecor, HAlign, Resolved, TextRun, field_scroll, label_style, resolve_run,
-        text_runs, to_phys,
+        sticky_scroll, text_runs, to_phys,
     };
     use crate::paint::{PaintOp, paint_widget_ops_focused, paint_widget_ops_frame};
     use crate::tree::{WidgetId, WidgetTree};
@@ -1690,6 +1977,44 @@ mod field_tests {
         assert_eq!(decor(&run).selection, None);
     }
 
+    /// `sticky_scroll` (0.138.0 review, critic C1): the scroll a text
+    /// field keeps between frames.
+    #[test]
+    fn sticky_scroll_keeps_its_window_until_the_caret_leaves_it() {
+        let w = CARET_WIDTH;
+        // The line and an end caret fit: always 0, whatever came before.
+        assert_eq!(sticky_scroll(40.0, 50.0, 50.0, 100.0), 0.0);
+        assert_eq!(sticky_scroll(0.0, 100.0 - w, 99.0, 100.0), 0.0);
+        // Nearly fits (RT133-01): an end caret still scrolls into view.
+        assert_eq!(sticky_scroll(0.0, 100.0, 100.0, 100.0), w);
+        // Caret inside the window [prev, prev + 100 - w]: unchanged, at
+        // both edges and between.
+        for caret in [80.0, 120.0, 180.0 - w] {
+            assert_eq!(sticky_scroll(80.0, 300.0, caret, 100.0), 80.0, "{caret}");
+        }
+        // Past the right edge: the least scroll bringing it just inside.
+        assert_eq!(sticky_scroll(80.0, 300.0, 200.0, 100.0), 200.0 + w - 100.0);
+        // Past the left edge: the least scroll, caret at the left edge.
+        assert_eq!(sticky_scroll(80.0, 300.0, 30.0, 100.0), 30.0);
+        assert_eq!(sticky_scroll(80.0, 300.0, 0.0, 100.0), 0.0);
+        // Clamped to [0, line + w - inner]: a stale scroll from a longer
+        // line, or a negative one, is pulled back.
+        assert_eq!(sticky_scroll(500.0, 300.0, 250.0, 100.0), 300.0 + w - 100.0);
+        assert_eq!(sticky_scroll(-20.0, 300.0, 50.0, 100.0), 0.0);
+        // Caret at the end of an overflowing line agrees with the pinned
+        // rule (the palette query's case).
+        assert_eq!(
+            sticky_scroll(0.0, 300.0, 300.0, 100.0),
+            field_scroll(300.0, 300.0, 100.0)
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(sticky_scroll(bad, 300.0, 1.0, 100.0), 0.0);
+            assert_eq!(sticky_scroll(10.0, bad, 1.0, 100.0), 0.0);
+            assert_eq!(sticky_scroll(10.0, 300.0, bad, 100.0), 0.0);
+            assert_eq!(sticky_scroll(10.0, 300.0, 1.0, bad), 0.0);
+        }
+    }
+
     #[test]
     fn field_scroll_is_zero_while_the_line_fits_and_pins_the_caret_otherwise() {
         assert_eq!(field_scroll(50.0, 50.0, 100.0), 0.0);
@@ -1743,6 +2068,10 @@ mod field_tests {
     fn plain_decor(cursor: usize) -> FieldDecor {
         FieldDecor {
             scroll_anchor: cursor,
+            // Caret-pinned (the palette query's rule): these tests pin
+            // `resolve_run`'s drawing, not the scroll policy, which
+            // `sticky_scroll`'s own tests cover.
+            scroll: None,
             caret: Some(cursor),
             caret_color: CARET,
             selection: None,
@@ -2083,6 +2412,82 @@ mod field_tests {
         assert!(texts_of(&tree, handle.root, None).is_empty());
     }
 
+    /// 0.141.0: the title slot draws the root's own label -- the title
+    /// -- in `text.primary`, flush left, inside the slot's own laid-out
+    /// box, and the message draws below it in its own box.
+    #[test]
+    fn a_dialog_draws_its_title_in_its_own_row_above_the_message() {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(800.0_f32),
+                height: taffy::style_helpers::length(600.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let theme = dark_theme();
+        let handle = ok(insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Aurora Didn't Close Properly",
+            "Something happened.",
+            vec![DialogAction::new("ok", "OK")],
+        ));
+        tree.compute_layout(800.0, 600.0);
+        let runs_in = |id| {
+            let Some(bounds) = tree.bounds(id) else {
+                unreachable!("laid out")
+            };
+            (
+                bounds,
+                text_runs(&tree, id, bounds, bounds, None, &theme, &scales),
+            )
+        };
+        let (title_box, title_runs) = runs_in(handle.title);
+        let [title] = &title_runs[..] else {
+            unreachable!("the title draws exactly one run: {title_runs:?}");
+        };
+        assert_eq!(title.text, "Aurora Didn't Close Properly");
+        assert_eq!(title.color, rgba(theme.text.primary, 1.0));
+        assert_eq!(title.align, HAlign::Start);
+        assert!(title.field.is_none());
+        assert_eq!(title.rect, super::rect_f32(title_box));
+        assert_eq!(title.clip, title_box);
+
+        let (message_box, message_runs) = runs_in(handle.message);
+        let [message] = &message_runs[..] else {
+            unreachable!("the message still draws: {message_runs:?}");
+        };
+        assert_eq!(message.text, "Something happened.");
+        assert!(
+            message.rect.1 >= title.rect.1 + title.rect.3,
+            "the message draws below the title: {message:?} vs {title:?}"
+        );
+        assert_eq!(message.rect, super::rect_f32(message_box));
+        // The root itself still draws nothing: the title is drawn once.
+        let (_, root_runs) = runs_in(handle.root);
+        assert!(root_runs.is_empty(), "{root_runs:?}");
+    }
+
+    /// Only a dialog's own unlabelled `GenericContainer` child is a title
+    /// slot: the same presentational node anywhere else draws nothing,
+    /// and an empty title draws no run at all.
+    #[test]
+    fn only_a_dialogs_own_slot_draws_the_title_and_an_empty_title_draws_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let stray = ok(tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::GenericContainer),
+            WidgetKind::Container,
+        ));
+        assert!(texts_of(&tree, stray, None).is_empty());
+        let handle = ok(insert_dialog(&mut tree, root, &scales, "", "M", vec![]));
+        assert!(texts_of(&tree, handle.title, None).is_empty());
+    }
+
     /// A text field holding `content`, laid out by the real layout
     /// (`insert_text_field`'s own style) in a 200 px column at (0, 0),
     /// focused, with `f` applied to its state; returns its bounds and
@@ -2307,5 +2712,330 @@ mod field_tests {
         assert_eq!(caret(Some(other)), Some(1), "any descendant counts");
         assert_eq!(caret(Some(other_root)), None, "an unrelated widget");
         assert_eq!(caret(None), None);
+    }
+}
+
+#[cfg(test)]
+// The caret's colour is compared bit-exactly: both sides are the same
+// token's `to_srgb_f32`, never accumulated arithmetic.
+#[allow(clippy::float_cmp)]
+mod offset_tests {
+    use super::{Resolved, field_offset_at, nearest_caret, resolve_run, text_runs};
+    use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::{
+        WidgetKind, insert_text_field, new_tree, test_scales, text_field_state, with_text_field_mut,
+    };
+    use aurora_core::Rect;
+    use aurora_text::TextEngine;
+    use aurora_theme::{Palette, Theme, ThemeSet};
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn dark_theme() -> Theme {
+        let palette = ok(Palette::from_toml_str(include_str!(
+            "../../../design/tokens/palette.toml"
+        )));
+        let mut themes = ThemeSet::new();
+        ok(themes.register(include_str!("../../../design/themes/dark.toml")));
+        ok(themes.resolve("Dark", &palette))
+    }
+
+    /// A text field holding `content`, laid out at (20, 10) 120x24.
+    fn field(content: &str) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        ok(tree.set_bounds(root, rect(0, 0, 400, 300)));
+        let id = ok(insert_text_field(&mut tree, root, &scales, "Name", content));
+        ok(tree.set_bounds(id, rect(20, 10, 120, 24)));
+        (tree, id)
+    }
+
+    fn offset(
+        engine: &mut TextEngine,
+        tree: &WidgetTree<WidgetKind>,
+        id: WidgetId,
+        scale: f32,
+        x: f32,
+    ) -> Option<usize> {
+        field_offset_at(engine, tree, id, &dark_theme(), &test_scales(), scale, x)
+    }
+
+    /// The logical x of the left edge of the caret `resolve_run` draws
+    /// for `id` with its cursor at `byte` — the pixel a user clicks on.
+    fn drawn_caret_x(
+        engine: &mut TextEngine,
+        tree: &mut WidgetTree<WidgetKind>,
+        id: WidgetId,
+        byte: usize,
+        scale: f32,
+    ) -> f32 {
+        ok(with_text_field_mut(tree, id, |s| {
+            s.cursor = byte;
+            s.selection_anchor = None;
+        }));
+        frame(engine, tree, scale);
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        let theme = dark_theme();
+        let Some(run) = text_runs(tree, id, bounds, bounds, Some(id), &theme, &test_scales())
+            .into_iter()
+            .next()
+        else {
+            unreachable!("a focused field draws");
+        };
+        let Some(caret_color) = run.field.as_ref().map(|f| f.caret_color) else {
+            unreachable!("a field run carries decor");
+        };
+        let carets: Vec<i32> = resolve_run(engine, &run, scale)
+            .into_iter()
+            .filter_map(|piece| match piece {
+                Resolved::Rect(r, c) if c == caret_color => Some(r[0]),
+                _ => None,
+            })
+            .collect();
+        let [x0] = carets.as_slice() else {
+            unreachable!("exactly one caret, got {carets:?}");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let x = *x0 as f32 / scale;
+        x
+    }
+
+    const SHORT: &str = "Hello, world";
+    const LONG: &str = "The quick brown fox jumps over the lazy dog, twice over";
+
+    /// Every caret `resolve_run` draws maps back to its own byte — with
+    /// the field scrolled to show it (an overflowing line) or not — and
+    /// so does a point a quarter px left of it, which a floor-style
+    /// "caret at or before the point" rule would give to the previous
+    /// byte.
+    #[test]
+    fn every_drawn_caret_maps_back_to_its_byte_at_scale_one_and_two() {
+        let mut engine = ok(TextEngine::new());
+        for content in [SHORT, LONG] {
+            for scale in [1.0_f32, 2.0] {
+                let (mut tree, id) = field(content);
+                let mut scrolled = false;
+                for byte in 0..=content.len() {
+                    let x = drawn_caret_x(&mut engine, &mut tree, id, byte, scale);
+                    // The caret sits where it would unscrolled only while
+                    // the line fits; past the box's width it is scrolled.
+                    let line = engine.shape(content, &super::label_style(&test_scales()), scale);
+                    // The field's box starts at x = 20, its text `spacing.sm` in.
+                    let inner = 20.0 + super::token_px(test_scales().spacing.sm);
+                    let unscrolled = inner + line.caret_x(byte).unwrap_or(0.0);
+                    scrolled |= x + 1.0 < unscrolled;
+                    for probe in [x + 0.25 / scale, x - 0.25] {
+                        assert_eq!(
+                            offset(&mut engine, &tree, id, scale, probe),
+                            Some(byte),
+                            "{content:?} at scale {scale}: byte {byte}, probe {probe}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    scrolled,
+                    content == LONG,
+                    "{content:?} at {scale}: only the overflowing line scrolls"
+                );
+            }
+        }
+    }
+
+    /// A point past either end — or in the field's padding — clamps to
+    /// the padded text box before the nearest caret is picked (0.138.0
+    /// review, critic C2). For a line that fits, or one scrolled to that
+    /// end, that is `0` or the content's length (0.138.0's original
+    /// contract, kept); for an end scrolled out of view it is the
+    /// nearest *visible* caret, which placing the caret there leaves
+    /// visible (the stored scroll does not move). Before C2 a press in
+    /// the padding of a scrolled field could pick a caret scrolled out
+    /// of view: at scale 1, `LONG` with its caret at `0`, a point far
+    /// right picked byte 55 (the end), with 14 the last visible caret.
+    #[test]
+    fn a_point_past_either_end_clamps_to_the_nearest_visible_caret() {
+        let mut engine = ok(TextEngine::new());
+        let pad = super::token_px(test_scales().spacing.sm);
+        let (inner_left, inner_right) = (20.0 + pad, 20.0 + 120.0 - pad);
+        for content in [SHORT, LONG] {
+            for scale in [1.0_f32, 2.0] {
+                let (mut tree, id) = field(content);
+                for cursor in [content.len(), 0] {
+                    ok(with_text_field_mut(&mut tree, id, |s| s.cursor = cursor));
+                    frame(&mut engine, &mut tree, scale);
+                    let scroll = ok(text_field_state(&tree, id)).scroll();
+                    let first = offset(&mut engine, &tree, id, scale, inner_left);
+                    let last = offset(
+                        &mut engine,
+                        &tree,
+                        id,
+                        scale,
+                        inner_right - super::CARET_WIDTH,
+                    );
+                    let at = |engine: &mut TextEngine, x| offset(engine, &tree, id, scale, x);
+                    let case = format!("{content:?} at {scale}, cursor {cursor}");
+                    assert_eq!(at(&mut engine, -1000.0), first, "{case}");
+                    assert_eq!(at(&mut engine, 20.5), first, "{case}: left padding");
+                    assert_eq!(at(&mut engine, 10_000.0), last, "{case}");
+                    assert_eq!(at(&mut engine, 139.5), last, "{case}: right padding");
+                    let (Some(first), Some(last)) = (first, last) else {
+                        unreachable!("{case}: a laid-out field answers");
+                    };
+                    match (content == LONG, cursor == 0) {
+                        (false, _) => assert_eq!((first, last), (0, content.len()), "{case}"),
+                        (true, true) => {
+                            assert_eq!(first, 0, "{case}");
+                            assert!(last < content.len(), "{case}: the end is scrolled away");
+                        }
+                        (true, false) => {
+                            assert!(first > 0, "{case}: the start is scrolled away");
+                            assert_eq!(last, content.len(), "{case}");
+                        }
+                    }
+                    // Each pick is a visible caret: placing it there does
+                    // not move the stored scroll.
+                    for byte in [first, last] {
+                        ok(with_text_field_mut(&mut tree, id, |s| s.cursor = byte));
+                        frame(&mut engine, &mut tree, scale);
+                        assert_eq!(
+                            ok(text_field_state(&tree, id)).scroll(),
+                            scroll,
+                            "{case}: byte {byte} was not visible"
+                        );
+                    }
+                    ok(with_text_field_mut(&mut tree, id, |s| s.cursor = cursor));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nearest_caret_breaks_an_exact_tie_toward_the_lower_byte() {
+        let carets = [(0, 0.0), (1, 10.0), (4, 20.0)];
+        assert_eq!(nearest_caret(&carets, 5.0), Some(0));
+        assert_eq!(nearest_caret(&carets, 5.01), Some(1));
+        assert_eq!(nearest_caret(&carets, 15.0), Some(1));
+        assert_eq!(nearest_caret(&carets, 15.01), Some(4));
+        assert_eq!(nearest_caret(&carets, -3.0), Some(0));
+        assert_eq!(nearest_caret(&carets, 99.0), Some(4));
+        assert_eq!(nearest_caret(&carets, f32::NAN), None);
+        assert_eq!(nearest_caret(&[], 1.0), None);
+    }
+
+    #[test]
+    fn no_offset_while_composing_or_for_another_widget() {
+        let mut engine = ok(TextEngine::new());
+        let (mut tree, id) = field(SHORT);
+        assert!(offset(&mut engine, &tree, id, 1.0, 40.0).is_some());
+        ok(with_text_field_mut(&mut tree, id, |s| {
+            s.set_composition("ni", None);
+        }));
+        assert_eq!(offset(&mut engine, &tree, id, 1.0, 40.0), None);
+        let root = tree.root();
+        assert_eq!(offset(&mut engine, &tree, root, 1.0, 40.0), None);
+    }
+
+    /// The real hit ([`field_offset_at`]) the app builds, at `scale`.
+    struct Hit<'a> {
+        engine: &'a mut TextEngine,
+        scale: f32,
+    }
+
+    impl crate::TextHit for Hit<'_> {
+        fn offset_at(
+            &mut self,
+            tree: &WidgetTree<WidgetKind>,
+            id: WidgetId,
+            point: (f32, f32),
+        ) -> Option<usize> {
+            offset(self.engine, tree, id, self.scale, point.0)
+        }
+    }
+
+    /// One frame's scroll update, as the app runs it before painting.
+    fn frame(engine: &mut TextEngine, tree: &mut WidgetTree<WidgetKind>, scale: f32) {
+        super::update_field_scrolls(engine, tree, &dark_theme(), &test_scales(), scale);
+    }
+
+    /// Critic C1 (0.138.0 review): in an overflowing field, a click and
+    /// a drag held still must leave the text where it is under the
+    /// pointer. With the old caret-pinned scroll every `Move` re-scrolled
+    /// from the caret the previous `Move` set, so the selection ran away
+    /// leftward and a plain click shifted the text under the pointer.
+    #[test]
+    fn a_click_and_a_still_drag_in_an_overflowing_field_stay_under_the_pointer() {
+        use crate::{ClickTracker, FocusManager, PointerEvent, PointerPhase};
+        let mut engine = ok(TextEngine::new());
+        for scale in [1.0_f32, 2.0] {
+            let (mut tree, id) = field(LONG);
+            let mut focus = FocusManager::new();
+            let mut click = ClickTracker::default();
+            // Caret at the end: the field is scrolled to its far right.
+            frame(&mut engine, &mut tree, scale);
+            let x = 20.0 + 60.0;
+            let y = 22.0;
+            let before = offset(&mut engine, &tree, id, scale, x);
+            let scroll = ok(text_field_state(&tree, id)).scroll();
+            assert!(scroll > 0.0, "scale {scale}: the line overflows");
+            assert!(
+                before.is_some_and(|b| b > 0 && b < LONG.len()),
+                "{before:?}"
+            );
+            let mut event = |tree: &mut WidgetTree<WidgetKind>, engine: &mut TextEngine, phase| {
+                ok(crate::handle_pointer_with(
+                    tree,
+                    &mut focus,
+                    &mut click,
+                    PointerEvent {
+                        phase,
+                        position: (x, y),
+                    },
+                    crate::shortcut::Modifiers::none(),
+                    &mut Hit { engine, scale },
+                ))
+            };
+            event(&mut tree, &mut engine, PointerPhase::Down);
+            let state = |tree: &WidgetTree<WidgetKind>| {
+                let s = ok(text_field_state(tree, id));
+                (s.cursor, s.selection_anchor)
+            };
+            assert_eq!(state(&tree), (ok_some(before), None), "scale {scale}");
+            for step in 0..6 {
+                frame(&mut engine, &mut tree, scale);
+                // What is under the pointer did not move.
+                assert_eq!(
+                    offset(&mut engine, &tree, id, scale, x),
+                    before,
+                    "scale {scale}, frame {step}: the text jumped under the pointer"
+                );
+                assert_eq!(
+                    ok(text_field_state(&tree, id)).scroll(),
+                    scroll,
+                    "scale {scale}, frame {step}: a click in the window keeps the scroll"
+                );
+                event(&mut tree, &mut engine, PointerPhase::Move);
+                assert_eq!(
+                    state(&tree),
+                    (ok_some(before), None),
+                    "scale {scale}, move {step}: a still drag selected nothing"
+                );
+            }
+        }
+    }
+
+    fn ok_some(value: Option<usize>) -> usize {
+        value.unwrap_or(usize::MAX)
     }
 }

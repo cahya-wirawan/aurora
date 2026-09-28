@@ -2,7 +2,7 @@
 //! a required accessibility node per widget (invariant §7.3.9). PLAN.md
 //! M1.7's first deliverable.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use accesskit::{Node as AccessibilityNode, NodeId, Tree, TreeId, TreeUpdate};
 use aurora_core::Rect;
@@ -115,6 +115,10 @@ struct WidgetNode<W> {
     /// This widget's *own* paint-layer flag — see [`PaintLayer`] for how
     /// the effective layer is derived from it.
     layer: PaintLayer,
+    /// Whether the last layout sized this widget through the pre-measure
+    /// hook ([`WidgetTree::compute_layout_with`] answering `Some`) rather
+    /// than from its own style — see [`WidgetTree::is_measured`].
+    measured: bool,
     payload: W,
 }
 
@@ -189,6 +193,7 @@ impl<W> WidgetTree<W> {
                 dirty: true,
                 damage_outset: 0,
                 layer: PaintLayer::Base,
+                measured: false,
                 payload,
             },
         );
@@ -496,6 +501,7 @@ impl<W> WidgetTree<W> {
                 dirty: true,
                 damage_outset: 0,
                 layer: PaintLayer::Base,
+                measured: false,
                 payload,
             },
         );
@@ -583,6 +589,23 @@ impl<W> WidgetTree<W> {
     #[must_use]
     pub fn bounds(&self, id: WidgetId) -> Option<Rect> {
         self.nodes.get(&id).map(|node| node.bounds)
+    }
+
+    /// Whether `id`'s current size came from the last layout's pre-measure
+    /// hook ([`Self::compute_layout_with`], 0.140.0) rather than from its
+    /// own style — `None` for an unknown id, `false` until a measuring
+    /// layout sizes it, and back to `false` after any layout that does not
+    /// (including every plain [`Self::compute_layout`]). A widget whose
+    /// bounds were placed by hand ([`Self::set_bounds`]) keeps whatever
+    /// the last layout left.
+    ///
+    /// Paint reads it: a *measured* checkbox's bounds hold its box, a gap
+    /// and its label, while an unmeasured one's bounds are the box itself
+    /// at whatever size its style (or a test's own hand-sized cell) gave
+    /// it — telling the two apart by geometry alone would be a guess.
+    #[must_use]
+    pub fn is_measured(&self, id: WidgetId) -> Option<bool> {
+        self.nodes.get(&id).map(|node| node.measured)
     }
 
     /// The topmost widget whose current bounds contain `point`
@@ -833,10 +856,49 @@ impl<W> WidgetTree<W> {
     /// own journal. Each widget's bounds are set via [`Self::set_bounds`]
     /// internally, so the usual dirty-marking (both vacated and newly
     /// occupied regions) applies here too, not a separate code path.
+    ///
+    /// **This is the text-blind path** (0.140.0): no widget's size is
+    /// measured from its text, so a widget whose layout depends on its own
+    /// label (a `Checkbox` today) keeps its unmeasured, style-only size.
+    /// It stays the right call for a headless test with no text engine
+    /// (every golden is laid out this way). A production caller that has
+    /// a text engine must lay out through
+    /// [`Self::compute_layout_with`] instead — in practice through
+    /// `crate::compute_text_layout`, which supplies the measurer — or its
+    /// checkboxes lose their labels.
     pub fn compute_layout(&mut self, width: f32, height: f32) {
+        self.compute_layout_with(width, height, &mut |_: &W| None);
+    }
+
+    /// [`Self::compute_layout`] with a **pre-measure hook**: `measure` is
+    /// asked once per widget, with its payload, before layout runs, and a
+    /// `Some(size)` overrides that widget's `style.size` with a definite
+    /// `size.width` x `size.height` (logical px) — on the internal `taffy`
+    /// copy only, never on the widget's own stored style, so a later
+    /// text-blind call is unaffected. `None` leaves the widget's style
+    /// exactly as it is; a hook that always answers `None` is byte-for-byte
+    /// [`Self::compute_layout`].
+    ///
+    /// Deliberately not a `taffy` measure callback: every measured widget
+    /// is a single line of known text whose size does not depend on the
+    /// space offered to it, so a size fixed before layout is exact, and
+    /// it keeps this tree's own style the one thing `taffy` reads.
+    pub fn compute_layout_with(
+        &mut self,
+        width: f32,
+        height: f32,
+        measure: &mut dyn FnMut(&W) -> Option<LayoutSize<f32>>,
+    ) {
         let mut taffy = TaffyTree::<()>::new();
         let mut taffy_ids = HashMap::new();
-        self.build_taffy_node(self.root, &mut taffy, &mut taffy_ids);
+        let mut measured = HashSet::new();
+        self.build_taffy_node(
+            self.root,
+            &mut taffy,
+            &mut taffy_ids,
+            measure,
+            &mut measured,
+        );
 
         let Some(&taffy_root) = taffy_ids.get(&self.root) else {
             unreachable!("build_taffy_node always inserts the node it was called with");
@@ -853,6 +915,13 @@ impl<W> WidgetTree<W> {
         }
 
         self.apply_taffy_layout(self.root, &taffy, &taffy_ids, 0.0, 0.0);
+
+        // No separate damage for a widget that became (or stopped being)
+        // measured: `set_bounds` above already marked every laid-out
+        // widget dirty, moved or not.
+        for (id, node) in &mut self.nodes {
+            node.measured = measured.contains(id);
+        }
     }
 
     /// Builds `id`'s subtree in `taffy`, children first (`taffy::TaffyTree`
@@ -864,23 +933,33 @@ impl<W> WidgetTree<W> {
         id: WidgetId,
         taffy: &mut TaffyTree<()>,
         taffy_ids: &mut HashMap<WidgetId, taffy::NodeId>,
+        measure: &mut dyn FnMut(&W) -> Option<LayoutSize<f32>>,
+        measured: &mut HashSet<WidgetId>,
     ) {
         let Some(node) = self.nodes.get(&id) else {
             unreachable!("build_taffy_node is only ever called with ids known to exist");
         };
         let mut taffy_children = Vec::with_capacity(node.children.len());
         for &child in &node.children {
-            self.build_taffy_node(child, taffy, taffy_ids);
+            self.build_taffy_node(child, taffy, taffy_ids, measure, measured);
             let Some(&taffy_child) = taffy_ids.get(&child) else {
                 unreachable!("just inserted by the recursive call above");
             };
             taffy_children.push(taffy_child);
         }
 
+        let mut style = node.style.clone();
+        if let Some(size) = measure(&node.payload) {
+            measured.insert(id);
+            style.size = LayoutSize {
+                width: taffy::style_helpers::length(size.width),
+                height: taffy::style_helpers::length(size.height),
+            };
+        }
         let result = if taffy_children.is_empty() {
-            taffy.new_leaf(node.style.clone())
+            taffy.new_leaf(style)
         } else {
-            taffy.new_with_children(node.style.clone(), &taffy_children)
+            taffy.new_with_children(style, &taffy_children)
         };
         let Ok(taffy_id) = result else {
             unreachable!(
@@ -1038,7 +1117,7 @@ mod tests {
     use accesskit::{Node, Role};
     use aurora_core::Rect;
     use taffy::style_helpers::{length, percent};
-    use taffy::{FlexDirection, Size, Style};
+    use taffy::{FlexDirection, Size, Size as LayoutSize, Style};
 
     fn bounds(x: i64, y: i64, w: u32, h: u32) -> Rect {
         Rect {
@@ -1500,6 +1579,53 @@ mod tests {
             Some(bounds(40, 0, 30, 20)),
             "b must start exactly where a ends"
         );
+    }
+
+    /// The pre-measure hook (0.140.0): a `Some` size replaces a widget's
+    /// style size for that layout only, its siblings move to make room,
+    /// the widget reports itself measured, and a later text-blind layout
+    /// puts everything back exactly — the stored style is never touched.
+    #[test]
+    fn compute_layout_with_a_measure_hook_overrides_only_that_layout() {
+        let root_style = Style {
+            flex_direction: FlexDirection::Row,
+            ..Default::default()
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), root_style, "root");
+        let a = match tree.insert(root, sized(40.0, 20.0), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.insert(root, sized(30.0, 20.0), label("b"), "b") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut asked = Vec::new();
+        tree.compute_layout_with(300.0, 150.0, &mut |payload: &&str| {
+            asked.push(*payload);
+            (*payload == "a").then_some(LayoutSize {
+                width: 55.0,
+                height: 25.0,
+            })
+        });
+        asked.sort_unstable();
+        assert_eq!(asked, ["a", "b", "root"], "asked once per widget");
+        assert_eq!(tree.bounds(a), Some(bounds(0, 0, 55, 25)));
+        assert_eq!(
+            tree.bounds(b),
+            Some(bounds(55, 0, 30, 20)),
+            "b shifts right"
+        );
+        assert_eq!(tree.is_measured(a), Some(true));
+        assert_eq!(tree.is_measured(b), Some(false));
+        assert_eq!(tree.is_measured(root), Some(false));
+
+        tree.take_damage();
+        tree.compute_layout(300.0, 150.0);
+        assert_eq!(tree.bounds(a), Some(bounds(0, 0, 40, 20)));
+        assert_eq!(tree.bounds(b), Some(bounds(40, 0, 30, 20)));
+        assert_eq!(tree.is_measured(a), Some(false));
+        assert_eq!(tree.is_measured(WidgetId::from(u64::MAX)), None);
     }
 
     #[test]

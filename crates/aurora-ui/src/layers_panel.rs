@@ -107,15 +107,17 @@
 //! caller (`aurora-app`) needs to turn a hit or an `ActionRequest` back
 //! into "which layer".
 //!
-//! **One-shot, not reactive**: [`populate_layers_panel`] builds rows
-//! once from whatever `LayerTree` state it's given. It does not diff
-//! against a previous population or react to later document edits —
-//! refreshing after an edit means calling it again, which is safe
-//! (0.77.1: it empties the panel body itself first, so a second call
-//! replaces the rows rather than silently stacking a second tree beside
-//! the first) but rebuilds every row. Real incremental refresh is
-//! separate work for whenever a document can actually be edited live in
-//! `aurora-app`.
+//! **Rows are built in one shot; descriptions refresh in place.**
+//! [`populate_layers_panel`] builds rows once from whatever `LayerTree`
+//! state it's given and does not diff against a previous population —
+//! refreshing *structure* means calling it again, which is safe (0.77.1:
+//! it empties the panel body itself first) but rebuilds every row. Since
+//! 0.135.0 the document *can* be edited live — the panel's opacity,
+//! blend-mode and visibility controls ([`crate::layer_controls`], a
+//! strip outside the body so a repopulation cannot destroy it) — and
+//! `aurora-app` keeps a row's text current through
+//! [`layer_row_description`] + `set_tree_item_description`, without a
+//! repopulation, so row ids, focus and a slider drag's capture survive.
 
 use std::collections::HashMap;
 
@@ -275,7 +277,7 @@ fn insert_layer_row(
     // rebuilds a row's whole node from its `TreeItemState` on every
     // mutation, including the one `insert_tree_item` performs on *this*
     // row the moment the loop below inserts a child under it.
-    set_tree_item_description(tree, row, Some(&describe_layer(layers, id)))?;
+    set_tree_item_description(tree, row, Some(&layer_row_description(layers, id)))?;
     rows.insert(row, id);
 
     for &child in children {
@@ -291,7 +293,14 @@ fn insert_layer_row(
 /// already does something — no compositor honours it yet (`aurora-render`
 /// still needs a real layer model to call it with, per that crate's own
 /// M1.3 notes).
-fn describe_layer(layers: &LayerTree, id: LayerId) -> String {
+///
+/// Public (0.135.0) so `aurora-app` can refresh one row's description in
+/// place, through `set_tree_item_description`, after a Layers-panel
+/// control edits that layer — without repopulating the whole panel.
+/// Blend modes use their user-facing names
+/// ([`crate::layer_controls::blend_mode_label`]), not `Debug` spellings.
+#[must_use]
+pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     let hidden = matches!(layers.visible(id), Some(false));
     let suffix = if hidden { ", hidden" } else { "" };
     match layers.kind(id) {
@@ -301,7 +310,8 @@ fn describe_layer(layers: &LayerTree, id: LayerId) -> String {
             let opacity = layers.opacity(id).unwrap_or(1.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let percent = (opacity * 100.0).round() as u32;
-            format!("{blend:?}, {percent}%{suffix}")
+            let blend = crate::layer_controls::blend_mode_label(blend);
+            format!("{blend}, {percent}%{suffix}")
         }
         None => "Unknown layer".to_owned(),
     }

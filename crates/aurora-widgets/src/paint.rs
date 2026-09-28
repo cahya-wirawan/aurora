@@ -70,8 +70,10 @@
 //! and an open dropdown list's option rows (0.132.0); `TextField` content
 //! with its caret (focused only), selection and IME preedit underlines,
 //! the command palette's query strip and result rows, a tooltip's text,
-//! and a dialog's message (0.133.0). Not yet: `Checkbox` (its box *is*
-//! its layout box) and a dialog's title (no layout slot).
+//! and a dialog's message (0.133.0); a *measured* `Checkbox`'s label,
+//! beside its box (0.140.0, `crate::compute_text_layout` — an unmeasured
+//! checkbox's bounds are all box, so it still draws none). Not yet: a
+//! dialog's title (no layout slot).
 //! [`paint_widget`] itself still returns solids only.
 //!
 //! Every kind's own geometry is built from bounds that
@@ -124,13 +126,13 @@ use aurora_vector::{
 
 use crate::error::WidgetError;
 use crate::input::FocusManager;
-use crate::text::{TextRun, text_runs};
+use crate::text::{TextRun, intersect, text_runs};
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
     CurveEditorState, DropdownState, Hsv, ListRowState, MARKER_RING_WIDTH, ScrollbarState,
-    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind, plot_rect,
-    row_height,
+    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind,
+    checkbox_box_rect, plot_rect, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -240,13 +242,17 @@ pub fn paint_widget_ops_focused(
     paint_widget_ops_frame(tree, id, focus, None, theme, scales, scale_factor)
 }
 
-/// [`paint_widget_ops_focused`] plus the widget holding keyboard focus
-/// (0.133.0), which a text field needs to draw its caret and the command
-/// palette's query strip needs to draw its own. `focused` is
-/// `FocusManager::focused()` — **any** focus origin, pointer included
-/// (a caret is where typing goes, not a keyboard-only indicator like the
-/// ring). [`paint_widget_ops_focused`] is exactly this with `focused =
-/// None`: no caret anywhere, everything else identical.
+/// [`paint_widget_ops_focused`] plus the frame's **caret owner**
+/// (0.133.0): the widget whose caret is drawn this frame, which a text
+/// field needs to draw its caret and the command palette's query strip
+/// needs to draw its own. It is normally `FocusManager::focused()` —
+/// **any** focus origin, pointer included (a caret is where typing goes,
+/// not a keyboard-only indicator like the ring) — and `None` during a
+/// hidden half-period of the caret's blink (0.139.0, [`crate::CaretBlink`]):
+/// the caret is the only thing it decides, so a blink never moves a
+/// field's scroll, selection or anything else drawn.
+/// [`paint_widget_ops_focused`] is exactly this with `focused = None`: no
+/// caret anywhere, everything else identical.
 ///
 /// # Errors
 ///
@@ -461,6 +467,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::ColorPickerPart(state) => state.is_disabled(),
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
+        WidgetKind::Label(state) => state.disabled,
         WidgetKind::Container
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
@@ -509,7 +516,8 @@ struct RingTarget {
 /// | Kind | Reference | Offset | Radius |
 /// |---|---|---|---|
 /// | `Button` | bounds | `+2` | `radius.sm` |
-/// | `Checkbox`, `ColorSwatch` | bounds | `+1` | `radius.sm` |
+/// | `Checkbox` | its box (`checkbox_box_rect`), not its label | `+1` | `radius.sm` |
+/// | `ColorSwatch` | bounds | `+1` | `radius.sm` |
 /// | `Slider`, `Scrollbar` | thumb | `+1` | `radius.pill` |
 /// | `TextField`, `Dropdown` (open or closed) | bounds | `-1` | `radius.sm` |
 /// | `Tab`, `TreeItem` (its own row), anything else | bounds | `-2` | `radius.sm` |
@@ -553,9 +561,21 @@ fn focus_ring_target(
     };
     Some(match tree.payload(focus.anchor)? {
         WidgetKind::Button(_) => boxed(vis, RING_OFFSET_CLEAR, sm),
-        WidgetKind::Checkbox(_) | WidgetKind::ColorSwatch(_) => {
-            boxed(vis, RING_OFFSET_ADJACENT, sm)
+        // Around the box only (0.140.0), not the label beside it — the
+        // ring hugs the control the way the gallery mockup's own box-only
+        // checkbox ring does. Whether a labelled checkbox's ring should
+        // enclose its label instead is a design-owner call, recorded in
+        // PLAN.md rather than decided here.
+        // A box clipped wholly away (only the label still showing) keeps
+        // an inside ring on what is visible — focus must stay visible.
+        WidgetKind::Checkbox(_) => {
+            let measured = tree.is_measured(focus.anchor) == Some(true);
+            match clip_box(checkbox_box_rect(full, measured, scales), full, visible) {
+                Some(target) => boxed(rect_f32(target), RING_OFFSET_ADJACENT, sm),
+                None => boxed(vis, RING_OFFSET_INSIDE, sm),
+            }
         }
+        WidgetKind::ColorSwatch(_) => boxed(vis, RING_OFFSET_ADJACENT, sm),
         WidgetKind::Slider(state) => thumb(slider_thumb_rect(state, visible)),
         WidgetKind::Scrollbar(state) => thumb(scrollbar_thumb_rect(state, visible)),
         WidgetKind::TextField(_) | WidgetKind::Dropdown(_) => boxed(vis, RING_OFFSET_ON_BORDER, sm),
@@ -1035,14 +1055,24 @@ pub fn paint_widget(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    let bounds = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
+    let full = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
-    let Some(bounds) = clip_to_clipping_ancestors(tree, id, bounds) else {
+    let Some(bounds) = clip_to_clipping_ancestors(tree, id, full) else {
         return Ok(vec![]);
     };
     match kind {
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
-        WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
+        // Only the box (0.140.0): a measured checkbox's bounds also hold
+        // its label, which is drawn as text (`crate::text::text_runs`).
+        // The box is placed in the *full* bounds and then clipped, so a
+        // clipping ancestor cuts it rather than moving it.
+        WidgetKind::Checkbox(state) => {
+            let measured = tree.is_measured(id) == Some(true);
+            match clip_box(checkbox_box_rect(full, measured, scales), full, bounds) {
+                Some(bounds) => paint_checkbox(state, bounds, theme, scales, scale_factor),
+                None => Ok(vec![]),
+            }
+        }
         WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales, scale_factor),
         WidgetKind::Scrollbar(state) => paint_scrollbar(state, bounds, theme, scales, scale_factor),
         WidgetKind::TextField(state) => {
@@ -1073,9 +1103,11 @@ pub fn paint_widget(
         WidgetKind::CurveEditor(state) => {
             paint_curve_editor(tree, id, state, theme, scales, scale_factor)
         }
-        WidgetKind::ColorPicker(_) | WidgetKind::CurveEditorPoint(_) | WidgetKind::Container => {
-            Ok(vec![])
-        }
+        // A label paints no solids; `crate::text_runs` draws its text.
+        WidgetKind::ColorPicker(_)
+        | WidgetKind::CurveEditorPoint(_)
+        | WidgetKind::Container
+        | WidgetKind::Label(_) => Ok(vec![]),
     }
 }
 
@@ -1133,6 +1165,18 @@ pub fn paint_widget(
 /// rather than floating with no visible owner. The rule lives in
 /// `WidgetTree::visible_rect` so `WidgetTree::hit_test` skips exactly
 /// the popovers this refuses to paint.
+/// `part` (a rect inside a widget's `full` bounds) cut to the widget's
+/// `visible` rect: `part` unchanged when nothing is clipped (so a
+/// degenerate, never-laid-out widget still paints what it always did),
+/// otherwise their intersection, `None` when that is empty.
+fn clip_box(part: Rect, full: Rect, visible: Rect) -> Option<Rect> {
+    if visible == full {
+        Some(part)
+    } else {
+        intersect(part, visible)
+    }
+}
+
 fn clip_to_clipping_ancestors(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
@@ -4799,15 +4843,19 @@ mod tests {
         let (tree, handle) = laid_out_dialog(&scales);
         let theme = dark_theme();
 
-        let paints = match paint_widget(&tree, handle.message, &theme, &scales, 1.0) {
-            Ok(paints) => paints,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        assert!(
-            paints.is_empty(),
-            "a dialog's message is a plain Container -- this crate emits no dialog text yet, so \
-             there is nothing to paint: {paints:?}"
-        );
+        // The title slot (0.141.0) is a plain Container too: its text is
+        // a `crate::text` run, never a paint.
+        for node in [handle.message, handle.title] {
+            let paints = match paint_widget(&tree, node, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert!(
+                paints.is_empty(),
+                "a dialog's message and title slot are plain Containers -- their text is drawn \
+                 by `crate::text`, so there is nothing to paint: {paints:?}"
+            );
+        }
     }
 
     /// A laid-out dropdown in a definitely sized root, optionally open
@@ -5823,6 +5871,35 @@ mod tests {
                 (100.0, 40.0, 24.0, 24.0),
                 RING_OFFSET_ADJACENT,
                 "swatch",
+            );
+        }
+
+        /// 0.140.0: a *measured* checkbox's bounds hold its box, a gap
+        /// and its label; the ring circles the box alone — the left,
+        /// vertically centred `type.size.md` square — never the label.
+        #[test]
+        fn a_labelled_checkbox_ring_circles_its_box_not_its_label() {
+            let (mut tree, root) = root_tree();
+            let scales = scales();
+            let checkbox = ok(insert_checkbox(&mut tree, root, &scales, "Visible"));
+            // Measured through the pre-measure hook, then placed by hand.
+            tree.compute_layout_with(400.0, 400.0, &mut |kind| {
+                matches!(kind, WidgetKind::Checkbox(_)).then_some(taffy::Size {
+                    width: 120.0,
+                    height: 21.0,
+                })
+            });
+            let side = scales.typography.size.md;
+            let height = side + 2 * scales.spacing.xxs;
+            place(&mut tree, checkbox, 40, 40, 120, height);
+            let y = 40.0 + ((height - side) / 2) as f32;
+            let side = side as f32;
+            assert_ring(
+                &mut tree,
+                checkbox,
+                (40.0, y, side, side),
+                RING_OFFSET_ADJACENT,
+                "labelled checkbox",
             );
         }
 

@@ -491,7 +491,8 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::ColorPicker(_)
         | WidgetKind::ColorPickerPart(_)
         | WidgetKind::CurveEditor(_)
-        | WidgetKind::CurveEditorPoint(_) => false,
+        | WidgetKind::CurveEditorPoint(_)
+        | WidgetKind::Label(_) => false,
     }
 }
 
@@ -822,9 +823,9 @@ mod tests {
     use crate::widgets::{
         CommandEntry, DialogAction, MenuItem, ScrollbarRange, WidgetKind, insert_button,
         insert_checkbox, insert_color_picker, insert_color_swatch, insert_command_palette,
-        insert_curve_editor, insert_dialog, insert_dropdown, insert_scrollbar, insert_slider,
-        insert_tab_bar, insert_text_field, insert_tree_item, insert_tree_view, new_tree, open_menu,
-        set_dropdown_open, spacing, tab_bar_state, test_scales, type_size,
+        insert_curve_editor, insert_dialog, insert_dropdown, insert_label, insert_scrollbar,
+        insert_slider, insert_tab_bar, insert_text_field, insert_tree_item, insert_tree_view,
+        new_tree, open_menu, set_dropdown_open, spacing, tab_bar_state, test_scales, type_size,
     };
     use accesskit::{Action, Role};
     use aurora_theme::Scales;
@@ -1246,6 +1247,7 @@ mod tests {
             WidgetKind::ColorPickerPart(_) => 20,
             WidgetKind::CurveEditor(_) => 21,
             WidgetKind::CurveEditorPoint(_) => 22,
+            WidgetKind::Label(_) => 23,
         }
     }
 
@@ -1371,12 +1373,13 @@ mod tests {
             64.0,
             aurora_core::ToneCurve::identity(),
         ));
+        ok(insert_label(&mut tree, root, &scales, "Size"));
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 23];
+        let mut seen = [false; 24];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1395,7 +1398,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 23], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 24], "every WidgetKind was built and asked");
     }
 
     #[test]

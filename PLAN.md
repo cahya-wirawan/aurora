@@ -26,6 +26,98 @@ than the tidiness.
 
 ## Where we are
 
+**Latest (2026-09-28, 0.141.0): dialog titles are drawn.** A dialog's
+title now has its own one-row slot above the message, so the crash-
+recovery prompt and every other app dialog show their title as well as
+their message, in `text.primary` Regular (a heavier title weight is a
+design-owner call). The slot is presentational to assistive tech — the
+dialog itself still carries the title as its one label, so it is
+announced once. The dialog is 33 px taller (122 px), which moved the
+smallest window in which its button stays clickable from ~34 px to 68 px
+(both short-window tests re-bracketed, measured). No golden changed —
+there are no dialog goldens, and goldens are text-free. Details: M1.7's
+widget-set "Update 0.141.0".
+  **Judge (same version):** PASS, 0.915. Its doc fixes are applied:
+  `aurora-app`'s `MIN_WINDOW_HEIGHT` doc now names the 68 px threshold
+  and a ~7x margin (was 34 px and "an order of magnitude"), a test doc's
+  "sub-~34px" is updated, and a joined comment line in `dialog.rs`
+  re-wrapped. Full gate green on the RTX 3090 with `AURORA_REQUIRE_GPU=1`
+  — 2,573 passed, 0 failed, 0 skipped; doctests, strict rustdoc and
+  `cargo deny check` clean. Carried: `dialog_title` keys on "a
+  `GenericContainer` child of a `Dialog`", so a future `GenericContainer`
+  wrapper under a dialog (e.g. an actions row) would also draw the title
+  — tie it to the first child, or document it, when one is added.
+
+**Previously (2026-09-28, 0.140.0): checkbox labels, via text-aware
+layout.** Layout can now size a widget from its own text: the app lays
+the workspace out through `aurora_widgets::compute_text_layout`, which
+measures each checkbox's label with the same text engine and scale
+factor the frame paints with, so the Layers panel's `Visible` checkbox
+and the Widget Gallery's checkbox now show their labels beside the box,
+and clicking the label toggles the box. One line only (no wrap, no
+ellipsis); the focus ring circles the box, not the label (a design-owner
+call). Every golden is unchanged. Details and disclosures: M1.7's
+"Layout engine" 0.140.0 update.
+
+**Previously (2026-09-28, 0.139.0): the text caret blinks.** A focused
+text field's caret (and the command palette's query caret) now blinks
+at 530 ms per half-period, shows solid again at once after any edit,
+caret or selection move, IME change, click or focus change, stays
+steady under the OS reduced-motion preference (read on macOS only
+today), and is hidden while the window lacks OS focus. The event loop
+sleeps until exactly the next flip and wakes for nothing when no caret
+is showing, so an idle window still blocks in `Wait`. The 530 ms
+interval is not a token and is flagged to the design owner. Details and
+disclosures: M1.7's "Text field" 0.139.0 update.
+
+**Previously (2026-09-28, 0.138.0): placing the caret with the pointer.**
+A click in a text field now puts the caret under the pointer, a
+`Shift`+click extends the selection, and a drag selects (dragging back
+onto the press point collapses it); what a drag selected copies with the
+0.137.0 chords. The hit test reuses exactly the geometry the field draws
+(same run, same stored scroll, same scale factor), so the byte
+chosen is the caret the user sees nearest the pointer. Review revision:
+a text field's horizontal scroll is now sticky and stored per field
+(it was caret-pinned, which made a click shift the text under the
+pointer and a drag in a long line run away). Not done:
+double-click word selection (winit reports no click count) and timed
+autoscroll past the field's edge. The only real text field is still the
+Widget Gallery's demo field. Details and disclosures: M1.7's "Text
+field" 0.138.0 update.
+
+**Previously (2026-09-28, 0.137.0): keyboard chords in a focused text
+field.** Select-all, copy, cut, paste, per-field undo/redo and word
+motion now work in a focused text field on the platform's primary
+modifier (`Cmd` on macOS, `Ctrl` elsewhere; word motion `Alt+Arrow` on
+macOS, `Ctrl+Arrow` elsewhere), through the real OS clipboard. An
+editing chord is always consumed inside the field, so `Ctrl+Z` there no
+longer undoes the document, even with the field's own history empty.
+Paste is now filtered and capped like typing (it bypassed both before),
+in the field and in the command palette, whose copy/paste now also use
+the primary modifier. The only real text field is still the Widget
+Gallery's demo field. Details and disclosures: M1.7's "Text field"
+0.137.0 update.
+
+**Previously (2026-09-28, 0.136.0): the Properties panel edits the tool.**
+A live "Radius 24 px" readout and a 1–256 px radius slider for the
+active tool (Brush and Eraser each keep their own; disabled for tools
+with no radius), on a new `ToolSettings` that replaces the fixed
+`BRUSH_RADIUS`/`ERASER_RADIUS` at every dab site, plus a new minimal
+`Label` widget. Tool settings are not document state: no undo step, not
+saved. A same-version review revision made one helper the only radius
+source for every dab site (both tools now tested), ends a radius drag on
+a mid-drag tool switch or an assistive-technology action, and discloses
+the 1 px radius's 12.8x dab count as a performance edge. Details and
+disclosures: M1.8's "Layers, history, tool-options panels" 0.136.0
+update.
+
+**Previously (2026-09-28, 0.135.0): the Layers panel edits the document.**
+An opacity slider (live drag, one undo step per gesture), a 27-mode
+blend-mode dropdown and a visibility checkbox for the active layer, on a
+router now shared between the Widget Gallery and the Layers controls.
+Details and disclosures: M1.8's "Layers, history, tool-options panels"
+0.135.0 update.
+
 **Latest (2026-09-26, 0.133.0): text round 2 — editable text.** A text
 field now draws its content, a caret while focused (any focus origin),
 its selection (`accent.primary` highlight, selected glyphs in
@@ -1962,6 +2054,96 @@ check licenses` clean with the new `toml` dependency.
   aurora-widgets --all-targets --all-features -- -D warnings` clean,
   `cargo test -p aurora-widgets` — 20/20 passed, `cargo deny check
   licenses` clean.
+
+  **Update 0.140.0 — text-aware layout; checkbox labels.** Closes the
+  "checkbox label deferred (needs a measure-func layout pass)"
+  disclosure carried since 0.133.0. *Tree* (`tree.rs`):
+  `WidgetTree::compute_layout_with(w, h, measure)` takes a **pre-measure
+  hook** `&mut dyn FnMut(&W) -> Option<taffy::Size<f32>>`, asked once per
+  widget before layout; `Some` overrides that widget's `style.size` on
+  the internal `taffy` copy only (the stored style is untouched), and
+  `compute_layout` is now that call with a hook answering `None` — byte
+  for byte the old path. Deliberately not a `taffy` measure callback:
+  a measured widget is one line of known text whose size does not depend
+  on the space offered. `WidgetTree::is_measured(id)` records whether the
+  last layout sized a widget through the hook (reset by every layout).
+  *Measuring* (new `measure.rs`): `TextMeasure { engine, scales,
+  scale_factor }`; `measure_widget(kind, &mut TextMeasure)` sizes only a
+  `Checkbox` whose sanitized label is not blank, to
+  `ceil(type.size.md + spacing.sm + shaped label width)` x
+  `max(row_height, type.size.md)` — `ceil` because `taffy` rounds a
+  fractional size to *nearest*, which would cut short a label whose
+  width ends under half a pixel past a whole one; a blank or
+  control-only label, or a width that is not finite and positive,
+  measures `None` (a bare box); `compute_text_layout(tree, w, h,
+  Option<TextMeasure>)` is the one entry point (`None` ==
+  `compute_layout`). *Checkbox* (one widget, so hit-testing, focus,
+  `Click` and the a11y node are unchanged and a click on the label
+  toggles through the existing path): `checkbox_box_rect(bounds,
+  measured, scales)` is the box — a `type.size.md` square flush left and
+  vertically centred when measured, **the whole bounds when not**. The
+  plan had keyed that on geometry alone (a side x side box equals its
+  bounds), which turned all ten checkbox golden/distinctness tests red:
+  the gallery sizes its checkboxes into 64 px cells, and those paint
+  whole; hence the `is_measured` flag rather than a geometric guess.
+  `paint_checkbox` and the `Checkbox` focus-ring arm both use the box
+  (placed in the full bounds, then clipped; a box clipped wholly away
+  keeps an inside ring on what is visible); the ring now circles the box
+  only. `text_runs` gains a `Checkbox` arm for measured checkboxes only:
+  flush left at `x + side + gap`, `text.primary` at the box's disabled
+  opacity, none when squeezed to no room. *App*: `layout_workspace` /
+  `App::layout` replace both production `compute_layout` calls
+  (`resumed`, `apply_resize` — which `ScaleFactorChanged`, key presses
+  and gallery events all go through), and `resumed` now creates the
+  `TextEngine` *before* its first layout. **Tests (+19, 2,568 total):**
+  1 tree (hook overrides one layout, siblings shift, a later text-blind
+  layout restores it, `is_measured`); 15 in `measure.rs` (no-engine ==
+  text-blind; box + gap + label x one row, exact; every width rounded up,
+  with a guard that some label lands in the round-down half; longer label
+  wider and pushes the next row down; scale 1 vs 2 within 1 px; blank /
+  control-only / spaces stay a bare box; only checkboxes measure; a NaN
+  scale measures nothing; a click on the label hit-tests the checkbox and
+  toggles it; measured box left + centred; unmeasured box = bounds; label
+  run rect, `text.primary`, disabled alpha; unmeasured / hand-sized /
+  squeezed draw no label; resolved glyphs identical with and without the
+  clip at scales 1, 1.25, 1.5, 2; a second layout and the paint that
+  follows shape nothing new); 1 paint (a labelled checkbox's ring circles
+  its box); 2 app (the real Layers panel's `Visible` checkbox, laid out
+  through the production helper, is measured and has room for its
+  label; with no engine the helper equals `compute_layout` for the whole
+  workspace). **Goldens:** unchanged, none re-blessed — shapes only, and
+  every golden is laid out with no engine.
+  **Mutations (all really run, RTX 3090, `AURORA_REQUIRE_GPU=1`, backup
+  and sha256-verified restore):** hook ignored in `build_taffy_node`
+  (killed, 8 + app); `compute_layout` passing a measuring hook (killed,
+  121); `ceil` dropped (**survived the first run** — `taffy`'s own
+  rounding hid it for every label then tested and the glyph-clip test is
+  not sensitive to it, since ink ends short of the advance; killed after
+  adding the rounded-up test); gap omitted (killed, 2 + app); height =
+  side (killed, 3); blank label measured (killed, 1); box paint = bounds
+  (killed, 1); ring around the whole bounds (killed, 1); label rect at
+  `bounds.x` (killed, 1); label colour `text.secondary` (killed, 1);
+  zero-width guard removed (killed, 1); `measured.insert` dropped
+  (killed, 7); label drawn for an unmeasured checkbox (killed, 1); box
+  keyed on geometry instead of `is_measured` (killed by the hand-placed
+  16 px ring test and, run separately, all ten checkbox gallery tests);
+  engine created after the first layout in `resumed` — **survives**:
+  `resumed` needs a real window and device, and nothing headless drives
+  it; the ordering is covered by review only, and its effect would be
+  one unlabelled first frame (the next relayout on any event fixes it).
+  **Disclosures:** one line — no wrapping, no ellipsis; a label wider
+  than its parent overflows and is clipped. The ring circles the box
+  only (design-owner call, flagged to Cahya). The `Label` widget still
+  does not size itself to its text. The new labelled layout is not
+  golden-covered (goldens are text-free and laid out without an engine);
+  it is asserted instead. A measured checkbox is still subject to
+  `taffy`'s default `flex_shrink` like any widget, so a very narrow
+  parent row could squeeze it (the label then draws clipped or not at
+  all). If the UI font fails to load, checkboxes fall back to bare boxes
+  with no label. The label-to-box gap is `spacing.sm` (12 px), chosen by
+  the plan, not the design owner. **Needs a human:** the labelled
+  checkboxes in the Layers panel and Widget Gallery at scale 1.0 and 2.0
+  on real hardware (alignment, gap, crispness, click-on-label).
 - [x] **Retained-mode tree with damage tracking** — done 2026-08-02,
   `crates/aurora-widgets/src/tree.rs` (`WidgetTree<W>`, `WidgetId`), 14
   tests. Exactly one root (unlike `aurora_doc::LayerTree`'s multiple
@@ -1995,6 +2177,21 @@ check licenses` clean with the new `toml` dependency.
   window or platform adapter needed, which is what "headless mode for
   automated UI tests" (this milestone's own later bullet) is really
   asking this crate to already be.
+  **Review (same version):** a combined review/judge PASSed at 0.917,
+  confirming no production path still lays out text-blind (every plain
+  `compute_layout` in `aurora-app`/`aurora-ui` is test-only), the
+  `measured` flag resets every pass, and a clipped label cannot break the
+  box. Its main follow-up — the gallery's 422 px minimum-height pin was
+  proven only for the text-blind layout — is closed by a twin test,
+  `the_measured_layout_keeps_the_same_minimum_height`, which lays the
+  gallery out with a real `TextEngine`, confirms the checkbox measured
+  with its label, and finds the curve editor still the taller column, so
+  the minimum is 422 px under the real layout too. Full gate green on the
+  RTX 3090 with `AURORA_REQUIRE_GPU=1` before that test (2,568 passed, 0
+  failed, 0 skipped; doctests, strict rustdoc, `cargo deny` clean);
+  2,569 with it. Carried: a label changed between layouts keeps its old
+  width until the next relayout (no path does this yet); the `resumed`
+  engine-before-layout order is guarded by review only.
 
   **A real bug in this exact function, found on real macOS hardware,
   2026-08-03**: Cahya ran `aurora-app` (once it actually had a
@@ -2099,6 +2296,345 @@ check licenses` clean with the new `toml` dependency.
   wide `cargo clippy --workspace` and `scripts/check_layering.py` still
   can't run here; per-crate verification substitutes, as in every prior
   entry.
+
+  **Update 0.137.0 — keyboard chords in a focused text field.** Closes
+  0.131.0's disclosure "word motion and `Ctrl`/`Cmd`+A/C/X/V/Z are not
+  routed (`Ctrl+Z` in the field still undoes the *document*)". New in
+  `aurora-widgets` (`text_field.rs`): `TextFieldChord` (`SelectAll`,
+  `Copy`, `Cut`, `Paste`, `Undo`, `Redo`, `WordLeft/WordRight { extend
+  }`), `TextFieldChord::from_key(key, modifiers, primary_is_meta)` (a
+  parameter, not a `cfg!`, so both platforms' tables are tested on every
+  host), `ChordEffect { changed, copied }` and
+  `handle_text_field_chord(tree, id, chord, pasted)`. Table: primary
+  (`Cmd` on macOS, `Ctrl` elsewhere) + A/C/X/V/Z, primary+Shift+Z redo,
+  `Ctrl+Y` redo off macOS only; **on macOS also the literal
+  `Ctrl+Z`/`Ctrl+Shift+Z`**, because the shortcut registry binds document
+  undo to the literal `Ctrl` chord on every platform; word motion
+  `Ctrl+Arrow` off macOS, `Alt+Arrow` on it, Shift extends. A primary
+  chord never has `Alt` held (`Ctrl+Alt` is `AltGr`, which types) nor
+  the other of `Ctrl`/`Cmd`; Shift with A/C/X/V makes the press *not* a
+  chord, so registry bindings like `Ctrl+Shift+P` still see it.
+  **Defect fixed:** `TextFieldState::paste` called `insert_str`, bypassing
+  `insert_typed`'s `is_insertable_char` filter and `TEXT_FIELD_MAX_BYTES`
+  cap; it now delegates to `insert_typed` and returns whether anything
+  was inserted (its only non-test caller is the new chord handler).
+  Copy/cut with nothing selected return `copied: None`, so the clipboard
+  is never overwritten with `""`. In `aurora-app`: `route_widget_key`
+  takes a `clipboard: &mut dyn ClipboardAccess` (the real
+  `SystemClipboard` from `App::handle_key_event`, `FakeClipboard` in
+  tests) and, for a focused text field whose press `from_key` maps,
+  calls the new `route_text_field_chord`: reads the clipboard only for a
+  paste, writes it only when a copy/cut had a selection, consumes the
+  chord without acting while an IME composition is in progress, and
+  **always returns `Handled`** — even when nothing changed (an undo with
+  the field's history empty), since `Ignored` would fall through to
+  `handle_key` and the registry's document undo. `const PRIMARY_IS_META:
+  bool = cfg!(target_os = "macos")`. Command palette: its copy/paste now
+  use the same primary predicate (`is_primary_chord`: before, literal
+  `Ctrl` on every platform, `Ctrl+Alt`/`AltGr` and `Ctrl+Shift`
+  included), a paste goes through `palette_query_with_paste` (filtered
+  and capped like a field; before, the whole clipboard was appended raw),
+  and copying an empty query no longer clears the clipboard. Tests: 19
+  new in `aurora-widgets` (`chord_tests`: both tables, AltGr, Shift,
+  `Ctrl+Y`, macOS `Ctrl+Z`, word motion; select-all+cut, copy with no
+  selection, paste replacing a selection, filtered, capped, empty,
+  undo/redo, word extend, disabled), 12 new in `aurora-app` (a
+  `GalleryRig::key_event` mirroring `App::handle_key_event` — router,
+  then `handle_key` with the real `default_shortcuts` only if not
+  handled; `undo_in_a_focused_field_with_empty_history_never_undoes_the_document`
+  with a control case showing the same rig *does* return
+  `ActivatedCommand::Undo` when the field is unfocused; clipboard round
+  trip; `Ctrl+Shift+P` still opens the palette; chords during a
+  composition; `Ctrl+Y`; word motion; a platform pin with literal
+  modifiers; five palette tests), and four existing tests updated (three
+  palette clipboard tests now press the platform primary, and the
+  gallery test's "a `Ctrl` chord is still the app's shortcut" now uses
+  `Ctrl+P`, since `Ctrl+Z` is the field's). **Mutations, really run and
+  reverted from a scratchpad backup:** chord branch returning `Ignored`
+  when unchanged; `PRIMARY_IS_META` inverted; macOS `Ctrl+Z` arm
+  dropped; paste via `insert_str`; copy with no selection writing `""`;
+  chords acted on while composing; Shift ignored on Z; palette paste
+  unfiltered — all eight killed. The inverted constant **survived** the
+  first run (every app test derived its modifiers from the constant
+  itself) and is killed only by the platform pin
+  `the_paste_chord_is_cmd_on_macos_and_ctrl_elsewhere`, added for it.
+  **Measured:** `AURORA_REQUIRE_GPU=1 cargo test -p aurora-widgets -p
+  aurora-ui -p aurora-app` on the RTX 3090 — 1,517 passed (aurora-app
+  lib 511, aurora-ui 125, aurora-widgets lib 751, `tests/gallery.rs` 129
+  + 45 ignored, `tests/headless.rs` 1), 0 failed; workspace clippy `-D
+  warnings`, `cargo fmt --all --check` and both check scripts clean;
+  `AURORA_REQUIRE_GPU=1 cargo test --workspace` — 2,513 passed (2,482 +
+  31 new), 0 failed, 45 ignored; `RUSTDOCFLAGS="-D warnings" cargo doc
+  -p aurora-widgets -p aurora-app --no-deps --all-features
+  --document-private-items` clean. Not run at build time: nextest,
+  workspace-wide strict rustdoc, `cargo deny`, CI on macOS/Windows.
+  **Measured after the review revision:** full gate green on the RTX
+  3090 with `AURORA_REQUIRE_GPU=1` — 2,514 passed, 0 failed, 45 ignored,
+  0 skipped; doctests and workspace-wide strict rustdoc clean; `cargo
+  deny check` clean on the pre-revision state (the revision added no
+  dependency). `default_shortcuts` binds none of `Ctrl+A/C/V/X/Y`, so on
+  macOS those presses (not field chords there) reach no document
+  command. Judge: PASS, 0.93.
+  **Disclosed, not done:** the Widget Gallery's demo field is still the
+  only real text field; the palette gets primary-modifier copy/paste and
+  a filtered paste only (no selection model, so no select-all, cut or
+  undo there; typed palette characters are still unfiltered and
+  Backspace pops one `char`, not a grapheme cluster); field undo does not
+  coalesce typing (each character is its own step) and its stacks are
+  unbounded (each snapshot at most 4 KiB); the global registry still
+  binds literal `Ctrl` chords on macOS, so `Cmd+Z` *outside* a field does
+  nothing; Undo from the menu or palette with a field focused still undoes
+  the document; `Cmd+Left/Right` (line start/end on macOS) is not
+  mapped; nothing has been pressed by a human on real hardware — macOS's
+  `Cmd` path in particular is tested only through the `primary_is_meta`
+  parameter on Linux. **Needs a human (macOS):** `Cmd+A/C/X/V/Z` and
+  `Cmd+Shift+Z` inside the Gallery field, and `Ctrl+Z` there, confirming
+  winit delivers them and the document's undo never fires.
+  **Review revision (0.137.0, same version):** an independent critic
+  (PASS, ~0.8) found `WordRight` untested (a `WordRight` calling
+  `move_word_left`, or dropping `extend`, would have survived) — the test
+  now pins the exact caret and a `WordRight { extend: true }` selection;
+  the paste cap cut on a *char* boundary and could split a flag, a ZWJ
+  sequence or a base from its combining mark — both the field and the
+  palette now cap on a grapheme boundary (shared
+  `push_graphemes_capped`); and a pasted multi-line text lost its line
+  breaks and tabs outright — they now become spaces (`single_line_paste`,
+  `\r\n` counting as one), as single-line inputs in browsers and Qt do,
+  for both the field and the palette. New test
+  `paste_turns_line_breaks_into_spaces_and_caps_on_a_grapheme_boundary`.
+  **Still open (review F4/F7):** other platform editing chords are
+  unmapped and simply do nothing — `Ctrl+Backspace/Delete` (delete a
+  word) and `Ctrl+Home/End` off macOS; `Cmd+Left/Right/Backspace`,
+  `Option+Backspace` and the Cocoa `Ctrl+A/E` on macOS; typed palette
+  characters are still neither filtered nor capped (only its paste is);
+  the rig mirrors `App::handle_key_event`'s router-then-`handle_key`
+  order rather than calling it.
+
+  **Update 0.138.0 — placing the caret with the pointer.** Closes
+  0.131.0's "a click does not place a text field's caret". New in
+  `aurora-widgets`: `set_text_field_caret(tree, id, offset, anchor)`
+  (`text_field.rs` — clamps to the content, floors both ends to a
+  grapheme-cluster boundary, collapses an anchor on the caret, not an
+  undo step, through `with_text_field_mut` so the accessibility node
+  follows); `field_offset_at(engine, tree, id, theme, scales,
+  scale_factor, x)` (`text.rs` — builds the field's own `text_runs` run,
+  shapes it at the display's scale, applies the same scroll
+  `resolve_run` draws with (caret-pinned `field_scroll` as first built;
+  sticky and stored since the review revision below), and returns the grapheme
+  boundary whose caret is nearest `x`; exact ties go to the lower byte;
+  `None` mid-composition, since the drawn text is then content plus
+  preedit); and in `pointer.rs` a `TextHit` trait (the one
+  engine-dependent step, injected so the router stays engine-free),
+  `NoTextHit`, and `handle_pointer_with(.., modifiers, hit)`, which
+  `handle_pointer` now delegates to with no modifiers and `NoTextHit`
+  (its behaviour unchanged). A text field's `Down` places the caret —
+  `Shift` extending from the existing anchor, or from the pre-click
+  caret — and **captures** the field (`Capture::TextField { id, anchor
+  }`): each `Move` moves the caret with the selection anchored at the
+  press, a `Move` back onto the anchor leaves a bare caret, the `Up`
+  releases it, and a field removed or disabled mid-drag cancels it
+  through the existing capture check. Composition blocks placement at
+  both levels (the pointer refuses even a `TextHit` that answers). In
+  `aurora-app`, `route_widget_pointer` takes the app's tracked modifiers
+  (`ModifiersChanged`) and an `EngineTextHit` over the app's own text
+  engine, theme, scales and scale factor; with no engine yet it passes
+  `NoTextHit` (focus only, as before). New tests: 8 pointer tests with a
+  fake hit (click, Shift+click from a caret and from a selection, drag
+  and collapse, removal/disable mid-drag, composition, no answer), 4
+  `field_offset_at` tests against a real `TextEngine` (every caret
+  `resolve_run` draws — and a point a quarter px left of it — maps back
+  to its byte, in a short and an overflowing (scrolled) field, at scale
+  1 and 2; both ends clamp; the tie rule; composition), 4
+  `set_text_field_caret` tests, and 2 app tests in the Gallery rig with
+  the real engine (click at scale 1 and 2 and Shift+click; drag then
+  primary+C copies exactly the dragged text). Mutations, each really run
+  and reverted (sha256-checked): scroll 0 in `field_offset_at`, nearest
+  caret replaced by floor, Shift dropped, no capture, the anchor
+  overwritten on `Move`, each of the three composition guards removed,
+  and no grapheme floor in `set_text_field_caret` — all 9 killed.
+  **Disclosed:** no double-/triple-click word/line selection (winit has
+  no click count; a timing-based detector is future work); no
+  autoscroll at all since the review revision — a drag past the edge
+  stops at the last visible caret (before it, the hidden byte nearest
+  the pointer was picked and the caret-pinned scroll jumped to it); `App::route_gallery`'s own call site (engine vs. `NoTextHit`,
+  its modifiers) is not exercised by a test — the rig calls
+  `route_widget_pointer` with the same `EngineTextHit` directly, as
+  every prior gallery test does; the app test finds its click points
+  with `field_offset_at` itself, so the geometry is proved in
+  `aurora-widgets` and the app test proves only the wiring; the app
+  test's field text is short, so the scroll mutation is caught only by
+  the widgets test. Headless, Linux only. **Needs a human:** click,
+  Shift+click and drag in the Widget Gallery's field on a real Retina
+  display (the scale-2 mapping is tested, not seen), including a long
+  overflowing line.
+
+  **Review revision (0.138.0, critic BLOCK C1-C6).** *C1 (high):* the
+  caret-pinned scroll this entry was built on (disclosed since 0.133.0)
+  broke pointer placement in an overflowing field: every drag `Move`
+  re-scrolled from the caret the previous `Move` had set, so the
+  selection ran away leftward, and a plain click moved the text under
+  the pointer on the next frame. A text field's scroll is now **sticky
+  and stored**: `TextFieldState` carries a private `scroll` (logical px,
+  compared by bits so the state keeps `Eq`; read with `scroll()`; view
+  state — not an undo step, not in the accessibility node, stored even
+  on a disabled field) written only by the new
+  `set_text_field_scroll` (marks the widget dirty only on a real
+  change). New pure `sticky_scroll(prev, line_width, caret_x,
+  inner_width)`: `0` while the line and an end caret fit; else `prev`
+  while the caret lies in `[prev, prev + inner - CARET_WIDTH]`, else the
+  least change bringing it just inside; clamped to `[0, line +
+  CARET_WIDTH - inner]`; non-finite gives `0`. New
+  `update_field_scrolls(engine, tree, theme, scales, scale_factor)`
+  shapes each visible field's own run and stores its sticky scroll;
+  `App::redraw` calls it once per frame, right after the text engine's
+  `begin_frame` and before widget paints are collected. `FieldDecor`
+  gains `scroll: Option<f32>`: `Some(stored)` for a text field (sticky),
+  `None` for the command palette's query (still caret-pinned
+  `field_scroll`, whose caret is always at the line's end, where the two
+  rules agree); `resolve_run`, `field_offset_at` and
+  `update_field_scrolls` share one placement (`place_field`). *C2
+  (medium):* `field_offset_at` clamps `x` to the padded text box and
+  considers only carets wholly inside the window `sticky_scroll` keeps
+  still (every caret if none is), so a press in the padding or at the
+  edge of a scrolled field picks the nearest *visible* caret and placing
+  it never scrolls. *C3 (low), kept:* `Shift`+click on an unfocused
+  field extends from the caret/anchor it kept (Chromium-like), now
+  pinned by a test. *C5:* one `TextFieldState::is_composing()` (preedit
+  non-empty) used by both pointer guards and `field_offset_at` —
+  behaviour-identical, since `set_composition` never stores an empty
+  preedit. **Tests (+6 `aurora-widgets`, +1 `aurora-app`):**
+  `a_click_and_a_still_drag_in_an_overflowing_field_stay_under_the_pointer`
+  (real `TextEngine`, scale 1 and 2: a click mid-way along an
+  overflowing line and six still `Move`s, a frame update between each —
+  cursor stable, no selection, the stored scroll unchanged, the byte
+  under the pointer unchanged); `sticky_scroll_keeps_its_window_until_the_caret_leaves_it`;
+  `the_stored_scroll_is_view_state`; pointer tests
+  `shift_click_inside_a_selection_keeps_the_anchor_and_shrinks_it`,
+  `shift_click_on_an_unfocused_field_extends_from_its_stored_caret`,
+  `a_move_with_no_hit_mid_drag_is_ignored_and_keeps_the_capture` (C4);
+  app `the_same_logical_point_places_the_same_byte_at_scale_one_and_two`
+  (C6). **Changed tests:** `a_point_past_either_end_clamps` became
+  `a_point_past_either_end_clamps_to_the_nearest_visible_caret` — its old
+  claim (a point far right of `LONG` with the caret at `0` gives the
+  content's length, 55) is exactly the invisible pick C2 forbids; it now
+  asserts `0`/length only for a line that fits or is scrolled to that
+  end, the first/last *visible* caret otherwise (14 in that case),
+  padding points included, and that placing either pick leaves the
+  stored scroll unchanged. `drawn_caret_x` and the app rig's
+  `pointer_with_engine` now run `update_field_scrolls` first, as the
+  app's frame does. `field_tests::plain_decor` sets `scroll: None`
+  (those tests pin drawing, not scroll policy). **Evidence:** the C1
+  test, run against the pre-revision `text.rs` with its frame hook a
+  no-op (there was no stored scroll), failed at scale 1, frame 0 — the
+  byte under the pointer went from 48 to 40 after the click. Mutations
+  on the revised `text.rs`, each run and restored from a scratchpad
+  backup with sha256 checked: text fields back on caret-pinned
+  (killed, 2 tests); no visible-caret filter (killed, 1);
+  `update_field_scrolls` writing nothing (killed, 1); the pointer clamp
+  to the padded box removed — **survives**: with the visible-caret
+  filter in place, a point outside the window already picks the edge
+  caret, so the clamp is output-equivalent and kept only as defence in
+  depth. **Disclosed:** no drag auto-scroll; the redraw call site of
+  `update_field_scrolls` is not itself exercised by a test (the rig
+  calls it the same way); a keyboard edit between two frames moves the
+  stored scroll only at the next frame, and a click in that gap is
+  mapped against the scroll the next frame will draw (`sticky_scroll`
+  of the stored value for the current caret), not the stale frame.
+  **Needs a human:** a long line in the Widget Gallery field — click,
+  drag and Shift+click with the text scrolled — on real hardware.
+
+  **Update 0.139.0 — caret blink.** Closes the "no caret blink"
+  disclosure carried since 0.133.0. New in `aurora-widgets`
+  (`caret.rs`): `CARET_BLINK_INTERVAL` (530 ms per half-period, the
+  Windows `GetCaretBlinkTime` default — **not a token**, same status as
+  `CARET_WIDTH`; flagged to Cahya with the caret's width and colour);
+  `CaretSignature` and `caret_signature(tree, focused)`, which reads the
+  caret the frame would draw — owner, cursor, selection anchor and a
+  hash of the content plus any IME composition for a focused, enabled
+  text field; owner and query for focus anywhere inside a command
+  palette; `None` otherwise, the same rule `text_runs` uses to draw a
+  caret at all; and `CaretBlink { epoch, signature }` with `observe`
+  (a changed signature restarts the clock), `visible(now,
+  reduced_motion)` (even half-periods since the epoch; always `true`
+  with no owner or under reduced motion) and `next_toggle(now,
+  reduced_motion)` (strictly after `now`; `None` with no owner or under
+  reduced motion). Restarting on a signature change rather than at each
+  input site means every path — keys, IME, pointer, accessibility
+  actions, focus moves — shows the caret solid immediately with no
+  per-site reset call to forget. Hiding needed no paint API change:
+  `paint_widget_ops_frame`'s `focused` is now documented as the frame's
+  caret owner, and the app passes `None` in a hidden half-period (it
+  decides only the caret — scroll anchor and selection do not read it,
+  and `update_field_scrolls` passes `None` anyway). In `aurora-app`: one
+  pure `caret_step` shared by `App::redraw` and `App::about_to_wait`
+  (observe, then the owner to paint with, the next flip, and whether
+  the owner differs from the last frame's); `earliest_deadline` merges
+  the flip with the gallery tooltip's deadline for `next_control_flow`;
+  a flip the last frame did not draw sets `needs_redraw`; `redraw`
+  records the owner it painted with before any early return, so a frame
+  that cannot draw (no surface, occluded) cannot make every iteration
+  ask again. New `WindowEvent::Focused` handling: while another window
+  has keyboard focus the caret is not drawn and does not blink (the
+  native convention, and no twice-a-second wake-ups in the background);
+  regaining focus is a signature change, so it returns solid. The OS
+  reduced-motion preference (`detect_accessibility_preferences`, now
+  read once in `run` and passed to `App::new`) gives a steady caret.
+  **Tests (+6 `aurora-widgets`, +3 `aurora-app`):** alternating
+  half-periods with the flip exactly at the interval; `next_toggle`
+  strictly future at 40 sampled instants, with visibility changing
+  there and not a nanosecond before; a new signature restarts the clock
+  visible and the same one does not; no owner / reduced motion never
+  blinks or wakes; `caret_signature` changes with content, cursor,
+  anchor, composition text and target, and is `None` when disabled; the
+  palette signature holds on the palette and its rows and follows the
+  query; app `a_focused_fields_caret_blinks_and_a_typed_character_shows_it_at_once`
+  (Gallery rig: `caret_step` over time, a typed character mid-hidden-phase,
+  and `target_paint_ops` drawing the caret with the visible owner and
+  not with the hidden one); `no_blink_without_a_caret_an_unfocused_window_or_with_reduced_motion`;
+  `the_loop_deadline_is_the_earlier_of_the_tooltip_and_the_caret_flip`.
+  **Mutations**, each run against the widgets `caret` tests and the app
+  caret/deadline tests, restored from a scratchpad backup, sha256
+  checked: `next_toggle` returning `now` (a busy loop), no epoch reset
+  on a signature change, blinking while the window is unfocused,
+  `visible` ignoring reduced motion, `next_toggle` ignoring it, the
+  phase inverted, `earliest_deadline` dropping its second argument,
+  `caret_step` never reporting a flip, and `caret_step`'s owner ignoring
+  the blink — **all 9 killed**. **3 survive**, all `App` method wiring
+  that no headless test can reach (`about_to_wait` needs an
+  `ActiveEventLoop`, `redraw` a surface): `about_to_wait` passing only
+  the tooltip deadline, `about_to_wait` ignoring `CaretStep::redraw`,
+  and `redraw` painting with `focus.focused()` instead of the caret
+  owner. **Review revision (same version):** a combined review/judge
+  (REVISE, ~0.91) found `redraw`'s whole doc comment had been moved onto
+  the new `App::caret_step` method (inserted between the doc and `fn
+  redraw`) — fixed by moving the method above the doc. It also
+  recommended extracting `about_to_wait`'s fold: new free
+  `fold_caret_step(step, gallery_deadline, &mut needs_redraw)` and test
+  `fold_caret_step_joins_the_deadlines_and_asks_for_the_flip`, which
+  kills the first two survivors (ignoring the caret's deadline; ignoring
+  its redraw) — both re-run and killed. The third (`redraw` painting
+  with `focus.focused()`) still needs a real frame and stays disclosed.
+  On Linux and Windows the caret always blinks, since reduced motion is
+  read on macOS only. **Disclosed:** the blink rate is fixed, not the OS's own
+  (Windows `GetCaretBlinkTime`, macOS `NSTextInsertionPointBlinkPeriod`,
+  GNOME's `cursor-blink`); reduced motion is detected on macOS only
+  (`false` elsewhere); a focused field that is not visible (collapsed
+  panel, scrolled out) still wakes the loop at 2 Hz; the caret is
+  hidden in a background window, a deliberate convention change from
+  0.133.0–0.138.0's always-drawn caret; `winit` delivering
+  `Focused(true)` on every platform is assumed, not observed (the flag
+  starts `true`); the signature's content hash (`DefaultHasher`) could in
+  principle collide, leaving one edit without a reset; each flip redraws
+  the whole frame, the same full frame every other redraw costs — no
+  damage-rect narrowing for the caret. Headless, Linux only. Workspace
+  run (`AURORA_REQUIRE_GPU=1 cargo test --workspace`, RTX 3090): 2,548
+  passed, 0 failed, 45 ignored; after the review revision the full gate
+  is green — 2,549 passed, 0 failed, 0 skipped, doctests, strict rustdoc
+  and `cargo deny check` clean. **Needs a
+  human:** watch the Widget Gallery field blink on real hardware, type
+  mid-blink, switch to another app and back, and toggle macOS "Reduce
+  motion"; and confirm with Activity Monitor/`top` that an idle Aurora
+  with nothing focused stays at ~0% CPU.
 - [x] **IME composition rendering (platform underline styles)** — done
   2026-08-02, `crates/aurora-widgets/src/widgets/text_field.rs`
   (`Composition`, `UnderlineStyle`, `composition_segments`,
@@ -2922,6 +3458,12 @@ check licenses` clean with the new `toml` dependency.
   after close stays the caller's job, as already disclosed. Workspace
   1,993 → 2,001 passing, 30 ignored, under `AURORA_REQUIRE_GPU=1` on
   the RTX 3090; the full gate, doctests and `cargo doc -D warnings` clean.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,539 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. Judge:
+  PASS, 0.917. Carried: a test (or debug assertion) that `App::redraw`
+  calls `update_field_scrolls` before paint collection; timed drag
+  autoscroll; double/triple-click selection.
 
   **0.124.0 (not a widget):** the gradient paint primitive the colour
   picker needs landed first, as its own step — `PaintOp`/`paint_widget_ops`
@@ -3902,7 +4444,9 @@ check licenses` clean with the new `toml` dependency.
   joins the frame's single atlas `prepare`. Horizontal scroll is
   stateless and caret-pinned (`field_scroll`): none while the line fits,
   otherwise the least scroll keeping the caret inside the `spacing.sm`
-  inset box. New `paint_widget_ops_frame` takes the focused widget;
+  inset box. (Superseded for text fields by 0.138.0's review revision:
+  sticky, stored per field, `sticky_scroll`/`update_field_scrolls`; the
+  palette query is still caret-pinned.) New `paint_widget_ops_frame` takes the focused widget;
   `paint_widget_ops_focused` is it with none (unchanged for every
   existing caller); the app's frame walker passes `self.focus.focused()`
   and converts every decor colour for the target (`TextRun::map_colors`).
@@ -3928,13 +4472,15 @@ check licenses` clean with the new `toml` dependency.
   fill covers only the lower half (decoded: strip `[49,49,54]` y 32..96,
   row `[120,172,255]` y 96..160). Shapes only: text is filtered out of
   every golden. Existing palette tests that counted body children now
-  account for the strip. **Disclosures:** no caret blink; caret-pinned
-  (not sticky) scroll; caret/selection colours provisional (caret colour,
+  account for the strip. **Disclosures:** no caret blink (closed in
+  0.139.0); caret-pinned
+  (not sticky) scroll (closed for text fields in 0.138.0's review
+  revision); caret/selection colours provisional (caret colour,
   width and blink tokens flagged to Cahya); no placeholder
   (`TextFieldState` has none); no click-to-place caret (a click focuses
   the field but does not move `cursor`); dialog title still not drawn (no
-  layout slot); checkbox label deferred (needs a measure-func layout
-  pass); tooltip and dialog message are one line, no wrap, no ellipsis;
+  layout slot — closed in 0.141.0); checkbox label deferred (needs a measure-func layout
+  pass — closed in 0.140.0); tooltip and dialog message are one line, no wrap, no ellipsis;
   (the text field box was one `type.size.md` tall -- fixed in the review
   revision below); palette rows and the strip split the body evenly,
   so with many results each can be shorter than a line (clipped), and
@@ -4060,6 +4606,74 @@ check licenses` clean with the new `toml` dependency.
   thumb (`text.primary`, gated) and fill (`accent.primary`, gated 3:1
   on the panel) carry the value. Whether a slider track should be a
   gated pair is a design-owner question, not added here.
+
+  **Update 0.141.0 — dialog titles.** Closes the "dialog title still not
+  drawn (no layout slot)" disclosure carried since 0.133.0. *Dialog*
+  (`widgets/dialog.rs`): `insert_dialog` inserts a **title slot as the
+  root's first child** (`DialogHandle::title`, new field), styled by a
+  new `title_style` — full content width (`TITLE_WIDTH_FRACTION`) and a
+  definite one-`row_height` height (a title is one line by design; the
+  message keeps its `min_size` floor). Its accessibility node is an
+  **unlabelled `Role::GenericContainer`**: the root keeps the title as
+  its own label, so the title is announced once; `accesskit_consumer`
+  0.38.0's common filter (`filters.rs:32`) excludes a `GenericContainer`
+  node from the platform tree, the same presentational pattern the
+  command palette's query strip already uses. *Text* (`text.rs`): a new
+  `dialog_title` helper recognises a `Dialog`'s own `GenericContainer`
+  child, and a guarded `Container` arm in `text_runs` draws the
+  parent's label there — one line, flush left, clipped, `text.primary`,
+  Regular weight, the same box treatment as the message. The message is
+  drawn exactly as before, now one row lower. *Layout numbers
+  (measured, default scales, 800 px wide):* content height 89 → 122 px
+  (+ one `row_height` 21 + one `spacing.sm` gap 12); the short-window
+  floor at which the button's centre stays hit-testable 34 → **68 px**
+  (67 fails, 68 passes, both in `aurora-widgets` and on the real
+  `aurora-app` workspace at 1000 px wide). Both short-window tests
+  (`the_dialogs_action_stays_hit_testable_in_a_very_short_window`,
+  `a_dialogs_action_is_still_clickable_in_a_very_short_window`) were
+  re-bracketed to 68/80/96/108 — all still below the ≈111 px the
+  pre-0.77.7 top-pinned style would need for today's content, so they
+  still separate the two layouts; the old 40/58 px rows now genuinely
+  fail, which is the documented `root_style` residue, not a centring
+  regression. Doc numbers updated in `dialog.rs`, `tests/gallery.rs`
+  (the surface sample, 41 px down, now lands in the gap between the
+  title and message rows) and `docs/taffy-behaviors.md`. App dialogs
+  (crash recovery, unsaved changes, and every `open_dialog` caller) get
+  titles with no app code change. **Tests (+4, 2,573 total):** dialog
+  (title slot is the first child, before message and actions; unlabelled
+  `GenericContainer`; root label unchanged; not an action), dialog layout
+  (the renamed `the_title_the_message_and_every_action_get_a_real_hittable_box`
+  now also asserts the title spans the message's width, is exactly one
+  row, and sits wholly above the message), text (title run text, colour
+  `text.primary`, `Start`, rect and clip = the slot's laid-out box,
+  message below it, root draws nothing; only a dialog's own slot draws
+  and an empty title draws no run), GPU `render_test` (title inks only its
+  own row, the message only its row below, neither paints a fill), and
+  the paint test now covers the title slot too. **Goldens:** none
+  changed and none re-blessed — **there are no dialog golden PNGs**
+  (the dialog gallery tests assert sampled pixels only), and every
+  golden is text-free anyway; `git status` shows no `.png` change.
+  **Mutations (all really run, RTX 3090, `AURORA_REQUIRE_GPU=1`, backup
+  and sha256-verified restore):** title arm removed (killed, 2 — text
+  and GPU ink); title in `text.secondary` (killed, 1); title slot
+  labelled — double announce (killed, 1, the a11y test); title inserted
+  as last child (killed, 3); title height 0 (killed, 1); the
+  `GenericContainer` role check in `dialog_title` loosened so the
+  message also draws the title (killed, 2); root `FlexDirection::Row`
+  (killed, 2 `aurora-widgets` + 2 `aurora-app` — the old "only one test
+  can see this field" note in `root_style` was re-measured and
+  corrected). **Disclosures:** Regular weight only, same size and colour
+  as the message — the title is distinguished by position alone until
+  the design owner picks a title style (no title-weight or title-size
+  token exists; none invented); one line, clipped, no ellipsis; message
+  wrapping still deferred; `Label` still does not size itself to its
+  text; no font fallback; the 68 px short-window floor is higher than
+  before (nothing clamps a dialog to the window, as before); the slot's
+  exclusion from the platform tree rests on `accesskit_consumer`'s
+  filter, verified by reading its source, not by a screen reader.
+  **Needs a human:** the crash-recovery dialog on real hardware at scale
+  1.0 and 2.0 (title legibility and spacing), and a screen reader
+  confirming the title is announced once.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
@@ -6460,6 +7074,228 @@ structural design work.
   state it's given; there's no diff-and-refresh mechanism yet, which is
   fine since nothing can edit a live document in `aurora-app` yet
   either.
+
+  **Update 0.135.0 — editable Layers-panel controls + shared widget
+  routing.** *(The "nothing can edit a live document" clause above is
+  superseded here.)* The Layers panel now carries an **opacity slider,
+  a blend-mode dropdown (all 27 modes, Photoshop's names, option order
+  = `BlendMode::ALL`) and a visibility checkbox** for the active layer
+  (`crates/aurora-ui/src/layer_controls.rs`, new). The strip is a child
+  of the panel *root*, after the body, because `populate_layers_panel`
+  clears the whole body on every call; `set_panel_collapsed` now hides
+  every non-body child of a panel root too. `sync_layer_controls`
+  mirrors the document into them in place (disables all three with no
+  active layer; never overwrites a slider holding pointer capture;
+  touches nothing when nothing changed). Row descriptions use the new
+  `blend_mode_label` ("Linear Dodge (Add)", not `LinearDodge`) and are
+  refreshed in place through the newly public `layer_row_description`.
+  In `aurora-app` the gallery-only routers became `route_widget_pointer`
+  / `route_widget_key` with a `WidgetOwner` (Gallery / LayerControls)
+  and one shared `ClickTracker`; the gallery-only names survive as
+  `#[cfg(test)]` wrappers so every 0.130–0.134 gallery test runs
+  unchanged. `apply_layer_control_outcome`: a **slider drag** applies
+  every move to the tree directly and records **one** undo step on
+  release via the new `History::record_opacity_change` (validated up
+  front like `record_bounds_change`, so a bad `old` cannot wedge undo);
+  a **keyboard/AT** opacity change, a **blend-mode commit** and a
+  **visibility toggle** are one `History` step each; every change
+  reports `CompositeInvalidation::Everything`. Every gesture-ending path
+  commits a pending drag: release, a modal's cancel (commits, like a
+  Move), `CursorLeft`, a press elsewhere (so an active-layer change
+  mid-drag commits to the *original* layer), `Undo`/`Redo` (commit
+  first, inside `perform_undo_redo`, which then re-syncs the controls),
+  and opening a file (commits before the document is replaced).
+  Assistive technology: a new `AccessibilityReaction::LayerControl` arm;
+  the live-workspace mapping guard now builds the controls and asserts
+  their actions reach it. `App::about_to_wait` runs the sync as a
+  catch-all every loop iteration. New `aurora-widgets`
+  `set_checkbox_checked` (owner-driven, allowed while disabled, no-op
+  when unchanged). Tests: 3 `aurora-doc`, 4 `aurora-widgets`, 7
+  `aurora-ui`, 12 `aurora-app` (including
+  `switching_a_layer_to_multiply_in_the_dropdown_changes_the_gpu_composite`,
+  run under `AURORA_REQUIRE_GPU=1` on an RTX 3090 with the Multiply
+  dispatch counter asserted). **Disclosed:** the brush still has no
+  opacity/flow parameter; keyboard/AT opacity changes are one undo step
+  per key/action (no coalescing); every drag move recomposites the whole
+  document (60 FPS is already missed); the 27-row list (~567 px) can
+  overflow a short window with no scrolling (the keyboard still reaches
+  every option); the strip sits *below* the layer list (`WidgetTree`
+  only appends); visibility is for the active layer only (no per-row
+  eye); a group gets the controls too; the `App` wiring (the
+  `about_to_wait` sync, `CursorLeft`, `run_undo_redo`'s capture release)
+  is covered by inspection plus free-function tests that mirror it, not
+  by driving `App` itself; nothing verified on Metal/DX12 or with a real
+  screen reader, and no human has dragged the slider on real hardware.
+
+  **Review revision (0.135.0, same version).** Red-team/critic findings
+  fixed, each with a test shown to fail by re-applying the mutation it
+  guards against (then restored, sha256-checked): an assistive
+  technology's row press mid pointer-drag now commits the drag on its own
+  layer and drops the slider's capture (`AccessibilityContext` carries
+  the shared `ClickTracker`), and — defensively, for any other path that
+  moves the active layer under a held capture — the live-drag branch
+  commits and then *drops* the rest of that capture (`detached`) instead
+  of retargeting it onto the new layer (RT135-3); replacing the document
+  (`open_file`/`open_aur_file`, so a dropped file too) now also closes an
+  open blend-mode list, via one `end_layer_control_gestures` helper
+  (RT135-4); the drag rig asserts every live move is `Everything`
+  (RT135-1); the collapse test asserts the strip's own `Display::None`
+  and that the slider's former centre no longer hits the strip (RT135-2);
+  an app-level test runs the app's `sync_layer_controls` wrapper between
+  moves with the tracker's capture (RT135-5); and `about_to_wait` now
+  syncs the controls after the macOS menu drain, so a menu command is
+  mirrored the same iteration (C5). New tests:
+  `an_accessibility_row_press_mid_drag_ends_the_drag_on_its_own_layer`,
+  `a_drag_whose_active_layer_changes_under_it_is_dropped_not_retargeted`,
+  `replacing_the_document_closes_the_blend_list_and_commits_a_drag`,
+  `the_apps_sync_leaves_a_dragged_slider_alone_between_moves`.
+  **Carry forward (C2):** no structural keyboard command (new, delete or
+  duplicate layer) exists yet; when one lands it must commit a pending
+  opacity drag first (`finish_opacity`, dropping the slider's capture),
+  exactly as undo/redo and a document swap already do.
+  **Judge follow-up, same version:** an assistive-technology action on a
+  control mid pointer drag now ends that drag the same way a row press
+  does (`end_pointer_opacity_drag`: committed, capture dropped), so the
+  rest of the pointer gesture can neither open a second step nor override
+  the action's value — test
+  `an_accessibility_set_value_mid_drag_ends_the_pointer_drag`, which fails
+  with the call removed. **Measured after the revision:** full gate green
+  on the RTX 3090 with `AURORA_REQUIRE_GPU=1` — 2,458 passed, 0 failed,
+  45 ignored, 0 skipped; doctests, strict rustdoc and `cargo deny check`
+  clean. Judge: PASS, 0.91. Carried: keyboard steps can drift off whole
+  percentages after a sync-back (cosmetic); a stale doc comment near
+  `run_undo_redo` saying Ctrl+Z never reaches it.
+
+  **Update 0.136.0 — editable Properties-panel tool controls + a Label
+  widget.** The Properties panel gains a strip (the same "child of the
+  panel root, after the body" placement as the Layers controls, so
+  `populate_properties_panel` repopulating the body on every tool switch
+  cannot destroy it; hidden by `set_panel_collapsed`, and inserted hidden
+  into an already-collapsed panel) holding a **live readout** ("Radius
+  24 px", "No radius for Move") and a **radius slider**
+  (`crates/aurora-ui/src/tool_controls.rs`, new: `insert_tool_controls`,
+  `sync_tool_controls`, `tool_controls_contains`, `radius_readout`,
+  `TOOL_RADIUS_MIN`/`MAX` = 1/256 px). `sync_tool_controls` updates in
+  place, disables both controls for a tool with no radius (slider keeps
+  its last value), clamps to the range, treats a non-finite radius as
+  none, and never overwrites the slider's value while it holds pointer
+  capture (the readout always follows). In `aurora-app` a `ToolSettings
+  { brush_radius, eraser_radius }` field on `App` (defaults 24.0 — the
+  old consts are now only its defaults) replaces the consts at **every**
+  dab site: `continue_drag`'s dab spacing (new `tool_settings`
+  parameter), `App::paint_dab`'s `stamp_dab` and `App::erase_dab`'s
+  `erase_dab`; `tool_options` (the Properties body rows) reads it too, and
+  `run_command`/`handle_key`/`perform_undo_redo`/`replace_document` carry
+  it so a tool switch shows the live radius. Routing:
+  `WidgetOwner::ToolControls` (the pointer and key routers and
+  `widget_owner` take the strip), `apply_tool_control_outcome` (a radius
+  slider `ValueChanged` from pointer, keyboard or assistive technology
+  sets the active tool's radius through `ToolSettings::set_radius` —
+  rounded to whole pixels, clamped, non-finite refused — then refreshes
+  the body and the readout; **no history step**), and a new
+  `AccessibilityReaction::ToolControl` arm; the live-workspace mapping
+  guard now builds the strip (with the Brush active so the slider
+  declares its actions) and asserts `SetValue`/`Increment`/`Decrement`
+  reach it. `App::new` builds and syncs the strip; `about_to_wait` runs
+  `sync_tool_controls_now` as a catch-all after the layer-controls sync,
+  so every tool-switch path (letter shortcut, palette; the macOS menu
+  cannot switch tools) is mirrored. Tool-letter shortcuts still work with the slider focused
+  (only a text field consumes a character key). New `aurora-widgets`
+  **`Label`** (`WidgetKind::Label(LabelState { text, disabled })`,
+  `insert_label`, `set_label_text`/`set_label_disabled` — both no-ops
+  when unchanged, otherwise a11y rebuild + damage — and `label_state`):
+  `Role::Label`, no actions, one `row_height` tall, paints no solids,
+  drawn by `text_runs` in `text.secondary` (gated at 4.5:1 on
+  `surface.panel` by `design/check_contrast.py`) or `text.disabled`;
+  every exhaustive `WidgetKind` match and both kind-coverage guards
+  (`action.rs`, `tooltip.rs`) extended. Tests: 6 `aurora-widgets`, 7
+  `aurora-ui`, 5 `aurora-app` (drag → radius changes and the next
+  segment's dab count follows it; switching Brush/Eraser/Move shows each
+  radius or disables; arrow keys change it and a letter still switches
+  tool with the slider focused; an AT `SetValue` sets it with no history
+  and NaN/±inf refused; `set_radius` rounding/clamping), plus the
+  extended guard. **Disclosed:** tool settings are not document state —
+  no undo step and **not persisted** (reset to 24 px every launch, not in
+  `.aur` or the workspace layout); the 1–256 px range, the readout's
+  wording, radius-vs-diameter ("Size") and `text.secondary` for the
+  readout are engineering defaults **flagged to the design owner**; the
+  brush still has no opacity/flow/hardness; `App::paint_dab`/`erase_dab`
+  reading the live radius was covered by inspection only as built (the
+  tests pinned `continue_drag`'s dab spacing for the **Brush only**, not
+  the Eraser and not a stamped extent, since `App` needs a window) —
+  closed in the review revision below; no value readouts were added to the Layers controls
+  (optional item, left); the Properties *body* rows ("Radius: 24px")
+  are still accessibility-only, not drawn (`text_runs` draws a `ListRow`
+  only under a menu, dropdown list or the palette) — the readout is the
+  visible value; nothing verified by a human on real hardware or with a
+  real screen reader. **Measured (builder):** `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` on the RTX 3090 — 2,476 passed, 0 failed, 45
+  ignored, 0 skipped; clippy `-D warnings`, fmt, `cargo check --locked`,
+  both check scripts and `design/check_contrast.py` clean. Not yet run:
+  nextest, `cargo deny`, CI on macOS/Windows.
+
+  **Review revision (0.136.0, same version).** Red-team killed 14 of 17
+  mutations; the three survivors and two behaviour gaps are fixed, each
+  with a test shown failing on the pre-fix or mutated code (backup,
+  mutate, run, restore, sha256-verified). (1) **RT136-1:** reverting
+  `continue_drag`'s *Eraser* arm to `ERASER_RADIUS` passed every test —
+  new `dragging_the_radius_slider_changes_the_eraser_radius_and_the_next_dabs`
+  (the Brush test's twin, plus "the brush's spacing did not move")
+  kills it. (2) **M4a/M4b:** the radius every dab site reads now comes
+  from one place, `ToolSettings::dab_radius(DabTool)`, and the stamp
+  itself moved out of `App::paint_dab`/`erase_dab` into a free
+  `stamp_tool_dab(DabTool, store, surface, local, settings, colour, drag)`
+  that both methods call — they no longer name a radius at all, so the
+  const cannot silently reappear there. Tested headlessly against a real
+  tile store: `dab_radius_reads_each_tools_own_live_radius` and
+  `stamp_tool_dab_stamps_with_each_tools_live_radius` (a pixel 12 px out
+  is inside a default 24 px dab and outside a 4 px one; for the Eraser,
+  after a 40 px brush dab). Reverting either `dab_radius` arm, either
+  `stamp_tool_dab` arm, or either `continue_drag` arm to the const is
+  killed. **Still by inspection:** that `App::paint_dab`/`erase_dab`
+  pass `DabTool::Brush`/`DabTool::Eraser` respectively and not the
+  other (constructing `App` needs a window). (3) **RT136-2:** a
+  radius-slider drag that crossed a tool switch (letter key mid-drag)
+  went on editing the *new* tool's radius — measured pre-fix: the
+  Eraser's radius went 24 → 232 from a drag begun on the Brush. Fix:
+  `end_radius_drag_on_tool_change` drops the slider's capture whenever
+  `App::handle_key_event`'s `handle_key` (letter shortcuts and the
+  command palette — the only paths that change `App::tool`; the macOS
+  menu's `activate_command` cannot) changed the tool. Test
+  `a_tool_switch_mid_drag_ends_the_radius_drag`: the Eraser stays 24,
+  the Brush keeps its drag value. Its `Rig` mirrors
+  `App::handle_key_event`, so the `App` call site itself is pinned by
+  the mirror, as the rest of that `Rig` is. (4) **RT136-4:** an
+  assistive technology's action on the radius slider now drops a live
+  pointer capture of it first (`release_radius_capture`, mirroring
+  `end_pointer_opacity_drag`), so the rest of that pointer gesture
+  cannot override the action's value — test
+  `an_at_set_value_mid_drag_ends_the_pointer_drag_of_the_radius_slider`.
+  (5) **RT136-3, disclosed not capped — a performance edge to measure on
+  real hardware:** at the slider's 1 px minimum `dab_step` hits its
+  0.5 px floor, so one 64 px segment lays **128** dabs against **10** at
+  the 24 px default (12.8×), and **1** at 256 px — pinned by
+  `a_one_pixel_radius_lays_many_more_dabs_per_segment`. Each tiny dab
+  touches few pixels, but per-dab overhead (tile lookup, snapshot
+  capture, cache invalidation) scales with the count, against the 10 ms
+  brush-latency budget whose measured margin is under 1 ms. No cap was
+  added: raising the floor would visibly gap a 1 px stroke, so it is a
+  brush-feel decision, not a trivial safe fix. **Measured (reviser):**
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-widgets -p aurora-ui -p
+  aurora-app` on the RTX 3090, workspace clippy `-D warnings` and
+  `cargo fmt --all --check`: 1,486 passed (aurora-app lib 499,
+  aurora-ui 125, aurora-widgets lib 732, `tests/gallery.rs` 129 + 45
+  ignored, `tests/headless.rs` 1), 0 failed, 0 skipped; clippy, fmt and
+  `cargo doc -p aurora-app --document-private-items` (`-D warnings`)
+  clean. Workspace total now 2,476 + 5 = 2,481 (not re-run
+  workspace-wide in this revision; the other crates are untouched).
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,482 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. Judge:
+  PASS, 0.92. Carried: the Properties body says "Radius: 24px" while the
+  readout says "Radius 24 px" (a screen-reader user hears both formats —
+  unify or flag to the design owner); a cheap guard that `paint_dab` and
+  `erase_dab` pass the right `DabTool`.
 
   Wired into `aurora-app` via a new `demo_layers()` — a small, clearly-
   fake three-layer tree (Background, Color balance at Multiply/80%,
@@ -28786,6 +29622,90 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-28 (0.141.0) — dialog titles.** A dialog's title now
+has its own one-row slot above the message (an unlabelled
+`GenericContainer`, so the title is still announced once, by the
+dialog), drawn through `text_runs` in `text.primary`. The dialog is
+122 px tall; its short-window floor moved to 68 px and both short-window
+tests were re-bracketed. No golden changed (none exist for the dialog).
+Full account: M1.7's widget-set "Update 0.141.0". **Needs a human:** the
+crash-recovery dialog on real hardware at scale 1.0 and 2.0, and a
+screen reader confirming a single title announcement; Cahya to decide
+whether a dialog title gets its own weight or size token. The text
+follow-ups named since 0.133.0 are now done except message wrapping,
+`Label` auto-sizing, ellipsis and font fallback. **Suggested next
+(0.142.0):** double-click word selection (queued since 0.139.0); after
+that the M1.10 gate work — the 60 FPS canvas budget (`recomposite` is
+~73% of the GPU-path frame, the only stage where the gap can plausibly
+close) is the largest engineering item still open there.
+
+**Addendum 2026-09-28 (0.140.0) — text-aware layout; checkbox labels.**
+`compute_text_layout` sizes each checkbox to box + gap + label with the
+paint's own engine and scale factor; the app lays out only through it,
+and creates the text engine before its first layout. Full account: M1.7's
+"Layout engine" 0.140.0 update. **Needs a human:** the Layers panel's
+`Visible` checkbox and the gallery checkbox at scale 1.0 and 2.0;
+Cahya to decide whether a labelled checkbox's focus ring should enclose
+its label and to confirm the `spacing.sm` gap. **Suggested next
+(0.141.0): dialog title** — a title node as the dialog's first child,
+`row_height` tall, its accessibility node a `GenericContainer` left
+unlabeled (the dialog already carries the title as its own label),
+drawn through the same `text_runs` path; re-bless the dialog goldens
+only. Message wrapping stays deferred; then double-click word
+selection.
+
+**Addendum 2026-09-28 (0.139.0) — caret blink.** The text caret blinks
+(530 ms, not a token, flagged to Cahya), restarts solid on any edit or
+caret change, is steady under reduced motion and hidden in a background
+window, and the loop sleeps until the next flip. Full account: M1.7's
+"Text field" 0.139.0 update. **Needs a human:** watch it blink on real
+hardware, including switching apps and macOS "Reduce motion".
+**Suggested next:** the measure-func layout round (checkbox labels,
+dialog titles); then double-click word selection (a click-count
+detector).
+
+**Addendum 2026-09-28 (0.138.0) — placing the caret with the pointer.**
+Click, `Shift`+click and drag-select in a text field, hit-tested against
+the same geometry the field draws. Full account: M1.7's "Text field"
+0.138.0 update. **Needs a human:** click/drag in the Widget Gallery's
+field on a real Retina display, with a line long enough to scroll.
+**Suggested next:** 0.139.0 caret blink (reset on edit, an
+`about_to_wait` deadline, off under reduced motion); then double-click
+word selection (a click-count detector) and the measure-func layout
+round (checkbox labels, dialog titles).
+
+**Addendum 2026-09-28 (0.137.0) — text-field keyboard chords.**
+Clipboard trio, select-all, field undo/redo and word motion in a
+focused text field; palette paste filtered/capped and on the primary
+modifier. Full account: M1.7's "Text field" 0.137.0 update. **Needs a
+human:** `Cmd+C/V/X/A/Z` in the Widget Gallery's field on macOS against
+the real system clipboard (and `Ctrl` on Linux/Windows), and that
+`Ctrl+Z`/`Cmd+Z` in the field leaves the canvas untouched.
+**Suggested next:** 0.138.0 click/Shift+click/drag caret placement (a
+text hit-test from pointer x to a byte offset); 0.139.0 caret blink
+(reset on edit, an `about_to_wait` deadline, off under reduced motion);
+then the measure-func layout round (checkbox labels, dialog titles).
+
+**Addendum 2026-09-28 (0.136.0) — editable Properties-panel tool
+controls.** A radius readout and slider for Brush/Eraser on a live
+`ToolSettings`, plus a minimal `Label` widget; no undo, not persisted.
+Full account: M1.8's 0.136.0 update. **Needs a human:** drag the radius
+slider and paint on real hardware; the design owner to confirm the
+1–256 px range, radius-vs-"Size" wording and readout colour.
+**Suggested next (0.137.0): text follow-ups** — checkbox labels and
+dialog titles via a measure-func layout pass, click-to-place caret,
+clipboard/select-all/undo in text fields, and caret blink. (0.137.0 did
+the clipboard/select-all/undo chords; see its own addendum.)
+
+**Addendum 2026-09-28 (0.135.0) — editable Layers-panel controls.**
+Opacity/blend/visibility for the active layer, one undo step per
+gesture, shared widget routing. Full account: M1.8's 0.135.0 update.
+**Needs a human:** drag the opacity slider and switch blend modes on
+real hardware (feel, recomposite latency, the long mode list on a short
+window). **Suggested next (0.136.0):** Properties-panel brush/eraser
+radius sliders (a `ToolSettings` replacing the `BRUSH_RADIUS`/
+`ERASER_RADIUS` consts), a minimal Label widget, and value readouts.
+
 **Addendum 2026-09-26 (0.133.0) — editable text.** Text fields draw
 content, a focused caret, selection and IME preedit underlines, scrolled
 to keep the caret visible; the command palette draws its query (new
@@ -28797,7 +29717,7 @@ real Retina display. **Design-owner decisions raised:** caret colour,
 width and blink tokens; selection colours are `accent.primary` /
 `text.on_accent` provisionally. **Suggested next:** checkbox labels (a
 measure-func layout pass), dialog titles, click-to-place caret, sticky
-scroll.
+scroll (both done in 0.138.0).
 
 **Addendum 2026-09-26 (0.132.0) — real text rendering.** Widget labels
 are real glyphs: `aurora-text` shapes (`harfrust`) and rasterizes

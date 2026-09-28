@@ -2,11 +2,12 @@
 //! first widget slice covers.
 
 use accesskit::{Action, Node, Role, Toggled};
+use aurora_core::Rect;
 use aurora_theme::Scales;
 use taffy::style_helpers::length;
 use taffy::{Size, Style};
 
-use super::{WidgetKind, type_size};
+use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 
@@ -46,6 +47,49 @@ fn style(scales: &Scales) -> Style {
             height: side,
         },
         ..Default::default()
+    }
+}
+
+/// The checkbox's box side and the gap between the box and its label,
+/// logical px: `type.size.md` (the same side its unmeasured layout box
+/// has, see [`style`]) and `spacing.sm`. Shared by the text-aware
+/// measurer (`crate::measure`), the paint of the box and focus ring, and
+/// the label's text run, so the three can never disagree on where the
+/// box ends and the label starts.
+pub(crate) fn checkbox_metrics(scales: &Scales) -> (f32, f32) {
+    (
+        type_size(scales.typography.size.md),
+        spacing(scales.spacing.sm),
+    )
+}
+
+/// The checkbox's own box within its layout `bounds` (0.140.0).
+///
+/// A **measured** checkbox (laid out through `crate::compute_text_layout`,
+/// [`WidgetTree::is_measured`]) has bounds that cover its box, a
+/// `spacing.sm` gap and its label — one widget, so a click on the label
+/// toggles it through the existing click path — and its box is a
+/// `type.size.md` square flush with the left edge, vertically centred,
+/// shrunk to fit if `bounds` is smaller.
+///
+/// An **unmeasured** checkbox's bounds *are* its box, whatever size they
+/// are: its default style is that same square, and a hand-sized cell (the
+/// component gallery's 64 px ones) is painted whole, exactly as before
+/// 0.140.0 — which is why every checkbox golden (laid out with no text
+/// engine) is unchanged.
+#[must_use]
+pub(crate) fn checkbox_box_rect(bounds: Rect, measured: bool, scales: &Scales) -> Rect {
+    if !measured {
+        return bounds;
+    }
+    let side = scales.typography.size.md;
+    let width = side.min(bounds.width);
+    let height = side.min(bounds.height);
+    Rect {
+        x: bounds.x,
+        y: bounds.y + i64::from((bounds.height - height) / 2),
+        width,
+        height,
     }
 }
 
@@ -102,6 +146,40 @@ pub fn toggle_checkbox(
     Ok(result)
 }
 
+/// Sets `id`'s checked state directly — an owner-driven change (the
+/// document's own value changed, an undo), not a user gesture, so unlike
+/// [`toggle_checkbox`] it is allowed on a **disabled** checkbox, the same
+/// distinction `set_dropdown_selected` draws. Setting the state it
+/// already has changes nothing: no accessibility rebuild, no damage.
+/// A real change rebuilds the accessibility node (so `toggled` reports
+/// the new state) and marks the control's bounds dirty so it repaints.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a checkbox.
+/// Nothing changes when either happens.
+pub fn set_checkbox_checked(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    checked: Toggled,
+) -> Result<(), WidgetError> {
+    match tree.payload(id) {
+        None => return Err(WidgetError::UnknownWidget(id)),
+        Some(WidgetKind::Checkbox(state)) => {
+            if state.checked == checked {
+                return Ok(());
+            }
+        }
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+    }
+    with_checkbox_mut(tree, id, |state| {
+        state.checked = checked;
+        Ok(())
+    })?;
+    tree.mark_dirty(id)
+}
+
 /// Sets whether `id` (a checkbox) is disabled.
 ///
 /// # Errors
@@ -140,7 +218,7 @@ fn with_checkbox_mut(
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_checkbox, set_checkbox_disabled, toggle_checkbox};
+    use super::{insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox};
     use crate::WidgetError;
     use crate::widgets::{WidgetKind, new_tree, test_scales};
     use accesskit::{Action, Toggled};
@@ -245,5 +323,89 @@ mod tests {
             Err(WidgetError::WrongWidgetKind(id)) => assert_eq!(id, root),
             other => unreachable!("expected WrongWidgetKind, got {other:?}"),
         }
+    }
+    #[test]
+    fn set_checkbox_checked_sets_the_value_and_the_accessibility_toggle() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_checkbox(&mut tree, root, &scales, "Visible") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_checkbox_checked(&mut tree, id, Toggled::True) {
+            unreachable!("{err:?}");
+        }
+        match tree.payload(id) {
+            Some(WidgetKind::Checkbox(state)) => assert_eq!(state.checked, Toggled::True),
+            other => unreachable!("expected Checkbox, got {other:?}"),
+        }
+        let Some(accessibility) = tree.accessibility(id) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(accessibility.toggled(), Some(Toggled::True));
+    }
+
+    #[test]
+    fn set_checkbox_checked_is_allowed_on_a_disabled_checkbox() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_checkbox(&mut tree, root, &scales, "Visible") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_checkbox_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            matches!(toggle_checkbox(&mut tree, id), Err(WidgetError::WidgetDisabled(got)) if got == id),
+            "a user toggle is refused while disabled"
+        );
+        if let Err(err) = set_checkbox_checked(&mut tree, id, Toggled::True) {
+            unreachable!("an owner-driven set must succeed while disabled: {err:?}");
+        }
+        match tree.payload(id) {
+            Some(WidgetKind::Checkbox(state)) => {
+                assert_eq!(state.checked, Toggled::True);
+                assert!(state.disabled, "setting the value must not re-enable it");
+            }
+            other => unreachable!("expected Checkbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_checkbox_checked_to_the_same_value_causes_no_damage() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_checkbox(&mut tree, root, &scales, "Visible") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 200.0);
+        tree.take_damage();
+        if let Err(err) = set_checkbox_checked(&mut tree, id, Toggled::False) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.take_damage(),
+            None,
+            "an unchanged value repaints nothing"
+        );
+        if let Err(err) = set_checkbox_checked(&mut tree, id, Toggled::True) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.is_dirty(id), Some(true));
+        assert!(
+            tree.take_damage().is_some(),
+            "a real change reaches the damage region"
+        );
+    }
+
+    #[test]
+    fn set_checkbox_checked_rejects_a_non_checkbox() {
+        let (mut tree, root) = new_tree(Style::default());
+        assert!(matches!(
+            set_checkbox_checked(&mut tree, root, Toggled::True),
+            Err(WidgetError::WrongWidgetKind(got)) if got == root
+        ));
     }
 }

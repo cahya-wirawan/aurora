@@ -95,7 +95,9 @@ exactly the property entry 2's auto-margin floor lacks.
   to `align_self: Center` (both vertical insets `auto()`) moved the minimum
   working window height from **~73px down to ~35px** at a fixed dialog content
   height of ~89px — a real, swept, before/after measurement, not a theoretical
-  improvement.
+  improvement. (0.141.0 gave the dialog title its own row, so the content is
+  now 122px and the same centring's floor is 68px — the floor tracks twice the
+  distance from the dialog's centre to its button, not the mechanism.)
 - **Found:** Dialog-overlay round (`0.77.7`).
 - **Caveat, same round:** this only applies on the axis a flex item's
   `align-self` actually governs — the *cross* axis. On the *main* axis of its

@@ -902,6 +902,44 @@ impl History {
         Ok(())
     }
 
+    /// Records an opacity change for `id` from `old` to whatever `tree`
+    /// currently shows, as a single undo step — the opacity counterpart
+    /// of [`Self::record_bounds_change`], and for the same kind of
+    /// caller: `aurora-app`'s Layers-panel opacity slider applies every
+    /// drag position to `tree` directly (live feedback, no undo step per
+    /// pointer-move) and records exactly one entry for the whole gesture
+    /// once it ends. Never touches `tree`. Journals
+    /// `SetOpacity { value: tree.opacity(id) }` and pushes its inverse,
+    /// `SetOpacity { value: old }`, so one undo restores `old` exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't name a real
+    /// layer in `tree`, or [`DocError::OpacityOutOfRange`] if `old` is
+    /// one [`LayerTree::set_opacity`] would refuse (outside `0.0..=1.0`,
+    /// or NaN). Nothing is recorded when either happens.
+    ///
+    /// `old` is checked up front, with `set_opacity`'s own predicate, for
+    /// exactly the reason [`Self::record_bounds_change`] documents: an
+    /// entry `undo` cannot apply would sit on the stack unpopped and
+    /// wedge undo permanently.
+    pub fn record_opacity_change(
+        &mut self,
+        tree: &LayerTree,
+        id: LayerId,
+        old: f32,
+    ) -> Result<(), DocError> {
+        let current = tree.opacity(id).ok_or(DocError::UnknownLayer(id))?;
+        // Same predicate as `LayerTree::set_opacity`, before any push.
+        if !(0.0..=1.0).contains(&old) {
+            return Err(DocError::OpacityOutOfRange(old));
+        }
+        self.journal
+            .push(LayerOp::SetOpacity { id, value: current });
+        self.push(LayerOp::SetOpacity { id, value: old });
+        Ok(())
+    }
+
     /// Same as [`LayerTree::set_visible`], recorded for undo.
     ///
     /// # Errors
@@ -2178,6 +2216,94 @@ mod tests {
             Err(DocError::UnknownLayer(got)) => assert_eq!(got, id),
             other => unreachable!("expected UnknownLayer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn record_opacity_change_records_one_undo_step_covering_a_change_already_applied() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let start = tree.opacity(id);
+        assert_eq!(start, Some(1.0));
+        // A live drag: several positions applied directly, bypassing
+        // History, exactly as `aurora-app`'s opacity slider does.
+        for value in [0.9, 0.6, 0.35] {
+            if let Err(err) = tree.set_opacity(id, value) {
+                unreachable!("{err:?}");
+            }
+        }
+        let journal_len_before = history.journal_len();
+
+        if let Err(err) = history.record_opacity_change(&tree, id, 1.0) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(history.journal_len(), journal_len_before + 1);
+        assert!(!history.can_redo());
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.opacity(id),
+            Some(1.0),
+            "one undo restores the pre-gesture opacity exactly"
+        );
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.opacity(id),
+            Some(0.35),
+            "redo reapplies the final value"
+        );
+    }
+
+    #[test]
+    fn record_opacity_change_rejects_an_unknown_id() {
+        let tree = LayerTree::new();
+        let mut history = History::new();
+        let bogus: super::LayerId = Id::from_raw(999);
+        match history.record_opacity_change(&tree, bogus, 0.5) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+        assert_eq!(history.journal_len(), 0);
+        assert!(!history.can_undo());
+    }
+
+    // The opacity twin of the 0.57.14 bounds wedge: an out-of-range or
+    // NaN `old` would sit on the undo stack, `undo` would refuse it via
+    // `LayerTree::set_opacity`, and nothing would pop it.
+    #[test]
+    fn record_opacity_change_rejects_an_invalid_old_value_and_records_nothing() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for bad in [-0.01_f32, 1.01, f32::NAN, f32::INFINITY] {
+            match history.record_opacity_change(&tree, id, bad) {
+                Err(DocError::OpacityOutOfRange(_)) => {}
+                other => unreachable!("expected OpacityOutOfRange for {bad}, got {other:?}"),
+            }
+            assert_eq!(history.journal_len(), 0, "a refused call journals nothing");
+            assert!(!history.can_undo(), "a refused call pushes nothing");
+        }
+        // Still usable afterwards.
+        if let Err(err) = tree.set_opacity(id, 0.25) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.record_opacity_change(&tree, id, 1.0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.opacity(id), Some(1.0));
     }
 
     #[test]

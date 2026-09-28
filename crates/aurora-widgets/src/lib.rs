@@ -68,8 +68,10 @@
 //! consumer.
 
 pub mod action;
+mod caret;
 mod error;
 mod input;
+mod measure;
 mod paint;
 mod pointer;
 pub mod render;
@@ -83,16 +85,18 @@ mod tree;
 pub mod widgets;
 
 pub use action::{ALL_ACTIONS, ActionOutcome, ActionRejection, handle_action};
+pub use caret::{CARET_BLINK_INTERVAL, CaretBlink, CaretSignature, caret_signature};
 pub use error::WidgetError;
 pub use input::{FocusManager, FocusOrigin, hit_test};
+pub use measure::{TextMeasure, compute_text_layout, measure_widget};
 pub use paint::{
     FOCUS_RING_INNER_WIDTH, FOCUS_RING_WIDTH, FocusPaint, Paint, PaintOp, SLIDER_THUMB_DIAMETER,
     SLIDER_TRACK_THICKNESS, paint_widget, paint_widget_ops, paint_widget_ops_focused,
     paint_widget_ops_frame,
 };
 pub use pointer::{
-    ClickTracker, KeyOutcome, PointerEvent, PointerOutcome, PointerPhase, handle_pointer,
-    handle_widget_key, handle_widget_text, is_shortcut_chord,
+    ClickTracker, KeyOutcome, NoTextHit, PointerEvent, PointerOutcome, PointerPhase, TextHit,
+    handle_pointer, handle_pointer_with, handle_widget_key, handle_widget_text, is_shortcut_chord,
 };
 pub use render::{
     AtlasLayout, AtlasSlot, GlyphAtlas, GlyphBatch, GpuColorMesh, GpuGlyphMesh, GpuMesh,
@@ -101,7 +105,7 @@ pub use render::{
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use text::{
-    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_scroll, label_style,
-    resolve_run, resolve_text, text_runs,
+    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_offset_at, field_scroll,
+    label_style, resolve_run, resolve_text, sticky_scroll, text_runs, update_field_scrolls,
 };
 pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};

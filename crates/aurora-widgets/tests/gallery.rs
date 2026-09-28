@@ -516,8 +516,9 @@ const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = (
 /// surround on all four sides without this file arranging one. The
 /// width is 256 because `read_rgba8` needs `width * 4` to be a multiple
 /// of `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`; the height is 192 so the
-/// dialog's own fixed ~89 px content height (nothing measures text)
-/// leaves a generous band of backdrop above and below it.
+/// dialog's own fixed content height (122 px since 0.141.0 gave the
+/// title its own row, ~89 px before; nothing measures dialog text)
+/// leaves a band of backdrop above and below it — 35 px each side.
 const DIALOG_CELL: (u32, u32) = (256, 192);
 const DIALOG_GALLERY_SIZE: (u32, u32) = DIALOG_CELL;
 
@@ -1580,12 +1581,15 @@ fn dialog_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2
 /// taffy-derived layout, which this file has already had to apologize
 /// for once (`TREE_VIEW_ROW_HEIGHT`'s own doc comment). And the
 /// dialog's naive centre is genuinely the *wrong* point: its content is
-/// only ~89 px tall — padding, a one-row message band, a gap, then the
-/// action button — so the vertical middle of the box lands on or very
-/// near the button, and "the surface is painted" would silently become
-/// "the button is painted." The surface sample is therefore taken
-/// halfway between the dialog's own top edge and the button's, which is
-/// message band and gap: dialog surface, nothing else.
+/// only 122 px tall — padding, a one-row title band (0.141.0), a gap, a
+/// one-row message band, a gap, then the action button — so the
+/// vertical middle of the box lands on or very near the button, and
+/// "the surface is painted" would silently become "the button is
+/// painted." The surface sample is therefore taken halfway between the
+/// dialog's own top edge and the button's (41 px down at the default
+/// scales), which since 0.141.0 lands in the gap between the title row
+/// and the message row: dialog surface, nothing else. (Neither text
+/// band paints a fill; any glyphs drawn there are `crate::text` runs.)
 ///
 /// That derivation holds **by construction, at any density**, but only
 /// one `Scales` fixture (the committed comfortable-density
