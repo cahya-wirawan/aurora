@@ -85,9 +85,10 @@
 //! the Layers panel already pays. Making History pay it too, for rows
 //! that route nowhere, would be a worse experience, not a better one.
 //!
-//! **One-shot, not reactive** — see [`crate::layers_panel`]'s own doc
-//! comment for why (the same reasoning applies here: nothing can edit
-//! a live document in `aurora-app` yet either).
+//! **One-shot, not reactive** — a caller re-populates after every
+//! recorded step. Since 0.135.0 that includes the Layers panel's own
+//! controls (`aurora-app`'s `refresh_history_panel`), the first panel
+//! widgets that edit a live document.
 
 use accesskit::{Node, Role};
 use aurora_doc::History;

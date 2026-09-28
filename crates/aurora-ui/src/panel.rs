@@ -420,6 +420,29 @@ pub fn set_panel_collapsed(
     tree.set_style(panel.root, root_style(collapsed))?;
 
     tree.set_style(panel.body, body_style(collapsed))?;
+    // Any *other* child of the root is panel content too (the Layers
+    // panel's controls strip, `crate::layer_controls`, lives there so
+    // repopulating the body cannot destroy it) and must hide with the
+    // body. Only `display` is touched, so each keeps its own style.
+    let others: Vec<WidgetId> = tree
+        .children(panel.root)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|&child| child != panel.body)
+        .collect();
+    for child in others {
+        let mut style = tree
+            .style(child)
+            .cloned()
+            .ok_or(WidgetError::UnknownWidget(child))?;
+        style.display = if collapsed {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        tree.set_style(child, style)?;
+    }
 
     let node = tree
         .accessibility(panel.root)

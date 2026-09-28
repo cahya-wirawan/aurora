@@ -26,6 +26,13 @@ than the tidiness.
 
 ## Where we are
 
+**Latest (2026-09-28, 0.135.0): the Layers panel edits the document.**
+An opacity slider (live drag, one undo step per gesture), a 27-mode
+blend-mode dropdown and a visibility checkbox for the active layer, on a
+router now shared between the Widget Gallery and the Layers controls.
+Details and disclosures: M1.8's "Layers, history, tool-options panels"
+0.135.0 update.
+
 **Latest (2026-09-26, 0.133.0): text round 2 — editable text.** A text
 field now draws its content, a caret while focused (any focus origin),
 its selection (`accent.primary` highlight, selected glyphs in
@@ -6460,6 +6467,97 @@ structural design work.
   state it's given; there's no diff-and-refresh mechanism yet, which is
   fine since nothing can edit a live document in `aurora-app` yet
   either.
+
+  **Update 0.135.0 — editable Layers-panel controls + shared widget
+  routing.** *(The "nothing can edit a live document" clause above is
+  superseded here.)* The Layers panel now carries an **opacity slider,
+  a blend-mode dropdown (all 27 modes, Photoshop's names, option order
+  = `BlendMode::ALL`) and a visibility checkbox** for the active layer
+  (`crates/aurora-ui/src/layer_controls.rs`, new). The strip is a child
+  of the panel *root*, after the body, because `populate_layers_panel`
+  clears the whole body on every call; `set_panel_collapsed` now hides
+  every non-body child of a panel root too. `sync_layer_controls`
+  mirrors the document into them in place (disables all three with no
+  active layer; never overwrites a slider holding pointer capture;
+  touches nothing when nothing changed). Row descriptions use the new
+  `blend_mode_label` ("Linear Dodge (Add)", not `LinearDodge`) and are
+  refreshed in place through the newly public `layer_row_description`.
+  In `aurora-app` the gallery-only routers became `route_widget_pointer`
+  / `route_widget_key` with a `WidgetOwner` (Gallery / LayerControls)
+  and one shared `ClickTracker`; the gallery-only names survive as
+  `#[cfg(test)]` wrappers so every 0.130–0.134 gallery test runs
+  unchanged. `apply_layer_control_outcome`: a **slider drag** applies
+  every move to the tree directly and records **one** undo step on
+  release via the new `History::record_opacity_change` (validated up
+  front like `record_bounds_change`, so a bad `old` cannot wedge undo);
+  a **keyboard/AT** opacity change, a **blend-mode commit** and a
+  **visibility toggle** are one `History` step each; every change
+  reports `CompositeInvalidation::Everything`. Every gesture-ending path
+  commits a pending drag: release, a modal's cancel (commits, like a
+  Move), `CursorLeft`, a press elsewhere (so an active-layer change
+  mid-drag commits to the *original* layer), `Undo`/`Redo` (commit
+  first, inside `perform_undo_redo`, which then re-syncs the controls),
+  and opening a file (commits before the document is replaced).
+  Assistive technology: a new `AccessibilityReaction::LayerControl` arm;
+  the live-workspace mapping guard now builds the controls and asserts
+  their actions reach it. `App::about_to_wait` runs the sync as a
+  catch-all every loop iteration. New `aurora-widgets`
+  `set_checkbox_checked` (owner-driven, allowed while disabled, no-op
+  when unchanged). Tests: 3 `aurora-doc`, 4 `aurora-widgets`, 7
+  `aurora-ui`, 12 `aurora-app` (including
+  `switching_a_layer_to_multiply_in_the_dropdown_changes_the_gpu_composite`,
+  run under `AURORA_REQUIRE_GPU=1` on an RTX 3090 with the Multiply
+  dispatch counter asserted). **Disclosed:** the brush still has no
+  opacity/flow parameter; keyboard/AT opacity changes are one undo step
+  per key/action (no coalescing); every drag move recomposites the whole
+  document (60 FPS is already missed); the 27-row list (~567 px) can
+  overflow a short window with no scrolling (the keyboard still reaches
+  every option); the strip sits *below* the layer list (`WidgetTree`
+  only appends); visibility is for the active layer only (no per-row
+  eye); a group gets the controls too; the `App` wiring (the
+  `about_to_wait` sync, `CursorLeft`, `run_undo_redo`'s capture release)
+  is covered by inspection plus free-function tests that mirror it, not
+  by driving `App` itself; nothing verified on Metal/DX12 or with a real
+  screen reader, and no human has dragged the slider on real hardware.
+
+  **Review revision (0.135.0, same version).** Red-team/critic findings
+  fixed, each with a test shown to fail by re-applying the mutation it
+  guards against (then restored, sha256-checked): an assistive
+  technology's row press mid pointer-drag now commits the drag on its own
+  layer and drops the slider's capture (`AccessibilityContext` carries
+  the shared `ClickTracker`), and — defensively, for any other path that
+  moves the active layer under a held capture — the live-drag branch
+  commits and then *drops* the rest of that capture (`detached`) instead
+  of retargeting it onto the new layer (RT135-3); replacing the document
+  (`open_file`/`open_aur_file`, so a dropped file too) now also closes an
+  open blend-mode list, via one `end_layer_control_gestures` helper
+  (RT135-4); the drag rig asserts every live move is `Everything`
+  (RT135-1); the collapse test asserts the strip's own `Display::None`
+  and that the slider's former centre no longer hits the strip (RT135-2);
+  an app-level test runs the app's `sync_layer_controls` wrapper between
+  moves with the tracker's capture (RT135-5); and `about_to_wait` now
+  syncs the controls after the macOS menu drain, so a menu command is
+  mirrored the same iteration (C5). New tests:
+  `an_accessibility_row_press_mid_drag_ends_the_drag_on_its_own_layer`,
+  `a_drag_whose_active_layer_changes_under_it_is_dropped_not_retargeted`,
+  `replacing_the_document_closes_the_blend_list_and_commits_a_drag`,
+  `the_apps_sync_leaves_a_dragged_slider_alone_between_moves`.
+  **Carry forward (C2):** no structural keyboard command (new, delete or
+  duplicate layer) exists yet; when one lands it must commit a pending
+  opacity drag first (`finish_opacity`, dropping the slider's capture),
+  exactly as undo/redo and a document swap already do.
+  **Judge follow-up, same version:** an assistive-technology action on a
+  control mid pointer drag now ends that drag the same way a row press
+  does (`end_pointer_opacity_drag`: committed, capture dropped), so the
+  rest of the pointer gesture can neither open a second step nor override
+  the action's value — test
+  `an_accessibility_set_value_mid_drag_ends_the_pointer_drag`, which fails
+  with the call removed. **Measured after the revision:** full gate green
+  on the RTX 3090 with `AURORA_REQUIRE_GPU=1` — 2,458 passed, 0 failed,
+  45 ignored, 0 skipped; doctests, strict rustdoc and `cargo deny check`
+  clean. Judge: PASS, 0.91. Carried: keyboard steps can drift off whole
+  percentages after a sync-back (cosmetic); a stale doc comment near
+  `run_undo_redo` saying Ctrl+Z never reaches it.
 
   Wired into `aurora-app` via a new `demo_layers()` — a small, clearly-
   fake three-layer tree (Background, Color balance at Multiply/80%,
@@ -28785,6 +28883,15 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-28 (0.135.0) — editable Layers-panel controls.**
+Opacity/blend/visibility for the active layer, one undo step per
+gesture, shared widget routing. Full account: M1.8's 0.135.0 update.
+**Needs a human:** drag the opacity slider and switch blend modes on
+real hardware (feel, recomposite latency, the long mode list on a short
+window). **Suggested next (0.136.0):** Properties-panel brush/eraser
+radius sliders (a `ToolSettings` replacing the `BRUSH_RADIUS`/
+`ERASER_RADIUS` consts), a minimal Label widget, and value readouts.
 
 **Addendum 2026-09-26 (0.133.0) — editable text.** Text fields draw
 content, a focused caret, selection and IME preedit underlines, scrolled

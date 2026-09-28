@@ -25,9 +25,9 @@
 //! here — that's real, separate work for whenever `aurora-vector`/text
 //! rendering exist to build one with.
 //!
-//! **One-shot, not reactive** — see [`crate::layers_panel`]'s own doc
-//! comment for why (the same reasoning applies here: nothing can edit
-//! a live document in `aurora-app` yet either). A caller re-populates on
+//! **One-shot, not reactive** — nothing here edits anything (the
+//! first panel controls that edit a live document, 0.135.0, are the
+//! Layers panel's own, [`crate::layer_controls`]). A caller re-populates on
 //! every tool change and [`populate_properties_panel`] empties the body
 //! for itself first, the same contract its two sibling `populate_*`
 //! functions already had — see `aurora-app`'s own

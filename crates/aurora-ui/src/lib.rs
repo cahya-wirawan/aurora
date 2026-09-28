@@ -22,6 +22,11 @@
 //! [`properties_panel`]'s own doc comment for why this crate carries no
 //! tool-specific knowledge itself).
 //!
+//! [`layer_controls`] (0.135.0) adds the Layers panel's opacity slider,
+//! blend-mode dropdown and visibility checkbox for the active layer —
+//! the first panel widgets that edit a live document (`aurora-app` owns
+//! the undo semantics).
+//!
 //! [`canvas_view::CanvasView`] and [`tool`] are PLAN.md M1.9's "basic
 //! tools" bullet: the pan/zoom coordinate transform and the tool
 //! dispatch logic (Move, Marquee Select, Zoom, Pan, Eyedropper) a real
@@ -32,6 +37,7 @@
 pub mod canvas_view;
 pub mod gallery_panel;
 pub mod history_panel;
+pub mod layer_controls;
 pub mod layers_panel;
 pub mod panel;
 pub mod properties_panel;
@@ -45,7 +51,11 @@ pub use gallery_panel::{
     remove_gallery_panel,
 };
 pub use history_panel::populate_history_panel;
-pub use layers_panel::populate_layers_panel;
+pub use layer_controls::{
+    LayerControls, blend_mode_index, blend_mode_label, blend_mode_options, insert_layer_controls,
+    layer_controls_contains, sync_layer_controls,
+};
+pub use layers_panel::{layer_row_description, populate_layers_panel};
 pub use panel::{
     PanelHandle, clear_panel_body, close_panel, insert_panel, panel_is_collapsed,
     set_panel_collapsed,

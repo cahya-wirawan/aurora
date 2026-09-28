@@ -158,7 +158,9 @@ mod tooltip;
 mod tree_view;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
-pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
+pub use checkbox::{
+    CheckboxState, insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox,
+};
 pub use color_picker::{
     ColorPickerKey, ColorPickerOutcome, ColorPickerPart, ColorPickerPartRole, ColorPickerPartState,
     ColorPickerState, Hsv, color_picker_part_at, color_picker_part_of, color_picker_state,

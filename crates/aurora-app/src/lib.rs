@@ -2506,6 +2506,9 @@ enum AccessibilityReaction {
     /// A `Click` on a Layers-panel row: select that layer through
     /// [`press_layer_row`], exactly as a pointer press on the row does.
     PressLayer(aurora_doc::LayerId),
+    /// An action on one of the Layers panel's controls (0.135.0) — handed
+    /// to [`apply_layer_control_outcome`], which edits the document.
+    LayerControl(aurora_widgets::ActionOutcome),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -2530,6 +2533,7 @@ fn route_accessibility_action(
     focus: &mut FocusManager,
     dialog: Option<&DialogHandle>,
     layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
     request: &accesskit::ActionRequest,
 ) -> AccessibilityReaction {
     if let Some(handle) = dialog
@@ -2551,6 +2555,13 @@ fn route_accessibility_action(
             if layer_rows.contains_key(&id) =>
         {
             AccessibilityReaction::LayerRowExpanded { row: id, expanded }
+        }
+        Ok(outcome)
+            if layer_controls.is_some_and(|controls| {
+                aurora_ui::layer_controls_contains(&workspace.tree, controls, request.target_node)
+            }) =>
+        {
+            AccessibilityReaction::LayerControl(outcome)
         }
         Ok(outcome) => AccessibilityReaction::Handled(outcome),
         Err(err) => AccessibilityReaction::Rejected(err),
@@ -2628,7 +2639,7 @@ struct AccessibilityContext<'a> {
     /// The open command palette's root, if any.
     palette: Option<WidgetId>,
     scales: &'a Scales,
-    layers: &'a aurora_doc::LayerTree,
+    layers: &'a mut aurora_doc::LayerTree,
     layer_rows: &'a mut HashMap<WidgetId, aurora_doc::LayerId>,
     active_layer: &'a mut Option<aurora_doc::LayerId>,
     view: &'a mut aurora_ui::CanvasView,
@@ -2637,6 +2648,15 @@ struct AccessibilityContext<'a> {
     undo_order: &'a mut UndoOrder,
     composite_cache: &'a mut CompositeCache,
     drag: &'a mut Option<Drag>,
+    /// The Layers panel's controls and a live opacity drag (0.135.0): an
+    /// assistive technology's action on a control edits the document
+    /// through [`apply_layer_control_outcome`], one undo step each.
+    layer_controls: &'a mut LayerControlsState,
+    /// The shared pointer tracker (`App::gallery_click`): a Layers-row
+    /// press ends a live opacity drag and drops the slider's capture, so
+    /// the pointer drag cannot go on into the newly active layer (review
+    /// RT135-3).
+    click: &'a mut ClickTracker,
     /// The Widget Gallery while open: an assistive technology's action on
     /// one of its widgets gets the same [`aurora_ui::apply_gallery_outcome`]
     /// reaction the pointer and keyboard paths give it (critic C1).
@@ -2683,11 +2703,64 @@ fn outcome_is_widget_local(outcome: &aurora_widgets::ActionOutcome) -> bool {
     }
 }
 
+/// [`AccessibilityReaction::LayerControl`]'s reaction: an assistive
+/// technology's action is its own gesture, so a pointer drag still
+/// pending ends first ([`end_pointer_opacity_drag`]: committed, and the
+/// slider's capture dropped so the rest of that pointer gesture cannot
+/// open a second step or override the action's value — judge follow-up
+/// 1), and the action itself is one undo step (no capture is passed to
+/// [`apply_layer_control_outcome`]).
+fn apply_layer_control_accessibility(
+    cx: &mut AccessibilityContext<'_>,
+    outcome: aurora_widgets::ActionOutcome,
+) {
+    tracing::debug!(?outcome, "accessibility action on a Layers-panel control");
+    end_pointer_opacity_drag(cx);
+    let mut edit = LayerControlEdit {
+        workspace: cx.workspace,
+        layers: cx.layers,
+        history: cx.history,
+        pixel_history: cx.pixel_history,
+        undo_order: cx.undo_order,
+        layer_rows: cx.layer_rows,
+        active_layer: *cx.active_layer,
+        state: cx.layer_controls,
+    };
+    let _ = finish_opacity(&mut edit);
+    let invalidation =
+        apply_layer_control_outcome(&mut edit, &PointerOutcome::Action(outcome), None);
+    apply_layer_control_invalidation(cx.composite_cache, &invalidation);
+}
+
+/// An assistive technology's Layers-row press is its own gesture: a
+/// pointer drag on the opacity slider still pending ends first, on the
+/// layer it started on ([`finish_opacity`]), and the slider's capture is
+/// dropped, so the rest of the pointer gesture cannot go on into the newly
+/// active layer (review RT135-3).
+fn end_pointer_opacity_drag(cx: &mut AccessibilityContext<'_>) {
+    if cx.layer_controls.pending.is_none() {
+        return;
+    }
+    cx.click.release_capture();
+    let _ = finish_opacity(&mut LayerControlEdit {
+        workspace: cx.workspace,
+        layers: cx.layers,
+        history: cx.history,
+        pixel_history: cx.pixel_history,
+        undo_order: cx.undo_order,
+        layer_rows: cx.layer_rows,
+        active_layer: *cx.active_layer,
+        state: cx.layer_controls,
+    });
+}
+
 /// Routes one assistive-technology `request` ([`route_accessibility_action`])
 /// and performs the app-level reaction it names — [`run_dialog_action`]
 /// for a dialog button, [`press_layer_row`] (with the exact argument list
 /// the pointer path passes) for a Layers-panel row,
-/// [`reconcile_layer_rows`] after a Layers-panel expand/collapse.
+/// [`reconcile_layer_rows`] after a Layers-panel expand/collapse, and
+/// [`apply_layer_control_accessibility`] for a Layers-panel control
+/// (0.135.0).
 /// `App::handle_accessibility_action` is a thin wrapper over this.
 ///
 /// **The command palette is modal to an assistive technology too**
@@ -2719,6 +2792,7 @@ fn apply_accessibility_action(
             cx.focus,
             cx.dialog.as_ref(),
             cx.layer_rows,
+            cx.layer_controls.controls.as_ref(),
             request,
         ),
     };
@@ -2727,6 +2801,7 @@ fn apply_accessibility_action(
             run_dialog_action(cx.workspace, cx.focus, cx.dialog, action);
         }
         AccessibilityReaction::PressLayer(layer_id) => {
+            end_pointer_opacity_drag(cx);
             press_layer_row(
                 cx.workspace,
                 cx.layer_rows,
@@ -2753,6 +2828,9 @@ fn apply_accessibility_action(
                 row,
                 expanded,
             );
+        }
+        AccessibilityReaction::LayerControl(outcome) => {
+            apply_layer_control_accessibility(cx, outcome);
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
             tracing::debug!(?outcome, "accessibility action on the widget gallery");
@@ -3209,9 +3287,9 @@ fn toggle_gallery(
     }
 }
 
-/// What [`route_gallery_pointer`] did with one event.
+/// What [`route_widget_pointer`] did with one event.
 #[derive(Debug, Clone, Default, PartialEq)]
-struct GalleryPointer {
+struct WidgetPointer {
     /// `Some` when the event was the gallery's (the caller stops routing
     /// it); `None` when the caller goes on routing it.
     outcome: Option<PointerOutcome>,
@@ -3224,6 +3302,67 @@ struct GalleryPointer {
     /// text field (0.131.0 review H2), so the caller re-runs layout and drops
     /// IME ([`App::sync_ime`]) even though the press goes on elsewhere.
     blurred: bool,
+    /// Whose widget [`Self::outcome`] belongs to (0.135.0): the caller
+    /// hands a [`WidgetOwner::LayerControls`] outcome to
+    /// [`apply_layer_control_outcome`]. Always `None` when `outcome` is.
+    owner: Option<WidgetOwner>,
+}
+
+/// Which app-owned widget group a widget belongs to (0.135.0) — the one
+/// question the shared pointer and key routers ask to decide whether an
+/// event is a widget's at all, and whose outcome handler runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidgetOwner {
+    /// The Widget Gallery ([`aurora_ui::GalleryPanel`]): demo widgets that
+    /// touch no document.
+    Gallery,
+    /// The Layers panel's opacity/blend/visibility controls
+    /// ([`aurora_ui::LayerControls`]): they edit the live document.
+    LayerControls,
+}
+
+/// The owner of `id`, if it is (or lies inside) the open gallery or the
+/// Layers panel's controls strip — including an open dropdown's popover
+/// list and rows, which are descendants of their dropdown.
+fn widget_owner(
+    tree: &WidgetTree<WidgetKind>,
+    gallery: Option<&aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    id: WidgetId,
+) -> Option<WidgetOwner> {
+    if gallery.is_some_and(|open| aurora_ui::gallery_contains(tree, open, id)) {
+        return Some(WidgetOwner::Gallery);
+    }
+    if layer_controls.is_some_and(|controls| aurora_ui::layer_controls_contains(tree, controls, id))
+    {
+        return Some(WidgetOwner::LayerControls);
+    }
+    None
+}
+
+/// Closes the Layers panel's blend-mode list when a `Down` lands outside
+/// it — the controls' half of [`aurora_ui::gallery_light_dismiss`].
+/// Returns whether it closed anything.
+fn layer_controls_light_dismiss(
+    tree: &mut WidgetTree<WidgetKind>,
+    controls: &aurora_ui::LayerControls,
+    point: (f32, f32),
+) -> bool {
+    let open = aurora_widgets::widgets::dropdown_state(tree, controls.blend)
+        .is_ok_and(aurora_widgets::widgets::DropdownState::is_open);
+    let inside = tree
+        .hit_test(point)
+        .is_some_and(|hit| tree.is_within(controls.blend, hit));
+    if !open || inside {
+        return false;
+    }
+    match aurora_widgets::widgets::set_dropdown_open(tree, controls.blend, false) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(?err, "failed to close the blend-mode list");
+            false
+        }
+    }
 }
 
 /// Routes one primary-button pointer event to the gallery, if it is the
@@ -3248,6 +3387,9 @@ struct GalleryPointer {
 /// **`Move`** (0.131.0) is the gallery's only while a gallery widget is
 /// captured (a drag in progress); otherwise it is `None`, so the app's
 /// own pointer-move handling runs.
+/// [`route_widget_pointer`] with no Layers-panel controls — the
+/// gallery-only shape every 0.130–0.134 gallery test was written against.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn route_gallery_pointer(
     workspace: &mut aurora_ui::Workspace,
@@ -3258,47 +3400,106 @@ fn route_gallery_pointer(
     modal_open: bool,
     phase: PointerPhase,
     position: (f32, f32),
-) -> GalleryPointer {
-    let Some(open) = gallery.as_mut() else {
-        return GalleryPointer::default();
-    };
+) -> WidgetPointer {
+    route_widget_pointer(
+        workspace, focus, gallery, None, click, scales, modal_open, phase, position,
+    )
+}
+
+/// Routes one primary-button pointer event to an app-owned widget — the
+/// Widget Gallery or (0.135.0) the Layers panel's controls — if it is
+/// one's: `outcome` is `None` (the caller goes on routing it) unless
+/// — for a `Down` — the press lands inside either ([`widget_owner`]),
+/// or — for an `Up` — a press is armed. One [`ClickTracker`] serves both,
+/// so at most one widget anywhere holds a press or a capture. A `Down`
+/// first light-dismisses the gallery's open menu or dropdown list and
+/// the controls' open blend-mode list when it lands outside them
+/// (reported as `dismissed`), and then keeps routing normally (a press on
+/// the canvas both closes the menu and paints). A refused press (a
+/// disabled widget) is consumed and logged, not passed on to whatever
+/// lies under it. Only a gallery outcome is applied here
+/// ([`aurora_ui::apply_gallery_outcome`]); a
+/// [`WidgetOwner::LayerControls`] outcome edits the document, so the
+/// caller applies it ([`apply_layer_control_outcome`]).
+///
+/// **`modal_open`** (a dialog or the command palette): a `Down` is not
+/// routed at all — no light dismiss, nothing armed — and an `Up`
+/// that would release a press armed *before* the modal opened cancels it
+/// instead of activating (red-team RT-1 / critic C4): the press is
+/// forgotten, its pressed look undone, and the outcome is
+/// [`PointerOutcome::Cancelled`]. A drag captured before the modal opened
+/// is cancelled the same way by its next `Move` or `Up` (0.131.0): the
+/// capture is dropped and the value keeps whatever the drag last set.
+///
+/// **`Move`** (0.131.0) is routed only while a widget is captured (a drag
+/// in progress); otherwise it is `None`, so the app's own pointer-move
+/// handling runs.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn route_widget_pointer(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    gallery: &mut Option<aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    click: &mut ClickTracker,
+    scales: &Scales,
+    modal_open: bool,
+    phase: PointerPhase,
+    position: (f32, f32),
+) -> WidgetPointer {
+    if gallery.is_none() && layer_controls.is_none() {
+        return WidgetPointer::default();
+    }
+    let owner_of =
+        |tree: &WidgetTree<WidgetKind>, gallery: &Option<aurora_ui::GalleryPanel>, id: WidgetId| {
+            widget_owner(tree, gallery.as_ref(), layer_controls, id)
+        };
     let mut dismissed = false;
-    match phase {
-        PointerPhase::Down if modal_open => return GalleryPointer::default(),
+    let owner = match phase {
+        PointerPhase::Down if modal_open => return WidgetPointer::default(),
         PointerPhase::Up | PointerPhase::Move if modal_open => {
             if let Some(captured) = click.captured() {
                 click.reset();
-                return GalleryPointer {
+                return WidgetPointer {
                     outcome: Some(PointerOutcome::Cancelled(captured)),
-                    ..GalleryPointer::default()
+                    owner: owner_of(&workspace.tree, gallery, captured),
+                    ..WidgetPointer::default()
                 };
             }
             if phase == PointerPhase::Move {
-                return GalleryPointer::default();
+                return WidgetPointer::default();
             }
             let Some(armed) = click.pressed() else {
-                return GalleryPointer::default();
+                return WidgetPointer::default();
             };
             click.reset();
             // Not a button, disabled or already gone: then there is no
             // pressed look to undo, so the refusal is moot.
             let _ = aurora_widgets::widgets::set_button_pressed(&mut workspace.tree, armed, false);
-            return GalleryPointer {
+            return WidgetPointer {
                 outcome: Some(PointerOutcome::Cancelled(armed)),
-                ..GalleryPointer::default()
+                owner: owner_of(&workspace.tree, gallery, armed),
+                ..WidgetPointer::default()
             };
         }
         PointerPhase::Down => {
-            match aurora_ui::gallery_light_dismiss(&mut workspace.tree, focus, open, position) {
-                Ok(closed) => dismissed = closed,
-                Err(err) => tracing::warn!(?err, "gallery light dismiss failed"),
+            if let Some(open) = gallery.as_mut() {
+                match aurora_ui::gallery_light_dismiss(&mut workspace.tree, focus, open, position) {
+                    Ok(closed) => dismissed = closed,
+                    Err(err) => tracing::warn!(?err, "gallery light dismiss failed"),
+                }
             }
-            let inside = workspace
+            if let Some(controls) = layer_controls
+                && layer_controls_light_dismiss(&mut workspace.tree, controls, position)
+            {
+                dismissed = true;
+                focus.validate(&workspace.tree);
+            }
+            let owner = workspace
                 .tree
                 .hit_test(position)
-                .is_some_and(|hit| aurora_ui::gallery_contains(&workspace.tree, open, hit));
-            if !inside {
-                // A gallery press or drag whose release never arrived (it
+                .and_then(|hit| owner_of(&workspace.tree, gallery, hit));
+            if owner.is_none() {
+                // A press or drag whose release never arrived (it
                 // happened outside the window) must not claim this
                 // press's release or its moves.
                 if click.is_active() {
@@ -3318,50 +3519,59 @@ fn route_gallery_pointer(
                 // gallery's text field (0.131.0 review H2): left focused
                 // behind a canvas click, it would swallow every later
                 // single-letter tool shortcut, with no caret to show why.
-                // Only the text field: every other gallery widget lets a
+                // Only the text field: every other widget lets a
                 // character key through already, and a light-dismissed
                 // menu's focus deliberately returns to its opener
                 // (critic C11).
-                let blurred = focus.focused() == Some(open.text_field);
+                let blurred = gallery
+                    .as_ref()
+                    .is_some_and(|open| focus.focused() == Some(open.text_field));
                 if blurred {
                     focus.blur(&mut workspace.tree);
                 }
-                return GalleryPointer {
+                return WidgetPointer {
                     outcome: None,
                     dismissed,
                     blurred,
+                    owner: None,
                 };
             }
+            owner
         }
         PointerPhase::Up => {
             // Armed (a click) or captured (a drag's release).
-            if !click.is_active() {
-                return GalleryPointer::default();
-            }
+            let Some(active) = click.captured().or(click.pressed()) else {
+                return WidgetPointer::default();
+            };
+            owner_of(&workspace.tree, gallery, active)
         }
         PointerPhase::Move => {
-            if click.captured().is_none() {
-                return GalleryPointer::default();
-            }
+            let Some(captured) = click.captured() else {
+                return WidgetPointer::default();
+            };
+            owner_of(&workspace.tree, gallery, captured)
         }
-    }
+    };
     let event = PointerEvent { phase, position };
     let outcome = match handle_pointer(&mut workspace.tree, focus, click, event) {
         Ok(outcome) => outcome,
         Err(err) => {
-            tracing::debug!(?err, "gallery refused a pointer event");
+            tracing::debug!(?err, "a widget refused a pointer event");
             PointerOutcome::Ignored
         }
     };
-    if let Err(err) =
-        aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, &outcome)
+    if owner == Some(WidgetOwner::Gallery)
+        && let Some(open) = gallery.as_mut()
+        && let Err(err) =
+            aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, &outcome)
     {
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
-    GalleryPointer {
+    WidgetPointer {
         outcome: Some(outcome),
         dismissed,
         blurred: false,
+        owner,
     }
 }
 
@@ -3397,6 +3607,7 @@ fn key_shows_focus_ring(key: Option<&Key>, modifiers: Modifiers) -> bool {
 /// is in progress, a named editing key (`Backspace`, the arrows, ...)
 /// is consumed without editing: the IME owns it, and it must neither
 /// edit the committed text under the composition nor reach a shortcut.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn route_gallery_key(
     workspace: &mut aurora_ui::Workspace,
@@ -3409,14 +3620,48 @@ fn route_gallery_key(
     key: Key,
     text: Option<&str>,
 ) -> Option<KeyOutcome> {
+    route_widget_key(
+        workspace,
+        focus,
+        gallery,
+        None,
+        scales,
+        dialog_open,
+        palette_open,
+        modifiers,
+        key,
+        text,
+    )
+    .map(|(_, outcome)| outcome)
+}
+
+/// The rules stated in full on `route_gallery_key` above (since 0.135.0 a
+/// `#[cfg(test)]` wrapper over this function), generalised to every
+/// app-owned widget [`widget_owner`] knows: the focused widget decides
+/// whose key it is, and the result carries that owner so the caller can
+/// hand a [`WidgetOwner::LayerControls`] outcome to
+/// [`apply_layer_control_outcome`]. The character-key rule is unchanged
+/// and is what keeps single-letter tool shortcuts working while the
+/// opacity slider or blend-mode dropdown is focused: only a text field
+/// consumes a `Key::Character`.
+#[allow(clippy::too_many_arguments)]
+fn route_widget_key(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    gallery: &mut Option<aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    scales: &Scales,
+    dialog_open: bool,
+    palette_open: bool,
+    modifiers: Modifiers,
+    key: Key,
+    text: Option<&str>,
+) -> Option<(WidgetOwner, KeyOutcome)> {
     if dialog_open || palette_open {
         return None;
     }
-    let open = gallery.as_mut()?;
     let focused = focus.focused()?;
-    if !aurora_ui::gallery_contains(&workspace.tree, open, focused) {
-        return None;
-    }
+    let owner = widget_owner(&workspace.tree, gallery.as_ref(), layer_controls, focused)?;
     let text_field = matches!(
         workspace.tree.payload(focused),
         Some(WidgetKind::TextField(_))
@@ -3455,13 +3700,325 @@ fn route_gallery_key(
             outcome = KeyOutcome::Handled(PointerOutcome::Focused(focused));
         }
     }
-    if let KeyOutcome::Handled(handled) = &outcome
+    if owner == WidgetOwner::Gallery
+        && let KeyOutcome::Handled(handled) = &outcome
+        && let Some(open) = gallery.as_mut()
         && let Err(err) =
             aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, handled)
     {
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
-    Some(outcome)
+    Some((owner, outcome))
+}
+
+// -- Layers-panel controls (0.135.0): opacity, blend mode, visibility --
+
+/// Acts on a Layers-panel control edit's [`CompositeInvalidation`]. Only
+/// `None` and `Everything` are produced today ([`structural_invalidation`]);
+/// a `Regions` is treated as `Everything`, the conservative reading.
+fn apply_layer_control_invalidation(
+    composite_cache: &mut CompositeCache,
+    invalidation: &CompositeInvalidation,
+) {
+    match invalidation {
+        CompositeInvalidation::None => {}
+        CompositeInvalidation::Regions(_) | CompositeInvalidation::Everything => {
+            composite_cache.bump();
+        }
+    }
+}
+
+/// A live opacity-slider drag the document already follows but whose
+/// single undo step is not recorded yet: which layer it edits and the
+/// opacity it had before the drag's first change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingOpacity {
+    layer: aurora_doc::LayerId,
+    start: f32,
+}
+
+/// The app's half of the Layers-panel controls: the widgets (`None` only
+/// if building them failed, which is logged) and a live drag's
+/// [`PendingOpacity`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct LayerControlsState {
+    controls: Option<aurora_ui::LayerControls>,
+    pending: Option<PendingOpacity>,
+    /// The slider still holds the pointer capture of a drag that was
+    /// already committed because the active layer changed under it (any
+    /// path — review RT135-3): its remaining moves are dropped, never
+    /// retargeted onto the newly active layer, until that capture ends
+    /// ([`settle_pending_opacity`] clears it).
+    detached: bool,
+}
+
+/// Everything a Layers-panel control edit touches — a context struct for
+/// the same reason [`AccessibilityContext`] is one.
+struct LayerControlEdit<'a> {
+    workspace: &'a mut aurora_ui::Workspace,
+    layers: &'a mut aurora_doc::LayerTree,
+    history: &'a mut aurora_doc::History,
+    pixel_history: &'a mut aurora_brush::PixelHistory,
+    undo_order: &'a mut UndoOrder,
+    layer_rows: &'a HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: Option<aurora_doc::LayerId>,
+    state: &'a mut LayerControlsState,
+}
+
+/// Rewrites `layer`'s Layers-panel row description in place ("Multiply,
+/// 40%") — no repopulation, so row ids, focus and a pointer capture all
+/// survive.
+fn refresh_layer_row(
+    workspace: &mut aurora_ui::Workspace,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+) {
+    let description = aurora_ui::layer_row_description(layers, layer);
+    for (&row, _) in layer_rows.iter().filter(|&(_, &id)| id == layer) {
+        if let Err(err) = aurora_widgets::widgets::set_tree_item_description(
+            &mut workspace.tree,
+            row,
+            Some(&description),
+        ) {
+            tracing::warn!(?err, "failed to refresh a Layers-panel row description");
+        }
+    }
+}
+
+/// Brings every Layers-panel row's description back in line with
+/// `layers` after an `Undo`/`Redo` (0.135.0) — which can now undo a
+/// control's opacity, blend-mode or visibility edit, and never
+/// repopulates the panel. Only a row whose text really changed is
+/// touched.
+fn refresh_layer_row_descriptions(
+    workspace: &mut aurora_ui::Workspace,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    layers: &aurora_doc::LayerTree,
+) {
+    for (&row, &layer) in layer_rows {
+        if !layers.contains(layer) {
+            continue;
+        }
+        let description = aurora_ui::layer_row_description(layers, layer);
+        let current = workspace
+            .tree
+            .accessibility(row)
+            .and_then(|node| node.description().map(str::to_owned));
+        if current.as_deref() == Some(description.as_str()) {
+            continue;
+        }
+        if let Err(err) = aurora_widgets::widgets::set_tree_item_description(
+            &mut workspace.tree,
+            row,
+            Some(&description),
+        ) {
+            tracing::warn!(?err, "failed to refresh a Layers-panel row description");
+        }
+    }
+}
+
+/// Ends a live opacity drag: records **one** undo step covering the whole
+/// gesture ([`aurora_doc::History::record_opacity_change`]) if the
+/// opacity really moved, onto the layer the drag *started* on — not
+/// whichever layer is active now. Returns whether a step was recorded.
+/// A no-op with nothing pending. Every path that can end a drag reaches
+/// this: its release, a cancel (a modal opening mid-drag **commits**,
+/// like a Move drag's cancel does), the pointer leaving the window, a
+/// press anywhere else, and `Undo`/`Redo` (which must commit first so
+/// they undo the drag rather than whatever preceded it).
+fn finish_opacity(cx: &mut LayerControlEdit<'_>) -> bool {
+    let Some(pending) = cx.state.pending.take() else {
+        return false;
+    };
+    if cx.layers.opacity(pending.layer) == Some(pending.start) {
+        return false;
+    }
+    match cx
+        .history
+        .record_opacity_change(cx.layers, pending.layer, pending.start)
+    {
+        Ok(()) => {
+            cx.undo_order
+                .record(UndoKind::Structural, cx.history, cx.pixel_history);
+            refresh_history_panel(cx.workspace, cx.history);
+            true
+        }
+        Err(err) => {
+            tracing::warn!(?err, "failed to record the completed opacity drag");
+            false
+        }
+    }
+}
+
+/// Ends every Layers-panel control gesture belonging to the document
+/// about to be replaced (`App::open_file`, `App::open_aur_file`, and so a
+/// dropped file): a live opacity drag is committed ([`finish_opacity`])
+/// with the slider's capture dropped, and an open blend-mode list is
+/// closed — left open, its next commit would land in the *new* document
+/// (review RT135-4). Returns whether an undo step was recorded.
+fn end_layer_control_gestures(cx: &mut LayerControlEdit<'_>, click: &mut ClickTracker) -> bool {
+    let Some(controls) = cx.state.controls else {
+        return false;
+    };
+    if cx.state.pending.is_some() || click.captured() == Some(controls.opacity) {
+        click.release_capture();
+    }
+    let committed = finish_opacity(cx);
+    cx.state.detached = false;
+    if let Err(err) =
+        aurora_widgets::widgets::set_dropdown_open(&mut cx.workspace.tree, controls.blend, false)
+    {
+        tracing::warn!(?err, "failed to close the blend-mode list");
+    }
+    committed
+}
+
+/// Commits a pending opacity drag once the opacity slider no longer holds
+/// the pointer capture (`captured` is the shared [`ClickTracker`]'s, read
+/// *after* routing). The one catch-all the app runs after every routed
+/// pointer event, so a capture dropped by any path — a release, a
+/// modal's cancel, `CursorLeft`'s `release_capture`, a press elsewhere
+/// resetting a stale capture — cannot strand a drag without its undo
+/// step.
+fn settle_pending_opacity(cx: &mut LayerControlEdit<'_>, captured: Option<WidgetId>) -> bool {
+    let slider = cx.state.controls.map(|controls| controls.opacity);
+    if slider.is_none() || captured != slider {
+        cx.state.detached = false;
+    }
+    if cx.state.pending.is_some() && (slider.is_none() || captured != slider) {
+        return finish_opacity(cx);
+    }
+    false
+}
+
+/// Turns one Layers-panel control outcome into a document edit and
+/// reports what it invalidated in the composite.
+///
+/// - **Opacity, dragged** (`ValueChanged` while the slider holds the
+///   capture): applied to the tree *directly*, no history — live
+///   feedback — with the drag's starting opacity remembered in
+///   [`PendingOpacity`]; one undo step is recorded when the drag ends
+///   ([`finish_opacity`]). Every move recomposites (`Everything`).
+/// - **Opacity, stepped** (`ValueChanged` with no capture: an arrow key
+///   or an assistive technology's `SetValue`/`Increment`): one
+///   `History::set_opacity` step per change.
+/// - **Blend mode** (`Committed { changed: true }`): one
+///   `History::set_blend_mode` step, `BlendMode::ALL[index]`.
+/// - **Visibility** (`Toggled`): one `History::set_visible` step.
+///
+/// Anything else (focus, an opened list, a highlight moving) is
+/// widget-local and changes nothing. A change always refreshes the
+/// active layer's row description in place.
+fn apply_layer_control_outcome(
+    cx: &mut LayerControlEdit<'_>,
+    outcome: &PointerOutcome,
+    captured: Option<WidgetId>,
+) -> CompositeInvalidation {
+    use aurora_widgets::ActionOutcome as Outcome;
+    use aurora_widgets::widgets::DropdownOutcome;
+    let Some(controls) = cx.state.controls else {
+        return CompositeInvalidation::None;
+    };
+    let _ = settle_pending_opacity(cx, captured);
+    let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
+        return CompositeInvalidation::None;
+    };
+    let edited: Result<Option<aurora_core::Rect>, aurora_doc::DocError> = match outcome {
+        PointerOutcome::Action(Outcome::ValueChanged { id, value }) if *id == controls.opacity => {
+            #[allow(clippy::cast_possible_truncation)]
+            let opacity = (value / 100.0).clamp(0.0, 1.0) as f32;
+            if captured == Some(controls.opacity) {
+                // The active layer changed under a live drag (an
+                // assistive technology's row press, a keyboard selection):
+                // the drag ends on the layer it started on, and the rest
+                // of this capture edits nothing (review RT135-3).
+                if cx
+                    .state
+                    .pending
+                    .is_some_and(|pending| pending.layer != active)
+                {
+                    let _ = finish_opacity(cx);
+                    cx.state.detached = true;
+                }
+                if cx.state.detached {
+                    return CompositeInvalidation::None;
+                }
+                if cx.state.pending.is_none() {
+                    let start = cx.layers.opacity(active).unwrap_or(1.0);
+                    cx.state.pending = Some(PendingOpacity {
+                        layer: active,
+                        start,
+                    });
+                }
+                match cx.layers.set_opacity(active, opacity) {
+                    Ok(()) => {
+                        refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, active);
+                        return CompositeInvalidation::Everything;
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                cx.history.set_opacity(cx.layers, active, opacity)
+            }
+        }
+        PointerOutcome::Action(Outcome::Dropdown {
+            id,
+            outcome:
+                DropdownOutcome::Committed {
+                    index,
+                    changed: true,
+                },
+        }) if *id == controls.blend => match aurora_doc::BlendMode::ALL.get(*index) {
+            Some(&mode) => cx.history.set_blend_mode(cx.layers, active, mode),
+            None => return CompositeInvalidation::None,
+        },
+        PointerOutcome::Action(Outcome::Toggled { id, state }) if *id == controls.visible => cx
+            .history
+            .set_visible(cx.layers, active, *state == accesskit::Toggled::True),
+        _ => return CompositeInvalidation::None,
+    };
+    match edited {
+        Ok(dirtied) => {
+            cx.undo_order
+                .record(UndoKind::Structural, cx.history, cx.pixel_history);
+            refresh_history_panel(cx.workspace, cx.history);
+            refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, active);
+            structural_invalidation(dirtied)
+        }
+        Err(err) => {
+            tracing::warn!(?err, "a Layers-panel control edit was refused");
+            CompositeInvalidation::None
+        }
+    }
+}
+
+/// Mirrors the document into the Layers-panel controls
+/// ([`aurora_ui::sync_layer_controls`]), leaving a captured opacity
+/// slider alone. Returns whether any control changed.
+fn sync_layer_controls(
+    workspace: &mut aurora_ui::Workspace,
+    state: &LayerControlsState,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    captured: Option<WidgetId>,
+) -> bool {
+    let Some(controls) = state.controls else {
+        return false;
+    };
+    match aurora_ui::sync_layer_controls(
+        &mut workspace.tree,
+        controls,
+        layers,
+        active_layer,
+        captured,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the Layers-panel controls");
+            false
+        }
+    }
 }
 
 /// Where the gallery's tooltip should see the pointer: `None` (as if the
@@ -6005,9 +6562,24 @@ fn perform_undo_redo(
     view: &mut aurora_ui::CanvasView,
     active_layer: Option<aurora_doc::LayerId>,
     drag: &mut Option<Drag>,
+    layer_controls: &mut LayerControlsState,
     command: AppCommand,
 ) -> CompositeInvalidation {
     let canvas_size = canvas_area_logical_size(workspace);
+    // A live opacity-slider drag is committed first (0.135.0), for the
+    // same reason a live Move is just below: `Undo` must undo the drag,
+    // not whatever preceded it. The caller drops the slider's capture.
+    let no_rows = HashMap::new();
+    let _ = finish_opacity(&mut LayerControlEdit {
+        workspace,
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        layer_rows: &no_rows,
+        active_layer,
+        state: layer_controls,
+    });
     commit_ending_drag(
         drag.take(),
         layers,
@@ -6117,6 +6689,9 @@ fn perform_undo_redo(
         canvas_size,
         &invalidation,
     );
+    // Reactive (0.135.0): the undone/redone step may have been one of the
+    // controls' own edits, or removed the active layer outright.
+    let _ = sync_layer_controls(workspace, layer_controls, layers, active_layer, None);
     invalidation
 }
 
@@ -14631,6 +15206,12 @@ struct App {
     /// `Down` ends both ([`Self::route_gallery`]), and neither starts
     /// while the gallery owns the pointer.
     gallery_click: ClickTracker,
+    /// The Layers panel's opacity/blend/visibility controls and a live
+    /// opacity drag's pending undo step (0.135.0). They share
+    /// [`Self::gallery_click`] with the gallery — one tracker for every
+    /// app-owned widget ([`route_widget_pointer`]), so despite its name
+    /// that field now also holds the opacity slider's capture.
+    layer_controls: LayerControlsState,
     /// Whether IME is currently allowed on the window — only while the
     /// gallery's text field is focused ([`Self::sync_ime`]).
     ime_allowed: bool,
@@ -14829,6 +15410,13 @@ impl App {
             1.0,
         );
 
+        let mut layer_controls = LayerControlsState::default();
+        match aurora_ui::insert_layer_controls(&mut workspace.tree, workspace.layers, &scales) {
+            Ok(controls) => layer_controls.controls = Some(controls),
+            Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
+        }
+        let _ = sync_layer_controls(&mut workspace, &layer_controls, &layers, active_layer, None);
+
         let mut focus = FocusManager::default();
         let mut dialog = None;
         if had_previous_marker {
@@ -14883,6 +15471,7 @@ impl App {
             pointer_position: None,
             gallery: None,
             gallery_click: ClickTracker::default(),
+            layer_controls,
             ime_allowed: false,
             ime_cursor_area: None,
             residency_viewport: None,
@@ -14935,7 +15524,7 @@ impl App {
                 dialog: &mut self.dialog,
                 palette: self.command_palette,
                 scales: &self.scales,
-                layers: &self.layers,
+                layers: &mut self.layers,
                 layer_rows: &mut self.layer_rows,
                 active_layer: &mut self.active_layer,
                 view: &mut self.canvas_view,
@@ -14944,6 +15533,8 @@ impl App {
                 undo_order: &mut self.undo_order,
                 composite_cache: &mut self.composite_cache,
                 drag: &mut self.drag,
+                layer_controls: &mut self.layer_controls,
+                click: &mut self.gallery_click,
                 gallery: &mut self.gallery,
             },
             request,
@@ -14994,10 +15585,12 @@ impl App {
         let Some(key) = key else {
             return;
         };
-        let gallery = route_gallery_key(
+        let controls = self.layer_controls.controls;
+        let routed = route_widget_key(
             &mut self.workspace,
             &mut self.focus,
             &mut self.gallery,
+            controls.as_ref(),
             &self.scales,
             self.dialog.is_some(),
             self.command_palette.is_some(),
@@ -15005,8 +15598,11 @@ impl App {
             key,
             event.text.as_deref(),
         );
-        if let Some(KeyOutcome::Handled(outcome)) = gallery {
-            tracing::debug!(?outcome, "widget gallery key");
+        if let Some((owner, KeyOutcome::Handled(outcome))) = routed {
+            tracing::debug!(?outcome, ?owner, "widget key");
+            if owner == WidgetOwner::LayerControls {
+                self.apply_layer_control(&outcome);
+            }
             self.relayout_after_gallery();
             return;
         }
@@ -15071,6 +15667,18 @@ impl App {
     /// this replaces still described that split, and had been false
     /// since.
     fn run_undo_redo(&mut self, command: AppCommand) {
+        // `perform_undo_redo` commits a live opacity drag first; the
+        // slider's capture ends with it, so the rest of that drag is not
+        // silently a second gesture and the slider can show the result.
+        if self
+            .layer_controls
+            .controls
+            .map(|controls| controls.opacity)
+            == self.gallery_click.captured()
+            && self.gallery_click.captured().is_some()
+        {
+            self.gallery_click.release_capture();
+        }
         // Annotated rather than discarded bare, for the reason
         // `CompositeInvalidation`'s own `#[must_use]` exists: the report
         // has already been acted on *inside* `perform_undo_redo`, which
@@ -15089,8 +15697,10 @@ impl App {
             &mut self.canvas_view,
             self.active_layer,
             &mut self.drag,
+            &mut self.layer_controls,
             command,
         );
+        refresh_layer_row_descriptions(&mut self.workspace, &self.layer_rows, &self.layers);
         // `App` itself has nothing further to do with the report -- the
         // cache it names has already been invalidated inside. It is
         // returned so a test can assert *which* invalidation a given
@@ -15154,6 +15764,8 @@ impl App {
     /// the previous document's pixels to be composited onto a smaller
     /// new one and persisted into this very call's own autosave.
     fn open_file(&mut self, path: &Path) {
+        // A live opacity drag belongs to the document being replaced.
+        self.commit_layer_controls_drag();
         if is_aur_path(path) {
             self.open_aur_file(path);
             return;
@@ -15312,6 +15924,7 @@ impl App {
     /// account, including why closing the rest needs an architectural
     /// change rather than a patch here.
     fn open_aur_file(&mut self, path: &Path) {
+        self.commit_layer_controls_drag();
         let Some(store) = self.tile_store.as_mut() else {
             tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
             return;
@@ -16510,8 +17123,10 @@ impl App {
         run_shutdown_cleanup(self);
     }
 
-    /// Routes one primary-button event to the Widget Gallery
-    /// ([`route_gallery_pointer`]); `true` when the gallery took it, after
+    /// Routes one primary-button event to the Widget Gallery or (0.135.0)
+    /// the Layers-panel controls ([`route_widget_pointer`]), applying a
+    /// control's document edit ([`Self::apply_layer_control`]) and
+    /// settling any drag whose capture ended; `true` when a widget took it, after
     /// re-running layout, re-announcing and requesting a redraw.
     ///
     /// A light dismiss that closed something re-runs layout, re-announces
@@ -16521,16 +17136,28 @@ impl App {
     /// second gesture, the same rule [`Self::handle_pointer_pressed`]
     /// applies to its layer-row and canvas branches.
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
-        let routed = route_gallery_pointer(
+        let controls = self.layer_controls.controls;
+        let routed = route_widget_pointer(
             &mut self.workspace,
             &mut self.focus,
             &mut self.gallery,
+            controls.as_ref(),
             &mut self.gallery_click,
             &self.scales,
             self.dialog.is_some() || self.command_palette.is_some(),
             phase,
             position,
         );
+        if routed.owner == Some(WidgetOwner::LayerControls)
+            && let Some(outcome) = routed.outcome.as_ref()
+        {
+            self.apply_layer_control(outcome);
+        } else {
+            // Any path that dropped the slider's capture -- a press
+            // elsewhere resetting a stale one, a modal's cancel -- ends
+            // the drag's pending undo step here (`settle_pending_opacity`).
+            self.settle_layer_controls_drag();
+        }
         let Some(outcome) = routed.outcome else {
             if routed.dismissed || routed.blurred {
                 self.relayout_after_gallery();
@@ -16647,6 +17274,74 @@ impl App {
             &self.scales,
         );
         self.relayout_after_gallery();
+    }
+
+    /// A [`LayerControlEdit`] over `App`'s own fields.
+    fn layer_control_edit(&mut self) -> LayerControlEdit<'_> {
+        LayerControlEdit {
+            workspace: &mut self.workspace,
+            layers: &mut self.layers,
+            history: &mut self.history,
+            pixel_history: &mut self.pixel_history,
+            undo_order: &mut self.undo_order,
+            layer_rows: &self.layer_rows,
+            active_layer: self.active_layer,
+            state: &mut self.layer_controls,
+        }
+    }
+
+    /// Applies one routed Layers-panel control outcome
+    /// ([`apply_layer_control_outcome`]) and acts on its invalidation.
+    fn apply_layer_control(&mut self, outcome: &PointerOutcome) {
+        let captured = self.gallery_click.captured();
+        let invalidation =
+            apply_layer_control_outcome(&mut self.layer_control_edit(), outcome, captured);
+        apply_layer_control_invalidation(&mut self.composite_cache, &invalidation);
+        self.needs_redraw = true;
+    }
+
+    /// [`settle_pending_opacity`] against the shared tracker's capture.
+    fn settle_layer_controls_drag(&mut self) {
+        let captured = self.gallery_click.captured();
+        if settle_pending_opacity(&mut self.layer_control_edit(), captured) {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Ends every Layers-panel control gesture outright before the
+    /// document is replaced ([`end_layer_control_gestures`]).
+    fn commit_layer_controls_drag(&mut self) {
+        let mut edit = LayerControlEdit {
+            workspace: &mut self.workspace,
+            layers: &mut self.layers,
+            history: &mut self.history,
+            pixel_history: &mut self.pixel_history,
+            undo_order: &mut self.undo_order,
+            layer_rows: &self.layer_rows,
+            active_layer: self.active_layer,
+            state: &mut self.layer_controls,
+        };
+        let _ = end_layer_control_gestures(&mut edit, &mut self.gallery_click);
+    }
+
+    /// The catch-all reactive sync ([`sync_layer_controls`]), run once per
+    /// event-loop iteration from [`Self::about_to_wait`], so every path
+    /// that changes the active layer or the document — a Layers-row
+    /// press, an undo, an open — is reflected without each one having to
+    /// remember. Touches nothing when nothing changed; re-announces and
+    /// redraws when something did.
+    fn sync_layer_controls_now(&mut self) {
+        let captured = self.gallery_click.captured();
+        if sync_layer_controls(
+            &mut self.workspace,
+            &self.layer_controls,
+            &self.layers,
+            self.active_layer,
+            captured,
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
     }
 
     /// Layout, accessibility push and a redraw after a gallery event —
@@ -17382,6 +18077,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 // A gallery drag ends too: its release may never arrive.
                 // The value keeps whatever the last move set.
                 self.gallery_click.release_capture();
+                self.settle_layer_controls_drag();
                 self.update_gallery_hover(None);
             }
             _ => {}
@@ -17436,8 +18132,12 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             self.relayout_after_gallery();
         }
         // Once per iteration, whatever ran above (a macOS menu command, an
-        // accessibility action): IME follows focus (review M1).
+        // accessibility action): IME follows focus (review M1), and the
+        // Layers-panel controls follow the document -- after the menu
+        // drain, so a menu command's own change is mirrored this
+        // iteration, not the next (critic C5).
         self.sync_ime();
+        self.sync_layer_controls_now();
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
@@ -17650,7 +18350,7 @@ mod tests {
     #[cfg(unix)]
     use super::create_dir_owner_only;
     use super::{
-        COMMAND_TOGGLE_WIDGET_GALLERY, GalleryPointer, key_shows_focus_ring, route_gallery_key,
+        COMMAND_TOGGLE_WIDGET_GALLERY, WidgetPointer, key_shows_focus_ring, route_gallery_key,
         route_gallery_pointer, toggle_gallery,
     };
     use aurora_doc::SelectionSet;
@@ -18110,6 +18810,7 @@ mod tests {
             &mut focus,
             None,
             &layer_rows,
+            None,
             &a11y_request(row_b, accesskit::Action::Click),
         );
         let AccessibilityReaction::PressLayer(pressed) = reaction else {
@@ -18166,6 +18867,7 @@ mod tests {
             &mut focus,
             dialog.as_ref(),
             &layer_rows,
+            None,
             &a11y_request(button, accesskit::Action::Click),
         );
         let AccessibilityReaction::DialogAction(action) = reaction else {
@@ -18199,6 +18901,7 @@ mod tests {
                 &mut focus,
                 dialog.as_ref(),
                 &layer_rows,
+                None,
                 &a11y_request(row_b, action),
             );
             assert!(
@@ -18219,6 +18922,7 @@ mod tests {
             &mut focus,
             None,
             &layer_rows,
+            None,
             &a11y_request(accesskit::NodeId(u64::MAX), accesskit::Action::Click),
         );
         assert!(matches!(
@@ -18228,7 +18932,7 @@ mod tests {
         let mut wrong = a11y_request(workspace.root, accesskit::Action::Focus);
         wrong.target_tree = accesskit::TreeId(accesskit::Uuid::from_u128(1));
         let reaction =
-            route_accessibility_action(&mut workspace, &mut focus, None, &layer_rows, &wrong);
+            route_accessibility_action(&mut workspace, &mut focus, None, &layer_rows, None, &wrong);
         assert!(matches!(
             reaction,
             AccessibilityReaction::Rejected(aurora_widgets::ActionRejection::WrongTree(_))
@@ -18277,6 +18981,7 @@ mod tests {
             &mut focus,
             None,
             &layer_rows,
+            None,
             &a11y_request(group_row, accesskit::Action::Collapse),
         );
         let AccessibilityReaction::LayerRowExpanded { row, expanded } = reaction else {
@@ -18303,6 +19008,7 @@ mod tests {
             &mut focus,
             None,
             &layer_rows,
+            None,
             &a11y_request(group_row, accesskit::Action::Expand),
         );
         let AccessibilityReaction::LayerRowExpanded { row, expanded } = reaction else {
@@ -18367,6 +19073,8 @@ mod tests {
             composite_cache: CompositeCache,
             drag: Option<Drag>,
             gallery: Option<aurora_ui::GalleryPanel>,
+            layer_controls: crate::LayerControlsState,
+            gallery_click: crate::ClickTracker,
         }
 
         impl AtState {
@@ -18390,11 +19098,30 @@ mod tests {
                     Ok(rows) => rows,
                     Err(err) => unreachable!("{err:?}"),
                 };
+                // The Layers-panel controls, exactly as `App::new` builds
+                // and first syncs them (0.135.0).
+                let mut layer_controls = crate::LayerControlsState::default();
+                match aurora_ui::insert_layer_controls(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                ) {
+                    Ok(controls) => layer_controls.controls = Some(controls),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+                let _ = crate::sync_layer_controls(
+                    &mut workspace,
+                    &layer_controls,
+                    &layers,
+                    active_layer,
+                    None,
+                );
                 workspace.tree.compute_layout(WIDTH, HEIGHT);
                 Self {
                     workspace,
                     focus: FocusManager::default(),
                     dialog: None,
+                    gallery_click: crate::ClickTracker::default(),
                     palette: None,
                     scales,
                     layers,
@@ -18407,6 +19134,7 @@ mod tests {
                     composite_cache: CompositeCache::default(),
                     drag: None,
                     gallery: None,
+                    layer_controls,
                 }
             }
 
@@ -18421,7 +19149,7 @@ mod tests {
                         dialog: &mut self.dialog,
                         palette: self.palette,
                         scales: &self.scales,
-                        layers: &self.layers,
+                        layers: &mut self.layers,
                         layer_rows: &mut self.layer_rows,
                         active_layer: &mut self.active_layer,
                         view: &mut self.view,
@@ -18430,6 +19158,8 @@ mod tests {
                         undo_order: &mut self.undo_order,
                         composite_cache: &mut self.composite_cache,
                         drag: &mut self.drag,
+                        layer_controls: &mut self.layer_controls,
+                        click: &mut self.gallery_click,
                         gallery: &mut self.gallery,
                     },
                     request,
@@ -18679,6 +19409,7 @@ mod tests {
                 stack.extend(probe.workspace.tree.children(id).unwrap_or_default());
             }
             let mut routed = 0_usize;
+            let mut layer_controls_routed = 0_usize;
             for &id in &ids {
                 for action in aurora_widgets::ALL_ACTIONS {
                     let declared = probe
@@ -18699,13 +19430,18 @@ mod tests {
                             _ => accesskit::ActionData::NumericValue(1.0),
                         });
                     }
+                    let controls = state.layer_controls.controls;
                     let reaction = route_accessibility_action(
                         &mut state.workspace,
                         &mut state.focus,
                         None,
                         &state.layer_rows,
+                        controls.as_ref(),
                         &request,
                     );
+                    if matches!(reaction, AccessibilityReaction::LayerControl(_)) {
+                        layer_controls_routed += 1;
+                    }
                     routed += 1;
                     if let AccessibilityReaction::Handled(outcome) = &reaction {
                         assert!(
@@ -18718,6 +19454,13 @@ mod tests {
             assert!(
                 routed > 10,
                 "only {routed} declared actions in the live workspace"
+            );
+            // The Layers-panel controls (0.135.0) are in the live
+            // workspace and their document-editing actions reach the
+            // mapped `LayerControl` arm rather than an unmapped `Handled`.
+            assert!(
+                layer_controls_routed >= 3,
+                "only {layer_controls_routed} actions reached the Layers-panel controls"
             );
         }
     }
@@ -19382,6 +20125,7 @@ mod tests {
             &mut view,
             active_layer,
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -21103,6 +21847,7 @@ mod tests {
             &mut view,
             Some(active),
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -30483,6 +31228,7 @@ mod tests {
             &mut view,
             active_layer,
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -30555,6 +31301,7 @@ mod tests {
             &mut view,
             Some(base),
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -30627,6 +31374,7 @@ mod tests {
             &mut view,
             None,
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -30710,6 +31458,7 @@ mod tests {
             &mut view,
             Some(layer),
             &mut drag,
+            &mut crate::LayerControlsState::default(),
             AppCommand::Undo,
         );
 
@@ -31119,6 +31868,7 @@ mod tests {
                 &mut view,
                 active,
                 &mut drag,
+                &mut crate::LayerControlsState::default(),
                 AppCommand::Undo,
             );
         }
@@ -31196,6 +31946,7 @@ mod tests {
                     &mut world.view,
                     world.active,
                     &mut world.drag,
+                    &mut crate::LayerControlsState::default(),
                     command,
                 );
             }
@@ -49266,7 +50017,7 @@ mod tests {
             phase: PointerPhase,
             at: (f32, f32),
             modal_open: bool,
-        ) -> GalleryPointer {
+        ) -> WidgetPointer {
             let routed = route_gallery_pointer(
                 &mut self.workspace,
                 &mut self.focus,
@@ -49605,17 +50356,18 @@ mod tests {
         let canvas = rig.centre(rig.workspace.canvas_area);
         assert_eq!(
             rig.routed(PointerPhase::Down, canvas, false),
-            GalleryPointer {
+            WidgetPointer {
                 outcome: None,
                 dismissed: true,
                 // The menu button, not the text field, has focus: it
                 // stays (critic C11), so nothing is blurred (review H2).
                 blurred: false,
+                owner: None,
             }
         );
         assert_eq!(
             rig.routed(PointerPhase::Down, canvas, false),
-            GalleryPointer::default(),
+            WidgetPointer::default(),
             "nothing left to dismiss"
         );
         assert_eq!(
@@ -49663,7 +50415,7 @@ mod tests {
         let at = rig.centre(rig.g().checkbox);
         assert_eq!(
             rig.routed(PointerPhase::Down, at, true),
-            GalleryPointer::default()
+            WidgetPointer::default()
         );
         assert_eq!(rig.click.pressed(), None, "nothing armed");
         assert_eq!(rig.pointer(PointerPhase::Up, at), None);
@@ -50174,5 +50926,950 @@ mod tests {
             gpu_target_needs_resize(Some(before), closed),
             "closing the gallery widens the canvas: {before:?} -> {closed:?}"
         );
+    }
+
+    // -- Layers-panel controls (0.135.0) ------------------------------------
+
+    // Exact float equality is the point in several assertions here: one
+    // undo must restore the pre-gesture opacity *exactly*.
+    #[allow(clippy::float_cmp)]
+    mod layer_controls {
+        use super::super::{
+            AccessibilityContext, AppCommand, CompositeCache, CompositeInvalidation, Drag,
+            GpuBlendDispatch, LayerControlEdit, LayerControlsState, UndoOrder, WidgetOwner,
+            WidgetPointer, apply_accessibility_action, apply_layer_control_invalidation,
+            apply_layer_control_outcome, composite_surface_id, default_shortcuts,
+            document_qualifies_for_gpu_compositing, end_layer_control_gestures, handle_key,
+            load_scales, perform_undo_redo, press_layer_row, recomposite_visible_tiles,
+            refresh_layer_row_descriptions, route_widget_key, route_widget_pointer,
+            settle_pending_opacity, sync_layer_controls, take_gpu_blend_dispatch_count,
+        };
+        use super::{
+            FakeClipboard, FakeFileDialog, fill_solid, read_first_texel, real_gpu_context,
+            real_tile_store, row_of,
+        };
+        use aurora_doc::{BlendMode, LayerId, LayerTree};
+        use aurora_theme::Scales;
+        use aurora_ui::{LayerControls, Tool};
+        use aurora_widgets::WidgetId;
+        use aurora_widgets::shortcut::{Key, Modifiers, NamedKey};
+        use aurora_widgets::widgets::WidgetKind;
+        use aurora_widgets::{
+            ClickTracker, FocusManager, KeyOutcome, PointerOutcome, PointerPhase,
+        };
+        use std::collections::HashMap;
+
+        const W: f32 = 1600.0;
+        const H: f32 = 900.0;
+        const LAYER_BOUNDS: aurora_core::Rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        /// Everything `App` holds that the controls touch, driven through
+        /// the same free functions and in the same order as
+        /// `App::route_gallery`, `App::handle_key_event` and
+        /// `App::run_undo_redo`.
+        struct Rig {
+            workspace: aurora_ui::Workspace,
+            focus: FocusManager,
+            gallery: Option<aurora_ui::GalleryPanel>,
+            click: ClickTracker,
+            scales: Scales,
+            layers: LayerTree,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: UndoOrder,
+            layer_rows: HashMap<WidgetId, LayerId>,
+            active: Option<LayerId>,
+            state: LayerControlsState,
+            cache: CompositeCache,
+            view: aurora_ui::CanvasView,
+            drag: Option<Drag>,
+        }
+
+        impl Rig {
+            /// Two root pixel layers, `a` (bottom) and `b` (top, active).
+            fn two_layers() -> (Self, LayerId, LayerId) {
+                let mut layers = LayerTree::new();
+                let mut ids = Vec::new();
+                for name in ["a", "b"] {
+                    match layers.add_pixel_layer(name, LAYER_BOUNDS, None) {
+                        Ok(id) => ids.push(id),
+                        Err(err) => unreachable!("{err:?}"),
+                    }
+                }
+                let (Some(&a), Some(&b)) = (ids.first(), ids.get(1)) else {
+                    unreachable!("two layers were just added");
+                };
+                (Self::new(layers, Some(b)), a, b)
+            }
+
+            fn new(layers: LayerTree, active: Option<LayerId>) -> Self {
+                let scales = match load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let mut workspace = aurora_ui::build_workspace();
+                let layer_rows = match aurora_ui::populate_layers_panel(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                    &layers,
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let mut state = LayerControlsState::default();
+                match aurora_ui::insert_layer_controls(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                ) {
+                    Ok(controls) => state.controls = Some(controls),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+                let _ = sync_layer_controls(&mut workspace, &state, &layers, active, None);
+                workspace.tree.compute_layout(W, H);
+                Self {
+                    workspace,
+                    focus: FocusManager::default(),
+                    gallery: None,
+                    click: ClickTracker::default(),
+                    scales,
+                    layers,
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order: UndoOrder::default(),
+                    layer_rows,
+                    active,
+                    state,
+                    cache: CompositeCache::default(),
+                    view: aurora_ui::CanvasView::new(),
+                    drag: None,
+                }
+            }
+
+            fn controls(&self) -> LayerControls {
+                match self.state.controls {
+                    Some(controls) => controls,
+                    None => unreachable!("built in `new`"),
+                }
+            }
+
+            fn edit(&mut self) -> LayerControlEdit<'_> {
+                LayerControlEdit {
+                    workspace: &mut self.workspace,
+                    layers: &mut self.layers,
+                    history: &mut self.history,
+                    pixel_history: &mut self.pixel_history,
+                    undo_order: &mut self.undo_order,
+                    layer_rows: &self.layer_rows,
+                    active_layer: self.active,
+                    state: &mut self.state,
+                }
+            }
+
+            fn centre(&self, id: WidgetId) -> (f32, f32) {
+                self.at(id, 0.5)
+            }
+
+            /// A point `fraction` of the way across `id`, vertically centred.
+            fn at(&self, id: WidgetId, fraction: f32) -> (f32, f32) {
+                let Some(b) = self.workspace.tree.bounds(id) else {
+                    unreachable!("{id:?} is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + b.width as f32 * fraction,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            /// `App::route_gallery`'s own sequence.
+            fn pointer(
+                &mut self,
+                phase: PointerPhase,
+                at: (f32, f32),
+                modal_open: bool,
+            ) -> (WidgetPointer, CompositeInvalidation) {
+                let controls = self.state.controls;
+                let routed = route_widget_pointer(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    controls.as_ref(),
+                    &mut self.click,
+                    &self.scales,
+                    modal_open,
+                    phase,
+                    at,
+                );
+                let captured = self.click.captured();
+                let invalidation = if routed.owner == Some(WidgetOwner::LayerControls)
+                    && let Some(outcome) = routed.outcome.as_ref()
+                {
+                    apply_layer_control_outcome(&mut self.edit(), outcome, captured)
+                } else {
+                    let _ = settle_pending_opacity(&mut self.edit(), captured);
+                    CompositeInvalidation::None
+                };
+                apply_layer_control_invalidation(&mut self.cache, &invalidation);
+                self.workspace.tree.compute_layout(W, H);
+                (routed, invalidation)
+            }
+
+            fn click(&mut self, id: WidgetId) -> CompositeInvalidation {
+                let at = self.centre(id);
+                let (_, down) = self.pointer(PointerPhase::Down, at, false);
+                let (_, up) = self.pointer(PointerPhase::Up, at, false);
+                if matches!(up, CompositeInvalidation::None) {
+                    down
+                } else {
+                    up
+                }
+            }
+
+            /// Down at 25%, moves to 40%/55%/70%, and (if `release`) Up —
+            /// a real drag on the opacity slider. Every move reports
+            /// `Everything` (review RT135-1: a live move reporting `None`
+            /// would leave the canvas showing the pre-drag opacity until
+            /// the release).
+            fn drag_opacity(&mut self, release: bool) {
+                let slider = self.controls().opacity;
+                let down = self.at(slider, 0.25);
+                let _ = self.pointer(PointerPhase::Down, down, false);
+                for fraction in [0.4, 0.55, 0.7] {
+                    let at = self.at(slider, fraction);
+                    let (_, invalidation) = self.pointer(PointerPhase::Move, at, false);
+                    assert!(
+                        matches!(invalidation, CompositeInvalidation::Everything),
+                        "a live drag move at {fraction} recomposites everything, got {invalidation:?}"
+                    );
+                }
+                if release {
+                    let at = self.at(slider, 0.7);
+                    let _ = self.pointer(PointerPhase::Up, at, false);
+                }
+            }
+
+            /// `App::handle_key_event`'s widget half.
+            fn key(&mut self, key: Key) -> Option<(WidgetOwner, KeyOutcome)> {
+                let controls = self.state.controls;
+                let routed = route_widget_key(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    controls.as_ref(),
+                    &self.scales,
+                    false,
+                    false,
+                    Modifiers::none(),
+                    key,
+                    None,
+                );
+                if let Some((WidgetOwner::LayerControls, KeyOutcome::Handled(outcome))) = &routed {
+                    let captured = self.click.captured();
+                    let invalidation =
+                        apply_layer_control_outcome(&mut self.edit(), outcome, captured);
+                    apply_layer_control_invalidation(&mut self.cache, &invalidation);
+                }
+                self.workspace.tree.compute_layout(W, H);
+                routed
+            }
+
+            /// `App::run_undo_redo`: drop the slider's capture, then
+            /// `perform_undo_redo` (which commits a pending drag first).
+            fn undo_redo(&mut self, command: AppCommand) -> CompositeInvalidation {
+                if self.click.captured() == Some(self.controls().opacity) {
+                    self.click.release_capture();
+                }
+                let mut palette = None;
+                let mut tool = Tool::default();
+                let invalidation = perform_undo_redo(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut palette,
+                    &mut tool,
+                    &mut self.layers,
+                    &mut self.history,
+                    &mut self.pixel_history,
+                    None,
+                    &mut self.undo_order,
+                    &mut self.cache,
+                    &mut self.view,
+                    self.active,
+                    &mut self.drag,
+                    &mut self.state,
+                    command,
+                );
+                refresh_layer_row_descriptions(&mut self.workspace, &self.layer_rows, &self.layers);
+                self.workspace.tree.compute_layout(W, H);
+                invalidation
+            }
+
+            fn opacity(&self, id: LayerId) -> f32 {
+                self.layers.opacity(id).unwrap_or(f32::NAN)
+            }
+
+            fn slider_value(&self) -> f64 {
+                match self.workspace.tree.payload(self.controls().opacity) {
+                    Some(WidgetKind::Slider(state)) => state.value,
+                    other => unreachable!("expected Slider, got {other:?}"),
+                }
+            }
+
+            fn selected_blend(&self) -> Option<usize> {
+                match aurora_widgets::widgets::dropdown_state(
+                    &self.workspace.tree,
+                    self.controls().blend,
+                ) {
+                    Ok(state) => state.selected(),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+
+            fn row_description(&self, layer: LayerId) -> String {
+                let row = row_of(&self.layer_rows, layer);
+                self.workspace
+                    .tree
+                    .accessibility(row)
+                    .and_then(|node| node.description().map(str::to_owned))
+                    .unwrap_or_default()
+            }
+        }
+
+        fn multiply_index() -> usize {
+            match aurora_ui::blend_mode_index(BlendMode::Multiply) {
+                Some(index) => index,
+                None => unreachable!("Multiply is in BlendMode::ALL"),
+            }
+        }
+
+        /// Opens the blend-mode list and commits `index` by pointer.
+        fn pick_blend(rig: &mut Rig, index: usize) -> CompositeInvalidation {
+            let blend = rig.controls().blend;
+            let opened = rig.click(blend);
+            assert!(
+                matches!(opened, CompositeInvalidation::None),
+                "opening edits nothing"
+            );
+            let rows = match aurora_widgets::widgets::dropdown_state(&rig.workspace.tree, blend) {
+                Ok(state) => state.rows().to_vec(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(&row) = rows.get(index) else {
+                unreachable!("the open list has {} rows, wanted {index}", rows.len());
+            };
+            rig.click(row)
+        }
+
+        #[test]
+        fn a_slider_drag_follows_live_and_records_exactly_one_undo_step() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            let undo_steps = rig.undo_order.undo.len();
+
+            rig.drag_opacity(false);
+            let live = rig.opacity(b);
+            assert!(live < 1.0, "the document follows the drag live, got {live}");
+            assert_eq!(rig.history.journal_len(), journal, "no step per move");
+            assert!(rig.state.pending.is_some());
+
+            let at = rig.at(rig.controls().opacity, 0.7);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            let released = rig.opacity(b);
+            assert!(
+                (f64::from(released) - rig.slider_value() / 100.0).abs() < 1e-6,
+                "the final opacity is the slider's final value: {released} vs {}",
+                rig.slider_value()
+            );
+            assert!(rig.state.pending.is_none());
+            assert_eq!(rig.history.journal_len(), journal + 1, "one journal entry");
+            assert_eq!(rig.undo_order.undo.len(), undo_steps + 1, "one undo step");
+            assert!(
+                rig.row_description(b)
+                    .ends_with(&format!("{}%", (f64::from(released) * 100.0).round()))
+            );
+
+            let invalidation = rig.undo_redo(AppCommand::Undo);
+            assert!(matches!(invalidation, CompositeInvalidation::Everything));
+            assert_eq!(rig.opacity(b), 1.0, "one undo restores the start exactly");
+            assert!(
+                (rig.slider_value() - 100.0).abs() < 1e-9,
+                "and the slider reflects the undone document"
+            );
+        }
+
+        #[test]
+        fn a_drag_cancelled_by_a_modal_commits_one_step() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            let live = rig.opacity(b);
+            let at = rig.at(rig.controls().opacity, 0.9);
+            let (routed, _) = rig.pointer(PointerPhase::Move, at, true);
+            assert_eq!(
+                routed.outcome,
+                Some(PointerOutcome::Cancelled(rig.controls().opacity))
+            );
+            assert_eq!(routed.owner, Some(WidgetOwner::LayerControls));
+            assert!(rig.state.pending.is_none(), "the cancel ended the drag");
+            assert_eq!(rig.opacity(b), live, "a cancel keeps the last value");
+            assert_eq!(rig.history.journal_len(), journal + 1, "and commits it");
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0);
+        }
+
+        /// An assistive technology's `Click` on `layer`'s row, through
+        /// `apply_accessibility_action` exactly as `App` runs it.
+        fn press_row_by_accessibility(rig: &mut Rig, layer: LayerId) {
+            let request = accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                target_node: row_of(&rig.layer_rows, layer),
+                data: None,
+            };
+            let mut dialog = None;
+            let _ = apply_accessibility_action(
+                &mut AccessibilityContext {
+                    workspace: &mut rig.workspace,
+                    focus: &mut rig.focus,
+                    dialog: &mut dialog,
+                    palette: None,
+                    scales: &rig.scales,
+                    layers: &mut rig.layers,
+                    layer_rows: &mut rig.layer_rows,
+                    active_layer: &mut rig.active,
+                    view: &mut rig.view,
+                    history: &mut rig.history,
+                    pixel_history: &mut rig.pixel_history,
+                    undo_order: &mut rig.undo_order,
+                    composite_cache: &mut rig.cache,
+                    drag: &mut rig.drag,
+                    layer_controls: &mut rig.state,
+                    click: &mut rig.click,
+                    gallery: &mut rig.gallery,
+                },
+                &request,
+            );
+            rig.workspace.tree.compute_layout(W, H);
+        }
+
+        /// Review RT135-3: an assistive technology selecting another layer
+        /// mid pointer-drag ends the drag on the layer it started on and
+        /// drops its capture — the rest of the pointer gesture never
+        /// edits the newly active layer.
+        #[test]
+        fn an_accessibility_row_press_mid_drag_ends_the_drag_on_its_own_layer() {
+            let (mut rig, a, b) = Rig::two_layers();
+            assert_eq!(rig.active, Some(b), "precondition: b is active");
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            let dragged = rig.opacity(b);
+            assert!(dragged < 1.0, "the drag moved b, got {dragged}");
+
+            press_row_by_accessibility(&mut rig, a);
+            assert_eq!(rig.active, Some(a), "the press selected a");
+            assert!(rig.state.pending.is_none(), "the press committed the drag");
+            assert_eq!(rig.click.captured(), None, "and dropped its capture");
+            assert_eq!(rig.history.journal_len(), journal + 1, "b's one step");
+
+            let slider = rig.controls().opacity;
+            for fraction in [0.3, 0.9] {
+                let at = rig.at(slider, fraction);
+                let _ = rig.pointer(PointerPhase::Move, at, false);
+            }
+            let at = rig.at(slider, 0.9);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            assert_eq!(rig.opacity(a), 1.0, "the pointer drag never reached a");
+            assert_eq!(rig.opacity(b), dragged, "b keeps the drag's value");
+            assert_eq!(rig.history.journal_len(), journal + 1, "exactly one step");
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0, "and it is b's");
+            assert_eq!(rig.opacity(a), 1.0);
+        }
+
+        /// Review RT135-3, the defensive half: whatever path moves the
+        /// active layer while the slider keeps the capture, the drag is
+        /// committed on its own layer and its remaining moves are
+        /// dropped, not retargeted.
+        #[test]
+        fn a_drag_whose_active_layer_changes_under_it_is_dropped_not_retargeted() {
+            let (mut rig, a, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            let dragged = rig.opacity(b);
+            // A stand-in for any selection path that leaves the
+            // slider's capture in place.
+            rig.active = Some(a);
+            let slider = rig.controls().opacity;
+            for fraction in [0.3, 0.9] {
+                let at = rig.at(slider, fraction);
+                let (_, invalidation) = rig.pointer(PointerPhase::Move, at, false);
+                assert!(
+                    matches!(invalidation, CompositeInvalidation::None),
+                    "a detached move edits nothing, got {invalidation:?}"
+                );
+            }
+            assert_eq!(rig.history.journal_len(), journal + 1, "b's step, once");
+            let at = rig.at(slider, 0.9);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            assert_eq!(rig.opacity(a), 1.0, "never retargeted onto a");
+            assert_eq!(rig.opacity(b), dragged);
+            assert!(rig.state.pending.is_none());
+            assert!(!rig.state.detached, "the release ends the detached capture");
+            assert_eq!(rig.history.journal_len(), journal + 1);
+
+            // The next drag is an ordinary one again, on a.
+            rig.drag_opacity(true);
+            assert!(rig.opacity(a) < 1.0, "a fresh drag edits a");
+            assert_eq!(rig.history.journal_len(), journal + 2);
+        }
+
+        /// Review RT135-4: replacing the document ends every control
+        /// gesture — an open blend-mode list is closed (left open, its
+        /// next commit would land in the new document) and a live drag
+        /// is committed with its capture dropped.
+        #[test]
+        fn replacing_the_document_closes_the_blend_list_and_commits_a_drag() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let blend = rig.controls().blend;
+            let is_open = |rig: &Rig| {
+                aurora_widgets::widgets::dropdown_state(&rig.workspace.tree, blend)
+                    .is_ok_and(aurora_widgets::widgets::DropdownState::is_open)
+            };
+            let _ = rig.click(blend);
+            assert!(is_open(&rig), "precondition: the list is open");
+            let mut click = rig.click;
+            let committed = end_layer_control_gestures(&mut rig.edit(), &mut click);
+            rig.click = click;
+            assert!(!committed, "nothing to commit");
+            assert!(!is_open(&rig), "the swap closed the list");
+
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            let mut click = rig.click;
+            let committed = end_layer_control_gestures(&mut rig.edit(), &mut click);
+            rig.click = click;
+            assert!(committed, "the drag's one step is recorded");
+            assert!(rig.state.pending.is_none());
+            assert_eq!(rig.click.captured(), None, "its capture is dropped");
+            assert_eq!(rig.history.journal_len(), journal + 1);
+            assert!(rig.opacity(b) < 1.0);
+        }
+
+        /// Review RT135-5: the app's own sync wrapper, run between drag
+        /// moves as `App::about_to_wait` runs it, hands the tracker's
+        /// capture through — a dragged slider keeps the drag's value even
+        /// when the document disagrees — and mirrors the document again
+        /// once the capture ends.
+        #[test]
+        fn the_apps_sync_leaves_a_dragged_slider_alone_between_moves() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let slider = rig.controls().opacity;
+            let down = rig.at(slider, 0.25);
+            let _ = rig.pointer(PointerPhase::Down, down, false);
+            for fraction in [0.4, 0.55, 0.7] {
+                let at = rig.at(slider, fraction);
+                let _ = rig.pointer(PointerPhase::Move, at, false);
+                let value = rig.slider_value();
+                // The document disagreeing with the slider mid-drag.
+                if let Err(err) = rig.layers.set_opacity(b, 0.9) {
+                    unreachable!("{err:?}");
+                }
+                let changed = sync_layer_controls(
+                    &mut rig.workspace,
+                    &rig.state,
+                    &rig.layers,
+                    rig.active,
+                    rig.click.captured(),
+                );
+                assert!(!changed, "a captured slider is left alone at {fraction}");
+                assert_eq!(rig.slider_value(), value, "it keeps the drag value");
+            }
+            let at = rig.at(slider, 0.7);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            if let Err(err) = rig.layers.set_opacity(b, 0.9) {
+                unreachable!("{err:?}");
+            }
+            let changed = sync_layer_controls(
+                &mut rig.workspace,
+                &rig.state,
+                &rig.layers,
+                rig.active,
+                rig.click.captured(),
+            );
+            assert!(changed, "released, the slider follows the document again");
+            assert!((rig.slider_value() - 90.0).abs() < 1e-3);
+        }
+
+        #[test]
+        fn undo_mid_drag_commits_the_drag_then_undoes_it_leaving_the_step_before_intact() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let multiply = multiply_index();
+            let _ = pick_blend(&mut rig, multiply);
+            assert_eq!(rig.layers.blend_mode(b), Some(BlendMode::Multiply));
+            rig.drag_opacity(false);
+            assert!(rig.opacity(b) < 1.0);
+
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0, "the undo undid the drag");
+            assert_eq!(
+                rig.layers.blend_mode(b),
+                Some(BlendMode::Multiply),
+                "not the blend change before it"
+            );
+            assert!(rig.state.pending.is_none());
+            assert_eq!(rig.click.captured(), None, "the drag's capture ended");
+
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.layers.blend_mode(b), Some(BlendMode::Normal));
+            assert_eq!(
+                rig.selected_blend(),
+                aurora_ui::blend_mode_index(BlendMode::Normal),
+                "the dropdown reflects the undone document"
+            );
+        }
+
+        #[test]
+        fn arrow_keys_on_the_focused_slider_are_one_undo_step_each() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let slider = rig.controls().opacity;
+            if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, slider) {
+                unreachable!("{err:?}");
+            }
+            let journal = rig.history.journal_len();
+            for _ in 0..2 {
+                match rig.key(Key::Named(NamedKey::ArrowLeft)) {
+                    Some((WidgetOwner::LayerControls, KeyOutcome::Handled(_))) => {}
+                    other => unreachable!("the slider takes the arrow, got {other:?}"),
+                }
+            }
+            let stepped = rig.opacity(b);
+            assert!(stepped < 1.0, "two steps down, got {stepped}");
+            assert_eq!(rig.history.journal_len(), journal + 2, "one step per key");
+            let _ = rig.undo_redo(AppCommand::Undo);
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0);
+        }
+
+        /// Judge follow-up 1: an assistive-technology action on a control
+        /// mid pointer drag ends that drag (committed, capture dropped),
+        /// so the rest of the pointer gesture neither opens a second step
+        /// nor overrides the action's value.
+        #[test]
+        fn an_accessibility_set_value_mid_drag_ends_the_pointer_drag() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            assert!(
+                rig.state.pending.is_some(),
+                "precondition: a drag is pending"
+            );
+            let request = accesskit::ActionRequest {
+                action: accesskit::Action::SetValue,
+                target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                target_node: rig.controls().opacity,
+                data: Some(accesskit::ActionData::NumericValue(30.0)),
+            };
+            let mut dialog = None;
+            let _ = apply_accessibility_action(
+                &mut AccessibilityContext {
+                    workspace: &mut rig.workspace,
+                    focus: &mut rig.focus,
+                    dialog: &mut dialog,
+                    palette: None,
+                    scales: &rig.scales,
+                    layers: &mut rig.layers,
+                    layer_rows: &mut rig.layer_rows,
+                    active_layer: &mut rig.active,
+                    view: &mut rig.view,
+                    history: &mut rig.history,
+                    pixel_history: &mut rig.pixel_history,
+                    undo_order: &mut rig.undo_order,
+                    composite_cache: &mut rig.cache,
+                    drag: &mut rig.drag,
+                    layer_controls: &mut rig.state,
+                    click: &mut rig.click,
+                    gallery: &mut rig.gallery,
+                },
+                &request,
+            );
+            rig.workspace.tree.compute_layout(W, H);
+            assert!(rig.state.pending.is_none(), "the drag was committed");
+            assert_eq!(rig.click.captured(), None, "and its capture dropped");
+            assert!(
+                (rig.opacity(b) - 0.3).abs() < 1e-6,
+                "got {}",
+                rig.opacity(b)
+            );
+            assert_eq!(rig.history.journal_len(), journal + 2, "drag + action");
+            let slider = rig.controls().opacity;
+            for fraction in [0.8, 0.95] {
+                let at = rig.at(slider, fraction);
+                let _ = rig.pointer(PointerPhase::Move, at, false);
+            }
+            let at = rig.at(slider, 0.95);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            assert!(
+                (rig.opacity(b) - 0.3).abs() < 1e-6,
+                "the rest of the pointer gesture did not override it, got {}",
+                rig.opacity(b)
+            );
+            assert_eq!(rig.history.journal_len(), journal + 2, "no third step");
+        }
+
+        #[test]
+        fn an_accessibility_set_value_on_the_slider_is_one_undo_step() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            let request = accesskit::ActionRequest {
+                action: accesskit::Action::SetValue,
+                target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                target_node: rig.controls().opacity,
+                data: Some(accesskit::ActionData::NumericValue(30.0)),
+            };
+            let mut dialog = None;
+            let _ = apply_accessibility_action(
+                &mut AccessibilityContext {
+                    workspace: &mut rig.workspace,
+                    focus: &mut rig.focus,
+                    dialog: &mut dialog,
+                    palette: None,
+                    scales: &rig.scales,
+                    layers: &mut rig.layers,
+                    layer_rows: &mut rig.layer_rows,
+                    active_layer: &mut rig.active,
+                    view: &mut rig.view,
+                    history: &mut rig.history,
+                    pixel_history: &mut rig.pixel_history,
+                    undo_order: &mut rig.undo_order,
+                    composite_cache: &mut rig.cache,
+                    drag: &mut rig.drag,
+                    layer_controls: &mut rig.state,
+                    click: &mut rig.click,
+                    gallery: &mut rig.gallery,
+                },
+                &request,
+            );
+            assert!(
+                (rig.opacity(b) - 0.3).abs() < 1e-6,
+                "got {}",
+                rig.opacity(b)
+            );
+            assert_eq!(rig.history.journal_len(), journal + 1);
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0);
+        }
+
+        #[test]
+        fn committing_multiply_in_the_dropdown_is_one_step_and_recomposites_everything() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            let invalidation = pick_blend(&mut rig, multiply_index());
+            assert!(matches!(invalidation, CompositeInvalidation::Everything));
+            assert_eq!(rig.layers.blend_mode(b), Some(BlendMode::Multiply));
+            assert_eq!(rig.history.journal_len(), journal + 1);
+            assert!(
+                rig.row_description(b).starts_with("Multiply, "),
+                "the row names the new mode: {:?}",
+                rig.row_description(b)
+            );
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.layers.blend_mode(b), Some(BlendMode::Normal));
+            assert!(rig.row_description(b).starts_with("Normal, "));
+        }
+
+        #[test]
+        fn the_visibility_checkbox_hides_the_layer_and_undo_restores_it() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let invalidation = rig.click(rig.controls().visible);
+            assert!(matches!(invalidation, CompositeInvalidation::Everything));
+            assert_eq!(rig.layers.visible(b), Some(false));
+            assert!(rig.row_description(b).ends_with(", hidden"));
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.layers.visible(b), Some(true));
+            assert!(matches!(
+                rig.workspace.tree.payload(rig.controls().visible),
+                Some(WidgetKind::Checkbox(state)) if state.checked == accesskit::Toggled::True
+            ));
+        }
+
+        #[test]
+        fn a_tool_letter_still_reaches_the_shortcuts_with_the_slider_focused() {
+            let (mut rig, _, _) = Rig::two_layers();
+            let slider = rig.controls().opacity;
+            if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, slider) {
+                unreachable!("{err:?}");
+            }
+            assert_eq!(rig.key(Key::Character('b')), None, "not the slider's key");
+            let mut tool = Tool::Pan;
+            let mut dialog = None;
+            let mut palette = None;
+            let _ = handle_key(
+                &mut rig.workspace,
+                &mut rig.focus,
+                &mut dialog,
+                &mut palette,
+                &mut tool,
+                &mut rig.layers,
+                &mut rig.history,
+                &mut rig.pixel_history,
+                None,
+                &mut rig.undo_order,
+                &default_shortcuts(),
+                Modifiers::none(),
+                Key::Character('b'),
+                Some("b"),
+                &mut FakeClipboard::default(),
+                &mut FakeFileDialog::default(),
+            );
+            assert_eq!(tool, Tool::Brush, "the tool shortcut fired");
+        }
+
+        #[test]
+        fn changing_the_active_layer_mid_drag_commits_the_drag_to_the_original_layer() {
+            let (mut rig, a, b) = Rig::two_layers();
+            rig.drag_opacity(false);
+            let dragged = rig.opacity(b);
+            assert!(dragged < 1.0);
+            // A press on layer `a`'s row: not the controls', so the router
+            // resets the stale capture and the settle commits the drag.
+            let row_a = row_of(&rig.layer_rows, a);
+            let at = rig.centre(row_a);
+            let (routed, _) = rig.pointer(PointerPhase::Down, at, false);
+            assert_eq!(
+                routed.outcome, None,
+                "the row press goes on to the Layers panel"
+            );
+            assert!(rig.state.pending.is_none(), "the drag was committed");
+            press_layer_row(
+                &mut rig.workspace,
+                &rig.layer_rows,
+                &mut rig.active,
+                &mut rig.view,
+                &rig.layers,
+                &mut rig.history,
+                &mut rig.pixel_history,
+                &mut rig.undo_order,
+                &mut rig.cache,
+                &mut rig.drag,
+                a,
+            );
+            assert_eq!(rig.active, Some(a));
+            let _ = sync_layer_controls(
+                &mut rig.workspace,
+                &rig.state,
+                &rig.layers,
+                rig.active,
+                None,
+            );
+            assert!(
+                (rig.slider_value() - 100.0).abs() < 1e-9,
+                "the slider shows `a`"
+            );
+            assert_eq!(rig.opacity(a), 1.0, "the drag never touched `a`");
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.opacity(b), 1.0, "the step was recorded against `b`");
+            assert_eq!(rig.opacity(a), 1.0);
+        }
+
+        #[test]
+        fn a_capture_released_by_the_pointer_leaving_is_settled_into_one_step() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            rig.drag_opacity(false);
+            // `WindowEvent::CursorLeft`'s own sequence.
+            rig.click.release_capture();
+            let captured = rig.click.captured();
+            assert!(settle_pending_opacity(&mut rig.edit(), captured));
+            assert_eq!(rig.history.journal_len(), journal + 1);
+            assert!(rig.opacity(b) < 1.0);
+        }
+
+        #[test]
+        fn a_press_on_the_canvas_is_not_claimed_by_the_controls() {
+            let (mut rig, _, _) = Rig::two_layers();
+            let canvas = rig.centre(rig.workspace.canvas_area);
+            let (routed, invalidation) = rig.pointer(PointerPhase::Down, canvas, false);
+            assert_eq!(routed.outcome, None);
+            assert_eq!(routed.owner, None);
+            assert!(matches!(invalidation, CompositeInvalidation::None));
+        }
+
+        /// The whole chain on a real adapter: the dropdown commits
+        /// `Multiply`, the invalidation reaches the cache, and the GPU
+        /// composite of the very same cache changes from the top layer's
+        /// colour to the Multiply product.
+        #[test]
+        fn switching_a_layer_to_multiply_in_the_dropdown_changes_the_gpu_composite() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let (mut rig, a, b) = Rig::two_layers();
+            let tile = aurora_tile::TileId { x: 0, y: 0 };
+            for (layer, rgba) in [(a, [0.5, 0.75, 0.25, 1.0]), (b, [0.5, 0.5, 0.5, 1.0])] {
+                let Some(surface) = rig.layers.surface_id(layer) else {
+                    unreachable!("a pixel layer");
+                };
+                fill_solid(&mut store, surface, tile, rgba);
+            }
+            let residency =
+                aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            recomposite_visible_tiles(
+                &residency,
+                &rig.layers,
+                None,
+                &mut store,
+                &mut rig.cache,
+                Some(&context),
+                Some(&mut compositor),
+            );
+            let before = read_first_texel(&mut store, composite_surface_id(), tile);
+            assert_eq!(
+                before,
+                (0.5, 0.5, 0.5, 1.0),
+                "Normal: the opaque top layer wins"
+            );
+
+            let invalidation = pick_blend(&mut rig, multiply_index());
+            assert!(matches!(invalidation, CompositeInvalidation::Everything));
+            assert!(document_qualifies_for_gpu_compositing(&rig.layers));
+            let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply);
+            recomposite_visible_tiles(
+                &residency,
+                &rig.layers,
+                None,
+                &mut store,
+                &mut rig.cache,
+                Some(&context),
+                Some(&mut compositor),
+            );
+            assert_eq!(
+                take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply),
+                1,
+                "the Multiply layer composited on the GPU, not the CPU fallback"
+            );
+            let after = read_first_texel(&mut store, composite_surface_id(), tile);
+            let expected = (0.25, 0.375, 0.125, 1.0);
+            let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+            for (got, want) in [
+                (after.0, expected.0),
+                (after.1, expected.1),
+                (after.2, expected.2),
+                (after.3, expected.3),
+            ] {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "the composite must become the Multiply product: {after:?} vs {expected:?}"
+                );
+            }
+        }
     }
 }
