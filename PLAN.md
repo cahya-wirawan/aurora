@@ -26,7 +26,18 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.138.0): placing the caret with the pointer.**
+**Latest (2026-09-28, 0.139.0): the text caret blinks.** A focused
+text field's caret (and the command palette's query caret) now blinks
+at 530 ms per half-period, shows solid again at once after any edit,
+caret or selection move, IME change, click or focus change, stays
+steady under the OS reduced-motion preference (read on macOS only
+today), and is hidden while the window lacks OS focus. The event loop
+sleeps until exactly the next flip and wakes for nothing when no caret
+is showing, so an idle window still blocks in `Wait`. The 530 ms
+interval is not a token and is flagged to the design owner. Details and
+disclosures: M1.7's "Text field" 0.139.0 update.
+
+**Previously (2026-09-28, 0.138.0): placing the caret with the pointer.**
 A click in a text field now puts the caret under the pointer, a
 `Shift`+click extends the selection, and a drag selects (dragging back
 onto the press point collapses it); what a drag selected copies with the
@@ -2393,6 +2404,99 @@ check licenses` clean with the new `toml` dependency.
   of the stored value for the current caret), not the stale frame.
   **Needs a human:** a long line in the Widget Gallery field — click,
   drag and Shift+click with the text scrolled — on real hardware.
+
+  **Update 0.139.0 — caret blink.** Closes the "no caret blink"
+  disclosure carried since 0.133.0. New in `aurora-widgets`
+  (`caret.rs`): `CARET_BLINK_INTERVAL` (530 ms per half-period, the
+  Windows `GetCaretBlinkTime` default — **not a token**, same status as
+  `CARET_WIDTH`; flagged to Cahya with the caret's width and colour);
+  `CaretSignature` and `caret_signature(tree, focused)`, which reads the
+  caret the frame would draw — owner, cursor, selection anchor and a
+  hash of the content plus any IME composition for a focused, enabled
+  text field; owner and query for focus anywhere inside a command
+  palette; `None` otherwise, the same rule `text_runs` uses to draw a
+  caret at all; and `CaretBlink { epoch, signature }` with `observe`
+  (a changed signature restarts the clock), `visible(now,
+  reduced_motion)` (even half-periods since the epoch; always `true`
+  with no owner or under reduced motion) and `next_toggle(now,
+  reduced_motion)` (strictly after `now`; `None` with no owner or under
+  reduced motion). Restarting on a signature change rather than at each
+  input site means every path — keys, IME, pointer, accessibility
+  actions, focus moves — shows the caret solid immediately with no
+  per-site reset call to forget. Hiding needed no paint API change:
+  `paint_widget_ops_frame`'s `focused` is now documented as the frame's
+  caret owner, and the app passes `None` in a hidden half-period (it
+  decides only the caret — scroll anchor and selection do not read it,
+  and `update_field_scrolls` passes `None` anyway). In `aurora-app`: one
+  pure `caret_step` shared by `App::redraw` and `App::about_to_wait`
+  (observe, then the owner to paint with, the next flip, and whether
+  the owner differs from the last frame's); `earliest_deadline` merges
+  the flip with the gallery tooltip's deadline for `next_control_flow`;
+  a flip the last frame did not draw sets `needs_redraw`; `redraw`
+  records the owner it painted with before any early return, so a frame
+  that cannot draw (no surface, occluded) cannot make every iteration
+  ask again. New `WindowEvent::Focused` handling: while another window
+  has keyboard focus the caret is not drawn and does not blink (the
+  native convention, and no twice-a-second wake-ups in the background);
+  regaining focus is a signature change, so it returns solid. The OS
+  reduced-motion preference (`detect_accessibility_preferences`, now
+  read once in `run` and passed to `App::new`) gives a steady caret.
+  **Tests (+6 `aurora-widgets`, +3 `aurora-app`):** alternating
+  half-periods with the flip exactly at the interval; `next_toggle`
+  strictly future at 40 sampled instants, with visibility changing
+  there and not a nanosecond before; a new signature restarts the clock
+  visible and the same one does not; no owner / reduced motion never
+  blinks or wakes; `caret_signature` changes with content, cursor,
+  anchor, composition text and target, and is `None` when disabled; the
+  palette signature holds on the palette and its rows and follows the
+  query; app `a_focused_fields_caret_blinks_and_a_typed_character_shows_it_at_once`
+  (Gallery rig: `caret_step` over time, a typed character mid-hidden-phase,
+  and `target_paint_ops` drawing the caret with the visible owner and
+  not with the hidden one); `no_blink_without_a_caret_an_unfocused_window_or_with_reduced_motion`;
+  `the_loop_deadline_is_the_earlier_of_the_tooltip_and_the_caret_flip`.
+  **Mutations**, each run against the widgets `caret` tests and the app
+  caret/deadline tests, restored from a scratchpad backup, sha256
+  checked: `next_toggle` returning `now` (a busy loop), no epoch reset
+  on a signature change, blinking while the window is unfocused,
+  `visible` ignoring reduced motion, `next_toggle` ignoring it, the
+  phase inverted, `earliest_deadline` dropping its second argument,
+  `caret_step` never reporting a flip, and `caret_step`'s owner ignoring
+  the blink — **all 9 killed**. **3 survive**, all `App` method wiring
+  that no headless test can reach (`about_to_wait` needs an
+  `ActiveEventLoop`, `redraw` a surface): `about_to_wait` passing only
+  the tooltip deadline, `about_to_wait` ignoring `CaretStep::redraw`,
+  and `redraw` painting with `focus.focused()` instead of the caret
+  owner. **Review revision (same version):** a combined review/judge
+  (REVISE, ~0.91) found `redraw`'s whole doc comment had been moved onto
+  the new `App::caret_step` method (inserted between the doc and `fn
+  redraw`) — fixed by moving the method above the doc. It also
+  recommended extracting `about_to_wait`'s fold: new free
+  `fold_caret_step(step, gallery_deadline, &mut needs_redraw)` and test
+  `fold_caret_step_joins_the_deadlines_and_asks_for_the_flip`, which
+  kills the first two survivors (ignoring the caret's deadline; ignoring
+  its redraw) — both re-run and killed. The third (`redraw` painting
+  with `focus.focused()`) still needs a real frame and stays disclosed.
+  On Linux and Windows the caret always blinks, since reduced motion is
+  read on macOS only. **Disclosed:** the blink rate is fixed, not the OS's own
+  (Windows `GetCaretBlinkTime`, macOS `NSTextInsertionPointBlinkPeriod`,
+  GNOME's `cursor-blink`); reduced motion is detected on macOS only
+  (`false` elsewhere); a focused field that is not visible (collapsed
+  panel, scrolled out) still wakes the loop at 2 Hz; the caret is
+  hidden in a background window, a deliberate convention change from
+  0.133.0–0.138.0's always-drawn caret; `winit` delivering
+  `Focused(true)` on every platform is assumed, not observed (the flag
+  starts `true`); the signature's content hash (`DefaultHasher`) could in
+  principle collide, leaving one edit without a reset; each flip redraws
+  the whole frame, the same full frame every other redraw costs — no
+  damage-rect narrowing for the caret. Headless, Linux only. Workspace
+  run (`AURORA_REQUIRE_GPU=1 cargo test --workspace`, RTX 3090): 2,548
+  passed, 0 failed, 45 ignored; after the review revision the full gate
+  is green — 2,549 passed, 0 failed, 0 skipped, doctests, strict rustdoc
+  and `cargo deny check` clean. **Needs a
+  human:** watch the Widget Gallery field blink on real hardware, type
+  mid-blink, switch to another app and back, and toggle macOS "Reduce
+  motion"; and confirm with Activity Monitor/`top` that an idle Aurora
+  with nothing focused stays at ~0% CPU.
 - [x] **IME composition rendering (platform underline styles)** — done
   2026-08-02, `crates/aurora-widgets/src/widgets/text_field.rs`
   (`Composition`, `UnderlineStyle`, `composition_segments`,
@@ -4230,7 +4334,8 @@ check licenses` clean with the new `toml` dependency.
   fill covers only the lower half (decoded: strip `[49,49,54]` y 32..96,
   row `[120,172,255]` y 96..160). Shapes only: text is filtered out of
   every golden. Existing palette tests that counted body children now
-  account for the strip. **Disclosures:** no caret blink; caret-pinned
+  account for the strip. **Disclosures:** no caret blink (closed in
+  0.139.0); caret-pinned
   (not sticky) scroll (closed for text fields in 0.138.0's review
   revision); caret/selection colours provisional (caret colour,
   width and blink tokens flagged to Cahya); no placeholder
@@ -29310,6 +29415,16 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-28 (0.139.0) — caret blink.** The text caret blinks
+(530 ms, not a token, flagged to Cahya), restarts solid on any edit or
+caret change, is steady under reduced motion and hidden in a background
+window, and the loop sleeps until the next flip. Full account: M1.7's
+"Text field" 0.139.0 update. **Needs a human:** watch it blink on real
+hardware, including switching apps and macOS "Reduce motion".
+**Suggested next:** the measure-func layout round (checkbox labels,
+dialog titles); then double-click word selection (a click-count
+detector).
 
 **Addendum 2026-09-28 (0.138.0) — placing the caret with the pointer.**
 Click, `Shift`+click and drag-select in a text field, hit-tested against

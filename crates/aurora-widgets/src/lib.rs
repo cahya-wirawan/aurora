@@ -68,6 +68,7 @@
 //! consumer.
 
 pub mod action;
+mod caret;
 mod error;
 mod input;
 mod paint;
@@ -83,6 +84,7 @@ mod tree;
 pub mod widgets;
 
 pub use action::{ALL_ACTIONS, ActionOutcome, ActionRejection, handle_action};
+pub use caret::{CARET_BLINK_INTERVAL, CaretBlink, CaretSignature, caret_signature};
 pub use error::WidgetError;
 pub use input::{FocusManager, FocusOrigin, hit_test};
 pub use paint::{

@@ -4328,7 +4328,8 @@ fn gallery_hover_point(
 
 /// The event loop's control flow for the next wait, set on **every**
 /// iteration by [`App::about_to_wait`]: wake at the earliest of a
-/// pending timer `deadline` (the gallery tooltip's) and `now + poll`
+/// pending timer `deadline` (the gallery tooltip's or the caret blink's
+/// next flip, whichever is sooner — [`earliest_deadline`]) and `now + poll`
 /// (macOS's muda-channel poll), or block in `Wait` when neither exists.
 /// A deadline already in the past wakes immediately; the tick that runs
 /// on that wake-up consumes it ([`gallery_timer_step`]), so it cannot
@@ -4343,6 +4344,83 @@ fn next_control_flow(
         (Some(deadline), Some(polled)) => ControlFlow::WaitUntil(deadline.min(polled)),
         (Some(at), None) | (None, Some(at)) => ControlFlow::WaitUntil(at),
         (None, None) => ControlFlow::Wait,
+    }
+}
+
+/// The earlier of two optional wake-up instants (0.139.0): the loop's
+/// one timer `deadline` for [`next_control_flow`], from the gallery
+/// tooltip's and the caret blink's. `None` only when neither exists.
+fn earliest_deadline(
+    a: Option<std::time::Instant>,
+    b: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(at), None) | (None, Some(at)) => Some(at),
+        (None, None) => None,
+    }
+}
+
+/// Folds one [`CaretStep`] into a loop iteration (0.139.0 review): asks
+/// for a redraw exactly when the step reports a flip the last frame did
+/// not draw, and returns the loop's next wake-up — the earlier of the
+/// tooltip's deadline and the caret's next toggle. `App::about_to_wait`
+/// calls this so both halves of its wiring are unit-testable.
+fn fold_caret_step(
+    step: CaretStep,
+    gallery_deadline: Option<std::time::Instant>,
+    needs_redraw: &mut bool,
+) -> Option<std::time::Instant> {
+    if step.redraw {
+        *needs_redraw = true;
+    }
+    earliest_deadline(gallery_deadline, step.next_toggle)
+}
+
+/// What [`caret_step`] decides for one frame or loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaretStep {
+    /// The caret owner to paint with (`paint_widget_ops_frame`'s
+    /// `focused`): the focused widget in a visible half-period, `None`
+    /// in a hidden one or while the window lacks OS focus.
+    owner: Option<WidgetId>,
+    /// When the blink next flips, strictly after `now`; `None` when it
+    /// never will (no caret, reduced motion, or an unfocused window).
+    next_toggle: Option<std::time::Instant>,
+    /// Whether `owner` differs from the last frame's — a flip (or any
+    /// other caret change) that frame never drew.
+    redraw: bool,
+}
+
+/// The caret blink's one step (0.139.0), shared by [`App::redraw`] and
+/// [`App::about_to_wait`] so the two never disagree: observe the caret
+/// `focused` would draw (restarting the blink on any change —
+/// `aurora_widgets::CaretBlink::observe`), then read which owner to
+/// paint with at `now` and when the next flip is due.
+///
+/// A window **without OS focus** draws no caret and does not blink —
+/// the native convention (a background window's field shows no
+/// insertion point), and what keeps a backgrounded Aurora from waking
+/// twice a second for a caret nobody is looking at. Regaining focus is
+/// a signature change, so the caret comes back solid. `drawn` is the
+/// owner the last frame painted with; `redraw` is whether this one
+/// differs from it.
+fn caret_step(
+    blink: &mut aurora_widgets::CaretBlink,
+    tree: &WidgetTree<WidgetKind>,
+    focused: Option<WidgetId>,
+    window_focused: bool,
+    reduced_motion: bool,
+    now: std::time::Instant,
+    drawn: Option<WidgetId>,
+) -> CaretStep {
+    let focused = focused.filter(|_| window_focused);
+    blink.observe(aurora_widgets::caret_signature(tree, focused), now);
+    let owner = focused.filter(|_| blink.visible(now, reduced_motion));
+    CaretStep {
+        owner,
+        next_toggle: blink.next_toggle(now, reduced_motion),
+        redraw: owner != drawn,
     }
 }
 
@@ -15734,6 +15812,30 @@ struct App {
     /// "block until something changes." Starts `true` so the window's
     /// very first frame actually paints.
     needs_redraw: bool,
+    /// The text caret's blink (0.139.0) — see [`caret_step`].
+    caret: CaretState,
+}
+
+/// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
+/// reads besides the tree and focus.
+#[derive(Debug)]
+struct CaretState {
+    /// The blink clock.
+    blink: aurora_widgets::CaretBlink,
+    /// The caret owner the last [`App::redraw`] painted with, so
+    /// [`App::about_to_wait`] can tell a blink flip that has not been
+    /// drawn yet ([`CaretStep::redraw`]). Recorded at the top of every
+    /// redraw, drawn or not (no surface yet, an occluded window), so an
+    /// undrawable frame can never make every loop iteration ask again.
+    drawn_owner: Option<WidgetId>,
+    /// Whether the window has OS keyboard focus (`WindowEvent::Focused`),
+    /// `true` until told otherwise. Without it the caret is not drawn
+    /// and does not blink ([`caret_step`]).
+    window_focused: bool,
+    /// The OS reduced-motion preference, read once at startup
+    /// (`detect_accessibility_preferences` — macOS only; `false`
+    /// everywhere else today): a steady caret that never blinks.
+    reduced_motion: bool,
 }
 
 impl ShutdownState for App {
@@ -15783,6 +15885,7 @@ impl App {
         had_previous_marker: bool,
         autosave_path: &Path,
         layout_path: Option<PathBuf>,
+        reduced_motion: bool,
     ) -> Self {
         let mut workspace = aurora_ui::build_workspace();
         if let Some(layout_path) = layout_path.as_deref() {
@@ -15962,6 +16065,12 @@ impl App {
             scales,
             failed: false,
             needs_redraw: true,
+            caret: CaretState {
+                blink: aurora_widgets::CaretBlink::new(std::time::Instant::now()),
+                drawn_owner: None,
+                window_focused: true,
+                reduced_motion,
+            },
         }
     }
 
@@ -18021,6 +18130,19 @@ impl App {
         }
     }
 
+    /// [`caret_step`] on this app's own state at `now`.
+    fn caret_step(&mut self, now: std::time::Instant) -> CaretStep {
+        caret_step(
+            &mut self.caret.blink,
+            &self.workspace.tree,
+            self.focus.focused(),
+            self.caret.window_focused,
+            self.caret.reduced_motion,
+            now,
+            self.caret.drawn_owner,
+        )
+    }
+
     /// Clears the surface to the real theme background colour, then —
     /// if a live document, tile store, and GPU atlas all exist —
     /// recomposites every visible pixel layer
@@ -18054,6 +18176,11 @@ impl App {
     // analogous reason.
     #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
+        // The caret owner this frame paints with (0.139.0 blink),
+        // recorded before any early return below — see
+        // `CaretState::drawn_owner`.
+        let caret_owner = self.caret_step(std::time::Instant::now()).owner;
+        self.caret.drawn_owner = caret_owner;
         // Before anything reads `canvas_view`: hold its zoom to the
         // floor the atlas can actually render at this canvas size
         // (`canvas_min_zoom`). This is the one place guaranteed to run
@@ -18127,7 +18254,7 @@ impl App {
                 let widget_paints = collect_widget_paints(
                     &self.workspace.tree,
                     focus_paint,
-                    self.focus.focused(),
+                    caret_owner,
                     &self.theme,
                     &self.scales,
                     gpu,
@@ -18614,6 +18741,10 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             }
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
             WindowEvent::RedrawRequested => self.redraw(),
+            // No caret, and no blink wake-ups, while another window has
+            // keyboard focus (`caret_step`); the redraw every real event
+            // gets repaints the caret's disappearance or return.
+            WindowEvent::Focused(focused) => self.caret.window_focused = focused,
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = translate_modifiers(modifiers.state());
             }
@@ -18677,7 +18808,8 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
 
     // Sets the control flow on **every** iteration, on every platform
     // (0.131.0): `Wait`, or `WaitUntil` the earliest of the gallery
-    // tooltip's deadline and (macOS only) the muda poll — see
+    // tooltip's deadline, the caret blink's next flip (0.139.0) and
+    // (macOS only) the muda poll — see
     // `next_control_flow`. Setting it only sometimes would leave a stale
     // `WaitUntil` in the past behind, which is a busy loop.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
@@ -18718,7 +18850,8 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // The gallery tooltip's timer: tick first, then read the next
         // deadline, so a deadline that just passed is consumed.
         let now = std::time::Instant::now();
-        let (changed, deadline) = gallery_timer_step(&mut self.workspace, &mut self.gallery, now);
+        let (changed, gallery_deadline) =
+            gallery_timer_step(&mut self.workspace, &mut self.gallery, now);
         if changed {
             self.relayout_after_gallery();
         }
@@ -18730,6 +18863,13 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         self.sync_ime();
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
+        // The caret blink (0.139.0): after everything above that can move
+        // focus or edit a field, so the signature it observes is this
+        // iteration's. A flip the last frame did not draw asks for one
+        // frame; the next flip joins the tooltip's deadline, so an idle
+        // loop with a focused field wakes exactly once per half-period.
+        let caret = self.caret_step(now);
+        let deadline = fold_caret_step(caret, gallery_deadline, &mut self.needs_redraw);
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
@@ -18738,7 +18878,8 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // used to rely on (and which pegged a full CPU core doing it,
         // since it never let the loop go idle at all -- see
         // `needs_redraw`'s own doc comment). Non-macOS has no channel to
-        // poll and blocks in plain `Wait` unless a tooltip is pending.
+        // poll and blocks in plain `Wait` unless a tooltip or a caret
+        // flip is pending.
         #[cfg(target_os = "macos")]
         let poll = Some(MUDA_POLL_INTERVAL);
         #[cfg(not(target_os = "macos"))]
@@ -18834,8 +18975,9 @@ pub fn run() -> anyhow::Result<()> {
     // `load_theme()` above already uses for the Dark theme -- a real
     // density preference (settings UI, persisted choice) is separate,
     // later work, not a regression introduced here.
+    let preferences = detect_accessibility_preferences();
     let scales = load_scales()?
-        .with_accessibility_preferences(detect_accessibility_preferences())
+        .with_accessibility_preferences(preferences)
         .with_density(aurora_theme::Density::Comfortable);
     let marker_path = marker_path();
     // Checked *before* writing this run's own marker below -- otherwise
@@ -18873,6 +19015,7 @@ pub fn run() -> anyhow::Result<()> {
         had_previous_marker,
         &autosave_path,
         layout_path,
+        preferences.reduced_motion,
     );
     event_loop
         .run_app(&mut app)
@@ -18931,8 +19074,9 @@ mod tests {
         write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use super::{
-        ControlFlow, apply_gallery_ime, drop_stale_gallery_composition, gallery_hover_point,
-        gallery_timer_step, gpu_target_needs_resize, next_control_flow,
+        CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
+        earliest_deadline, fold_caret_step, gallery_hover_point, gallery_timer_step,
+        gpu_target_needs_resize, next_control_flow,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -51753,6 +51897,153 @@ mod tests {
         let before = rig.slider_value();
         assert_eq!(rig.pointer(PointerPhase::Move, rig.slider_at(0.9)), None);
         assert!((rig.slider_value() - before).abs() < f64::EPSILON);
+    }
+
+    /// Whether `target_paint_ops` draws a caret for `field` when the
+    /// frame's caret owner is `owner` — the headless half of a frame.
+    fn draws_caret(rig: &GalleryRig, owner: Option<WidgetId>) -> bool {
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err}"),
+        };
+        let ops = super::target_paint_ops(
+            &rig.workspace.tree,
+            None,
+            owner,
+            &theme,
+            &rig.scales,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1.0,
+        );
+        let content = rig.text();
+        ops.iter().any(|op| match op {
+            super::PaintOp::Text(run) => {
+                run.text == content && run.field.as_ref().is_some_and(|f| f.caret.is_some())
+            }
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn a_focused_fields_caret_blinks_and_a_typed_character_shows_it_at_once() {
+        let mut rig = GalleryRig::open();
+        let field = rig.focus_text_field();
+        let interval = aurora_widgets::CARET_BLINK_INTERVAL;
+        let t0 = std::time::Instant::now();
+        let mut blink = aurora_widgets::CaretBlink::new(t0);
+        let step = |rig: &GalleryRig,
+                    blink: &mut aurora_widgets::CaretBlink,
+                    now: std::time::Instant,
+                    drawn: Option<WidgetId>| {
+            caret_step(
+                blink,
+                &rig.workspace.tree,
+                rig.focus.focused(),
+                true,
+                false,
+                now,
+                drawn,
+            )
+        };
+        let first = step(&rig, &mut blink, t0, None);
+        assert_eq!(first.owner, Some(field), "solid on focus");
+        assert_eq!(first.next_toggle, Some(t0 + interval));
+        assert!(first.redraw, "the first frame has not drawn it yet");
+        assert!(draws_caret(&rig, first.owner));
+        // Same half-period, already drawn: nothing to do.
+        let mid = step(&rig, &mut blink, t0 + interval / 2, first.owner);
+        assert!(!mid.redraw);
+        assert_eq!(mid.owner, Some(field));
+        // The flip: hidden, a frame is due, and that frame has no caret.
+        let hidden_at = t0 + interval + std::time::Duration::from_millis(10);
+        let hidden = step(&rig, &mut blink, hidden_at, first.owner);
+        assert_eq!(hidden.owner, None);
+        assert!(hidden.redraw, "a flip the last frame did not draw");
+        assert_eq!(hidden.next_toggle, Some(t0 + interval * 2));
+        assert!(
+            !draws_caret(&rig, hidden.owner),
+            "no caret in a hidden phase"
+        );
+        // Typing mid-hidden-phase shows the caret at once, for a whole
+        // fresh visible half-period.
+        let before = rig.text();
+        rig.typed(Key::Character('x'), Some("x"), Modifiers::none());
+        assert_ne!(rig.text(), before, "the character was typed");
+        let typed = step(&rig, &mut blink, hidden_at, hidden.owner);
+        assert_eq!(typed.owner, Some(field), "typing shows the caret");
+        assert!(typed.redraw);
+        assert_eq!(typed.next_toggle, Some(hidden_at + interval));
+        assert!(draws_caret(&rig, typed.owner));
+    }
+
+    #[test]
+    fn no_blink_without_a_caret_an_unfocused_window_or_with_reduced_motion() {
+        let mut rig = GalleryRig::open();
+        let t0 = std::time::Instant::now();
+        let interval = aurora_widgets::CARET_BLINK_INTERVAL;
+        let mut blink = aurora_widgets::CaretBlink::new(t0);
+        // Nothing with a caret focused: the loop may block.
+        let idle = caret_step(&mut blink, &rig.workspace.tree, None, true, false, t0, None);
+        assert_eq!((idle.next_toggle, idle.redraw), (None, false));
+        let field = rig.focus_text_field();
+        let tree = &rig.workspace.tree;
+        // Another window has keyboard focus: no caret, no wake-ups.
+        for k in 0..4u32 {
+            let now = t0 + interval * k;
+            let away = caret_step(&mut blink, tree, Some(field), false, false, now, None);
+            assert_eq!((away.owner, away.next_toggle), (None, None), "{k}");
+        }
+        // Reduced motion: a steady caret, and no wake-ups either.
+        for k in 0..4u32 {
+            let now = t0 + interval * k;
+            let steady = caret_step(&mut blink, tree, Some(field), true, true, now, Some(field));
+            assert_eq!(steady.owner, Some(field), "{k}");
+            assert_eq!(steady.next_toggle, None, "{k}");
+            assert!(!steady.redraw, "{k}");
+        }
+    }
+
+    #[test]
+    fn fold_caret_step_joins_the_deadlines_and_asks_for_the_flip() {
+        let now = std::time::Instant::now();
+        let soon = now + std::time::Duration::from_millis(10);
+        let late = now + std::time::Duration::from_millis(500);
+        let step = |redraw, next_toggle| CaretStep {
+            owner: None,
+            next_toggle,
+            redraw,
+        };
+        let mut needs = false;
+        assert_eq!(
+            fold_caret_step(step(false, Some(soon)), Some(late), &mut needs),
+            Some(soon)
+        );
+        assert!(!needs, "no flip, no redraw");
+        assert_eq!(
+            fold_caret_step(step(true, None), Some(late), &mut needs),
+            Some(late)
+        );
+        assert!(needs, "a flip asks for a frame");
+        let mut needs = false;
+        assert_eq!(fold_caret_step(step(false, None), None, &mut needs), None);
+        assert!(!needs);
+    }
+
+    #[test]
+    fn the_loop_deadline_is_the_earlier_of_the_tooltip_and_the_caret_flip() {
+        let now = std::time::Instant::now();
+        let soon = now + std::time::Duration::from_millis(10);
+        let late = now + std::time::Duration::from_millis(500);
+        assert_eq!(earliest_deadline(None, None), None);
+        assert_eq!(earliest_deadline(Some(late), None), Some(late));
+        assert_eq!(earliest_deadline(None, Some(soon)), Some(soon));
+        assert_eq!(earliest_deadline(Some(late), Some(soon)), Some(soon));
+        assert_eq!(earliest_deadline(Some(soon), Some(late)), Some(soon));
+        assert_eq!(
+            next_control_flow(now, earliest_deadline(None, Some(soon)), None),
+            ControlFlow::WaitUntil(soon),
+            "a caret flip alone wakes the loop"
+        );
     }
 
     #[test]

@@ -23,10 +23,11 @@
 //! `Tab` (label, centred), `TreeItem` (label, one row tall), a `Menu`'s
 //! action rows, a `Dropdown`'s current value, and an open dropdown list's
 //! option rows. Since 0.133.0 also a `TextField`'s content — with its
-//! caret while focused ([`CARET_WIDTH`], no blink), its selection
-//! (`accent.primary` highlight, selected glyphs redrawn in
-//! `text.on_accent`) and its IME preedit spliced in at the cursor and
-//! underlined ([`FieldDecor`], [`resolve_run`]), horizontally scrolled
+//! caret while focused ([`CARET_WIDTH`]; blinking since 0.139.0,
+//! [`crate::CaretBlink`]), its selection (`accent.primary` highlight,
+//! selected glyphs redrawn in `text.on_accent`) and its IME preedit
+//! spliced in at the cursor and underlined ([`FieldDecor`],
+//! [`resolve_run`]), horizontally scrolled
 //! to keep the caret visible (since 0.138.0's review a text field's
 //! scroll is sticky and stored — [`sticky_scroll`],
 //! [`update_field_scrolls`]; the palette query stays caret-pinned,
@@ -108,9 +109,10 @@ impl TextRun {
 /// The caret's width in logical pixels (rounded to at least one physical
 /// pixel). **Not a token**: `design/tokens/scales.toml` has no
 /// stroke-weight scale — the same gap [`crate::paint::FOCUS_RING_WIDTH`]
-/// records. Its width, colour (`text.primary`, provisional) and the
-/// absence of a blink are flagged to the design owner (Cahya, PRD
-/// FR-027 *Ownership*) rather than invented here.
+/// records. Its width and colour (`text.primary`, provisional) are
+/// flagged to the design owner (Cahya, PRD FR-027 *Ownership*) rather
+/// than invented here, as is its blink cadence
+/// ([`crate::CARET_BLINK_INTERVAL`], 0.139.0).
 pub const CARET_WIDTH: f32 = 1.0;
 
 /// An editable line's decorations. Every byte offset indexes

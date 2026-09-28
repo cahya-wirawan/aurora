@@ -240,13 +240,17 @@ pub fn paint_widget_ops_focused(
     paint_widget_ops_frame(tree, id, focus, None, theme, scales, scale_factor)
 }
 
-/// [`paint_widget_ops_focused`] plus the widget holding keyboard focus
-/// (0.133.0), which a text field needs to draw its caret and the command
-/// palette's query strip needs to draw its own. `focused` is
-/// `FocusManager::focused()` — **any** focus origin, pointer included
-/// (a caret is where typing goes, not a keyboard-only indicator like the
-/// ring). [`paint_widget_ops_focused`] is exactly this with `focused =
-/// None`: no caret anywhere, everything else identical.
+/// [`paint_widget_ops_focused`] plus the frame's **caret owner**
+/// (0.133.0): the widget whose caret is drawn this frame, which a text
+/// field needs to draw its caret and the command palette's query strip
+/// needs to draw its own. It is normally `FocusManager::focused()` —
+/// **any** focus origin, pointer included (a caret is where typing goes,
+/// not a keyboard-only indicator like the ring) — and `None` during a
+/// hidden half-period of the caret's blink (0.139.0, [`crate::CaretBlink`]):
+/// the caret is the only thing it decides, so a blink never moves a
+/// field's scroll, selection or anything else drawn.
+/// [`paint_widget_ops_focused`] is exactly this with `focused = None`: no
+/// caret anywhere, everything else identical.
 ///
 /// # Errors
 ///
