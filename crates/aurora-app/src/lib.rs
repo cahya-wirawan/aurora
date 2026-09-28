@@ -518,8 +518,8 @@ use aurora_text::TextEngine;
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, DialogHandle, WidgetKind, command_palette_state,
-    insert_command_palette, insert_dialog, move_command_palette_selection,
+    CommandEntry, DialogAction, DialogHandle, TextFieldChord, WidgetKind, command_palette_state,
+    handle_text_field_chord, insert_command_palette, insert_dialog, move_command_palette_selection,
     set_command_palette_query,
 };
 use aurora_widgets::{
@@ -3666,6 +3666,14 @@ fn key_shows_focus_ring(key: Option<&Key>, modifiers: Modifiers) -> bool {
 /// is in progress, a named editing key (`Backspace`, the arrows, ...)
 /// is consumed without editing: the IME owns it, and it must neither
 /// edit the committed text under the composition nor reach a shortcut.
+///
+/// **Editing chords** (0.137.0): a press [`TextFieldChord::from_key`]
+/// maps — select-all, copy, cut, paste, undo, redo, word motion, on the
+/// platform's primary modifier ([`PRIMARY_IS_META`]) — goes to the
+/// focused text field through `clipboard` and is **always** consumed
+/// ([`route_text_field_chord`]), so `Ctrl+Z` inside a field can never
+/// reach document undo. Any other chord (`Ctrl+Shift+P`, say) still
+/// falls through to the registry.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn route_gallery_key(
@@ -3678,6 +3686,7 @@ fn route_gallery_key(
     modifiers: Modifiers,
     key: Key,
     text: Option<&str>,
+    clipboard: &mut dyn ClipboardAccess,
 ) -> Option<KeyOutcome> {
     route_widget_key(
         workspace,
@@ -3691,6 +3700,7 @@ fn route_gallery_key(
         modifiers,
         key,
         text,
+        clipboard,
     )
     .map(|(_, outcome)| outcome)
 }
@@ -3717,6 +3727,7 @@ fn route_widget_key(
     modifiers: Modifiers,
     key: Key,
     text: Option<&str>,
+    clipboard: &mut dyn ClipboardAccess,
 ) -> Option<(WidgetOwner, KeyOutcome)> {
     if dialog_open || palette_open {
         return None;
@@ -3744,7 +3755,18 @@ fn route_widget_key(
         tracing::debug!(?err, "gallery refused a key");
         KeyOutcome::Ignored
     };
+    // An editing chord (0.137.0) is the field's, never the registry's:
+    // see `route_text_field_chord` for why it is consumed even when it
+    // changes nothing.
+    let chord = if text_field {
+        TextFieldChord::from_key(&key, modifiers, PRIMARY_IS_META)
+    } else {
+        None
+    };
     let mut outcome = match key {
+        _ if let Some(chord) = chord => {
+            route_text_field_chord(&mut workspace.tree, focused, chord, composing, clipboard)
+        }
         Key::Named(named)
             if composing
                 && aurora_widgets::widgets::TextFieldKey::from_named_key(named).is_some() =>
@@ -3776,6 +3798,56 @@ fn route_widget_key(
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
     Some((owner, outcome))
+}
+
+/// Whether the platform's primary shortcut modifier is `Cmd` (macOS) —
+/// `Ctrl` everywhere else. Only the text-field chords
+/// ([`TextFieldChord::from_key`]) and the command palette's clipboard
+/// chords read it: the shortcut registry itself ([`default_shortcuts`])
+/// still binds the literal `Ctrl` chords on every platform.
+const PRIMARY_IS_META: bool = cfg!(target_os = "macos");
+
+/// Applies an editing chord to the focused text field `id` (0.137.0):
+/// reads the OS clipboard only for a paste, and writes it only when a
+/// copy or cut had something selected (never an empty string). **Always
+/// [`KeyOutcome::Handled`]**, even when nothing changed — an undo with the
+/// field's own history empty, a copy with nothing selected, a refused
+/// edit: an `Ignored` would send the chord on to the shortcut registry,
+/// and `Ctrl+Z` there is *document* undo, which must never run from
+/// inside a focused text field. While an IME composition is in progress
+/// the chord is consumed without acting, like a named editing key: the
+/// IME owns the keyboard until it commits.
+fn route_text_field_chord(
+    tree: &mut aurora_widgets::WidgetTree<WidgetKind>,
+    id: WidgetId,
+    chord: TextFieldChord,
+    composing: bool,
+    clipboard: &mut dyn ClipboardAccess,
+) -> KeyOutcome {
+    if composing {
+        return KeyOutcome::Handled(PointerOutcome::Focused(id));
+    }
+    let pasted = if chord == TextFieldChord::Paste {
+        clipboard.get_text()
+    } else {
+        None
+    };
+    match handle_text_field_chord(tree, id, chord, pasted.as_deref()) {
+        Ok(effect) => {
+            if let Some(copied) = effect.copied {
+                clipboard.set_text(copied);
+            }
+            KeyOutcome::Handled(if effect.changed {
+                PointerOutcome::Changed(id)
+            } else {
+                PointerOutcome::Focused(id)
+            })
+        }
+        Err(err) => {
+            tracing::debug!(?err, ?chord, "text field refused a chord");
+            KeyOutcome::Handled(PointerOutcome::Focused(id))
+        }
+    }
 }
 
 // -- Layers-panel controls (0.135.0): opacity, blend mode, visibility --
@@ -5118,6 +5190,41 @@ fn refresh_properties_panel(
     }
 }
 
+/// Whether `modifiers` is the platform's bare primary shortcut modifier —
+/// `Cmd` when `primary_is_meta` (macOS), `Ctrl` otherwise — with neither
+/// `Shift`, `Alt` (`Ctrl+Alt` is `AltGr`, which types) nor the other of
+/// `Ctrl`/`Cmd`. The command palette's clipboard chords (0.137.0);
+/// [`TextFieldChord::from_key`] applies the same rule to a text field's.
+fn is_primary_chord(modifiers: Modifiers, primary_is_meta: bool) -> bool {
+    let (primary, other) = if primary_is_meta {
+        (modifiers.meta, modifiers.control)
+    } else {
+        (modifiers.control, modifiers.meta)
+    };
+    primary && !other && !modifiers.alt && !modifiers.shift
+}
+
+/// `query` with `pasted` appended, filtered and capped the way a text
+/// field's paste is (0.137.0): line breaks and tabs become spaces
+/// ([`aurora_widgets::widgets::single_line_paste`]), other characters
+/// [`aurora_widgets::widgets::is_insertable_char`] rejects — a bidi
+/// override — are dropped, and the result stops growing at
+/// [`aurora_widgets::widgets::TEXT_FIELD_MAX_BYTES`] (at a grapheme
+/// boundary). Before, a clipboard's whole content was appended raw.
+fn palette_query_with_paste(query: &str, pasted: &str) -> String {
+    let mut out = query.to_owned();
+    let filtered: String = aurora_widgets::widgets::single_line_paste(pasted)
+        .chars()
+        .filter(|&c| aurora_widgets::widgets::is_insertable_char(c))
+        .collect();
+    aurora_widgets::widgets::push_graphemes_capped(
+        &mut out,
+        &filtered,
+        aurora_widgets::widgets::TEXT_FIELD_MAX_BYTES,
+    );
+    out
+}
+
 /// Routes one key press while the command palette is open — captures
 /// input directly rather than going through [`ShortcutRegistry`], the
 /// same "a modal dialog owns the keyboard while open" behaviour every
@@ -5173,21 +5280,28 @@ fn handle_palette_key(
                 }
             }
         }
-        // `Ctrl+C`/`Ctrl+V` against the real system clipboard. Paste
+        // Copy/paste against the real system clipboard, on the platform's
+        // primary modifier (`Cmd` on macOS, `Ctrl` elsewhere; 0.137.0 —
+        // before, `Ctrl` on every platform, and `Ctrl+Alt`, which is
+        // `AltGr`, too). Copy takes the whole query (the palette has no
+        // selection of its own) and never writes an empty one. Paste
         // appends at the query's own end, matching how typing a plain
         // character already works below -- this palette has no cursor
-        // position of its own to insert at.
-        Key::Character('c') if chord.modifiers.control => {
-            if let Ok(state) = command_palette_state(&workspace.tree, root) {
+        // position of its own to insert at -- and is filtered and capped
+        // like a text field's ([`palette_query_with_paste`]).
+        Key::Character('c') if is_primary_chord(chord.modifiers, PRIMARY_IS_META) => {
+            if let Ok(state) = command_palette_state(&workspace.tree, root)
+                && !state.query().is_empty()
+            {
                 clipboard.set_text(state.query().to_owned());
             }
         }
-        Key::Character('v') if chord.modifiers.control => {
+        Key::Character('v') if is_primary_chord(chord.modifiers, PRIMARY_IS_META) => {
             if let (Ok(state), Some(pasted)) = (
                 command_palette_state(&workspace.tree, root),
                 clipboard.get_text(),
             ) {
-                let query = format!("{}{pasted}", state.query());
+                let query = palette_query_with_paste(state.query(), &pasted);
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
                     tracing::warn!(?err, "failed to update command palette query");
                 }
@@ -15916,6 +16030,7 @@ impl App {
             self.modifiers,
             key,
             event.text.as_deref(),
+            &mut self.clipboard,
         );
         if let Some((owner, KeyOutcome::Handled(outcome))) = routed {
             tracing::debug!(?outcome, ?owner, "widget key");
@@ -18749,9 +18864,26 @@ mod tests {
     #[cfg(unix)]
     use super::create_dir_owner_only;
     use super::{
-        COMMAND_TOGGLE_WIDGET_GALLERY, WidgetPointer, key_shows_focus_ring, route_gallery_key,
-        route_gallery_pointer, toggle_gallery,
+        COMMAND_TOGGLE_WIDGET_GALLERY, PRIMARY_IS_META, WidgetPointer, is_primary_chord,
+        key_shows_focus_ring, palette_query_with_paste, route_gallery_key, route_gallery_pointer,
+        toggle_gallery,
     };
+
+    /// The platform's primary shortcut modifier alone — `Cmd` on macOS,
+    /// `Ctrl` elsewhere ([`PRIMARY_IS_META`]).
+    fn primary() -> Modifiers {
+        if PRIMARY_IS_META {
+            Modifiers {
+                meta: true,
+                ..Modifiers::none()
+            }
+        } else {
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            }
+        }
+    }
     use aurora_doc::SelectionSet;
     use aurora_theme::Scales;
     use aurora_theme::{Palette, ThemeSet};
@@ -23191,7 +23323,7 @@ mod tests {
     // native picker involved, matching this module's own doc comment.
 
     #[test]
-    fn ctrl_c_copies_the_current_query_to_the_clipboard() {
+    fn primary_c_copies_the_current_query_to_the_clipboard() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -23214,13 +23346,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
-            KeyChord::new(
-                Modifiers {
-                    control: true,
-                    ..Modifiers::none()
-                },
-                Key::Character('c'),
-            ),
+            KeyChord::new(primary(), Key::Character('c')),
             None,
             &mut clipboard,
             &mut file_dialog,
@@ -23231,7 +23357,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_v_pastes_the_clipboard_into_the_query() {
+    fn primary_v_pastes_the_clipboard_into_the_query() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -23245,13 +23371,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
-            KeyChord::new(
-                Modifiers {
-                    control: true,
-                    ..Modifiers::none()
-                },
-                Key::Character('v'),
-            ),
+            KeyChord::new(primary(), Key::Character('v')),
             None,
             &mut clipboard,
             &mut file_dialog,
@@ -23284,13 +23404,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
-            KeyChord::new(
-                Modifiers {
-                    control: true,
-                    ..Modifiers::none()
-                },
-                Key::Character('v'),
-            ),
+            KeyChord::new(primary(), Key::Character('v')),
             None,
             &mut clipboard,
             &mut file_dialog,
@@ -23304,6 +23418,177 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "");
+    }
+
+    // -- clipboard chords on the platform's primary modifier (0.137.0) --
+
+    /// Presses `modifiers`+`key` in an open palette over `clipboard` and
+    /// returns the query afterwards.
+    fn palette_chord(
+        workspace: &mut aurora_ui::Workspace,
+        focus: &mut FocusManager,
+        palette: &mut Option<WidgetId>,
+        clipboard: &mut FakeClipboard,
+        modifiers: Modifiers,
+        key: char,
+    ) -> String {
+        handle_palette_key(
+            workspace,
+            focus,
+            palette,
+            KeyChord::new(modifiers, Key::Character(key)),
+            None,
+            clipboard,
+            &mut FakeFileDialog::default(),
+        );
+        let Some(root) = *palette else {
+            unreachable!("a clipboard chord must not close the palette");
+        };
+        match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state.query().to_owned(),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn the_primary_chord_is_cmd_on_macos_and_ctrl_elsewhere() {
+        let with = |control, shift, alt, meta| Modifiers {
+            control,
+            shift,
+            alt,
+            meta,
+        };
+        // Off macOS: `Ctrl` alone.
+        assert!(is_primary_chord(with(true, false, false, false), false));
+        assert!(!is_primary_chord(with(false, false, false, true), false));
+        // On macOS: `Cmd` alone; `Ctrl` is not the primary chord there.
+        assert!(is_primary_chord(with(false, false, false, true), true));
+        assert!(!is_primary_chord(with(true, false, false, false), true));
+        for primary_is_meta in [false, true] {
+            // `Ctrl+Alt` is `AltGr` (it types); `Shift`, `Alt` or both
+            // primaries held is some other chord.
+            assert!(!is_primary_chord(
+                with(true, false, true, false),
+                primary_is_meta
+            ));
+            assert!(!is_primary_chord(
+                with(!primary_is_meta, false, true, primary_is_meta),
+                primary_is_meta
+            ));
+            assert!(!is_primary_chord(
+                with(!primary_is_meta, true, false, primary_is_meta),
+                primary_is_meta
+            ));
+            assert!(!is_primary_chord(
+                with(true, false, false, true),
+                primary_is_meta
+            ));
+            assert!(!is_primary_chord(Modifiers::none(), primary_is_meta));
+        }
+    }
+
+    #[test]
+    fn the_non_primary_modifier_and_altgr_do_not_paste_into_the_palette() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard {
+            contents: Some("history".to_owned()),
+        };
+        let other = if PRIMARY_IS_META {
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            }
+        } else {
+            Modifiers {
+                meta: true,
+                ..Modifiers::none()
+            }
+        };
+        let altgr = Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::none()
+        };
+        for modifiers in [other, altgr] {
+            let query = palette_chord(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut clipboard,
+                modifiers,
+                'v',
+            );
+            assert_eq!(query, "", "{modifiers:?} is not the paste chord");
+        }
+    }
+
+    #[test]
+    fn a_palette_paste_is_filtered_and_capped_like_a_text_field() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard {
+            contents: Some("his\ntory\t\r\n\u{202e}".to_owned()),
+        };
+        let query = palette_chord(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut clipboard,
+            primary(),
+            'v',
+        );
+        assert_eq!(
+            query, "his tory  ",
+            "newline, tab and CR+LF become spaces; the bidi override is dropped"
+        );
+
+        clipboard.contents = Some("x".repeat(aurora_widgets::widgets::TEXT_FIELD_MAX_BYTES * 3));
+        let query = palette_chord(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut clipboard,
+            primary(),
+            'v',
+        );
+        assert_eq!(query.len(), aurora_widgets::widgets::TEXT_FIELD_MAX_BYTES);
+        assert!(query.starts_with("his tory  "));
+    }
+
+    #[test]
+    fn palette_query_with_paste_stops_at_a_character_boundary() {
+        let max = aurora_widgets::widgets::TEXT_FIELD_MAX_BYTES;
+        let query = "a".repeat(max - 1);
+        // A two-byte `é` does not fit in the one byte left; nothing after
+        // it is taken either.
+        assert_eq!(palette_query_with_paste(&query, "\u{e9}b"), query);
+        assert_eq!(palette_query_with_paste(&query, "bc").len(), max);
+        assert_eq!(palette_query_with_paste("ab", "c\u{2029}d"), "abcd");
+    }
+
+    #[test]
+    fn copying_an_empty_palette_query_leaves_the_clipboard_alone() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard {
+            contents: Some("kept".to_owned()),
+        };
+        palette_chord(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut clipboard,
+            primary(),
+            'c',
+        );
+        assert_eq!(clipboard.contents.as_deref(), Some("kept"));
     }
 
     #[test]
@@ -50611,6 +50896,7 @@ mod tests {
         gallery: Option<aurora_ui::GalleryPanel>,
         click: ClickTracker,
         scales: Scales,
+        clipboard: FakeClipboard,
     }
 
     impl GalleryRig {
@@ -50625,6 +50911,7 @@ mod tests {
                 gallery: None,
                 click: ClickTracker::default(),
                 scales,
+                clipboard: FakeClipboard::default(),
             };
             rig.toggle();
             rig
@@ -50706,6 +50993,7 @@ mod tests {
                 Modifiers::none(),
                 key,
                 None,
+                &mut self.clipboard,
             );
             self.workspace
                 .tree
@@ -50729,6 +51017,7 @@ mod tests {
                 modifiers,
                 key,
                 text,
+                &mut self.clipboard,
             );
             self.workspace
                 .tree
@@ -50759,6 +51048,48 @@ mod tests {
             self.pointer(PointerPhase::Up, at);
             assert_eq!(self.focus.focused(), Some(field));
             field
+        }
+
+        /// `App::handle_key_event` end to end: the widget router first,
+        /// and — only when it did not handle the key — [`handle_key`]
+        /// against a fresh, empty document with the real
+        /// [`default_shortcuts`]. Returns the router's outcome, what
+        /// `handle_key` handed back (`Some(ActivatedCommand::Undo)` is a
+        /// *document* undo reaching `App::run_undo_redo`), and whether
+        /// the command palette ended up open.
+        fn key_event(
+            &mut self,
+            key: Key,
+            text: Option<&str>,
+            modifiers: Modifiers,
+        ) -> (Option<KeyOutcome>, Option<ActivatedCommand>, bool) {
+            let routed = self.typed(key, text, modifiers);
+            if matches!(routed, Some(KeyOutcome::Handled(_))) {
+                return (routed, None, false);
+            }
+            let mut dialog = None;
+            let mut palette = None;
+            let mut tool = Tool::default();
+            let picked = handle_key(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut dialog,
+                &mut palette,
+                &mut tool,
+                &crate::ToolSettings::default(),
+                &mut aurora_doc::LayerTree::new(),
+                &mut aurora_doc::History::new(),
+                &mut aurora_brush::PixelHistory::new(),
+                None,
+                &mut UndoOrder::default(),
+                &default_shortcuts(),
+                modifiers,
+                key,
+                text,
+                &mut self.clipboard,
+                &mut FakeFileDialog::default(),
+            );
+            (routed, picked, palette.is_some())
         }
 
         fn slider_at(&self, fraction: f32) -> (f32, f32) {
@@ -51099,6 +51430,7 @@ mod tests {
             },
             Key::Named(NamedKey::Home),
             None,
+            &mut rig.clipboard,
         );
         assert_eq!(outcome, Some(KeyOutcome::Ignored));
         assert!(matches!(
@@ -51343,13 +51675,14 @@ mod tests {
             Some(KeyOutcome::Handled(PointerOutcome::Focused(field)))
         );
         assert_eq!(rig.text(), "B");
-        // A `Ctrl` chord is still the app's shortcut.
+        // A `Ctrl` chord outside the field's own chord table (0.137.0)
+        // is still the app's shortcut.
         let control = Modifiers {
             control: true,
             ..Modifiers::none()
         };
         assert_eq!(
-            rig.typed(Key::Character('z'), Some("\u{1a}"), control),
+            rig.typed(Key::Character('p'), Some("\u{10}"), control),
             Some(KeyOutcome::Ignored)
         );
         assert_eq!(rig.text(), "B");
@@ -51398,6 +51731,216 @@ mod tests {
             "",
             "Backspace deletes once, its text is not inserted"
         );
+    }
+
+    // -- text-field editing chords (0.137.0) --
+
+    fn with_shift(modifiers: Modifiers) -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..modifiers
+        }
+    }
+
+    const LITERAL_CTRL: Modifiers = Modifiers {
+        control: true,
+        shift: false,
+        alt: false,
+        meta: false,
+    };
+
+    /// The chord the shortcut registry binds to document undo is the
+    /// literal `Ctrl+Z` on every platform. With a text field focused it
+    /// is the *field's* undo — and even with the field's own history
+    /// empty it must be consumed, never fall through to the document.
+    #[test]
+    fn undo_in_a_focused_field_with_empty_history_never_undoes_the_document() {
+        let mut rig = GalleryRig::open();
+        // The rig can see a document undo at all: unfocused, `Ctrl+Z`
+        // reaches the registry.
+        let (_, picked, _) = rig.key_event(Key::Character('z'), Some("\u{1a}"), LITERAL_CTRL);
+        assert_eq!(picked, Some(ActivatedCommand::Undo), "the control case");
+
+        let field = rig.focus_text_field();
+        for modifiers in [
+            LITERAL_CTRL,
+            with_shift(LITERAL_CTRL),
+            primary(),
+            with_shift(primary()),
+        ] {
+            let (routed, picked, _) = rig.key_event(Key::Character('z'), None, modifiers);
+            assert_eq!(
+                routed,
+                Some(KeyOutcome::Handled(PointerOutcome::Focused(field))),
+                "{modifiers:?}: consumed although nothing changed"
+            );
+            assert_eq!(picked, None, "{modifiers:?} reached document undo/redo");
+        }
+        assert_eq!(rig.text(), "");
+    }
+
+    /// Pins [`PRIMARY_IS_META`] to the real platform with literal
+    /// modifiers, independently of the constant (every other chord test
+    /// derives its modifiers from it through `primary()`, so an inverted
+    /// constant would leave them self-consistent and green): `Cmd+V`
+    /// pastes on macOS and `Ctrl+V` everywhere else, and the other one
+    /// does not.
+    #[test]
+    fn the_paste_chord_is_cmd_on_macos_and_ctrl_elsewhere() {
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::none()
+        };
+        let (paste, not_paste) = if cfg!(target_os = "macos") {
+            (cmd, LITERAL_CTRL)
+        } else {
+            (LITERAL_CTRL, cmd)
+        };
+        let mut rig = GalleryRig::open();
+        rig.focus_text_field();
+        rig.clipboard.contents = Some("p".to_owned());
+        rig.key_event(Key::Character('v'), None, not_paste);
+        assert_eq!(rig.text(), "", "{not_paste:?} is not this platform's paste");
+        rig.key_event(Key::Character('v'), None, paste);
+        assert_eq!(rig.text(), "p");
+    }
+
+    #[test]
+    fn ctrl_y_in_a_focused_field_is_the_fields_redo_off_macos() {
+        let mut rig = GalleryRig::open();
+        let field = rig.focus_text_field();
+        let (routed, picked, _) = rig.key_event(Key::Character('y'), None, LITERAL_CTRL);
+        if PRIMARY_IS_META {
+            // Not a chord on macOS; `Ctrl+Y` is not bound either.
+            assert_eq!(routed, Some(KeyOutcome::Ignored));
+        } else {
+            assert_eq!(
+                routed,
+                Some(KeyOutcome::Handled(PointerOutcome::Focused(field)))
+            );
+        }
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn select_all_copy_cut_paste_undo_redo_round_trip_through_the_clipboard() {
+        let mut rig = GalleryRig::open();
+        let field = rig.focus_text_field();
+        for c in ['h', 'i'] {
+            rig.typed(Key::Character(c), Some(&c.to_string()), Modifiers::none());
+        }
+        assert_eq!(rig.text(), "hi");
+        let chord = |rig: &mut GalleryRig, c: char, modifiers: Modifiers| {
+            rig.key_event(Key::Character(c), None, modifiers)
+        };
+
+        let (routed, _, _) = chord(&mut rig, 'a', primary());
+        assert_eq!(
+            routed,
+            Some(KeyOutcome::Handled(PointerOutcome::Changed(field)))
+        );
+        chord(&mut rig, 'c', primary());
+        assert_eq!(rig.clipboard.contents.as_deref(), Some("hi"));
+        assert_eq!(rig.text(), "hi", "copy leaves the field alone");
+
+        let (routed, _, _) = chord(&mut rig, 'x', primary());
+        assert_eq!(
+            routed,
+            Some(KeyOutcome::Handled(PointerOutcome::Changed(field)))
+        );
+        assert_eq!(rig.text(), "");
+        assert_eq!(rig.clipboard.contents.as_deref(), Some("hi"));
+
+        // Copy and cut with nothing selected never overwrite the clipboard.
+        chord(&mut rig, 'c', primary());
+        chord(&mut rig, 'x', primary());
+        assert_eq!(rig.clipboard.contents.as_deref(), Some("hi"));
+
+        chord(&mut rig, 'v', primary());
+        chord(&mut rig, 'v', primary());
+        assert_eq!(rig.text(), "hihi");
+
+        // A pasted newline becomes a space: this is a single-line field.
+        rig.clipboard.contents = Some("\n!".to_owned());
+        chord(&mut rig, 'v', primary());
+        assert_eq!(rig.text(), "hihi !");
+
+        let (_, picked, _) = chord(&mut rig, 'z', primary());
+        assert_eq!(picked, None);
+        assert_eq!(rig.text(), "hihi");
+        chord(&mut rig, 'z', with_shift(primary()));
+        assert_eq!(rig.text(), "hihi !");
+    }
+
+    #[test]
+    fn word_motion_moves_the_caret_in_a_focused_field() {
+        let mut rig = GalleryRig::open();
+        rig.focus_text_field();
+        for c in "ab cd".chars() {
+            let key = if c == ' ' {
+                Key::Named(NamedKey::Space)
+            } else {
+                Key::Character(c)
+            };
+            rig.typed(key, Some(&c.to_string()), Modifiers::none());
+        }
+        let word = if PRIMARY_IS_META {
+            Modifiers {
+                alt: true,
+                ..Modifiers::none()
+            }
+        } else {
+            LITERAL_CTRL
+        };
+        rig.key_event(Key::Named(NamedKey::ArrowLeft), None, with_shift(word));
+        // Typing over the word-wide selection replaces it.
+        rig.typed(Key::Character('x'), Some("x"), Modifiers::none());
+        assert_eq!(rig.text(), "ab x");
+    }
+
+    #[test]
+    fn ctrl_shift_p_still_opens_the_palette_with_the_field_focused() {
+        let mut rig = GalleryRig::open();
+        rig.focus_text_field();
+        let (routed, _, palette_open) =
+            rig.key_event(Key::Character('p'), None, with_shift(LITERAL_CTRL));
+        assert_eq!(routed, Some(KeyOutcome::Ignored));
+        assert!(palette_open, "the registry's Ctrl+Shift+P still runs");
+    }
+
+    #[test]
+    fn a_chord_during_a_composition_is_consumed_without_acting() {
+        let mut rig = GalleryRig::open();
+        let field = rig.focus_text_field();
+        rig.typed(Key::Character('a'), Some("a"), Modifiers::none());
+        let preedit = winit::event::Ime::Preedit("ni".to_owned(), Some((2, 2)));
+        assert!(apply_gallery_ime(
+            &mut rig.workspace,
+            &rig.focus,
+            rig.gallery.as_ref(),
+            &preedit
+        ));
+        rig.clipboard.contents = Some("pasted".to_owned());
+        for (c, modifiers) in [
+            ('v', primary()),
+            ('a', primary()),
+            ('z', primary()),
+            ('z', LITERAL_CTRL),
+        ] {
+            let (routed, picked, _) = rig.key_event(Key::Character(c), None, modifiers);
+            assert_eq!(
+                routed,
+                Some(KeyOutcome::Handled(PointerOutcome::Focused(field))),
+                "{c} {modifiers:?}"
+            );
+            assert_eq!(picked, None);
+        }
+        assert_eq!(rig.text(), "a", "nothing pasted, nothing undone");
+        let selected = match rig.workspace.tree.payload(field) {
+            Some(aurora_widgets::widgets::WidgetKind::TextField(state)) => state.selection_anchor,
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(selected, None, "nothing selected");
     }
 
     #[test]
@@ -51827,6 +52370,7 @@ mod tests {
                     Modifiers::none(),
                     key,
                     None,
+                    &mut FakeClipboard::default(),
                 );
                 if let Some((WidgetOwner::LayerControls, KeyOutcome::Handled(outcome))) = &routed {
                     let captured = self.click.captured();
@@ -52691,6 +53235,7 @@ mod tests {
                     Modifiers::none(),
                     key,
                     text,
+                    &mut FakeClipboard::default(),
                 );
                 if let Some((WidgetOwner::ToolControls, KeyOutcome::Handled(outcome))) = &routed {
                     let captured = self.click.captured();

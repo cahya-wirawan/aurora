@@ -205,9 +205,10 @@ pub use tab_bar::{
     select_tab, set_tab_bar_disabled, tab_bar_state,
 };
 pub use text_field::{
-    Composition, TEXT_FIELD_MAX_BYTES, TextFieldKey, TextFieldState, UnderlineStyle,
-    composition_segments, handle_text_field_key, insert_text_field, insert_text_field_text,
-    is_insertable_char, set_text_field_disabled, text_field_state, with_text_field_mut,
+    ChordEffect, Composition, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldKey, TextFieldState,
+    UnderlineStyle, composition_segments, handle_text_field_chord, handle_text_field_key,
+    insert_text_field, insert_text_field_text, is_insertable_char, push_graphemes_capped,
+    set_text_field_disabled, single_line_paste, text_field_state, with_text_field_mut,
 };
 pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{

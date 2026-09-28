@@ -26,7 +26,20 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.136.0): the Properties panel edits the tool.**
+**Latest (2026-09-28, 0.137.0): keyboard chords in a focused text
+field.** Select-all, copy, cut, paste, per-field undo/redo and word
+motion now work in a focused text field on the platform's primary
+modifier (`Cmd` on macOS, `Ctrl` elsewhere; word motion `Alt+Arrow` on
+macOS, `Ctrl+Arrow` elsewhere), through the real OS clipboard. An
+editing chord is always consumed inside the field, so `Ctrl+Z` there no
+longer undoes the document, even with the field's own history empty.
+Paste is now filtered and capped like typing (it bypassed both before),
+in the field and in the command palette, whose copy/paste now also use
+the primary modifier. The only real text field is still the Widget
+Gallery's demo field. Details and disclosures: M1.7's "Text field"
+0.137.0 update.
+
+**Previously (2026-09-28, 0.136.0): the Properties panel edits the tool.**
 A live "Radius 24 px" readout and a 1–256 px radius slider for the
 active tool (Brush and Eraser each keep their own; disabled for tools
 with no radius), on a new `ToolSettings` that replaces the fixed
@@ -2119,6 +2132,119 @@ check licenses` clean with the new `toml` dependency.
   wide `cargo clippy --workspace` and `scripts/check_layering.py` still
   can't run here; per-crate verification substitutes, as in every prior
   entry.
+
+  **Update 0.137.0 — keyboard chords in a focused text field.** Closes
+  0.131.0's disclosure "word motion and `Ctrl`/`Cmd`+A/C/X/V/Z are not
+  routed (`Ctrl+Z` in the field still undoes the *document*)". New in
+  `aurora-widgets` (`text_field.rs`): `TextFieldChord` (`SelectAll`,
+  `Copy`, `Cut`, `Paste`, `Undo`, `Redo`, `WordLeft/WordRight { extend
+  }`), `TextFieldChord::from_key(key, modifiers, primary_is_meta)` (a
+  parameter, not a `cfg!`, so both platforms' tables are tested on every
+  host), `ChordEffect { changed, copied }` and
+  `handle_text_field_chord(tree, id, chord, pasted)`. Table: primary
+  (`Cmd` on macOS, `Ctrl` elsewhere) + A/C/X/V/Z, primary+Shift+Z redo,
+  `Ctrl+Y` redo off macOS only; **on macOS also the literal
+  `Ctrl+Z`/`Ctrl+Shift+Z`**, because the shortcut registry binds document
+  undo to the literal `Ctrl` chord on every platform; word motion
+  `Ctrl+Arrow` off macOS, `Alt+Arrow` on it, Shift extends. A primary
+  chord never has `Alt` held (`Ctrl+Alt` is `AltGr`, which types) nor
+  the other of `Ctrl`/`Cmd`; Shift with A/C/X/V makes the press *not* a
+  chord, so registry bindings like `Ctrl+Shift+P` still see it.
+  **Defect fixed:** `TextFieldState::paste` called `insert_str`, bypassing
+  `insert_typed`'s `is_insertable_char` filter and `TEXT_FIELD_MAX_BYTES`
+  cap; it now delegates to `insert_typed` and returns whether anything
+  was inserted (its only non-test caller is the new chord handler).
+  Copy/cut with nothing selected return `copied: None`, so the clipboard
+  is never overwritten with `""`. In `aurora-app`: `route_widget_key`
+  takes a `clipboard: &mut dyn ClipboardAccess` (the real
+  `SystemClipboard` from `App::handle_key_event`, `FakeClipboard` in
+  tests) and, for a focused text field whose press `from_key` maps,
+  calls the new `route_text_field_chord`: reads the clipboard only for a
+  paste, writes it only when a copy/cut had a selection, consumes the
+  chord without acting while an IME composition is in progress, and
+  **always returns `Handled`** — even when nothing changed (an undo with
+  the field's history empty), since `Ignored` would fall through to
+  `handle_key` and the registry's document undo. `const PRIMARY_IS_META:
+  bool = cfg!(target_os = "macos")`. Command palette: its copy/paste now
+  use the same primary predicate (`is_primary_chord`: before, literal
+  `Ctrl` on every platform, `Ctrl+Alt`/`AltGr` and `Ctrl+Shift`
+  included), a paste goes through `palette_query_with_paste` (filtered
+  and capped like a field; before, the whole clipboard was appended raw),
+  and copying an empty query no longer clears the clipboard. Tests: 19
+  new in `aurora-widgets` (`chord_tests`: both tables, AltGr, Shift,
+  `Ctrl+Y`, macOS `Ctrl+Z`, word motion; select-all+cut, copy with no
+  selection, paste replacing a selection, filtered, capped, empty,
+  undo/redo, word extend, disabled), 12 new in `aurora-app` (a
+  `GalleryRig::key_event` mirroring `App::handle_key_event` — router,
+  then `handle_key` with the real `default_shortcuts` only if not
+  handled; `undo_in_a_focused_field_with_empty_history_never_undoes_the_document`
+  with a control case showing the same rig *does* return
+  `ActivatedCommand::Undo` when the field is unfocused; clipboard round
+  trip; `Ctrl+Shift+P` still opens the palette; chords during a
+  composition; `Ctrl+Y`; word motion; a platform pin with literal
+  modifiers; five palette tests), and four existing tests updated (three
+  palette clipboard tests now press the platform primary, and the
+  gallery test's "a `Ctrl` chord is still the app's shortcut" now uses
+  `Ctrl+P`, since `Ctrl+Z` is the field's). **Mutations, really run and
+  reverted from a scratchpad backup:** chord branch returning `Ignored`
+  when unchanged; `PRIMARY_IS_META` inverted; macOS `Ctrl+Z` arm
+  dropped; paste via `insert_str`; copy with no selection writing `""`;
+  chords acted on while composing; Shift ignored on Z; palette paste
+  unfiltered — all eight killed. The inverted constant **survived** the
+  first run (every app test derived its modifiers from the constant
+  itself) and is killed only by the platform pin
+  `the_paste_chord_is_cmd_on_macos_and_ctrl_elsewhere`, added for it.
+  **Measured:** `AURORA_REQUIRE_GPU=1 cargo test -p aurora-widgets -p
+  aurora-ui -p aurora-app` on the RTX 3090 — 1,517 passed (aurora-app
+  lib 511, aurora-ui 125, aurora-widgets lib 751, `tests/gallery.rs` 129
+  + 45 ignored, `tests/headless.rs` 1), 0 failed; workspace clippy `-D
+  warnings`, `cargo fmt --all --check` and both check scripts clean;
+  `AURORA_REQUIRE_GPU=1 cargo test --workspace` — 2,513 passed (2,482 +
+  31 new), 0 failed, 45 ignored; `RUSTDOCFLAGS="-D warnings" cargo doc
+  -p aurora-widgets -p aurora-app --no-deps --all-features
+  --document-private-items` clean. Not run at build time: nextest,
+  workspace-wide strict rustdoc, `cargo deny`, CI on macOS/Windows.
+  **Measured after the review revision:** full gate green on the RTX
+  3090 with `AURORA_REQUIRE_GPU=1` — 2,514 passed, 0 failed, 45 ignored,
+  0 skipped; doctests and workspace-wide strict rustdoc clean; `cargo
+  deny check` clean on the pre-revision state (the revision added no
+  dependency). `default_shortcuts` binds none of `Ctrl+A/C/V/X/Y`, so on
+  macOS those presses (not field chords there) reach no document
+  command. Judge: PASS, 0.93.
+  **Disclosed, not done:** the Widget Gallery's demo field is still the
+  only real text field; the palette gets primary-modifier copy/paste and
+  a filtered paste only (no selection model, so no select-all, cut or
+  undo there; typed palette characters are still unfiltered and
+  Backspace pops one `char`, not a grapheme cluster); field undo does not
+  coalesce typing (each character is its own step) and its stacks are
+  unbounded (each snapshot at most 4 KiB); the global registry still
+  binds literal `Ctrl` chords on macOS, so `Cmd+Z` *outside* a field does
+  nothing; Undo from the menu or palette with a field focused still undoes
+  the document; `Cmd+Left/Right` (line start/end on macOS) is not
+  mapped; nothing has been pressed by a human on real hardware — macOS's
+  `Cmd` path in particular is tested only through the `primary_is_meta`
+  parameter on Linux. **Needs a human (macOS):** `Cmd+A/C/X/V/Z` and
+  `Cmd+Shift+Z` inside the Gallery field, and `Ctrl+Z` there, confirming
+  winit delivers them and the document's undo never fires.
+  **Review revision (0.137.0, same version):** an independent critic
+  (PASS, ~0.8) found `WordRight` untested (a `WordRight` calling
+  `move_word_left`, or dropping `extend`, would have survived) — the test
+  now pins the exact caret and a `WordRight { extend: true }` selection;
+  the paste cap cut on a *char* boundary and could split a flag, a ZWJ
+  sequence or a base from its combining mark — both the field and the
+  palette now cap on a grapheme boundary (shared
+  `push_graphemes_capped`); and a pasted multi-line text lost its line
+  breaks and tabs outright — they now become spaces (`single_line_paste`,
+  `\r\n` counting as one), as single-line inputs in browsers and Qt do,
+  for both the field and the palette. New test
+  `paste_turns_line_breaks_into_spaces_and_caps_on_a_grapheme_boundary`.
+  **Still open (review F4/F7):** other platform editing chords are
+  unmapped and simply do nothing — `Ctrl+Backspace/Delete` (delete a
+  word) and `Ctrl+Home/End` off macOS; `Cmd+Left/Right/Backspace`,
+  `Option+Backspace` and the Cocoa `Ctrl+A/E` on macOS; typed palette
+  characters are still neither filtered nor capped (only its paste is);
+  the rig mirrors `App::handle_key_event`'s router-then-`handle_key`
+  order rather than calling it.
 - [x] **IME composition rendering (platform underline styles)** — done
   2026-08-02, `crates/aurora-widgets/src/widgets/text_field.rs`
   (`Composition`, `UnderlineStyle`, `composition_segments`,
@@ -29028,6 +29154,18 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-28 (0.137.0) — text-field keyboard chords.**
+Clipboard trio, select-all, field undo/redo and word motion in a
+focused text field; palette paste filtered/capped and on the primary
+modifier. Full account: M1.7's "Text field" 0.137.0 update. **Needs a
+human:** `Cmd+C/V/X/A/Z` in the Widget Gallery's field on macOS against
+the real system clipboard (and `Ctrl` on Linux/Windows), and that
+`Ctrl+Z`/`Cmd+Z` in the field leaves the canvas untouched.
+**Suggested next:** 0.138.0 click/Shift+click/drag caret placement (a
+text hit-test from pointer x to a byte offset); 0.139.0 caret blink
+(reset on edit, an `about_to_wait` deadline, off under reduced motion);
+then the measure-func layout round (checkbox labels, dialog titles).
+
 **Addendum 2026-09-28 (0.136.0) — editable Properties-panel tool
 controls.** A radius readout and slider for Brush/Eraser on a live
 `ToolSettings`, plus a minimal `Label` widget; no undo, not persisted.
@@ -29036,7 +29174,8 @@ slider and paint on real hardware; the design owner to confirm the
 1–256 px range, radius-vs-"Size" wording and readout colour.
 **Suggested next (0.137.0): text follow-ups** — checkbox labels and
 dialog titles via a measure-func layout pass, click-to-place caret,
-clipboard/select-all/undo in text fields, and caret blink.
+clipboard/select-all/undo in text fields, and caret blink. (0.137.0 did
+the clipboard/select-all/undo chords; see its own addendum.)
 
 **Addendum 2026-09-28 (0.135.0) — editable Layers-panel controls.**
 Opacity/blend/visibility for the active layer, one undo step per

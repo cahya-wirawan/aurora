@@ -62,7 +62,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
-use crate::shortcut::NamedKey;
+use crate::shortcut::{Key, Modifiers, NamedKey};
 use crate::tree::{WidgetId, WidgetTree};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,9 +364,18 @@ impl TextFieldState {
 
     /// Inserts `text` at the caret (or over the current selection) — the
     /// text-buffer half of a paste; a caller reads the real text from
-    /// the OS clipboard and passes it in here.
-    pub fn paste(&mut self, text: &str) {
-        self.insert_str(text);
+    /// the OS clipboard and passes it in here. Goes through
+    /// [`Self::insert_typed`] (0.137.0), so pasted text is filtered and
+    /// capped exactly like typed text: a clipboard holding a newline, a
+    /// tab or a bidi override cannot put one into a single-line field,
+    /// and a huge clipboard cannot grow it past [`TEXT_FIELD_MAX_BYTES`].
+    /// Returns whether anything was inserted.
+    ///
+    /// Line breaks and tabs become spaces first ([`single_line_paste`]),
+    /// the way single-line inputs in browsers and Qt behave, rather than
+    /// being deleted outright (review F3).
+    pub fn paste(&mut self, text: &str) -> bool {
+        self.insert_typed(&single_line_paste(text))
     }
 
     /// Sets (or replaces) the in-progress IME composition, anchored at
@@ -628,7 +637,8 @@ pub fn set_text_field_disabled(
 /// caret motion and the two deletions. Deliberately not `Tab`, `Enter`
 /// or `Escape` (focus traversal and a dialog's own keys stay the
 /// caller's), and not word motion or `Ctrl`/`Cmd` editing chords — a
-/// chord never reaches a widget ([`crate::handle_widget_key`]).
+/// chord never reaches a widget through [`crate::handle_widget_key`];
+/// those are [`TextFieldChord`]s, which the app routes itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextFieldKey {
     Left,
@@ -686,6 +696,156 @@ pub fn handle_text_field_key(
     })
 }
 
+/// The editing chords a focused text field consumes (0.137.0): the
+/// clipboard trio, select-all, per-field undo/redo and word motion. Kept
+/// apart from [`TextFieldKey`] because a chord is held with the platform's
+/// *primary* modifier — `Cmd` on macOS, `Ctrl` elsewhere — which
+/// [`crate::handle_widget_key`] deliberately refuses; the app routes these
+/// itself ([`Self::from_key`], then [`handle_text_field_chord`]) so it can
+/// read and write the real OS clipboard around them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFieldChord {
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Redo,
+    WordLeft { extend: bool },
+    WordRight { extend: bool },
+}
+
+impl TextFieldChord {
+    /// The chord `key` held with `modifiers` stands for, if any.
+    /// `primary_is_meta` names the platform's primary modifier (`true` on
+    /// macOS, where it is `Cmd`; `false` elsewhere, where it is `Ctrl`) —
+    /// a parameter rather than a `cfg!` so both tables are testable on
+    /// every host.
+    ///
+    /// | chord | primary is `Ctrl` | primary is `Cmd` |
+    /// |---|---|---|
+    /// | select all / copy / cut / paste | `Ctrl+A/C/X/V` | `Cmd+A/C/X/V` |
+    /// | undo | `Ctrl+Z` | `Cmd+Z`, and `Ctrl+Z` |
+    /// | redo | `Ctrl+Shift+Z`, `Ctrl+Y` | `Cmd+Shift+Z`, and `Ctrl+Shift+Z` |
+    /// | word left / right | `Ctrl+Left/Right` | `Alt+Left/Right` |
+    ///
+    /// `Shift` extends a word motion's selection and turns undo into
+    /// redo; with any other letter it makes the press *not* a chord, so
+    /// a registry binding such as `Ctrl+Shift+P` still sees it. A primary
+    /// chord never has `Alt` held — `Ctrl+Alt` is how Windows reports
+    /// `AltGr`, which types — nor the other of `Ctrl`/`Cmd`.
+    ///
+    /// macOS also maps `Ctrl+Z`/`Ctrl+Shift+Z`: the app's shortcut
+    /// registry binds document undo/redo to the literal `Ctrl` chord on
+    /// every platform, so without this arm `Ctrl+Z` pressed inside a
+    /// focused field would undo the *document*.
+    #[must_use]
+    pub fn from_key(key: &Key, modifiers: Modifiers, primary_is_meta: bool) -> Option<Self> {
+        let (primary, other) = if primary_is_meta {
+            (modifiers.meta, modifiers.control)
+        } else {
+            (modifiers.control, modifiers.meta)
+        };
+        let shift = modifiers.shift;
+        match *key {
+            Key::Named(named) => {
+                // Word motion: `Ctrl` off macOS, `Alt`/`Option` on it.
+                let word_modifier = if primary_is_meta {
+                    modifiers.alt && !modifiers.control && !modifiers.meta
+                } else {
+                    modifiers.control && !modifiers.alt && !modifiers.meta
+                };
+                if !word_modifier {
+                    return None;
+                }
+                match named {
+                    NamedKey::ArrowLeft => Some(Self::WordLeft { extend: shift }),
+                    NamedKey::ArrowRight => Some(Self::WordRight { extend: shift }),
+                    _ => None,
+                }
+            }
+            Key::Character(c) => {
+                if modifiers.alt {
+                    return None;
+                }
+                let c = c.to_ascii_lowercase();
+                if primary && !other {
+                    return match (c, shift) {
+                        ('a', false) => Some(Self::SelectAll),
+                        ('c', false) => Some(Self::Copy),
+                        ('x', false) => Some(Self::Cut),
+                        ('v', false) => Some(Self::Paste),
+                        ('z', false) => Some(Self::Undo),
+                        ('z', true) => Some(Self::Redo),
+                        ('y', false) if !primary_is_meta => Some(Self::Redo),
+                        _ => None,
+                    };
+                }
+                // macOS only: the registry's literal `Ctrl+Z`/`Ctrl+Shift+Z`.
+                if primary_is_meta && modifiers.control && !modifiers.meta && c == 'z' {
+                    return Some(if shift { Self::Redo } else { Self::Undo });
+                }
+                None
+            }
+        }
+    }
+}
+
+/// What [`handle_text_field_chord`] did: whether the field's content,
+/// caret or selection changed, and the text a `Copy`/`Cut` wants written
+/// to the OS clipboard — `None` when nothing was selected, so a caller
+/// never overwrites the clipboard with an empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChordEffect {
+    pub changed: bool,
+    pub copied: Option<String>,
+}
+
+/// Applies `chord` to text field `id`. `pasted` is the clipboard's text
+/// for [`TextFieldChord::Paste`] (ignored otherwise; `None` pastes
+/// nothing) and goes through [`TextFieldState::insert_typed`], so it is
+/// filtered and capped exactly like typing, with line breaks and tabs
+/// turned into spaces first ([`single_line_paste`]), since this is a
+/// single-line field. Undo/redo are the field's
+/// own history, never the document's.
+///
+/// # Errors
+///
+/// Whatever [`with_text_field_mut`] refuses — a disabled field included.
+pub fn handle_text_field_chord(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    chord: TextFieldChord,
+    pasted: Option<&str>,
+) -> Result<ChordEffect, WidgetError> {
+    with_text_field_mut(tree, id, |state| {
+        let before = state.snapshot();
+        let mut copied = None;
+        match chord {
+            TextFieldChord::SelectAll => state.select_all(),
+            TextFieldChord::Copy => copied = Some(state.copy()),
+            TextFieldChord::Cut => copied = Some(state.cut()),
+            TextFieldChord::Paste => {
+                if let Some(text) = pasted {
+                    state.paste(text);
+                }
+            }
+            TextFieldChord::Undo => {
+                state.undo();
+            }
+            TextFieldChord::Redo => {
+                state.redo();
+            }
+            TextFieldChord::WordLeft { extend } => state.move_word_left(extend),
+            TextFieldChord::WordRight { extend } => state.move_word_right(extend),
+        }
+        ChordEffect {
+            changed: state.snapshot() != before,
+            copied: copied.filter(|text| !text.is_empty()),
+        }
+    })
+}
+
 /// The most bytes typed input may grow a text field's content to
 /// ([`TextFieldState::insert_typed`]). Every edit snapshots the whole
 /// content for undo and re-shapes it, so an unbounded single-line field
@@ -708,24 +868,43 @@ pub fn is_insertable_char(c: char) -> bool {
         )
 }
 
+/// `text` as one line, for a paste into a single-line input: `\r\n`,
+/// `\n`, `\r` and `\t` each become one space (review F3, 0.137.0).
+/// Everything else is left for [`is_insertable_char`] to filter.
+#[must_use]
+pub fn single_line_paste(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r', '\t'], " ")
+}
+
+/// Appends `text` to `out` whole grapheme cluster by whole cluster,
+/// stopping before the first cluster that would take `out` past `cap`
+/// bytes — so a cap never splits a flag, a ZWJ emoji sequence or a base
+/// from its combining mark (review F2). Returns whether anything was
+/// appended.
+pub fn push_graphemes_capped(out: &mut String, text: &str, cap: usize) -> bool {
+    let before = out.len();
+    for grapheme in text.graphemes(true) {
+        if out.len() + grapheme.len() > cap {
+            break;
+        }
+        out.push_str(grapheme);
+    }
+    out.len() > before
+}
+
 impl TextFieldState {
     /// Inserts typed (or IME-committed) `text` at the caret, replacing any
     /// selection, after dropping every character [`is_insertable_char`]
-    /// rejects and truncating it (at a character boundary) so the content
+    /// rejects and truncating it (at a grapheme-cluster boundary) so the content
     /// stays within [`TEXT_FIELD_MAX_BYTES`]. Returns whether anything was
     /// inserted; text that is empty once filtered changes nothing and
     /// records no undo step.
     pub fn insert_typed(&mut self, text: &str) -> bool {
         let selected = self.selection_range().map_or(0, |range| range.len());
-        let mut room = TEXT_FIELD_MAX_BYTES.saturating_sub(self.content.len() - selected);
+        let room = TEXT_FIELD_MAX_BYTES.saturating_sub(self.content.len() - selected);
+        let filtered: String = text.chars().filter(|&c| is_insertable_char(c)).collect();
         let mut printable = String::new();
-        for c in text.chars().filter(|&c| is_insertable_char(c)) {
-            let Some(left) = room.checked_sub(c.len_utf8()) else {
-                break;
-            };
-            room = left;
-            printable.push(c);
-        }
+        push_graphemes_capped(&mut printable, &filtered, room);
         if printable.is_empty() {
             return false;
         }
@@ -1392,5 +1571,435 @@ mod tests {
         assert!(state.insert_typed("bc"));
         assert_eq!(state.content.len(), super::TEXT_FIELD_MAX_BYTES);
         assert!(!state.insert_typed("d"), "full");
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::{
+        ChordEffect, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldState, handle_text_field_chord,
+        insert_text_field, set_text_field_disabled, text_field_state,
+    };
+    use crate::WidgetError;
+    use crate::shortcut::{Key, Modifiers, NamedKey};
+    use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::{WidgetKind, new_tree, test_scales};
+    use taffy::Style;
+
+    const CTRL: Modifiers = Modifiers {
+        control: true,
+        shift: false,
+        alt: false,
+        meta: false,
+    };
+    const CTRL_SHIFT: Modifiers = Modifiers {
+        control: true,
+        shift: true,
+        alt: false,
+        meta: false,
+    };
+    const CTRL_ALT: Modifiers = Modifiers {
+        control: true,
+        shift: false,
+        alt: true,
+        meta: false,
+    };
+    const CMD: Modifiers = Modifiers {
+        control: false,
+        shift: false,
+        alt: false,
+        meta: true,
+    };
+    const CMD_SHIFT: Modifiers = Modifiers {
+        control: false,
+        shift: true,
+        alt: false,
+        meta: true,
+    };
+    const ALT: Modifiers = Modifiers {
+        control: false,
+        shift: false,
+        alt: true,
+        meta: false,
+    };
+    const ALT_SHIFT: Modifiers = Modifiers {
+        control: false,
+        shift: true,
+        alt: true,
+        meta: false,
+    };
+    const CTRL_CMD: Modifiers = Modifiers {
+        control: true,
+        shift: false,
+        alt: false,
+        meta: true,
+    };
+
+    fn ch(c: char) -> Key {
+        Key::Character(c)
+    }
+
+    fn arrow_left() -> Key {
+        Key::Named(NamedKey::ArrowLeft)
+    }
+
+    fn arrow_right() -> Key {
+        Key::Named(NamedKey::ArrowRight)
+    }
+
+    // -- from_key: the table --
+
+    #[test]
+    fn primary_letters_map_on_both_platforms() {
+        for (primary_is_meta, primary) in [(false, CTRL), (true, CMD)] {
+            let chord = |c| TextFieldChord::from_key(&ch(c), primary, primary_is_meta);
+            assert_eq!(chord('a'), Some(TextFieldChord::SelectAll));
+            assert_eq!(chord('c'), Some(TextFieldChord::Copy));
+            assert_eq!(chord('x'), Some(TextFieldChord::Cut));
+            assert_eq!(chord('v'), Some(TextFieldChord::Paste));
+            assert_eq!(chord('z'), Some(TextFieldChord::Undo));
+            assert_eq!(chord('p'), None, "an unlisted letter falls through");
+        }
+    }
+
+    #[test]
+    fn the_other_platforms_primary_is_not_a_chord() {
+        // `Cmd+C` off macOS and `Ctrl+C` on it are not the copy chord.
+        assert_eq!(TextFieldChord::from_key(&ch('c'), CMD, false), None);
+        assert_eq!(TextFieldChord::from_key(&ch('c'), CTRL, true), None);
+        assert_eq!(TextFieldChord::from_key(&ch('v'), CTRL, true), None);
+        assert_eq!(TextFieldChord::from_key(&ch('a'), CTRL, true), None);
+        // Both held at once is neither platform's chord.
+        assert_eq!(TextFieldChord::from_key(&ch('c'), CTRL_CMD, false), None);
+        assert_eq!(TextFieldChord::from_key(&ch('c'), CTRL_CMD, true), None);
+    }
+
+    #[test]
+    fn shift_turns_undo_into_redo_and_unmaps_the_other_letters() {
+        assert_eq!(
+            TextFieldChord::from_key(&ch('z'), CTRL_SHIFT, false),
+            Some(TextFieldChord::Redo)
+        );
+        assert_eq!(
+            TextFieldChord::from_key(&ch('z'), CMD_SHIFT, true),
+            Some(TextFieldChord::Redo)
+        );
+        // An uppercase character (a layout that reports it) is the same key.
+        assert_eq!(
+            TextFieldChord::from_key(&ch('Z'), CTRL_SHIFT, false),
+            Some(TextFieldChord::Redo)
+        );
+        for c in ['a', 'c', 'x', 'v', 'p'] {
+            assert_eq!(
+                TextFieldChord::from_key(&ch(c), CTRL_SHIFT, false),
+                None,
+                "{c}"
+            );
+            assert_eq!(
+                TextFieldChord::from_key(&ch(c), CMD_SHIFT, true),
+                None,
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_y_is_redo_off_macos_only() {
+        assert_eq!(
+            TextFieldChord::from_key(&ch('y'), CTRL, false),
+            Some(TextFieldChord::Redo)
+        );
+        assert_eq!(TextFieldChord::from_key(&ch('y'), CMD, true), None);
+        assert_eq!(TextFieldChord::from_key(&ch('y'), CTRL, true), None);
+    }
+
+    #[test]
+    fn macos_also_maps_the_registrys_literal_ctrl_z() {
+        assert_eq!(
+            TextFieldChord::from_key(&ch('z'), CTRL, true),
+            Some(TextFieldChord::Undo)
+        );
+        assert_eq!(
+            TextFieldChord::from_key(&ch('z'), CTRL_SHIFT, true),
+            Some(TextFieldChord::Redo)
+        );
+    }
+
+    #[test]
+    fn altgr_is_never_a_chord() {
+        // Windows reports `AltGr` as `Ctrl+Alt`; it types.
+        for c in ['a', 'c', 'x', 'v', 'z', 'y', 'q'] {
+            assert_eq!(
+                TextFieldChord::from_key(&ch(c), CTRL_ALT, false),
+                None,
+                "{c}"
+            );
+            assert_eq!(
+                TextFieldChord::from_key(&ch(c), CTRL_ALT, true),
+                None,
+                "{c}"
+            );
+        }
+        // Nor is `Option+letter` on macOS (it types `å`, `ç`, ...).
+        assert_eq!(TextFieldChord::from_key(&ch('c'), ALT, true), None);
+    }
+
+    #[test]
+    fn word_motion_is_ctrl_arrow_off_macos() {
+        assert_eq!(
+            TextFieldChord::from_key(&arrow_left(), CTRL, false),
+            Some(TextFieldChord::WordLeft { extend: false })
+        );
+        assert_eq!(
+            TextFieldChord::from_key(&arrow_right(), CTRL_SHIFT, false),
+            Some(TextFieldChord::WordRight { extend: true })
+        );
+        assert_eq!(TextFieldChord::from_key(&arrow_left(), ALT, false), None);
+        assert_eq!(
+            TextFieldChord::from_key(&arrow_left(), CTRL_ALT, false),
+            None
+        );
+        assert_eq!(
+            TextFieldChord::from_key(&Key::Named(NamedKey::Home), CTRL, false),
+            None
+        );
+    }
+
+    #[test]
+    fn word_motion_is_alt_arrow_on_macos_only() {
+        assert_eq!(
+            TextFieldChord::from_key(&arrow_left(), ALT, true),
+            Some(TextFieldChord::WordLeft { extend: false })
+        );
+        assert_eq!(
+            TextFieldChord::from_key(&arrow_right(), ALT_SHIFT, true),
+            Some(TextFieldChord::WordRight { extend: true })
+        );
+        assert_eq!(TextFieldChord::from_key(&arrow_left(), CTRL, true), None);
+        assert_eq!(TextFieldChord::from_key(&arrow_left(), CMD, true), None);
+    }
+
+    #[test]
+    fn unmodified_keys_are_not_chords() {
+        for primary_is_meta in [false, true] {
+            assert_eq!(
+                TextFieldChord::from_key(&ch('z'), Modifiers::none(), primary_is_meta),
+                None
+            );
+            assert_eq!(
+                TextFieldChord::from_key(&arrow_left(), Modifiers::none(), primary_is_meta),
+                None
+            );
+        }
+    }
+
+    // -- handle_text_field_chord: the effects --
+
+    fn tree_with(content: &str) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_text_field(&mut tree, root, &scales, "Name", content) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, id)
+    }
+
+    fn apply(
+        tree: &mut WidgetTree<WidgetKind>,
+        id: WidgetId,
+        chord: TextFieldChord,
+        pasted: Option<&str>,
+    ) -> ChordEffect {
+        match handle_text_field_chord(tree, id, chord, pasted) {
+            Ok(effect) => effect,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn state(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> TextFieldState {
+        match text_field_state(tree, id) {
+            Ok(state) => state.clone(),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn select_all_then_cut_empties_the_field_and_copies_everything() {
+        let (mut tree, id) = tree_with("hello world");
+        let effect = apply(&mut tree, id, TextFieldChord::SelectAll, None);
+        assert!(effect.changed);
+        assert_eq!(effect.copied, None);
+        let effect = apply(&mut tree, id, TextFieldChord::Cut, None);
+        assert!(effect.changed);
+        assert_eq!(effect.copied.as_deref(), Some("hello world"));
+        assert_eq!(state(&tree, id).content, "");
+        assert_eq!(
+            tree.accessibility(id).and_then(accesskit::Node::value),
+            Some(""),
+            "the accessibility value follows"
+        );
+    }
+
+    #[test]
+    fn copy_leaves_the_field_alone() {
+        let (mut tree, id) = tree_with("hello");
+        apply(&mut tree, id, TextFieldChord::SelectAll, None);
+        let effect = apply(&mut tree, id, TextFieldChord::Copy, None);
+        assert!(!effect.changed);
+        assert_eq!(effect.copied.as_deref(), Some("hello"));
+        assert_eq!(state(&tree, id).content, "hello");
+    }
+
+    #[test]
+    fn copy_or_cut_with_no_selection_copies_nothing() {
+        let (mut tree, id) = tree_with("hello");
+        let effect = apply(&mut tree, id, TextFieldChord::Copy, None);
+        assert_eq!(
+            effect,
+            ChordEffect::default(),
+            "never overwrite the clipboard with \"\""
+        );
+        let effect = apply(&mut tree, id, TextFieldChord::Cut, None);
+        assert_eq!(effect, ChordEffect::default());
+        assert_eq!(state(&tree, id).content, "hello");
+    }
+
+    #[test]
+    fn paste_replaces_the_selection() {
+        let (mut tree, id) = tree_with("hello world");
+        apply(&mut tree, id, TextFieldChord::SelectAll, None);
+        let effect = apply(&mut tree, id, TextFieldChord::Paste, Some("bye"));
+        assert!(effect.changed);
+        assert_eq!(effect.copied, None);
+        let after = state(&tree, id);
+        assert_eq!(after.content, "bye");
+        assert_eq!(after.cursor, 3);
+        assert_eq!(after.selection_anchor, None);
+    }
+
+    #[test]
+    fn paste_is_filtered_like_typing() {
+        let (mut tree, id) = tree_with("");
+        let effect = apply(
+            &mut tree,
+            id,
+            TextFieldChord::Paste,
+            Some("one\ntwo\tthree\r\n\u{202e}four"),
+        );
+        assert!(effect.changed);
+        assert_eq!(state(&tree, id).content, "one two three four");
+    }
+
+    #[test]
+    fn paste_is_capped_at_the_maximum_length() {
+        let (mut tree, id) = tree_with("ab");
+        let huge = "x".repeat(TEXT_FIELD_MAX_BYTES * 2);
+        assert!(apply(&mut tree, id, TextFieldChord::Paste, Some(&huge)).changed);
+        assert_eq!(state(&tree, id).content.len(), TEXT_FIELD_MAX_BYTES);
+        assert!(
+            !apply(&mut tree, id, TextFieldChord::Paste, Some("y")).changed,
+            "a full field takes nothing more"
+        );
+    }
+
+    #[test]
+    fn paste_of_nothing_changes_nothing() {
+        let (mut tree, id) = tree_with("abc");
+        apply(&mut tree, id, TextFieldChord::SelectAll, None);
+        assert!(!apply(&mut tree, id, TextFieldChord::Paste, None).changed);
+        assert!(!apply(&mut tree, id, TextFieldChord::Paste, Some("\u{202e}")).changed);
+        assert_eq!(state(&tree, id).content, "abc", "the selection survives");
+    }
+
+    #[test]
+    fn undo_and_redo_are_the_fields_own_history() {
+        let (mut tree, id) = tree_with("");
+        assert!(
+            !apply(&mut tree, id, TextFieldChord::Undo, None).changed,
+            "an empty history undoes nothing"
+        );
+        apply(&mut tree, id, TextFieldChord::Paste, Some("abc"));
+        assert!(apply(&mut tree, id, TextFieldChord::Undo, None).changed);
+        assert_eq!(state(&tree, id).content, "");
+        assert!(apply(&mut tree, id, TextFieldChord::Redo, None).changed);
+        assert_eq!(state(&tree, id).content, "abc");
+        assert!(!apply(&mut tree, id, TextFieldChord::Redo, None).changed);
+    }
+
+    #[test]
+    fn word_motion_moves_and_extends() {
+        let (mut tree, id) = tree_with("one two three");
+        let effect = apply(
+            &mut tree,
+            id,
+            TextFieldChord::WordLeft { extend: false },
+            None,
+        );
+        assert!(effect.changed);
+        let after = state(&tree, id);
+        assert_eq!(after.cursor, "one two ".len());
+        assert_eq!(after.selection_anchor, None);
+
+        apply(
+            &mut tree,
+            id,
+            TextFieldChord::WordLeft { extend: true },
+            None,
+        );
+        let after = state(&tree, id);
+        assert_eq!(after.selected_text(), "two ");
+
+        apply(
+            &mut tree,
+            id,
+            TextFieldChord::WordRight { extend: false },
+            None,
+        );
+        let after = state(&tree, id);
+        assert_eq!(after.selection_anchor, None);
+        assert_eq!(after.cursor, "one two ".len(), "WordRight moves right");
+
+        apply(
+            &mut tree,
+            id,
+            TextFieldChord::WordRight { extend: true },
+            None,
+        );
+        let after = state(&tree, id);
+        assert_eq!(after.cursor, "one two three".len());
+        assert_eq!(after.selected_text(), "three", "WordRight extends");
+    }
+
+    #[test]
+    fn paste_turns_line_breaks_into_spaces_and_caps_on_a_grapheme_boundary() {
+        let (mut tree, id) = tree_with("");
+        apply(&mut tree, id, TextFieldChord::Paste, Some("a\r\nb\nc\td"));
+        assert_eq!(state(&tree, id).content, "a b c d");
+
+        // Fill to two bytes below the cap, then paste a flag (two
+        // regional indicators, 8 bytes): it must not be split in half.
+        let filler = "x".repeat(TEXT_FIELD_MAX_BYTES - 2);
+        let (mut tree, id) = tree_with(&filler);
+        apply(
+            &mut tree,
+            id,
+            TextFieldChord::Paste,
+            Some("\u{1F1E9}\u{1F1EA}"),
+        );
+        assert_eq!(state(&tree, id).content, filler, "no half flag");
+    }
+
+    #[test]
+    fn a_disabled_field_refuses_every_chord() {
+        let (mut tree, id) = tree_with("abc");
+        if let Err(err) = set_text_field_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        match handle_text_field_chord(&mut tree, id, TextFieldChord::Paste, Some("x")) {
+            Err(WidgetError::WidgetDisabled(got)) => assert_eq!(got, id),
+            other => unreachable!("expected WidgetDisabled, got {other:?}"),
+        }
+        assert_eq!(state(&tree, id).content, "abc");
     }
 }
