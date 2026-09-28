@@ -811,7 +811,8 @@ mod tests {
     fn a_tall_window_does_not_stretch_the_slider_vertically() {
         // The slider's `flex_grow` is for a row container; in the gallery's
         // column it must not soak up spare height, or its thumb (drawn as
-        // tall as the slider) grows with the window (0.133.1).
+        // tall as the slider until 0.134.0) grows with the window (0.133.1);
+        // the pointer target still would.
         for height in [480.0, 800.0, 1600.0] {
             let (ws, g, scales) = opened_at(1280.0, height);
             let Some(slider) = ws.tree.bounds(g.slider) else {

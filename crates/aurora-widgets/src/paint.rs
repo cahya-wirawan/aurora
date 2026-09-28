@@ -298,6 +298,23 @@ pub fn paint_widget_ops_frame(
 /// owner (Cahya, PRD FR-027 *Ownership*) rather than invented here.
 pub const FOCUS_RING_WIDTH: f32 = 2.0;
 
+/// A slider's track (and value fill) thickness, in logical pixels — the
+/// mockup's `.slider { height: 4px }` (`design/gallery/index.html`).
+/// **Not a token**, for [`FOCUS_RING_WIDTH`]'s reason: the scales have
+/// no control-part size for it. From the mockup; flagged to the design
+/// owner (Cahya, PRD FR-027 *Ownership*) rather than invented here.
+/// Capped at the slider's own height, so a short slider never paints a
+/// track taller than itself.
+pub const SLIDER_TRACK_THICKNESS: f32 = 4.0;
+
+/// A slider thumb's diameter, in logical pixels — the mockup's
+/// `.slider .thumb { width: 12px; height: 12px }`. **Not a token**, for
+/// [`FOCUS_RING_WIDTH`]'s reason; from the mockup, flagged to the design
+/// owner. Capped at the slider's own height *and* width
+/// (`slider_thumb_rect`), so a tiny slider still draws a whole thumb
+/// inside its bounds.
+pub const SLIDER_THUMB_DIAMETER: f32 = 12.0;
+
 /// The focus ring's second-colour line, in logical pixels: `text.on_accent`
 /// directly on the inner side of the `border.focus` band (C40-style, not
 /// C40's 9:1 ratio — see [`paint_widget_ops_focused`]). Always inside the band, so it
@@ -1200,15 +1217,25 @@ fn paint_checkbox(
     Ok(paints)
 }
 
-/// `Slider`'s own two shapes, in draw order: a track (a thin, full-width
-/// pill-shaped bar, `surface.sunken` — the same "recessed input
-/// control" token `Checkbox`'s own unchecked box already uses) and a
-/// thumb on top of it (a circular knob — `scales.radius.pill`'s own
-/// 9999 clamps down to a real circle against any shape this small, the
-/// same reasoning that already applies to the track's own rounded
-/// ends), positioned at `state.value`'s own proportional offset along
-/// `state.min..=state.max`. `disabled_opacity` is applied to both
-/// shapes uniformly, not just one.
+/// `Slider`'s own shapes, in draw order, matching the gallery mockup
+/// (`design/gallery/index.html`'s `.slider`, 0.134.0):
+///
+/// 1. a **track** — the full width, [`SLIDER_TRACK_THICKNESS`] tall
+///    (capped at the slider's height), vertically centred,
+///    `border.default` (the mockup's `--border-default`), pill ends;
+/// 2. a **fill** — the same band from the track's left edge to the
+///    thumb's *centre*, `accent.primary`, pill ends; omitted entirely
+///    while the thumb is parked at the left end (the value at `min`,
+///    the mockup's `width: 0%`), not tessellated under it;
+/// 3. a **thumb** — a [`SLIDER_THUMB_DIAMETER`] circle (see
+///    [`slider_thumb_rect`] for its travel and caps), `text.primary`,
+///    vertically centred — `scales.radius.pill`'s own 9999 clamps down
+///    to a real circle against any shape this small;
+/// 4. the thumb's `control_outline`, in themes that draw one (high
+///    contrast).
+///
+/// `disabled_opacity` is applied to every shape uniformly, the mockup's
+/// `opacity` on the whole slider.
 fn paint_slider(
     state: &SliderState,
     bounds: Rect,
@@ -1222,32 +1249,37 @@ fn paint_slider(
         1.0
     };
     let tolerance = tolerance_for_scale_factor(scale_factor);
+    let pill = scales.radius.pill as f32;
 
-    let track_thickness = bounds.height as f32 * 0.3;
-    let track_path = rounded_rect(
-        bounds.x as f32,
-        bounds.y as f32 + (bounds.height as f32 - track_thickness) / 2.0,
-        bounds.width as f32,
-        track_thickness,
-        scales.radius.pill as f32,
-    );
+    let height = bounds.height as f32;
+    let track_thickness = SLIDER_TRACK_THICKNESS.min(height);
+    let track_x = bounds.x as f32;
+    let track_y = bounds.y as f32 + (height - track_thickness) / 2.0;
+    let track_path = rounded_rect(track_x, track_y, bounds.width as f32, track_thickness, pill);
     let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
-    let track = (track_mesh, [r, g, b, alpha]);
+    let [r, g, b] = theme.border.default.to_srgb_f32();
+    let mut paints = vec![(track_mesh, [r, g, b, alpha])];
 
     let (thumb_x, thumb_y, thumb_w, thumb_h) = slider_thumb_rect(state, bounds);
-    let thumb_path = rounded_rect(
-        thumb_x,
-        thumb_y,
-        thumb_w,
-        thumb_h,
-        scales.radius.pill as f32,
-    );
-    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.accent.primary.to_srgb_f32();
-    let thumb = (thumb_mesh, [r, g, b, alpha]);
+    // The fill ends under the thumb's centre, so the thumb always covers
+    // the fill's own rounded right end. At `min` the thumb sits flush
+    // with the track's left end and the whole fill (half a thumb wide)
+    // would be inscribed in it -- touching its left edge, where
+    // anti-aliasing could leak an accent sliver -- so it is omitted,
+    // the mockup's `width: 0%`.
+    let fill_width = thumb_x + thumb_w / 2.0 - track_x;
+    if thumb_x > track_x && fill_width > 0.0 {
+        let fill_path = rounded_rect(track_x, track_y, fill_width, track_thickness, pill);
+        let fill_mesh = fill(&fill_path, tolerance).map_err(WidgetError::Paint)?;
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        paints.push((fill_mesh, [r, g, b, alpha]));
+    }
 
-    let mut paints = vec![track, thumb];
+    let thumb_path = rounded_rect(thumb_x, thumb_y, thumb_w, thumb_h, pill);
+    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.text.primary.to_srgb_f32();
+    paints.push((thumb_mesh, [r, g, b, alpha]));
+
     // The thumb, not the track: the track is a groove, not itself a
     // focusable control -- the thumb is the actual interactive handle a
     // user grabs (this module's own doc comment / `control_outline`'s).
@@ -1257,10 +1289,20 @@ fn paint_slider(
     Ok(paints)
 }
 
-/// A slider's thumb `(x, y, w, h)` within `bounds`: a `bounds.height`
-/// square at `state.value`'s proportional offset along
-/// `state.min..=state.max` — shared by [`paint_slider`] and the focus
-/// ring, so the ring always circles the thumb actually drawn.
+/// A slider's thumb `(x, y, w, h)` within `bounds` — shared by
+/// [`paint_slider`] and the focus ring, so the ring always circles the
+/// thumb actually drawn.
+///
+/// The thumb is a square of side `d = min(SLIDER_THUMB_DIAMETER,
+/// bounds.height, bounds.width)`, vertically centred. Its **centre**
+/// travels from `x + d/2` (at `min`) to `x + w - d/2` (at `max`), so the
+/// whole thumb stays inside `bounds` at both ends. The mockup instead
+/// centres the thumb on the track's very end (`translate(-50%, -50%)` at
+/// `left: 0%`/`100%`), overhanging the slider by `d/2`; staying inside
+/// is a deliberate departure, because an overhanging thumb would be
+/// clipped by the slider's own bounds (and by a scroll view's) and its
+/// focus ring would spill past the damage outset. Flagged to the design
+/// owner with the two constants.
 fn slider_thumb_rect(state: &SliderState, bounds: Rect) -> (f32, f32, f32, f32) {
     // `range <= 0.0` is a degenerate slider (`min == max`, or a caller
     // that ignored `insert_slider`'s own "assumes min <= max"
@@ -1272,11 +1314,12 @@ fn slider_thumb_rect(state: &SliderState, bounds: Rect) -> (f32, f32, f32, f32) 
     } else {
         0.0
     };
-    let thumb_size = bounds.height as f32;
-    let thumb_travel = (bounds.width as f32 - thumb_size).max(0.0);
+    let (width, height) = (bounds.width as f32, bounds.height as f32);
+    let thumb_size = SLIDER_THUMB_DIAMETER.min(height).min(width);
+    let thumb_travel = (width - thumb_size).max(0.0);
     (
         bounds.x as f32 + fraction as f32 * thumb_travel,
-        bounds.y as f32,
+        bounds.y as f32 + (height - thumb_size) / 2.0,
         thumb_size,
         thumb_size,
     )
@@ -1294,10 +1337,11 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
 }
 
 /// `Scrollbar`'s own two shapes, in draw order: a full-length track
-/// (`surface.sunken`, the same "recessed control" token a `Slider`'s own
-/// track already uses) and a thumb on top of it (`accent.primary`), both
-/// `scales.radius.pill`. `disabled_opacity` is applied to both shapes
-/// uniformly, exactly as [`paint_slider`] already does.
+/// (`surface.sunken`, the "recessed control" token an unchecked
+/// `Checkbox`'s box also uses — a `Slider`'s track moved to
+/// `border.default` with the mockup in 0.134.0) and a thumb on top of it
+/// (`accent.primary`), both `scales.radius.pill`. `disabled_opacity` is
+/// applied to both shapes uniformly, exactly as [`paint_slider`] does.
 ///
 /// The one real difference from a slider: a scrollbar's thumb has a
 /// *length* of its own, proportional to how much of the scrolled content
@@ -2468,7 +2512,7 @@ mod tests {
         insert_tree_item, insert_tree_view, new_tree, row_height, set_button_disabled,
         set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
         set_dropdown_disabled, set_dropdown_open, set_scrollbar_disabled, set_scrollbar_value,
-        set_slider_disabled, set_slider_value, set_text_field_disabled, set_tree_item_disabled,
+        set_slider_disabled, set_text_field_disabled, set_tree_item_disabled,
         set_tree_item_selected, toggle_checkbox,
     };
     use crate::widgets::{
@@ -2869,123 +2913,162 @@ mod tests {
         assert_eq!(color[3], theme.state.disabled_opacity);
     }
 
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn a_laid_out_slider_paints_a_track_then_a_thumb() {
+    /// Inserts a `0..=100` slider at `value`, lays it out at exactly
+    /// `bounds`, optionally disables it, and returns its paints.
+    fn slider_paints(value: f64, bounds: Rect, disabled: bool, theme: &Theme) -> Vec<Paint> {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
-        let slider = match insert_slider(&mut tree, root, &scales, "vol", 50.0, 0.0, 100.0) {
+        let slider = match insert_slider(&mut tree, root, &scales, "vol", value, 0.0, 100.0) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = tree.set_bounds(
-            slider,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 200,
-                height: 20,
-            },
-        ) {
+        if let Err(err) = tree.set_bounds(slider, bounds) {
             unreachable!("{err:?}");
         }
-        let theme = dark_theme();
-
-        let mut paints = match paint_widget(&tree, slider, &theme, &scales, 1.0) {
+        if disabled && let Err(err) = set_slider_disabled(&mut tree, slider, true) {
+            unreachable!("{err:?}");
+        }
+        match paint_widget(&tree, slider, theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// Asserts a mesh's bounding box is `expected` to within a
+    /// tessellation hair.
+    fn assert_bbox_near(mesh: &aurora_vector::Mesh, expected: Bbox, what: &str) {
+        let actual = bbox(mesh);
+        let near = |a: f32, b: f32| (a - b).abs() <= 0.05;
+        assert!(
+            near(actual.0, expected.0)
+                && near(actual.1, expected.1)
+                && near(actual.2, expected.2)
+                && near(actual.3, expected.3),
+            "{what}: bbox {actual:?}, expected {expected:?}"
+        );
+    }
+
+    const SLIDER_200X20: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 20,
+    };
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_slider_paints_the_mockups_track_fill_and_thumb() {
+        let theme = dark_theme();
+        let paints = slider_paints(50.0, SLIDER_200X20, false, &theme);
+        let [track, value_fill, thumb] = paints.as_slice() else {
+            unreachable!("a mid-value slider paints a track, a fill and a thumb: {paints:?}");
         };
-        assert_eq!(paints.len(), 2, "a slider paints a track and a thumb");
-        let (thumb_mesh, thumb_color) = paints.remove(1);
-        let (track_mesh, track_color) = paints.remove(0);
-        assert!(
-            !track_mesh.vertices.is_empty() && !track_mesh.indices.is_empty(),
-            "the track must tessellate to real geometry"
-        );
-        assert!(
-            !thumb_mesh.vertices.is_empty() && !thumb_mesh.indices.is_empty(),
-            "the thumb must tessellate to real geometry"
-        );
-        let [r, g, b] = theme.surface.sunken.to_srgb_f32();
-        assert_eq!(
-            track_color,
-            [r, g, b, 1.0],
-            "the track must use surface.sunken, the same recessed-control token an unchecked \
-             checkbox already uses"
-        );
+
+        // A 4 px border.default track, full width, centred in 20 px.
+        assert_bbox_near(&track.0, (0.0, 8.0, 200.0, 12.0), "track");
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(track.1, [r, g, b, 1.0], "the track is border.default");
+
+        // A 12 px text.primary thumb, centred vertically; at 50% its
+        // centre sits halfway along the 188 px of travel, at x = 100.
+        assert_bbox_near(&thumb.0, (94.0, 4.0, 106.0, 16.0), "thumb");
+        let [r, g, b] = theme.text.primary.to_srgb_f32();
+        assert_eq!(thumb.1, [r, g, b, 1.0], "the thumb is text.primary");
+
+        // The accent fill runs from the track's left edge to the thumb's
+        // centre, in the track's own band.
+        assert_bbox_near(&value_fill.0, (0.0, 8.0, 100.0, 12.0), "fill");
         let [r, g, b] = theme.accent.primary.to_srgb_f32();
-        assert_eq!(
-            thumb_color,
-            [r, g, b, 1.0],
-            "the thumb must use accent.primary at full opacity"
-        );
+        assert_eq!(value_fill.1, [r, g, b, 1.0], "the fill is accent.primary");
+    }
+
+    #[test]
+    fn a_slider_at_min_paints_no_fill_and_keeps_its_thumb_inside_its_bounds() {
+        let theme = dark_theme();
+        let paints = slider_paints(0.0, SLIDER_200X20, false, &theme);
+        let [track, thumb] = paints.as_slice() else {
+            unreachable!("a slider at min paints no zero-width fill: {paints:?}");
+        };
+        assert_bbox_near(&track.0, (0.0, 8.0, 200.0, 12.0), "track at min");
+        assert_bbox_near(&thumb.0, (0.0, 4.0, 12.0, 16.0), "thumb at min");
+    }
+
+    #[test]
+    fn a_slider_at_max_keeps_its_thumb_inside_its_bounds_and_fills_to_its_centre() {
+        let theme = dark_theme();
+        let paints = slider_paints(100.0, SLIDER_200X20, false, &theme);
+        let [_, value_fill, thumb] = paints.as_slice() else {
+            unreachable!("a slider at max paints a track, a fill and a thumb: {paints:?}");
+        };
+        assert_bbox_near(&thumb.0, (188.0, 4.0, 200.0, 16.0), "thumb at max");
+        assert_bbox_near(&value_fill.0, (0.0, 8.0, 194.0, 12.0), "fill at max");
+    }
+
+    #[test]
+    fn a_slider_shorter_than_its_thumb_and_track_caps_both_at_its_height() {
+        let theme = dark_theme();
+        let bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 40,
+            height: 3,
+        };
+        let paints = slider_paints(0.0, bounds, false, &theme);
+        let [track, thumb] = paints.as_slice() else {
+            unreachable!("{paints:?}");
+        };
+        assert_bbox_near(&track.0, (10.0, 20.0, 50.0, 23.0), "capped track");
+        assert_bbox_near(&thumb.0, (10.0, 20.0, 13.0, 23.0), "capped thumb");
+
+        // Narrower than the thumb, too: the thumb shrinks to the width.
+        let narrow = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 20,
+        };
+        let paints = slider_paints(100.0, narrow, false, &theme);
+        let Some(thumb) = paints.last() else {
+            unreachable!("{paints:?}");
+        };
+        assert_bbox_near(&thumb.0, (0.0, 6.0, 8.0, 14.0), "width-capped thumb");
     }
 
     #[test]
     fn a_sliders_thumb_moves_right_as_its_value_increases() {
-        let (mut tree, root) = new_tree(taffy::Style::default());
-        let scales = scales();
-        let slider = match insert_slider(&mut tree, root, &scales, "vol", 0.0, 0.0, 100.0) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = tree.set_bounds(
-            slider,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 200,
-                height: 20,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
         let theme = dark_theme();
-
-        let thumb_min_x = |tree: &WidgetTree<WidgetKind>| -> f32 {
-            let mut paints = match paint_widget(tree, slider, &theme, &scales, 1.0) {
-                Ok(paints) => paints,
-                Err(err) => unreachable!("{err:?}"),
+        let thumb_min_x = |value: f64| -> f32 {
+            let paints = slider_paints(value, SLIDER_200X20, false, &theme);
+            let Some((thumb_mesh, _)) = paints.last() else {
+                unreachable!("{paints:?}");
             };
-            assert_eq!(paints.len(), 2);
-            let (thumb_mesh, _) = paints.remove(1);
-            thumb_mesh
-                .vertices
-                .iter()
-                .map(|point| point.x)
-                .fold(f32::INFINITY, f32::min)
+            bbox(thumb_mesh).0
         };
-
-        let at_min = thumb_min_x(&tree);
-        if let Err(err) = set_slider_value(&mut tree, slider, 100.0) {
-            unreachable!("{err:?}");
-        }
-        let at_max = thumb_min_x(&tree);
+        let (at_min, at_mid, at_max) = (thumb_min_x(0.0), thumb_min_x(50.0), thumb_min_x(100.0));
         assert!(
-            at_max > at_min,
-            "the thumb must move right as the value increases: {at_min} -> {at_max}"
+            at_min < at_mid && at_mid < at_max,
+            "the thumb must move right as the value increases: {at_min} -> {at_mid} -> {at_max}"
         );
     }
 
     #[test]
     #[allow(clippy::float_cmp)]
-    fn a_disabled_slider_applies_the_theme_disabled_opacity_to_both_shapes() {
-        let (mut tree, root) = new_tree(taffy::Style::default());
-        let scales = scales();
-        let slider = match insert_slider(&mut tree, root, &scales, "vol", 0.0, 0.0, 100.0) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = set_slider_disabled(&mut tree, slider, true) {
-            unreachable!("{err:?}");
-        }
+    fn a_disabled_slider_applies_the_theme_disabled_opacity_to_every_shape() {
         let theme = dark_theme();
+        let paints = slider_paints(50.0, SLIDER_200X20, true, &theme);
+        assert_eq!(paints.len(), 3, "track, fill and thumb: {paints:?}");
+        for (_, color) in &paints {
+            assert_eq!(color[3], theme.state.disabled_opacity);
+        }
 
-        let paints = match paint_widget(&tree, slider, &theme, &scales, 1.0) {
-            Ok(paints) => paints,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        assert_eq!(paints.len(), 2);
+        // High contrast adds the thumb's control outline; it dims too.
+        let theme = high_contrast_theme();
+        let paints = slider_paints(50.0, SLIDER_200X20, true, &theme);
+        assert_eq!(
+            paints.len(),
+            4,
+            "track, fill, thumb and outline: {paints:?}"
+        );
         for (_, color) in &paints {
             assert_eq!(color[3], theme.state.disabled_opacity);
         }
@@ -3050,8 +3133,8 @@ mod tests {
         assert_eq!(
             track_color,
             [r, g, b, 1.0],
-            "the track must use surface.sunken, the same recessed-control token a slider's own \
-             track already uses"
+            "the track must use surface.sunken, the same recessed-control token an unchecked \
+             checkbox already uses"
         );
         let [r, g, b] = theme.accent.primary.to_srgb_f32();
         assert_eq!(
