@@ -46,6 +46,9 @@ fn style(scales: &Scales) -> Style {
     // height instead, and the thumb (as tall as the slider) grew with the
     // window — 45 px in the Widget Gallery at 1280x480 (0.133.1). The
     // `max_size` height caps that without changing the row behaviour.
+    // (Since 0.134.0 the thumb is the mockup's fixed 12 px circle, so it
+    // no longer tracks this height; the cap still keeps the slider's
+    // hit area a control row rather than a slab of the window.)
     let height = length(type_size(scales.typography.size.md));
     Style {
         flex_grow: 1.0,

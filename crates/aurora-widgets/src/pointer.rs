@@ -454,6 +454,11 @@ fn focus_pointer(
 /// - **Slider**: the fraction of the widget's own width over
 ///   `width - 1` pixels (the last hittable pixel, since hit testing is
 ///   exclusive at the far edge), clamped to `[0, 1]`, onto `[min, max]`.
+///   The *drawn* thumb's centre travels one thumb diameter less than this
+///   (`paint::slider_thumb_rect` keeps the thumb inside the bounds), so
+///   near either end a press lands up to half a thumb from the centre it
+///   moves the thumb to — the same order of offset the pre-0.134.0 square
+///   thumb had, kept so the first and last pixels still reach `min`/`max`.
 /// - **Scrollbar**: the pointer names where the thumb's **centre** should
 ///   go. The thumb travels `track - thumb` pixels (its length is
 ///   `page_size`-proportional, exactly as `paint_scrollbar` draws it), so

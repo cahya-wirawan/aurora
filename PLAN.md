@@ -4024,12 +4024,42 @@ check licenses` clean with the new `toml` dependency.
   field 85 px instead of 21), and the slider thumb is drawn as tall as
   the slider. Both now cap their height with `max_size` (row behaviour
   unchanged). New test `a_tall_window_does_not_stretch_the_slider_vertically`
-  (window heights 480/800/1600) fails without either cap. **Design
-  note, not changed:** `design/gallery/index.html` specifies a 4 px
-  `border.default` track with an `accent.primary` fill and a 12 px
-  `text.primary` thumb; the widget paints a `surface.sunken` track 30%
-  of its height and an `accent.primary` thumb as tall as the slider (13
-  px) — a design-owner call.
+  (window heights 480/800/1600) fails without either cap. The design
+  mismatch this round only noted (the mockup's 4 px track, accent fill
+  and 12 px thumb) was fixed at the design owner's request in 0.134.0,
+  below.
+  **Slider matches the mockup (0.134.0).** At Cahya's request,
+  `paint_slider` now draws `design/gallery/index.html`'s `.slider`: a
+  full-width `border.default` track `SLIDER_TRACK_THICKNESS` (4 px)
+  tall, an `accent.primary` value fill from the track's left edge to the
+  thumb's centre (omitted at `min`), and a `SLIDER_THUMB_DIAMETER`
+  (12 px) `text.primary` circle, all vertically centred and pill-ended;
+  `control_outline` stays on the thumb, `disabled_opacity` on every
+  shape. Both sizes are named consts, **not tokens** (no control-part
+  size scale exists) — from the mockup, flagged to the design owner
+  like `FOCUS_RING_WIDTH`. Both are capped at the slider's height (the
+  thumb at its width too). One deliberate departure: the thumb's centre
+  travels `[x + d/2, x + w - d/2]` so the thumb stays inside the
+  slider's bounds, where the mockup centres it on the track's very ends
+  and overhangs by half a thumb (which would be clipped, and would carry
+  the focus ring past the damage outset). `slider_thumb_rect` is still
+  shared with the focus ring, so the ring (offset +1, the mockup's
+  `outline-offset: 1px`) follows. Pointer mapping unchanged (first/last
+  pixel still reach min/max; near the ends a press lands up to half a
+  thumb from the drawn centre, as before). Six paint tests replace the
+  old three (geometry and colour of all three shapes, no fill at min,
+  thumb inside bounds at min/max, height/width caps, disabled alpha
+  with and without the HC outline); the five `slider_gallery*.png`
+  goldens were re-blessed on the RTX 3090. Known: per-shape disabled
+  alpha lets the dimmed fill/track show through the dimmed thumb (the
+  mockup's opacity is on the whole group; pre-existing for the track);
+  in both High Contrast galleries the bare track is invisible because
+  `border.default` is `hc.mid_gray`, the galleries' own clear colour
+  (in the app it sits on black/white); `border.default` is an
+  ungated, decorative token (1.43:1 on `surface.panel` in Dark) — the
+  thumb (`text.primary`, gated) and fill (`accent.primary`, gated 3:1
+  on the panel) carry the value. Whether a slider track should be a
+  gated pair is a design-owner question, not added here.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no

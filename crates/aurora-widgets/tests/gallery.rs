@@ -349,8 +349,8 @@ use aurora_widgets::widgets::{
 };
 use aurora_widgets::{
     FocusManager, FocusOrigin, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp,
-    GradientPipeline, PaintLayer, PaintOp, PathPipeline, TextPipeline, WidgetId, WidgetTree,
-    draw_paint_ops, paint_widget_ops_focused,
+    GradientPipeline, PaintLayer, PaintOp, PathPipeline, SLIDER_THUMB_DIAMETER, TextPipeline,
+    WidgetId, WidgetTree, draw_paint_ops, paint_widget_ops_focused,
 };
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
@@ -398,10 +398,13 @@ const SLIDER_CELL: (u32, u32) = (128, 32);
 const SLIDER_GALLERY_SIZE: (u32, u32) = (SLIDER_CELL.0 * 3, SLIDER_CELL.1);
 /// How far into each slider cell, from its own left edge,
 /// `render_gallery_produces_distinct_pixels_for_each_slider_state`
-/// samples — well within the thumb's own 32px width when the thumb is
-/// at that cell's own left edge (the minimum-value cell), but past it
-/// once the thumb has moved away (see that test's own doc comment).
-const SLIDER_THUMB_SAMPLE_OFFSET_X: u32 = 16;
+/// samples — the thumb's own centre when the thumb is parked at that
+/// cell's left edge (the minimum-value cell, 0.134.0's
+/// `SLIDER_THUMB_DIAMETER` circle), and inside the `accent.primary`
+/// value fill once the thumb has moved away (see that test's own doc
+/// comment).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const SLIDER_THUMB_SAMPLE_OFFSET_X: u32 = (SLIDER_THUMB_DIAMETER / 2.0) as u32;
 
 /// A scrollbar is the one widget here whose *cell shape* has to differ
 /// by state, not just its contents: a bar only has travel along its own
@@ -5140,11 +5143,12 @@ menu_golden_test!(
 /// the others: instead of comparing each cell's own centre (which
 /// would just show the track, not the thumb, for anything but a
 /// dead-centre value), this samples a fixed offset from each cell's
-/// own left edge (`x = 16`, well within the thumb's own 32px width) —
-/// at the minimum value the thumb sits right there (`accent.primary`);
-/// at the maximum value the thumb has moved to the cell's own right
-/// edge, so that same offset now shows bare track (`surface.sunken`)
-/// instead. A real, direct proof the thumb's own position actually
+/// own left edge (`SLIDER_THUMB_SAMPLE_OFFSET_X`, the thumb's centre
+/// when parked there) — at the minimum value the thumb sits right there
+/// (`text.primary`, 0.134.0's mockup match); at the maximum value the
+/// thumb has moved to the cell's own right edge, so that same offset now
+/// shows the value fill (`accent.primary`) instead, and the disabled
+/// slider's half-way fill shows it dimmed. A real, direct proof the thumb's own position actually
 /// moved, via rendered pixels rather than mesh vertices
 /// (`src/paint.rs`'s own `a_sliders_thumb_moves_right_as_its_value_
 /// increases` unit test already covers the geometry; this covers the
@@ -5186,7 +5190,7 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state() {
     assert_ne!(
         at_max[..3],
         disabled[..3],
-        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+        "state.disabled_opacity must render the value fill dimmer than full opacity, at the same offset"
     );
 }
 
@@ -5196,7 +5200,10 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state() {
 /// (minimum value), the right edge (maximum value), and a dimmed thumb
 /// at its own middle position (disabled) — visually unambiguous, no
 /// low-contrast concern the way `CommandPalette`/`TextField`'s own
-/// galleries had (see `NEUTRAL_CLEAR`'s own doc comment).
+/// galleries had (see `NEUTRAL_CLEAR`'s own doc comment). **Re-blessed
+/// in 0.134.0**, with all four other slider goldens, for the mockup's
+/// look: a 4 px `border.default` track, an `accent.primary` value fill
+/// up to the thumb's centre, and a 12 px `text.primary` thumb.
 #[test]
 fn slider_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
@@ -5226,12 +5233,12 @@ fn slider_gallery_matches_the_golden_image() {
 /// against the Light theme (`light_theme()`/`LIGHT_CLEAR`) instead of
 /// Dark. `slider_gallery_tree` itself is unchanged and reused as-is —
 /// the tree doesn't depend on theme, only rendering does. Light's own
-/// `surface.sunken` (`neutral.700`, `#c1c1c7`) against `LIGHT_CLEAR`
-/// (`neutral.900`, `#f5f5f6`) is a real, if modest, contrast — the same
-/// spirit as `Checkbox`'s own unchecked box getting away with a modest
-/// contrast because a brighter cell (here, the thumb's own
-/// `accent.primary`, `#124fb0` in Light) anchors the review; no new
-/// backdrop constant was needed.
+/// track (`border.default`, `neutral.600`, since 0.134.0) against
+/// `LIGHT_CLEAR` (`neutral.900`, `#f5f5f6`) is a real, if modest,
+/// contrast — the same spirit as `Checkbox`'s own unchecked box getting
+/// away with a modest contrast because a stronger cell (here, the value
+/// fill's `accent.primary`, `#124fb0` in Light) anchors the review; no
+/// new backdrop constant was needed.
 #[test]
 fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_light_theme() {
     let Some(context) = real_context() else {
@@ -5269,7 +5276,7 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_light_theme(
     assert_ne!(
         at_max[..3],
         disabled[..3],
-        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+        "state.disabled_opacity must render the value fill dimmer than full opacity, at the same offset"
     );
 }
 
@@ -5280,9 +5287,9 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_light_theme(
 /// does not exist yet). The same reasoning
 /// `render_gallery_produces_distinct_pixels_for_each_slider_state_in_
 /// light_theme`'s own doc comment gives for why no special backdrop
-/// handling is needed applies here too: `surface.sunken` against
-/// `LIGHT_CLEAR` is a real, if modest, contrast, and the thumb's own
-/// bright `accent.primary` gives a human reviewing the golden a genuine
+/// handling is needed applies here too: the `border.default` track
+/// against `LIGHT_CLEAR` is a real, if modest, contrast, and the value
+/// fill's `accent.primary` gives a human reviewing the golden a genuine
 /// reference point regardless.
 ///
 /// **`#[ignore]`d, deliberately — this file's own "never bless blind"
@@ -5322,11 +5329,12 @@ fn slider_gallery_matches_the_golden_image_in_light_theme() {
 /// `render_gallery_produces_distinct_pixels_for_each_slider_state`, but
 /// against High Contrast Dark (`high_contrast_dark_theme()`/
 /// `HIGH_CONTRAST_DARK_CLEAR`) instead of Dark or Light.
-/// `slider_gallery_tree` itself is unchanged and reused as-is. Unlike
-/// Dark/Light, the track (`surface.sunken`, `hc.black`) needs
-/// `HIGH_CONTRAST_DARK_CLEAR` to be visible at all against the clear
-/// colour, the same reasoning `Checkbox`'s own High Contrast Dark test
-/// gives (`HIGH_CONTRAST_DARK_CLEAR`'s own doc comment).
+/// `slider_gallery_tree` itself is unchanged and reused as-is. Since
+/// 0.134.0 the track is `border.default` (`hc.mid_gray`), which is the
+/// very grey `HIGH_CONTRAST_DARK_CLEAR` clears to — so in this gallery
+/// (only) the bare track is invisible; in the app it sits on
+/// `hc.black` at ~5.3:1. The thumb and the `accent.primary` fill still
+/// carry every state here, which is all this test samples.
 #[test]
 fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
@@ -5365,7 +5373,7 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contras
     assert_ne!(
         at_max[..3],
         disabled[..3],
-        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+        "state.disabled_opacity must render the value fill dimmer than full opacity, at the same offset"
     );
 }
 
@@ -5410,11 +5418,12 @@ fn slider_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
 /// `render_gallery_produces_distinct_pixels_for_each_slider_state`, but
 /// against High Contrast Light (`high_contrast_light_theme()`/
 /// `HIGH_CONTRAST_LIGHT_CLEAR`) instead of any other theme.
-/// `slider_gallery_tree` itself is unchanged and reused as-is. As with
-/// High Contrast Dark, the track (`surface.sunken`, `hc.white` here)
-/// needs `HIGH_CONTRAST_LIGHT_CLEAR` to be visible at all against the
-/// clear colour, the same reasoning `Checkbox`'s own High Contrast Light
-/// test gives (`HIGH_CONTRAST_LIGHT_CLEAR`'s own doc comment).
+/// `slider_gallery_tree` itself is unchanged and reused as-is. Since
+/// 0.134.0 the track is `border.default` (`hc.mid_gray`), the very
+/// grey `HIGH_CONTRAST_LIGHT_CLEAR` clears to — so in this gallery (only)
+/// the bare track is invisible; in the app it sits on white at ~3.95:1.
+/// The thumb and the `accent.primary` fill still carry every state this
+/// test samples.
 #[test]
 fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
@@ -5453,7 +5462,7 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contras
     assert_ne!(
         at_max[..3],
         disabled[..3],
-        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+        "state.disabled_opacity must render the value fill dimmer than full opacity, at the same offset"
     );
 }
 
@@ -5537,7 +5546,7 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_color_critic
     assert_ne!(
         at_max[..3],
         disabled[..3],
-        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+        "state.disabled_opacity must render the value fill dimmer than full opacity, at the same offset"
     );
 }
 
@@ -5546,11 +5555,11 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_color_critic
 /// `COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
 /// diffed against its own golden target (`tests/golden/
 /// slider_gallery_color_critical.png`, which does not exist yet).
-/// `surface.sunken` clears `COLOR_CRITICAL_CLEAR` at ≈2.05:1
-/// (`COLOR_CRITICAL_CLEAR`'s own doc comment) — real and modest, but the
-/// thumb's own bright `accent.primary` gives a human reviewing the golden
-/// a genuine reference point regardless, the same reasoning Light's own
-/// `Slider` slice already used.
+/// The track has been `border.default` (`cc.border_mid`) since
+/// 0.134.0 — modest against `COLOR_CRITICAL_CLEAR`, but the thumb's
+/// `text.primary` and the value fill's `accent.primary` give a human
+/// reviewing the golden a genuine reference point regardless, the same
+/// reasoning Light's own `Slider` slice already used.
 ///
 /// **`#[ignore]`d, deliberately — this file's own "never bless blind"
 /// discipline** (see `aurora_testkit::compare_to_golden`'s own
