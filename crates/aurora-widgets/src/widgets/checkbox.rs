@@ -2,11 +2,12 @@
 //! first widget slice covers.
 
 use accesskit::{Action, Node, Role, Toggled};
+use aurora_core::Rect;
 use aurora_theme::Scales;
 use taffy::style_helpers::length;
 use taffy::{Size, Style};
 
-use super::{WidgetKind, type_size};
+use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 
@@ -46,6 +47,49 @@ fn style(scales: &Scales) -> Style {
             height: side,
         },
         ..Default::default()
+    }
+}
+
+/// The checkbox's box side and the gap between the box and its label,
+/// logical px: `type.size.md` (the same side its unmeasured layout box
+/// has, see [`style`]) and `spacing.sm`. Shared by the text-aware
+/// measurer (`crate::measure`), the paint of the box and focus ring, and
+/// the label's text run, so the three can never disagree on where the
+/// box ends and the label starts.
+pub(crate) fn checkbox_metrics(scales: &Scales) -> (f32, f32) {
+    (
+        type_size(scales.typography.size.md),
+        spacing(scales.spacing.sm),
+    )
+}
+
+/// The checkbox's own box within its layout `bounds` (0.140.0).
+///
+/// A **measured** checkbox (laid out through `crate::compute_text_layout`,
+/// [`WidgetTree::is_measured`]) has bounds that cover its box, a
+/// `spacing.sm` gap and its label — one widget, so a click on the label
+/// toggles it through the existing click path — and its box is a
+/// `type.size.md` square flush with the left edge, vertically centred,
+/// shrunk to fit if `bounds` is smaller.
+///
+/// An **unmeasured** checkbox's bounds *are* its box, whatever size they
+/// are: its default style is that same square, and a hand-sized cell (the
+/// component gallery's 64 px ones) is painted whole, exactly as before
+/// 0.140.0 — which is why every checkbox golden (laid out with no text
+/// engine) is unchanged.
+#[must_use]
+pub(crate) fn checkbox_box_rect(bounds: Rect, measured: bool, scales: &Scales) -> Rect {
+    if !measured {
+        return bounds;
+    }
+    let side = scales.typography.size.md;
+    let width = side.min(bounds.width);
+    let height = side.min(bounds.height);
+    Rect {
+        x: bounds.x,
+        y: bounds.y + i64::from((bounds.height - height) / 2),
+        width,
+        height,
     }
 }
 

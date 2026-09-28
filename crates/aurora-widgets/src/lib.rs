@@ -71,6 +71,7 @@ pub mod action;
 mod caret;
 mod error;
 mod input;
+mod measure;
 mod paint;
 mod pointer;
 pub mod render;
@@ -87,6 +88,7 @@ pub use action::{ALL_ACTIONS, ActionOutcome, ActionRejection, handle_action};
 pub use caret::{CARET_BLINK_INTERVAL, CaretBlink, CaretSignature, caret_signature};
 pub use error::WidgetError;
 pub use input::{FocusManager, FocusOrigin, hit_test};
+pub use measure::{TextMeasure, compute_text_layout, measure_widget};
 pub use paint::{
     FOCUS_RING_INNER_WIDTH, FOCUS_RING_WIDTH, FocusPaint, Paint, PaintOp, SLIDER_THUMB_DIAMETER,
     SLIDER_TRACK_THICKNESS, paint_widget, paint_widget_ops, paint_widget_ops_focused,

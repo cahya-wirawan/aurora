@@ -48,8 +48,8 @@ use aurora_theme::{Color, Scales, Theme};
 
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    TextFieldState, UnderlineStyle, WidgetKind, composition_segments, floor_char_boundary,
-    row_height,
+    TextFieldState, UnderlineStyle, WidgetKind, checkbox_metrics, composition_segments,
+    floor_char_boundary, row_height,
 };
 
 /// Horizontal alignment of a run inside its content box.
@@ -250,7 +250,7 @@ fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bo
 }
 
 /// The intersection of two rects, or `None` when they do not overlap.
-fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+pub(crate) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
     let x1 = (a.x + i64::from(a.width)).min(b.x + i64::from(b.width));
@@ -483,6 +483,31 @@ pub fn text_runs(
             })
             .into_iter()
             .collect(),
+        // A checkbox's label (0.140.0): one line, flush left, just past
+        // the box and a `spacing.sm` gap (`checkbox_metrics`), in
+        // `text.primary` — it names a control the user acts on, not
+        // supporting text — faded by the same disabled opacity the box
+        // itself carries. Only a *measured* checkbox (laid out through
+        // `crate::compute_text_layout`) draws one: an unmeasured one's
+        // bounds are all box (`checkbox_box_rect`), so no run is produced
+        // — every golden (laid out with no text engine) stays text-free
+        // exactly as before. A measured checkbox squeezed to no room past
+        // its box draws none either.
+        WidgetKind::Checkbox(state) if tree.is_measured(id) == Some(true) => {
+            let (side, gap) = checkbox_metrics(scales);
+            let (x, y, w, h) = full;
+            let width = w - side - gap;
+            if width > 0.0 {
+                vec![run(
+                    &state.label,
+                    rgba(theme.text.primary, opacity(state.disabled, theme)),
+                    (x + side + gap, y, width, h),
+                    HAlign::Start,
+                )]
+            } else {
+                Vec::new()
+            }
+        }
         // A static label: one line, flush left, supporting text.
         WidgetKind::Label(state) => {
             let color = if state.disabled {
@@ -578,7 +603,7 @@ fn sanitize_field(text: &str) -> String {
 /// included) replaced by a space. Labels are one line, shaped left to
 /// right in one bundled font with no fallback: a control character has no
 /// glyph to draw and would otherwise shape as a `.notdef` box.
-fn sanitize_label(text: &str) -> String {
+pub(crate) fn sanitize_label(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()

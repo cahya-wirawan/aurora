@@ -163,6 +163,7 @@ pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pre
 pub use checkbox::{
     CheckboxState, insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox,
 };
+pub(crate) use checkbox::{checkbox_box_rect, checkbox_metrics};
 pub use color_picker::{
     ColorPickerKey, ColorPickerOutcome, ColorPickerPart, ColorPickerPartRole, ColorPickerPartState,
     ColorPickerState, Hsv, color_picker_part_at, color_picker_part_of, color_picker_state,

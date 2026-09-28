@@ -5637,6 +5637,35 @@ fn translate_modifiers(state: winit::keyboard::ModifiersState) -> Modifiers {
     }
 }
 
+/// Lays `workspace` out in `width` x `height` logical px through
+/// [`aurora_widgets::compute_text_layout`]: text-aware (checkboxes sized
+/// to box + gap + label) when `engine` is `Some`, and exactly the
+/// text-blind `compute_layout` when it is `None` (the UI font failed to
+/// load — checkboxes then stay bare boxes). `scale_factor` must be the
+/// one the frame's text is painted at, so the lines layout shapes are the
+/// cache entries paint reuses.
+fn layout_workspace(
+    workspace: &mut aurora_ui::Workspace,
+    engine: Option<&mut TextEngine>,
+    scales: &Scales,
+    scale_factor: f64,
+    width: f32,
+    height: f32,
+) {
+    #[allow(clippy::cast_possible_truncation)]
+    let scale_factor = scale_factor as f32;
+    aurora_widgets::compute_text_layout(
+        &mut workspace.tree,
+        width,
+        height,
+        engine.map(|engine| aurora_widgets::TextMeasure {
+            engine,
+            scales,
+            scale_factor,
+        }),
+    );
+}
+
 /// Converts a real, physical-pixel window size into the logical pixels
 /// `aurora_widgets::WidgetTree::compute_layout` expects, dividing out
 /// `scale_factor` — `winit`'s own physical/logical distinction
@@ -18050,6 +18079,22 @@ impl App {
         self.sync_ime();
     }
 
+    /// Lays the workspace out in `width` x `height` logical px, text-aware
+    /// (0.140.0) — the one place production code lays the workspace out,
+    /// so every layout sizes checkboxes to their labels with the same
+    /// engine, scales and scale factor the frame paints with. See
+    /// [`layout_workspace`].
+    fn layout(&mut self, width: f32, height: f32) {
+        layout_workspace(
+            &mut self.workspace,
+            self.text_engine.as_mut(),
+            &self.scales,
+            self.scale_factor,
+            width,
+            height,
+        );
+    }
+
     /// Recomputes the workspace layout for `physical_size`, then
     /// reconfigures the presentation surface *and* the canvas atlas to
     /// match — layout is pure geometry (no GPU needed) and stays current
@@ -18080,7 +18125,7 @@ impl App {
     /// stance `resumed`'s own analogous call already takes.
     fn apply_resize(&mut self, physical_size: (u32, u32)) {
         let (width, height) = logical_size(physical_size, self.scale_factor);
-        self.workspace.tree.compute_layout(width, height);
+        self.layout(width, height);
 
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -18650,8 +18695,20 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         self.menu.init_for_nsapp();
 
         self.scale_factor = window.scale_factor();
+        // Before the first layout (0.140.0): layout measures checkbox
+        // labels with this engine, and one created after it would leave
+        // the first frame's checkboxes unlabelled bare boxes until the
+        // next relayout.
+        if self.text_engine.is_none() {
+            match TextEngine::new() {
+                Ok(engine) => self.text_engine = Some(engine),
+                Err(err) => {
+                    tracing::error!(?err, "UI font failed to load; widget labels are not drawn");
+                }
+            }
+        }
         let (width, height) = logical_size((size.width, size.height), self.scale_factor);
-        self.workspace.tree.compute_layout(width, height);
+        self.layout(width, height);
 
         // Sized once, here, to the canvas area's own physical size --
         // see `residency`/`canvas_pipeline`'s own doc comments for why a
@@ -18677,14 +18734,6 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         self.gradient_pipeline = Some(GradientPipeline::new(gpu.device()));
         self.text_pipeline = Some(TextPipeline::new(gpu.device()));
         self.glyph_atlas = Some(GlyphAtlas::new(gpu.device()));
-        if self.text_engine.is_none() {
-            match TextEngine::new() {
-                Ok(engine) => self.text_engine = Some(engine),
-                Err(err) => {
-                    tracing::error!(?err, "UI font failed to load; widget labels are not drawn");
-                }
-            }
-        }
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -54261,5 +54310,84 @@ mod tests {
             assert_eq!(rig.tool, Tool::Eraser, "the shortcut fired");
             assert_eq!(rig.slider(), (24.0, false));
         }
+    }
+}
+
+/// 0.140.0: the app's one production layout path is text-aware.
+#[cfg(test)]
+mod text_layout_tests {
+    use aurora_core::Rect;
+    use aurora_text::TextEngine;
+    use aurora_widgets::{WidgetId, WidgetTree, widgets::WidgetKind};
+
+    use super::{layout_workspace, load_scales};
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The real workspace with the real Layers-panel controls, as
+    /// `App::new` builds it.
+    fn workspace() -> (aurora_ui::Workspace, aurora_ui::LayerControls) {
+        let scales = ok(load_scales());
+        let mut workspace = aurora_ui::build_workspace();
+        let controls = ok(aurora_ui::insert_layer_controls(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+        ));
+        (workspace, controls)
+    }
+
+    fn every_bounds(tree: &WidgetTree<WidgetKind>) -> Vec<(WidgetId, Option<Rect>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root()];
+        while let Some(id) = stack.pop() {
+            out.push((id, tree.bounds(id)));
+            stack.extend(tree.children(id).unwrap_or_default().iter().copied());
+        }
+        out
+    }
+
+    #[test]
+    fn the_layers_panel_visible_checkbox_is_laid_out_wide_enough_for_its_label() {
+        let scales = ok(load_scales());
+        let (mut workspace, controls) = workspace();
+        let mut engine = ok(TextEngine::new());
+        layout_workspace(
+            &mut workspace,
+            Some(&mut engine),
+            &scales,
+            2.0,
+            1280.0,
+            800.0,
+        );
+        let Some(bounds) = workspace.tree.bounds(controls.visible) else {
+            unreachable!("the Visible checkbox exists");
+        };
+        let side = scales.typography.size.md;
+        let gap = scales.spacing.sm;
+        assert!(
+            bounds.width > side + gap,
+            "box + gap + label, not a bare box: {bounds:?}"
+        );
+        assert_eq!(workspace.tree.is_measured(controls.visible), Some(true));
+        let label = engine.shape("Visible", &aurora_widgets::label_style(&scales), 2.0);
+        #[allow(clippy::cast_precision_loss)]
+        let room = bounds.width as f32 - (side + gap) as f32;
+        assert!(room >= label.width, "{room} < {}", label.width);
+    }
+
+    #[test]
+    fn without_an_engine_the_production_layout_is_the_text_blind_one() {
+        let scales = ok(load_scales());
+        let (mut via_helper, _) = workspace();
+        let (mut blind, _) = workspace();
+        layout_workspace(&mut via_helper, None, &scales, 2.0, 1280.0, 800.0);
+        blind.tree.compute_layout(1280.0, 800.0);
+        assert_eq!(every_bounds(&via_helper.tree), every_bounds(&blind.tree));
     }
 }

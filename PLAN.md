@@ -26,7 +26,18 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.139.0): the text caret blinks.** A focused
+**Latest (2026-09-28, 0.140.0): checkbox labels, via text-aware
+layout.** Layout can now size a widget from its own text: the app lays
+the workspace out through `aurora_widgets::compute_text_layout`, which
+measures each checkbox's label with the same text engine and scale
+factor the frame paints with, so the Layers panel's `Visible` checkbox
+and the Widget Gallery's checkbox now show their labels beside the box,
+and clicking the label toggles the box. One line only (no wrap, no
+ellipsis); the focus ring circles the box, not the label (a design-owner
+call). Every golden is unchanged. Details and disclosures: M1.7's
+"Layout engine" 0.140.0 update.
+
+**Previously (2026-09-28, 0.139.0): the text caret blinks.** A focused
 text field's caret (and the command palette's query caret) now blinks
 at 530 ms per half-period, shows solid again at once after any edit,
 caret or selection move, IME change, click or focus change, stays
@@ -2021,6 +2032,96 @@ check licenses` clean with the new `toml` dependency.
   aurora-widgets --all-targets --all-features -- -D warnings` clean,
   `cargo test -p aurora-widgets` — 20/20 passed, `cargo deny check
   licenses` clean.
+
+  **Update 0.140.0 — text-aware layout; checkbox labels.** Closes the
+  "checkbox label deferred (needs a measure-func layout pass)"
+  disclosure carried since 0.133.0. *Tree* (`tree.rs`):
+  `WidgetTree::compute_layout_with(w, h, measure)` takes a **pre-measure
+  hook** `&mut dyn FnMut(&W) -> Option<taffy::Size<f32>>`, asked once per
+  widget before layout; `Some` overrides that widget's `style.size` on
+  the internal `taffy` copy only (the stored style is untouched), and
+  `compute_layout` is now that call with a hook answering `None` — byte
+  for byte the old path. Deliberately not a `taffy` measure callback:
+  a measured widget is one line of known text whose size does not depend
+  on the space offered. `WidgetTree::is_measured(id)` records whether the
+  last layout sized a widget through the hook (reset by every layout).
+  *Measuring* (new `measure.rs`): `TextMeasure { engine, scales,
+  scale_factor }`; `measure_widget(kind, &mut TextMeasure)` sizes only a
+  `Checkbox` whose sanitized label is not blank, to
+  `ceil(type.size.md + spacing.sm + shaped label width)` x
+  `max(row_height, type.size.md)` — `ceil` because `taffy` rounds a
+  fractional size to *nearest*, which would cut short a label whose
+  width ends under half a pixel past a whole one; a blank or
+  control-only label, or a width that is not finite and positive,
+  measures `None` (a bare box); `compute_text_layout(tree, w, h,
+  Option<TextMeasure>)` is the one entry point (`None` ==
+  `compute_layout`). *Checkbox* (one widget, so hit-testing, focus,
+  `Click` and the a11y node are unchanged and a click on the label
+  toggles through the existing path): `checkbox_box_rect(bounds,
+  measured, scales)` is the box — a `type.size.md` square flush left and
+  vertically centred when measured, **the whole bounds when not**. The
+  plan had keyed that on geometry alone (a side x side box equals its
+  bounds), which turned all ten checkbox golden/distinctness tests red:
+  the gallery sizes its checkboxes into 64 px cells, and those paint
+  whole; hence the `is_measured` flag rather than a geometric guess.
+  `paint_checkbox` and the `Checkbox` focus-ring arm both use the box
+  (placed in the full bounds, then clipped; a box clipped wholly away
+  keeps an inside ring on what is visible); the ring now circles the box
+  only. `text_runs` gains a `Checkbox` arm for measured checkboxes only:
+  flush left at `x + side + gap`, `text.primary` at the box's disabled
+  opacity, none when squeezed to no room. *App*: `layout_workspace` /
+  `App::layout` replace both production `compute_layout` calls
+  (`resumed`, `apply_resize` — which `ScaleFactorChanged`, key presses
+  and gallery events all go through), and `resumed` now creates the
+  `TextEngine` *before* its first layout. **Tests (+19, 2,568 total):**
+  1 tree (hook overrides one layout, siblings shift, a later text-blind
+  layout restores it, `is_measured`); 15 in `measure.rs` (no-engine ==
+  text-blind; box + gap + label x one row, exact; every width rounded up,
+  with a guard that some label lands in the round-down half; longer label
+  wider and pushes the next row down; scale 1 vs 2 within 1 px; blank /
+  control-only / spaces stay a bare box; only checkboxes measure; a NaN
+  scale measures nothing; a click on the label hit-tests the checkbox and
+  toggles it; measured box left + centred; unmeasured box = bounds; label
+  run rect, `text.primary`, disabled alpha; unmeasured / hand-sized /
+  squeezed draw no label; resolved glyphs identical with and without the
+  clip at scales 1, 1.25, 1.5, 2; a second layout and the paint that
+  follows shape nothing new); 1 paint (a labelled checkbox's ring circles
+  its box); 2 app (the real Layers panel's `Visible` checkbox, laid out
+  through the production helper, is measured and has room for its
+  label; with no engine the helper equals `compute_layout` for the whole
+  workspace). **Goldens:** unchanged, none re-blessed — shapes only, and
+  every golden is laid out with no engine.
+  **Mutations (all really run, RTX 3090, `AURORA_REQUIRE_GPU=1`, backup
+  and sha256-verified restore):** hook ignored in `build_taffy_node`
+  (killed, 8 + app); `compute_layout` passing a measuring hook (killed,
+  121); `ceil` dropped (**survived the first run** — `taffy`'s own
+  rounding hid it for every label then tested and the glyph-clip test is
+  not sensitive to it, since ink ends short of the advance; killed after
+  adding the rounded-up test); gap omitted (killed, 2 + app); height =
+  side (killed, 3); blank label measured (killed, 1); box paint = bounds
+  (killed, 1); ring around the whole bounds (killed, 1); label rect at
+  `bounds.x` (killed, 1); label colour `text.secondary` (killed, 1);
+  zero-width guard removed (killed, 1); `measured.insert` dropped
+  (killed, 7); label drawn for an unmeasured checkbox (killed, 1); box
+  keyed on geometry instead of `is_measured` (killed by the hand-placed
+  16 px ring test and, run separately, all ten checkbox gallery tests);
+  engine created after the first layout in `resumed` — **survives**:
+  `resumed` needs a real window and device, and nothing headless drives
+  it; the ordering is covered by review only, and its effect would be
+  one unlabelled first frame (the next relayout on any event fixes it).
+  **Disclosures:** one line — no wrapping, no ellipsis; a label wider
+  than its parent overflows and is clipped. The ring circles the box
+  only (design-owner call, flagged to Cahya). The `Label` widget still
+  does not size itself to its text. The new labelled layout is not
+  golden-covered (goldens are text-free and laid out without an engine);
+  it is asserted instead. A measured checkbox is still subject to
+  `taffy`'s default `flex_shrink` like any widget, so a very narrow
+  parent row could squeeze it (the label then draws clipped or not at
+  all). If the UI font fails to load, checkboxes fall back to bare boxes
+  with no label. The label-to-box gap is `spacing.sm` (12 px), chosen by
+  the plan, not the design owner. **Needs a human:** the labelled
+  checkboxes in the Layers panel and Widget Gallery at scale 1.0 and 2.0
+  on real hardware (alignment, gap, crispness, click-on-label).
 - [x] **Retained-mode tree with damage tracking** — done 2026-08-02,
   `crates/aurora-widgets/src/tree.rs` (`WidgetTree<W>`, `WidgetId`), 14
   tests. Exactly one root (unlike `aurora_doc::LayerTree`'s multiple
@@ -2054,6 +2155,21 @@ check licenses` clean with the new `toml` dependency.
   window or platform adapter needed, which is what "headless mode for
   automated UI tests" (this milestone's own later bullet) is really
   asking this crate to already be.
+  **Review (same version):** a combined review/judge PASSed at 0.917,
+  confirming no production path still lays out text-blind (every plain
+  `compute_layout` in `aurora-app`/`aurora-ui` is test-only), the
+  `measured` flag resets every pass, and a clipped label cannot break the
+  box. Its main follow-up — the gallery's 422 px minimum-height pin was
+  proven only for the text-blind layout — is closed by a twin test,
+  `the_measured_layout_keeps_the_same_minimum_height`, which lays the
+  gallery out with a real `TextEngine`, confirms the checkbox measured
+  with its label, and finds the curve editor still the taller column, so
+  the minimum is 422 px under the real layout too. Full gate green on the
+  RTX 3090 with `AURORA_REQUIRE_GPU=1` before that test (2,568 passed, 0
+  failed, 0 skipped; doctests, strict rustdoc, `cargo deny` clean);
+  2,569 with it. Carried: a label changed between layouts keeps its old
+  width until the next relayout (no path does this yet); the `resumed`
+  engine-before-layout order is guarded by review only.
 
   **A real bug in this exact function, found on real macOS hardware,
   2026-08-03**: Cahya ran `aurora-app` (once it actually had a
@@ -4342,7 +4458,7 @@ check licenses` clean with the new `toml` dependency.
   (`TextFieldState` has none); no click-to-place caret (a click focuses
   the field but does not move `cursor`); dialog title still not drawn (no
   layout slot); checkbox label deferred (needs a measure-func layout
-  pass); tooltip and dialog message are one line, no wrap, no ellipsis;
+  pass — closed in 0.140.0); tooltip and dialog message are one line, no wrap, no ellipsis;
   (the text field box was one `type.size.md` tall -- fixed in the review
   revision below); palette rows and the strip split the body evenly,
   so with many results each can be shorter than a line (clipped), and
@@ -29415,6 +29531,21 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-28 (0.140.0) — text-aware layout; checkbox labels.**
+`compute_text_layout` sizes each checkbox to box + gap + label with the
+paint's own engine and scale factor; the app lays out only through it,
+and creates the text engine before its first layout. Full account: M1.7's
+"Layout engine" 0.140.0 update. **Needs a human:** the Layers panel's
+`Visible` checkbox and the gallery checkbox at scale 1.0 and 2.0;
+Cahya to decide whether a labelled checkbox's focus ring should enclose
+its label and to confirm the `spacing.sm` gap. **Suggested next
+(0.141.0): dialog title** — a title node as the dialog's first child,
+`row_height` tall, its accessibility node a `GenericContainer` left
+unlabeled (the dialog already carries the title as its own label),
+drawn through the same `text_runs` path; re-bless the dialog goldens
+only. Message wrapping stays deferred; then double-click word
+selection.
 
 **Addendum 2026-09-28 (0.139.0) — caret blink.** The text caret blinks
 (530 ms, not a token, flagged to Cahya), restarts solid on any edit or

@@ -787,6 +787,54 @@ mod tests {
         assert!(row > bottom, "clipped below the minimum: {row} > {bottom}");
     }
 
+    /// The same pin under the app's real, text-measured layout (0.140.0
+    /// judge follow-up): a measured checkbox is a row tall, not a bare
+    /// box, so the left column grows. The right column (the curve
+    /// editor) must still be the taller one, or the 422 px minimum above
+    /// would describe a layout the app never uses.
+    #[test]
+    fn the_measured_layout_keeps_the_same_minimum_height() {
+        let scales = test_scales();
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads")
+        };
+        let mut ws = build_workspace();
+        let g = match insert_gallery_panel(&mut ws.tree, ws.root, &scales) {
+            Ok(g) => g,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        aurora_widgets::compute_text_layout(
+            &mut ws.tree,
+            1280.0,
+            TALL,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
+        let (Some(content), Some(body), Some(checkbox), Some(tree_row), Some(curve)) = (
+            gallery_content_height(&ws.tree, &g),
+            ws.tree.bounds(g.panel.body),
+            ws.tree.bounds(g.checkbox),
+            ws.tree.bounds(g.tree_rows[2]),
+            ws.tree.bounds(g.curve),
+        ) else {
+            unreachable!()
+        };
+        assert!(
+            checkbox.width > checkbox.height,
+            "the checkbox was measured with its label: {checkbox:?}"
+        );
+        assert!(
+            tree_row.bottom() <= curve.bottom(),
+            "the curve editor is still the taller column: {tree_row:?} vs {curve:?}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let min = (body.y + i64::from(content)) as f32;
+        assert!((min - 422.0).abs() < f32::EPSILON, "measured minimum {min}");
+    }
+
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the
     /// gallery never shrinks, so at 640 x 480 it and the rail leave the
     /// canvas a sliver. Pinned here so a regression that pushes the
