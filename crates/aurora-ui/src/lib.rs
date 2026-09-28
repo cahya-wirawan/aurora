@@ -42,6 +42,7 @@ pub mod layers_panel;
 pub mod panel;
 pub mod properties_panel;
 pub mod tool;
+pub mod tool_controls;
 pub mod workspace;
 
 pub use canvas_view::CanvasView;
@@ -62,4 +63,8 @@ pub use panel::{
 };
 pub use properties_panel::populate_properties_panel;
 pub use tool::Tool;
+pub use tool_controls::{
+    TOOL_RADIUS_MAX, TOOL_RADIUS_MIN, ToolControls, insert_tool_controls, radius_readout,
+    sync_tool_controls, tool_controls_contains,
+};
 pub use workspace::{Workspace, build_workspace, rail_width, set_rail_width};

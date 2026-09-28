@@ -1132,6 +1132,7 @@ fn replace_document(
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
     tool: aurora_ui::Tool,
+    tool_settings: &ToolSettings,
 ) -> Result<
     (
         HashMap<WidgetId, aurora_doc::LayerId>,
@@ -1150,7 +1151,7 @@ fn replace_document(
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
-    let options = tool_options(tool);
+    let options = tool_options(tool, tool_settings);
     aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
@@ -2509,6 +2510,10 @@ enum AccessibilityReaction {
     /// An action on one of the Layers panel's controls (0.135.0) — handed
     /// to [`apply_layer_control_outcome`], which edits the document.
     LayerControl(aurora_widgets::ActionOutcome),
+    /// An action on the Properties panel's tool controls (0.136.0) —
+    /// handed to [`apply_tool_control_outcome`], which edits the live
+    /// tool settings (never the document, no history).
+    ToolControl(aurora_widgets::ActionOutcome),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -2534,6 +2539,7 @@ fn route_accessibility_action(
     dialog: Option<&DialogHandle>,
     layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
     layer_controls: Option<&aurora_ui::LayerControls>,
+    tool_controls: Option<&aurora_ui::ToolControls>,
     request: &accesskit::ActionRequest,
 ) -> AccessibilityReaction {
     if let Some(handle) = dialog
@@ -2562,6 +2568,13 @@ fn route_accessibility_action(
             }) =>
         {
             AccessibilityReaction::LayerControl(outcome)
+        }
+        Ok(outcome)
+            if tool_controls.is_some_and(|controls| {
+                aurora_ui::tool_controls_contains(&workspace.tree, controls, request.target_node)
+            }) =>
+        {
+            AccessibilityReaction::ToolControl(outcome)
         }
         Ok(outcome) => AccessibilityReaction::Handled(outcome),
         Err(err) => AccessibilityReaction::Rejected(err),
@@ -2661,6 +2674,13 @@ struct AccessibilityContext<'a> {
     /// one of its widgets gets the same [`aurora_ui::apply_gallery_outcome`]
     /// reaction the pointer and keyboard paths give it (critic C1).
     gallery: &'a mut Option<aurora_ui::GalleryPanel>,
+    /// The active tool, its live settings and the Properties panel's
+    /// tool controls (0.136.0): an assistive technology's `SetValue`,
+    /// `Increment` or `Decrement` on the radius slider sets the radius
+    /// through [`apply_tool_control_outcome`] — no history step.
+    tool: aurora_ui::Tool,
+    tool_settings: &'a mut ToolSettings,
+    tool_controls: Option<aurora_ui::ToolControls>,
 }
 
 /// What the caller of [`apply_accessibility_action`] still has to do —
@@ -2732,6 +2752,32 @@ fn apply_layer_control_accessibility(
     apply_layer_control_invalidation(cx.composite_cache, &invalidation);
 }
 
+/// [`AccessibilityReaction::ToolControl`]'s reaction (0.136.0): the
+/// action sets the active tool's radius ([`apply_tool_control_outcome`],
+/// no capture, no history step). An assistive technology's action is its
+/// own gesture, so a pointer drag of the radius slider still pending
+/// loses its capture first ([`release_radius_capture`], review RT136-4,
+/// mirroring [`end_pointer_opacity_drag`]): the rest of that pointer
+/// gesture cannot override the value the action just set.
+fn apply_tool_control_accessibility(
+    cx: &mut AccessibilityContext<'_>,
+    outcome: aurora_widgets::ActionOutcome,
+) {
+    tracing::debug!(
+        ?outcome,
+        "accessibility action on a Properties-panel tool control"
+    );
+    let _ = release_radius_capture(cx.click, cx.tool_controls);
+    let _ = apply_tool_control_outcome(
+        cx.workspace,
+        cx.tool_controls,
+        cx.tool,
+        cx.tool_settings,
+        &PointerOutcome::Action(outcome),
+        None,
+    );
+}
+
 /// An assistive technology's Layers-row press is its own gesture: a
 /// pointer drag on the opacity slider still pending ends first, on the
 /// layer it started on ([`finish_opacity`]), and the slider's capture is
@@ -2793,6 +2839,7 @@ fn apply_accessibility_action(
             cx.dialog.as_ref(),
             cx.layer_rows,
             cx.layer_controls.controls.as_ref(),
+            cx.tool_controls.as_ref(),
             request,
         ),
     };
@@ -2831,6 +2878,9 @@ fn apply_accessibility_action(
         }
         AccessibilityReaction::LayerControl(outcome) => {
             apply_layer_control_accessibility(cx, outcome);
+        }
+        AccessibilityReaction::ToolControl(outcome) => {
+            apply_tool_control_accessibility(cx, outcome);
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
             tracing::debug!(?outcome, "accessibility action on the widget gallery");
@@ -3319,6 +3369,10 @@ enum WidgetOwner {
     /// The Layers panel's opacity/blend/visibility controls
     /// ([`aurora_ui::LayerControls`]): they edit the live document.
     LayerControls,
+    /// The Properties panel's radius readout and slider
+    /// ([`aurora_ui::ToolControls`], 0.136.0): they edit the live tool
+    /// settings, never the document.
+    ToolControls,
 }
 
 /// The owner of `id`, if it is (or lies inside) the open gallery or the
@@ -3328,6 +3382,7 @@ fn widget_owner(
     tree: &WidgetTree<WidgetKind>,
     gallery: Option<&aurora_ui::GalleryPanel>,
     layer_controls: Option<&aurora_ui::LayerControls>,
+    tool_controls: Option<&aurora_ui::ToolControls>,
     id: WidgetId,
 ) -> Option<WidgetOwner> {
     if gallery.is_some_and(|open| aurora_ui::gallery_contains(tree, open, id)) {
@@ -3336,6 +3391,9 @@ fn widget_owner(
     if layer_controls.is_some_and(|controls| aurora_ui::layer_controls_contains(tree, controls, id))
     {
         return Some(WidgetOwner::LayerControls);
+    }
+    if tool_controls.is_some_and(|controls| aurora_ui::tool_controls_contains(tree, controls, id)) {
+        return Some(WidgetOwner::ToolControls);
     }
     None
 }
@@ -3402,7 +3460,7 @@ fn route_gallery_pointer(
     position: (f32, f32),
 ) -> WidgetPointer {
     route_widget_pointer(
-        workspace, focus, gallery, None, click, scales, modal_open, phase, position,
+        workspace, focus, gallery, None, None, click, scales, modal_open, phase, position,
     )
 }
 
@@ -3440,18 +3498,19 @@ fn route_widget_pointer(
     focus: &mut FocusManager,
     gallery: &mut Option<aurora_ui::GalleryPanel>,
     layer_controls: Option<&aurora_ui::LayerControls>,
+    tool_controls: Option<&aurora_ui::ToolControls>,
     click: &mut ClickTracker,
     scales: &Scales,
     modal_open: bool,
     phase: PointerPhase,
     position: (f32, f32),
 ) -> WidgetPointer {
-    if gallery.is_none() && layer_controls.is_none() {
+    if gallery.is_none() && layer_controls.is_none() && tool_controls.is_none() {
         return WidgetPointer::default();
     }
     let owner_of =
         |tree: &WidgetTree<WidgetKind>, gallery: &Option<aurora_ui::GalleryPanel>, id: WidgetId| {
-            widget_owner(tree, gallery.as_ref(), layer_controls, id)
+            widget_owner(tree, gallery.as_ref(), layer_controls, tool_controls, id)
         };
     let mut dismissed = false;
     let owner = match phase {
@@ -3625,6 +3684,7 @@ fn route_gallery_key(
         focus,
         gallery,
         None,
+        None,
         scales,
         dialog_open,
         palette_open,
@@ -3650,6 +3710,7 @@ fn route_widget_key(
     focus: &mut FocusManager,
     gallery: &mut Option<aurora_ui::GalleryPanel>,
     layer_controls: Option<&aurora_ui::LayerControls>,
+    tool_controls: Option<&aurora_ui::ToolControls>,
     scales: &Scales,
     dialog_open: bool,
     palette_open: bool,
@@ -3661,7 +3722,13 @@ fn route_widget_key(
         return None;
     }
     let focused = focus.focused()?;
-    let owner = widget_owner(&workspace.tree, gallery.as_ref(), layer_controls, focused)?;
+    let owner = widget_owner(
+        &workspace.tree,
+        gallery.as_ref(),
+        layer_controls,
+        tool_controls,
+        focused,
+    )?;
     let text_field = matches!(
         workspace.tree.payload(focused),
         Some(WidgetKind::TextField(_))
@@ -4019,6 +4086,100 @@ fn sync_layer_controls(
             false
         }
     }
+}
+
+/// Mirrors the active `tool` and its live radius into the Properties
+/// panel's tool controls ([`aurora_ui::sync_tool_controls`]), leaving a
+/// captured slider's value alone. Returns whether anything changed.
+fn sync_tool_controls(
+    workspace: &mut aurora_ui::Workspace,
+    controls: Option<aurora_ui::ToolControls>,
+    tool: aurora_ui::Tool,
+    settings: &ToolSettings,
+    captured: Option<WidgetId>,
+) -> bool {
+    let Some(controls) = controls else {
+        return false;
+    };
+    match aurora_ui::sync_tool_controls(
+        &mut workspace.tree,
+        controls,
+        tool,
+        settings.radius(tool).map(f64::from),
+        captured,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the Properties-panel tool controls");
+            false
+        }
+    }
+}
+
+/// Applies one routed Properties-panel tool-control outcome (0.136.0):
+/// a radius slider `ValueChanged` — pointer drag, keyboard or assistive
+/// technology alike — sets the active tool's radius
+/// ([`ToolSettings::set_radius`]: rounded, clamped, non-finite refused),
+/// then refreshes the Properties body and the readout. **No history
+/// step**: tool settings are not document state. Returns whether a
+/// radius changed.
+fn apply_tool_control_outcome(
+    workspace: &mut aurora_ui::Workspace,
+    controls: Option<aurora_ui::ToolControls>,
+    tool: aurora_ui::Tool,
+    settings: &mut ToolSettings,
+    outcome: &PointerOutcome,
+    captured: Option<WidgetId>,
+) -> bool {
+    let Some(controls) = controls else {
+        return false;
+    };
+    let PointerOutcome::Action(aurora_widgets::ActionOutcome::ValueChanged { id, value }) = outcome
+    else {
+        return false;
+    };
+    if *id != controls.radius || !settings.set_radius(tool, *value) {
+        return false;
+    }
+    refresh_properties_panel(workspace, tool, settings);
+    let _ = sync_tool_controls(workspace, Some(controls), tool, settings, captured);
+    true
+}
+
+/// Drops the pointer capture of the Properties panel's radius slider, if
+/// it holds it (review RT136-4). A radius drag has no pending state of
+/// its own to settle — every `Move` already set the radius — so ending it
+/// is only this. Returns whether a capture was dropped.
+fn release_radius_capture(
+    click: &mut ClickTracker,
+    controls: Option<aurora_ui::ToolControls>,
+) -> bool {
+    let Some(controls) = controls else {
+        return false;
+    };
+    if click.captured() != Some(controls.radius) {
+        return false;
+    }
+    click.release_capture();
+    true
+}
+
+/// Ends a radius-slider drag when the active tool changed under it
+/// (review RT136-2): the slider edits *the active tool's* radius
+/// ([`apply_tool_control_outcome`]), so a drag begun on the Brush that
+/// went on after a letter-key switch to the Eraser would otherwise start
+/// editing the Eraser's radius mid-gesture. Called with the tool from
+/// before and after every path that can switch it
+/// ([`App::handle_key_event`]'s [`handle_key`], which carries the letter
+/// shortcuts and the command palette). Returns whether a capture was
+/// dropped.
+fn end_radius_drag_on_tool_change(
+    click: &mut ClickTracker,
+    controls: Option<aurora_ui::ToolControls>,
+    before: aurora_ui::Tool,
+    after: aurora_ui::Tool,
+) -> bool {
+    before != after && release_radius_capture(click, controls)
 }
 
 /// Where the gallery's tooltip should see the pointer: `None` (as if the
@@ -4704,6 +4865,7 @@ fn run_command(
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
+    tool_settings: &ToolSettings,
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
@@ -4726,7 +4888,7 @@ fn run_command(
         }
         AppCommand::SelectTool(selected) => {
             *tool = selected;
-            refresh_properties_panel(workspace, selected);
+            refresh_properties_panel(workspace, selected, tool_settings);
             CompositeInvalidation::None
         }
         AppCommand::Undo => match undo_order.undo.last().copied() {
@@ -4895,23 +5057,16 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
 /// Brush/Eraser-specific knowledge at all, see
 /// `aurora_ui::properties_panel`'s own doc comment). Only
 /// [`aurora_ui::Tool::Brush`] and [`aurora_ui::Tool::Eraser`] have a real
-/// parameter today ([`BRUSH_RADIUS`]/
-/// [`ERASER_RADIUS`]); every other tool (`Move`, `MarqueeSelect`, `Zoom`,
+/// parameter today (its live radius in `settings`, 0.136.0); every other tool (`Move`, `MarqueeSelect`, `Zoom`,
 /// `Pan`, `Eyedropper`) has no real backing data anywhere in this crate
 /// yet, so it gets an honest empty list rather than an invented option —
 /// the same "nothing to show" pattern the command palette already uses
 /// for an unselected row.
-#[allow(clippy::match_same_arms)]
-fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
-    match tool {
-        aurora_ui::Tool::Brush => vec![("Radius", format!("{BRUSH_RADIUS}px"))],
-        aurora_ui::Tool::Eraser => vec![("Radius", format!("{ERASER_RADIUS}px"))],
-        aurora_ui::Tool::Move
-        | aurora_ui::Tool::MarqueeSelect
-        | aurora_ui::Tool::Zoom
-        | aurora_ui::Tool::Pan
-        | aurora_ui::Tool::Eyedropper => vec![],
-    }
+fn tool_options(tool: aurora_ui::Tool, settings: &ToolSettings) -> Vec<(&'static str, String)> {
+    settings
+        .radius(tool)
+        .map(|radius| vec![("Radius", format!("{radius}px"))])
+        .unwrap_or_default()
 }
 
 /// Repopulates the Properties panel for `tool` — the same shape
@@ -4936,7 +5091,11 @@ fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
 /// a lost edit, and this crate denies `unwrap`/`panic` besides. Unlike
 /// [`refresh_history_panel`], the rebuild cost of doing this per call is
 /// not worth a caveat: [`tool_options`] yields at most one row.
-fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) {
+fn refresh_properties_panel(
+    workspace: &mut aurora_ui::Workspace,
+    tool: aurora_ui::Tool,
+    settings: &ToolSettings,
+) {
     let scales = match load_scales() {
         Ok(scales) => scales,
         Err(err) => {
@@ -4947,7 +5106,7 @@ fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_u
             return;
         }
     };
-    let options = tool_options(tool);
+    let options = tool_options(tool, settings);
     if let Err(err) = aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
@@ -5096,6 +5255,7 @@ fn handle_key(
     dialog: &mut Option<DialogHandle>,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
+    tool_settings: &ToolSettings,
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
@@ -5161,6 +5321,7 @@ fn handle_key(
             focus,
             palette,
             tool,
+            tool_settings,
             layers,
             history,
             pixel_history,
@@ -5892,6 +6053,7 @@ fn continue_drag(
     canvas_point: (f32, f32),
     view: &mut aurora_ui::CanvasView,
     selection: &mut aurora_doc::SelectionSet,
+    tool_settings: &ToolSettings,
     bounds: PanBounds,
 ) -> Vec<(f32, f32)> {
     match drag {
@@ -5915,7 +6077,10 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            let step = aurora_brush::dab_step(BRUSH_RADIUS, aurora_brush::DEFAULT_SPACING);
+            let step = aurora_brush::dab_step(
+                tool_settings.dab_radius(DabTool::Brush),
+                aurora_brush::DEFAULT_SPACING,
+            );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
             *last_doc = current_doc;
@@ -5926,7 +6091,10 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            let step = aurora_brush::dab_step(ERASER_RADIUS, aurora_brush::DEFAULT_SPACING);
+            let step = aurora_brush::dab_step(
+                tool_settings.dab_radius(DabTool::Eraser),
+                aurora_brush::DEFAULT_SPACING,
+            );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
             *last_doc = current_doc;
@@ -6553,6 +6721,7 @@ fn perform_undo_redo(
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
+    tool_settings: &ToolSettings,
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
@@ -6667,6 +6836,7 @@ fn perform_undo_redo(
         focus,
         palette,
         tool,
+        tool_settings,
         layers,
         history,
         pixel_history,
@@ -14346,25 +14516,141 @@ fn eyedropper_sample(
     (a > 0.0).then_some([r, g, b])
 }
 
-/// The Brush tool's fixed radius — a real default, not a placeholder,
-/// but not a considered one either: there is no brush options UI yet
-/// (size picker, real engine, Phase 2 per PLAN.md's own "(real engine
-/// is Phase 2)" framing on this bullet).
+/// The Brush tool's *starting* radius ([`ToolSettings::default`]) — a
+/// real default, not a considered one. Since 0.136.0 the live radius is
+/// [`ToolSettings::brush_radius`], edited from the Properties panel's
+/// radius slider.
 const BRUSH_RADIUS: f32 = 24.0;
 
 /// [`App::current_colour`]'s own starting value — black, since there is
 /// no colour-picker UI yet to set it any other way at startup. Real
 /// after that: the Eyedropper tool changes it to whatever's actually
 /// sampled, and every `Brush` dab paints with whatever it currently is,
-/// not this constant directly (unlike [`BRUSH_RADIUS`]/[`ERASER_RADIUS`],
-/// which stay fixed).
+/// not this constant directly (like [`BRUSH_RADIUS`]/[`ERASER_RADIUS`],
+/// which since 0.136.0 are only [`ToolSettings`]' starting values).
 const DEFAULT_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
 
-/// The Eraser tool's fixed radius — same reasoning and same value as
-/// [`BRUSH_RADIUS`] (no options UI yet), kept as its own named constant
-/// rather than reusing `BRUSH_RADIUS` directly so the two tools' sizes
-/// can diverge later without one silently changing the other.
+/// The Eraser tool's *starting* radius — same reasoning and same value
+/// as [`BRUSH_RADIUS`], kept as its own named constant so the two tools'
+/// sizes are independent ([`ToolSettings`] edits them separately).
 const ERASER_RADIUS: f32 = 24.0;
+
+/// The live per-tool parameters (0.136.0): the Brush's and the Eraser's
+/// dab radius, in document pixels, edited from the Properties panel's
+/// radius slider ([`apply_tool_control_outcome`]) and read by every dab
+/// site. **Not document state**: changing a radius records no undo step
+/// and is not saved in a `.aur` file or the workspace layout — it resets
+/// to [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on every launch.
+#[derive(Debug, Clone, PartialEq)]
+struct ToolSettings {
+    brush_radius: f32,
+    eraser_radius: f32,
+}
+
+impl Default for ToolSettings {
+    fn default() -> Self {
+        Self {
+            brush_radius: BRUSH_RADIUS,
+            eraser_radius: ERASER_RADIUS,
+        }
+    }
+}
+
+/// The two tools that lay dabs (review M4a/M4b): the one key
+/// [`ToolSettings::dab_radius`] reads a live radius by, so every dab
+/// site — [`continue_drag`]'s spacing and [`stamp_tool_dab`]'s stamp —
+/// asks the same question the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DabTool {
+    Brush,
+    Eraser,
+}
+
+impl ToolSettings {
+    /// The live radius `tool`'s dabs are laid with — **the only place a
+    /// dab site reads a radius** (review M4a/M4b, 0.136.0). Both
+    /// [`continue_drag`]'s dab spacing and [`stamp_tool_dab`]'s stamp go
+    /// through it, so neither can silently fall back to
+    /// [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on its own.
+    fn dab_radius(&self, tool: DabTool) -> f32 {
+        match tool {
+            DabTool::Brush => self.brush_radius,
+            DabTool::Eraser => self.eraser_radius,
+        }
+    }
+
+    /// `tool`'s radius, or `None` for a tool that has none.
+    fn radius(&self, tool: aurora_ui::Tool) -> Option<f32> {
+        match tool {
+            aurora_ui::Tool::Brush => Some(self.brush_radius),
+            aurora_ui::Tool::Eraser => Some(self.eraser_radius),
+            aurora_ui::Tool::Move
+            | aurora_ui::Tool::MarqueeSelect
+            | aurora_ui::Tool::Zoom
+            | aurora_ui::Tool::Pan
+            | aurora_ui::Tool::Eyedropper => None,
+        }
+    }
+
+    /// Sets `tool`'s radius to `value`, rounded to whole pixels and
+    /// clamped to the slider's range ([`aurora_ui::TOOL_RADIUS_MIN`]..=
+    /// [`aurora_ui::TOOL_RADIUS_MAX`]). Refuses (returns `false`, changing
+    /// nothing) a non-finite `value` or a tool without a radius; returns
+    /// whether the radius actually changed.
+    fn set_radius(&mut self, tool: aurora_ui::Tool, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let radius = value
+            .round()
+            .clamp(aurora_ui::TOOL_RADIUS_MIN, aurora_ui::TOOL_RADIUS_MAX)
+            as f32;
+        let slot = match tool {
+            aurora_ui::Tool::Brush => &mut self.brush_radius,
+            aurora_ui::Tool::Eraser => &mut self.eraser_radius,
+            _ => return false,
+        };
+        if slot.to_bits() == radius.to_bits() {
+            return false;
+        }
+        *slot = radius;
+        true
+    }
+}
+
+/// Stamps one `tool` dab at `local` (layer-local) on `surface` with the
+/// live radius ([`ToolSettings::dab_radius`]) — `aurora_brush::stamp_dab`
+/// in `colour` for the Brush, `aurora_brush::erase_dab` for the Eraser —
+/// capturing into the live drag's own stroke snapshot
+/// ([`brush_stroke_mut`]/[`eraser_stroke_mut`]). The one stamp site
+/// behind [`App::paint_dab`] and [`App::erase_dab`], pulled out of them
+/// (review M4a/M4b, 0.136.0) so the radius they stamp with is
+/// testable without an `App`, which needs a window.
+fn stamp_tool_dab(
+    tool: DabTool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    local: (f32, f32),
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+) -> aurora_brush::DabOutcome {
+    let radius = settings.dab_radius(tool);
+    match tool {
+        DabTool::Brush => aurora_brush::stamp_dab(
+            store,
+            surface,
+            local,
+            radius,
+            colour,
+            brush_stroke_mut(drag),
+        ),
+        DabTool::Eraser => {
+            aurora_brush::erase_dab(store, surface, local, radius, eraser_stroke_mut(drag))
+        }
+    }
+}
 
 // -- Canvas rendering: drawing the live document to the screen --
 //
@@ -15212,6 +15498,13 @@ struct App {
     /// app-owned widget ([`route_widget_pointer`]), so despite its name
     /// that field now also holds the opacity slider's capture.
     layer_controls: LayerControlsState,
+    /// The live Brush/Eraser radius (0.136.0) — not document state, see
+    /// [`ToolSettings`].
+    tool_settings: ToolSettings,
+    /// The Properties panel's radius readout and slider (0.136.0; `None`
+    /// only if building them failed, which is logged). The slider shares
+    /// [`Self::gallery_click`] with every other app-owned widget.
+    tool_controls: Option<aurora_ui::ToolControls>,
     /// Whether IME is currently allowed on the window — only while the
     /// gallery's text field is focused ([`Self::sync_ime`]).
     ime_allowed: bool,
@@ -15371,7 +15664,7 @@ impl App {
             workspace.properties,
             &scales,
             aurora_ui::Tool::default(),
-            &tool_options(aurora_ui::Tool::default()),
+            &tool_options(aurora_ui::Tool::default(), &ToolSettings::default()),
         ) {
             unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
         }
@@ -15416,6 +15709,25 @@ impl App {
             Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
         }
         let _ = sync_layer_controls(&mut workspace, &layer_controls, &layers, active_layer, None);
+        let tool_settings = ToolSettings::default();
+        let tool_controls = match aurora_ui::insert_tool_controls(
+            &mut workspace.tree,
+            workspace.properties,
+            &scales,
+        ) {
+            Ok(controls) => Some(controls),
+            Err(err) => {
+                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
+                None
+            }
+        };
+        let _ = sync_tool_controls(
+            &mut workspace,
+            tool_controls,
+            aurora_ui::Tool::default(),
+            &tool_settings,
+            None,
+        );
 
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -15472,6 +15784,8 @@ impl App {
             gallery: None,
             gallery_click: ClickTracker::default(),
             layer_controls,
+            tool_settings,
+            tool_controls,
             ime_allowed: false,
             ime_cursor_area: None,
             residency_viewport: None,
@@ -15536,6 +15850,9 @@ impl App {
                 layer_controls: &mut self.layer_controls,
                 click: &mut self.gallery_click,
                 gallery: &mut self.gallery,
+                tool: self.tool,
+                tool_settings: &mut self.tool_settings,
+                tool_controls: self.tool_controls,
             },
             request,
         );
@@ -15586,11 +15903,13 @@ impl App {
             return;
         };
         let controls = self.layer_controls.controls;
+        let tool_controls = self.tool_controls;
         let routed = route_widget_key(
             &mut self.workspace,
             &mut self.focus,
             &mut self.gallery,
             controls.as_ref(),
+            tool_controls.as_ref(),
             &self.scales,
             self.dialog.is_some(),
             self.command_palette.is_some(),
@@ -15600,18 +15919,22 @@ impl App {
         );
         if let Some((owner, KeyOutcome::Handled(outcome))) = routed {
             tracing::debug!(?outcome, ?owner, "widget key");
-            if owner == WidgetOwner::LayerControls {
-                self.apply_layer_control(&outcome);
+            match owner {
+                WidgetOwner::LayerControls => self.apply_layer_control(&outcome),
+                WidgetOwner::ToolControls => self.apply_tool_control(&outcome),
+                WidgetOwner::Gallery => {}
             }
             self.relayout_after_gallery();
             return;
         }
+        let tool_before = self.tool;
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
             &mut self.command_palette,
             &mut self.tool,
+            &self.tool_settings,
             &mut self.layers,
             &mut self.history,
             &mut self.pixel_history,
@@ -15623,6 +15946,14 @@ impl App {
             event.text.as_deref(),
             &mut self.clipboard,
             &mut self.file_dialog,
+        );
+        // Review RT136-2: a radius drag cannot carry over onto the tool
+        // this key just switched to.
+        let _ = end_radius_drag_on_tool_change(
+            &mut self.gallery_click,
+            self.tool_controls,
+            tool_before,
+            self.tool,
         );
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
@@ -15688,6 +16019,7 @@ impl App {
             &mut self.focus,
             &mut self.command_palette,
             &mut self.tool,
+            &self.tool_settings,
             &mut self.layers,
             &mut self.history,
             &mut self.pixel_history,
@@ -15785,17 +16117,23 @@ impl App {
                 return;
             }
         };
-        let (layer_rows, active_layer) =
-            match replace_document(&mut self.workspace, &scales, &layers, &history, self.tool) {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        "failed to rebuild the workspace panels for the opened document"
-                    );
-                    return;
-                }
-            };
+        let (layer_rows, active_layer) = match replace_document(
+            &mut self.workspace,
+            &scales,
+            &layers,
+            &history,
+            self.tool,
+            &self.tool_settings,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    "failed to rebuild the workspace panels for the opened document"
+                );
+                return;
+            }
+        };
 
         // The image's own real, decoded dimensions -- known exactly
         // here, rather than derived back out of the one layer just
@@ -15964,17 +16302,23 @@ impl App {
                 return;
             }
         };
-        let (layer_rows, active_layer) =
-            match replace_document(&mut self.workspace, &scales, &layers, &history, self.tool) {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        "failed to rebuild the workspace panels for the opened document"
-                    );
-                    return;
-                }
-            };
+        let (layer_rows, active_layer) = match replace_document(
+            &mut self.workspace,
+            &scales,
+            &layers,
+            &history,
+            self.tool,
+            &self.tool_settings,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    "failed to rebuild the workspace panels for the opened document"
+                );
+                return;
+            }
+        };
         // Before the autosave below, and that ordering is load-bearing
         // rather than tidy: `write_autosave` hands this straight back to
         // the writer, so the autosave `open_aur_file` performs -- which
@@ -16424,6 +16768,7 @@ impl App {
                 canvas_point,
                 &mut self.canvas_view,
                 &mut self.selection,
+                &self.tool_settings,
                 pan_bounds(
                     &self.layers,
                     self.active_layer,
@@ -16680,19 +17025,19 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        // Both borrows are of distinct fields of `self`, so they
-        // coexist. This is why the accessor is a free function over
-        // `&mut Option<Drag>` and not a `&mut self` helper method: that
-        // would borrow all of `self` and conflict with `self.tile_store`
-        // above.
-        let snapshot = brush_stroke_mut(&mut self.drag);
-        let outcome = aurora_brush::stamp_dab(
+        // All borrows are of distinct fields of `self`, so they coexist.
+        // This is why the stamp (and the stroke accessor inside it) is a
+        // free function over `&mut Option<Drag>` and not a `&mut self`
+        // helper method: that would borrow all of `self` and conflict
+        // with `self.tile_store` above.
+        let outcome = stamp_tool_dab(
+            DabTool::Brush,
             store,
             surface,
             local,
-            BRUSH_RADIUS,
+            &self.tool_settings,
             self.current_colour,
-            snapshot,
+            &mut self.drag,
         );
         for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
@@ -16740,9 +17085,17 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        // Same distinct-field borrow pair `Self::paint_dab` relies on.
-        let snapshot = eraser_stroke_mut(&mut self.drag);
-        let outcome = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS, snapshot);
+        // Same distinct-field borrows `Self::paint_dab` relies on; the
+        // colour is unused by an erase.
+        let outcome = stamp_tool_dab(
+            DabTool::Eraser,
+            store,
+            surface,
+            local,
+            &self.tool_settings,
+            self.current_colour,
+            &mut self.drag,
+        );
         for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
         }
@@ -17137,11 +17490,13 @@ impl App {
     /// applies to its layer-row and canvas branches.
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
         let controls = self.layer_controls.controls;
+        let tool_controls = self.tool_controls;
         let routed = route_widget_pointer(
             &mut self.workspace,
             &mut self.focus,
             &mut self.gallery,
             controls.as_ref(),
+            tool_controls.as_ref(),
             &mut self.gallery_click,
             &self.scales,
             self.dialog.is_some() || self.command_palette.is_some(),
@@ -17153,6 +17508,11 @@ impl App {
         {
             self.apply_layer_control(outcome);
         } else {
+            if routed.owner == Some(WidgetOwner::ToolControls)
+                && let Some(outcome) = routed.outcome.as_ref()
+            {
+                self.apply_tool_control(outcome);
+            }
             // Any path that dropped the slider's capture -- a press
             // elsewhere resetting a stale one, a modal's cancel -- ends
             // the drag's pending undo step here (`settle_pending_opacity`).
@@ -17298,6 +17658,44 @@ impl App {
             apply_layer_control_outcome(&mut self.layer_control_edit(), outcome, captured);
         apply_layer_control_invalidation(&mut self.composite_cache, &invalidation);
         self.needs_redraw = true;
+    }
+
+    /// Applies one routed Properties-panel tool-control outcome
+    /// ([`apply_tool_control_outcome`]): a radius change re-announces and
+    /// redraws. No history step — tool settings are not document state.
+    fn apply_tool_control(&mut self, outcome: &PointerOutcome) {
+        let captured = self.gallery_click.captured();
+        if apply_tool_control_outcome(
+            &mut self.workspace,
+            self.tool_controls,
+            self.tool,
+            &mut self.tool_settings,
+            outcome,
+            captured,
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// The catch-all tool sync (0.136.0), run once per event-loop
+    /// iteration beside [`Self::sync_layer_controls_now`]: every path that
+    /// switches the active tool (a letter shortcut or the command palette;
+    /// the macOS menu cannot switch tools) is reflected in the radius controls without each
+    /// one having to remember. The Properties *body* is refreshed by those
+    /// paths themselves ([`refresh_properties_panel`]).
+    fn sync_tool_controls_now(&mut self) {
+        let captured = self.gallery_click.captured();
+        if sync_tool_controls(
+            &mut self.workspace,
+            self.tool_controls,
+            self.tool,
+            &self.tool_settings,
+            captured,
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
     }
 
     /// [`settle_pending_opacity`] against the shared tracker's capture.
@@ -18138,6 +18536,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // iteration, not the next (critic C5).
         self.sync_ime();
         self.sync_layer_controls_now();
+        self.sync_tool_controls_now();
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
@@ -18811,6 +19210,7 @@ mod tests {
             None,
             &layer_rows,
             None,
+            None,
             &a11y_request(row_b, accesskit::Action::Click),
         );
         let AccessibilityReaction::PressLayer(pressed) = reaction else {
@@ -18868,6 +19268,7 @@ mod tests {
             dialog.as_ref(),
             &layer_rows,
             None,
+            None,
             &a11y_request(button, accesskit::Action::Click),
         );
         let AccessibilityReaction::DialogAction(action) = reaction else {
@@ -18902,6 +19303,7 @@ mod tests {
                 dialog.as_ref(),
                 &layer_rows,
                 None,
+                None,
                 &a11y_request(row_b, action),
             );
             assert!(
@@ -18923,6 +19325,7 @@ mod tests {
             None,
             &layer_rows,
             None,
+            None,
             &a11y_request(accesskit::NodeId(u64::MAX), accesskit::Action::Click),
         );
         assert!(matches!(
@@ -18931,8 +19334,15 @@ mod tests {
         ));
         let mut wrong = a11y_request(workspace.root, accesskit::Action::Focus);
         wrong.target_tree = accesskit::TreeId(accesskit::Uuid::from_u128(1));
-        let reaction =
-            route_accessibility_action(&mut workspace, &mut focus, None, &layer_rows, None, &wrong);
+        let reaction = route_accessibility_action(
+            &mut workspace,
+            &mut focus,
+            None,
+            &layer_rows,
+            None,
+            None,
+            &wrong,
+        );
         assert!(matches!(
             reaction,
             AccessibilityReaction::Rejected(aurora_widgets::ActionRejection::WrongTree(_))
@@ -18982,6 +19392,7 @@ mod tests {
             None,
             &layer_rows,
             None,
+            None,
             &a11y_request(group_row, accesskit::Action::Collapse),
         );
         let AccessibilityReaction::LayerRowExpanded { row, expanded } = reaction else {
@@ -19008,6 +19419,7 @@ mod tests {
             &mut focus,
             None,
             &layer_rows,
+            None,
             None,
             &a11y_request(group_row, accesskit::Action::Expand),
         );
@@ -19075,6 +19487,9 @@ mod tests {
             gallery: Option<aurora_ui::GalleryPanel>,
             layer_controls: crate::LayerControlsState,
             gallery_click: crate::ClickTracker,
+            tool: aurora_ui::Tool,
+            tool_settings: crate::ToolSettings,
+            tool_controls: Option<aurora_ui::ToolControls>,
         }
 
         impl AtState {
@@ -19116,8 +19531,32 @@ mod tests {
                     active_layer,
                     None,
                 );
+                // The Properties-panel tool controls, as `App::new` builds
+                // them (0.136.0) -- but with the Brush active rather than
+                // `Tool::default()`, so the radius slider is enabled and
+                // declares its actions (a disabled slider declares none).
+                let tool = aurora_ui::Tool::Brush;
+                let tool_settings = crate::ToolSettings::default();
+                let tool_controls = match aurora_ui::insert_tool_controls(
+                    &mut workspace.tree,
+                    workspace.properties,
+                    &scales,
+                ) {
+                    Ok(controls) => Some(controls),
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let _ = crate::sync_tool_controls(
+                    &mut workspace,
+                    tool_controls,
+                    tool,
+                    &tool_settings,
+                    None,
+                );
                 workspace.tree.compute_layout(WIDTH, HEIGHT);
                 Self {
+                    tool,
+                    tool_settings,
+                    tool_controls,
                     workspace,
                     focus: FocusManager::default(),
                     dialog: None,
@@ -19161,6 +19600,9 @@ mod tests {
                         layer_controls: &mut self.layer_controls,
                         click: &mut self.gallery_click,
                         gallery: &mut self.gallery,
+                        tool: self.tool,
+                        tool_settings: &mut self.tool_settings,
+                        tool_controls: self.tool_controls,
                     },
                     request,
                 );
@@ -19410,6 +19852,7 @@ mod tests {
             }
             let mut routed = 0_usize;
             let mut layer_controls_routed = 0_usize;
+            let mut tool_controls_routed = 0_usize;
             for &id in &ids {
                 for action in aurora_widgets::ALL_ACTIONS {
                     let declared = probe
@@ -19431,16 +19874,21 @@ mod tests {
                         });
                     }
                     let controls = state.layer_controls.controls;
+                    let tool_controls = state.tool_controls;
                     let reaction = route_accessibility_action(
                         &mut state.workspace,
                         &mut state.focus,
                         None,
                         &state.layer_rows,
                         controls.as_ref(),
+                        tool_controls.as_ref(),
                         &request,
                     );
                     if matches!(reaction, AccessibilityReaction::LayerControl(_)) {
                         layer_controls_routed += 1;
+                    }
+                    if matches!(reaction, AccessibilityReaction::ToolControl(_)) {
+                        tool_controls_routed += 1;
                     }
                     routed += 1;
                     if let AccessibilityReaction::Handled(outcome) = &reaction {
@@ -19461,6 +19909,120 @@ mod tests {
             assert!(
                 layer_controls_routed >= 3,
                 "only {layer_controls_routed} actions reached the Layers-panel controls"
+            );
+            // The Properties-panel radius slider (0.136.0): `SetValue`,
+            // `Increment` and `Decrement` reach the mapped `ToolControl`
+            // arm.
+            assert!(
+                tool_controls_routed >= 3,
+                "only {tool_controls_routed} actions reached the Properties-panel tool controls"
+            );
+        }
+
+        /// An assistive technology's `SetValue` on the Properties-panel
+        /// radius slider (0.136.0) sets the Brush radius through the mapped
+        /// `ToolControl` arm, refreshes the readout and the body, records
+        /// no history step, and a non-finite value changes nothing.
+        #[test]
+        #[allow(clippy::float_cmp)]
+        fn an_at_set_value_on_the_radius_slider_sets_the_radius_without_history() {
+            let (layers, _history) = demo_document();
+            let active = topmost_pixel_layer(&layers);
+            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let Some(controls) = state.tool_controls else {
+                unreachable!("built");
+            };
+            let mut request = a11y_request(controls.radius, accesskit::Action::SetValue);
+            request.data = Some(accesskit::ActionData::NumericValue(80.0));
+            let effects = state.act(&request);
+            assert!(effects.redraw);
+            assert_eq!(state.tool_settings.brush_radius, 80.0);
+            assert_eq!(state.tool_settings.eraser_radius, 24.0);
+            assert_eq!(
+                state
+                    .workspace
+                    .tree
+                    .accessibility(controls.readout)
+                    .and_then(accesskit::Node::label),
+                Some("Radius 80 px")
+            );
+            assert!(!state.history.can_undo(), "no history step");
+            assert!(state.undo_order.undo.is_empty());
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                request.data = Some(accesskit::ActionData::NumericValue(bad));
+                let _ = state.act(&request);
+                assert_eq!(state.tool_settings.brush_radius, 80.0, "{bad} refused");
+            }
+            let _ = state.act(&a11y_request(controls.radius, accesskit::Action::Increment));
+            assert!(state.tool_settings.brush_radius > 80.0);
+            assert!(!state.history.can_undo());
+        }
+
+        /// Review RT136-4: an assistive technology's `SetValue` during a
+        /// live pointer drag of the radius slider drops the slider's
+        /// capture first, so the rest of the pointer gesture cannot
+        /// override the value the action set.
+        #[test]
+        #[allow(clippy::float_cmp)]
+        fn an_at_set_value_mid_drag_ends_the_pointer_drag_of_the_radius_slider() {
+            let (layers, _history) = demo_document();
+            let active = topmost_pixel_layer(&layers);
+            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let Some(controls) = state.tool_controls else {
+                unreachable!("built");
+            };
+            let Some(b) = state.workspace.tree.bounds(controls.radius) else {
+                unreachable!("laid out");
+            };
+            // `App::route_gallery`'s tool half.
+            let pointer = |state: &mut AtState, phase, fraction: f32| {
+                #[allow(clippy::cast_precision_loss)]
+                let at = (
+                    b.x as f32 + b.width as f32 * fraction,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                let routed = crate::route_widget_pointer(
+                    &mut state.workspace,
+                    &mut state.focus,
+                    &mut state.gallery,
+                    None,
+                    Some(&controls),
+                    &mut state.gallery_click,
+                    &state.scales,
+                    false,
+                    phase,
+                    at,
+                );
+                if let Some(outcome) = routed.outcome.as_ref() {
+                    let captured = state.gallery_click.captured();
+                    let _ = crate::apply_tool_control_outcome(
+                        &mut state.workspace,
+                        Some(controls),
+                        state.tool,
+                        &mut state.tool_settings,
+                        outcome,
+                        captured,
+                    );
+                }
+                state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+            };
+            pointer(&mut state, PointerPhase::Down, 0.1);
+            pointer(&mut state, PointerPhase::Move, 0.2);
+            assert_eq!(state.gallery_click.captured(), Some(controls.radius));
+            let mut request = a11y_request(controls.radius, accesskit::Action::SetValue);
+            request.data = Some(accesskit::ActionData::NumericValue(80.0));
+            let _ = state.act(&request);
+            assert_eq!(state.tool_settings.brush_radius, 80.0);
+            assert_eq!(
+                state.gallery_click.captured(),
+                None,
+                "the action ended the pointer drag"
+            );
+            pointer(&mut state, PointerPhase::Move, 0.9);
+            pointer(&mut state, PointerPhase::Up, 0.9);
+            assert_eq!(
+                state.tool_settings.brush_radius, 80.0,
+                "the rest of the pointer gesture did not override the action"
             );
         }
     }
@@ -19981,6 +20543,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -20116,6 +20679,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -20141,6 +20705,7 @@ mod tests {
                 pointer,
                 &mut view,
                 &mut selection,
+                &crate::ToolSettings::default(),
                 pan_bounds(&layers, active_layer, None),
             ),
             None => Vec::new(),
@@ -20666,6 +21231,7 @@ mod tests {
             &new_layers,
             &new_history,
             aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
         ) {
             Ok(result) => result,
             Err(err) => unreachable!("{err:?}"),
@@ -21249,6 +21815,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21262,6 +21829,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21275,6 +21843,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21289,6 +21858,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21319,6 +21889,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21345,6 +21916,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21383,6 +21955,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21421,6 +21994,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21461,6 +22035,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21482,6 +22057,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21501,6 +22077,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21557,6 +22134,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21585,6 +22163,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21713,6 +22292,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21732,6 +22312,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21838,6 +22419,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21891,6 +22473,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21963,6 +22546,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -21989,6 +22573,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22009,6 +22594,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22027,6 +22613,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22074,6 +22661,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22325,6 +22913,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22358,6 +22947,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22418,6 +23008,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22482,6 +23073,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22526,6 +23118,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -22566,6 +23159,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -31219,6 +31813,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -31292,6 +31887,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -31365,6 +31961,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -31449,6 +32046,7 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -31859,6 +32457,7 @@ mod tests {
                 &mut focus,
                 &mut palette,
                 &mut tool,
+                &crate::ToolSettings::default(),
                 &mut layers,
                 &mut history,
                 &mut pixel_history,
@@ -31937,6 +32536,7 @@ mod tests {
                     &mut world.focus,
                     &mut world.palette,
                     &mut world.tool,
+                    &crate::ToolSettings::default(),
                     &mut world.layers,
                     &mut world.history,
                     &mut world.pixel_history,
@@ -46111,6 +46711,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -47687,6 +48288,7 @@ mod tests {
             (15.0, 8.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(view.pan(), (-45.0, -52.0));
@@ -47713,6 +48315,7 @@ mod tests {
             (30.0, 25.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
@@ -47731,6 +48334,7 @@ mod tests {
             (50.0, 5.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
@@ -47758,6 +48362,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
@@ -47790,6 +48395,7 @@ mod tests {
             (3.0, 0.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         // Segment shorter than one step (6): no new dab yet, but the 3
@@ -47813,6 +48419,7 @@ mod tests {
             (7.0, 0.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(second, vec![(6.0, 0.0)]);
@@ -47836,6 +48443,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
@@ -47875,6 +48483,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, Vec::new(), "Move must never produce dabs to paint");
@@ -47903,6 +48512,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert_eq!(
@@ -48003,6 +48613,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         // Render: the continuous position `redraw` feeds
@@ -48035,6 +48646,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((300.0, 300.0), None),
         );
         assert_eq!(canvas_local_origin(&view, (300.0, 300.0)), (0.0, 0.0));
@@ -48351,7 +48963,14 @@ mod tests {
 
         // The property that actually matters, stated as the user would
         // see it.
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, bounds);
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            bounds,
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint: {} dabs were placed",
@@ -48445,7 +49064,14 @@ mod tests {
         );
         // And the live drag was re-anchored, not left measuring against
         // a view that moved under it.
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            grown_bounds,
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint across a resize: {} dabs were placed",
@@ -48515,7 +49141,14 @@ mod tests {
             "setup: render and paint agree again; got {local:?}"
         );
 
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            grown_bounds,
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint across a resize it spent over a \
@@ -48553,7 +49186,14 @@ mod tests {
             (top_left.0 - 300.0).abs() <= 1e-3 && (top_left.1 - 150.0).abs() <= 1e-3,
             "setup: the near clamp really does move the view here: {top_left:?}"
         );
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            moved,
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint when the near bound moves under it: \
@@ -48600,6 +49240,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert!(
@@ -48636,7 +49277,14 @@ mod tests {
         let moved = bounds_at((300.0, 150.0), None);
         let unchanged_floor = view.min_zoom();
         apply_canvas_min_zoom(&mut view, Some(&mut drag), None, unchanged_floor, moved);
-        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+        let _ = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            moved,
+        );
 
         let Drag::Move { current_bounds, .. } = drag else {
             unreachable!("still a Move drag");
@@ -48731,6 +49379,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert!(
@@ -48780,6 +49429,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         let Drag::Move { current_bounds, .. } = drag else {
@@ -48875,6 +49525,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert!(
@@ -48899,6 +49550,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         assert!(
@@ -48947,6 +49599,7 @@ mod tests {
             pointer,
             &mut view,
             &mut selection,
+            &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
         let Drag::Move { current_bounds, .. } = drag else {
@@ -49107,6 +49760,7 @@ mod tests {
                 point,
                 &mut real_view,
                 &mut selection,
+                &crate::ToolSettings::default(),
                 bounds_at((0.0, 0.0), None),
             );
         }
@@ -50293,6 +50947,7 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &crate::ToolSettings::default(),
             &mut layers,
             &mut history,
             &mut pixel_history,
@@ -51102,6 +51757,7 @@ mod tests {
                     &mut self.focus,
                     &mut self.gallery,
                     controls.as_ref(),
+                    None,
                     &mut self.click,
                     &self.scales,
                     modal_open,
@@ -51164,6 +51820,7 @@ mod tests {
                     &mut self.focus,
                     &mut self.gallery,
                     controls.as_ref(),
+                    None,
                     &self.scales,
                     false,
                     false,
@@ -51194,6 +51851,7 @@ mod tests {
                     &mut self.focus,
                     &mut palette,
                     &mut tool,
+                    &crate::ToolSettings::default(),
                     &mut self.layers,
                     &mut self.history,
                     &mut self.pixel_history,
@@ -51353,6 +52011,9 @@ mod tests {
                     layer_controls: &mut rig.state,
                     click: &mut rig.click,
                     gallery: &mut rig.gallery,
+                    tool: aurora_ui::Tool::default(),
+                    tool_settings: &mut crate::ToolSettings::default(),
+                    tool_controls: None,
                 },
                 &request,
             );
@@ -51596,6 +52257,9 @@ mod tests {
                     layer_controls: &mut rig.state,
                     click: &mut rig.click,
                     gallery: &mut rig.gallery,
+                    tool: aurora_ui::Tool::default(),
+                    tool_settings: &mut crate::ToolSettings::default(),
+                    tool_controls: None,
                 },
                 &request,
             );
@@ -51653,6 +52317,9 @@ mod tests {
                     layer_controls: &mut rig.state,
                     click: &mut rig.click,
                     gallery: &mut rig.gallery,
+                    tool: aurora_ui::Tool::default(),
+                    tool_settings: &mut crate::ToolSettings::default(),
+                    tool_controls: None,
                 },
                 &request,
             );
@@ -51716,6 +52383,7 @@ mod tests {
                 &mut dialog,
                 &mut palette,
                 &mut tool,
+                &crate::ToolSettings::default(),
                 &mut rig.layers,
                 &mut rig.history,
                 &mut rig.pixel_history,
@@ -51870,6 +52538,597 @@ mod tests {
                     "the composite must become the Multiply product: {after:?} vs {expected:?}"
                 );
             }
+        }
+    }
+
+    // -- Properties-panel tool controls (0.136.0) ---------------------------
+
+    // Exact float equality is the point: a radius is a whole number of
+    // pixels once set.
+    #[allow(clippy::float_cmp)]
+    mod tool_controls {
+        use super::super::{
+            DabTool, Drag, ToolSettings, UndoOrder, WidgetOwner, apply_tool_control_outcome,
+            continue_drag, default_shortcuts, end_radius_drag_on_tool_change, handle_key,
+            load_scales, route_widget_key, route_widget_pointer, sample_pixel, stamp_tool_dab,
+            sync_tool_controls, tool_options,
+        };
+        use super::{FakeClipboard, FakeFileDialog, bounds_at, commit_test_store, layer_bounds};
+        use aurora_theme::Scales;
+        use aurora_ui::{Tool, ToolControls};
+        use aurora_widgets::WidgetId;
+        use aurora_widgets::shortcut::{Key, Modifiers, NamedKey};
+        use aurora_widgets::widgets::WidgetKind;
+        use aurora_widgets::{
+            ClickTracker, FocusManager, KeyOutcome, PointerOutcome, PointerPhase,
+        };
+
+        const W: f32 = 1600.0;
+        const H: f32 = 900.0;
+
+        /// Everything `App` holds that the tool controls touch, driven
+        /// through the same free functions and in the same order as
+        /// `App::route_gallery`, `App::handle_key_event` and
+        /// `App::about_to_wait`'s catch-all sync.
+        struct Rig {
+            workspace: aurora_ui::Workspace,
+            focus: FocusManager,
+            gallery: Option<aurora_ui::GalleryPanel>,
+            click: ClickTracker,
+            scales: Scales,
+            tool: Tool,
+            settings: ToolSettings,
+            controls: ToolControls,
+            layers: aurora_doc::LayerTree,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: UndoOrder,
+        }
+
+        impl Rig {
+            fn new(tool: Tool) -> Self {
+                let scales = match load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let mut workspace = aurora_ui::build_workspace();
+                let controls = match aurora_ui::insert_tool_controls(
+                    &mut workspace.tree,
+                    workspace.properties,
+                    &scales,
+                ) {
+                    Ok(controls) => controls,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let mut rig = Self {
+                    workspace,
+                    focus: FocusManager::default(),
+                    gallery: None,
+                    click: ClickTracker::default(),
+                    scales,
+                    tool,
+                    settings: ToolSettings::default(),
+                    controls,
+                    layers: aurora_doc::LayerTree::new(),
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order: UndoOrder::default(),
+                };
+                rig.sync();
+                rig
+            }
+
+            /// `App::sync_tool_controls_now`.
+            fn sync(&mut self) {
+                let captured = self.click.captured();
+                let _ = sync_tool_controls(
+                    &mut self.workspace,
+                    Some(self.controls),
+                    self.tool,
+                    &self.settings,
+                    captured,
+                );
+                self.workspace.tree.compute_layout(W, H);
+            }
+
+            fn at(&self, id: WidgetId, fraction: f32) -> (f32, f32) {
+                let Some(b) = self.workspace.tree.bounds(id) else {
+                    unreachable!("{id:?} is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + b.width as f32 * fraction,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            /// `App::route_gallery`'s tool half.
+            fn pointer(&mut self, phase: PointerPhase, at: (f32, f32)) -> Option<WidgetOwner> {
+                let controls = self.controls;
+                let routed = route_widget_pointer(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    None,
+                    Some(&controls),
+                    &mut self.click,
+                    &self.scales,
+                    false,
+                    phase,
+                    at,
+                );
+                if routed.owner == Some(WidgetOwner::ToolControls)
+                    && let Some(outcome) = routed.outcome.as_ref()
+                {
+                    let captured = self.click.captured();
+                    let _ = apply_tool_control_outcome(
+                        &mut self.workspace,
+                        Some(controls),
+                        self.tool,
+                        &mut self.settings,
+                        outcome,
+                        captured,
+                    );
+                }
+                self.workspace.tree.compute_layout(W, H);
+                routed.owner
+            }
+
+            /// `App::handle_key_event`: the widget router first, then (if
+            /// it declined) the shortcut registry, then the catch-all sync.
+            fn key(&mut self, key: Key, text: Option<&str>) -> Option<(WidgetOwner, KeyOutcome)> {
+                let controls = self.controls;
+                let routed = route_widget_key(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    None,
+                    Some(&controls),
+                    &self.scales,
+                    false,
+                    false,
+                    Modifiers::none(),
+                    key,
+                    text,
+                );
+                if let Some((WidgetOwner::ToolControls, KeyOutcome::Handled(outcome))) = &routed {
+                    let captured = self.click.captured();
+                    let _ = apply_tool_control_outcome(
+                        &mut self.workspace,
+                        Some(controls),
+                        self.tool,
+                        &mut self.settings,
+                        outcome,
+                        captured,
+                    );
+                } else if routed.is_none() {
+                    let mut dialog = None;
+                    let mut palette = None;
+                    let tool_before = self.tool;
+                    let _ = handle_key(
+                        &mut self.workspace,
+                        &mut self.focus,
+                        &mut dialog,
+                        &mut palette,
+                        &mut self.tool,
+                        &self.settings,
+                        &mut self.layers,
+                        &mut self.history,
+                        &mut self.pixel_history,
+                        None,
+                        &mut self.undo_order,
+                        &default_shortcuts(),
+                        Modifiers::none(),
+                        key,
+                        text,
+                        &mut FakeClipboard::default(),
+                        &mut FakeFileDialog::default(),
+                    );
+                    let _ = end_radius_drag_on_tool_change(
+                        &mut self.click,
+                        Some(controls),
+                        tool_before,
+                        self.tool,
+                    );
+                }
+                self.sync();
+                routed
+            }
+
+            fn slider(&self) -> (f64, bool) {
+                match self.workspace.tree.payload(self.controls.radius) {
+                    Some(WidgetKind::Slider(state)) => (state.value, state.disabled),
+                    other => unreachable!("expected Slider, got {other:?}"),
+                }
+            }
+
+            fn readout(&self) -> String {
+                match self.workspace.tree.payload(self.controls.readout) {
+                    Some(WidgetKind::Label(state)) => state.text.clone(),
+                    other => unreachable!("expected Label, got {other:?}"),
+                }
+            }
+
+            /// The Properties body's rows' accessible labels.
+            fn body_rows(&self) -> Vec<String> {
+                self.workspace
+                    .tree
+                    .children(self.workspace.properties.body)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|&row| self.workspace.tree.accessibility(row))
+                    .filter_map(|node| node.label().map(str::to_owned))
+                    .collect()
+            }
+
+            fn assert_no_history(&self) {
+                assert!(
+                    !self.history.can_undo(),
+                    "a radius edit is not a history step"
+                );
+                assert!(self.undo_order.undo.is_empty());
+                assert!(self.undo_order.redo.is_empty());
+            }
+        }
+
+        /// The dabs a 64-px Brush segment lays down with `settings`.
+        fn brush_dabs(settings: &ToolSettings) -> usize {
+            let mut drag = Drag::Brush {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            };
+            continue_drag(
+                &mut drag,
+                (64.0, 0.0),
+                &mut aurora_ui::CanvasView::new(),
+                &mut aurora_doc::SelectionSet::new(),
+                settings,
+                bounds_at((0.0, 0.0), None),
+            )
+            .len()
+        }
+
+        /// The dabs a 64-px Eraser segment lays down with `settings`.
+        fn eraser_dabs(settings: &ToolSettings) -> usize {
+            let mut drag = Drag::Eraser {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            };
+            continue_drag(
+                &mut drag,
+                (64.0, 0.0),
+                &mut aurora_ui::CanvasView::new(),
+                &mut aurora_doc::SelectionSet::new(),
+                settings,
+                bounds_at((0.0, 0.0), None),
+            )
+            .len()
+        }
+
+        /// Review RT136-1: the Eraser twin of
+        /// `dragging_the_radius_slider_changes_the_brush_radius_and_the_next_dabs`
+        /// — the slider drag reaches `eraser_radius`, and `continue_drag`'s
+        /// Eraser arm spaces the next dabs by it (reverting that arm to
+        /// `ERASER_RADIUS` leaves `after == before`).
+        #[test]
+        fn dragging_the_radius_slider_changes_the_eraser_radius_and_the_next_dabs() {
+            let mut rig = Rig::new(Tool::Eraser);
+            assert_eq!(rig.slider(), (24.0, false));
+            let before = eraser_dabs(&rig.settings);
+            let slider = rig.controls.radius;
+            assert_eq!(
+                rig.pointer(PointerPhase::Down, rig.at(slider, 0.25)),
+                Some(WidgetOwner::ToolControls)
+            );
+            for fraction in [0.3, 0.4, 0.5] {
+                let at = rig.at(slider, fraction);
+                let _ = rig.pointer(PointerPhase::Move, at);
+            }
+            let at = rig.at(slider, 0.5);
+            let _ = rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            let radius = rig.settings.eraser_radius;
+            assert!(
+                radius > 100.0,
+                "the drag moved the eraser radius, got {radius}"
+            );
+            assert_eq!(rig.settings.brush_radius, 24.0, "the brush keeps its own");
+            assert_eq!(rig.slider().0, f64::from(radius));
+            assert_eq!(rig.body_rows(), vec![format!("Radius: {radius}px")]);
+            let after = eraser_dabs(&rig.settings);
+            assert!(
+                after < before,
+                "a bigger eraser radius spaces dabs further apart: {before} -> {after}"
+            );
+            assert_eq!(
+                after,
+                eraser_dabs(&ToolSettings {
+                    eraser_radius: radius,
+                    ..ToolSettings::default()
+                })
+            );
+            assert_eq!(
+                brush_dabs(&rig.settings),
+                brush_dabs(&ToolSettings::default()),
+                "the brush's spacing did not move"
+            );
+            rig.assert_no_history();
+        }
+
+        /// Review M4a/M4b: the one radius every dab site reads.
+        #[test]
+        fn dab_radius_reads_each_tools_own_live_radius() {
+            let settings = ToolSettings {
+                brush_radius: 7.0,
+                eraser_radius: 40.0,
+            };
+            assert_eq!(settings.dab_radius(DabTool::Brush), 7.0);
+            assert_eq!(settings.dab_radius(DabTool::Eraser), 40.0);
+            let defaults = ToolSettings::default();
+            assert_eq!(defaults.dab_radius(DabTool::Brush), 24.0);
+            assert_eq!(defaults.dab_radius(DabTool::Eraser), 24.0);
+        }
+
+        /// Review M4a/M4b: `App::paint_dab`/`App::erase_dab`'s shared
+        /// stamp really stamps with the live, non-default radius of each
+        /// tool — a pixel 12 px from the centre is inside a default 24 px
+        /// dab and outside a 4 px one, so reverting either arm to the
+        /// starting constant paints (or erases) it.
+        #[test]
+        fn stamp_tool_dab_stamps_with_each_tools_live_radius() {
+            let (_dir, mut store) = commit_test_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let layer = match layers.add_pixel_layer("a", layer_bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(layer) else {
+                unreachable!("just created as a pixel layer");
+            };
+            let mut drag = None;
+            let centre = (100.0, 100.0);
+            let near = (112.0, 100.0);
+            let alpha = |store: &mut aurora_tile::TileStore, at| {
+                sample_pixel(store, surface, at).map_or(0.0, |px| px[3])
+            };
+            let small = ToolSettings {
+                brush_radius: 4.0,
+                eraser_radius: 4.0,
+            };
+            let outcome = stamp_tool_dab(
+                DabTool::Brush,
+                &mut store,
+                surface,
+                centre,
+                &small,
+                [1.0, 0.0, 0.0],
+                &mut drag,
+            );
+            assert!(!outcome.painted().is_empty());
+            assert!(alpha(&mut store, centre) > 0.5, "the centre is painted");
+            assert_eq!(
+                alpha(&mut store, near),
+                0.0,
+                "12 px out is outside a 4 px brush dab"
+            );
+            // A big brush dab to erase from, then a 4 px eraser dab.
+            let big = ToolSettings {
+                brush_radius: 40.0,
+                eraser_radius: 4.0,
+            };
+            let _ = stamp_tool_dab(
+                DabTool::Brush,
+                &mut store,
+                surface,
+                centre,
+                &big,
+                [1.0, 0.0, 0.0],
+                &mut drag,
+            );
+            assert!(alpha(&mut store, near) > 0.5, "a 40 px dab covers it");
+            let _ = stamp_tool_dab(
+                DabTool::Eraser,
+                &mut store,
+                surface,
+                centre,
+                &big,
+                [1.0, 0.0, 0.0],
+                &mut drag,
+            );
+            assert!(alpha(&mut store, centre) < 0.5, "the centre is erased");
+            assert!(
+                alpha(&mut store, near) > 0.5,
+                "12 px out is outside a 4 px eraser dab"
+            );
+        }
+
+        /// Review RT136-3, measured: a 64-px segment at the slider's
+        /// minimum radius (1 px, `dab_step`'s 0.5 px floor) lays 12.8x the
+        /// dabs of the 24 px default — the performance edge PLAN.md
+        /// discloses for real-hardware measurement.
+        #[test]
+        fn a_one_pixel_radius_lays_many_more_dabs_per_segment() {
+            let one = ToolSettings {
+                brush_radius: 1.0,
+                eraser_radius: 1.0,
+            };
+            assert_eq!(brush_dabs(&one), 128);
+            assert_eq!(eraser_dabs(&one), 128);
+            assert_eq!(brush_dabs(&ToolSettings::default()), 10);
+            let max = ToolSettings {
+                brush_radius: 256.0,
+                eraser_radius: 256.0,
+            };
+            assert_eq!(brush_dabs(&max), 1);
+        }
+
+        /// Review RT136-2: a radius drag begun on the Brush that goes on
+        /// after a letter-key switch to the Eraser must not start editing
+        /// the Eraser's radius — the switch ends the drag.
+        #[test]
+        fn a_tool_switch_mid_drag_ends_the_radius_drag() {
+            let mut rig = Rig::new(Tool::Brush);
+            let slider = rig.controls.radius;
+            let _ = rig.pointer(PointerPhase::Down, rig.at(slider, 0.25));
+            let at = rig.at(slider, 0.4);
+            let _ = rig.pointer(PointerPhase::Move, at);
+            let brush = rig.settings.brush_radius;
+            assert!(brush > 24.0, "the drag moved the brush radius, got {brush}");
+            assert_eq!(rig.click.captured(), Some(slider), "mid-drag");
+            let _ = rig.key(Key::Character('e'), Some("e"));
+            assert_eq!(rig.tool, Tool::Eraser);
+            assert_eq!(rig.click.captured(), None, "the switch ended the drag");
+            assert_eq!(rig.slider(), (24.0, false), "the slider shows the eraser");
+            for fraction in [0.6, 0.8, 0.9] {
+                let at = rig.at(slider, fraction);
+                let _ = rig.pointer(PointerPhase::Move, at);
+            }
+            let at = rig.at(slider, 0.9);
+            let _ = rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            assert_eq!(
+                rig.settings.eraser_radius, 24.0,
+                "the eraser was not edited"
+            );
+            assert_eq!(
+                rig.settings.brush_radius, brush,
+                "the brush keeps the drag value"
+            );
+            assert_eq!(rig.slider(), (24.0, false));
+            rig.assert_no_history();
+            // Ending an unrelated capture is not this helper's business.
+            assert!(!end_radius_drag_on_tool_change(
+                &mut rig.click,
+                Some(rig.controls),
+                Tool::Brush,
+                Tool::Brush,
+            ));
+        }
+
+        #[test]
+        fn set_radius_rounds_clamps_and_refuses_non_finite_values_and_radiusless_tools() {
+            let mut settings = ToolSettings::default();
+            assert!(settings.set_radius(Tool::Brush, 40.4));
+            assert_eq!(settings.brush_radius, 40.0);
+            assert_eq!(settings.eraser_radius, 24.0, "the eraser keeps its own");
+            assert!(!settings.set_radius(Tool::Brush, 40.0), "unchanged");
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(!settings.set_radius(Tool::Brush, bad));
+                assert_eq!(settings.brush_radius, 40.0, "{bad} refused");
+            }
+            assert!(settings.set_radius(Tool::Eraser, 1e9));
+            assert_eq!(settings.eraser_radius, 256.0);
+            assert!(settings.set_radius(Tool::Eraser, -3.0));
+            assert_eq!(settings.eraser_radius, 1.0);
+            assert!(!settings.set_radius(Tool::Move, 50.0));
+            assert_eq!(settings.radius(Tool::Move), None);
+            assert_eq!(
+                tool_options(Tool::Brush, &settings),
+                vec![("Radius", "40px".to_owned())]
+            );
+            assert!(tool_options(Tool::Zoom, &settings).is_empty());
+        }
+
+        #[test]
+        fn dragging_the_radius_slider_changes_the_brush_radius_and_the_next_dabs() {
+            let mut rig = Rig::new(Tool::Brush);
+            assert_eq!(rig.slider(), (24.0, false));
+            assert_eq!(rig.readout(), "Radius 24 px");
+            let before = brush_dabs(&rig.settings);
+            let slider = rig.controls.radius;
+            assert_eq!(
+                rig.pointer(PointerPhase::Down, rig.at(slider, 0.25)),
+                Some(WidgetOwner::ToolControls)
+            );
+            for fraction in [0.3, 0.4, 0.5] {
+                let at = rig.at(slider, fraction);
+                assert_eq!(
+                    rig.pointer(PointerPhase::Move, at),
+                    Some(WidgetOwner::ToolControls)
+                );
+            }
+            assert_eq!(rig.click.captured(), Some(slider), "mid-drag");
+            let mid = rig.settings.brush_radius;
+            assert!(mid > 100.0, "the live drag moved the radius, got {mid}");
+            assert_eq!(rig.readout(), format!("Radius {mid:.0} px"));
+            let at = rig.at(slider, 0.5);
+            let _ = rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            let radius = rig.settings.brush_radius;
+            assert_eq!(radius, radius.round(), "a whole pixel");
+            assert_eq!(rig.settings.eraser_radius, 24.0);
+            assert_eq!(
+                rig.slider().0,
+                f64::from(radius),
+                "the slider shows the set radius"
+            );
+            assert_eq!(rig.body_rows(), vec![format!("Radius: {radius}px")]);
+            let after = brush_dabs(&rig.settings);
+            assert!(
+                after < before,
+                "a bigger radius spaces dabs further apart: {before} -> {after}"
+            );
+            assert_eq!(
+                after,
+                brush_dabs(&ToolSettings {
+                    brush_radius: radius,
+                    ..ToolSettings::default()
+                })
+            );
+            rig.assert_no_history();
+        }
+
+        #[test]
+        fn switching_tools_shows_each_tools_own_radius_and_disables_for_move() {
+            let mut rig = Rig::new(Tool::Brush);
+            assert!(rig.settings.set_radius(Tool::Brush, 50.0));
+            rig.sync();
+            assert_eq!(rig.slider(), (50.0, false));
+            let _ = rig.key(Key::Character('e'), Some("e"));
+            assert_eq!(rig.tool, Tool::Eraser);
+            assert_eq!(rig.slider(), (24.0, false));
+            assert_eq!(rig.readout(), "Radius 24 px");
+            assert_eq!(rig.body_rows(), vec!["Radius: 24px".to_owned()]);
+            let _ = rig.key(Key::Character('v'), Some("v"));
+            assert_eq!(rig.tool, Tool::Move);
+            assert!(rig.slider().1, "Move has no radius: disabled");
+            assert_eq!(rig.readout(), "No radius for Move");
+            assert!(rig.body_rows().is_empty());
+            let _ = rig.key(Key::Character('b'), Some("b"));
+            assert_eq!(rig.slider(), (50.0, false), "the brush kept its radius");
+        }
+
+        #[test]
+        fn arrow_keys_on_the_focused_slider_change_the_radius_and_letters_still_switch_tools() {
+            let mut rig = Rig::new(Tool::Brush);
+            let slider = rig.controls.radius;
+            if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, slider) {
+                unreachable!("{err:?}");
+            }
+            let routed = rig.key(Key::Named(NamedKey::ArrowRight), None);
+            assert!(matches!(
+                routed,
+                Some((
+                    WidgetOwner::ToolControls,
+                    KeyOutcome::Handled(PointerOutcome::Action(_))
+                ))
+            ));
+            let up = rig.settings.brush_radius;
+            assert!(up > 24.0, "ArrowRight grew the radius, got {up}");
+            assert_eq!(rig.slider().0, f64::from(up));
+            let _ = rig.key(Key::Named(NamedKey::ArrowLeft), None);
+            assert!(rig.settings.brush_radius < up);
+            rig.assert_no_history();
+            // Only a text field consumes a character key: the letter goes
+            // on to the tool shortcuts.
+            assert_eq!(rig.key(Key::Character('e'), Some("e")), None);
+            assert_eq!(rig.tool, Tool::Eraser, "the shortcut fired");
+            assert_eq!(rig.slider(), (24.0, false));
         }
     }
 }

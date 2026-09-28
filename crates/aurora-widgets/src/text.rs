@@ -470,6 +470,15 @@ pub fn text_runs(
             })
             .into_iter()
             .collect(),
+        // A static label: one line, flush left, supporting text.
+        WidgetKind::Label(state) => {
+            let color = if state.disabled {
+                theme.text.disabled
+            } else {
+                theme.text.secondary
+            };
+            vec![run(&state.text, rgba(color, 1.0), full, HAlign::Start)]
+        }
         WidgetKind::Container => container_text(tree, id, focused, theme)
             .map(|(text, decor)| match decor {
                 Some(decor) => {
@@ -1004,6 +1013,41 @@ mod tests {
                 rgba(theme.text.primary, 1.0)
             ]
         );
+    }
+
+    #[test]
+    fn a_label_draws_its_text_flush_left_in_secondary_and_disabled_in_text_disabled() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let label = ok(crate::widgets::insert_label(
+            &mut tree,
+            root,
+            &scales,
+            "Size 24 px",
+        ));
+        let theme = dark_theme();
+        let bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 21,
+        };
+        let runs = text_runs(&tree, label, bounds, bounds, None, &theme, &scales);
+        assert_eq!(runs.len(), 1);
+        assert!(runs.first().is_some_and(|r| r.text == "Size 24 px"
+            && r.align == HAlign::Start
+            && r.color == rgba(theme.text.secondary, 1.0)
+            && r.field.is_none()));
+        ok(crate::widgets::set_label_disabled(&mut tree, label, true));
+        let runs = text_runs(&tree, label, bounds, bounds, None, &theme, &scales);
+        assert_eq!(
+            runs.first().map(|r| r.color),
+            Some(rgba(theme.text.disabled, 1.0))
+        );
+        // It paints no solids of its own: the text is everything.
+        place(&mut tree, label, 10, 20, 200, 21);
+        let paints = ok(crate::paint_widget(&tree, label, &theme, &scales, 1.0));
+        assert!(paints.is_empty(), "{paints:?}");
     }
 
     #[test]

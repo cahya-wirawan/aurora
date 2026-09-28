@@ -461,6 +461,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::ColorPickerPart(state) => state.is_disabled(),
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
+        WidgetKind::Label(state) => state.disabled,
         WidgetKind::Container
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
@@ -1073,9 +1074,11 @@ pub fn paint_widget(
         WidgetKind::CurveEditor(state) => {
             paint_curve_editor(tree, id, state, theme, scales, scale_factor)
         }
-        WidgetKind::ColorPicker(_) | WidgetKind::CurveEditorPoint(_) | WidgetKind::Container => {
-            Ok(vec![])
-        }
+        // A label paints no solids; `crate::text_runs` draws its text.
+        WidgetKind::ColorPicker(_)
+        | WidgetKind::CurveEditorPoint(_)
+        | WidgetKind::Container
+        | WidgetKind::Label(_) => Ok(vec![]),
     }
 }
 

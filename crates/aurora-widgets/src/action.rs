@@ -368,6 +368,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::ColorPickerPart(state) => state.is_disabled(),
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
+        WidgetKind::Label(state) => state.disabled,
         WidgetKind::Container
         | WidgetKind::CommandPalette(_)
         | WidgetKind::Panel
@@ -787,11 +788,12 @@ mod tests {
         CommandEntry, DialogAction, DialogHandle, MenuItem, ScrollbarRange, color_picker_state,
         curve_editor_state, dropdown_state, insert_button, insert_checkbox, insert_color_picker,
         insert_color_swatch, insert_command_palette, insert_curve_editor, insert_dialog,
-        insert_dropdown, insert_scrollbar, insert_slider, insert_tab_bar, insert_text_field,
-        insert_tree_item, insert_tree_view, menu_state, new_tree, open_menu, select_curve_point,
-        select_tab, set_checkbox_disabled, set_color_picker_disabled, set_curve_editor_disabled,
-        set_dropdown_open, set_slider_disabled, set_text_field_disabled, set_tree_item_disabled,
-        set_tree_item_expanded, tab_bar_state, test_scales, text_field_state, with_text_field_mut,
+        insert_dropdown, insert_label, insert_scrollbar, insert_slider, insert_tab_bar,
+        insert_text_field, insert_tree_item, insert_tree_view, menu_state, new_tree, open_menu,
+        select_curve_point, select_tab, set_checkbox_disabled, set_color_picker_disabled,
+        set_curve_editor_disabled, set_dropdown_open, set_slider_disabled, set_text_field_disabled,
+        set_tree_item_disabled, set_tree_item_expanded, tab_bar_state, test_scales,
+        text_field_state, with_text_field_mut,
     };
     use accesskit::{Node, Orientation, Role};
     use aurora_core::{CurvePoint, ToneCurve};
@@ -957,6 +959,8 @@ mod tests {
         let editor = ok(insert_curve_editor(
             &mut tree, root, &scales, "Curve", 100.0, curve,
         ));
+        // A label declares no action at all: the sweep proves none routes.
+        ok(insert_label(&mut tree, root, &scales, "Size 24 px"));
         tree.compute_layout(800.0, 600.0);
         let _ = tree.take_damage();
         Fixture {
@@ -1792,9 +1796,10 @@ mod tests {
             WidgetKind::ColorPickerPart(_) => 20,
             WidgetKind::CurveEditor(_) => 21,
             WidgetKind::CurveEditorPoint(_) => 22,
+            WidgetKind::Label(_) => 23,
         }
     }
-    const KIND_COUNT: usize = 23;
+    const KIND_COUNT: usize = 24;
 
     /// The data a well-formed request for `action` on `id` would carry.
     fn well_formed(f: &Fixture, id: WidgetId, action: Action) -> Option<ActionData> {

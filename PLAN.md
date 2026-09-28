@@ -26,7 +26,20 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.135.0): the Layers panel edits the document.**
+**Latest (2026-09-28, 0.136.0): the Properties panel edits the tool.**
+A live "Radius 24 px" readout and a 1–256 px radius slider for the
+active tool (Brush and Eraser each keep their own; disabled for tools
+with no radius), on a new `ToolSettings` that replaces the fixed
+`BRUSH_RADIUS`/`ERASER_RADIUS` at every dab site, plus a new minimal
+`Label` widget. Tool settings are not document state: no undo step, not
+saved. A same-version review revision made one helper the only radius
+source for every dab site (both tools now tested), ends a radius drag on
+a mid-drag tool switch or an assistive-technology action, and discloses
+the 1 px radius's 12.8x dab count as a performance edge. Details and
+disclosures: M1.8's "Layers, history, tool-options panels" 0.136.0
+update.
+
+**Previously (2026-09-28, 0.135.0): the Layers panel edits the document.**
 An opacity slider (live drag, one undo step per gesture), a 27-mode
 blend-mode dropdown and a visibility checkbox for the active layer, on a
 router now shared between the Widget Gallery and the Layers controls.
@@ -6558,6 +6571,137 @@ structural design work.
   clean. Judge: PASS, 0.91. Carried: keyboard steps can drift off whole
   percentages after a sync-back (cosmetic); a stale doc comment near
   `run_undo_redo` saying Ctrl+Z never reaches it.
+
+  **Update 0.136.0 — editable Properties-panel tool controls + a Label
+  widget.** The Properties panel gains a strip (the same "child of the
+  panel root, after the body" placement as the Layers controls, so
+  `populate_properties_panel` repopulating the body on every tool switch
+  cannot destroy it; hidden by `set_panel_collapsed`, and inserted hidden
+  into an already-collapsed panel) holding a **live readout** ("Radius
+  24 px", "No radius for Move") and a **radius slider**
+  (`crates/aurora-ui/src/tool_controls.rs`, new: `insert_tool_controls`,
+  `sync_tool_controls`, `tool_controls_contains`, `radius_readout`,
+  `TOOL_RADIUS_MIN`/`MAX` = 1/256 px). `sync_tool_controls` updates in
+  place, disables both controls for a tool with no radius (slider keeps
+  its last value), clamps to the range, treats a non-finite radius as
+  none, and never overwrites the slider's value while it holds pointer
+  capture (the readout always follows). In `aurora-app` a `ToolSettings
+  { brush_radius, eraser_radius }` field on `App` (defaults 24.0 — the
+  old consts are now only its defaults) replaces the consts at **every**
+  dab site: `continue_drag`'s dab spacing (new `tool_settings`
+  parameter), `App::paint_dab`'s `stamp_dab` and `App::erase_dab`'s
+  `erase_dab`; `tool_options` (the Properties body rows) reads it too, and
+  `run_command`/`handle_key`/`perform_undo_redo`/`replace_document` carry
+  it so a tool switch shows the live radius. Routing:
+  `WidgetOwner::ToolControls` (the pointer and key routers and
+  `widget_owner` take the strip), `apply_tool_control_outcome` (a radius
+  slider `ValueChanged` from pointer, keyboard or assistive technology
+  sets the active tool's radius through `ToolSettings::set_radius` —
+  rounded to whole pixels, clamped, non-finite refused — then refreshes
+  the body and the readout; **no history step**), and a new
+  `AccessibilityReaction::ToolControl` arm; the live-workspace mapping
+  guard now builds the strip (with the Brush active so the slider
+  declares its actions) and asserts `SetValue`/`Increment`/`Decrement`
+  reach it. `App::new` builds and syncs the strip; `about_to_wait` runs
+  `sync_tool_controls_now` as a catch-all after the layer-controls sync,
+  so every tool-switch path (letter shortcut, palette; the macOS menu
+  cannot switch tools) is mirrored. Tool-letter shortcuts still work with the slider focused
+  (only a text field consumes a character key). New `aurora-widgets`
+  **`Label`** (`WidgetKind::Label(LabelState { text, disabled })`,
+  `insert_label`, `set_label_text`/`set_label_disabled` — both no-ops
+  when unchanged, otherwise a11y rebuild + damage — and `label_state`):
+  `Role::Label`, no actions, one `row_height` tall, paints no solids,
+  drawn by `text_runs` in `text.secondary` (gated at 4.5:1 on
+  `surface.panel` by `design/check_contrast.py`) or `text.disabled`;
+  every exhaustive `WidgetKind` match and both kind-coverage guards
+  (`action.rs`, `tooltip.rs`) extended. Tests: 6 `aurora-widgets`, 7
+  `aurora-ui`, 5 `aurora-app` (drag → radius changes and the next
+  segment's dab count follows it; switching Brush/Eraser/Move shows each
+  radius or disables; arrow keys change it and a letter still switches
+  tool with the slider focused; an AT `SetValue` sets it with no history
+  and NaN/±inf refused; `set_radius` rounding/clamping), plus the
+  extended guard. **Disclosed:** tool settings are not document state —
+  no undo step and **not persisted** (reset to 24 px every launch, not in
+  `.aur` or the workspace layout); the 1–256 px range, the readout's
+  wording, radius-vs-diameter ("Size") and `text.secondary` for the
+  readout are engineering defaults **flagged to the design owner**; the
+  brush still has no opacity/flow/hardness; `App::paint_dab`/`erase_dab`
+  reading the live radius was covered by inspection only as built (the
+  tests pinned `continue_drag`'s dab spacing for the **Brush only**, not
+  the Eraser and not a stamped extent, since `App` needs a window) —
+  closed in the review revision below; no value readouts were added to the Layers controls
+  (optional item, left); the Properties *body* rows ("Radius: 24px")
+  are still accessibility-only, not drawn (`text_runs` draws a `ListRow`
+  only under a menu, dropdown list or the palette) — the readout is the
+  visible value; nothing verified by a human on real hardware or with a
+  real screen reader. **Measured (builder):** `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` on the RTX 3090 — 2,476 passed, 0 failed, 45
+  ignored, 0 skipped; clippy `-D warnings`, fmt, `cargo check --locked`,
+  both check scripts and `design/check_contrast.py` clean. Not yet run:
+  nextest, `cargo deny`, CI on macOS/Windows.
+
+  **Review revision (0.136.0, same version).** Red-team killed 14 of 17
+  mutations; the three survivors and two behaviour gaps are fixed, each
+  with a test shown failing on the pre-fix or mutated code (backup,
+  mutate, run, restore, sha256-verified). (1) **RT136-1:** reverting
+  `continue_drag`'s *Eraser* arm to `ERASER_RADIUS` passed every test —
+  new `dragging_the_radius_slider_changes_the_eraser_radius_and_the_next_dabs`
+  (the Brush test's twin, plus "the brush's spacing did not move")
+  kills it. (2) **M4a/M4b:** the radius every dab site reads now comes
+  from one place, `ToolSettings::dab_radius(DabTool)`, and the stamp
+  itself moved out of `App::paint_dab`/`erase_dab` into a free
+  `stamp_tool_dab(DabTool, store, surface, local, settings, colour, drag)`
+  that both methods call — they no longer name a radius at all, so the
+  const cannot silently reappear there. Tested headlessly against a real
+  tile store: `dab_radius_reads_each_tools_own_live_radius` and
+  `stamp_tool_dab_stamps_with_each_tools_live_radius` (a pixel 12 px out
+  is inside a default 24 px dab and outside a 4 px one; for the Eraser,
+  after a 40 px brush dab). Reverting either `dab_radius` arm, either
+  `stamp_tool_dab` arm, or either `continue_drag` arm to the const is
+  killed. **Still by inspection:** that `App::paint_dab`/`erase_dab`
+  pass `DabTool::Brush`/`DabTool::Eraser` respectively and not the
+  other (constructing `App` needs a window). (3) **RT136-2:** a
+  radius-slider drag that crossed a tool switch (letter key mid-drag)
+  went on editing the *new* tool's radius — measured pre-fix: the
+  Eraser's radius went 24 → 232 from a drag begun on the Brush. Fix:
+  `end_radius_drag_on_tool_change` drops the slider's capture whenever
+  `App::handle_key_event`'s `handle_key` (letter shortcuts and the
+  command palette — the only paths that change `App::tool`; the macOS
+  menu's `activate_command` cannot) changed the tool. Test
+  `a_tool_switch_mid_drag_ends_the_radius_drag`: the Eraser stays 24,
+  the Brush keeps its drag value. Its `Rig` mirrors
+  `App::handle_key_event`, so the `App` call site itself is pinned by
+  the mirror, as the rest of that `Rig` is. (4) **RT136-4:** an
+  assistive technology's action on the radius slider now drops a live
+  pointer capture of it first (`release_radius_capture`, mirroring
+  `end_pointer_opacity_drag`), so the rest of that pointer gesture
+  cannot override the action's value — test
+  `an_at_set_value_mid_drag_ends_the_pointer_drag_of_the_radius_slider`.
+  (5) **RT136-3, disclosed not capped — a performance edge to measure on
+  real hardware:** at the slider's 1 px minimum `dab_step` hits its
+  0.5 px floor, so one 64 px segment lays **128** dabs against **10** at
+  the 24 px default (12.8×), and **1** at 256 px — pinned by
+  `a_one_pixel_radius_lays_many_more_dabs_per_segment`. Each tiny dab
+  touches few pixels, but per-dab overhead (tile lookup, snapshot
+  capture, cache invalidation) scales with the count, against the 10 ms
+  brush-latency budget whose measured margin is under 1 ms. No cap was
+  added: raising the floor would visibly gap a 1 px stroke, so it is a
+  brush-feel decision, not a trivial safe fix. **Measured (reviser):**
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-widgets -p aurora-ui -p
+  aurora-app` on the RTX 3090, workspace clippy `-D warnings` and
+  `cargo fmt --all --check`: 1,486 passed (aurora-app lib 499,
+  aurora-ui 125, aurora-widgets lib 732, `tests/gallery.rs` 129 + 45
+  ignored, `tests/headless.rs` 1), 0 failed, 0 skipped; clippy, fmt and
+  `cargo doc -p aurora-app --document-private-items` (`-D warnings`)
+  clean. Workspace total now 2,476 + 5 = 2,481 (not re-run
+  workspace-wide in this revision; the other crates are untouched).
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,482 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. Judge:
+  PASS, 0.92. Carried: the Properties body says "Radius: 24px" while the
+  readout says "Radius 24 px" (a screen-reader user hears both formats —
+  unify or flag to the design owner); a cheap guard that `paint_dab` and
+  `erase_dab` pass the right `DabTool`.
 
   Wired into `aurora-app` via a new `demo_layers()` — a small, clearly-
   fake three-layer tree (Background, Color balance at Multiply/80%,
@@ -28883,6 +29027,16 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-28 (0.136.0) — editable Properties-panel tool
+controls.** A radius readout and slider for Brush/Eraser on a live
+`ToolSettings`, plus a minimal `Label` widget; no undo, not persisted.
+Full account: M1.8's 0.136.0 update. **Needs a human:** drag the radius
+slider and paint on real hardware; the design owner to confirm the
+1–256 px range, radius-vs-"Size" wording and readout colour.
+**Suggested next (0.137.0): text follow-ups** — checkbox labels and
+dialog titles via a measure-func layout pass, click-to-place caret,
+clipboard/select-all/undo in text fields, and caret blink.
 
 **Addendum 2026-09-28 (0.135.0) — editable Layers-panel controls.**
 Opacity/blend/visibility for the active layer, one undo step per

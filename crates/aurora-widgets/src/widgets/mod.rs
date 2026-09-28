@@ -112,7 +112,8 @@
 //! tessellates real geometry through `aurora-vector` for **twenty**
 //! of the [`WidgetKind`] variants below (every one except `Container`,
 //! [`WidgetKind::ColorPicker`]'s own root, whose children paint, and
-//! [`WidgetKind::CurveEditorPoint`], whose root paints;
+//! [`WidgetKind::CurveEditorPoint`], whose root paints, and
+//! [`WidgetKind::Label`], 0.136.0, which is text only;
 //! [`WidgetKind::CurveEditor`] as of `0.126.0`;
 //! [`WidgetKind::ColorPickerPart`] as of `0.125.0`, the first to paint a
 //! gradient through [`crate::paint_widget_ops`],
@@ -147,6 +148,7 @@ mod command_palette;
 mod curve_editor;
 mod dialog;
 mod dropdown;
+mod label;
 mod list_row;
 mod menu;
 mod scrollbar;
@@ -188,6 +190,7 @@ pub use dropdown::{
     dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
     set_dropdown_selected, toggle_dropdown,
 };
+pub use label::{LabelState, insert_label, label_state, set_label_disabled, set_label_text};
 pub use list_row::ListRowState;
 pub use menu::{
     MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,
@@ -369,6 +372,11 @@ pub enum WidgetKind {
     /// `Role::Slider` over the editor's whole box, created only by
     /// `curve_editor.rs`. Paints nothing.
     CurveEditorPoint(CurveEditorPointState),
+    /// A static one-line text label — `Role::Label`, no actions, never a
+    /// tab stop, created by `label.rs`'s [`insert_label`] (0.136.0). Paints
+    /// no solids; [`crate::text_runs`] draws its text in `text.secondary`
+    /// (`text.disabled` when disabled).
+    Label(LabelState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

@@ -9,25 +9,33 @@
 //! **Generic mechanism, caller owns the data** — the same split
 //! [`crate::tool`]'s own doc comment draws between this crate (tool
 //! identity, pure geometry) and `aurora-app` (the live document, the
-//! live parameters). This module knows nothing about `BRUSH_RADIUS`,
-//! `ERASER_RADIUS`, or any other tool-specific constant — those live in
-//! `aurora-app`, the one place real per-tool parameters exist today
+//! live parameters). This module knows nothing about the Brush's or
+//! Eraser's radius or any other tool parameter — those live in
+//! `aurora-app`'s `ToolSettings` (0.136.0; the `BRUSH_RADIUS`/
+//! `ERASER_RADIUS` consts are now only its defaults), the one place real
+//! per-tool parameters exist today
 //! (`aurora-ui` has no dependency on `aurora-app`, and couldn't reach
 //! them even if it wanted to — `scripts/layering.json`). A caller with
 //! no real options for the active tool passes an empty slice, which
 //! [`populate_properties_panel`] renders as an honest empty list — not
 //! a placeholder row, not an invented default.
 //!
-//! **No pixel rendering** — same boundary [`crate::history_panel`] and
-//! [`crate::layers_panel`] both keep: a row's accessible name is the
-//! label/value text the caller passed in, no icon, no editable field, no
-//! drawn pixels. There is no size-picker or other editable-options UI
-//! here — that's real, separate work for whenever `aurora-vector`/text
-//! rendering exist to build one with.
+//! **The body is read-only; the editable controls live beside it
+//! (0.136.0).** A row's accessible name is the label/value text the
+//! caller passed in — no icon, no editable field, and still no drawn
+//! text (`aurora_widgets::text_runs` draws a `ListRow`'s label only under
+//! a menu, a dropdown list or the command palette). The first *visible*
+//! Properties text is the tool-controls readout, a real
+//! `WidgetKind::Label`. The editable radius slider and that readout are
+//! [`crate::tool_controls`]' strip, a sibling *after* this body on the
+//! panel root, so repopulating the body on a tool switch never destroys
+//! them. `aurora-app` refreshes the body with the live radius whenever it
+//! changes, so the row and the readout agree.
 //!
 //! **One-shot, not reactive** — nothing here edits anything (the
 //! first panel controls that edit a live document, 0.135.0, are the
-//! Layers panel's own, [`crate::layer_controls`]). A caller re-populates on
+//! Layers panel's own, [`crate::layer_controls`]; the Properties panel's
+//! own tool controls, 0.136.0, are [`crate::tool_controls`]). A caller re-populates on
 //! every tool change and [`populate_properties_panel`] empties the body
 //! for itself first, the same contract its two sibling `populate_*`
 //! functions already had — see `aurora-app`'s own
@@ -50,8 +58,8 @@
 //! call site, no click routing. So this draws exactly what the old code
 //! drew (nothing) and changes only the geometry: a real, non-degenerate,
 //! hit-testable rect. Still not drawn at all: the row's own label text
-//! (it reaches the accessibility node and nothing else — there is no
-//! glyph rendering here yet) and any editable control.
+//! (it reaches the accessibility node and nothing else) — the editable
+//! control and the visible readout are [`crate::tool_controls`]' strip.
 //!
 //! **Rows past the bottom of the panel are clipped and unreachable**
 //! — the same structural gap [`crate::history_panel`] and
