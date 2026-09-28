@@ -4015,6 +4015,21 @@ check licenses` clean with the new `toml` dependency.
   cursor inside the preedit (C7), drop `resolve_run`'s double placement
   (RT133-02), and note that the vertical outline inset also clips glyph
   ink touching the outline rows.
+  **0.133.1 (bug fix, found by the user on macOS, 2026-09-28).** The
+  user confirmed the text field, command palette, tooltip and caret work,
+  and reported the gallery slider's thumb as far too big. Cause:
+  `slider::style` and `text_field::style` set `flex_grow: 1.0`, meant for
+  a row parent; in the gallery's column it grew their *height* to soak
+  up spare space (measured at 1280x480: slider 45 px instead of 13, text
+  field 85 px instead of 21), and the slider thumb is drawn as tall as
+  the slider. Both now cap their height with `max_size` (row behaviour
+  unchanged). New test `a_tall_window_does_not_stretch_the_slider_vertically`
+  (window heights 480/800/1600) fails without either cap. **Design
+  note, not changed:** `design/gallery/index.html` specifies a 4 px
+  `border.default` track with an `accent.primary` fill and a 12 px
+  `text.primary` thumb; the widget paints a `surface.sunken` track 30%
+  of its height and an `accent.primary` thumb as tall as the slider (13
+  px) — a design-owner call.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no

@@ -19,7 +19,7 @@
 //! ([`GALLERY_EDITOR_ROWS`], [`GALLERY_TREE_ROWS`]) are *counts of rows*,
 //! not pixel values, the same kind of layout constant `workspace.rs`'s
 //! `RAIL_*` widths are. The body clips; below
-//! [`gallery_content_height`] the bottom of the left column (tree rows) is
+//! [`gallery_content_height`] the bottom of the taller column (the right column's curve editor) is
 //! clipped and unreachable, since nothing in this toolkit scrolls yet.
 //!
 //! **What this does not do**, all disclosed rather than hidden: no text
@@ -148,7 +148,7 @@ pub fn gallery_width(scales: &Scales) -> f32 {
 /// The height the gallery's content needs, measured from the last layout
 /// (the two-column block including its padding, which never shrinks): a
 /// panel body shorter than this clips the bottom of the taller column —
-/// the left one's tree rows with the default scales — and what is clipped
+/// the right one's curve editor with the default scales — and what is clipped
 /// cannot be clicked, since nothing in this toolkit scrolls yet. `None`
 /// before the first layout.
 #[must_use]
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_as_tall_as_the_content_clips_nothing_and_a_shorter_one_clips_the_tree() {
+    fn a_body_as_tall_as_the_content_clips_nothing_and_a_shorter_one_clips_the_taller_column() {
         let scales = test_scales();
         let (ws, g, _) = opened(TALL);
         let (Some(content), Some(body)) = (
@@ -767,12 +767,17 @@ mod tests {
         assert!((min - 422.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
-            let (Some(row), Some(body)) =
-                (ws.tree.bounds(g.tree_rows[2]), ws.tree.bounds(g.panel.body))
-            else {
+            // The taller column's last widget: since 0.133.1 stopped the
+            // slider and text field stretching, that is the right column's
+            // curve editor, not the left column's last tree row.
+            let (Some(row), Some(curve), Some(body)) = (
+                ws.tree.bounds(g.tree_rows[2]),
+                ws.tree.bounds(g.curve),
+                ws.tree.bounds(g.panel.body),
+            ) else {
                 unreachable!()
             };
-            (row.bottom(), body.bottom())
+            (row.bottom().max(curve.bottom()), body.bottom())
         };
         let (row, bottom) = last_row_vs_body(min);
         assert!(row <= bottom, "{row} <= {bottom} at {min}");
@@ -800,6 +805,32 @@ mod tests {
             canvas.width < 64,
             "the disclosed narrow canvas — widen this pin knowingly: {canvas:?}"
         );
+    }
+
+    #[test]
+    fn a_tall_window_does_not_stretch_the_slider_vertically() {
+        // The slider's `flex_grow` is for a row container; in the gallery's
+        // column it must not soak up spare height, or its thumb (drawn as
+        // tall as the slider) grows with the window (0.133.1).
+        for height in [480.0, 800.0, 1600.0] {
+            let (ws, g, scales) = opened_at(1280.0, height);
+            let Some(slider) = ws.tree.bounds(g.slider) else {
+                unreachable!()
+            };
+            let expected = scales.typography.size.md;
+            assert!(
+                slider.height <= expected,
+                "slider {slider:?} at window height {height}, expected <= {expected}"
+            );
+            let Some(field) = ws.tree.bounds(g.text_field) else {
+                unreachable!()
+            };
+            let row = aurora_widgets::widgets::row_height(&scales);
+            assert!(
+                f64::from(field.height) <= f64::from(row).ceil(),
+                "text field {field:?} at window height {height}, expected <= {row}"
+            );
+        }
     }
 
     #[test]
