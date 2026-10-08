@@ -27,6 +27,7 @@ tiff = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 zip = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

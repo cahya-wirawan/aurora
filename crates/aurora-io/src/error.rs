@@ -226,4 +226,85 @@ pub enum IoError {
          (first: {first})"
     )]
     IncompleteComposite { skipped: usize, first: String },
+    /// [`crate::psd::decode`] was given bytes that do not start with a
+    /// Photoshop file's own `8BPS` signature — not a PSD/PSB file at
+    /// all, whatever its extension says.
+    #[error("not a Photoshop file (no 8BPS signature)")]
+    NotPsd,
+    /// A PSD/PSB file ended before a structure it declares did — the
+    /// usual result of a truncated download or copy. `what` names the
+    /// structure being read when the bytes ran out.
+    #[error("the Photoshop file ends too early (while reading {what})")]
+    PsdTruncated { what: &'static str },
+    /// A PSD/PSB structure is internally inconsistent — a length that
+    /// disagrees with the data, a compressed row that decodes to the
+    /// wrong size, an inverted rectangle. `what` names the structure.
+    #[error("the Photoshop file is damaged ({what})")]
+    PsdMalformed { what: &'static str },
+    /// The header's own version field is neither `1` (PSD) nor `2`
+    /// (PSB).
+    #[error("unsupported Photoshop file version {0}")]
+    UnsupportedPsdVersion(u16),
+    /// The file uses a colour mode this reader does not decode — only
+    /// RGB is read (0.144.0).
+    #[error(
+        "the file uses the {name} colour mode (code {code}); only RGB can be opened",
+        name = psd_color_mode_name(*.0),
+        code = .0
+    )]
+    UnsupportedPsdColorMode(u16),
+    /// The file's bit depth is not 8 or 16 bits per channel.
+    #[error("the file uses {0} bits per channel; only 8 and 16 can be opened")]
+    UnsupportedPsdDepth(u16),
+    /// A channel uses a compression method this reader does not know
+    /// (PSD defines `0`..=`3`).
+    #[error("the file uses unknown compression method {0}")]
+    UnsupportedPsdCompression(u16),
+    /// The canvas or a layer is larger than the format (30,000 px for
+    /// PSD, 300,000 px for PSB) or Aurora's own document ceiling allows.
+    #[error("the file declares a {width}x{height} image, past the {max}px limit")]
+    PsdTooLarge { width: u64, height: u64, max: u64 },
+    /// The file's layers add up to more pixels than this reader holds
+    /// in memory at once. Checked from the declared rectangles *before*
+    /// any pixel buffer is allocated, so a small hostile file cannot
+    /// turn into a huge allocation.
+    #[error("the file's layers add up to {total} pixels, past this reader's {max}-pixel limit")]
+    PsdPixelBudget { total: u64, max: u64 },
+    /// The file nests layer groups deeper than an Aurora document can
+    /// hold (`aurora_doc::MAX_LAYER_TREE_DEPTH`).
+    #[error("the file nests layer groups more than {max} deep")]
+    PsdGroupsTooDeep { max: usize },
+    /// A pixel buffer the file legitimately needs (its size already
+    /// checked against [`crate::psd::PIXEL_BUDGET`] and against the bytes
+    /// actually present) could not be allocated — the machine is out of
+    /// memory. Reported instead of aborting the process (0.144.0 review).
+    #[error("not enough memory to open the Photoshop file ({bytes} bytes needed for one buffer)")]
+    PsdOutOfMemory { bytes: u64 },
+    /// [`crate::write_into_store_at`] was asked to place an image so far
+    /// from its surface's own origin that a tile coordinate would not
+    /// fit in `u32`.
+    #[error("cannot place a {width}x{height} image at ({x}, {y}) in a tile surface")]
+    ImagePlacementOutOfRange {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// The user-facing name of a PSD header colour-mode code, for
+/// [`IoError::UnsupportedPsdColorMode`]'s message.
+#[must_use]
+pub fn psd_color_mode_name(mode: u16) -> &'static str {
+    match mode {
+        0 => "Bitmap",
+        1 => "Grayscale",
+        2 => "Indexed Color",
+        3 => "RGB",
+        4 => "CMYK",
+        7 => "Multichannel",
+        8 => "Duotone",
+        9 => "Lab",
+        _ => "unknown",
+    }
 }

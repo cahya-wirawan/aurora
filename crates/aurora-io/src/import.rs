@@ -44,30 +44,74 @@ pub fn write_into_store(
     store: &mut TileStore,
     surface: SurfaceId,
 ) -> Result<(), IoError> {
+    write_into_store_at(image, store, surface, 0, 0)
+}
+
+/// [`write_into_store`], but with `image`'s own top-left corner placed at
+/// surface-local `(dx, dy)` instead of `(0, 0)` (0.144.0 review): what a
+/// PSD layer whose own rectangle sits inside a larger, canvas-anchored
+/// layer bounds needs (`crate::psd::build_document`'s normalisation).
+///
+/// Touches only the tiles the placed image overlaps — every other tile
+/// of the surface stays never-written, which the tile store treats as
+/// fully transparent and holds no memory or scratch space for. Within a
+/// touched tile only the overlapped region is copied; the rest of a
+/// freshly allocated tile is already zero.
+///
+/// # Errors
+///
+/// [`IoError::ImagePlacementOutOfRange`] if `dx + width` or `dy + height`
+/// does not fit in `u32` (no tile is touched then), or [`IoError::Tile`]
+/// if paging a touched tile in from the scratch disk fails.
+pub fn write_into_store_at(
+    image: &Image,
+    store: &mut TileStore,
+    surface: SurfaceId,
+    dx: u32,
+    dy: u32,
+) -> Result<(), IoError> {
     let width = image.width();
     let height = image.height();
     if width == 0 || height == 0 {
         return Ok(());
     }
+    let out_of_range = || IoError::ImagePlacementOutOfRange {
+        x: dx,
+        y: dy,
+        width,
+        height,
+    };
+    // Exclusive surface-local right/bottom edges.
+    let right = dx.checked_add(width).ok_or_else(out_of_range)?;
+    let bottom = dy.checked_add(height).ok_or_else(out_of_range)?;
     let samples = image.samples();
-    let tiles_x = width.div_ceil(TILE);
-    let tiles_y = height.div_ceil(TILE);
+    let row_len = width as usize;
 
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let origin_x = tx * TILE;
-            let origin_y = ty * TILE;
-            let w = (width - origin_x).min(TILE);
-            let h = (height - origin_y).min(TILE);
+    for ty in (dy / TILE)..bottom.div_ceil(TILE) {
+        for tx in (dx / TILE)..right.div_ceil(TILE) {
+            // The tile's own surface-local extent, clipped to the image.
+            let tile_x0 = tx * TILE;
+            let tile_y0 = ty * TILE;
+            let x0 = tile_x0.max(dx);
+            let y0 = tile_y0.max(dy);
+            let x1 = tile_x0.saturating_add(TILE).min(right);
+            let y1 = tile_y0.saturating_add(TILE).min(bottom);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            let w = (x1 - x0) as usize;
             let tile = store.get_mut(surface, TileId { x: tx, y: ty })?;
             let texels = tile.texels_mut();
 
-            for ly in 0..h {
-                let src_start =
-                    ((origin_y + ly) as usize * width as usize + origin_x as usize) * CHANNELS;
-                let src_end = src_start + (w as usize) * CHANNELS;
-                let dst_start = (ly * TILE) as usize * CHANNELS;
-                let dst_end = dst_start + (w as usize) * CHANNELS;
+            for sy in y0..y1 {
+                // Image-local source row/column, tile-local destination.
+                let src_row = (sy - dy) as usize;
+                let src_col = (x0 - dx) as usize;
+                let src_start = (src_row * row_len + src_col) * CHANNELS;
+                let src_end = src_start + w * CHANNELS;
+                let dst_start =
+                    ((sy - tile_y0) as usize * TILE as usize + (x0 - tile_x0) as usize) * CHANNELS;
+                let dst_end = dst_start + w * CHANNELS;
                 if let (Some(src), Some(dst)) = (
                     samples.get(src_start..src_end),
                     texels.get_mut(dst_start..dst_end),
@@ -77,10 +121,10 @@ pub fn write_into_store(
             }
 
             tile.mark_dirty(aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
+                x: i64::from(x0 - tile_x0),
+                y: i64::from(y0 - tile_y0),
+                width: x1 - x0,
+                height: y1 - y0,
             });
         }
     }

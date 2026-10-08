@@ -26,7 +26,28 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.143.1): opening or saving a file never fails
+**Latest (2026-10-08, 0.144.0): PSD and PSB files open, layered.**
+`aurora_io::psd` is Aurora's own reader (no third-party PSD crate) for
+8- and 16-bit RGB Photoshop files: raw, PackBits, ZIP and ZIP-with-
+prediction channels; layers from the layer-info section or a 16-bit
+file's `Lr16` block; groups (section dividers, depth-capped, walked with
+an explicit stack); Unicode names; opacity, fill opacity, all 27 blend
+modes and visibility; the merged image for a file with no layers.
+`App::open_file` routes `.psd`/`.psb` to `App::open_psd_file`, which
+installs the whole tree exactly as a flat image is installed (old tiles
+swept first, then every layer written). Anything Aurora can't show yet
+— masks (decoded, not applied until 0.145.0), clipping, effects,
+adjustment/fill layers, Pass Through with blend modes inside — is listed
+in an "Opened With Changes" dialog; CMYK/Lab/Grayscale/32-bit get their
+own "Couldn't Open File" reason. Over the 272-file psd-tools corpus: 217
+open, 55 refused as unsupported, 0 refused as damaged, and for all 217
+the layer tree matches psd-tools' except for deliberately left-out
+records, with 728 of 728 comparable layers' pixel sums equal. 2,683
+tests passing (after the review revision) (`AURORA_REQUIRE_GPU=1`, RTX 3090). **Not yet verified on
+real hardware** — the user's own PSD is the test. Details: M1.8's
+open-file bullet, "Update 0.144.0".
+
+**Previously (2026-10-08, 0.143.1): opening or saving a file never fails
 silently.** A real macOS session opened a `.psd` and nothing happened:
 `aurora_io::decode_by_extension` has no PSD reader, and `App::open_file`
 only logged. Every refused open — flat image or `.aur` — now raises a
@@ -8561,7 +8582,7 @@ structural design work.
   applies to a bad autosave. All three existing "the user chose a file"
   paths — the command palette, a dropped file, and the macOS native
   menu — now call it instead of just recording the path. 5 new tests
-  (93 total in `aurora-app`). Still open: PSD/PSB (this bullet's own
+  (93 total in `aurora-app`). Still open: PSD/PSB (read since 0.144.0, below; this bullet's own
   scope was always PNG/JPEG/TIFF, the formats `aurora-io` already
   decoded); a document with more than one layer (an opened file always
   becomes exactly one pixel layer, matching what a flat image actually
@@ -8626,6 +8647,135 @@ structural design work.
   `App`'s wiring. Before that revision the full gate was green on the RTX
   3090 with `AURORA_REQUIRE_GPU=1` (2,625 passed, 0 failed, 0 skipped;
   doctests, strict rustdoc, `cargo deny` clean).
+
+  **Update 0.144.0 — PSD/PSB layered read.** The user's `.psd` now opens.
+  `aurora-io` gained `psd` (`decode` → `PsdFile`, `build_document` →
+  `PsdDocument { layers, history, canvas_size, pixels, report }`, `read`
+  = both; re-exported as `read_psd`/`decode_psd`/`build_psd_document`),
+  written from the format rather than on a PSD crate, and a direct
+  `flate2` dependency (already in the lock file via `png`/`zip`; no new
+  package, `cargo deny` clean). Scope: colour mode RGB, 8 or 16 bits;
+  compression 0–3; PSD and PSB (8-byte section, channel and wide-key
+  block lengths, 4-byte RLE row counts); layers from the layer-info
+  section or `Lr16`/`Layr`; `luni` names over Pascal; `lsct`/`lsdk`
+  groups (type 3 opens, 1/2 closes, the divider's blend key wins);
+  `iOpa` fill opacity; flags bit 1 = hidden; the merged image only when
+  the tree is entirely empty. Samples are promoted straight to `f16`
+  (`promote_u8`/`promote_u16`), tagged sRGB. Untrusted-input rules: every
+  read is bounds-checked, size arithmetic checked, channel lengths summed
+  against the remaining bytes before slicing, the decoded total checked
+  against `PIXEL_BUDGET` (2^28 px) from the declared rectangles before
+  anything is allocated, zlib read through `take(expected + 1)`, group
+  nesting capped at `MAX_GROUP_DEPTH` (255) on an explicit stack.
+  Lenient where real files require it, each found on the corpus: an
+  inverted layer rectangle (`vector-mask2.psd`) is empty rather than an
+  error, and a groups-only file never reads its (truncated, in
+  `group-divider-blend-mode.psd`) merged image. `aurora-app`:
+  `is_psd_path` → `App::open_psd_file` (read → `open_psd_document` →
+  `report_open_failure` on refusal) → `install_opened_document`, the
+  flat-image install path factored out so both opens share it;
+  `replace_document_pixels` now takes every incoming `(LayerId, &Image)`
+  and writes them all after the one sweep. `open_failure_message` names
+  the PSD refusals (unsupported mode/depth/compression/version; too
+  large/deep; damaged) and `OPENABLE_FORMATS` lists PSD/PSB. A non-empty
+  import report raises "Opened With Changes" (`psd_report_message`, one
+  "OK"). **Evidence:** 35 `aurora-io` PSD tests (a `cfg(test)` PSD/PSB
+  writer for every structural case; real psd-tools fixtures committed
+  under `crates/aurora-io/tests/fixtures/psd/` with psd-tools' MIT
+  `LICENSE` and a `PROVENANCE.md` of sha256s, expected values read with
+  psd-tools 1.17.4; every-prefix truncation and 24,000 seeded single-byte
+  mutations, no panic; a corpus sweep that prints `SKIPPED` without the
+  gitignored corpus) and 7 new plus 3 rewritten `aurora-app` tests. Corpus
+  sweep: 272 files, 217 opened, 55 unsupported (colour modes, 32-bit),
+  0 damaged; a one-off differential against psd-tools (not committed)
+  matched the layer tree of 184 files exactly, the other 33 differing
+  only by records deliberately left out (adjustment layers, shape/fill
+  layers with no stored pixels, or the merged-image fallback), and 728 of
+  728 comparable layers' pixel sums. Mutations (each really run, restored
+  and checksum-verified): 21 run, 19 killed; the 2 survivors are `App`
+  wiring (`open_psd_file`'s refusal calling `report_open_failure`, and
+  `open_file`'s `is_psd_path` dispatch), inspection-only like the rest
+  of `App`. **Disclosed:** read only (no PSD write); in memory, not
+  through the tile store (breaks invariant §7.3.1 for this path; the
+  2 GB/5 s budget is not addressed); ICC ignored (reported only when the
+  profile is not recognisably sRGB, a byte-match heuristic); Grayscale is
+  0.145.0, CMYK/Lab/32-bit refused; masks decoded but not applied, vector
+  masks, clipping, effects (reported whenever an `lfx2`/`lrFX` block is
+  present, even if disabled), Blend If and knockout not applied (the last
+  two unreported); text/smart objects/shapes open as their stored pixels;
+  shape and fill layers with no stored pixels are left out; Pass Through
+  becomes Normal (reported only when a blend mode inside could differ);
+  Pascal names read as Latin-1. (Two lines that stood here were wrong
+  and are corrected by the review revision below: Ctrl+Z never took the
+  import apart, and the active layer is no longer root-only.)
+
+  **Review revision (0.144.0, same version).** A critic (BLOCK) and a
+  red-team pass found five must-fix issues; all are fixed, each with a
+  test, and the four behavioural ones were shown failing on the
+  pre-revision code first (backup in the session scratchpad, restored and
+  sha256-verified). *C-01, view anchored at a layer corner:* the app
+  anchors the view, pan limit and composite grid to the active layer's
+  origin, and Photoshop crops layers to their content. `build_document`
+  now gives every pixel layer bounds = its own rectangle ∪ the canvas,
+  with its pixels placed at an offset (`PsdPixels { layer, image,
+  offset }`) through the new `aurora_io::write_into_store_at`; untouched
+  tiles stay never-written (transparent, no memory). Pre-fix a layer at
+  (255, 255) kept bounds (255, 255, 2, 2). *C-02, Ctrl+Z:* the History
+  panel lists the journal, but `install_opened_document` reset
+  `undo_order` while `History` still held the build steps, so neither
+  "undo takes the import apart" nor "nothing to undo" was consistently
+  true. New `History::clear_undo` (journal kept — autosave and crash
+  recovery replay it) is called by `build_document`, `document_from_image`
+  and `install_opened_document`: an opened file is the undo baseline,
+  `can_undo()` is false, and the panel lists the journal exactly as a
+  reopened `.aur` does. *C-03:* `topmost_pixel_layer` is now a
+  depth-first, top-first walk, so an all-groups file opens with an active
+  pixel layer (pre-fix: `None`). *C-04/RT-01/RT-03, amplification:* a
+  124-byte file declaring a 16384² layer with no channels took 910 ms and
+  2 GiB; one with empty RLE channels took 1.01 s before erroring. Now a
+  layer with no colour/alpha channel opens empty (reported); every
+  channel to be decoded must hold at least `min_channel_len` bytes (raw:
+  exact; RLE: row table + 2 bytes per 128-byte run per row; ZIP:
+  samples / 2064, half deflate's 1032:1 maximum) *before* the RGBA buffer
+  exists; every pixel buffer is `try_reserve_exact` → new
+  `IoError::PsdOutOfMemory`; the merged image is inflated one plane at a
+  time into one reused buffer (no 3-plane intermediate). Both cases now
+  return in well under 100 ms. A ZIP layer can still cost ~2,000× its
+  compressed size, bounded by `PIXEL_BUDGET`. *C-05/RT-02:* only the
+  first channel of each id is decoded; duplicates are counted and never
+  inflated (pre-fix a 50-duplicate layer decoded every copy — the test's
+  wrong-size duplicate failed the open). **P2:** a damaged mask no longer
+  fails the open (C-06, reported); a layer whose pixels fail to reach the
+  tile store is now reported in the open dialog rather than only logged
+  (C-07, also for flat images); the merged fallback uses the merged alpha
+  (negative layer count, `Mtrn`/`Mt16`) and removes Photoshop's white
+  matte as psd-tools does (C-08); `open_file`'s dispatch is the pure
+  `open_route` → `OpenRoute { Aur, Psd, Image }`, unit-tested (C-12,
+  kills the 0.144.0 dispatch survivor); one serialised sRGB profile is
+  re-parsed per image instead of built per image (RT-04: 2,000 builds
+  203 ms vs 1.5 ms; 32,767 1×1 layers decode + build in 257 ms). **P3:**
+  a fill layer with pixels and no vector mask is reported as a fill, not
+  a shape (C-09); Blend If (non-default blending ranges) and Knockout
+  are now reported (C-10; the corpus has 0 Blend If and 1 Knockout file);
+  a rectangle whose right/bottom edge is past the document range is a
+  typed error, and a canvas-anchored bounds wider than the document
+  ceiling is `PsdTooLarge` (C-11). Corpus unchanged: 272 files, 217
+  opened, 55 unsupported, 0 damaged. **Still disclosed, named
+  follow-ons:** the decode runs synchronously on the UI thread
+  (invariant §7.3.4) and reads the whole file into memory (§7.3.1);
+  layer flags bits 3/4 ("pixel data irrelevant") are ignored; fill
+  opacity is applied uniformly, though Photoshop treats it differently
+  for its special blend modes; the merged-alpha path does not consult
+  the alpha-identifiers resource.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,683 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean. Judge:
+  PASS, 0.903. Carried: widening bounds to the canvas can turn a legal
+  far-off-canvas layer into `PsdTooLarge` (clip the overflow or give it
+  its own message); view/pan now includes a layer's off-canvas overflow
+  (export is unaffected — `canvas_size` comes from the header); a
+  per-open memory ceiling tied to available RAM; check whether a
+  duplicate `-2`/`-3` mask channel is decoded once only.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30024,6 +30174,14 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.144.0) — PSD/PSB layered read.** Done as
+0.143.1 suggested. Full account: M1.8's open-file bullet, "Update
+0.144.0". **Needs a human:** open the PSD that showed nothing on macOS,
+plus one with groups and one 16-bit file, and compare against Photoshop;
+check the "Opened With Changes" dialog reads well and is announced.
+**Suggested next (0.145.0):** apply layer masks (already decoded into
+`PsdMask`) through `add_mask`/`write_mask_coverage`, and Grayscale.
 
 **Addendum 2026-10-08 (0.143.1) — never fail silently when opening a
 file.** Patch for the real-macOS `.psd` report: refused opens and saves

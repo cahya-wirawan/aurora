@@ -779,6 +779,11 @@ fn document_from_image(
         Ok(id) => id,
         Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
     };
+    // The opened file is the undo baseline: the journal keeps the add
+    // (autosave/recovery replay it, the History panel lists it), the undo
+    // stack does not (0.144.0 review) -- `App::install_opened_document`
+    // resets `undo_order` to match.
+    history.clear_undo();
     (layers, history, id)
 }
 
@@ -872,6 +877,93 @@ fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
 fn is_aur_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("aur"))
+}
+
+/// Whether `path`'s own extension names a Photoshop file — `.psd` or
+/// `.psb`, case-insensitively — which [`App::open_file`] routes to
+/// [`App::open_psd_file`] (0.144.0) instead of the flat-image decoders.
+#[must_use]
+fn is_psd_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("psd") || ext.eq_ignore_ascii_case("psb"))
+}
+
+/// Which reader [`App::open_file`] hands a chosen path to — the pure,
+/// testable half of its dispatch (0.144.0 review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenRoute {
+    /// An Aurora document ([`is_aur_path`]).
+    Aur,
+    /// A Photoshop file ([`is_psd_path`]).
+    Psd,
+    /// Everything else: the flat-image decoders, which refuse an
+    /// extension they do not know with a typed error.
+    Image,
+}
+
+#[must_use]
+fn open_route(path: &Path) -> OpenRoute {
+    if is_aur_path(path) {
+        OpenRoute::Aur
+    } else if is_psd_path(path) {
+        OpenRoute::Psd
+    } else {
+        OpenRoute::Image
+    }
+}
+
+/// The open-report sentence for `unwritten` layers whose pixels could
+/// not be written into the tile store (0.144.0 review, C-07) — `None`
+/// when every layer was written.
+#[must_use]
+fn unwritten_layers_item(unwritten: usize) -> Option<String> {
+    (unwritten > 0).then(|| {
+        format!(
+            "{unwritten} layer{s} could not be loaded into memory and {is} shown empty.",
+            s = if unwritten == 1 { "" } else { "s" },
+            is = if unwritten == 1 { "is" } else { "are" },
+        )
+    })
+}
+
+/// Decodes a chosen PSD/PSB file's bytes into a whole document
+/// (`aurora_io::read_psd`) — [`App::open_psd_file`]'s testable half. A
+/// refusal is an [`OpenFailure::Decode`] carrying the reader's own typed
+/// error, which [`open_failure_message`] turns into plain language.
+fn open_psd_document(bytes: &[u8]) -> Result<aurora_io::PsdDocument, OpenFailure> {
+    aurora_io::read_psd(bytes).map_err(OpenFailure::Decode)
+}
+
+/// The "Opened With Changes" dialog's title (0.144.0).
+const PSD_REPORT_TITLE: &str = "Opened With Changes";
+
+const PSD_REPORT_DISMISS: &str = "psd.report.dismiss";
+
+/// The import-report dialog's single "OK": the document is already
+/// open; the dialog only says what it could not show.
+fn psd_report_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(PSD_REPORT_DISMISS, "OK")]
+}
+
+/// The import-report message for a PSD that opened but uses things
+/// Aurora cannot show faithfully yet — `None` for one it shows as
+/// Photoshop would, which opens with no dialog at all. Each report item
+/// is one sentence from `aurora_io::psd`, sanitized like every other
+/// file-derived string a dialog shows; the file is never modified.
+fn psd_report_message(file_name: &str, report: &aurora_io::PsdImportReport) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = report
+        .items
+        .iter()
+        .map(|item| aurora_doc::sanitize_display_name(item).into_owned())
+        .collect();
+    Some(format!(
+        "\"{file_name}\" opened, but this version of Aurora can't show all of it yet. {} \
+         The original file has not been changed.",
+        items.join(" ")
+    ))
 }
 
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
@@ -1228,14 +1320,18 @@ fn replace_document(
 }
 
 /// The store-side half of replacing the current document with a freshly
-/// opened flat image: frees every tile the *outgoing* document still
+/// opened flat image or PSD: frees every tile the *outgoing* document still
 /// holds — its layer and mask surfaces
 /// (`aurora_doc::forget_document_surfaces`) plus this crate's own
 /// reserved composite-preview surface ([`composite_surface_id`], which
 /// no `LayerTree` can name and so no `aurora-doc` sweep can reach) —
-/// then writes `image`'s own pixels onto the incoming layer's surface
-/// (`aurora_io::write_into_store`). Returns how many tiles were freed,
-/// summed across both sweeps.
+/// then writes each `incoming` image onto its own layer's surface at its
+/// own surface-local offset (`aurora_io::write_into_store_at`) — one
+/// entry at `(0, 0)` for a flat image, one per pixel layer for a PSD.
+/// Returns how many tiles were freed, summed across both sweeps, and how
+/// many incoming layers' pixels could **not** be written — which the
+/// caller must surface to the user (0.144.0 review: a write failure used
+/// to be log-only, i.e. a silently blank layer).
 ///
 /// # Why the composite surface is swept here too
 ///
@@ -1290,32 +1386,41 @@ fn replace_document_pixels(
     outgoing_layers: aurora_doc::LayerTree,
     outgoing_history: aurora_doc::History,
     incoming_layers: &aurora_doc::LayerTree,
-    incoming_layer: aurora_doc::LayerId,
-    image: &aurora_io::Image,
-) -> usize {
+    incoming: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+) -> (usize, usize) {
     let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
         + store.forget_surface(composite_surface_id());
-    // Its own `else`, not folded into the write below: a layer with no
-    // surface means the document just opened has nowhere to put its
-    // pixels and will come up blank. That is worth a loud line even
-    // though `document_from_image` always builds a pixel layer -- every
-    // other skipped or failed path in this crate says so, and a silent
-    // blank canvas is the one outcome a user cannot diagnose.
-    let Some(surface) = incoming_layers.surface_id(incoming_layer) else {
-        tracing::error!(
-            ?incoming_layer,
-            "the opened document's layer has no surface; its pixels were not written into the \
-             tile store and the canvas will be blank"
-        );
-        return freed;
-    };
-    if let Err(err) = aurora_io::write_into_store(image, store, surface) {
-        tracing::warn!(
-            ?err,
-            "failed to write the opened image's pixels into the tile store"
-        );
+    // Every incoming layer is written only after the sweep above has
+    // finished -- all of them, not just the first: with a multi-layer
+    // PSD (0.144.0) every one of its layer ids, not only id 0, can alias
+    // a surface the outgoing document still held.
+    let mut failed = 0_usize;
+    for (incoming_layer, image, (dx, dy)) in incoming {
+        // Its own `else`, not folded into the write below: a layer with
+        // no surface means the document just opened has nowhere to put
+        // its pixels and will come up blank. That is worth a loud line
+        // even though every caller builds pixel layers -- every other
+        // skipped or failed path in this crate says so, and a silent
+        // blank canvas is the one outcome a user cannot diagnose.
+        let Some(surface) = incoming_layers.surface_id(*incoming_layer) else {
+            tracing::error!(
+                ?incoming_layer,
+                "an opened document's layer has no surface; its pixels were not written into the \
+                 tile store and it will be blank"
+            );
+            failed += 1;
+            continue;
+        };
+        if let Err(err) = aurora_io::write_into_store_at(image, store, surface, *dx, *dy) {
+            tracing::warn!(
+                ?err,
+                ?incoming_layer,
+                "failed to write an opened layer's pixels into the tile store"
+            );
+            failed += 1;
+        }
     }
-    freed
+    (freed, failed)
 }
 
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
@@ -2340,10 +2445,12 @@ enum OpenFailure {
     /// The file could not be read from disk at all (missing, permission
     /// denied, a device error).
     Read(std::io::Error),
-    /// A flat image (`aurora_io::decode_by_extension`) refused it — an
-    /// unrecognised extension (`IoError::UnsupportedExtension`, which is
-    /// where a `.psd` lands today) or a file that does not decode as the
-    /// format its extension names.
+    /// A flat image (`aurora_io::decode_by_extension`) or a PSD/PSB
+    /// (`aurora_io::read_psd`, 0.144.0) refused it — an unrecognised
+    /// extension (`IoError::UnsupportedExtension`), a file that does not
+    /// decode as the format its extension names, or a Photoshop file of a
+    /// kind this build does not read (CMYK, 32-bit, ...), each carried as
+    /// the reader's own typed error.
     Decode(aurora_io::IoError),
     /// A `.aur` document refused it during [`read_aur_for_open`]'s own
     /// throwaway pre-check, **before the live tile store was touched**.
@@ -2386,7 +2493,8 @@ fn open_failed_dialog_actions() -> Vec<DialogAction> {
 /// the one list every "can't open that kind of file" message names.
 /// Kept next to [`open_failure_message`] rather than derived from
 /// `aurora_io`, because that crate dispatches on extensions, not names.
-const OPENABLE_FORMATS: &str = "PNG, JPEG, TIFF and Aurora documents (.aur)";
+const OPENABLE_FORMATS: &str =
+    "PNG, JPEG, TIFF, Photoshop (PSD and PSB, 8- or 16-bit RGB) and Aurora documents (.aur)";
 
 /// The formats this build saves — [`save_failure_message`]'s own
 /// counterpart to [`OPENABLE_FORMATS`]. The same set today.
@@ -2493,10 +2601,23 @@ fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure)
             unsupported_extension_clause(ext, FileDirection::Open)
         ),
         OpenFailure::Decode(
+            err @ (aurora_io::IoError::PsdTooLarge { .. }
+            | aurora_io::IoError::PsdPixelBudget { .. }
+            | aurora_io::IoError::PsdGroupsTooDeep { .. }),
+        ) => format!(
+            "\"{file_name}\" is too large or too deeply nested for this version of Aurora to \
+             open. Details: {}.",
+            display_error_detail(err)
+        ),
+        OpenFailure::Decode(
             err @ (aurora_io::IoError::UnexpectedColorType(_)
             | aurora_io::IoError::UnexpectedJpegColorSpace(_)
             | aurora_io::IoError::UnsupportedTiffColorType(_)
-            | aurora_io::IoError::UnsupportedTiffSampleFormat(_)),
+            | aurora_io::IoError::UnsupportedTiffSampleFormat(_)
+            | aurora_io::IoError::UnsupportedPsdVersion(_)
+            | aurora_io::IoError::UnsupportedPsdColorMode(_)
+            | aurora_io::IoError::UnsupportedPsdDepth(_)
+            | aurora_io::IoError::UnsupportedPsdCompression(_)),
         ) => format!(
             "\"{file_name}\" uses a kind of {} that Aurora can't open yet. Details: {}.",
             format_name_for_extension(extension).unwrap_or("image"),
@@ -7095,18 +7216,32 @@ fn handle_zoom_tool_click(
 // renders in its new place, not just in the document model. Undo-as-
 // you-drag remains separate, still-open follow-on work.
 
-/// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
-/// initial value. `layers.roots()` is already ordered top-to-bottom
-/// (index 0 topmost, matching every panel in this workspace), so the
-/// first root that's a pixel layer (skipping any group) is it. `None`
-/// for a document with no pixel layer at all.
+/// The topmost pixel layer in `layers`, at any depth — [`App::active_layer`]'s
+/// own initial value. Every level is ordered top-to-bottom (index 0
+/// topmost, matching every panel in this workspace), so a depth-first,
+/// top-first walk meets the visually topmost pixel layer first: a group
+/// is searched, child by child, before anything below it. `None` for a
+/// document with no pixel layer at all.
+///
+/// Until the 0.144.0 review this searched the roots only, so a PSD whose
+/// every root is a group — common in real files — opened with no active
+/// layer and a brush that painted nothing. Walked with an explicit stack;
+/// the tree's own depth cap bounds it either way.
 #[must_use]
 fn topmost_pixel_layer(layers: &aurora_doc::LayerTree) -> Option<aurora_doc::LayerId> {
-    layers
-        .roots()
-        .iter()
-        .copied()
-        .find(|&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. })))
+    // Reversed onto the stack so the topmost sibling is popped first.
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        match layers.kind(id) {
+            Some(aurora_doc::LayerKind::Pixel { .. }) => return Some(id),
+            _ => {
+                if let Some(children) = layers.children(id) {
+                    stack.extend(children.iter().rev().copied());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `active_layer`, together with its own bounds, if it names a real
@@ -17418,9 +17553,16 @@ impl App {
     fn open_file(&mut self, path: &Path) {
         // A live opacity drag belongs to the document being replaced.
         self.commit_layer_controls_drag();
-        if is_aur_path(path) {
-            self.open_aur_file(path);
-            return;
+        match open_route(path) {
+            OpenRoute::Aur => {
+                self.open_aur_file(path);
+                return;
+            }
+            OpenRoute::Psd => {
+                self.open_psd_file(path);
+                return;
+            }
+            OpenRoute::Image => {}
         }
         let image = match open_image(path) {
             Ok(image) => image,
@@ -17434,11 +17576,147 @@ impl App {
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image");
         let (layers, history, layer_id) = document_from_image(name, &image);
+        // The image's own real, decoded dimensions -- known exactly
+        // here, rather than derived back out of the one layer just
+        // built from it (`document_canvas_size`'s own fallback role).
+        let canvas_size = (image.width(), image.height());
+        let Some(unwritten) = self.install_opened_document(
+            layers,
+            history,
+            &[(layer_id, &image, (0, 0))],
+            canvas_size,
+        ) else {
+            return;
+        };
+        if let Some(item) = unwritten_layers_item(unwritten) {
+            let report = aurora_io::PsdImportReport { items: vec![item] };
+            if let Some(message) = psd_report_message(&display_file_name(path), &report)
+                && !self.open_psd_report_dialog(&message)
+            {
+                tracing::warn!(%message, "the open report could not be shown");
+            }
+        }
+    }
+
+    /// Opens a Photoshop file (0.144.0): reads and decodes it whole
+    /// ([`open_psd_document`], `aurora_io::read_psd`) into a real,
+    /// multi-layer document with its groups, names, opacity, fill
+    /// opacity, blend modes and visibility, then installs it exactly the
+    /// way a flat image is installed ([`Self::install_opened_document`]:
+    /// old tiles swept first, every layer's pixels written, autosave,
+    /// view reset). A refused file — unreadable, damaged, or a kind this
+    /// build does not read (CMYK, 32-bit, ...) — reaches the user through
+    /// [`Self::report_open_failure`] with the reader's own reason, and
+    /// leaves the current document untouched: nothing is swapped or
+    /// swept until the whole file has decoded.
+    ///
+    /// A file that opened but uses things Aurora cannot show yet
+    /// (adjustment layers, masks, clipping, effects, ...) gets the
+    /// itemised [`PSD_REPORT_TITLE`] dialog ([`psd_report_message`]);
+    /// one shown faithfully opens with no dialog.
+    fn open_psd_file(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
+                self.report_open_failure(path, &OpenFailure::Read(err));
+                return;
+            }
+        };
+        let document = match open_psd_document(&bytes) {
+            Ok(document) => document,
+            Err(failure) => {
+                tracing::warn!(path = %path.display(), ?failure, "failed to decode the chosen PSD");
+                self.report_open_failure(path, &failure);
+                return;
+            }
+        };
+        drop(bytes);
+        let aurora_io::PsdDocument {
+            layers,
+            history,
+            canvas_size,
+            pixels,
+            report,
+        } = document;
+        let mut report = report;
+        let incoming: Vec<(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))> = pixels
+            .iter()
+            .map(|placed| (placed.layer, &placed.image, placed.offset))
+            .collect();
+        let Some(unwritten) = self.install_opened_document(layers, history, &incoming, canvas_size)
+        else {
+            return;
+        };
+        drop(incoming);
+        drop(pixels);
+        report.items.extend(unwritten_layers_item(unwritten));
+        if let Some(message) = psd_report_message(&display_file_name(path), &report) {
+            tracing::info!(path = %path.display(), items = report.items.len(), "opened a PSD with changes");
+            if !self.open_psd_report_dialog(&message) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %message,
+                    "the PSD import report could not be shown (a dialog is already open)"
+                );
+            }
+        }
+    }
+
+    /// Opens the [`PSD_REPORT_TITLE`] dialog with `message`, relaid out
+    /// and announced — [`Self::open_skipped_tiles_dialog`]'s shape.
+    /// Returns whether it actually opened.
+    fn open_psd_report_dialog(&mut self, message: &str) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            PSD_REPORT_TITLE,
+            message,
+            psd_report_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
+    }
+
+    /// Makes a freshly decoded document (a flat image's one layer, or a
+    /// PSD's whole tree) *the* document: rebuilds the panels
+    /// ([`replace_document`]), swaps the tree and history in, sweeps the
+    /// outgoing document's tiles and only then writes every `pixels`
+    /// entry ([`replace_document_pixels`] — the order is forced, see
+    /// there), autosaves, and resets the per-document session state.
+    /// Returns `None` — with the current document untouched — if the
+    /// design scales or the panel rebuild fail first (log-only: there is
+    /// no dialog to build without the scales); otherwise how many layers'
+    /// pixels could not be written into the tile store, which the caller
+    /// must tell the user about ([`unwritten_layers_item`]).
+    fn install_opened_document(
+        &mut self,
+        layers: aurora_doc::LayerTree,
+        mut history: aurora_doc::History,
+        pixels: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+        canvas_size: (u32, u32),
+    ) -> Option<usize> {
+        // The opened file is the undo baseline -- see the `undo_order`
+        // reset below for why this must agree with it.
+        history.clear_undo();
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
                 tracing::error!(%err, "failed to load design scales; cannot open a document");
-                return;
+                return None;
             }
         };
         let (layer_rows, active_layer) = match replace_document(
@@ -17455,14 +17733,9 @@ impl App {
                     ?err,
                     "failed to rebuild the workspace panels for the opened document"
                 );
-                return;
+                return None;
             }
         };
-
-        // The image's own real, decoded dimensions -- known exactly
-        // here, rather than derived back out of the one layer just
-        // built from it (`document_canvas_size`'s own fallback role).
-        let canvas_size = (image.width(), image.height());
 
         // Every fallible step is behind us: nothing below this line can
         // still bail out, so this is the point at which the incoming
@@ -17475,18 +17748,19 @@ impl App {
         // and the sweep/write below.
         let outgoing_layers = std::mem::replace(&mut self.layers, layers);
         let outgoing_history = std::mem::replace(&mut self.history, history);
+        let mut unwritten_layers = 0_usize;
 
         if let Some(store) = self.tile_store.as_mut() {
             // Sweep, *then* write -- see `replace_document_pixels` for
             // why that order is forced and what the other one costs.
-            let freed = replace_document_pixels(
+            let (freed, failed) = replace_document_pixels(
                 store,
                 outgoing_layers,
                 outgoing_history,
                 &self.layers,
-                layer_id,
-                &image,
+                pixels,
             );
+            unwritten_layers = failed;
             tracing::debug!(
                 freed_tiles = freed,
                 "freed the previous document's tiles before writing the opened image's"
@@ -17496,7 +17770,7 @@ impl App {
             // so writing it first would persist an empty one.
             //
             // A fresh, empty carried record: a document decoded from a
-            // PNG/JPEG/TIFF has no `skipped-tiles` history of its own,
+            // PNG/JPEG/TIFF/PSD has no `skipped-tiles` history of its own,
             // and keeping the *previous* document's would attach one
             // file's losses to another file entirely. Assigned before
             // the write for the same reason `open_aur_file` assigns its
@@ -17527,12 +17801,17 @@ impl App {
         self.canvas_size = canvas_size;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- the `std::mem::replace` above
-        // installed a brand-new, empty `History` (not merged with the
-        // old one, which was swept and dropped instead), so
-        // keeping the old `pixel_history`/`undo_order` around would let
-        // Ctrl+Z reach into a document that's no longer open, and
-        // `undo_order` would already be desynced from `history`'s own
-        // (now-empty) stacks regardless.
+        // installed the incoming `History` (not merged with the old one,
+        // which was swept and dropped instead), so keeping the old
+        // `pixel_history`/`undo_order` around would let Ctrl+Z reach
+        // into a document that's no longer open. That incoming history
+        // is *not* empty -- its journal records every step that built
+        // the document (one add per layer, one per non-default
+        // property), which autosave and crash recovery replay and the
+        // History panel lists -- but its undo/redo stacks were cleared
+        // on the way in (`History::clear_undo`, 0.144.0 review), so a
+        // fresh `undo_order` agrees with it: the opened file is the
+        // baseline, and Ctrl+Z cannot take the import apart.
         self.pixel_history = aurora_brush::PixelHistory::new();
         self.undo_order = UndoOrder::default();
         self.composite_cache.bump();
@@ -17561,6 +17840,7 @@ impl App {
         // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
+        Some(unwritten_layers)
     }
 
     /// Opens a real `.aur` file (ADR 0009): `aurora_io::read_aur` gives
@@ -20242,7 +20522,7 @@ mod tests {
         Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
         GpuBlendDispatch, GpuBlendDispatches, GpuPaintOp, Key, KeyChord, MIN_WINDOW_HEIGHT,
         MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, OPEN_FAILED_DISMISS,
-        OPEN_FAILED_TITLE, OPEN_FAILED_UNCHANGED, OpenFailure, PALETTE_TOML, PanBounds,
+        OPEN_FAILED_TITLE, OPEN_FAILED_UNCHANGED, OpenFailure, OpenRoute, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
         RailResize, RecoveredDocument, SAVE_FAILED_UNCHANGED, SaveFailure, ShutdownState,
@@ -20261,17 +20541,18 @@ mod tests {
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
         hash_position, hash_to_unit_f32, incomplete_composite_message, install_startup_panels,
-        is_aur_path, layer_for_surface, layer_local_point, load_document_view, load_scales,
-        load_theme, logical_point, logical_size, mark_active_layer_row, mark_move_refusal_reported,
-        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
-        open_command_palette, open_crash_recovery_dialog, open_dialog, open_failure_message,
-        open_image, open_open_failed_dialog, open_tile_store, palette_commands, pan_bounds,
-        partial_autosave_path, perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider,
-        press_layer_row, previous_session_left_a_marker, read_aur_for_open,
-        recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
-        replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
-        route_accessibility_action, run_command, run_dialog_action, run_shutdown_cleanup,
-        sample_pixel, save_failure_message, select_layer, shift_bounds,
+        is_aur_path, is_psd_path, layer_for_surface, layer_local_point, load_document_view,
+        load_scales, load_theme, logical_point, logical_size, mark_active_layer_row,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_failure_message, open_image, open_open_failed_dialog, open_psd_document, open_route,
+        open_tile_store, palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo,
+        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, psd_report_dialog_actions, psd_report_message,
+        read_aur_for_open, recomposite_visible_tiles, reconcile_layer_rows, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, route_accessibility_action, run_command, run_dialog_action,
+        run_shutdown_cleanup, sample_pixel, save_failure_message, select_layer, shift_bounds,
         skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
         take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
         tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
@@ -22726,6 +23007,10 @@ mod tests {
         }
     }
 
+    /// `open_image` itself is the flat-image path only: a `.psd` never
+    /// reaches it from [`App::open_file`] since 0.144.0 (`is_psd_path`
+    /// routes it to [`App::open_psd_file`] first), and if one did, it
+    /// would still be refused rather than misread.
     #[test]
     fn open_image_reports_an_unsupported_extension_for_a_psd() {
         let dir = match tempfile::tempdir() {
@@ -22744,22 +23029,371 @@ mod tests {
         }
     }
 
-    /// The exact text the user who opened a `.psd` on macOS sees today
-    /// (0.143.1) — pinned word for word, because the whole round exists
-    /// so that this sentence reaches a screen instead of nothing.
+    /// The exact text a user opening a CMYK `.psd` sees (0.144.0) —
+    /// pinned word for word. Until 0.144.0 *every* `.psd` got a "can't
+    /// read Photoshop files yet" message (0.143.1); now RGB files open
+    /// and only the kinds this build really cannot read are refused, each
+    /// with the reader's own reason.
     #[test]
-    fn open_failure_message_for_a_psd_names_the_file_the_format_and_what_aurora_can_open() {
+    fn open_failure_message_for_a_cmyk_psd_names_the_file_and_the_colour_mode() {
         let message = open_failure_message(
             "photo.psd",
             "psd",
-            &OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension("psd".to_owned())),
+            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(4)),
         );
         assert_eq!(
             message,
-            "Aurora can't open \"photo.psd\": this version can't read Photoshop (PSD) files yet. \
-             It can open PNG, JPEG, TIFF and Aurora documents (.aur). Your current document has \
-             not changed."
+            "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
+             the file uses the CMYK colour mode (code 4); only RGB can be opened. Your current \
+             document has not changed."
         );
+    }
+
+    #[test]
+    fn open_failure_message_names_every_psd_refusal_in_plain_language() {
+        let psd = |err: aurora_io::IoError| {
+            open_failure_message("art.psd", "psd", &OpenFailure::Decode(err))
+        };
+        let cases = [
+            (
+                psd(aurora_io::IoError::UnsupportedPsdDepth(32)),
+                "uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: the file \
+                 uses 32 bits per channel; only 8 and 16 can be opened.",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdColorMode(1)),
+                "the Grayscale colour mode",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdCompression(9)),
+                "unknown compression method 9",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdVersion(3)),
+                "unsupported Photoshop file version 3",
+            ),
+            (
+                psd(aurora_io::IoError::PsdTruncated { what: "layer info" }),
+                "\"art.psd\" isn't a valid Photoshop (PSD) file, or it is damaged. Details: the \
+                 Photoshop file ends too early (while reading layer info).",
+            ),
+            (
+                psd(aurora_io::IoError::PsdMalformed {
+                    what: "layer rectangle",
+                }),
+                "the Photoshop file is damaged (layer rectangle)",
+            ),
+            (psd(aurora_io::IoError::NotPsd), "not a Photoshop file"),
+            (
+                psd(aurora_io::IoError::PsdTooLarge {
+                    width: 40_000,
+                    height: 1,
+                    max: 30_000,
+                }),
+                "is too large or too deeply nested for this version of Aurora to open",
+            ),
+            (
+                psd(aurora_io::IoError::PsdPixelBudget {
+                    total: 1 << 30,
+                    max: 1 << 28,
+                }),
+                "past this reader's 268435456-pixel limit",
+            ),
+            (
+                psd(aurora_io::IoError::PsdGroupsTooDeep { max: 255 }),
+                "nests layer groups more than 255 deep",
+            ),
+        ];
+        for (message, needle) in cases {
+            assert!(message.contains(needle), "{needle:?} not in {message:?}");
+            assert!(message.ends_with(OPEN_FAILED_UNCHANGED), "{message}");
+        }
+    }
+
+    /// C-12: `App::open_file`'s dispatch, as the pure function it calls.
+    #[test]
+    fn open_route_sends_each_extension_to_its_own_reader() {
+        for (path, route) in [
+            ("a.psd", OpenRoute::Psd),
+            ("a.PSB", OpenRoute::Psd),
+            ("b.aur", OpenRoute::Aur),
+            ("b.AUR", OpenRoute::Aur),
+            ("c.png", OpenRoute::Image),
+            ("c.tiff", OpenRoute::Image),
+            ("noext", OpenRoute::Image),
+            ("a.psd.png", OpenRoute::Image),
+        ] {
+            assert_eq!(open_route(std::path::Path::new(path)), route, "{path}");
+        }
+    }
+
+    /// C-03: a document whose every root is a group still gets an
+    /// active pixel layer — the topmost one at any depth.
+    #[test]
+    fn topmost_pixel_layer_searches_inside_groups_top_first() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let add_group = |layers: &mut aurora_doc::LayerTree, name: &str, parent| match layers
+            .add_group(name, parent)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let add_pixel = |layers: &mut aurora_doc::LayerTree, name: &str, parent| match layers
+            .add_pixel_layer(name, rect, parent)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Bottom root group with a pixel layer; top root group holding an
+        // empty group above a nested group with two pixel layers.
+        let low = add_group(&mut layers, "low", None);
+        let _low_px = add_pixel(&mut layers, "low px", Some(low));
+        let high = add_group(&mut layers, "high", None);
+        let nested = add_group(&mut layers, "nested", Some(high));
+        let _under = add_pixel(&mut layers, "under", Some(nested));
+        let over = add_pixel(&mut layers, "over", Some(nested));
+        let _empty = add_group(&mut layers, "empty", Some(high));
+        assert!(
+            layers
+                .roots()
+                .iter()
+                .all(|id| !matches!(layers.kind(*id), Some(aurora_doc::LayerKind::Pixel { .. })))
+        );
+        assert_eq!(topmost_pixel_layer(&layers), Some(over));
+    }
+
+    /// A smoke test on a real grouped file: `group.psd` opens with an
+    /// active pixel layer. It has a root pixel layer too, so it passed
+    /// with the old root-only search as well — the regression test for
+    /// all-groups files is `topmost_pixel_layer_searches_inside_groups_top_first`.
+    #[test]
+    fn an_all_groups_psd_opens_with_an_active_pixel_layer() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(active) = topmost_pixel_layer(&document.layers) else {
+            unreachable!("group.psd has pixel layers");
+        };
+        assert!(document.layers.bounds(active).is_some());
+    }
+
+    /// C-01: a PSD whose top layer Photoshop cropped to (8, 4, 85, 46)
+    /// opens with the view anchored at the canvas origin, and its pixels
+    /// land at their real document position.
+    #[test]
+    fn an_opened_psds_cropped_top_layer_is_anchored_at_the_canvas_origin() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/2layers.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(active) = topmost_pixel_layer(&document.layers) else {
+            unreachable!("2layers.psd has pixel layers");
+        };
+        assert_eq!(
+            active_layer_origin(&document.layers, Some(active)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            document.layers.bounds(active),
+            Some(aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 101,
+                height: 55
+            })
+        );
+        let Some(placed) = document.pixels.iter().find(|p| p.layer == active) else {
+            unreachable!("no pixels for the top layer");
+        };
+        assert_eq!(placed.offset, (8, 4));
+
+        let (_scratch, mut store) = real_tile_store();
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+        );
+        assert_eq!(failed, 0);
+        let Some(surface) = document.layers.surface_id(active) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        let tile = match store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Surface (8, 4) is the image's own (0, 0); surface (7, 3) is
+        // outside the cropped rectangle, so never written.
+        let at = |x: usize, y: usize| -> Vec<half::f16> {
+            let i = (y * aurora_tile::TILE as usize + x) * 4;
+            tile.texels()
+                .get(i..i + 4)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            at(8, 4),
+            placed
+                .image
+                .samples()
+                .get(..4)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        );
+        assert_eq!(at(7, 3), vec![half::f16::ZERO; 4]);
+    }
+
+    /// C-02: an opened document is the undo baseline — Ctrl+Z has nothing
+    /// to take apart, and the History panel lists exactly the journal.
+    #[test]
+    fn an_opened_document_cannot_be_undone_and_the_history_panel_lists_its_journal() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        assert!(!document.history.can_undo());
+        assert!(document.history.journal_len() > 1);
+        let (_layers, flat_history, _id) = document_from_image("photo", &fake_image(2, 2));
+        assert!(!flat_history.can_undo());
+        assert_eq!(flat_history.journal_len(), 1);
+
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        if let Err(err) = replace_document(
+            &mut workspace,
+            &scales,
+            &document.layers,
+            &document.history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            unreachable!("{err:?}");
+        }
+        let rows = workspace
+            .tree
+            .children(workspace.history.body)
+            .map_or(0, <[_]>::len);
+        assert_eq!(rows, document.history.journal_descriptions().len());
+    }
+
+    #[test]
+    fn is_psd_path_matches_psd_and_psb_case_insensitively() {
+        for yes in ["a.psd", "a.PSD", "b.psb", "B.PsB", "/x/y.z.psd"] {
+            assert!(is_psd_path(std::path::Path::new(yes)), "{yes}");
+        }
+        for no in ["a.png", "a.aur", "psd", "a.psd.png", "a.ps"] {
+            assert!(!is_psd_path(std::path::Path::new(no)), "{no}");
+        }
+    }
+
+    /// The real decode seam [`App::open_psd_file`] calls, on a real
+    /// psd-tools fixture (`aurora-io`'s committed `tests/fixtures/psd/`).
+    #[test]
+    fn open_psd_document_opens_a_real_two_layer_psd() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/2layers.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        assert_eq!(document.canvas_size, (101, 55));
+        assert_eq!(document.layers.roots().len(), 2);
+        assert_eq!(document.pixels.len(), 2);
+        assert!(document.report.is_empty());
+        let names: Vec<_> = document
+            .layers
+            .roots()
+            .iter()
+            .map(|id| document.layers.name(*id))
+            .collect();
+        assert_eq!(names, [Some("Слой"), Some("Фон")]);
+    }
+
+    #[test]
+    fn open_psd_document_refuses_unsupported_and_damaged_files_with_typed_errors() {
+        let lab = include_bytes!("../../aurora-io/tests/fixtures/psd/4x4_8bit_lab.psd");
+        assert!(matches!(
+            open_psd_document(lab),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::UnsupportedPsdColorMode(9)
+            ))
+        ));
+        let deep = include_bytes!("../../aurora-io/tests/fixtures/psd/32bit5x5.psd");
+        assert!(matches!(
+            open_psd_document(deep),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::UnsupportedPsdDepth(32)
+            ))
+        ));
+        assert!(matches!(
+            open_psd_document(b"PNG not really"),
+            Err(OpenFailure::Decode(aurora_io::IoError::NotPsd))
+        ));
+        let real = include_bytes!("../../aurora-io/tests/fixtures/psd/1layer.psd");
+        let truncated = real.get(..real.len() / 2).unwrap_or_default();
+        assert!(matches!(
+            open_psd_document(truncated),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::PsdTruncated { .. } | aurora_io::IoError::PsdMalformed { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn psd_report_message_is_none_for_a_faithful_open_and_itemised_otherwise() {
+        assert_eq!(
+            psd_report_message("a.psd", &aurora_io::PsdImportReport::default()),
+            None
+        );
+        let report = aurora_io::PsdImportReport {
+            items: vec![
+                "1 clipped layer is shown unclipped.".to_owned(),
+                format!("2 layer masks are{}not applied yet.", '\u{202E}'),
+            ],
+        };
+        let Some(message) = psd_report_message("a.psd", &report) else {
+            unreachable!("a non-empty report must produce a message");
+        };
+        assert!(message.starts_with("\"a.psd\" opened, but"), "{message}");
+        assert!(message.contains("1 clipped layer is shown unclipped."));
+        assert!(message.contains("layer masks"));
+        assert!(!message.contains('\u{202E}'), "{message:?}");
+        assert!(message.ends_with("The original file has not been changed."));
+        let actions = psd_report_dialog_actions();
+        assert_eq!(actions.len(), 1);
+    }
+
+    /// The real report a real fixture produces reaches the message: the
+    /// shape layer in psd-tools' `group.psd` opens as pixels and says so.
+    #[test]
+    fn a_real_psd_with_a_shape_layer_produces_an_opened_with_changes_message() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(message) = psd_report_message("group.psd", &document.report) else {
+            unreachable!("group.psd's shape layer must be reported");
+        };
+        assert!(message.contains("shape layer"), "{message}");
     }
 
     #[test]
@@ -22769,8 +23403,8 @@ mod tests {
         };
         let cases: Vec<(String, &str)> = vec![
             (
-                open_failure_message("big.psb", "psb", &unsupported("psb")),
-                "this version can't read Photoshop Large Document (PSB) files yet",
+                open_failure_message("old.webp", "webp", &unsupported("webp")),
+                "Aurora doesn't recognise the \".webp\" file type",
             ),
             (
                 open_failure_message("x.xyz", "xyz", &unsupported("xyz")),
@@ -22953,8 +23587,14 @@ mod tests {
         if let Err(err) = std::fs::write(&path, b"8BPS") {
             unreachable!("{err:?}");
         }
-        let Err(failure) = open_image(&path) else {
-            unreachable!("a .psd must be refused in 0.143.1");
+        // Since 0.144.0 a `.psd` is read for real, so the refusal under
+        // test is a damaged one: just the signature, nothing after it.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Err(failure) = open_psd_document(&bytes) else {
+            unreachable!("a four-byte .psd must be refused");
         };
         let message = open_failure_message(&display_file_name(&path), "psd", &failure);
         assert!(open_open_failed_dialog(
@@ -23569,13 +24209,12 @@ mod tests {
              mean anything"
         );
 
-        let freed = replace_document_pixels(
+        let (freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         assert_eq!(freed, 9, "the outgoing document's whole 3x3 tile grid");
@@ -23598,6 +24237,89 @@ mod tests {
             "the incoming image's own pixels must be what the surface holds -- neither the \
              outgoing document's colour nor a blank tile"
         );
+    }
+
+    /// A multi-layer open (a PSD, 0.144.0): the sweep runs once, first,
+    /// and then *every* incoming layer's pixels are written — including
+    /// layers whose ids (and so surfaces) alias ones the outgoing
+    /// document held, which is every one of them here.
+    #[test]
+    fn replacing_a_documents_pixels_writes_every_incoming_layer_after_the_sweep() {
+        let (_scratch, mut store) = real_tile_store();
+
+        // Outgoing: two layers, ids 0 and 1, both painted.
+        let mut outgoing_layers = aurora_doc::LayerTree::new();
+        let mut outgoing_history = aurora_doc::History::new();
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 300,
+        };
+        let red = filled_image(300, 300, [1.0, 0.0, 0.0, 1.0]);
+        for name in ["o0", "o1"] {
+            let id = match outgoing_history.add_pixel_layer(&mut outgoing_layers, name, rect, None)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = outgoing_layers.surface_id(id) else {
+                unreachable!("pixel layer without a surface");
+            };
+            if let Err(err) = aurora_io::write_into_store(&red, &mut store, surface) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        // Incoming: two smaller layers with the same ids.
+        let mut incoming_layers = aurora_doc::LayerTree::new();
+        let mut incoming_history = aurora_doc::History::new();
+        let small = aurora_core::Rect {
+            width: 10,
+            height: 10,
+            ..rect
+        };
+        let green = filled_image(10, 10, [0.0, 1.0, 0.0, 1.0]);
+        let blue = filled_image(10, 10, [0.0, 0.0, 1.0, 1.0]);
+        let mut ids = Vec::new();
+        for name in ["i0", "i1"] {
+            match incoming_history.add_pixel_layer(&mut incoming_layers, name, small, None) {
+                Ok(id) => ids.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let [first, second] = ids.as_slice() else {
+            unreachable!("two layers");
+        };
+        let (freed, _) = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            &[(*first, &green, (0, 0)), (*second, &blue, (0, 0))],
+        );
+        assert_eq!(freed, 8, "both outgoing 2x2 tile grids");
+        for (id, colour) in [
+            (*first, [0.0, 1.0, 0.0, 1.0]),
+            (*second, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = incoming_layers.surface_id(id) else {
+                unreachable!("pixel layer without a surface");
+            };
+            assert!(
+                !store.contains_tile(surface, aurora_tile::TileId { x: 1, y: 1 }),
+                "an outgoing-only tile must not survive on {id:?}'s aliasing surface"
+            );
+            let read = match aurora_io::read_from_store(&mut store, surface, 10, 10) {
+                Ok(image) => image,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(
+                read.samples().get(0..4),
+                Some(colour.map(half::f16::from_f32).as_slice()),
+                "{id:?} must hold its own incoming pixels"
+            );
+        }
     }
 
     /// The third surface no `LayerTree` can name: this crate's own
@@ -23641,13 +24363,12 @@ mod tests {
         let (incoming_layers, _incoming_history, incoming_layer) =
             document_from_image("incoming", &incoming_image);
 
-        let freed = replace_document_pixels(
+        let (freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         assert!(
@@ -23695,13 +24416,12 @@ mod tests {
             "the two documents must still alias the same surface for this test to mean anything"
         );
 
-        let _freed = replace_document_pixels(
+        let (_freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         // The whole of tile (0, 0) -- 256x256, of which the incoming
@@ -33677,13 +34397,12 @@ mod tests {
         let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
         let (incoming_layers, _incoming_history, incoming_layer) =
             document_from_image("incoming", &incoming_image);
-        let _freed = replace_document_pixels(
+        let (_freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
         // What `App::open_file` does right after. A bump forces a
         // recompute and says nothing about residency, which is precisely
