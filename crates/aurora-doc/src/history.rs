@@ -686,6 +686,50 @@ impl History {
         Ok(id)
     }
 
+    /// Same as [`LayerTree::add_pixel_layer_at`], recorded for undo as
+    /// one step: undo removes the layer, redo puts it back at the same
+    /// sibling position (the existing `RemoveById`/`Restore` pair
+    /// already captures the index at remove time, so no new `LayerOp`
+    /// variant is needed and the journal's `postcard` ordinals are
+    /// untouched).
+    ///
+    /// The journal records the index the layer *actually* landed at —
+    /// `index` after [`LayerTree::add_pixel_layer_at`]'s own clamp — so
+    /// [`Self::replay`] reproduces the same sibling order rather than
+    /// re-clamping against a list that may differ.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::add_pixel_layer_at`]. Nothing is recorded
+    /// when it fails.
+    pub fn add_pixel_layer_at(
+        &mut self,
+        tree: &mut LayerTree,
+        name: impl Into<String>,
+        bounds: Rect,
+        parent: Option<LayerId>,
+        index: usize,
+    ) -> Result<LayerId, DocError> {
+        let name = name.into();
+        let id = tree.add_pixel_layer_at(name.clone(), bounds, parent, index)?;
+        // Read back rather than recomputed: the tree's own clamp is the
+        // one source of truth for where the layer went. The fallback is
+        // unreachable (the id was inserted under `parent` one line
+        // above), and `index` is the only sane value if it ever were.
+        let landed = current_index(tree, id, parent).unwrap_or(index);
+        self.journal.push(LayerOp::Restore(RemovedSubtree {
+            root: id,
+            parent,
+            index: landed,
+            entries: vec![(
+                id,
+                LayerEntry::new(name, parent, LayerKind::Pixel { bounds }),
+            )],
+        }));
+        self.push(LayerOp::RemoveById(id));
+        Ok(id)
+    }
+
     /// Same as [`LayerTree::add_group`], recorded for undo.
     ///
     /// # Errors
@@ -1926,6 +1970,189 @@ mod tests {
         );
         assert_eq!(dirty, Some(bounds()));
         assert_eq!(tree.kind(id), Some(&LayerKind::Pixel { bounds: bounds() }));
+    }
+
+    /// Three root pixel layers, `[top, mid, bottom]` in sibling order,
+    /// built through `history` so its journal holds them too.
+    fn three_roots(tree: &mut LayerTree, history: &mut History) -> [super::LayerId; 3] {
+        let mut add = |name: &str| match history.add_pixel_layer(tree, name, bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bottom = add("bottom");
+        let mid = add("mid");
+        let top = add("top");
+        [top, mid, bottom]
+    }
+
+    #[test]
+    fn add_pixel_layer_at_lands_at_the_requested_sibling_index() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let [top, mid, bottom] = three_roots(&mut tree, &mut history);
+
+        // Index 1 is directly above `mid` (which sits at 1 before the
+        // insert): index 0 is topmost.
+        let new = match history.add_pixel_layer_at(&mut tree, "new", other_bounds(), None, 1) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), &[top, new, mid, bottom]);
+        assert_eq!(
+            tree.kind(new),
+            Some(&LayerKind::Pixel {
+                bounds: other_bounds()
+            })
+        );
+        assert_eq!(tree.name(new), Some("new"));
+    }
+
+    #[test]
+    fn add_pixel_layer_at_index_zero_matches_add_pixel_layer() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let [top, mid, bottom] = three_roots(&mut tree, &mut history);
+        let new = match history.add_pixel_layer_at(&mut tree, "new", bounds(), None, 0) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), &[new, top, mid, bottom]);
+    }
+
+    #[test]
+    fn add_pixel_layer_at_clamps_an_out_of_range_index_to_the_bottom() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let [top, mid, bottom] = three_roots(&mut tree, &mut history);
+        let new = match history.add_pixel_layer_at(&mut tree, "new", bounds(), None, 99) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), &[top, mid, bottom, new]);
+
+        // The journal records where it *landed* (3), not the requested
+        // 99, so replay reproduces the order.
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.roots(), tree.roots());
+    }
+
+    #[test]
+    fn add_pixel_layer_at_inside_a_group_lands_among_its_children() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut add =
+            |name: &str| match history.add_pixel_layer(&mut tree, name, bounds(), Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let lower = add("lower");
+        let upper = add("upper");
+        let new = match history.add_pixel_layer_at(&mut tree, "new", bounds(), Some(group), 1) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.children(group), Some(&[upper, new, lower][..]));
+        assert_eq!(tree.parent(new), Some(group));
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.children(group), tree.children(group));
+    }
+
+    #[test]
+    fn add_pixel_layer_at_is_one_step_and_redo_restores_the_same_index() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let [top, mid, bottom] = three_roots(&mut tree, &mut history);
+        let new = match history.add_pixel_layer_at(&mut tree, "new", bounds(), None, 2) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), &[top, mid, new, bottom]);
+
+        // One undo removes it -- and only it.
+        match history.undo(&mut tree) {
+            Ok(dirty) => assert_eq!(dirty, Some(bounds())),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(!tree.contains(new));
+        assert_eq!(tree.roots(), &[top, mid, bottom]);
+
+        // Redo puts the same id back at the same index, not on top.
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.roots(), &[top, mid, new, bottom]);
+        assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn add_pixel_layer_at_survives_a_journal_save_load_replay() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let [top, mid, bottom] = three_roots(&mut tree, &mut history);
+        let new = match history.add_pixel_layer_at(&mut tree, "new", bounds(), None, 1) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let loaded = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match loaded.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.roots(), &[top, new, mid, bottom]);
+    }
+
+    #[test]
+    fn add_pixel_layer_at_refuses_exactly_what_add_pixel_layer_refuses() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let steps_before = history.journal_len();
+
+        match history.add_pixel_layer_at(&mut tree, "x", bounds(), Some(pixel), 0) {
+            Err(DocError::NotAGroup(id)) => assert_eq!(id, pixel),
+            other => unreachable!("expected NotAGroup, got {other:?}"),
+        }
+        let ghost: super::LayerId = Id::from_raw(9_999);
+        match history.add_pixel_layer_at(&mut tree, "x", bounds(), Some(ghost), 0) {
+            Err(DocError::UnknownLayer(id)) => assert_eq!(id, ghost),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+        let far = Rect {
+            x: i64::MAX,
+            ..bounds()
+        };
+        match history.add_pixel_layer_at(&mut tree, "x", far, None, 0) {
+            Err(DocError::LayerOriginOutOfRange { .. }) => {}
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+
+        // Nothing recorded, nothing added.
+        assert_eq!(history.journal_len(), steps_before);
+        assert_eq!(tree.roots(), &[pixel]);
+        match history.undo(&mut tree) {
+            Ok(_) => assert!(!tree.contains(pixel), "the only step is the first add"),
+            Err(err) => unreachable!("{err:?}"),
+        }
     }
 
     #[test]

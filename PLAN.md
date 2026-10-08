@@ -26,7 +26,22 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.142.0): the Layers panel is recognisable.** A
+**Latest (2026-10-08, 0.143.0): layers can be added and deleted.**
+New Layer (command palette, macOS Layer menu, `Ctrl+Shift+N`) inserts an
+empty, document-sized "Layer N" directly above the active node — above a
+group, never inside it — and selects it. Delete Layer (palette and menu;
+deliberately no shortcut) removes the active node and its subtree,
+refuses to remove the last pixel layer, and selects the layer below,
+else above, else the parent, else the topmost. Each is one undo step
+(`History::add_pixel_layer_at`; no new `LayerOp` variant, so journal
+ordinals are unchanged), and undoing a delete restores the layer's
+pixels. Structural undo/redo now rebuilds the Layers panel when the
+layer set changed and never leaves the active layer naming a removed
+one. 22 new tests (2,613 passing, `AURORA_REQUIRE_GPU=1`, RTX 3090), 14
+mutations all killed. **Not yet verified on real hardware**; Duplicate
+Layer is deferred. Details: M1.8's Layers-panel "Update 0.143.0".
+
+**Previously (2026-10-08, 0.142.0): the Layers panel is recognisable.** A
 real macOS screenshot had shown the Layers panel as an unlabelled strip
 with no highlighted row, and the Properties readout cut mid-word ("No
 radius for Marque"). Three fixes. (1) The active layer's row is
@@ -8143,6 +8158,154 @@ structural design work.
 
   3 new tests in `aurora-ui` (95, was 92), 1,524 passing across the
   workspace (was 1,521). Same gate, same result.
+
+  **Update 0.143.0 — New Layer / Delete Layer.** The first commands that
+  change *which* layers exist (until now only a file open could).
+  - **`aurora-doc`:** `LayerTree::add_pixel_layer_at(name, bounds, parent,
+    index)` and `History::add_pixel_layer_at` insert at a sibling index
+    (`0` = topmost, clamped to the bottom like `reparent`) in one call, so
+    the add is **one** undo step. No new `LayerOp` variant — the journal's
+    `postcard` ordinals are untouched: the journal records a
+    `Restore(RemovedSubtree { index: <where it actually landed>, .. })`,
+    and undo/redo ride the existing `RemoveById`/`Restore` pair, which
+    already captures the index at remove time. `insert`/`insert_unchecked`
+    gained an `index` (every older caller passes `0`). Errors and the "no
+    id consumed on failure" rule are exactly `add_pixel_layer`'s. 7 new
+    tests (index, index 0, clamp + replay, inside a group, one step +
+    redo at the same index, journal save/load/replay, refusals record
+    nothing).
+  - **`aurora-app`:** `perform_layer_command` (a free function over
+    `LayerCommandContext`, so it is headless-testable) runs, in order:
+    `end_layer_control_gestures` (a live opacity drag becomes its own
+    step first), `commit_ending_drag` (a held stroke is recorded before
+    its layer can be deleted), the `History` call, one
+    `UndoKind::Structural` in `UndoOrder` (clearing every redo stack),
+    `rebuild_layer_rows`, `refresh_history_panel`, `sync_layer_controls`
+    and `composite_cache.bump()`.
+    - **New Layer** goes directly above the active node, as its sibling
+      at its current index, so above a *group*, never inside it. With
+      nothing active it goes on top of the roots. It is named
+      "Layer N" (N = 1 + the largest existing "Layer n"), has bounds =
+      `App::canvas_size` (else the union of the pixel layers' bounds),
+      and becomes active.
+    - **Delete Layer** removes the active node and its whole subtree. It
+      is **refused** (logged, no history entry, tree and rows untouched)
+      when no pixel layer would remain outside that subtree. The next
+      active node is the sibling now at the same index (the one below),
+      else the sibling above, else the parent group, else the topmost
+      pixel layer. A deleted layer's tiles stay in the store, so undo
+      brings its pixels back.
+    - **Structural undo/redo now rebuilds the Layers panel when the layer
+      set changed.** Before this round nothing could add or remove a
+      layer, so no undo had to. `App::run_undo_redo` takes a
+      `LayerSetSnapshot` (ids + the active node's position) before
+      `perform_undo_redo`. `sync_layer_rows_after_undo_redo` then
+      compares the tree before and after, *not* the rows, because rows
+      under an AT-collapsed group are legitimately absent. It rebuilds
+      only on a real set change, so an opacity/visibility/blend undo
+      keeps every row id, focus and capture. The new active node is a
+      reappeared layer (an undone Delete or redone New), else the
+      surviving active node, else whatever now sits at its old position.
+      `active_layer` therefore never names a removed layer. If focus was
+      on a Layers row it follows the active row.
+  - **Wiring:** `AppCommand::{NewLayer, DeleteLayer}` →
+    `ActivatedCommand::{NewLayer, DeleteLayer}` → `App::run_layer_command`.
+    `handle_key` hands both back; `run_command` never runs them, and its
+    arm reports `Everything` defensively. Palette entries "New Layer" /
+    "Delete Layer" (`layer.new` / `layer.delete`). A macOS **Layer**
+    submenu sits between Edit and View, with no accelerator hint (as for
+    Undo). **`Ctrl+Shift+N` → New Layer** (literal `Ctrl`, so macOS
+    `Cmd+Shift+N` does not resolve — the same named gap as `Ctrl+Z`). There
+    is **no Delete shortcut**, deliberately: a bare `Delete`/`Backspace`
+    would collide with text-field editing and a future "clear
+    selection". `typing_into_the_open_palette_filters_to_a_matching_command`
+    now expects 5 "lay" matches (was 3).
+  - **Tests:** 15 new `aurora-app` tests (`tests::layer_commands`) plus
+    the 7 in `aurora-doc`. Workspace: **2,613 passing, 0 failed**
+    (`AURORA_REQUIRE_GPU=1 cargo test --workspace`, RTX 3090; was 2,591).
+  - **Mutation matrix — all 14 really run and restored by checksum
+    (sha256 verified after the run), all KILLED:**
+
+    | # | Mutation | Killed by |
+    |---|---|---|
+    | 1 | journal records index 0 | 3 `aurora-doc` replay tests |
+    | 2 | New inserted below the active node | 4 |
+    | 3 | skip `end_layer_control_gestures` | the opacity-drag-ordering test |
+    | 4 | skip the `Structural` record | 7 |
+    | 5 | remove the last-pixel-layer refusal | the refusal test |
+    | 6 | never rebuild rows after undo/redo | 5 |
+    | 7 | next active prefers the sibling above | 2 |
+    | 8 | skip `composite_cache.bump()` | 2 |
+    | 9 | rebuild rows on every undo (opacity too) | the row-id-stability check |
+    | 10 | New goes inside an active group | the group test |
+    | 11 | `handle_key` does not hand `NewLayer` back | the `GalleryRig` key test |
+    | 12 | no "reappeared layer" preference | 3 |
+    | 13 | the tree ignores `index` | 7 `aurora-doc` tests |
+    | 14 | the refusal counts groups as survivors | the refusal test |
+
+  - **Disclosed, not fixed:**
+    - Duplicate Layer is deferred: it needs a property + mask + tile
+      copy op that does not exist.
+    - A deleted layer's tiles stay resident until the document is
+      replaced; undo needs them.
+    - A rebuild re-expands every group an AT had collapsed (the same cost
+      `reconcile_layer_rows` already carries).
+    - Delete is refused only for the last *pixel* layer, so empty groups
+      can be deleted freely.
+    - Rows are rebuilt whole, O(layers), on each command and set-changing
+      undo.
+    - The macOS `Layer` submenu is `#[cfg(target_os = "macos")]` and was
+      not compiled in this Linux round; CI's macOS job compiles it.
+    - `Ctrl+Shift+N` with a focused text field fires New Layer — see the
+      review revision below (was "not exercised" before it).
+    - **Nothing here has been used by a human on real hardware.**
+  - **Review revision (0.143.0, same version).** Five follow-ups from the
+    judge's PASS, done without a version bump:
+    - **Delete → Undo restores the whole layer, not just its pixels —
+      verified, no bug.** `RemovedSubtree` carries each removed node's
+      full `LayerEntry`, so opacity, blend mode, visibility and mask
+      (bounds/enabled/inverted, and the same mask coverage surface id)
+      all come back. New test
+      `undoing_a_delete_restores_opacity_blend_mode_visibility_and_mask`
+      sets all four off their defaults on `mid` (opacity `0.25`,
+      `Screen`, hidden, a mask), deletes, undoes, asserts each plus name,
+      bounds, index and active row, then redoes and asserts the layer is
+      gone again.
+    - **`rebuild_layer_rows` no longer touches the composite cache.** Its
+      conditional "bump if the grid anchor moved" read its *before* after
+      the tree had already changed, against an active id that could name
+      the just-removed layer, so it was not a real before/after compare.
+      It was dropped (with the now-unused `composite_cache` parameter)
+      and the doc comment says callers own invalidation. Both callers
+      bump unconditionally: `perform_layer_command` already did;
+      `sync_layer_rows_after_undo_redo` now does too when it rebuilds,
+      rather than leaning on `perform_undo_redo`'s structural step having
+      reported `Everything` against the *old* active id (the active node,
+      and so the anchor, can move after that comparison).
+    - **`Ctrl+Shift+N` inside a focused text field fires New Layer.** It
+      is not one of the field's own editing chords, so `route_widget_key`
+      returns it unhandled and `handle_key` resolves it. **This is
+      deliberate-by-default, and disclosed: a global layer shortcut fires
+      from inside a text field.** The field's content and focus are
+      untouched (the chord's control character is not typed). Pinned by
+      `ctrl_shift_n_in_a_focused_text_field_falls_through_to_new_layer`
+      (`GalleryRig::key_event`, the real router + `handle_key`).
+    - **`.aur` and the journal.** `write_aur` serializes the live tree, so
+      an added, never-painted layer is written and a deleted one is not:
+      `an_aur_save_writes_an_added_layer_and_omits_a_deleted_one` runs New,
+      then Delete, writes to memory, reads back into a fresh store and
+      compares root names and order plus `contains` on both ids. Journal
+      replay reproducing the add index is the existing `aurora-doc` test
+      `add_pixel_layer_at_survives_a_journal_save_load_replay`.
+    - **Still unverified:** the macOS `Layer` menu is
+      `#[cfg(target_os = "macos")]` and has not been compiled on Linux; it
+      needs the first macOS CI run, or a human.
+    - Tests: `tests::layer_commands` is now 18 (was 15). Measured:
+      `AURORA_REQUIRE_GPU=1 cargo test -p aurora-doc -p aurora-app` on the
+      RTX 3090 (counts in the round's report). The workspace total was not
+      re-run; by arithmetic it is 2,616 (2,613 + 3). **Measured afterwards:** the full gate on the RTX 3090 with
+      `AURORA_REQUIRE_GPU=1` passed exactly 2,616, 0 failed, 0 skipped;
+      doctests, strict rustdoc and `cargo deny check` clean. Judge: PASS, 0.91.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real
@@ -29783,6 +29946,27 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.143.0) — New Layer / Delete Layer.** Done as
+0.142.0's addendum suggested, with one refinement: rows are rebuilt after
+a structural undo/redo when the *tree's* layer set changed (compared
+against a pre-command snapshot), not when the rows differ from the tree —
+rows under an AT-collapsed group are legitimately absent. A reappearing
+layer (undone Delete, redone New) becomes active. Full account: M1.8's
+Layers-panel "Update 0.143.0". **Needs a human:** New/Delete from the
+palette, the macOS Layer menu and `Ctrl+Shift+N` on real hardware,
+painting on the new layer, undo/redo of both, and a screen reader
+hearing the rebuilt rows. **Cahya to decide:** whether macOS should get
+`Cmd`-based shortcuts (the standing `Ctrl` gap) and whether Delete Layer
+deserves a shortcut. **Suggested next:** Duplicate Layer (needs a layer
+property + mask + tile copy op in `aurora-doc`), or layer reordering
+from the panel (`History::reparent` already exists). **Review revision
+(same version):** Delete → Undo verified to restore opacity, blend mode,
+visibility and mask; `rebuild_layer_rows` no longer bumps the cache
+(callers own it); `Ctrl+Shift+N` in a focused text field fires New Layer
+(disclosed, pinned by a test); `.aur` save of added/deleted layers
+pinned; the macOS Layer menu still needs the first macOS CI run or a
+human. Details in the M1.8 entry.
 
 **Addendum 2026-10-08 (0.142.0) — the Layers panel is recognisable.**
 The active layer's row is highlighted at startup and after every open
