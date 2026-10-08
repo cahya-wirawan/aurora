@@ -410,6 +410,91 @@ pub fn write_mask_coverage(
     Ok(())
 }
 
+/// Writes a whole rectangle of mask coverage, one tile at a time —
+/// the bulk counterpart of [`write_mask_coverage`] (0.147.0, for a PSD
+/// mask the size of its document).
+///
+/// `origin`/`width`/`height` are the region, **in the mask's own frame**
+/// (relative to [`crate::LayerMask::bounds`]' origin — this module's
+/// "addressing convention"), and `coverage(column, row)` gives the value
+/// at region-local `(column, row)`. Each value is clamped to
+/// `0.0..=1.0` (a `NaN` reads as `1.0`, failing open like
+/// [`read_mask_coverage`]) and stored as `(v, v, v, 1.0)`, exactly as
+/// [`write_mask_coverage`] stores one texel. Every touched tile is paged
+/// in once and marked dirty once, over the part of it the region covers,
+/// so the cost is one store lookup per *tile*, not per texel. Tiles the
+/// region does not touch are never created.
+///
+/// Returns how many tiles were written. An empty region writes nothing.
+/// The region's far edges saturate at `u32::MAX`; no mask can reach
+/// that, since [`crate::LayerTree::add_mask`] caps a mask's extent at
+/// [`aurora_core::MAX_DOCUMENT_EXTENT`].
+///
+/// # Errors
+///
+/// [`aurora_tile::TileError`] if the store cannot page a tile in. Tiles
+/// before the failing one stay written.
+pub fn write_mask_coverage_region(
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    origin: (u32, u32),
+    width: u32,
+    height: u32,
+    mut coverage: impl FnMut(u32, u32) -> f32,
+) -> Result<usize, aurora_tile::TileError> {
+    let side = aurora_tile::TILE;
+    let (x0, y0) = origin;
+    let x1 = x0.saturating_add(width);
+    let y1 = y0.saturating_add(height);
+    if x0 >= x1 || y0 >= y1 {
+        return Ok(0);
+    }
+    let one = half::f16::from_f32(1.0);
+    let mut written = 0_usize;
+    for ty in (y0 / side)..y1.div_ceil(side) {
+        for tx in (x0 / side)..x1.div_ceil(side) {
+            let tile_x0 = tx.saturating_mul(side);
+            let tile_y0 = ty.saturating_mul(side);
+            let cx0 = tile_x0.max(x0);
+            let cy0 = tile_y0.max(y0);
+            let cx1 = tile_x0.saturating_add(side).min(x1);
+            let cy1 = tile_y0.saturating_add(side).min(y1);
+            if cx0 >= cx1 || cy0 >= cy1 {
+                continue;
+            }
+            let entry = store.get_mut(surface, aurora_tile::TileId { x: tx, y: ty })?;
+            let texels = entry.texels_mut();
+            for y in cy0..cy1 {
+                let row_base = (y - tile_y0) as usize * side as usize;
+                for x in cx0..cx1 {
+                    let raw = coverage(x - x0, y - y0);
+                    let value = if raw.is_nan() {
+                        1.0
+                    } else {
+                        raw.clamp(0.0, 1.0)
+                    };
+                    let value = half::f16::from_f32(value);
+                    let base = (row_base + (x - tile_x0) as usize) * aurora_tile::CHANNELS;
+                    if let Some([r, g, b, a]) = texels.get_mut(base..base + aurora_tile::CHANNELS) {
+                        *r = value;
+                        *g = value;
+                        *b = value;
+                        *a = one;
+                    }
+                }
+            }
+            entry.mark_dirty(aurora_core::Rect {
+                x: i64::from(cx0 - tile_x0),
+                y: i64::from(cy0 - tile_y0),
+                width: cx1 - cx0,
+                height: cy1 - cy0,
+            });
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// Frees every tile stored under `id`'s mask surface, so a mask on that
 /// layer starts from unpainted coverage.
 ///
@@ -566,6 +651,91 @@ mod tests {
             unreachable!("(x, y) constructed in range for a whole tile");
         };
         texel.to_vec()
+    }
+
+    #[test]
+    // 0.147.0: the bulk writer stores exactly what the per-texel writer
+    // would, across a tile boundary, leaves texels outside the region
+    // unpainted, and creates no tile the region does not touch.
+    fn write_mask_coverage_region_matches_per_texel_writes_across_tiles() {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0x09 | MASK_SURFACE_BIT);
+        let side = aurora_tile::TILE;
+        // Straddles the first column boundary: columns side-2 .. side+2.
+        let origin = (side - 2, 3);
+        let value = |c: u32, r: u32| (c as f32) * 0.25 + (r as f32) * 0.125;
+        let written =
+            match super::write_mask_coverage_region(&mut store, surface, origin, 4, 2, value) {
+                Ok(n) => n,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        assert_eq!(written, 2);
+        let left = aurora_tile::TileId { x: 0, y: 0 };
+        let right = aurora_tile::TileId { x: 1, y: 0 };
+        let at = |store: &mut aurora_tile::TileStore, tile, x, y| {
+            read_mask_coverage(&texel_at(store, surface, tile, x, y))
+        };
+        let s = side as usize;
+        assert!(exactly(at(&mut store, left, s - 2, 3), 0.0));
+        assert!(exactly(at(&mut store, left, s - 1, 4), 0.375));
+        assert!(exactly(at(&mut store, right, 0, 3), 0.5));
+        assert!(exactly(at(&mut store, right, 1, 4), 0.875));
+        // Outside the region: unpainted, so fully visible.
+        assert!(exactly(at(&mut store, left, s - 3, 3), 1.0));
+        assert!(exactly(at(&mut store, right, 2, 3), 1.0));
+        assert!(exactly(at(&mut store, left, s - 2, 5), 1.0));
+        assert!(!store.contains_tile(surface, aurora_tile::TileId { x: 0, y: 1 }));
+        // Dirty over exactly the written part of each tile.
+        assert_eq!(
+            store.take_dirty(surface, left),
+            Some(aurora_core::Rect {
+                x: i64::from(side - 2),
+                y: 3,
+                width: 2,
+                height: 2
+            })
+        );
+        assert_eq!(
+            store.take_dirty(surface, right),
+            Some(aurora_core::Rect {
+                x: 0,
+                y: 3,
+                width: 2,
+                height: 2
+            })
+        );
+    }
+
+    #[test]
+    // Values are clamped like the per-texel writer, a NaN fails open,
+    // and an empty region touches nothing.
+    fn write_mask_coverage_region_clamps_fails_open_and_skips_an_empty_region() {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0x0A | MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let values = [-1.0_f32, 2.0, f32::NAN];
+        let written =
+            match super::write_mask_coverage_region(&mut store, surface, (0, 0), 3, 1, |c, _| {
+                values.get(c as usize).copied().unwrap_or(0.5)
+            }) {
+                Ok(n) => n,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        assert_eq!(written, 1);
+        for (x, expected) in [(0, 0.0), (1, 1.0), (2, 1.0)] {
+            let texel = texel_at(&mut store, surface, tile, x, 0);
+            assert!(exactly(read_mask_coverage(&texel), expected), "x = {x}");
+            // Painted: opaque presence flag, even for the NaN.
+            assert!(texel.get(3).is_some_and(|a| a.to_f32() > 0.0));
+        }
+        let empty = aurora_tile::SurfaceId::from_raw(0x0B | MASK_SURFACE_BIT);
+        for (w, h) in [(0, 5), (5, 0)] {
+            assert!(matches!(
+                super::write_mask_coverage_region(&mut store, empty, (7, 7), w, h, |_, _| 0.0),
+                Ok(0)
+            ));
+        }
+        assert!(!store.contains_tile(empty, tile));
     }
 
     #[test]

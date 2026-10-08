@@ -37,6 +37,10 @@ pub(crate) struct TestLayer {
     pub blocks: Vec<([u8; 4], Vec<u8>)>,
     /// Mask data: `(top, left, bottom, right, default colour, flags)`.
     pub mask: Option<(i32, i32, i32, i32, u8, u8)>,
+    /// Mask data past the first 18 bytes, replacing the two padding
+    /// bytes a 20-byte mask record ends in — the "real" mask fields and
+    /// a parameter block (0.147.0).
+    pub mask_tail: Option<Vec<u8>>,
 }
 
 impl TestLayer {
@@ -81,7 +85,25 @@ impl TestLayer {
             fill: None,
             blocks: Vec::new(),
             mask: None,
+            mask_tail: None,
         }
+    }
+
+    /// A Grayscale layer (0.147.0): transparency then grey, from
+    /// `[grey, alpha]` samples.
+    pub fn gray(
+        name: &str,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+        depth: u16,
+        samples: &[[u16; 2]],
+    ) -> Self {
+        let rgba: Vec<[u16; 4]> = samples.iter().map(|[v, a]| [*v, 0, 0, *a]).collect();
+        let mut layer = Self::pixels(name, left, top, width, height, depth, &rgba);
+        layer.channels.retain(|(id, _)| *id == -1 || *id == 0);
+        layer
     }
 
     /// An empty-rectangle record with the four usual zero-size channels.
@@ -320,11 +342,13 @@ fn record_extra(layer: &TestLayer, psb: bool) -> Vec<u8> {
     let mut extra = Vec::new();
     match layer.mask {
         Some((t, l, b, r, default, flags)) => {
-            put_u32(&mut extra, 20);
+            let tail = layer.mask_tail.clone().unwrap_or_else(|| vec![0, 0]);
+            put_u32(&mut extra, 18 + tail.len());
             for v in [t, l, b, r] {
                 extra.extend_from_slice(&v.to_be_bytes());
             }
-            extra.extend_from_slice(&[default, flags, 0, 0]);
+            extra.extend_from_slice(&[default, flags]);
+            extra.extend_from_slice(&tail);
         }
         None => put_u32(&mut extra, 0),
     }

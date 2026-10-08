@@ -1077,6 +1077,41 @@ impl History {
         // Only now, with a genuinely new mask committed, is the old
         // occupant of this derived surface unreachable and safe to free.
         crate::mask::forget_mask_coverage(tree, store, id);
+        self.record_add_mask(id, bounds);
+        Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// [`Self::add_mask`] for a document being **built from a file**
+    /// (`aurora-io`'s PSD import, 0.147.0), which has no tile store yet:
+    /// the same tree edit and the same journal/undo entries, but no
+    /// residue sweep.
+    ///
+    /// That sweep is not skipped, it is moved. A freshly built tree's
+    /// mask surfaces alias whatever the *outgoing* document's layers
+    /// with the same ids left behind (`LayerTree::mask_surface_id` is
+    /// derived from the id, and ids restart at zero), so the caller must
+    /// free the outgoing document's tiles (`forget_document_surfaces`,
+    /// which covers mask surfaces) before it writes this mask's coverage
+    /// — `aurora-app`'s `replace_document_pixels` does exactly that,
+    /// sweep first, then pixels, then masks. A caller on a *live*
+    /// document must use [`Self::add_mask`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::add_mask`]; nothing is changed or recorded
+    /// when it refuses.
+    pub fn add_imported_mask(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        bounds: Rect,
+    ) -> Result<Option<Rect>, DocError> {
+        tree.add_mask(id, bounds)?;
+        self.record_add_mask(id, bounds);
+        Ok(layer_dirty_rect(tree, id))
+    }
+
+    fn record_add_mask(&mut self, id: LayerId, bounds: Rect) {
         self.journal.push(LayerOp::RestoreMask(
             id,
             LayerMask {
@@ -1086,7 +1121,6 @@ impl History {
             },
         ));
         self.push(LayerOp::RemoveMask(id));
-        Ok(layer_dirty_rect(tree, id))
     }
 
     /// Same as [`LayerTree::remove_mask`], recorded for undo.
@@ -2780,6 +2814,52 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(tree.lock(id), Some(LayerLock::all()));
+    }
+
+    /// 0.147.0: `add_imported_mask` records exactly what `add_mask`
+    /// does — the journal replays to the same masked tree, and undo
+    /// removes it — without needing a store.
+    #[test]
+    fn add_imported_mask_journals_and_undoes_like_add_mask() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.add_imported_mask(&mut tree, id, other_bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_mask_enabled(&mut tree, id, false) {
+            unreachable!("{err:?}");
+        }
+        let expected = Some(LayerMask {
+            bounds: other_bounds(),
+            enabled: false,
+            inverted: false,
+        });
+        assert_eq!(tree.mask(id).cloned(), expected);
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.mask(id).cloned(), expected);
+        for _ in 0..2 {
+            if let Err(err) = history.undo(&mut tree) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(tree.mask(id), None);
+        // A refusal records nothing.
+        let journal = history.journal_len();
+        if let Err(err) = history.add_imported_mask(&mut tree, id, other_bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert!(matches!(
+            history.add_imported_mask(&mut tree, id, other_bounds()),
+            Err(DocError::MaskAlreadyExists(_))
+        ));
+        assert_eq!(history.journal_len(), journal + 1);
     }
 
     #[test]

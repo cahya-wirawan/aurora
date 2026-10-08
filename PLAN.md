@@ -26,7 +26,33 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.146.0): the dock panels have a visible
+**Latest (2026-10-08, 0.147.0): PSD layer masks are applied, and
+Grayscale PSDs open.** A PSD layer's or group's user mask (channel `-2`)
+becomes a real `aurora_doc::LayerMask` with its coverage written into
+the tile store, with Photoshop's semantics: the rectangle is in document
+coordinates and the default colour fills outside it (hidden → the Aurora
+mask bounds are the PSD rectangle; shown → the layer's own bounds, the
+rest left unpainted), the disabled flag attaches the mask *disabled*,
+the (obsolete) invert flag is baked into the coverage, 16-bit masks keep
+their full depth. The "position relative to layer" flag does not move
+the mask (psd-tools ignores it too; reported where the two readings
+differ). Density/feather, vector masks and Photoshop's combined "real"
+mask stay listed in "Opened With Changes"; plain masks no longer are.
+Coverage goes through the tile store tile by tile (new
+`aurora_doc::write_mask_coverage_region`), written by `aurora-app` only
+after the outgoing document's tiles are swept (masks after pixels); the
+tree side is `History::add_imported_mask`. Grayscale (colour mode 1,
+8/16-bit) opens layered, grey expanded to R = G = B and tagged sRGB like
+RGB; Bitmap/Indexed/Duotone/CMYK/Lab stay refused by name. Corpus: 272
+files, 235 open (was 217), 37 unsupported, 0 damaged; 889/889 layer
+pixel sums (161 Grayscale) and 215/215 kept masks match psd-tools.
+18 mutations, 18 killed. Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`): 2,758 passed, 0 failed, 0 skipped; judge PASS
+≈0.92. **Not yet verified on real hardware** — compare a
+masked and a Grayscale PSD against Photoshop on macOS. Details: "Next
+action", addendum 0.147.0.
+
+**Previously (2026-10-08, 0.146.0): the dock panels have a visible
 scrollbar.** Every docked panel's body now sits in a non-scrolling
 `[body | scrollbar]` row (`PanelHandle::viewport`, `PanelHandle::
 scrollbar`), so the bar never moves with the content. It is the existing
@@ -8829,6 +8855,52 @@ structural design work.
   (export is unaffected — `canvas_size` comes from the header); a
   per-open memory ceiling tied to available RAM; check whether a
   duplicate `-2`/`-3` mask channel is decoded once only.
+
+  **Update 0.147.0 — user masks applied; Grayscale.** `decode_mask` now
+  returns a mask only when the record has a `-2` channel (mask data
+  without one describes only a vector mask), and only the *first* `-2`
+  is decoded (`find`) — answering the carried duplicate-channel item.
+  Groups keep theirs (`PsdNode::Group { mask }`). `build_document`'s
+  `Builder::attach_mask` maps the PSD mask onto Aurora's model (inside
+  `LayerMask::bounds` unpainted = `1.0`, outside = `0.0`): effective
+  default hidden → bounds = the PSD rectangle; shown → bounds = the
+  layer's canvas-anchored bounds (the canvas for a group) and only the
+  overlap with the PSD rectangle is queued (`PsdDocument::masks`,
+  `PsdMaskPixels { layer, offset, width, height, coverage }`, cropped,
+  invert baked in). Disabled → `History::set_mask_enabled(false)`. The
+  tree edit is `History::add_imported_mask` (journal and undo entries
+  identical to `add_mask`, no store; documented as import-only — the
+  caller sweeps). `aurora_io::write_psd_mask` (= `psd::write_mask_pixels`)
+  writes one queued mask through `aurora_doc::write_mask_coverage_region`
+  (one `get_mut` and one `mark_dirty` per tile, closure-supplied values,
+  clamped, NaN → `1.0`). `aurora-app`'s `replace_document_pixels` takes
+  the masks and writes them after the sweep and the pixels; a failed
+  mask counts toward the "could not be loaded" report line. New report
+  notes: `MaskParametersNotApplied` (density < 255 or feather ≠ 0, read
+  in psd-tools' order after the 36-byte "real" fields), `RealMaskNotUsed`
+  (a `-3` channel), `MaskRelativePosition` (flag bit 0 on a layer not at
+  the origin); `MaskNotApplied` is gone; a mask rectangle past the
+  document range is now reported as unreadable instead of silently
+  dropped. Grayscale: `Header::color_mode`, `color_planes()`; channel 0
+  is grey and 1/2 are unknown channels; `replicate_gray` after decode;
+  the merged image maps plane 1 to alpha when merged transparency is
+  on; `sGray` counts as sRGB for the ICC note. `UnsupportedPsdColorMode`'s
+  text now says "only RGB and Grayscale can be opened". **Evidence:** 20
+  new `aurora-io` tests (masks: both defaults × 4 compressions with a
+  rectangle off the canvas, far outside, disabled, inverted, 16-bit ×
+  4 compressions, relative flag, density/feather, real mask, group mask;
+  hostile: empty/inverted rect, past the document range, a 16,000² rect
+  with a 4-byte channel × 4 compressions (dropped, < 2 s) and a 30,000²
+  one (`PsdPixelBudget`), wrong-depth and truncated RLE channels;
+  Grayscale: both depths × 4 compressions with alpha, mask, unknown
+  channels, merged fallback with and without alpha, every refused mode,
+  the real 8- and 16-bit fixtures; the truncation/mutation sweeps gained
+  a Grayscale file with a parameterised mask; a document-sized-mask
+  timing test), 3 `aurora-doc` tests (`write_mask_coverage_region` ×2,
+  `add_imported_mask`), 3 `aurora-app` tests through
+  `open_psd_document` → `replace_document_pixels` → `composite_document`.
+  New committed fixture `4x4_16bit_grayscale.psd` (psd-tools, sha256 in
+  `PROVENANCE.md`). Corpus and mutations: see addendum 0.147.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30227,6 +30299,104 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.147.0) — PSD layer masks applied; Grayscale
+PSDs.** Done as 0.146.0 suggested. Full account: M1.8's open-file
+bullet, "Update 0.147.0". **Choices, stated:** a disabled mask is
+attached disabled (the model supports it), not reported; the invert
+flag is baked into the coverage rather than set as `LayerMask::inverted`;
+flags bit 0 does not move the mask (psd-tools ignores it; every flagged
+mask in its corpus is on a layer at the origin, where the readings
+agree), reported only where they would differ; a Grayscale file gets
+RGB's assumption — tagged sRGB, an embedded profile ignored and reported
+unless it names sRGB or sGray, no profile → no note. **Corpus** (psd-tools
+1.17.4 fixtures, 272 files): 235 opened, 37 unsupported (CMYK, Lab,
+Bitmap, Indexed, Duotone, Multichannel, 32-bit), 0 refused as damaged
+(0.144.0: 217/55/0). Differential (one-off scripts in the session
+scratchpad, not committed): 889 of 889 comparable layers' pixel sums
+equal psd-tools' (161 of them Grayscale; 16-bit samples compared after
+the same `f16` rounding on both sides), and 215 of 215 masks on kept
+layers equal in rectangle, default colour, disabled flag and coverage
+sum; the other 141 psd-tools masks belong to adjustment/fill layers
+Aurora leaves out. **Open time (measured, this Linux box):** a 4096 ×
+4096 RGB layer with a document-sized ZIP mask — read + build 491 ms,
+coverage write into a real tile store 131 ms (debug build); 190 ms /
+98 ms in release. **Mutations (18, each file backed up to the session
+scratchpad's `mut147/`, restored and sha256-checked — all 18 restored
+OK; `aurora-app` runs with `AURORA_REQUIRE_GPU=1`). 18 killed:**
+
+| # | Mutation | Killed by (count) |
+|---|---|---|
+| M1 | default colour ignored (always shown) | 10, e.g. `a_mask_is_applied_with_either_default_colour_and_a_rect_partly_off_the_canvas` |
+| M2 | rectangle offset dropped on write | 3 app, e.g. `an_opened_psds_layer_mask_is_composited_with_photoshop_semantics` |
+| M3 | disabled flag ignored | 6, incl. `a_disabled_mask_is_attached_disabled_with_its_coverage` |
+| M4 | invert flag ignored | 3, incl. `an_inverted_mask_flips_its_samples_and_its_default_colour` |
+| M5 | grey not replicated to G/B | 4, incl. `real_grayscale_fixture_matches_psd_tools` |
+| M6 | 16-bit mask read as its high byte | 1, `a_sixteen_bit_mask_keeps_its_low_byte` |
+| M7 | out-of-range mask rect not reported | 1, `a_mask_rect_past_the_document_range_is_reported_and_not_applied` |
+| M8 | no crop to the attached bounds | 3 |
+| M9 | masks written before the sweep | 1, `an_opened_psds_mask_is_written_after_the_outgoing_masks_are_swept` |
+| M10 | masks never written by the app | 3 app |
+| M11 | bulk writer leaves the presence flag unset | 4 doc |
+| M12 | bulk writer uses tile-local coordinates | 2, incl. `write_mask_coverage_region_matches_per_texel_writes_across_tiles` |
+| M13 | group masks not attached | 1, `a_group_mask_is_applied_to_the_group_over_the_canvas` |
+| M14 | relative-position note even where readings agree | 1 |
+| M15 | mask parameters never detected | 3 |
+| M16 | Grayscale channels 1/2 taken as colour | 1 |
+| M17 | `add_imported_mask` does not journal | 1, `add_imported_mask_journals_and_undoes_like_add_mask` |
+| M18 | merged Grayscale alpha plane in the wrong slot | 1, `a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha` — **survived** until that test was added |
+
+**Disclosed:** mask density and feather are reported, not applied
+(psd-tools applies density); Photoshop's combined pixel + vector "real"
+mask (`-3`) is not used — the `-2` mask applies and the vector part is
+reported, so a layer with both shows less masking than Photoshop; flags
+bit 0's meaning is unverified against Photoshop on an offset layer; a
+group's shown-outside mask is bounded by the canvas, so group content
+off the canvas is clipped by it (invisible today, visible after a move);
+mask coverage costs a full RGBA `f16` texel per pixel (the existing
+`aurora_doc::mask` trade-off) and a document-sized mask doubles that
+layer's tile memory; the decode is still whole-file in memory and on the
+UI thread (§7.3.1/§7.3.4, unchanged); a mask that fails to write is
+counted as an unwritten *layer* in the report wording; masks are applied
+through the CPU compositor path — whether a masked flat document still
+takes the GPU fast path was not re-examined this round; nothing paints
+or undoes mask pixels yet. Indexed, Duotone and Bitmap are refused, not
+converted. The app-level tests build PSDs with a small hand-rolled
+writer in `aurora-app`'s tests (the `aurora-io` writer is `cfg(test)`
+there); `App::open_psd_file`'s own new argument threading is covered by
+inspection only, like the rest of `App`. **Needs a human:** on real
+macOS, open a PSD with layer and group masks (default black and white,
+one disabled, one partly off the canvas) and a Grayscale PSD (8- and
+16-bit, with transparency and a mask) and compare each side by side
+with Photoshop; check the "Opened With Changes" wording for density/
+feather and a combined mask. **Measured after the review:** full gate
+green on the RTX 3090 with `AURORA_REQUIRE_GPU=1` — fmt, layering, style
+lint, `check --locked`, clippy `-D warnings`, 2,758 passed, 0 failed,
+0 skipped, strict rustdoc and `cargo deny` clean. Independent judge:
+**PASS ≈0.92**, no critical/high issue. Its review points, recorded
+rather than fixed: (L-02, now measured) the corpus has 427 layers with a
+`-2` user mask and 17 (in 12 files) with a `-3` combined "real" mask,
+**none** with `real_flags.parameters_applied` — so psd-tools' effective
+mask is the `-2` one on every corpus layer, the 215/215 comparison was
+against that `-2` channel, and the "Photoshop prefers `-3`" case is
+untested by the corpus, not merely by the unit tests; (L-01) a
+hidden-by-default mask whose rect has an edge past ±300,000 is dropped
+and reported (`MaskUnreadable`), so that layer opens fully visible
+rather than hidden — fail-open, disclosed, not fixed; (L-03, not
+checked) the journal records the mask struct but not its coverage, so a
+crash recovery that replayed the journal without an `.aur` autosave
+would restore the mask reading fully visible — whether any recovery
+path does that is unverified; (L-04) a failed mask write is counted
+under the report's "layers could not be loaded" line; (L-05) whether a
+masked flat document still takes the GPU fast path was not
+re-examined. **Suggested next (0.147.1):** the History panel shows only
+the structural journal, so brush/eraser strokes never appear and undo
+adds a row instead of moving a marker (a real-macOS report, 2026-10-08)
+— one merged list in `UndoOrder` order, a current-step marker, redoable
+steps dimmed, refreshed after every stroke/undo/redo. **Then (0.148.0):** apply mask
+density (psd-tools' `d·m + (1 − d)`), then vector masks (needs a path
+rasteriser — `aurora-vector`), or decode off the UI thread and stream
+layers through the tile store (§7.3.4/§7.3.1).
 
 **Addendum 2026-10-08 (0.146.0) — a visible panel scrollbar.** Done as
 0.145.0 suggested. **Shape:** `insert_panel` now builds `root → [header,

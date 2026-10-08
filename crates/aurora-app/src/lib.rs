@@ -1393,6 +1393,7 @@ fn replace_document_pixels(
     outgoing_history: aurora_doc::History,
     incoming_layers: &aurora_doc::LayerTree,
     incoming: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+    masks: &[aurora_io::PsdMaskPixels],
 ) -> (usize, usize) {
     let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
         + store.forget_surface(composite_surface_id());
@@ -1422,6 +1423,24 @@ fn replace_document_pixels(
                 ?err,
                 ?incoming_layer,
                 "failed to write an opened layer's pixels into the tile store"
+            );
+            failed += 1;
+        }
+    }
+    // A PSD's mask coverage (0.147.0), after the sweep for the same
+    // reason as the pixels: a mask surface is derived from the layer id
+    // (`LayerTree::mask_surface_id`), so the incoming layer 0's mask
+    // surface is exactly the outgoing layer 0's. Written before the
+    // sweep, the sweep would erase it; skipped, the outgoing mask's
+    // coverage would show through the incoming one. A mask that fails
+    // to write counts as an unwritten layer -- it would otherwise show
+    // the layer unmasked with no word to the user.
+    for mask in masks {
+        if let Err(err) = aurora_io::write_psd_mask(mask, incoming_layers, store) {
+            tracing::warn!(
+                ?err,
+                layer = ?mask.layer,
+                "failed to write an opened layer mask's coverage into the tile store"
             );
             failed += 1;
         }
@@ -17931,6 +17950,7 @@ impl App {
             layers,
             history,
             &[(layer_id, &image, (0, 0))],
+            &[],
             canvas_size,
         ) else {
             return;
@@ -17984,6 +18004,7 @@ impl App {
             history,
             canvas_size,
             pixels,
+            masks,
             report,
         } = document;
         let mut report = report;
@@ -17991,12 +18012,14 @@ impl App {
             .iter()
             .map(|placed| (placed.layer, &placed.image, placed.offset))
             .collect();
-        let Some(unwritten) = self.install_opened_document(layers, history, &incoming, canvas_size)
+        let Some(unwritten) =
+            self.install_opened_document(layers, history, &incoming, &masks, canvas_size)
         else {
             return;
         };
         drop(incoming);
         drop(pixels);
+        drop(masks);
         report.items.extend(unwritten_layers_item(unwritten));
         if let Some(message) = psd_report_message(&display_file_name(path), &report) {
             tracing::info!(path = %path.display(), items = report.items.len(), "opened a PSD with changes");
@@ -18054,6 +18077,7 @@ impl App {
         layers: aurora_doc::LayerTree,
         mut history: aurora_doc::History,
         pixels: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+        masks: &[aurora_io::PsdMaskPixels],
         canvas_size: (u32, u32),
     ) -> Option<usize> {
         // The opened file is the undo baseline -- see the `undo_order`
@@ -18106,6 +18130,7 @@ impl App {
                 outgoing_history,
                 &self.layers,
                 pixels,
+                masks,
             );
             unwritten_layers = failed;
             tracing::debug!(
@@ -23531,7 +23556,7 @@ mod tests {
         assert_eq!(
             message,
             "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
-             the file uses the CMYK colour mode (code 4); only RGB can be opened. Your current \
+             the file uses the CMYK colour mode (code 4); only RGB and Grayscale can be opened. Your current \
              document has not changed."
         );
     }
@@ -23548,8 +23573,8 @@ mod tests {
                  uses 32 bits per channel; only 8 and 16 can be opened.",
             ),
             (
-                psd(aurora_io::IoError::UnsupportedPsdColorMode(1)),
-                "the Grayscale colour mode",
+                psd(aurora_io::IoError::UnsupportedPsdColorMode(8)),
+                "the Duotone colour mode",
             ),
             (
                 psd(aurora_io::IoError::UnsupportedPsdCompression(9)),
@@ -23715,6 +23740,7 @@ mod tests {
             aurora_doc::History::new(),
             &document.layers,
             &incoming,
+            &[],
         );
         assert_eq!(failed, 0);
         let Some(surface) = document.layers.surface_id(active) else {
@@ -23743,6 +23769,287 @@ mod tests {
                 .unwrap_or_default()
         );
         assert_eq!(at(7, 3), vec![half::f16::ZERO; 4]);
+    }
+
+    /// One layer of [`tiny_psd`]: its `(left, top, width, height)`,
+    /// raw 8-bit channels by id, and an optional user mask
+    /// `(top, left, bottom, right, default colour, flags)`.
+    struct TinyLayer {
+        rect: (i32, i32, i32, i32),
+        channels: Vec<(i16, Vec<u8>)>,
+        mask: Option<(i32, i32, i32, i32, u8, u8)>,
+    }
+
+    /// A minimal, uncompressed 8-bit PSD (0.147.0) — just enough of the
+    /// format for the app-level mask/Grayscale tests, which cannot reach
+    /// `aurora-io`'s own `cfg(test)` writer. `mode` is the header colour
+    /// mode (`3` RGB, `1` Grayscale).
+    #[allow(clippy::many_single_char_names)] // PSD's own field names
+    fn tiny_psd(width: u32, height: u32, mode: u16, layers: &[TinyLayer]) -> Vec<u8> {
+        let be32 = |o: &mut Vec<u8>, v: usize| {
+            o.extend_from_slice(&u32::try_from(v).unwrap_or(u32::MAX).to_be_bytes());
+        };
+        let planes: u16 = if mode == 1 { 1 } else { 3 };
+        let mut o = Vec::new();
+        o.extend_from_slice(b"8BPS");
+        o.extend_from_slice(&1_u16.to_be_bytes());
+        o.extend_from_slice(&[0; 6]);
+        o.extend_from_slice(&planes.to_be_bytes());
+        o.extend_from_slice(&height.to_be_bytes());
+        o.extend_from_slice(&width.to_be_bytes());
+        o.extend_from_slice(&8_u16.to_be_bytes());
+        o.extend_from_slice(&mode.to_be_bytes());
+        be32(&mut o, 0);
+        be32(&mut o, 0);
+        let mut info = Vec::new();
+        info.extend_from_slice(&i16::try_from(layers.len()).unwrap_or(0).to_be_bytes());
+        let mut data = Vec::new();
+        for layer in layers {
+            let (left, top, w, h) = layer.rect;
+            for v in [top, left, top + h, left + w] {
+                info.extend_from_slice(&v.to_be_bytes());
+            }
+            info.extend_from_slice(
+                &u16::try_from(layer.channels.len())
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+            for (id, plane) in &layer.channels {
+                info.extend_from_slice(&id.to_be_bytes());
+                be32(&mut info, plane.len() + 2);
+                data.extend_from_slice(&0_u16.to_be_bytes());
+                data.extend_from_slice(plane);
+            }
+            info.extend_from_slice(b"8BIMnorm");
+            info.extend_from_slice(&[255, 0, 0, 0]);
+            let mut extra = Vec::new();
+            match layer.mask {
+                Some((t, l, b, r, default, flags)) => {
+                    be32(&mut extra, 20);
+                    for v in [t, l, b, r] {
+                        extra.extend_from_slice(&v.to_be_bytes());
+                    }
+                    extra.extend_from_slice(&[default, flags, 0, 0]);
+                }
+                None => be32(&mut extra, 0),
+            }
+            be32(&mut extra, 0);
+            extra.extend_from_slice(&[1, b'L', 0, 0]);
+            be32(&mut info, extra.len());
+            info.extend_from_slice(&extra);
+        }
+        info.extend_from_slice(&data);
+        if info.len() % 2 == 1 {
+            info.push(0);
+        }
+        let mut section = Vec::new();
+        be32(&mut section, info.len());
+        section.extend_from_slice(&info);
+        be32(&mut section, 0);
+        be32(&mut o, section.len());
+        o.extend_from_slice(&section);
+        o.extend_from_slice(&0_u16.to_be_bytes());
+        o.extend(std::iter::repeat_n(
+            0xFF,
+            usize::from(planes) * (width * height) as usize,
+        ));
+        o
+    }
+
+    /// An opaque `w × h` RGB layer of one colour.
+    fn tiny_solid(rect: (i32, i32, i32, i32), rgb: [u8; 3]) -> TinyLayer {
+        let n = usize::try_from(rect.2 * rect.3).unwrap_or(0);
+        TinyLayer {
+            rect,
+            channels: vec![
+                (-1, vec![255; n]),
+                (0, vec![rgb[0]; n]),
+                (1, vec![rgb[1]; n]),
+                (2, vec![rgb[2]; n]),
+            ],
+            mask: None,
+        }
+    }
+
+    /// Opens `bytes` as a PSD, writes it into a fresh store after
+    /// sweeping `outgoing` (the real open's order), and composites it.
+    fn open_and_composite_psd(
+        bytes: &[u8],
+        store: &mut aurora_tile::TileStore,
+        outgoing: (aurora_doc::LayerTree, aurora_doc::History),
+    ) -> (aurora_io::PsdDocument, aurora_io::Image) {
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = replace_document_pixels(
+            store,
+            outgoing.0,
+            outgoing.1,
+            &document.layers,
+            &incoming,
+            &document.masks,
+        );
+        assert_eq!(failed, 0);
+        let (w, h) = document.canvas_size;
+        let image = match composite_document(&document.layers, store, w, h) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        drop(incoming);
+        (document, image)
+    }
+
+    fn near(actual: [f32; 4], expected: [f32; 4]) -> bool {
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(a, e)| (a - e).abs() <= 1.0 / 255.0)
+    }
+
+    /// 0.147.0: a PSD layer's user mask is applied — the composite at
+    /// sample pixels is the masked result Photoshop shows, for both
+    /// default colours, a rectangle partly off the canvas, and a
+    /// disabled mask (which shows the layer unmasked).
+    #[test]
+    fn an_opened_psds_layer_mask_is_composited_with_photoshop_semantics() {
+        // Mask 3×4 at (1, -1): columns 1..4, rows -1..3, samples by
+        // column 0, 128, 255 (the same in every row).
+        let samples: Vec<u8> = (0..12)
+            .map(|i| [0_u8, 128, 255].get(i % 3).copied().unwrap_or(0))
+            .collect();
+        for (default, flags) in [(0_u8, 0_u8), (255, 0), (0, 0x02)] {
+            // A fresh store each time: with an empty outgoing document
+            // nothing sweeps the previous round's mask tiles.
+            let (_scratch, mut store) = real_tile_store();
+            let top = TinyLayer {
+                mask: Some((-1, 1, 3, 4, default, flags)),
+                ..tiny_solid((0, 0, 4, 4), [0, 0, 255])
+            };
+            let mut top = top;
+            top.channels.push((-2, samples.clone()));
+            let bytes = tiny_psd(4, 4, 3, &[tiny_solid((0, 0, 4, 4), [255, 0, 0]), top]);
+            let (_document, image) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            for (x, y) in [(0, 0), (1, 0), (2, 1), (3, 2), (0, 3), (2, 3)] {
+                let inside = (1..4).contains(&x) && y < 3;
+                let m = if flags & 0x02 != 0 {
+                    1.0
+                } else if inside {
+                    f32::from([0_u8, 128, 255].get((x - 1) as usize).copied().unwrap_or(0)) / 255.0
+                } else {
+                    f32::from(default) / 255.0
+                };
+                let want = [1.0 - m, 0.0, m, 1.0];
+                let got = image_pixel(&image, x, y);
+                assert!(
+                    near(got, want),
+                    "({x}, {y}) default {default} flags {flags}: {got:?}"
+                );
+            }
+        }
+    }
+
+    /// 0.147.0, the aliasing trap: the outgoing document's layer 0 had a
+    /// mask painted fully hidden on the same derived mask surface the
+    /// incoming PSD's layer 0 gets. The sweep must run first (no stale
+    /// coverage outside the new mask's rectangle) and the new coverage
+    /// must land after it (the new rectangle's own zeros survive).
+    #[test]
+    fn an_opened_psds_mask_is_written_after_the_outgoing_masks_are_swept() {
+        let (_scratch, mut store) = real_tile_store();
+        let mut old_layers = aurora_doc::LayerTree::new();
+        let mut old_history = aurora_doc::History::new();
+        let canvas = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let old = match old_history.add_pixel_layer(&mut old_layers, "old", canvas, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = old_history.add_mask(&mut old_layers, &mut store, old, canvas) {
+            unreachable!("{err:?}");
+        }
+        let Some(old_surface) = old_layers.mask_surface_id(old) else {
+            unreachable!("masked layer");
+        };
+        if let Err(err) =
+            aurora_doc::write_mask_coverage_region(&mut store, old_surface, (0, 0), 4, 4, |_, _| {
+                0.0
+            })
+        {
+            unreachable!("{err:?}");
+        }
+        // Incoming: one opaque green layer, default-255 mask hiding only
+        // (2, 2)..(4, 4).
+        let mut layer = TinyLayer {
+            mask: Some((2, 2, 4, 4, 255, 0)),
+            ..tiny_solid((0, 0, 4, 4), [0, 255, 0])
+        };
+        layer.channels.push((-2, vec![0; 4]));
+        let (document, image) = open_and_composite_psd(
+            &tiny_psd(4, 4, 3, &[layer]),
+            &mut store,
+            (old_layers, old_history),
+        );
+        assert_eq!(
+            document.layers.mask_surface_id(root_id(&document)),
+            Some(old_surface)
+        );
+        assert!(
+            near(image_pixel(&image, 0, 0), [0.0, 1.0, 0.0, 1.0]),
+            "stale hidden coverage"
+        );
+        assert!(
+            near(image_pixel(&image, 3, 3), [0.0, 0.0, 0.0, 0.0]),
+            "new coverage lost"
+        );
+    }
+
+    fn root_id(document: &aurora_io::PsdDocument) -> aurora_doc::LayerId {
+        match document.layers.roots().first() {
+            Some(id) => *id,
+            None => unreachable!("one layer"),
+        }
+    }
+
+    /// 0.147.0: a Grayscale PSD opens as a layered document whose grey
+    /// is R = G = B, with its alpha and its mask applied like RGB's.
+    #[test]
+    fn an_opened_grayscale_psd_composites_grey_with_its_alpha_and_mask() {
+        let (_scratch, mut store) = real_tile_store();
+        let layer = TinyLayer {
+            rect: (0, 0, 2, 2),
+            channels: vec![
+                (-1, vec![255, 255, 0, 255]),
+                (0, vec![90, 90, 90, 200]),
+                (-2, vec![0]),
+            ],
+            mask: Some((1, 1, 2, 2, 255, 0)),
+        };
+        let (_document, image) = open_and_composite_psd(
+            &tiny_psd(2, 2, 1, &[layer]),
+            &mut store,
+            (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+        );
+        let g = 90.0 / 255.0;
+        assert!(near(image_pixel(&image, 0, 0), [g, g, g, 1.0]));
+        assert!(near(image_pixel(&image, 1, 0), [g, g, g, 1.0]));
+        // Transparent in the file.
+        assert!(near(image_pixel(&image, 0, 1), [0.0, 0.0, 0.0, 0.0]));
+        // Masked away.
+        assert!(near(image_pixel(&image, 1, 1), [0.0, 0.0, 0.0, 0.0]));
     }
 
     /// C-02: an opened document is the undo baseline — Ctrl+Z has nothing
@@ -24702,6 +25009,7 @@ mod tests {
             outgoing_history,
             &incoming_layers,
             &[(incoming_layer, &incoming_image, (0, 0))],
+            &[],
         );
 
         assert_eq!(freed, 9, "the outgoing document's whole 3x3 tile grid");
@@ -24784,6 +25092,7 @@ mod tests {
             outgoing_history,
             &incoming_layers,
             &[(*first, &green, (0, 0)), (*second, &blue, (0, 0))],
+            &[],
         );
         assert_eq!(freed, 8, "both outgoing 2x2 tile grids");
         for (id, colour) in [
@@ -24856,6 +25165,7 @@ mod tests {
             outgoing_history,
             &incoming_layers,
             &[(incoming_layer, &incoming_image, (0, 0))],
+            &[],
         );
 
         assert!(
@@ -24909,6 +25219,7 @@ mod tests {
             outgoing_history,
             &incoming_layers,
             &[(incoming_layer, &incoming_image, (0, 0))],
+            &[],
         );
 
         // The whole of tile (0, 0) -- 256x256, of which the incoming
@@ -34890,6 +35201,7 @@ mod tests {
             outgoing_history,
             &incoming_layers,
             &[(incoming_layer, &incoming_image, (0, 0))],
+            &[],
         );
         // What `App::open_file` does right after. A bump forces a
         // recompute and says nothing about residency, which is precisely
