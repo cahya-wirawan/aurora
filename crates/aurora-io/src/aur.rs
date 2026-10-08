@@ -1594,9 +1594,14 @@ fn read_persisted_tiles<R: Read + Seek>(
 /// *same* `(surface, tile)` before calling [`read`] and whose tile this
 /// read then overwrote: that tile's earlier content was destroyed by the
 /// overwrite itself, not by this rollback, and no amount of eviction
-/// here brings it back. `aurora-app` never does that — both of its
-/// read paths open a document *into* a store, they do not merge one
-/// into a live document — and the alternative (leaving the rejected
+/// here brings it back. **`aurora-app` did exactly that until 0.143.1**
+/// — its open-a-`.aur` path read straight into the live store while the
+/// current document was still in it, and both documents' surface ids
+/// restart from zero, so a damaged file erased tiles of the document it
+/// left open. It now reads the same bytes into a throwaway store first
+/// (`aurora_app`'s `read_aur_for_open`) and touches the live store only
+/// if that succeeds. A caller that reads into a store already holding
+/// content must do the same; the alternative here (leaving the rejected
 /// file's pixels resident) is the failure this exists to prevent.
 ///
 /// Failures are logged, never returned: this runs on an error path that

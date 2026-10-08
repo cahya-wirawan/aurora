@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.143.0"
+version = "0.145.0"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -198,6 +198,12 @@ tiff = "0.11"
 # which aren't pre-compressed) -- no encryption, no bzip2/lzma/zstd/ppmd,
 # none of which `.aur` needs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# zlib inflate for PSD/PSB channel data (`aurora-io`'s `psd` reader,
+# 0.144.0: compression methods 2 "ZIP" and 3 "ZIP with prediction").
+# Already in the lock file through `png` and `zip`, so this adds no
+# package; default features off with the pure-Rust `miniz_oxide`
+# backend, the one those two already resolve to.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Text shaping and glyph rasterization for `aurora-text` (0.132.0). These
 # are the two engines `cosmic-text` 0.19 itself shapes and rasterizes with
 # (CLAUDE.md's stack names `cosmic-text`); Aurora depends on them directly

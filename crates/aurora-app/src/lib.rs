@@ -779,29 +779,35 @@ fn document_from_image(
         Ok(id) => id,
         Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
     };
+    // The opened file is the undo baseline: the journal keeps the add
+    // (autosave/recovery replay it, the History panel lists it), the undo
+    // stack does not (0.144.0 review) -- `App::install_opened_document`
+    // resets `undo_order` to match.
+    history.clear_undo();
     (layers, history, id)
 }
 
 /// Reads `path` from disk and decodes it via
 /// `aurora_io::decode_by_extension` — the real "open a file" read+decode
-/// step. `None` on any real failure (I/O, decode, unrecognised
-/// extension), logged as a warning rather than propagated: a bad chosen
+/// step. An [`OpenFailure`] on any real failure (I/O, decode,
+/// unrecognised extension), logged as a warning and handed back for
+/// [`App::open_file`] to show ([`open_failure_message`]): a bad chosen
 /// file must never crash or leave `App` in a half-updated state, the
-/// same honesty [`recover_document`] already applies to a bad autosave.
-#[must_use]
-fn open_image(path: &Path) -> Option<aurora_io::Image> {
+/// same honesty [`recover_document`] already applies to a bad autosave —
+/// and, since 0.143.1, it must not fail *silently* either.
+fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
-            return None;
+            return Err(OpenFailure::Read(err));
         }
     };
     match aurora_io::decode_by_extension(path, &bytes) {
-        Ok(image) => Some(image),
+        Ok(image) => Ok(image),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "failed to decode the chosen file");
-            None
+            Err(OpenFailure::Decode(err))
         }
     }
 }
@@ -871,6 +877,93 @@ fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
 fn is_aur_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("aur"))
+}
+
+/// Whether `path`'s own extension names a Photoshop file — `.psd` or
+/// `.psb`, case-insensitively — which [`App::open_file`] routes to
+/// [`App::open_psd_file`] (0.144.0) instead of the flat-image decoders.
+#[must_use]
+fn is_psd_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("psd") || ext.eq_ignore_ascii_case("psb"))
+}
+
+/// Which reader [`App::open_file`] hands a chosen path to — the pure,
+/// testable half of its dispatch (0.144.0 review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenRoute {
+    /// An Aurora document ([`is_aur_path`]).
+    Aur,
+    /// A Photoshop file ([`is_psd_path`]).
+    Psd,
+    /// Everything else: the flat-image decoders, which refuse an
+    /// extension they do not know with a typed error.
+    Image,
+}
+
+#[must_use]
+fn open_route(path: &Path) -> OpenRoute {
+    if is_aur_path(path) {
+        OpenRoute::Aur
+    } else if is_psd_path(path) {
+        OpenRoute::Psd
+    } else {
+        OpenRoute::Image
+    }
+}
+
+/// The open-report sentence for `unwritten` layers whose pixels could
+/// not be written into the tile store (0.144.0 review, C-07) — `None`
+/// when every layer was written.
+#[must_use]
+fn unwritten_layers_item(unwritten: usize) -> Option<String> {
+    (unwritten > 0).then(|| {
+        format!(
+            "{unwritten} layer{s} could not be loaded into memory and {is} shown empty.",
+            s = if unwritten == 1 { "" } else { "s" },
+            is = if unwritten == 1 { "is" } else { "are" },
+        )
+    })
+}
+
+/// Decodes a chosen PSD/PSB file's bytes into a whole document
+/// (`aurora_io::read_psd`) — [`App::open_psd_file`]'s testable half. A
+/// refusal is an [`OpenFailure::Decode`] carrying the reader's own typed
+/// error, which [`open_failure_message`] turns into plain language.
+fn open_psd_document(bytes: &[u8]) -> Result<aurora_io::PsdDocument, OpenFailure> {
+    aurora_io::read_psd(bytes).map_err(OpenFailure::Decode)
+}
+
+/// The "Opened With Changes" dialog's title (0.144.0).
+const PSD_REPORT_TITLE: &str = "Opened With Changes";
+
+const PSD_REPORT_DISMISS: &str = "psd.report.dismiss";
+
+/// The import-report dialog's single "OK": the document is already
+/// open; the dialog only says what it could not show.
+fn psd_report_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(PSD_REPORT_DISMISS, "OK")]
+}
+
+/// The import-report message for a PSD that opened but uses things
+/// Aurora cannot show faithfully yet — `None` for one it shows as
+/// Photoshop would, which opens with no dialog at all. Each report item
+/// is one sentence from `aurora_io::psd`, sanitized like every other
+/// file-derived string a dialog shows; the file is never modified.
+fn psd_report_message(file_name: &str, report: &aurora_io::PsdImportReport) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = report
+        .items
+        .iter()
+        .map(|item| aurora_doc::sanitize_display_name(item).into_owned())
+        .collect();
+    Some(format!(
+        "\"{file_name}\" opened, but this version of Aurora can't show all of it yet. {} \
+         The original file has not been changed.",
+        items.join(" ")
+    ))
 }
 
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
@@ -1075,19 +1168,8 @@ fn verify_aur(path: &Path) -> bool {
         tracing::warn!(path = %path.display(), "failed to reopen the exported .aur file to verify it");
         return false;
     };
-    let Some(budget) = std::num::NonZeroUsize::new(16) else {
-        unreachable!("16 is non-zero");
-    };
-    let Some(scratch_dir) = aur_verify_scratch_dir() else {
-        tracing::warn!("no scratch directory for the .aur verification store");
+    let Some((_scratch_dir, mut store)) = aur_scratch_store() else {
         return false;
-    };
-    let mut store = match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
-        Ok(store) => store,
-        Err(err) => {
-            tracing::warn!(?err, "failed to open the .aur verification scratch store");
-            return false;
-        }
     };
     match aurora_io::read_aur(file, &mut store) {
         Ok(_) => true,
@@ -1096,6 +1178,70 @@ fn verify_aur(path: &Path) -> bool {
             false
         }
     }
+}
+
+/// A throwaway `aurora_tile::TileStore` for reading a `.aur` container
+/// somewhere that is *not* the live document's store — [`verify_aur`]'s
+/// read-back and [`read_aur_for_open`]'s pre-check. The returned
+/// `TempDir` owns the store's scratch files: keep it alive as long as
+/// the store, drop both together. `None` (logged) if either could not be
+/// created.
+fn aur_scratch_store() -> Option<(tempfile::TempDir, aurora_tile::TileStore)> {
+    let Some(budget) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("16 is non-zero");
+    };
+    let Some(scratch_dir) = aur_verify_scratch_dir() else {
+        tracing::warn!("no scratch directory for a throwaway .aur read store");
+        return None;
+    };
+    match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
+        Ok(store) => Some((scratch_dir, store)),
+        Err(err) => {
+            tracing::warn!(?err, "failed to open a throwaway .aur read store");
+            None
+        }
+    }
+}
+
+/// Reads a chosen `.aur` file's `bytes` into the **live** `store`, but
+/// only after the very same bytes have been read successfully into a
+/// throwaway one ([`aur_scratch_store`]) — [`App::open_aur_file`]'s own
+/// read step since 0.143.1.
+///
+/// **Why the pre-check exists (found in 0.143.1).** `aurora_io::read_aur`
+/// writes tiles into the store it is given as it decodes them, and on a
+/// failure part-way through it rolls back by *forgetting* every tile it
+/// had committed (0.71.2). Its own doc comment calls that safe because
+/// "`aurora-app` never ... merge one into a live document" — but
+/// `App::open_aur_file` reads straight into the live store while the
+/// current document is still in it, and both documents' surface ids
+/// derive from `LayerId`s that restart at zero. So a damaged `.aur` whose
+/// early tile entries decode and whose later one does not first
+/// overwrote, then deleted, the *current* document's tiles on every
+/// surface they share — a refused open that silently erased pixels of
+/// the document it claimed to leave alone. Pinned by
+/// `a_damaged_aur_read_straight_into_a_live_store_erases_the_current_documents_tiles`,
+/// and closed here by refusing before the live store is touched:
+/// `read_aur` is a pure function of its bytes and the store it writes,
+/// so bytes that read cleanly once read cleanly again — barring the
+/// store itself failing, which is [`OpenFailure::AurAfterCheck`].
+///
+/// The cost is decoding every tile twice (the pre-check pages them to
+/// its own scratch directory, under a 16-tile memory budget) and holding
+/// the whole file in memory, as the flat-image path already does.
+fn read_aur_for_open(
+    bytes: &[u8],
+    store: &mut aurora_tile::TileStore,
+) -> Result<aurora_io::AurDocument, OpenFailure> {
+    {
+        let Some((_scratch_dir, mut scratch)) = aur_scratch_store() else {
+            return Err(OpenFailure::NoTileStorage);
+        };
+        aurora_io::read_aur(std::io::Cursor::new(bytes), &mut scratch).map_err(OpenFailure::Aur)?;
+        // `scratch` and its directory drop here, before the live read
+        // starts, so the two never hold the file's tiles at once.
+    }
+    aurora_io::read_aur(std::io::Cursor::new(bytes), store).map_err(OpenFailure::AurAfterCheck)
 }
 
 /// Clears and repopulates `workspace`'s Layers/History/Properties panels
@@ -1154,6 +1300,12 @@ fn replace_document(
     // caller can observe, including the error: a missing panel body is
     // still reported as the same `WidgetError::UnknownWidget`, just
     // raised by the populate call instead of the clear before it.
+    // A different document starts its Layers and History panels at the
+    // top (0.145.0): a scroll offset into the outgoing document's rows
+    // means nothing for the incoming one's. Properties is left alone --
+    // it shows the tool, which an open does not change.
+    workspace.tree.set_scroll_y(workspace.layers.body, 0.0)?;
+    workspace.tree.set_scroll_y(workspace.history.body, 0.0)?;
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
@@ -1174,14 +1326,18 @@ fn replace_document(
 }
 
 /// The store-side half of replacing the current document with a freshly
-/// opened flat image: frees every tile the *outgoing* document still
+/// opened flat image or PSD: frees every tile the *outgoing* document still
 /// holds — its layer and mask surfaces
 /// (`aurora_doc::forget_document_surfaces`) plus this crate's own
 /// reserved composite-preview surface ([`composite_surface_id`], which
 /// no `LayerTree` can name and so no `aurora-doc` sweep can reach) —
-/// then writes `image`'s own pixels onto the incoming layer's surface
-/// (`aurora_io::write_into_store`). Returns how many tiles were freed,
-/// summed across both sweeps.
+/// then writes each `incoming` image onto its own layer's surface at its
+/// own surface-local offset (`aurora_io::write_into_store_at`) — one
+/// entry at `(0, 0)` for a flat image, one per pixel layer for a PSD.
+/// Returns how many tiles were freed, summed across both sweeps, and how
+/// many incoming layers' pixels could **not** be written — which the
+/// caller must surface to the user (0.144.0 review: a write failure used
+/// to be log-only, i.e. a silently blank layer).
 ///
 /// # Why the composite surface is swept here too
 ///
@@ -1236,32 +1392,41 @@ fn replace_document_pixels(
     outgoing_layers: aurora_doc::LayerTree,
     outgoing_history: aurora_doc::History,
     incoming_layers: &aurora_doc::LayerTree,
-    incoming_layer: aurora_doc::LayerId,
-    image: &aurora_io::Image,
-) -> usize {
+    incoming: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+) -> (usize, usize) {
     let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
         + store.forget_surface(composite_surface_id());
-    // Its own `else`, not folded into the write below: a layer with no
-    // surface means the document just opened has nowhere to put its
-    // pixels and will come up blank. That is worth a loud line even
-    // though `document_from_image` always builds a pixel layer -- every
-    // other skipped or failed path in this crate says so, and a silent
-    // blank canvas is the one outcome a user cannot diagnose.
-    let Some(surface) = incoming_layers.surface_id(incoming_layer) else {
-        tracing::error!(
-            ?incoming_layer,
-            "the opened document's layer has no surface; its pixels were not written into the \
-             tile store and the canvas will be blank"
-        );
-        return freed;
-    };
-    if let Err(err) = aurora_io::write_into_store(image, store, surface) {
-        tracing::warn!(
-            ?err,
-            "failed to write the opened image's pixels into the tile store"
-        );
+    // Every incoming layer is written only after the sweep above has
+    // finished -- all of them, not just the first: with a multi-layer
+    // PSD (0.144.0) every one of its layer ids, not only id 0, can alias
+    // a surface the outgoing document still held.
+    let mut failed = 0_usize;
+    for (incoming_layer, image, (dx, dy)) in incoming {
+        // Its own `else`, not folded into the write below: a layer with
+        // no surface means the document just opened has nowhere to put
+        // its pixels and will come up blank. That is worth a loud line
+        // even though every caller builds pixel layers -- every other
+        // skipped or failed path in this crate says so, and a silent
+        // blank canvas is the one outcome a user cannot diagnose.
+        let Some(surface) = incoming_layers.surface_id(*incoming_layer) else {
+            tracing::error!(
+                ?incoming_layer,
+                "an opened document's layer has no surface; its pixels were not written into the \
+                 tile store and it will be blank"
+            );
+            failed += 1;
+            continue;
+        };
+        if let Err(err) = aurora_io::write_into_store_at(image, store, surface, *dx, *dy) {
+            tracing::warn!(
+                ?err,
+                ?incoming_layer,
+                "failed to write an opened layer's pixels into the tile store"
+            );
+            failed += 1;
+        }
     }
-    freed
+    (freed, failed)
 }
 
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
@@ -2270,6 +2435,321 @@ fn incomplete_composite_message(skipped: usize, first: &str) -> String {
          document, so the exported image would have been missing content. The first failure was: \
          {first}. Any existing file at that path is unchanged."
     )
+}
+
+/// Why an open was refused — [`App::open_file`]'s and
+/// [`App::open_aur_file`]'s own failure value, carried to
+/// [`open_failure_message`] so the user is told what happened instead
+/// of nothing at all (0.143.1).
+///
+/// Until 0.143.1 every one of these was a `tracing::warn!` and a bare
+/// `return`: choosing a file Aurora cannot read — a `.psd`, on real
+/// macOS hardware — closed the file picker and changed nothing on
+/// screen, which reads exactly like the app ignoring the click.
+#[derive(Debug)]
+enum OpenFailure {
+    /// The file could not be read from disk at all (missing, permission
+    /// denied, a device error).
+    Read(std::io::Error),
+    /// A flat image (`aurora_io::decode_by_extension`) or a PSD/PSB
+    /// (`aurora_io::read_psd`, 0.144.0) refused it — an unrecognised
+    /// extension (`IoError::UnsupportedExtension`), a file that does not
+    /// decode as the format its extension names, or a Photoshop file of a
+    /// kind this build does not read (CMYK, 32-bit, ...), each carried as
+    /// the reader's own typed error.
+    Decode(aurora_io::IoError),
+    /// A `.aur` document refused it during [`read_aur_for_open`]'s own
+    /// throwaway pre-check, **before the live tile store was touched**.
+    Aur(aurora_io::IoError),
+    /// A `.aur` document passed that pre-check and then failed anyway
+    /// while being read into the live tile store (a scratch-disk write
+    /// failing mid-read, say). The one case where "your current document
+    /// has not changed" cannot be promised: `aurora_io::read_aur`'s own
+    /// rollback drops every tile it committed, and on surface ids the
+    /// current document shares (both restart from zero) some of those
+    /// were the current document's own. Said plainly in the message
+    /// rather than papered over.
+    AurAfterCheck(aurora_io::IoError),
+    /// There is nowhere to read a `.aur` document's tiles into: no live
+    /// tile store this session, or no scratch store for the pre-check.
+    NoTileStorage,
+}
+
+/// The sentence every refused open ends with — except
+/// [`OpenFailure::AurAfterCheck`], the one case that cannot honestly
+/// say it. Shared so a test can pin both halves of that rule.
+const OPEN_FAILED_UNCHANGED: &str = "Your current document has not changed.";
+
+/// The refused-open dialog's own title. Fixed, deliberately: the
+/// dialog's title is one row ([`insert_dialog`]), so the file name —
+/// arbitrary length — goes in the message, which wraps.
+const OPEN_FAILED_TITLE: &str = "Couldn't Open File";
+
+const OPEN_FAILED_DISMISS: &str = "open.failed.dismiss";
+
+/// The refused-open dialog's own action — a single "OK", for the same
+/// reason [`export_refused_dialog_actions`] has one: the open already
+/// failed and nothing changed, so acknowledging is the whole
+/// interaction.
+fn open_failed_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(OPEN_FAILED_DISMISS, "OK")]
+}
+
+/// The formats this build opens, in the words a user knows them by —
+/// the one list every "can't open that kind of file" message names.
+/// Kept next to [`open_failure_message`] rather than derived from
+/// `aurora_io`, because that crate dispatches on extensions, not names.
+const OPENABLE_FORMATS: &str =
+    "PNG, JPEG, TIFF, Photoshop (PSD and PSB, 8- or 16-bit RGB) and Aurora documents (.aur)";
+
+/// The formats this build saves — [`save_failure_message`]'s own
+/// counterpart to [`OPENABLE_FORMATS`]. The same set today.
+const SAVEABLE_FORMATS: &str = "PNG, JPEG, TIFF or Aurora document (.aur)";
+
+/// `path`'s own file name for a dialog message, made safe to show.
+///
+/// The name is **outside text** — a file name can carry control and
+/// bidi-formatting characters, and it is heading for a rendered label
+/// and an `accesskit` announcement — so it goes through
+/// `aurora_doc::sanitize_display_name`, the same treatment layer names
+/// and [`skipped_tiles_message`]'s file-controlled reasons get. Falls
+/// back to the whole path for one with no file name component.
+fn display_file_name(path: &Path) -> String {
+    let raw = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    aurora_doc::sanitize_display_name(&raw).into_owned()
+}
+
+/// What a user would call a file with this (lower-cased) extension, for
+/// a "this isn't a valid ..." sentence. `None` for one this build has no
+/// name for.
+fn format_name_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "png" => Some("PNG"),
+        "jpg" | "jpeg" => Some("JPEG"),
+        "tif" | "tiff" => Some("TIFF"),
+        "aur" => Some("Aurora document"),
+        "psd" => Some("Photoshop (PSD)"),
+        "psb" => Some("Photoshop Large Document (PSB)"),
+        _ => None,
+    }
+}
+
+/// An error's own text, made safe and short enough to show — decoder
+/// messages can quote bytes out of the file being opened, so they get
+/// the same sanitizing-and-capping [`display_file_name`] gives names.
+fn display_error_detail(err: &dyn std::fmt::Display) -> String {
+    aurora_doc::sanitize_display_name(&err.to_string()).into_owned()
+}
+
+/// Which way a file is going, for the wording the two directions share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileDirection {
+    Open,
+    Save,
+}
+
+/// The clause naming why an extension this build cannot handle was
+/// refused, for both directions — the text after "Aurora can't open
+/// "name": " in [`open_failure_message`] and its save counterpart.
+fn unsupported_extension_clause(extension: &str, direction: FileDirection) -> String {
+    if extension.is_empty() {
+        return match direction {
+            FileDirection::Open => {
+                "it has no file extension, so Aurora can't tell what kind of file it is".to_owned()
+            }
+            FileDirection::Save => {
+                "it has no file extension, so Aurora can't tell which format to use".to_owned()
+            }
+        };
+    }
+    let verb = match direction {
+        FileDirection::Open => "read",
+        FileDirection::Save => "write",
+    };
+    match format_name_for_extension(extension) {
+        Some(format) => format!("this version can't {verb} {format} files yet"),
+        None => format!(
+            "Aurora doesn't recognise the \".{}\" file type",
+            display_error_detail(&extension)
+        ),
+    }
+}
+
+/// The plain-language message for a refused open — what the user sees
+/// in the [`OPEN_FAILED_TITLE`] dialog.
+///
+/// Every message names the file, says what went wrong in terms a user
+/// can act on (a format to convert to, a file that moved, a permission
+/// to grant), carries the underlying error's own text as `Details:`
+/// where there is one, and ends with [`OPEN_FAILED_UNCHANGED`] — the
+/// single most important fact after a failed open. The one exception is
+/// [`OpenFailure::AurAfterCheck`], which says instead what it cannot
+/// promise.
+fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure) -> String {
+    let body = match failure {
+        OpenFailure::Read(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "Aurora couldn't find \"{file_name}\". It may have been moved, renamed or deleted."
+            ),
+            std::io::ErrorKind::PermissionDenied => {
+                format!("Aurora doesn't have permission to read \"{file_name}\".")
+            }
+            _ => format!(
+                "Aurora couldn't read \"{file_name}\". Details: {}.",
+                display_error_detail(err)
+            ),
+        },
+        OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext)) => format!(
+            "Aurora can't open \"{file_name}\": {}. It can open {OPENABLE_FORMATS}.",
+            unsupported_extension_clause(ext, FileDirection::Open)
+        ),
+        OpenFailure::Decode(
+            err @ (aurora_io::IoError::PsdTooLarge { .. }
+            | aurora_io::IoError::PsdPixelBudget { .. }
+            | aurora_io::IoError::PsdGroupsTooDeep { .. }),
+        ) => format!(
+            "\"{file_name}\" is too large or too deeply nested for this version of Aurora to \
+             open. Details: {}.",
+            display_error_detail(err)
+        ),
+        OpenFailure::Decode(
+            err @ (aurora_io::IoError::UnexpectedColorType(_)
+            | aurora_io::IoError::UnexpectedJpegColorSpace(_)
+            | aurora_io::IoError::UnsupportedTiffColorType(_)
+            | aurora_io::IoError::UnsupportedTiffSampleFormat(_)
+            | aurora_io::IoError::UnsupportedPsdVersion(_)
+            | aurora_io::IoError::UnsupportedPsdColorMode(_)
+            | aurora_io::IoError::UnsupportedPsdDepth(_)
+            | aurora_io::IoError::UnsupportedPsdCompression(_)),
+        ) => format!(
+            "\"{file_name}\" uses a kind of {} that Aurora can't open yet. Details: {}.",
+            format_name_for_extension(extension).unwrap_or("image"),
+            display_error_detail(err)
+        ),
+        OpenFailure::Decode(err) => format!(
+            "\"{file_name}\" isn't a valid {} file, or it is damaged. Details: {}.",
+            format_name_for_extension(extension).unwrap_or("image"),
+            display_error_detail(err)
+        ),
+        OpenFailure::Aur(err) => format!(
+            "\"{file_name}\" isn't a valid Aurora document, or it is damaged or was written by a \
+             newer version of Aurora. Details: {}.",
+            display_error_detail(err)
+        ),
+        OpenFailure::AurAfterCheck(err) => {
+            // Deliberately no `OPEN_FAILED_UNCHANGED`: see the variant.
+            return format!(
+                "\"{file_name}\" looked valid, but reading it into this session failed partway \
+                 through. Details: {}. Some of your current document's pixels may have been \
+                 cleared. Save it under a new name and check it before continuing.",
+                display_error_detail(err)
+            );
+        }
+        OpenFailure::NoTileStorage => format!(
+            "Aurora couldn't open \"{file_name}\" because this session has no storage for image \
+             data available."
+        ),
+    };
+    format!("{body} {OPEN_FAILED_UNCHANGED}")
+}
+
+/// Opens the refused-open dialog for `message` — [`open_dialog`] with
+/// [`OPEN_FAILED_TITLE`] and [`open_failed_dialog_actions`], and
+/// therefore a no-op (returning `false`) if a dialog is already open.
+/// The testable half of [`App::report_open_failure`], which adds the
+/// relayout, the announcement, and the log line for a suppressed one.
+fn open_open_failed_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    scales: &Scales,
+    message: &str,
+) -> bool {
+    open_dialog(
+        workspace,
+        focus,
+        dialog,
+        scales,
+        OPEN_FAILED_TITLE,
+        message,
+        open_failed_dialog_actions(),
+    )
+}
+
+/// Why a save or export was refused — [`App::save_file`]'s and
+/// [`App::save_aur_file`]'s own failure value for everything except
+/// the incomplete-composite refusal, which keeps its own itemized
+/// dialog ([`incomplete_composite_message`]).
+#[derive(Debug)]
+enum SaveFailure {
+    /// `aurora_io::encode_by_extension` refused — an extension this
+    /// build cannot write (`IoError::UnsupportedExtension`, where a
+    /// `.psd` lands today) or an encoder error (a JPEG past its own
+    /// dimension limit, say).
+    Encode(aurora_io::IoError),
+    /// Writing, verifying by reading back, or the final rename failed
+    /// ([`write_verified`]/[`App::save_aur_file`], or a save path with no
+    /// file name); each of those leaves
+    /// whatever was already at the path untouched and removes its own
+    /// temp file. The detailed cause is in the log.
+    Write,
+    /// The document's layers could not be combined into one image to
+    /// export (`composite_document` failed with anything other than the
+    /// itemized `IoError::IncompleteComposite`, which keeps its own
+    /// dialog). Nothing is written. 0.143.1 review: this was the last
+    /// silent export failure.
+    Composite(aurora_io::IoError),
+    /// This session has no live tile store, so there are no pixels to
+    /// export. Nothing is written.
+    NoTileStorage,
+}
+
+/// The refused-save dialog's own title.
+const SAVE_FAILED_TITLE: &str = "Couldn't Save File";
+
+const SAVE_FAILED_DISMISS: &str = "save.failed.dismiss";
+
+/// The refused-save dialog's own single "OK".
+fn save_failed_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(SAVE_FAILED_DISMISS, "OK")]
+}
+
+/// The sentence every refused save ends with: nothing was written, and
+/// whatever was already at that path is intact — both true on every
+/// path that produces a [`SaveFailure`].
+const SAVE_FAILED_UNCHANGED: &str =
+    "Nothing was saved, and any existing file with that name is unchanged.";
+
+/// The plain-language message for a refused save, ending with
+/// [`SAVE_FAILED_UNCHANGED`].
+fn save_failure_message(file_name: &str, failure: &SaveFailure) -> String {
+    let body = match failure {
+        SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension(ext)) => format!(
+            "Aurora can't save \"{file_name}\": {}. It can save as {SAVEABLE_FORMATS}.",
+            unsupported_extension_clause(ext, FileDirection::Save)
+        ),
+        SaveFailure::Encode(err) => format!(
+            "Aurora couldn't encode \"{file_name}\". Details: {}.",
+            display_error_detail(err)
+        ),
+        SaveFailure::Write => format!(
+            "Aurora couldn't write \"{file_name}\": creating the file, writing the document into \
+             it, or reading it back to check it failed. Aurora's log has the details."
+        ),
+        SaveFailure::Composite(err) => format!(
+            "Aurora couldn't export \"{file_name}\": the document's layers could not be combined \
+             into one image. Details: {}.",
+            display_error_detail(err)
+        ),
+        SaveFailure::NoTileStorage => format!(
+            "Aurora couldn't export \"{file_name}\": this session has no storage for image data, \
+             so there are no pixels to save."
+        ),
+    };
+    format!("{body} {SAVE_FAILED_UNCHANGED}")
 }
 
 const SKIPPED_TILES_DISMISS: &str = "skipped.tiles.dismiss";
@@ -6564,6 +7044,170 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
     }
 }
 
+/// How far, in logical px, one `WindowEvent::MouseWheel` over a dock
+/// panel scrolls it (0.145.0). **Positive is "scroll up"** — `winit`'s own
+/// sign convention, the same one [`zoom_steps_for_scroll`] reads: the
+/// content moves down and what is above comes into view, so the caller
+/// passes the *negated* value to `WidgetTree::scroll_by`.
+///
+/// - A wheel's `LineDelta` is in lines: one notch moves one panel row
+///   (`row`, `aurora_widgets::widgets::row_height`).
+/// - A trackpad's `PixelDelta` is in **physical** px (`winit` 0.30's
+///   macOS backend converts `scrollingDeltaY`'s points with
+///   `to_physical(scale_factor)`), so it is divided back by
+///   `scale_factor` into the logical px layout uses — otherwise a Retina
+///   trackpad would scroll panels twice as fast as the fingers move. A
+///   non-positive or non-finite `scale_factor` falls back to `1.0`, the
+///   same guard [`logical_size`] uses.
+///
+/// A non-finite result is `0.0`: `scroll_by` rejects one anyway, and a
+/// stray `NaN` from a driver should be no scroll rather than a logged
+/// error per event.
+#[must_use]
+fn panel_scroll_delta(delta: winit::event::MouseScrollDelta, scale_factor: f64, row: f32) -> f32 {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let dy = match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, lines) => lines * row,
+        winit::event::MouseScrollDelta::PixelDelta(position) => (position.y / scale_factor) as f32,
+    };
+    if dy.is_finite() { dy } else { 0.0 }
+}
+
+/// Where one `WindowEvent::MouseWheel` at `position` (logical px) goes —
+/// [`wheel_target`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WheelTarget {
+    /// Zoom the canvas around this canvas-area-relative point
+    /// ([`apply_scroll_zoom`]) — exactly the pre-0.145.0 behaviour.
+    Canvas((f32, f32)),
+    /// Scroll this panel body ([`scroll_panel`]).
+    Panel(WidgetId),
+    /// Nothing moves.
+    Nothing,
+}
+
+/// Routes a wheel event (0.145.0), in this order:
+///
+/// 1. **An open modal dialog swallows it** (`modal_open`), the same rule
+///    [`handle_key`] opens with — neither the canvas nor a panel behind a
+///    modal moves.
+/// 2. **Over the canvas it zooms, first and unconditionally** — checked
+///    before any panel, and regardless of `pointer_owned`, so a wheel
+///    over the canvas does exactly what it did before scrolling existed,
+///    zoom-while-stroking included ([`apply_scroll_zoom`]'s own drag
+///    re-anchoring).
+/// 3. **Anywhere else, while something owns the pointer**
+///    (`pointer_owned`: a live canvas drag, a rail resize, or a gallery
+///    widget's capture) nothing moves: scrolling a panel out from under a
+///    drag would move whatever the drag is pointing at.
+/// 4. Otherwise the scroll container under the pointer that has
+///    somewhere to scroll (`WidgetTree::scroll_container_at`) scrolls;
+///    one whose content fits, an open popover, or the bare rail is
+///    [`WheelTarget::Nothing`].
+#[must_use]
+fn wheel_target(
+    workspace: &aurora_ui::Workspace,
+    position: (f32, f32),
+    modal_open: bool,
+    pointer_owned: bool,
+) -> WheelTarget {
+    if modal_open {
+        return WheelTarget::Nothing;
+    }
+    if let Some(canvas_point) = pointer_in_canvas(workspace, position) {
+        return WheelTarget::Canvas(canvas_point);
+    }
+    if pointer_owned {
+        return WheelTarget::Nothing;
+    }
+    workspace
+        .tree
+        .scroll_container_at(position)
+        .map_or(WheelTarget::Nothing, WheelTarget::Panel)
+}
+
+/// Scrolls `container` by one wheel event's [`panel_scroll_delta`],
+/// negated into `WidgetTree::scroll_by`'s "positive reveals what is
+/// below" direction. Returns whether anything on screen moved — `false`
+/// against either end of the range, so a trackpad's momentum tail
+/// hitting the top or bottom costs no relayout.
+fn scroll_panel(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    container: WidgetId,
+    delta: winit::event::MouseScrollDelta,
+    scale_factor: f64,
+    scales: &Scales,
+) -> bool {
+    let dy = panel_scroll_delta(
+        delta,
+        scale_factor,
+        aurora_widgets::widgets::row_height(scales),
+    );
+    match tree.scroll_by(container, -dy) {
+        Ok(moved) => moved,
+        Err(err) => {
+            tracing::warn!(?err, "panel scroll failed");
+            false
+        }
+    }
+}
+
+/// What [`follow_scroll`] last saw (0.145.0): the focused widget and the
+/// active layer at the previous layout. Starts empty, so the first
+/// layout after startup — or after [`App::open_file`] resets it — counts
+/// both as changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScrollFollow {
+    focus: Option<WidgetId>,
+    active: Option<aurora_doc::LayerId>,
+}
+
+/// Keeps what the user is working on in view (0.145.0): after a layout,
+/// if keyboard focus moved to a different widget, scrolls that widget's
+/// panel just far enough to show it; if the active layer changed (a row
+/// click, undo/redo, New/Delete Layer, an opened document), does the same
+/// for that layer's Layers row. Returns whether either scrolled, so the
+/// caller lays out once more. **Only on a real change** — a widget or
+/// layer that stays put is never scrolled back into view, so a user who
+/// scrolls the active row out of sight keeps the view they chose.
+///
+/// The active row is followed second, so when one event moves both (a
+/// Layers row click focuses and activates the same row) it is the row
+/// that wins. A rebuilt Layers panel gives every row a new `WidgetId`, so
+/// focus on a row "changes" across a repopulate even when it stays on the
+/// same layer, and that row is brought back into view — disclosed rather
+/// than special-cased.
+fn follow_scroll(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    last: &mut ScrollFollow,
+    focused: Option<WidgetId>,
+    active: Option<aurora_doc::LayerId>,
+) -> bool {
+    let mut moved = false;
+    if focused != last.focus
+        && let Some(widget) = focused
+    {
+        moved |= tree.scroll_into_view(widget);
+    }
+    if active != last.active
+        && let Some(layer) = active
+        && let Some((&row, _)) = layer_rows.iter().find(|&(_, &id)| id == layer)
+    {
+        moved |= tree.scroll_into_view(row);
+    }
+    *last = ScrollFollow {
+        focus: focused,
+        active,
+    };
+    moved
+}
+
 /// Zooms `view` in/out around `anchor` (already canvas-area-relative) in
 /// response to one `WindowEvent::MouseWheel` — the "scroll to zoom"
 /// gesture that works regardless of which tool is active, matching
@@ -6742,18 +7386,32 @@ fn handle_zoom_tool_click(
 // renders in its new place, not just in the document model. Undo-as-
 // you-drag remains separate, still-open follow-on work.
 
-/// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
-/// initial value. `layers.roots()` is already ordered top-to-bottom
-/// (index 0 topmost, matching every panel in this workspace), so the
-/// first root that's a pixel layer (skipping any group) is it. `None`
-/// for a document with no pixel layer at all.
+/// The topmost pixel layer in `layers`, at any depth — [`App::active_layer`]'s
+/// own initial value. Every level is ordered top-to-bottom (index 0
+/// topmost, matching every panel in this workspace), so a depth-first,
+/// top-first walk meets the visually topmost pixel layer first: a group
+/// is searched, child by child, before anything below it. `None` for a
+/// document with no pixel layer at all.
+///
+/// Until the 0.144.0 review this searched the roots only, so a PSD whose
+/// every root is a group — common in real files — opened with no active
+/// layer and a brush that painted nothing. Walked with an explicit stack;
+/// the tree's own depth cap bounds it either way.
 #[must_use]
 fn topmost_pixel_layer(layers: &aurora_doc::LayerTree) -> Option<aurora_doc::LayerId> {
-    layers
-        .roots()
-        .iter()
-        .copied()
-        .find(|&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. })))
+    // Reversed onto the stack so the topmost sibling is popped first.
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        match layers.kind(id) {
+            Some(aurora_doc::LayerKind::Pixel { .. }) => return Some(id),
+            _ => {
+                if let Some(children) = layers.children(id) {
+                    stack.extend(children.iter().rev().copied());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `active_layer`, together with its own bounds, if it names a real
@@ -16325,6 +16983,11 @@ struct App {
     /// `WidgetTree::hit_test` result up in to turn a click into "select
     /// this layer."
     layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+    /// The focused widget and active layer the last layout saw — what
+    /// [`follow_scroll`] compares against to scroll a newly focused
+    /// widget or newly active layer's row into view (0.145.0). Reset to
+    /// empty when a document is opened, since layer ids restart there.
+    scroll_follow: ScrollFollow,
     /// This document's own shared tile store (ADR 0010) — `None` if it
     /// failed to open (e.g. an unwritable scratch directory), logged as
     /// a warning rather than treated as fatal, the same "must never stop
@@ -16657,6 +17320,7 @@ impl App {
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
+            scroll_follow: ScrollFollow::default(),
             tile_store,
             residency: None,
             canvas_pipeline: None,
@@ -17039,7 +17703,15 @@ impl App {
     /// A read/decode failure (bad file, unrecognised extension) is
     /// logged and leaves the current document completely untouched —
     /// the same honesty [`recover_document`] already applies to a bad
-    /// autosave, extended here to a bad chosen file.
+    /// autosave, extended here to a bad chosen file — and, since
+    /// 0.143.1, is **shown** too ([`Self::report_open_failure`]): until
+    /// then it was log-only, so opening a `.psd` simply did nothing on
+    /// screen. A later `load_scales`/[`replace_document`] failure is
+    /// still log-only (there is no dialog to build without the scales).
+    /// The wiring itself is covered by inspection — a real `App` needs a
+    /// window and an event loop — while the message
+    /// ([`open_failure_message`]) and dialog
+    /// ([`open_open_failed_dialog`]) halves are unit-tested.
     ///
     /// Resets `canvas_view`/`selection`/`drag` to their own fresh-
     /// session defaults — a newly opened document has no relationship
@@ -17057,23 +17729,170 @@ impl App {
     fn open_file(&mut self, path: &Path) {
         // A live opacity drag belongs to the document being replaced.
         self.commit_layer_controls_drag();
-        if is_aur_path(path) {
-            self.open_aur_file(path);
-            return;
+        match open_route(path) {
+            OpenRoute::Aur => {
+                self.open_aur_file(path);
+                return;
+            }
+            OpenRoute::Psd => {
+                self.open_psd_file(path);
+                return;
+            }
+            OpenRoute::Image => {}
         }
-        let Some(image) = open_image(path) else {
-            return;
+        let image = match open_image(path) {
+            Ok(image) => image,
+            Err(failure) => {
+                self.report_open_failure(path, &failure);
+                return;
+            }
         };
         let name = path
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image");
         let (layers, history, layer_id) = document_from_image(name, &image);
+        // The image's own real, decoded dimensions -- known exactly
+        // here, rather than derived back out of the one layer just
+        // built from it (`document_canvas_size`'s own fallback role).
+        let canvas_size = (image.width(), image.height());
+        let Some(unwritten) = self.install_opened_document(
+            layers,
+            history,
+            &[(layer_id, &image, (0, 0))],
+            canvas_size,
+        ) else {
+            return;
+        };
+        if let Some(item) = unwritten_layers_item(unwritten) {
+            let report = aurora_io::PsdImportReport { items: vec![item] };
+            if let Some(message) = psd_report_message(&display_file_name(path), &report)
+                && !self.open_psd_report_dialog(&message)
+            {
+                tracing::warn!(%message, "the open report could not be shown");
+            }
+        }
+    }
+
+    /// Opens a Photoshop file (0.144.0): reads and decodes it whole
+    /// ([`open_psd_document`], `aurora_io::read_psd`) into a real,
+    /// multi-layer document with its groups, names, opacity, fill
+    /// opacity, blend modes and visibility, then installs it exactly the
+    /// way a flat image is installed ([`Self::install_opened_document`]:
+    /// old tiles swept first, every layer's pixels written, autosave,
+    /// view reset). A refused file — unreadable, damaged, or a kind this
+    /// build does not read (CMYK, 32-bit, ...) — reaches the user through
+    /// [`Self::report_open_failure`] with the reader's own reason, and
+    /// leaves the current document untouched: nothing is swapped or
+    /// swept until the whole file has decoded.
+    ///
+    /// A file that opened but uses things Aurora cannot show yet
+    /// (adjustment layers, masks, clipping, effects, ...) gets the
+    /// itemised [`PSD_REPORT_TITLE`] dialog ([`psd_report_message`]);
+    /// one shown faithfully opens with no dialog.
+    fn open_psd_file(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
+                self.report_open_failure(path, &OpenFailure::Read(err));
+                return;
+            }
+        };
+        let document = match open_psd_document(&bytes) {
+            Ok(document) => document,
+            Err(failure) => {
+                tracing::warn!(path = %path.display(), ?failure, "failed to decode the chosen PSD");
+                self.report_open_failure(path, &failure);
+                return;
+            }
+        };
+        drop(bytes);
+        let aurora_io::PsdDocument {
+            layers,
+            history,
+            canvas_size,
+            pixels,
+            report,
+        } = document;
+        let mut report = report;
+        let incoming: Vec<(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))> = pixels
+            .iter()
+            .map(|placed| (placed.layer, &placed.image, placed.offset))
+            .collect();
+        let Some(unwritten) = self.install_opened_document(layers, history, &incoming, canvas_size)
+        else {
+            return;
+        };
+        drop(incoming);
+        drop(pixels);
+        report.items.extend(unwritten_layers_item(unwritten));
+        if let Some(message) = psd_report_message(&display_file_name(path), &report) {
+            tracing::info!(path = %path.display(), items = report.items.len(), "opened a PSD with changes");
+            if !self.open_psd_report_dialog(&message) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %message,
+                    "the PSD import report could not be shown (a dialog is already open)"
+                );
+            }
+        }
+    }
+
+    /// Opens the [`PSD_REPORT_TITLE`] dialog with `message`, relaid out
+    /// and announced — [`Self::open_skipped_tiles_dialog`]'s shape.
+    /// Returns whether it actually opened.
+    fn open_psd_report_dialog(&mut self, message: &str) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            PSD_REPORT_TITLE,
+            message,
+            psd_report_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
+    }
+
+    /// Makes a freshly decoded document (a flat image's one layer, or a
+    /// PSD's whole tree) *the* document: rebuilds the panels
+    /// ([`replace_document`]), swaps the tree and history in, sweeps the
+    /// outgoing document's tiles and only then writes every `pixels`
+    /// entry ([`replace_document_pixels`] — the order is forced, see
+    /// there), autosaves, and resets the per-document session state.
+    /// Returns `None` — with the current document untouched — if the
+    /// design scales or the panel rebuild fail first (log-only: there is
+    /// no dialog to build without the scales); otherwise how many layers'
+    /// pixels could not be written into the tile store, which the caller
+    /// must tell the user about ([`unwritten_layers_item`]).
+    fn install_opened_document(
+        &mut self,
+        layers: aurora_doc::LayerTree,
+        mut history: aurora_doc::History,
+        pixels: &[(aurora_doc::LayerId, &aurora_io::Image, (u32, u32))],
+        canvas_size: (u32, u32),
+    ) -> Option<usize> {
+        // The opened file is the undo baseline -- see the `undo_order`
+        // reset below for why this must agree with it.
+        history.clear_undo();
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
                 tracing::error!(%err, "failed to load design scales; cannot open a document");
-                return;
+                return None;
             }
         };
         let (layer_rows, active_layer) = match replace_document(
@@ -17090,14 +17909,9 @@ impl App {
                     ?err,
                     "failed to rebuild the workspace panels for the opened document"
                 );
-                return;
+                return None;
             }
         };
-
-        // The image's own real, decoded dimensions -- known exactly
-        // here, rather than derived back out of the one layer just
-        // built from it (`document_canvas_size`'s own fallback role).
-        let canvas_size = (image.width(), image.height());
 
         // Every fallible step is behind us: nothing below this line can
         // still bail out, so this is the point at which the incoming
@@ -17110,18 +17924,19 @@ impl App {
         // and the sweep/write below.
         let outgoing_layers = std::mem::replace(&mut self.layers, layers);
         let outgoing_history = std::mem::replace(&mut self.history, history);
+        let mut unwritten_layers = 0_usize;
 
         if let Some(store) = self.tile_store.as_mut() {
             // Sweep, *then* write -- see `replace_document_pixels` for
             // why that order is forced and what the other one costs.
-            let freed = replace_document_pixels(
+            let (freed, failed) = replace_document_pixels(
                 store,
                 outgoing_layers,
                 outgoing_history,
                 &self.layers,
-                layer_id,
-                &image,
+                pixels,
             );
+            unwritten_layers = failed;
             tracing::debug!(
                 freed_tiles = freed,
                 "freed the previous document's tiles before writing the opened image's"
@@ -17131,7 +17946,7 @@ impl App {
             // so writing it first would persist an empty one.
             //
             // A fresh, empty carried record: a document decoded from a
-            // PNG/JPEG/TIFF has no `skipped-tiles` history of its own,
+            // PNG/JPEG/TIFF/PSD has no `skipped-tiles` history of its own,
             // and keeping the *previous* document's would attach one
             // file's losses to another file entirely. Assigned before
             // the write for the same reason `open_aur_file` assigns its
@@ -17162,17 +17977,26 @@ impl App {
         self.canvas_size = canvas_size;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- the `std::mem::replace` above
-        // installed a brand-new, empty `History` (not merged with the
-        // old one, which was swept and dropped instead), so
-        // keeping the old `pixel_history`/`undo_order` around would let
-        // Ctrl+Z reach into a document that's no longer open, and
-        // `undo_order` would already be desynced from `history`'s own
-        // (now-empty) stacks regardless.
+        // installed the incoming `History` (not merged with the old one,
+        // which was swept and dropped instead), so keeping the old
+        // `pixel_history`/`undo_order` around would let Ctrl+Z reach
+        // into a document that's no longer open. That incoming history
+        // is *not* empty -- its journal records every step that built
+        // the document (one add per layer, one per non-default
+        // property), which autosave and crash recovery replay and the
+        // History panel lists -- but its undo/redo stacks were cleared
+        // on the way in (`History::clear_undo`, 0.144.0 review), so a
+        // fresh `undo_order` agrees with it: the opened file is the
+        // baseline, and Ctrl+Z cannot take the import apart.
         self.pixel_history = aurora_brush::PixelHistory::new();
         self.undo_order = UndoOrder::default();
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
+        // Layer ids restart in a fresh document, so the incoming active
+        // layer may share the outgoing one's id: forget what was last
+        // followed, so the next layout scrolls its row into view.
+        self.scroll_follow = ScrollFollow::default();
         // Through `load_document_view`, never `reset_canvas_view` or
         // `CanvasView::default()` directly: the default drops the
         // atlas's zoom floor, and the reset on its own drops the pan
@@ -17196,6 +18020,7 @@ impl App {
         // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
+        Some(unwritten_layers)
     }
 
     /// Opens a real `.aur` file (ADR 0009): `aurora_io::read_aur` gives
@@ -17204,10 +18029,15 @@ impl App {
     /// document-replacement shape [`Self::open_file`]'s own flat-image
     /// path uses ([`replace_document`], resetting
     /// `canvas_view`/`selection`/`drag`), just fed by a real document
-    /// reader instead of a single decoded image. A silent no-op
-    /// (logged) if there's no live tile store, the file fails to open,
-    /// or `read_aur` itself fails (corrupt file, missing manifest/
-    /// history entry, or an unsupported future schema version).
+    /// reader instead of a single decoded image. Refused — logged *and*
+    /// shown since 0.143.1 ([`Self::report_open_failure`]), silent before
+    /// — if there's no live tile store, the file fails to read, or
+    /// `read_aur` itself fails (corrupt file, missing manifest/history
+    /// entry, or an unsupported future schema version). That last read
+    /// goes through [`read_aur_for_open`], which checks the bytes in a
+    /// throwaway store first: before 0.143.1 a damaged file read straight
+    /// into the live store could erase tiles of the document it left
+    /// open (see that function).
     ///
     /// **Unlike [`Self::open_file`], this deliberately does not sweep
     /// the outgoing document** — no [`replace_document_pixels`], no
@@ -17222,38 +18052,10 @@ impl App {
     /// change rather than a patch here.
     fn open_aur_file(&mut self, path: &Path) {
         self.commit_layer_controls_drag();
-        let Some(store) = self.tile_store.as_mut() else {
-            tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
-            return;
-        };
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to open the chosen .aur file");
-                return;
-            }
-        };
-        // The profile (4th element) is a real, checked value now
-        // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
-        // crate yet tracks a "current document profile" to restore it
-        // into -- no colour-management UI exists to have set one in the
-        // first place, so every `.aur` file this app has ever written
-        // only ever carries `None` in practice. Discarded here rather
-        // than invented a field to hold, honestly, until that UI exists.
-        let document = match aurora_io::read_aur(file, store) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
-                return;
-            }
-        };
-        let aurora_io::AurDocument {
-            layers,
-            history,
-            canvas_size,
-            profile: _profile,
-            skipped_tiles,
-        } = document;
+        // Before the read, not after it as until 0.143.1: once the live
+        // read has succeeded the current document's aliased tiles are
+        // already overwritten, so every refusal that can still happen
+        // without a document to show for it belongs ahead of that point.
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
@@ -17261,6 +18063,23 @@ impl App {
                 return;
             }
         };
+        let Some(document) = self.read_chosen_aur(path) else {
+            return;
+        };
+        // The profile (`_profile`) is a real, checked value now
+        // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
+        // crate yet tracks a "current document profile" to restore it
+        // into -- no colour-management UI exists to have set one in the
+        // first place, so every `.aur` file this app has ever written
+        // only ever carries `None` in practice. Discarded here rather
+        // than invented a field to hold, honestly, until that UI exists.
+        let aurora_io::AurDocument {
+            layers,
+            history,
+            canvas_size,
+            profile: _profile,
+            skipped_tiles,
+        } = document;
         let (layer_rows, active_layer) = match replace_document(
             &mut self.workspace,
             &scales,
@@ -17286,12 +18105,11 @@ impl App {
         // means a crash between opening a lossy file and acting on the
         // dialog leaves crash recovery a document that still knows.
         self.skipped_tiles = skipped_tiles;
-        // Re-borrowed rather than reusing the `store` binding above:
-        // that borrow of `self.tile_store` has to end before
-        // `replace_document`'s own `&mut self.workspace` above, and
-        // `read_aur` has already populated the store by now, so the
-        // container this writes carries the opened document's real
-        // tiles.
+        // Re-borrowed rather than kept from the read above: that borrow
+        // of `self.tile_store` has to end before `report_open_failure`/
+        // `replace_document` borrow `self`, and `read_aur` has already
+        // populated the store by now, so the container this writes
+        // carries the opened document's real tiles.
         if let Some(store) = self.tile_store.as_mut() {
             write_autosave(
                 &autosave_path(),
@@ -17316,6 +18134,10 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
+        // Layer ids restart in a fresh document, so the incoming active
+        // layer may share the outgoing one's id: forget what was last
+        // followed, so the next layout scrolls its row into view.
+        self.scroll_follow = ScrollFollow::default();
         // Through `load_document_view`, never `reset_canvas_view` or
         // `CanvasView::default()` directly: the default drops the
         // atlas's zoom floor, and the reset on its own drops the pan
@@ -17364,6 +18186,110 @@ impl App {
                      the document is still missing what it names"
                 );
             }
+        }
+    }
+
+    /// [`Self::open_aur_file`]'s read step: the chosen file's bytes,
+    /// read into the live tile store through [`read_aur_for_open`]'s
+    /// pre-check. `None` once every refusal on the way — no live store,
+    /// an unreadable file, a damaged or unsupported container — has been
+    /// logged and shown ([`Self::report_open_failure`]).
+    fn read_chosen_aur(&mut self, path: &Path) -> Option<aurora_io::AurDocument> {
+        let read = match (self.tile_store.as_mut(), std::fs::read(path)) {
+            (None, _) => Err(OpenFailure::NoTileStorage),
+            (Some(_), Err(err)) => Err(OpenFailure::Read(err)),
+            (Some(store), Ok(bytes)) => read_aur_for_open(&bytes, store),
+        };
+        match read {
+            Ok(document) => Some(document),
+            Err(failure) => {
+                tracing::warn!(path = %path.display(), ?failure, "failed to open the chosen .aur file");
+                self.report_open_failure(path, &failure);
+                None
+            }
+        }
+    }
+
+    /// Tells the user an open was refused (0.143.1): builds
+    /// [`open_failure_message`] for `path` and `failure`, and opens the
+    /// [`OPEN_FAILED_TITLE`] dialog with it ([`open_open_failed_dialog`])
+    /// — then relays out and announces it, the same pair
+    /// [`Self::open_export_refused_dialog`] runs and for the same reason
+    /// (the macOS native-menu route reaches [`Self::open_file`] without
+    /// the keyboard path's own relayout).
+    ///
+    /// If the one modal slot is already occupied, the message is logged
+    /// in full instead — it is not allowed to vanish. A failure to load
+    /// the design scales is logged too: there is no dialog to build
+    /// without them.
+    fn report_open_failure(&mut self, path: &Path, failure: &OpenFailure) {
+        let extension = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let message = open_failure_message(&display_file_name(path), &extension, failure);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, %message, "failed to load design scales; cannot show why an open failed");
+                return;
+            }
+        };
+        let opened = open_open_failed_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            &message,
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        if !opened {
+            tracing::warn!(
+                path = %path.display(),
+                %message,
+                "the open failure could not be shown (a dialog is already open)"
+            );
+        }
+    }
+
+    /// [`Self::report_open_failure`]'s save-side counterpart (0.143.1):
+    /// the [`SAVE_FAILED_TITLE`] dialog with [`save_failure_message`],
+    /// relayout and announcement included, logged in full if the modal
+    /// slot is taken.
+    fn report_save_failure(&mut self, path: &Path, failure: &SaveFailure) {
+        let message = save_failure_message(&display_file_name(path), failure);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, %message, "failed to load design scales; cannot show why a save failed");
+                return;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            SAVE_FAILED_TITLE,
+            &message,
+            save_failed_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        if !opened {
+            tracing::warn!(
+                path = %path.display(),
+                %message,
+                "the save failure could not be shown (a dialog is already open)"
+            );
         }
     }
 
@@ -17524,11 +18450,17 @@ impl App {
     /// tile reads failed and what the first one said
     /// ([`incomplete_composite_message`]) — which is what CLAUDE.md's own
     /// "warn with an itemized list before any lossy save" rule asks for.
-    /// Every other error from this path stays log-only, deliberately: a
-    /// bad extension or a failed write is a different, narrower failure
-    /// than "the document itself could not be read," and widening the
-    /// match would put a modal alert in front of failures that don't
-    /// warrant one.
+    /// The match stays narrow, deliberately: that itemized dialog is
+    /// for "the document itself could not be read," and no other error
+    /// is allowed to reuse its wording. **Every other failure is shown
+    /// too since 0.143.1**, through its own [`SAVE_FAILED_TITLE`] dialog
+    /// ([`Self::report_save_failure`]): an extension this build cannot
+    /// write (a `.psd`, say — until then the export silently did
+    /// nothing, leaving the user to believe it had saved) or encode
+    /// failure, a failed write/verify/rename, any other composite
+    /// failure ([`SaveFailure::Composite`]) and a session with no live
+    /// tile store ([`SaveFailure::NoTileStorage`]) — after the 0.143.1
+    /// review no export failure is log-only.
     ///
     /// **The wiring line itself is covered by inspection, not by a
     /// test.** Reaching it needs a real `App` — a window, a GPU adapter,
@@ -17545,6 +18477,8 @@ impl App {
             return;
         }
         let Some(store) = self.tile_store.as_mut() else {
+            tracing::error!(path = %path.display(), "refusing to export: no live tile store");
+            self.report_save_failure(path, &SaveFailure::NoTileStorage);
             return;
         };
         let (width, height) = self.canvas_size;
@@ -17573,6 +18507,11 @@ impl App {
                              the file is still untouched"
                         );
                     }
+                } else {
+                    // Every other composite failure is shown too (0.143.1
+                    // review): the generic save-failure dialog, never the
+                    // itemized incomplete-composite wording above.
+                    self.report_save_failure(path, &SaveFailure::Composite(err));
                 }
                 return;
             }
@@ -17581,11 +18520,14 @@ impl App {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::warn!(path = %path.display(), ?err, "failed to encode the exported image");
+                self.report_save_failure(path, &SaveFailure::Encode(err));
                 return;
             }
         };
         if write_verified(path, &bytes, image.width(), image.height()) {
             tracing::info!(path = %path.display(), "exported the composited document");
+        } else {
+            self.report_save_failure(path, &SaveFailure::Write);
         }
     }
 
@@ -17624,6 +18566,7 @@ impl App {
 
         let Some(file_name) = path.file_name() else {
             tracing::warn!(path = %path.display(), "save path has no file name");
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         };
         let mut temp_name = file_name.to_os_string();
@@ -17651,18 +18594,21 @@ impl App {
         if let Err(err) = write_result {
             tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
 
         if !verify_aur(&temp_path) {
             tracing::warn!(path = %temp_path.display(), "exported .aur file failed to verify by reading it back");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
 
         if let Err(err) = std::fs::rename(&temp_path, path) {
             tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
         tracing::info!(path = %path.display(), "exported the document as .aur");
@@ -18284,24 +19230,54 @@ impl App {
     /// one keeps the drag and re-anchors it against the moved view —
     /// see [`shift_drag_reference`] for why the pan clamp inside that
     /// zoom would otherwise paint a line the user never drew.
+    ///
+    /// **Over a dock panel it scrolls that panel (0.145.0)** — see
+    /// [`wheel_target`] for the full routing order (a modal dialog
+    /// swallows the event; the canvas check runs first) and
+    /// [`panel_scroll_delta`] for the units. A scroll that moved nothing
+    /// (either end of the range) relayouts nothing.
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         let Some(position) = self.pointer_position else {
             return;
         };
-        let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
-            return;
-        };
-        apply_scroll_zoom(
-            &mut self.canvas_view,
-            self.drag.as_mut(),
-            canvas_point,
-            delta,
-            pan_bounds(
-                &self.layers,
-                self.active_layer,
-                canvas_area_logical_size(&self.workspace),
+        let pointer_owned = self.drag.is_some()
+            || self.rail_resize.is_some()
+            || self.gallery_click.captured().is_some();
+        match wheel_target(
+            &self.workspace,
+            position,
+            self.dialog.is_some(),
+            pointer_owned,
+        ) {
+            WheelTarget::Canvas(canvas_point) => apply_scroll_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                canvas_point,
+                delta,
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             ),
-        );
+            WheelTarget::Panel(container) => {
+                if scroll_panel(
+                    &mut self.workspace.tree,
+                    container,
+                    delta,
+                    self.scale_factor,
+                    &self.scales,
+                ) {
+                    let window_size = self.window.as_ref().map(|window| window.inner_size());
+                    if let Some(size) = window_size {
+                        self.apply_resize((size.width, size.height));
+                    }
+                    self.push_accessibility();
+                    self.needs_redraw = true;
+                }
+            }
+            WheelTarget::Nothing => {}
+        }
     }
 
     /// Routes one native menu activation to [`activate_command`] — the
@@ -18742,6 +19718,11 @@ impl App {
     /// so every layout sizes checkboxes to their labels with the same
     /// engine, scales and scale factor the frame paints with. See
     /// [`layout_workspace`].
+    ///
+    /// Also where scrolling follows focus and the active layer
+    /// ([`follow_scroll`], 0.145.0): every relayout compares both against
+    /// the previous one, and lays out a second time only when that
+    /// scrolled a panel.
     fn layout(&mut self, width: f32, height: f32) {
         layout_workspace(
             &mut self.workspace,
@@ -18751,6 +19732,22 @@ impl App {
             width,
             height,
         );
+        if follow_scroll(
+            &mut self.workspace.tree,
+            &self.layer_rows,
+            &mut self.scroll_follow,
+            self.focus.focused(),
+            self.active_layer,
+        ) {
+            layout_workspace(
+                &mut self.workspace,
+                self.text_engine.as_mut(),
+                &self.scales,
+                self.scale_factor,
+                width,
+                height,
+            );
+        }
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -19759,39 +20756,44 @@ mod tests {
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
         Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
         GpuBlendDispatch, GpuBlendDispatches, GpuPaintOp, Key, KeyChord, MIN_WINDOW_HEIGHT,
-        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
+        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, OPEN_FAILED_DISMISS,
+        OPEN_FAILED_TITLE, OPEN_FAILED_UNCHANGED, OpenFailure, OpenRoute, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, StartupPanels, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_roots_into_tile,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        RailResize, RecoveredDocument, SAVE_FAILED_UNCHANGED, SaveFailure, ShutdownState,
+        StartupPanels, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, display_file_name,
+        dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
         hash_position, hash_to_unit_f32, incomplete_composite_message, install_startup_panels,
-        is_aur_path, layer_for_surface, layer_local_point, load_document_view, load_scales,
-        load_theme, logical_point, logical_size, mark_active_layer_row, mark_move_refusal_reported,
-        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
-        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
-        replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
-        route_accessibility_action, run_command, run_dialog_action, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, take_gpu_blend_dispatch_count,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
-        toggle_command_palette, topmost_pixel_layer, translate_blend_mode, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        is_aur_path, is_psd_path, layer_for_surface, layer_local_point, load_document_view,
+        load_scales, load_theme, logical_point, logical_size, mark_active_layer_row,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_failure_message, open_image, open_open_failed_dialog, open_psd_document, open_route,
+        open_tile_store, palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo,
+        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, psd_report_dialog_actions, psd_report_message,
+        read_aur_for_open, recomposite_visible_tiles, reconcile_layer_rows, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, route_accessibility_action, run_command, run_dialog_action,
+        run_shutdown_cleanup, sample_pixel, save_failure_message, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
+        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use super::{
         CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
@@ -22225,7 +23227,7 @@ mod tests {
             unreachable!("{err:?}");
         }
 
-        let Some(decoded) = open_image(&path) else {
+        let Ok(decoded) = open_image(&path) else {
             unreachable!("a real, freshly written PNG must decode");
         };
         assert_eq!(decoded.width(), 4);
@@ -22233,12 +23235,19 @@ mod tests {
     }
 
     #[test]
-    fn open_image_returns_none_for_a_path_that_does_not_exist() {
-        assert!(open_image(std::path::Path::new("/no/such/file.png")).is_none());
+    fn open_image_reports_a_read_failure_for_a_path_that_does_not_exist() {
+        match open_image(std::path::Path::new("/no/such/file.png")) {
+            Err(OpenFailure::Read(err)) => assert_eq!(err.kind(), std::io::ErrorKind::NotFound),
+            other => unreachable!("expected a not-found read failure, got {other:?}"),
+        }
     }
 
+    /// `open_image` itself is the flat-image path only: a `.psd` never
+    /// reaches it from [`App::open_file`] since 0.144.0 (`is_psd_path`
+    /// routes it to [`App::open_psd_file`] first), and if one did, it
+    /// would still be refused rather than misread.
     #[test]
-    fn open_image_returns_none_for_an_unsupported_extension() {
+    fn open_image_reports_an_unsupported_extension_for_a_psd() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err:?}"),
@@ -22247,7 +23256,846 @@ mod tests {
         if let Err(err) = std::fs::write(&path, b"whatever") {
             unreachable!("{err:?}");
         }
-        assert!(open_image(&path).is_none());
+        match open_image(&path) {
+            Err(OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext))) => {
+                assert_eq!(ext, "psd");
+            }
+            other => unreachable!("expected an unsupported-extension failure, got {other:?}"),
+        }
+    }
+
+    /// The exact text a user opening a CMYK `.psd` sees (0.144.0) —
+    /// pinned word for word. Until 0.144.0 *every* `.psd` got a "can't
+    /// read Photoshop files yet" message (0.143.1); now RGB files open
+    /// and only the kinds this build really cannot read are refused, each
+    /// with the reader's own reason.
+    #[test]
+    fn open_failure_message_for_a_cmyk_psd_names_the_file_and_the_colour_mode() {
+        let message = open_failure_message(
+            "photo.psd",
+            "psd",
+            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(4)),
+        );
+        assert_eq!(
+            message,
+            "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
+             the file uses the CMYK colour mode (code 4); only RGB can be opened. Your current \
+             document has not changed."
+        );
+    }
+
+    #[test]
+    fn open_failure_message_names_every_psd_refusal_in_plain_language() {
+        let psd = |err: aurora_io::IoError| {
+            open_failure_message("art.psd", "psd", &OpenFailure::Decode(err))
+        };
+        let cases = [
+            (
+                psd(aurora_io::IoError::UnsupportedPsdDepth(32)),
+                "uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: the file \
+                 uses 32 bits per channel; only 8 and 16 can be opened.",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdColorMode(1)),
+                "the Grayscale colour mode",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdCompression(9)),
+                "unknown compression method 9",
+            ),
+            (
+                psd(aurora_io::IoError::UnsupportedPsdVersion(3)),
+                "unsupported Photoshop file version 3",
+            ),
+            (
+                psd(aurora_io::IoError::PsdTruncated { what: "layer info" }),
+                "\"art.psd\" isn't a valid Photoshop (PSD) file, or it is damaged. Details: the \
+                 Photoshop file ends too early (while reading layer info).",
+            ),
+            (
+                psd(aurora_io::IoError::PsdMalformed {
+                    what: "layer rectangle",
+                }),
+                "the Photoshop file is damaged (layer rectangle)",
+            ),
+            (psd(aurora_io::IoError::NotPsd), "not a Photoshop file"),
+            (
+                psd(aurora_io::IoError::PsdTooLarge {
+                    width: 40_000,
+                    height: 1,
+                    max: 30_000,
+                }),
+                "is too large or too deeply nested for this version of Aurora to open",
+            ),
+            (
+                psd(aurora_io::IoError::PsdPixelBudget {
+                    total: 1 << 30,
+                    max: 1 << 28,
+                }),
+                "past this reader's 268435456-pixel limit",
+            ),
+            (
+                psd(aurora_io::IoError::PsdGroupsTooDeep { max: 255 }),
+                "nests layer groups more than 255 deep",
+            ),
+        ];
+        for (message, needle) in cases {
+            assert!(message.contains(needle), "{needle:?} not in {message:?}");
+            assert!(message.ends_with(OPEN_FAILED_UNCHANGED), "{message}");
+        }
+    }
+
+    /// C-12: `App::open_file`'s dispatch, as the pure function it calls.
+    #[test]
+    fn open_route_sends_each_extension_to_its_own_reader() {
+        for (path, route) in [
+            ("a.psd", OpenRoute::Psd),
+            ("a.PSB", OpenRoute::Psd),
+            ("b.aur", OpenRoute::Aur),
+            ("b.AUR", OpenRoute::Aur),
+            ("c.png", OpenRoute::Image),
+            ("c.tiff", OpenRoute::Image),
+            ("noext", OpenRoute::Image),
+            ("a.psd.png", OpenRoute::Image),
+        ] {
+            assert_eq!(open_route(std::path::Path::new(path)), route, "{path}");
+        }
+    }
+
+    /// C-03: a document whose every root is a group still gets an
+    /// active pixel layer — the topmost one at any depth.
+    #[test]
+    fn topmost_pixel_layer_searches_inside_groups_top_first() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let add_group = |layers: &mut aurora_doc::LayerTree, name: &str, parent| match layers
+            .add_group(name, parent)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let add_pixel = |layers: &mut aurora_doc::LayerTree, name: &str, parent| match layers
+            .add_pixel_layer(name, rect, parent)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Bottom root group with a pixel layer; top root group holding an
+        // empty group above a nested group with two pixel layers.
+        let low = add_group(&mut layers, "low", None);
+        let _low_px = add_pixel(&mut layers, "low px", Some(low));
+        let high = add_group(&mut layers, "high", None);
+        let nested = add_group(&mut layers, "nested", Some(high));
+        let _under = add_pixel(&mut layers, "under", Some(nested));
+        let over = add_pixel(&mut layers, "over", Some(nested));
+        let _empty = add_group(&mut layers, "empty", Some(high));
+        assert!(
+            layers
+                .roots()
+                .iter()
+                .all(|id| !matches!(layers.kind(*id), Some(aurora_doc::LayerKind::Pixel { .. })))
+        );
+        assert_eq!(topmost_pixel_layer(&layers), Some(over));
+    }
+
+    /// A smoke test on a real grouped file: `group.psd` opens with an
+    /// active pixel layer. It has a root pixel layer too, so it passed
+    /// with the old root-only search as well — the regression test for
+    /// all-groups files is `topmost_pixel_layer_searches_inside_groups_top_first`.
+    #[test]
+    fn an_all_groups_psd_opens_with_an_active_pixel_layer() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(active) = topmost_pixel_layer(&document.layers) else {
+            unreachable!("group.psd has pixel layers");
+        };
+        assert!(document.layers.bounds(active).is_some());
+    }
+
+    /// C-01: a PSD whose top layer Photoshop cropped to (8, 4, 85, 46)
+    /// opens with the view anchored at the canvas origin, and its pixels
+    /// land at their real document position.
+    #[test]
+    fn an_opened_psds_cropped_top_layer_is_anchored_at_the_canvas_origin() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/2layers.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(active) = topmost_pixel_layer(&document.layers) else {
+            unreachable!("2layers.psd has pixel layers");
+        };
+        assert_eq!(
+            active_layer_origin(&document.layers, Some(active)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            document.layers.bounds(active),
+            Some(aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 101,
+                height: 55
+            })
+        );
+        let Some(placed) = document.pixels.iter().find(|p| p.layer == active) else {
+            unreachable!("no pixels for the top layer");
+        };
+        assert_eq!(placed.offset, (8, 4));
+
+        let (_scratch, mut store) = real_tile_store();
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+        );
+        assert_eq!(failed, 0);
+        let Some(surface) = document.layers.surface_id(active) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        let tile = match store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Surface (8, 4) is the image's own (0, 0); surface (7, 3) is
+        // outside the cropped rectangle, so never written.
+        let at = |x: usize, y: usize| -> Vec<half::f16> {
+            let i = (y * aurora_tile::TILE as usize + x) * 4;
+            tile.texels()
+                .get(i..i + 4)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            at(8, 4),
+            placed
+                .image
+                .samples()
+                .get(..4)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        );
+        assert_eq!(at(7, 3), vec![half::f16::ZERO; 4]);
+    }
+
+    /// C-02: an opened document is the undo baseline — Ctrl+Z has nothing
+    /// to take apart, and the History panel lists exactly the journal.
+    #[test]
+    fn an_opened_document_cannot_be_undone_and_the_history_panel_lists_its_journal() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        assert!(!document.history.can_undo());
+        assert!(document.history.journal_len() > 1);
+        let (_layers, flat_history, _id) = document_from_image("photo", &fake_image(2, 2));
+        assert!(!flat_history.can_undo());
+        assert_eq!(flat_history.journal_len(), 1);
+
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        if let Err(err) = replace_document(
+            &mut workspace,
+            &scales,
+            &document.layers,
+            &document.history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            unreachable!("{err:?}");
+        }
+        let rows = workspace
+            .tree
+            .children(workspace.history.body)
+            .map_or(0, <[_]>::len);
+        assert_eq!(rows, document.history.journal_descriptions().len());
+    }
+
+    #[test]
+    fn is_psd_path_matches_psd_and_psb_case_insensitively() {
+        for yes in ["a.psd", "a.PSD", "b.psb", "B.PsB", "/x/y.z.psd"] {
+            assert!(is_psd_path(std::path::Path::new(yes)), "{yes}");
+        }
+        for no in ["a.png", "a.aur", "psd", "a.psd.png", "a.ps"] {
+            assert!(!is_psd_path(std::path::Path::new(no)), "{no}");
+        }
+    }
+
+    /// The real decode seam [`App::open_psd_file`] calls, on a real
+    /// psd-tools fixture (`aurora-io`'s committed `tests/fixtures/psd/`).
+    #[test]
+    fn open_psd_document_opens_a_real_two_layer_psd() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/2layers.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        assert_eq!(document.canvas_size, (101, 55));
+        assert_eq!(document.layers.roots().len(), 2);
+        assert_eq!(document.pixels.len(), 2);
+        assert!(document.report.is_empty());
+        let names: Vec<_> = document
+            .layers
+            .roots()
+            .iter()
+            .map(|id| document.layers.name(*id))
+            .collect();
+        assert_eq!(names, [Some("Слой"), Some("Фон")]);
+    }
+
+    #[test]
+    fn open_psd_document_refuses_unsupported_and_damaged_files_with_typed_errors() {
+        let lab = include_bytes!("../../aurora-io/tests/fixtures/psd/4x4_8bit_lab.psd");
+        assert!(matches!(
+            open_psd_document(lab),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::UnsupportedPsdColorMode(9)
+            ))
+        ));
+        let deep = include_bytes!("../../aurora-io/tests/fixtures/psd/32bit5x5.psd");
+        assert!(matches!(
+            open_psd_document(deep),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::UnsupportedPsdDepth(32)
+            ))
+        ));
+        assert!(matches!(
+            open_psd_document(b"PNG not really"),
+            Err(OpenFailure::Decode(aurora_io::IoError::NotPsd))
+        ));
+        let real = include_bytes!("../../aurora-io/tests/fixtures/psd/1layer.psd");
+        let truncated = real.get(..real.len() / 2).unwrap_or_default();
+        assert!(matches!(
+            open_psd_document(truncated),
+            Err(OpenFailure::Decode(
+                aurora_io::IoError::PsdTruncated { .. } | aurora_io::IoError::PsdMalformed { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn psd_report_message_is_none_for_a_faithful_open_and_itemised_otherwise() {
+        assert_eq!(
+            psd_report_message("a.psd", &aurora_io::PsdImportReport::default()),
+            None
+        );
+        let report = aurora_io::PsdImportReport {
+            items: vec![
+                "1 clipped layer is shown unclipped.".to_owned(),
+                format!("2 layer masks are{}not applied yet.", '\u{202E}'),
+            ],
+        };
+        let Some(message) = psd_report_message("a.psd", &report) else {
+            unreachable!("a non-empty report must produce a message");
+        };
+        assert!(message.starts_with("\"a.psd\" opened, but"), "{message}");
+        assert!(message.contains("1 clipped layer is shown unclipped."));
+        assert!(message.contains("layer masks"));
+        assert!(!message.contains('\u{202E}'), "{message:?}");
+        assert!(message.ends_with("The original file has not been changed."));
+        let actions = psd_report_dialog_actions();
+        assert_eq!(actions.len(), 1);
+    }
+
+    /// The real report a real fixture produces reaches the message: the
+    /// shape layer in psd-tools' `group.psd` opens as pixels and says so.
+    #[test]
+    fn a_real_psd_with_a_shape_layer_produces_an_opened_with_changes_message() {
+        let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
+        let document = match open_psd_document(bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        let Some(message) = psd_report_message("group.psd", &document.report) else {
+            unreachable!("group.psd's shape layer must be reported");
+        };
+        assert!(message.contains("shape layer"), "{message}");
+    }
+
+    #[test]
+    fn open_failure_message_covers_every_failure_in_plain_language() {
+        let unsupported = |ext: &str| {
+            OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext.to_owned()))
+        };
+        let cases: Vec<(String, &str)> = vec![
+            (
+                open_failure_message("old.webp", "webp", &unsupported("webp")),
+                "Aurora doesn't recognise the \".webp\" file type",
+            ),
+            (
+                open_failure_message("x.xyz", "xyz", &unsupported("xyz")),
+                "Aurora doesn't recognise the \".xyz\" file type",
+            ),
+            (
+                open_failure_message("README", "", &unsupported("")),
+                "it has no file extension",
+            ),
+            (
+                open_failure_message(
+                    "gone.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ),
+                "Aurora couldn't find \"gone.png\". It may have been moved, renamed or deleted.",
+            ),
+            (
+                open_failure_message(
+                    "locked.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ),
+                "Aurora doesn't have permission to read \"locked.png\".",
+            ),
+            (
+                open_failure_message(
+                    "odd.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::other("device on fire")),
+                ),
+                "Aurora couldn't read \"odd.png\". Details: device on fire.",
+            ),
+            (
+                open_failure_message(
+                    "broken.png",
+                    "png",
+                    &OpenFailure::Decode(
+                        match aurora_io::decode_by_extension(
+                            std::path::Path::new("broken.png"),
+                            b"not a png",
+                        ) {
+                            Err(err) => err,
+                            Ok(_) => unreachable!("garbage must not decode as a PNG"),
+                        },
+                    ),
+                ),
+                "\"broken.png\" isn't a valid PNG file, or it is damaged. Details:",
+            ),
+            (
+                open_failure_message(
+                    "cmyk.tif",
+                    "tif",
+                    &OpenFailure::Decode(aurora_io::IoError::UnsupportedTiffSampleFormat("int")),
+                ),
+                "\"cmyk.tif\" uses a kind of TIFF that Aurora can't open yet.",
+            ),
+            (
+                open_failure_message(
+                    "bad.aur",
+                    "aur",
+                    &OpenFailure::Aur(aurora_io::IoError::MissingEntry("manifest")),
+                ),
+                "\"bad.aur\" isn't a valid Aurora document",
+            ),
+            (
+                open_failure_message("doc.aur", "aur", &OpenFailure::NoTileStorage),
+                "this session has no storage for image data available",
+            ),
+        ];
+        for (message, expected) in &cases {
+            assert!(
+                message.contains(expected),
+                "{message:?} must contain {expected:?}"
+            );
+            assert!(
+                message.ends_with(OPEN_FAILED_UNCHANGED),
+                "every refused open before the live store is touched must end by saying the \
+                 current document has not changed: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_failure_message_after_the_check_does_not_promise_the_document_is_unchanged() {
+        let message = open_failure_message(
+            "doc.aur",
+            "aur",
+            &OpenFailure::AurAfterCheck(aurora_io::IoError::MissingEntry("history")),
+        );
+        assert!(
+            !message.contains(OPEN_FAILED_UNCHANGED),
+            "this is the one case that cannot honestly say so: {message:?}"
+        );
+        assert!(message.contains("may have been cleared"), "{message:?}");
+        assert!(message.contains("\"doc.aur\""), "{message:?}");
+    }
+
+    #[test]
+    fn display_file_name_strips_control_and_bidi_characters_from_the_name() {
+        let path = std::path::Path::new("/tmp/evil\u{202e}gpj.\u{7}photo.psd");
+        let name = display_file_name(path);
+        assert_eq!(name, "evilgpj.photo.psd");
+        assert_eq!(
+            display_file_name(std::path::Path::new("/")),
+            "/",
+            "a path with no file name component falls back to the whole path"
+        );
+    }
+
+    #[test]
+    fn save_failure_message_covers_every_failure_and_says_nothing_was_written() {
+        let psd = save_failure_message(
+            "export.psd",
+            &SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension("psd".to_owned())),
+        );
+        assert_eq!(
+            psd,
+            "Aurora can't save \"export.psd\": this version can't write Photoshop (PSD) files \
+             yet. It can save as PNG, JPEG, TIFF or Aurora document (.aur). Nothing was saved, \
+             and any existing file with that name is unchanged."
+        );
+        let jpeg = save_failure_message(
+            "huge.jpg",
+            &SaveFailure::Encode(aurora_io::IoError::JpegDimensionsTooLarge {
+                width: 70_000,
+                height: 10,
+            }),
+        );
+        assert!(
+            jpeg.contains("Aurora couldn't encode \"huge.jpg\". Details: image is 70000x10"),
+            "{jpeg:?}"
+        );
+        let write = save_failure_message("out.png", &SaveFailure::Write);
+        assert!(
+            write.starts_with("Aurora couldn't write \"out.png\""),
+            "{write:?}"
+        );
+        let composite = save_failure_message(
+            "flat.png",
+            &SaveFailure::Composite(aurora_io::IoError::UnsupportedExtension("x".to_owned())),
+        );
+        assert!(
+            composite.starts_with("Aurora couldn't export \"flat.png\": the document's layers"),
+            "{composite:?}"
+        );
+        let no_store = save_failure_message("flat.png", &SaveFailure::NoTileStorage);
+        assert!(
+            no_store.contains("no storage for image data"),
+            "{no_store:?}"
+        );
+        for message in [&psd, &jpeg, &write, &composite, &no_store] {
+            assert!(message.ends_with(SAVE_FAILED_UNCHANGED), "{message:?}");
+        }
+    }
+
+    /// The seam [`App::report_open_failure`] is built on: a refused open
+    /// raises a real alert dialog whose one action ("OK") takes focus and
+    /// whose message is the [`open_failure_message`] text — and leaves
+    /// the document it was raised over exactly as it was.
+    #[test]
+    fn a_refused_open_raises_a_focused_alert_and_leaves_the_document_alone() {
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (layers, history, current) = document_from_image("current", &fake_image(4, 4));
+        let roots_before = layers.roots().to_vec();
+        let bounds_before = layers.bounds(current);
+        let journal_before = history.journal_descriptions();
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("photo.psd");
+        if let Err(err) = std::fs::write(&path, b"8BPS") {
+            unreachable!("{err:?}");
+        }
+        // Since 0.144.0 a `.psd` is read for real, so the refusal under
+        // test is a damaged one: just the signature, nothing after it.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Err(failure) = open_psd_document(&bytes) else {
+            unreachable!("a four-byte .psd must be refused");
+        };
+        let message = open_failure_message(&display_file_name(&path), "psd", &failure);
+        assert!(open_open_failed_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            &message
+        ));
+
+        let Some(handle) = dialog.clone() else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the refused-open dialog always has one action");
+        };
+        assert_eq!(id, OPEN_FAILED_DISMISS);
+        assert_eq!(handle.actions.len(), 1);
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.message)
+                .and_then(accesskit::Node::label),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .and_then(accesskit::Node::label),
+            Some(OPEN_FAILED_TITLE)
+        );
+        assert_eq!(layers.roots(), roots_before.as_slice());
+        assert_eq!(layers.name(current), Some("current"));
+        assert_eq!(layers.bounds(current), bounds_before);
+        assert_eq!(history.journal_descriptions(), journal_before);
+
+        // The one modal slot is taken now: a second refusal is not
+        // shown over it (and `App::report_open_failure` logs it instead).
+        assert!(!open_open_failed_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "another"
+        ));
+        assert_eq!(dialog, Some(handle));
+    }
+
+    /// A real `.aur` container for the read tests below: one pixel layer
+    /// (`LayerId` 0, like every fresh document's first layer) carrying a
+    /// mask, its content tile real, plus a mask tile entry holding bytes
+    /// the tile codec refuses — so a read commits the content tile, then
+    /// fails. The content surface is the *same* surface the live
+    /// document's own first layer uses, which is the whole hazard.
+    fn damaged_aur_sharing_the_first_surface() -> (Vec<u8>, aurora_tile::SurfaceId) {
+        let (_dir, mut store) = real_tile_store();
+        let red: Vec<half::f16> = (0..16)
+            .flat_map(|_| [1.0, 0.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        let image = match aurora_io::Image::new(4, 4, aurora_color::IccProfile::srgb(), red) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut layers, history, id) = document_from_image("damaged", &image);
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&image, &mut store, surface) {
+            unreachable!("{err:?}");
+        }
+        let mask_rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        if let Err(err) = layers.add_mask(id, mask_rect) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a masked layer has a mask surface");
+        };
+        let mut written = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut written,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let mask_entry = format!("tiles/{}/0_0.tile", mask_surface.to_raw());
+        let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(written.into_inner())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut rebuilt = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let entry = match archive.by_index_raw(index) {
+                Ok(entry) => entry,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if entry.name() == mask_entry {
+                continue;
+            }
+            if let Err(err) = rebuilt.raw_copy_file(entry) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Err(err) = rebuilt.start_file(mask_entry, zip::write::SimpleFileOptions::default()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = std::io::Write::write_all(&mut rebuilt, b"this is not an encoded tile") {
+            unreachable!("{err:?}");
+        }
+        let bytes = match rebuilt.finish() {
+            Ok(cursor) => cursor.into_inner(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (bytes, surface)
+    }
+
+    /// The live store a damaged open lands in: the current document's
+    /// own first layer, painted green (`fake_image`), on `surface`.
+    fn live_store_with_the_current_document(
+        surface: aurora_tile::SurfaceId,
+    ) -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let (dir, mut store) = real_tile_store();
+        let (layers, _history, id) = document_from_image("current", &fake_image(4, 4));
+        assert_eq!(
+            layers.surface_id(id),
+            Some(surface),
+            "precondition: both documents' first layers share one surface id"
+        );
+        if let Err(err) = aurora_io::write_into_store(&fake_image(4, 4), &mut store, surface) {
+            unreachable!("{err:?}");
+        }
+        (dir, store)
+    }
+
+    /// The first texel of `surface`'s tile `(0, 0)`, as exact `f16` bits
+    /// (compared bit for bit — every value here is exactly representable).
+    fn first_texel(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+    ) -> [u16; 4] {
+        let tile = match store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut texel = [0; 4];
+        for (out, sample) in texel.iter_mut().zip(tile.texels()) {
+            *out = sample.to_bits();
+        }
+        texel
+    }
+
+    fn texel_bits(texel: [f32; 4]) -> [u16; 4] {
+        texel.map(|value| half::f16::from_f32(value).to_bits())
+    }
+
+    /// **The 0.143.1 finding, pinned.** `aurora_io::read_aur` read
+    /// straight into a live store that already holds the current
+    /// document: the damaged file's content tile overwrites the current
+    /// document's tile on their shared surface, the mask tile then fails
+    /// to decode, and the rollback *forgets* that tile — so the refused
+    /// open has erased a tile of the document it left on screen. This is
+    /// what `App::open_aur_file` did until 0.143.1; [`read_aur_for_open`]
+    /// exists so it no longer does (next test).
+    #[test]
+    fn a_damaged_aur_read_straight_into_a_live_store_erases_the_current_documents_tiles() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (bytes, surface) = damaged_aur_sharing_the_first_surface();
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([0.0, 1.0, 0.0, 1.0])
+        );
+
+        match aurora_io::read_aur(std::io::Cursor::new(&bytes), &mut live) {
+            Err(aurora_io::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+        assert!(
+            !live.contains_tile(surface, aurora_tile::TileId { x: 0, y: 0 }),
+            "pinned hazard: the rollback forgets the current document's own tile"
+        );
+    }
+
+    #[test]
+    fn read_aur_for_open_refuses_a_damaged_file_before_touching_the_live_store() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (bytes, surface) = damaged_aur_sharing_the_first_surface();
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+
+        match read_aur_for_open(&bytes, &mut live) {
+            Err(OpenFailure::Aur(aurora_io::IoError::Tile(_))) => {}
+            other => unreachable!("expected a pre-check refusal, got {other:?}"),
+        }
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([0.0, 1.0, 0.0, 1.0]),
+            "the current document's pixels must survive a refused open"
+        );
+    }
+
+    #[test]
+    fn read_aur_for_open_reads_a_sound_file_into_the_live_store() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_source_dir, mut source) = real_tile_store();
+        let red: Vec<half::f16> = (0..16)
+            .flat_map(|_| [1.0, 0.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        let image = match aurora_io::Image::new(4, 4, aurora_color::IccProfile::srgb(), red) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history, id) = document_from_image("sound", &image);
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&image, &mut source, surface) {
+            unreachable!("{err:?}");
+        }
+        let mut written = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut written,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut source,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+
+        let document = match read_aur_for_open(written.get_ref(), &mut live) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("a sound file must open: {failure:?}"),
+        };
+        assert_eq!(document.canvas_size, (4, 4));
+        assert_eq!(document.layers.name(id), Some("sound"));
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([1.0, 0.0, 0.0, 1.0])
+        );
     }
 
     /// Every Layers row's `TreeItemState::selected` payload, keyed by the
@@ -22596,13 +24444,12 @@ mod tests {
              mean anything"
         );
 
-        let freed = replace_document_pixels(
+        let (freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         assert_eq!(freed, 9, "the outgoing document's whole 3x3 tile grid");
@@ -22625,6 +24472,89 @@ mod tests {
             "the incoming image's own pixels must be what the surface holds -- neither the \
              outgoing document's colour nor a blank tile"
         );
+    }
+
+    /// A multi-layer open (a PSD, 0.144.0): the sweep runs once, first,
+    /// and then *every* incoming layer's pixels are written — including
+    /// layers whose ids (and so surfaces) alias ones the outgoing
+    /// document held, which is every one of them here.
+    #[test]
+    fn replacing_a_documents_pixels_writes_every_incoming_layer_after_the_sweep() {
+        let (_scratch, mut store) = real_tile_store();
+
+        // Outgoing: two layers, ids 0 and 1, both painted.
+        let mut outgoing_layers = aurora_doc::LayerTree::new();
+        let mut outgoing_history = aurora_doc::History::new();
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 300,
+        };
+        let red = filled_image(300, 300, [1.0, 0.0, 0.0, 1.0]);
+        for name in ["o0", "o1"] {
+            let id = match outgoing_history.add_pixel_layer(&mut outgoing_layers, name, rect, None)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = outgoing_layers.surface_id(id) else {
+                unreachable!("pixel layer without a surface");
+            };
+            if let Err(err) = aurora_io::write_into_store(&red, &mut store, surface) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        // Incoming: two smaller layers with the same ids.
+        let mut incoming_layers = aurora_doc::LayerTree::new();
+        let mut incoming_history = aurora_doc::History::new();
+        let small = aurora_core::Rect {
+            width: 10,
+            height: 10,
+            ..rect
+        };
+        let green = filled_image(10, 10, [0.0, 1.0, 0.0, 1.0]);
+        let blue = filled_image(10, 10, [0.0, 0.0, 1.0, 1.0]);
+        let mut ids = Vec::new();
+        for name in ["i0", "i1"] {
+            match incoming_history.add_pixel_layer(&mut incoming_layers, name, small, None) {
+                Ok(id) => ids.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let [first, second] = ids.as_slice() else {
+            unreachable!("two layers");
+        };
+        let (freed, _) = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            &[(*first, &green, (0, 0)), (*second, &blue, (0, 0))],
+        );
+        assert_eq!(freed, 8, "both outgoing 2x2 tile grids");
+        for (id, colour) in [
+            (*first, [0.0, 1.0, 0.0, 1.0]),
+            (*second, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = incoming_layers.surface_id(id) else {
+                unreachable!("pixel layer without a surface");
+            };
+            assert!(
+                !store.contains_tile(surface, aurora_tile::TileId { x: 1, y: 1 }),
+                "an outgoing-only tile must not survive on {id:?}'s aliasing surface"
+            );
+            let read = match aurora_io::read_from_store(&mut store, surface, 10, 10) {
+                Ok(image) => image,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(
+                read.samples().get(0..4),
+                Some(colour.map(half::f16::from_f32).as_slice()),
+                "{id:?} must hold its own incoming pixels"
+            );
+        }
     }
 
     /// The third surface no `LayerTree` can name: this crate's own
@@ -22668,13 +24598,12 @@ mod tests {
         let (incoming_layers, _incoming_history, incoming_layer) =
             document_from_image("incoming", &incoming_image);
 
-        let freed = replace_document_pixels(
+        let (freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         assert!(
@@ -22722,13 +24651,12 @@ mod tests {
             "the two documents must still alias the same surface for this test to mean anything"
         );
 
-        let _freed = replace_document_pixels(
+        let (_freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
 
         // The whole of tile (0, 0) -- 256x256, of which the incoming
@@ -32704,13 +34632,12 @@ mod tests {
         let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
         let (incoming_layers, _incoming_history, incoming_layer) =
             document_from_image("incoming", &incoming_image);
-        let _freed = replace_document_pixels(
+        let (_freed, _) = replace_document_pixels(
             &mut store,
             outgoing_layers,
             outgoing_history,
             &incoming_layers,
-            incoming_layer,
-            &incoming_image,
+            &[(incoming_layer, &incoming_image, (0, 0))],
         );
         // What `App::open_file` does right after. A bump forces a
         // recompute and says nothing about residency, which is precisely
@@ -55984,5 +57911,278 @@ mod text_layout_tests {
         layout_workspace(&mut via_helper, None, &scales, 2.0, 1280.0, 800.0);
         blind.tree.compute_layout(1280.0, 800.0);
         assert_eq!(every_bounds(&via_helper.tree), every_bounds(&blind.tree));
+    }
+}
+
+/// Panel scrolling's app half (0.145.0): wheel routing, units, and
+/// scrolling that follows focus, the active layer and a document open.
+#[cfg(test)]
+mod panel_scroll_tests {
+    use super::{
+        ScrollFollow, WheelTarget, follow_scroll, panel_scroll_delta, pointer_in_canvas,
+        replace_document, scroll_panel, wheel_target,
+    };
+    use std::collections::HashMap;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseScrollDelta;
+
+    const ROW: f32 = 21.0;
+
+    fn layers_of(count: usize) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        for i in 0..count {
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            };
+            if let Err(err) = layers.add_pixel_layer(format!("Layer {i}"), bounds, None) {
+                unreachable!("{err:?}");
+            }
+        }
+        layers
+    }
+
+    /// A real workspace holding a `count`-layer document, laid out in a
+    /// short 1000x400 window.
+    fn crowded(
+        count: usize,
+    ) -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+    ) {
+        let scales = crate::test_workspace_scales();
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let layers = layers_of(count);
+        let history = aurora_doc::History::new();
+        let (rows, _) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        workspace.tree.compute_layout(1000.0, 400.0);
+        (workspace, layers, rows)
+    }
+
+    fn inside_layers_body(workspace: &aurora_ui::Workspace) -> (f32, f32) {
+        let Some(body) = workspace.tree.bounds(workspace.layers.body) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = ((body.x + 20) as f32, (body.y + 20) as f32);
+        point
+    }
+
+    #[test]
+    fn panel_scroll_delta_converts_lines_and_physical_pixels_to_logical_px() {
+        let line = |y| MouseScrollDelta::LineDelta(0.0, y);
+        let pixels = |y| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        assert!((panel_scroll_delta(line(1.0), 2.0, ROW) - ROW).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(line(-1.0), 1.0, ROW) + ROW).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(pixels(30.0), 2.0, ROW) - 15.0).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(pixels(-30.0), 1.0, ROW) + 30.0).abs() < f32::EPSILON);
+        assert!(
+            (panel_scroll_delta(pixels(30.0), 0.0, ROW) - 30.0).abs() < f32::EPSILON,
+            "a nonsense scale factor falls back to 1"
+        );
+        assert!(panel_scroll_delta(pixels(f64::NAN), 2.0, ROW).abs() < f32::EPSILON);
+        assert!(panel_scroll_delta(line(f32::INFINITY), 1.0, ROW).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_wheel_over_the_layers_body_scrolls_it_down_and_back() {
+        let (mut workspace, _, _) = crowded(200);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(pointer_in_canvas(&workspace, point), None);
+        let WheelTarget::Panel(container) = wheel_target(&workspace, point, false, false) else {
+            unreachable!("the crowded Layers body is under the pointer");
+        };
+        assert_eq!(container, workspace.layers.body);
+        let scales = crate::test_workspace_scales();
+        // A wheel notch *towards* the user (negative y) reveals what is
+        // below: the offset grows by one row.
+        let down = MouseScrollDelta::LineDelta(0.0, -1.0);
+        assert!(scroll_panel(
+            &mut workspace.tree,
+            container,
+            down,
+            2.0,
+            &scales
+        ));
+        let row = aurora_widgets::widgets::row_height(&scales);
+        assert_eq!(workspace.tree.scroll_y(container), Some(row));
+        let up = MouseScrollDelta::LineDelta(0.0, 3.0);
+        assert!(scroll_panel(
+            &mut workspace.tree,
+            container,
+            up,
+            2.0,
+            &scales
+        ));
+        assert_eq!(workspace.tree.scroll_y(container), Some(0.0));
+        assert!(
+            !scroll_panel(&mut workspace.tree, container, up, 2.0, &scales),
+            "already at the top: nothing moves, so nothing relayouts"
+        );
+    }
+
+    #[test]
+    fn a_wheel_over_the_canvas_zooms_and_never_scrolls_a_panel() {
+        let (workspace, _, _) = crowded(200);
+        assert!(matches!(
+            wheel_target(&workspace, (100.0, 50.0), false, false),
+            WheelTarget::Canvas(_)
+        ));
+        // ...and still does while a drag owns the pointer.
+        assert!(matches!(
+            wheel_target(&workspace, (100.0, 50.0), false, true),
+            WheelTarget::Canvas(_)
+        ));
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+    }
+
+    #[test]
+    fn a_modal_dialog_or_an_owned_pointer_stops_the_wheel_moving_anything() {
+        let (workspace, _, _) = crowded(200);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(
+            wheel_target(&workspace, point, true, false),
+            WheelTarget::Nothing
+        );
+        assert_eq!(
+            wheel_target(&workspace, (100.0, 50.0), true, false),
+            WheelTarget::Nothing,
+            "not even the canvas zooms behind a modal"
+        );
+        assert_eq!(
+            wheel_target(&workspace, point, false, true),
+            WheelTarget::Nothing
+        );
+    }
+
+    #[test]
+    fn a_wheel_over_a_panel_whose_content_fits_does_nothing() {
+        let (workspace, _, _) = crowded(2);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(
+            wheel_target(&workspace, point, false, false),
+            WheelTarget::Nothing
+        );
+    }
+
+    #[test]
+    fn an_active_layer_change_to_an_off_screen_row_scrolls_it_into_view() {
+        let (mut workspace, layers, rows) = crowded(200);
+        let mut last = ScrollFollow::default();
+        // The first follow (startup) settles on the topmost layer, already
+        // in view.
+        let top = layers.roots().first().copied();
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            top
+        ));
+        let bottom = layers.roots().last().copied();
+        assert!(follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            bottom
+        ));
+        workspace.tree.compute_layout(1000.0, 400.0);
+        let Some((&row, _)) = rows.iter().find(|&(_, &id)| Some(id) == bottom) else {
+            unreachable!("every layer has a row");
+        };
+        let (Some(row_bounds), Some(body)) = (
+            workspace.tree.bounds(row),
+            workspace.tree.bounds(workspace.layers.body),
+        ) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            row_bounds.y >= body.y && row_bounds.bottom() <= body.bottom(),
+            "{row_bounds:?} inside {body:?}"
+        );
+        // No change: the user's own scroll back to the top is left alone.
+        if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 0.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            bottom
+        ));
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+    }
+
+    #[test]
+    fn a_focus_change_to_an_off_screen_row_scrolls_it_into_view() {
+        let (mut workspace, layers, rows) = crowded(200);
+        let mut last = ScrollFollow::default();
+        let Some(&layer) = layers.roots().get(150) else {
+            unreachable!("200 layers");
+        };
+        let Some((&row, _)) = rows.iter().find(|&(_, &id)| id == layer) else {
+            unreachable!("every layer has a row");
+        };
+        assert!(follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            Some(row),
+            None
+        ));
+        assert!(
+            workspace
+                .tree
+                .scroll_y(workspace.layers.body)
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        assert_eq!(last.focus, Some(row));
+    }
+
+    #[test]
+    fn replacing_the_document_resets_layers_and_history_to_the_top() {
+        let (mut workspace, _, _) = crowded(200);
+        let scales = crate::test_workspace_scales();
+        if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 500.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            workspace
+                .tree
+                .scroll_y(workspace.layers.body)
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        let layers = layers_of(200);
+        let history = aurora_doc::History::new();
+        if let Err(err) = replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            unreachable!("{err:?}");
+        }
+        workspace.tree.compute_layout(1000.0, 400.0);
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+        assert_eq!(workspace.tree.scroll_y(workspace.history.body), Some(0.0));
     }
 }

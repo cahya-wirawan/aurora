@@ -127,6 +127,8 @@ use aurora_widgets::widgets::{
     WidgetKind, insert_tree_item, insert_tree_view, set_tree_item_description,
 };
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
+use taffy::style_helpers::{auto, percent};
+use taffy::{FlexDirection, Size, Style};
 
 use crate::panel::{PanelHandle, clear_panel_body};
 
@@ -213,11 +215,33 @@ pub fn populate_layers_panel(
 ) -> Result<HashMap<WidgetId, LayerId>, WidgetError> {
     clear_panel_body(tree, panel.body)?;
     let view = insert_tree_view(tree, panel.body, None)?;
+    tree.set_style(view, tree_container_style())?;
     let mut rows = HashMap::new();
     for &id in layers.roots() {
         insert_layer_row(tree, view, scales, layers, id, &mut rows)?;
     }
     Ok(rows)
+}
+
+/// The Layers tree container's own layout (0.145.0): full body width and
+/// **as tall as its rows** (`height: auto`, never shrunk), replacing
+/// `insert_tree_view`'s body-height `percent(1.0)`. The panel body is a
+/// scroll container, and a scroll offset moves everything inside it: a
+/// container held at the body's height would move up with the rows and
+/// leave every row past its own shifted bottom edge unreachable by
+/// `WidgetTree::hit_test`, which never descends past a parent that does
+/// not contain the point. `crate::panel`'s `body_style` records why this
+/// does not reintroduce the rail-starvation bug `0.77.1` fixed.
+fn tree_container_style() -> Style {
+    Style {
+        flex_direction: FlexDirection::Column,
+        flex_shrink: 0.0,
+        size: Size {
+            width: percent(1.0_f32),
+            height: auto(),
+        },
+        ..Default::default()
+    }
 }
 
 fn insert_layer_row(
@@ -1170,56 +1194,160 @@ mod tests {
         }
     }
 
-    /// The honest other half of the fix above, pinned rather than left
-    /// implied: bounding the panel means the rows that no longer fit are
-    /// *clipped*, and with no scrolling container anywhere in
-    /// `aurora-widgets` yet (`tree_view`'s own disclosed gap), clipped
-    /// means **unreachable** -- laid out, but past the panel's own
-    /// bounds, where `hit_test` refuses to descend. The rows that do fit
-    /// still work, which is why this is an improvement on losing the
-    /// Properties and History panels outright rather than a finished
-    /// Layers panel.
+    /// The centre of `id`'s current bounds, as a pointer position.
+    fn centre_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (f32, f32) {
+        let Some(rect) = tree.bounds(id) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = (
+            (rect.x + i64::from(rect.width) / 2) as f32,
+            (rect.y + i64::from(rect.height) / 2) as f32,
+        );
+        point
+    }
+
+    fn crowded_workspace(count: usize, height: f32) -> crate::workspace::Workspace {
+        let mut layers = LayerTree::new();
+        for i in 0..count {
+            if let Err(err) = layers.add_pixel_layer(format!("Layer {i}"), bounds(), None) {
+                unreachable!("{err:?}");
+            }
+        }
+        let scales = test_scales();
+        let mut ws = crate::workspace::build_workspace(&scales);
+        if let Err(err) = populate_layers_panel(&mut ws.tree, ws.layers, &scales, &layers) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, height);
+        ws
+    }
+
+    /// The other half of the fix above: bounding the panel means the
+    /// rows that no longer fit are clipped -- laid out past the panel's
+    /// own bounds, where `hit_test` refuses to descend -- and as of
+    /// 0.145.0 scrolling the panel body is what brings them back. Built
+    /// in a deliberately short window (the real-macOS report: a
+    /// many-layer PSD in a short window, rows past the bottom
+    /// unreachable).
     #[test]
-    fn rows_past_the_bottom_of_a_bounded_panel_are_clipped_and_not_yet_reachable() {
+    fn a_layers_row_past_the_bottom_is_reachable_after_scrolling() {
+        let mut ws = crowded_workspace(200, 400.0);
+        let row_ids = rows_of(&ws.tree, tree_root(&ws.tree, ws.layers));
+        assert_eq!(row_ids.len(), 200, "every layer still gets a real row");
+        let Some(&last) = row_ids.last() else {
+            unreachable!("200 rows");
+        };
+        let reachable = |ws: &crate::workspace::Workspace, row: WidgetId| {
+            ws.tree.hit_test(centre_of(&ws.tree, row)) == Some(row)
+        };
+        assert!(!reachable(&ws, last), "clipped before scrolling");
+        let range = ws.tree.scroll_range(ws.layers.body).unwrap_or(0.0);
+        assert!(
+            range > 0.0,
+            "a crowded body has somewhere to scroll: {range}"
+        );
+
+        // Everything in the body's top half reaches the body as a scroll
+        // container.
+        let Some(body_bounds) = ws.tree.bounds(ws.layers.body) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let inside = ((body_bounds.x + 10) as f32, (body_bounds.y + 10) as f32);
+        assert_eq!(ws.tree.scroll_container_at(inside), Some(ws.layers.body));
+
+        if let Err(err) = ws.tree.set_scroll_y(ws.layers.body, f32::MAX) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 400.0);
+        assert!(
+            reachable(&ws, last),
+            "the last row is clickable once scrolled to"
+        );
+        let Some(last_bounds) = ws.tree.bounds(last) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            last_bounds.bottom() <= body_bounds.bottom(),
+            "and wholly inside the body: {last_bounds:?} in {body_bounds:?}"
+        );
+        // ...and every row is reachable at *some* offset: scrolling a row
+        // into view always makes it clickable.
+        for &row in &row_ids {
+            ws.tree.scroll_into_view(row);
+            ws.tree.compute_layout(1600.0, 400.0);
+            assert!(reachable(&ws, row), "row {row:?} after scroll_into_view");
+        }
+        // The sibling panels never moved.
+        assert_eq!(ws.tree.scroll_y(ws.properties.body), Some(0.0));
+        assert_eq!(ws.tree.scroll_y(ws.history.body), Some(0.0));
+    }
+
+    #[test]
+    fn every_panel_body_is_scrollable() {
+        let ws = crowded_workspace(1, 900.0);
+        for (name, panel) in [
+            ("layers", ws.layers),
+            ("properties", ws.properties),
+            ("history", ws.history),
+        ] {
+            assert_eq!(ws.tree.is_scrollable(panel.body), Some(true), "{name}");
+            assert_eq!(
+                ws.tree.is_scrollable(panel.root),
+                Some(false),
+                "{name} root"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_survives_repopulate_and_collapse_round_trip() {
+        let mut ws = crowded_workspace(100, 400.0);
+        if let Err(err) = ws.tree.set_scroll_y(ws.layers.body, 120.0) {
+            unreachable!("{err:?}");
+        }
+        // Repopulating rebuilds every row under the same body.
         let mut layers = LayerTree::new();
         for i in 0..100 {
             if let Err(err) = layers.add_pixel_layer(format!("Layer {i}"), bounds(), None) {
                 unreachable!("{err:?}");
             }
         }
-
-        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) = populate_layers_panel(&mut ws.tree, ws.layers, &scales, &layers) {
             unreachable!("{err:?}");
         }
-        ws.tree.compute_layout(1600.0, 900.0);
+        ws.tree.compute_layout(1600.0, 400.0);
+        assert_eq!(ws.tree.scroll_y(ws.layers.body), Some(120.0), "repopulate");
 
-        let row_ids = rows_of(&ws.tree, tree_root(&ws.tree, ws.layers));
-        assert_eq!(row_ids.len(), 100, "every layer still gets a real row");
-        let reachable = row_ids
-            .iter()
-            .filter(|&&row| {
-                let Some(row_bounds) = ws.tree.bounds(row) else {
-                    unreachable!("just laid out");
-                };
-                #[allow(clippy::cast_precision_loss)]
-                let point = (
-                    (row_bounds.x + i64::from(row_bounds.width) / 2) as f32,
-                    (row_bounds.y + i64::from(row_bounds.height) / 2) as f32,
-                );
-                ws.tree.hit_test(point) == Some(row)
-            })
-            .count();
-        assert!(
-            reachable > 0,
-            "the rows that fit in the panel must still be clickable"
+        // Collapsing resets the body's style; the flag and offset stay.
+        for collapsed in [true, false] {
+            if let Err(err) = crate::panel::set_panel_collapsed(&mut ws.tree, ws.layers, collapsed)
+            {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(1600.0, 400.0);
+        }
+        assert_eq!(ws.tree.is_scrollable(ws.layers.body), Some(true));
+        assert_eq!(
+            ws.tree.scroll_y(ws.layers.body),
+            Some(120.0),
+            "collapse round trip"
         );
-        assert!(
-            reachable < row_ids.len(),
-            "and the rest are clipped -- this is the disclosed gap a real scrolling container \
-             would close, not a claim that all 100 rows are usable"
-        );
+
+        // A shorter document re-clamps on the next layout.
+        let mut few = LayerTree::new();
+        for i in 0..2 {
+            if let Err(err) = few.add_pixel_layer(format!("Layer {i}"), bounds(), None) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Err(err) = populate_layers_panel(&mut ws.tree, ws.layers, &scales, &few) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 400.0);
+        assert_eq!(ws.tree.scroll_y(ws.layers.body), Some(0.0));
     }
 
     #[test]

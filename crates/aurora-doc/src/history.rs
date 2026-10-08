@@ -460,6 +460,18 @@ impl History {
         self.redo_stack.clear();
     }
 
+    /// Discards every undo *and* redo entry, keeping the journal — makes
+    /// the current state the baseline undo cannot go behind, exactly what
+    /// [`Self::load_journal`] produces for a reopened `.aur`. For a
+    /// document freshly built from a file (a flat image or a PSD,
+    /// `aurora-io`/`aurora-app`, 0.144.0 review): the journal still
+    /// records every build step, because autosave and crash recovery
+    /// replay it, but undo must not take the opened file apart.
+    pub fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
     /// How many ops the journal has recorded so far — mostly useful for
     /// tests; see [`Self::journal_descriptions`] for reading individual
     /// entries. This is the untruncated count, so it can exceed

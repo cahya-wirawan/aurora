@@ -6,12 +6,15 @@
 //! **Scope, stated honestly.** Five things a finished tree widget has
 //! and this one does not:
 //!
-//! - **No scrolling container.** A tree taller than its parent
-//!   overflows it; nothing here clips, and nothing observes a
-//!   [`super::ScrollbarState`] to move content. That is the same gap
-//!   `widgets`' own module doc comment records for `Scrollbar` (which
-//!   is a position *model*, not scrolling), and it is unchanged by this
-//!   module — a real scrolling container is separate, later work.
+//! - **No scrolling of its own.** A tree taller than its parent
+//!   overflows it; nothing here clips or scrolls. Scrolling belongs to
+//!   whatever holds the tree: as of 0.145.0 a
+//!   [`crate::WidgetTree::set_scrollable`] ancestor that clips its
+//!   vertical overflow (an `aurora-ui` panel body) scrolls the rows,
+//!   provided the tree's own container is sized to its content rather
+//!   than to that ancestor — see [`crate::WidgetTree::hit_test`] for why.
+//!   Nothing yet observes a [`super::ScrollbarState`] to move content:
+//!   there is no visible scrollbar on a scrolling tree.
 //! - **No disclosure triangle.** This crate draws no glyphs at all
 //!   (`paint`'s own module doc comment — solid fills only), so a
 //!   collapsed row is announced as collapsed but has no ▸ of its own;
@@ -467,6 +470,14 @@ fn style(scales: &Scales) -> Style {
             width: length(row),
             height: length(row),
         },
+        // Never shrunk (0.144.1): in a container shorter than its rows,
+        // flex's default `flex_shrink: 1` squeezed a group row down to
+        // its one-row minimum while its children (laid out inside it)
+        // kept their own height, so they painted over the rows below —
+        // seen on real macOS with a many-layer PSD in a short window.
+        // Unshrunk, rows that don't fit run off the bottom of the
+        // clipping panel body instead of overlapping each other.
+        flex_shrink: 0.0,
         // Spelled out rather than `..Default::default()`-ed: a
         // `taffy::Rect<LengthPercentage>` has no `Default` (unlike the
         // `Dimension` rects elsewhere in this crate), so the two unused
@@ -2078,6 +2089,64 @@ mod tests {
             !state_of(&tree, parent).has_children,
             "and must not mark its would-be parent as a group either"
         );
+    }
+
+    /// 0.144.1, found on real macOS with a many-layer PSD: in a tree
+    /// shorter than its rows, a group row used to shrink to its one-row
+    /// minimum while its children kept their height, so the children
+    /// painted over the rows after the group. No two rows' own label
+    /// strips may overlap, however short the container.
+    #[test]
+    fn rows_never_overlap_in_a_container_shorter_than_its_rows() {
+        let scales = test_scales();
+        let row = row_height(&scales);
+        let (mut tree, root) = new_tree(Style {
+            size: Size {
+                width: percent(1.0_f32),
+                height: percent(1.0_f32),
+            },
+            ..Default::default()
+        });
+        let Ok(view) = insert_tree_view(&mut tree, root, None) else {
+            unreachable!()
+        };
+        let mut rows = Vec::new();
+        let Ok(group) = insert_tree_item(&mut tree, view, &scales, "Group", true) else {
+            unreachable!()
+        };
+        rows.push(group);
+        for name in ["a", "b", "c", "d"] {
+            let Ok(child) = insert_tree_item(&mut tree, group, &scales, name, false) else {
+                unreachable!()
+            };
+            rows.push(child);
+        }
+        for name in ["after 1", "after 2", "after 3"] {
+            let Ok(id) = insert_tree_item(&mut tree, view, &scales, name, false) else {
+                unreachable!()
+            };
+            rows.push(id);
+        }
+        // Far shorter than the eight rows need.
+        tree.compute_layout(300.0, row * 3.0);
+        let mut tops: Vec<i64> = rows
+            .iter()
+            .map(|id| match tree.bounds(*id) {
+                Some(bounds) => bounds.y,
+                None => unreachable!("every row is laid out"),
+            })
+            .collect();
+        tops.sort_unstable();
+        #[allow(clippy::cast_possible_truncation)]
+        let strip = row as i64;
+        for pair in tops.windows(2) {
+            if let [above, below] = pair {
+                assert!(
+                    below - above >= strip,
+                    "rows overlap: tops {tops:?}, row height {strip}"
+                );
+            }
+        }
     }
 
     /// `MAX_TREE_DEPTH`'s whole justification is a *measured* margin

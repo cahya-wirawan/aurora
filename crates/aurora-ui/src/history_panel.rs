@@ -418,14 +418,13 @@ mod tests {
         }
     }
 
-    /// The honest limit of the fix, pinned rather than left implied.
-    /// Bounding the panel means rows that no longer fit are clipped, and
-    /// with no scrolling container anywhere in `aurora-widgets` yet,
-    /// clipped means **unreachable**. The rows that do fit really work,
-    /// which is what makes this an improvement rather than a finished
-    /// panel.
+    /// Bounding the panel means rows that no longer fit are clipped:
+    /// at scroll offset 0 they are not hittable. Since 0.145.0 the panel
+    /// body scrolls (wheel/trackpad, scroll-into-view), so clipped no
+    /// longer means unreachable — this pins only the unscrolled state.
+    /// The rows that do fit really work.
     #[test]
-    fn rows_past_the_bottom_of_a_bounded_history_panel_are_clipped_and_not_yet_reachable() {
+    fn rows_past_the_bottom_of_a_bounded_history_panel_are_clipped_until_scrolled() {
         let history = history_with(200);
         let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();

@@ -34,7 +34,9 @@
 //! are not on the list in any form, so none of them moves this count.)
 //! `Scrollbar` is a deliberately narrow landing: a bounded position
 //! *model* with an accessibility node, a layout style, and a paint, but
-//! nothing in this crate scrolls any content yet. It has a real
+//! nothing yet drives it from real scrolled content (0.145.0 added
+//! scroll containers to [`crate::WidgetTree`] itself —
+//! [`crate::WidgetTree::set_scrollable`] — with no scrollbar attached). It has a real
 //! component-gallery entry with a contrast check passing in every
 //! built-in theme; only its golden-image diff tests are unblessed
 //! (`#[ignore]`d pending a human bless on real GPU hardware, the same
@@ -45,7 +47,8 @@
 //! nested `Role::TreeItem` rows), real expand/collapse that actually
 //! adds and removes child widgets, per-level indentation from `taffy`'s
 //! own padding accumulation, and a real gallery entry — but still **no
-//! scrolling container** (a tree taller than its parent overflows), **no
+//! scrolling of its own** (a tree taller than its parent overflows it;
+//! a scrollable ancestor is what scrolls it, as of 0.145.0), **no
 //! disclosure-triangle glyph** (this crate draws no glyphs at all), and
 //! **no in-row content** (a row's own band holds nothing but the row, so
 //! the Layers-panel "thumbnail + checkbox + name on one line" shape

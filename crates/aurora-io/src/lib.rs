@@ -27,7 +27,9 @@
 //! `aurora_doc::LayerTree`/`History` plus every pixel layer's own
 //! tiles, round-tripped through a `.aur` file — the answer to what
 //! `png`/`jpeg`/`tiff` structurally can't do (more than one flat
-//! image). PSD/PSB remains open.
+//! image). [`psd`] (0.144.0) is Aurora's own PSD/PSB *reader* — 8- and
+//! 16-bit RGB, layered, groups included — producing the same
+//! `LayerTree`/`History` shape `.aur` does; writing PSD/PSB remains open.
 
 pub mod aur;
 mod channels;
@@ -36,12 +38,20 @@ mod image;
 pub mod import;
 pub mod jpeg;
 pub mod png;
+pub mod psd;
 pub mod tiff;
 
 pub use aur::{
     AurDocument, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
     write as write_aur, write_best_effort as write_aur_best_effort,
 };
-pub use error::IoError;
+pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
-pub use import::{decode_by_extension, encode_by_extension, read_from_store, write_into_store};
+pub use import::{
+    decode_by_extension, encode_by_extension, read_from_store, write_into_store,
+    write_into_store_at,
+};
+pub use psd::{
+    PsdDocument, PsdImportReport, PsdPixels, build_document as build_psd_document,
+    decode as decode_psd, read as read_psd,
+};
