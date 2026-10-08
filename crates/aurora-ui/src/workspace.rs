@@ -22,6 +22,8 @@
 //! ([`Workspace::divider`]) is a real `Role::Splitter` node with a real
 //! (currently zero) layout footprint, not a rendered grab handle yet.
 
+use std::collections::HashMap;
+
 use accesskit::{Action, Node, Role};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
@@ -78,6 +80,12 @@ pub struct Workspace {
     /// scroll-follow can bring the marker into view after every
     /// refresh, the way it follows the active layer's row.
     pub history_current: Option<WidgetId>,
+    /// The History panel's clickable rows (0.148.0), each mapped to how
+    /// many steps are applied once it is the current one — the
+    /// [`crate::HistoryRows::targets`] of the last population; empty until
+    /// a caller first populates it. `aurora-app` hit-tests a press (and
+    /// looks up an assistive technology's `Click`) here to jump.
+    pub history_rows: HashMap<WidgetId, usize>,
 }
 
 /// The rail's own layout style at `width` (logical px) — shared by
@@ -251,6 +259,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         properties,
         history,
         history_current: None,
+        history_rows: HashMap::new(),
     }
 }
 

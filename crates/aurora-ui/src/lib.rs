@@ -51,7 +51,9 @@ pub use gallery_panel::{
     gallery_content_height, gallery_hover, gallery_light_dismiss, gallery_next_deadline,
     gallery_tick, insert_gallery_panel, remove_gallery_panel,
 };
-pub use history_panel::{HistoryStep, UNDONE_STATE, populate_history_panel};
+pub use history_panel::{
+    HistoryRows, HistoryStep, UNDONE_STATE, populate_history_panel, populate_history_panel_rows,
+};
 pub use layer_controls::{
     LayerControls, blend_mode_index, blend_mode_label, blend_mode_options, insert_layer_controls,
     layer_controls_contains, sync_layer_controls,

@@ -98,21 +98,32 @@
 //! with the real surface size first — an oversized scissor rect is a
 //! `wgpu` validation error, in crates that deny `panic`/`unwrap`.
 //!
-//! **No `Action::Focus`/`Action::Click` on a row, deliberately — and no
-//! click-to-jump yet.** Clicking a row does nothing (out of scope for
-//! 0.147.1; the suggested next step). Adding the actions would make every
-//! step a `Tab` stop — up to 1002
-//! of them inside one panel — which is the same crate-wide focus-model
-//! question `aurora_widgets::widgets::tree_view` already discloses and
-//! the Layers panel already pays. Making History pay it too, for rows
-//! that route nowhere, would be a worse experience, not a better one.
+//! **A click on a row jumps there** (0.148.0). Every step row and the
+//! origin row declare `Action::Click`, and [`populate_history_panel_rows`]
+//! hands the caller a [`HistoryRows::targets`] map from each such row to
+//! the number of steps that are applied once it is the current one (`0`
+//! for the origin row, `i + 1` for the step at index `i` of `steps`).
+//! `aurora-app` routes a pointer press and an assistive technology's
+//! `Click` on a mapped row to the same jump, which undoes or redoes one
+//! step at a time through the `Ctrl+Z`/`Ctrl+Shift+Z` path. The notice
+//! rows are not steps: they declare nothing and are not in the map, so a
+//! click on one does nothing.
+//!
+//! **Still no `Action::Focus` on a row, deliberately**, so the rows are
+//! not `Tab` stops and there is no keyboard way to jump yet. Making every
+//! step a `Tab` stop — up to 1002 of them inside one panel — is the same
+//! crate-wide focus-model question `aurora_widgets::widgets::tree_view`
+//! already discloses and the Layers panel already pays; it wants arrow-key
+//! navigation inside one focusable list, not 1000 stops.
 //!
 //! **One-shot, not reactive** — a caller re-populates after every
 //! recorded step, undo and redo (`aurora-app`'s `refresh_history_panel`):
 //! a committed stroke, a structural edit, a layer-control commit, New and
 //! Delete Layer, and an opened document. Never per dab.
 
-use accesskit::{Node, Role};
+use std::collections::HashMap;
+
+use accesskit::{Action, Node, Role};
 use aurora_doc::MAX_DESCRIPTIONS;
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{ListRowState, WidgetKind};
@@ -166,11 +177,14 @@ fn omitted(count: usize, which: &str) -> String {
 /// there directly.
 ///
 /// **`Role::List`/`Role::ListItem`, not `Role::ListBox`/
-/// `Role::ListBoxOption`.** Rows now report `selected` (the current
-/// step), but nothing chooses a row yet — click-to-jump is still open —
-/// so a listbox would over-promise an interaction that does not exist.
-/// Revisit when rows become clickable. **Not checked against a real
-/// screen reader.**
+/// `Role::ListBoxOption`, even now that a row can be clicked** (0.148.0).
+/// A listbox is a single focusable widget whose options the arrow keys
+/// move through; these rows take no focus and no keys, so announcing a
+/// listbox would promise a keyboard interaction that does not exist. A
+/// list item that reports `selected` and declares `Action::Click` says
+/// what is really there. The Layers panel's `Role::Tree` rows are
+/// focusable, which is the difference. Revisit when the rows get keyboard
+/// navigation. **Not checked against a real screen reader.**
 ///
 /// **Repopulating is safe**: `panel.body`'s existing children are
 /// removed first ([`clear_panel_body`]).
@@ -185,6 +199,36 @@ pub fn populate_history_panel(
     origin: &str,
     steps: &[HistoryStep<'_>],
 ) -> Result<WidgetId, WidgetError> {
+    populate_history_panel_rows(tree, panel, scales, origin, steps).map(|rows| rows.current)
+}
+
+/// What [`populate_history_panel_rows`] built (0.148.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRows {
+    /// The current step's row (the origin row when nothing is applied).
+    pub current: WidgetId,
+    /// Every clickable row — the origin row and each step row, never a
+    /// notice row — mapped to how many steps are applied once that row
+    /// is the current one: `0` for the origin row, `i + 1` for the step
+    /// at index `i` of `steps`.
+    pub targets: HashMap<WidgetId, usize>,
+}
+
+/// [`populate_history_panel`], also returning the row-to-target map a
+/// click on a row is routed through ([`HistoryRows::targets`]). Every
+/// row in that map declares `Action::Click`; no row declares
+/// `Action::Focus`.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.body` doesn't exist.
+pub fn populate_history_panel_rows(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    scales: &Scales,
+    origin: &str,
+    steps: &[HistoryStep<'_>],
+) -> Result<HistoryRows, WidgetError> {
     clear_panel_body(tree, panel.body)?;
     tree.set_accessibility(panel.body, Node::new(Role::List))?;
 
@@ -200,6 +244,9 @@ pub fn populate_history_panel(
         node.set_label(label);
         if let Some(selected) = selected {
             node.set_selected(selected);
+            // A step (or the origin): clicking it jumps there. A notice
+            // row (`selected == None`) is not a step and declares nothing.
+            node.add_action(Action::Click);
         }
         if undone {
             node.set_state_description(UNDONE_STATE);
@@ -225,8 +272,11 @@ pub fn populate_history_panel(
         .min(current.unwrap_or(0));
     let end = start.saturating_add(MAX_DESCRIPTIONS).min(len);
 
+    let mut targets = HashMap::new();
     let first = if start == 0 {
-        insert(tree, origin, Some(current.is_none()), false)?
+        let row = insert(tree, origin, Some(current.is_none()), false)?;
+        targets.insert(row, 0);
+        row
     } else {
         insert(tree, &omitted(start, "earlier"), None, false)?
     };
@@ -234,6 +284,7 @@ pub fn populate_history_panel(
     for (index, step) in steps.iter().enumerate().take(end).skip(start) {
         let selected = current == Some(index);
         let row = insert(tree, step.label, Some(selected), step.undone)?;
+        targets.insert(row, index.saturating_add(1));
         if selected {
             current_row = row;
         }
@@ -241,7 +292,10 @@ pub fn populate_history_panel(
     if end < len {
         insert(tree, &omitted(len - end, "later"), None, true)?;
     }
-    Ok(current_row)
+    Ok(HistoryRows {
+        current: current_row,
+        targets,
+    })
 }
 
 #[cfg(test)]
@@ -632,6 +686,81 @@ mod tests {
         assert_eq!(
             tree.children(panel.body).and_then(|rows| rows.get(1)),
             Some(&current)
+        );
+    }
+
+    /// 0.148.0: the origin row and every step row declare `Action::Click`
+    /// and map to the applied-step count that makes them current; a
+    /// notice row declares nothing and is not in the map; no row is a
+    /// `Tab` stop (`Action::Focus`). Checked on a capped window, where row
+    /// index is not step index.
+    #[test]
+    fn step_rows_are_clickable_and_map_to_their_applied_step_count() {
+        let labels = history_with(1005);
+        let scales = test_scales();
+        let (mut tree, panel) = panel_tree();
+        let rows = match crate::populate_history_panel_rows(
+            &mut tree,
+            panel,
+            &scales,
+            "Open",
+            &split(&labels, 2),
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(children) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(children.len(), 1002, "notice + 1000 steps + notice");
+        assert_eq!(rows.targets.len(), 1000, "every step row, no notice row");
+        for (position, &row) in children.iter().enumerate() {
+            let Some(node) = tree.accessibility(row) else {
+                unreachable!("every row has a node");
+            };
+            assert!(
+                !node.supports_action(accesskit::Action::Focus),
+                "no Tab stop"
+            );
+            let notice = position == 0 || position == children.len() - 1;
+            assert_eq!(
+                node.supports_action(accesskit::Action::Click),
+                !notice,
+                "row {position}"
+            );
+            // Row 1 shows step index 1 (the window starts at the current
+            // step), so row `p` shows step `p` and its target is `p + 1`.
+            let expected = (!notice).then_some(position + 1);
+            assert_eq!(rows.targets.get(&row).copied(), expected, "row {position}");
+        }
+        assert_eq!(rows.targets.get(&rows.current), Some(&2), "two applied");
+
+        let (mut tree, panel) = panel_tree();
+        let short = history_with(3);
+        let rows = match crate::populate_history_panel_rows(
+            &mut tree,
+            panel,
+            &scales,
+            "New Document",
+            &split(&short, 0),
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(origin) = tree
+            .children(panel.body)
+            .and_then(|rows| rows.first().copied())
+        else {
+            unreachable!("just populated");
+        };
+        assert_eq!(
+            rows.current, origin,
+            "nothing applied: the origin is current"
+        );
+        assert_eq!(rows.targets.get(&origin), Some(&0));
+        assert!(
+            tree.accessibility(origin)
+                .is_some_and(|node| node.supports_action(accesskit::Action::Click))
         );
     }
 
