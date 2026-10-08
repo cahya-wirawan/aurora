@@ -13,8 +13,8 @@
 //!   vertical overflow (an `aurora-ui` panel body) scrolls the rows,
 //!   provided the tree's own container is sized to its content rather
 //!   than to that ancestor — see [`crate::WidgetTree::hit_test`] for why.
-//!   Nothing yet observes a [`super::ScrollbarState`] to move content:
-//!   there is no visible scrollbar on a scrolling tree.
+//!   The scrollbar beside such a panel body (0.146.0) is linked to the
+//!   body, not to the tree ([`super::link_scrollbar`]).
 //! - **No disclosure triangle.** This crate draws no glyphs at all
 //!   (`paint`'s own module doc comment — solid fills only), so a
 //!   collapsed row is announced as collapsed but has no ▸ of its own;

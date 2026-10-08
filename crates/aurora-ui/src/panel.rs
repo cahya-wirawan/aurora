@@ -20,7 +20,7 @@
 //! redock and floating panels — both need real interaction/drag-state
 //! machinery this crate doesn't build yet.
 
-use accesskit::{Action, Node, Role};
+use accesskit::{Action, Node, Orientation, Role};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind, row_height};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
@@ -43,8 +43,22 @@ pub struct PanelHandle {
     pub header: WidgetId,
     /// Where a caller adds this panel's real content once it exists
     /// (layer rows, property fields, history entries) — currently
-    /// always empty.
+    /// always empty. The panel's scroll container (0.145.0).
     pub body: WidgetId,
+    /// The non-scrolling row the body sits in (0.146.0), `[body |
+    /// scrollbar]`: the root's second child, where the body used to be. It
+    /// exists because a scroll offset moves every descendant of the body,
+    /// so the bar cannot live inside it. Hidden with the body on collapse
+    /// (it is one of the root's "other" children, [`set_panel_collapsed`]).
+    pub viewport: WidgetId,
+    /// The body's vertical scrollbar (0.146.0), along the viewport's right
+    /// edge — linked to the body (`aurora_widgets::widgets::
+    /// link_scrollbar`), so dragging it, pressing its track or an
+    /// assistive technology's value actions scroll the body, and every
+    /// text-aware layout (`aurora_widgets::compute_text_layout`) copies the
+    /// body's offset back into it. `Display::None`, taking no width, while
+    /// the body's content fits.
+    pub scrollbar: WidgetId,
 }
 
 /// Adds a new, empty, titled panel as the last child of `parent`,
@@ -91,12 +105,55 @@ pub fn insert_panel(
         Node::new(Role::GenericContainer),
         WidgetKind::Container,
     )?;
-    let body = widgets::insert_container(tree, root, body_style(false))?;
+    let viewport = widgets::insert_container(tree, root, viewport_style())?;
+    let body = widgets::insert_container(tree, viewport, body_style(false))?;
     // Every docked panel's body scrolls (0.145.0) -- see `body_style`.
     // The flag is the tree's own, not part of the style, so
     // `set_panel_collapsed`'s style resets keep it.
     tree.set_scrollable(body, true)?;
-    Ok(PanelHandle { root, header, body })
+    // Its bar (0.146.0) sits beside it, never inside it: thickness, track
+    // and thumb colours and radius are the widget's own token-derived
+    // ones (`type_size md`, `paint_scrollbar`), the same as the gallery's.
+    let scrollbar = widgets::insert_scrollbar(
+        tree,
+        viewport,
+        scales,
+        Orientation::Vertical,
+        None,
+        0.0,
+        widgets::ScrollbarRange {
+            min: 0.0,
+            max: 0.0,
+            page_size: 0.0,
+        },
+    )?;
+    widgets::link_scrollbar(tree, scrollbar, body)?;
+    Ok(PanelHandle {
+        root,
+        header,
+        body,
+        viewport,
+        scrollbar,
+    })
+}
+
+/// The `[body | scrollbar]` row (0.146.0, [`PanelHandle::viewport`]):
+/// it takes over exactly the flex role the body had in the root before —
+/// grow into the panel's share of the rail from a zero basis, never
+/// impose a minimum on either axis — and lays the two out side by side.
+/// The body (`flex_grow: 1`, zero basis) takes the width the bar leaves,
+/// and both stretch to the row's height.
+fn viewport_style() -> Style {
+    Style {
+        flex_direction: taffy::FlexDirection::Row,
+        flex_grow: 1.0,
+        flex_basis: Dimension::ZERO,
+        min_size: taffy::Size {
+            width: Dimension::ZERO,
+            height: Dimension::ZERO,
+        },
+        ..Default::default()
+    }
 }
 
 /// The title slot's own layout: exactly one row tall (`row_height`, the
@@ -231,10 +288,18 @@ fn root_style(collapsed: bool) -> Style {
 /// bottom into view — `aurora-app` routes the wheel — and the body's own
 /// bounds never move, so this clip is what keeps a scrolled-out row
 /// invisible and unclickable. Until then rows past the bottom of a
-/// crowded Layers panel were laid out but not reachable at all. What is
-/// still missing is a visible scrollbar (a mouse with no wheel cannot
-/// scroll yet) and the accessibility scroll *actions*; the body does
-/// report its position and range to a screen reader.
+/// crowded Layers panel were laid out but not reachable at all. As of
+/// 0.146.0 the body also has a visible scrollbar beside it
+/// ([`PanelHandle::scrollbar`]) — a mouse with no wheel can drag it or
+/// press its track, and an assistive technology can set its value — and
+/// the body still reports its own position and range to a screen reader.
+///
+/// **The body now sits in a `Row` (0.146.0), [`PanelHandle::viewport`]**,
+/// not directly in the root. `flex_grow: 1` and the zero basis therefore
+/// act on its *width* (it takes what the bar leaves) while its height
+/// stretches to the viewport's; the viewport carries the vertical
+/// `flex_grow`/zero-basis/zero-minimum role this style used to play in
+/// the root, so nothing above the panel sees a difference.
 ///
 /// **`FlexDirection::Column` is new in `0.77.2`, and it is a bug fix,
 /// not a preference.** The body previously inherited `Style::default()`'s
@@ -639,7 +704,9 @@ mod tests {
         assert_eq!(accessibility.is_expanded(), Some(true));
         assert_eq!(tree.payload(panel.root), Some(&WidgetKind::Panel));
         assert_eq!(tree.children(panel.body), Some([].as_slice()));
-        assert_eq!(tree.parent(panel.body), Some(panel.root));
+        assert_eq!(tree.parent(panel.body), Some(panel.viewport));
+        assert_eq!(tree.parent(panel.viewport), Some(panel.root));
+        assert_eq!(tree.parent(panel.scrollbar), Some(panel.viewport));
         match panel_is_collapsed(&tree, panel) {
             Ok(collapsed) => assert!(!collapsed, "a freshly inserted panel starts expanded"),
             Err(err) => unreachable!("{err:?}"),
@@ -865,6 +932,8 @@ mod tests {
             root: bogus,
             header: bogus,
             body: bogus,
+            viewport: bogus,
+            scrollbar: bogus,
         };
         match panel_is_collapsed(&tree, panel) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -880,6 +949,8 @@ mod tests {
             root: bogus,
             header: bogus,
             body: bogus,
+            viewport: bogus,
+            scrollbar: bogus,
         };
         match set_panel_collapsed(&mut tree, panel, true) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -1329,6 +1400,8 @@ mod tests {
             root: bogus,
             header: bogus,
             body: bogus,
+            viewport: bogus,
+            scrollbar: bogus,
         };
         match close_panel(&mut tree, panel) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),

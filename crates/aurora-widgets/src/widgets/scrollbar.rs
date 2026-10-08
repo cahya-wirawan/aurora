@@ -1,16 +1,20 @@
 //! A scrollbar: a bounded position along one axis, plus the size of the
 //! visible page within that range.
 //!
-//! **Scope, stated honestly. This is a position *model*, not scrolling.**
-//! Nothing in this crate scrolls any content: there is no viewport, no
-//! clip rect, no content-offset transform, and no widget observes a
-//! [`ScrollbarState`] to move itself. `widgets`' own module doc comment
-//! lists "scrolling for scrollbars/trees" as infrastructure that does
-//! not exist yet, and it still does not — what landed here is the
-//! accessibility node, the layout style, the clamped value arithmetic,
-//! and the paint geometry, which is exactly the boundary every other
-//! widget in this module already keeps ("layout + content, no
-//! behaviour"). A real scrolling container is separate, later work.
+//! **Two uses.** A bare bar ([`insert_scrollbar`] alone) is a position
+//! *model*: nothing observes its [`ScrollbarState`] to move any content,
+//! which is what the Widget Gallery's demo bar is. A **linked** bar
+//! (0.146.0, [`link_scrollbar`]) drives a [`WidgetTree::set_scrollable`]
+//! container instead: [`set_scrollbar_value`] — and so a pointer drag, a
+//! track press and an assistive technology's `SetValue`/`Increment`/
+//! `Decrement`, which all go through it — scrolls that container, and
+//! [`sync_linked_scrollbars`] (run by `crate::compute_text_layout` after
+//! every layout) copies the container's offset, range and height back
+//! into the bar and hides the bar (`Display::None`, so it takes no width)
+//! while the content fits. The bar must **not** be a descendant of the
+//! container it scrolls — a scroll offset moves every descendant, and the
+//! bar would scroll away with the content; `aurora-ui`'s docked panels put
+//! it beside the body in a row of its own.
 //!
 //! `tests/gallery.rs` now carries this widget's own component-gallery
 //! entry — four cells (a vertical bar at its own minimum, at its own
@@ -30,8 +34,10 @@
 //! shipping `accesskit` platform adapter, whereas the numeric-value
 //! properties are what drive the Windows UIA `RangeValue` pattern and the
 //! macOS/AT-SPI Value interfaces. The scroll-offset vocabulary describes
-//! a *scrollable container's* own state, which is precisely the thing
-//! this crate does not have yet.
+//! a *scrollable container's* own state — and that is where it lives:
+//! since 0.145.0 a [`WidgetTree::set_scrollable`] container reports
+//! `scroll_y`/`scroll_y_min`/`scroll_y_max` itself, so a linked bar's
+//! numeric value is the bar's own announcement, not a duplicate of them.
 //!
 //! **Known platform caveat, stated rather than implied away.**
 //! `accesskit`'s own Windows UIA adapter maps `Role::ScrollBar` to a
@@ -45,7 +51,7 @@
 use accesskit::{Action, Node, Orientation, Role};
 use aurora_theme::Scales;
 use taffy::style_helpers::{length, percent};
-use taffy::{Size, Style};
+use taffy::{Display, Size, Style};
 
 use super::{WidgetKind, type_size};
 use crate::error::WidgetError;
@@ -107,17 +113,22 @@ pub struct ScrollbarState {
     /// The scrollbar's own accessible name, when it has one. `Option`
     /// rather than [`super::SliderState`]'s bare `String`, because a
     /// scrollbar is usually named by the region it scrolls (an
-    /// `aria-controls`-shaped relationship this crate cannot express
-    /// yet) rather than by chrome of its own — but a standalone bar
-    /// with no such region, which is every scrollbar this crate can
-    /// build today, is otherwise announced as an unnamed "scroll bar",
-    /// so a caller must be able to supply one.
+    /// `aria-controls`-shaped relationship, which a linked bar announces
+    /// through [`Self::scrolls`] since 0.146.0) rather than by chrome of
+    /// its own — but a bare bar with no such region (the gallery's demo
+    /// bar) is otherwise announced as an unnamed "scroll bar", so a caller
+    /// must be able to supply one.
     pub label: Option<String>,
     pub value: f64,
     pub min: f64,
     pub max: f64,
     pub page_size: f64,
     pub disabled: bool,
+    /// The scroll container this bar drives, once [`link_scrollbar`] has
+    /// linked it (0.146.0); `None` for a bare position model. Announced as
+    /// the node's `controls` relation — the `aria-controls` shape the
+    /// [`Self::label`] doc names.
+    pub scrolls: Option<WidgetId>,
 }
 
 fn node(state: &ScrollbarState) -> Node {
@@ -137,10 +148,25 @@ fn node(state: &ScrollbarState) -> Node {
     if state.disabled {
         node.set_disabled();
     } else {
-        node.add_action(Action::Focus);
+        // A linked bar is not a `Tab` stop (0.146.0), the same as a
+        // platform's own scrollbars: a keyboard user reaches the scrolled
+        // content by focus, and a focused row scrolls itself into view.
+        // Its value actions stay, so an assistive technology can still
+        // scroll with it.
+        if state.scrolls.is_none() {
+            node.add_action(Action::Focus);
+        }
         node.add_action(Action::SetValue);
         node.add_action(Action::Increment);
         node.add_action(Action::Decrement);
+    }
+    if let Some(container) = state.scrolls {
+        node.set_controls(vec![container]);
+        // Nothing to scroll: the bar is not shown (`sync_scrollbar`), so
+        // it is not announced either.
+        if state.max <= state.min {
+            node.set_hidden();
+        }
     }
     node
 }
@@ -289,6 +315,7 @@ pub fn insert_scrollbar(
         max: range.max,
         page_size,
         disabled: false,
+        scrolls: None,
     };
     tree.insert(
         parent,
@@ -301,6 +328,11 @@ pub fn insert_scrollbar(
 /// Sets `id` (a scrollbar) to `value`, clamped to its own
 /// `min..=max`. Returns the clamped value actually stored. A non-finite
 /// `value` is parked at `min` — see `clamped_value`.
+///
+/// **A linked bar ([`link_scrollbar`]) scrolls its container too**
+/// (0.146.0), through [`WidgetTree::set_scroll_y`], and then stores — and
+/// returns — the offset the container actually took, so the two can never
+/// disagree after a call.
 ///
 /// # Errors
 ///
@@ -318,6 +350,7 @@ pub fn set_scrollbar_value(
     value: f64,
 ) -> Result<f64, WidgetError> {
     let mut result = 0.0;
+    let mut linked = None;
     with_scrollbar_mut(tree, id, |state| {
         if state.disabled {
             return Err(WidgetError::WidgetDisabled(id));
@@ -325,9 +358,188 @@ pub fn set_scrollbar_value(
         checked_range(state.min, state.max)?;
         state.value = clamped_value(value, state.min, state.max);
         result = state.value;
+        linked = state.scrolls;
         Ok(())
     })?;
+    if let Some(container) = linked {
+        #[allow(clippy::cast_possible_truncation)]
+        tree.set_scroll_y(container, result as f32)?;
+        let taken = tree.scroll_y(container).map_or(result, f64::from);
+        with_scrollbar_mut(tree, id, |state| {
+            state.value = clamped_value(taken, state.min, state.max);
+            result = state.value;
+            Ok(())
+        })?;
+    }
     Ok(result)
+}
+
+/// Links `bar` (a scrollbar) to `container` (0.146.0): from now on
+/// [`set_scrollbar_value`] scrolls `container`, and
+/// [`sync_linked_scrollbars`] keeps the bar's value, range, page size and
+/// visibility in line with it. The bar stops being a `Tab` stop and
+/// announces `container` as the region it controls. Syncs once at once,
+/// so a bar linked to a container that has not been laid out yet starts
+/// hidden.
+///
+/// `bar` must not be a descendant of `container` — see this module's own
+/// doc comment.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] if either id doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if `bar` isn't a scrollbar.
+pub fn link_scrollbar(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    container: WidgetId,
+) -> Result<(), WidgetError> {
+    if !tree.contains(container) {
+        return Err(WidgetError::UnknownWidget(container));
+    }
+    with_scrollbar_mut(tree, bar, |state| {
+        state.scrolls = Some(container);
+        Ok(())
+    })?;
+    sync_scrollbar(tree, bar)?;
+    Ok(())
+}
+
+/// The scroll container `id` drives, if `id` is a linked scrollbar
+/// ([`link_scrollbar`]); `None` for anything else.
+#[must_use]
+pub fn scrollbar_target(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<WidgetId> {
+    match tree.payload(id) {
+        Some(WidgetKind::Scrollbar(state)) => state.scrolls,
+        _ => None,
+    }
+}
+
+/// Copies a linked `bar`'s container's state into the bar (0.146.0):
+/// `value` = the container's [`WidgetTree::scroll_y`], `max` = its
+/// [`WidgetTree::scroll_range`] (`min` is always `0.0`), `page_size` = its
+/// laid-out height — [`ScrollbarRange`]'s own `max = content - page`
+/// convention, which is exactly what `scroll_range` already is. The bar is
+/// shown while `max > 0` and `Display::None` otherwise, so a panel whose
+/// content fits gives the bar no width at all. A container that no longer
+/// exists hides the bar. Never writes to the container: a collapsed body
+/// keeps the offset it was collapsed at, with its bar hidden.
+///
+/// Returns whether the bar's **visibility** changed — the one change that
+/// moves other widgets (the container gains or loses the bar's width), so
+/// the caller lays out once more. A state-only change dirties the bar
+/// for repaint and returns `false`. An unlinked bar is left alone.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] if `bar` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it isn't a scrollbar.
+// Exact float equality is the intent: an unchanged value is the same
+// stored number.
+#[allow(clippy::float_cmp)]
+pub fn sync_scrollbar(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+) -> Result<bool, WidgetError> {
+    sync_one(tree, bar, true)
+}
+
+/// [`sync_scrollbar`], with `may_toggle: false` leaving the bar's
+/// visibility as it is and returning whether it *would* have changed.
+#[allow(clippy::float_cmp)]
+fn sync_one(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    may_toggle: bool,
+) -> Result<bool, WidgetError> {
+    let state = match tree.payload(bar) {
+        Some(WidgetKind::Scrollbar(state)) => state,
+        Some(_) => return Err(WidgetError::WrongWidgetKind(bar)),
+        None => return Err(WidgetError::UnknownWidget(bar)),
+    };
+    let Some(container) = state.scrolls else {
+        return Ok(false);
+    };
+    let (offset, max, page) = match (
+        tree.scroll_y(container),
+        tree.scroll_range(container),
+        tree.bounds(container),
+    ) {
+        (Some(offset), Some(range), Some(bounds)) => (
+            f64::from(offset),
+            f64::from(range).max(0.0),
+            f64::from(bounds.height),
+        ),
+        _ => (0.0, 0.0, 0.0),
+    };
+    let value = clamped_value(offset, 0.0, max);
+    if state.min != 0.0 || state.max != max || state.page_size != page || state.value != value {
+        with_scrollbar_mut(tree, bar, |state| {
+            state.min = 0.0;
+            state.max = max;
+            state.page_size = page;
+            state.value = value;
+            Ok(())
+        })?;
+    }
+    let display = if max > 0.0 {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    let mut style = tree
+        .style(bar)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(bar))?;
+    if style.display == display {
+        return Ok(false);
+    }
+    if !may_toggle {
+        return Ok(true);
+    }
+    style.display = display;
+    tree.set_style(bar, style)?;
+    Ok(true)
+}
+
+/// [`sync_scrollbar`] for every linked scrollbar in `tree` (0.146.0) —
+/// what `crate::compute_text_layout` runs after its first layout. Returns
+/// whether any bar was shown or hidden, in which case that function lays
+/// out once more and then calls [`settle_linked_scrollbars`], never a
+/// third layout.
+pub fn sync_linked_scrollbars(tree: &mut WidgetTree<WidgetKind>) -> bool {
+    sync_all(tree, true)
+}
+
+/// The second, settling pass after [`sync_linked_scrollbars`] toggled a
+/// bar and the tree was laid out again (0.146.0): every linked bar takes
+/// its container's new value, range and page size, but **no bar is shown
+/// or hidden** — a bar the first pass showed is never hidden by this one,
+/// and the other way round — so the layout just computed stays the one
+/// the bars are drawn in. Returns whether some bar *would* have toggled.
+///
+/// That happens only for content whose height **shrinks** as it narrows
+/// (an aspect-ratio box, say): showing the bar narrows it until it fits,
+/// or hiding the bar widens it until it overflows. The bar then stays as
+/// the first pass left it — shown over a full-length thumb, or hidden over
+/// still-scrollable content (the wheel and focus still scroll it) — and
+/// the next layout may decide the other way, so such content can flip per
+/// layout. Text, rows and every shipped panel's content only grow as they
+/// narrow, for which this never happens.
+pub fn settle_linked_scrollbars(tree: &mut WidgetTree<WidgetKind>) -> bool {
+    sync_all(tree, false)
+}
+
+fn sync_all(tree: &mut WidgetTree<WidgetKind>, may_toggle: bool) -> bool {
+    let bars: Vec<WidgetId> = tree
+        .ids()
+        .filter(|&id| scrollbar_target(tree, id).is_some())
+        .collect();
+    let mut toggled = false;
+    for bar in bars {
+        toggled |= matches!(sync_one(tree, bar, may_toggle), Ok(true));
+    }
+    toggled
 }
 
 /// Sets whether `id` (a scrollbar) is disabled.
@@ -380,7 +592,10 @@ fn with_scrollbar_mut(
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollbarRange, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value};
+    use super::{
+        ScrollbarRange, insert_scrollbar, link_scrollbar, set_scrollbar_disabled,
+        set_scrollbar_value,
+    };
     use crate::WidgetError;
     use crate::widgets::{WidgetKind, new_tree, test_scales};
     use accesskit::{Action, Orientation};
@@ -969,6 +1184,323 @@ mod tests {
             }),
             "a horizontal scrollbar is one type-scale step tall and as wide as the region it \
              sits beside"
+        );
+    }
+
+    // -- linked scrollbars (0.146.0) --
+
+    /// A 200x300 window with a 100 px tall row `[body | bar]`: the body is
+    /// a clipping scroll container holding `rows` 20 px rows, the bar is
+    /// linked to it and is *not* its descendant.
+    fn linked_scene(
+        rows: usize,
+    ) -> (
+        crate::WidgetTree<WidgetKind>,
+        crate::WidgetId,
+        crate::WidgetId,
+        Vec<crate::WidgetId>,
+    ) {
+        let (mut tree, root) = new_tree(Style {
+            flex_direction: FlexDirection::Column,
+            size: Size {
+                width: length(200.0_f32),
+                height: length(300.0_f32),
+            },
+            ..Default::default()
+        });
+        let ok = |result: Result<crate::WidgetId, WidgetError>| match result {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let viewport = ok(crate::widgets::insert_container(
+            &mut tree,
+            root,
+            Style {
+                flex_direction: FlexDirection::Row,
+                flex_shrink: 0.0,
+                size: Size {
+                    width: length(200.0_f32),
+                    height: length(100.0_f32),
+                },
+                ..Default::default()
+            },
+        ));
+        let body = ok(crate::widgets::insert_container(
+            &mut tree,
+            viewport,
+            Style {
+                flex_direction: FlexDirection::Column,
+                flex_grow: 1.0,
+                flex_basis: length(0.0_f32),
+                overflow: taffy::Point {
+                    x: taffy::Overflow::Hidden,
+                    y: taffy::Overflow::Hidden,
+                },
+                ..Default::default()
+            },
+        ));
+        if let Err(err) = tree.set_scrollable(body, true) {
+            unreachable!("{err:?}");
+        }
+        let bar = ok(insert_scrollbar(
+            &mut tree,
+            viewport,
+            &test_scales(),
+            Orientation::Vertical,
+            None,
+            0.0,
+            ScrollbarRange {
+                min: 0.0,
+                max: 0.0,
+                page_size: 0.0,
+            },
+        ));
+        if let Err(err) = link_scrollbar(&mut tree, bar, body) {
+            unreachable!("{err:?}");
+        }
+        let rows = (0..rows)
+            .map(|_| {
+                ok(crate::widgets::insert_container(
+                    &mut tree,
+                    body,
+                    Style {
+                        flex_shrink: 0.0,
+                        size: Size {
+                            width: taffy::Dimension::auto(),
+                            height: length(20.0_f32),
+                        },
+                        ..Default::default()
+                    },
+                ))
+            })
+            .collect();
+        crate::compute_text_layout(&mut tree, 200.0, 300.0, None);
+        (tree, body, bar, rows)
+    }
+
+    fn bar_state(
+        tree: &crate::WidgetTree<WidgetKind>,
+        bar: crate::WidgetId,
+    ) -> super::ScrollbarState {
+        match tree.payload(bar) {
+            Some(WidgetKind::Scrollbar(state)) => state.clone(),
+            other => unreachable!("not a scrollbar: {other:?}"),
+        }
+    }
+
+    fn rect(tree: &crate::WidgetTree<WidgetKind>, id: crate::WidgetId) -> Rect {
+        match tree.bounds(id) {
+            Some(rect) => rect,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    #[test]
+    fn a_linked_bar_is_hidden_takes_no_width_and_is_announced_hidden_while_content_fits() {
+        let (tree, body, bar, rows) = linked_scene(3);
+        assert_eq!(tree.scroll_range(body), Some(0.0));
+        assert_eq!(rect(&tree, bar).width, 0, "no width at all");
+        assert_eq!(rect(&tree, body).width, 200, "the body takes the whole row");
+        let Some(&row) = rows.first() else {
+            unreachable!("three rows");
+        };
+        assert_eq!(rect(&tree, row).width, 200);
+        let Some(node) = tree.accessibility(bar) else {
+            unreachable!("inserted");
+        };
+        assert!(node.is_hidden());
+        assert_eq!(node.role(), accesskit::Role::ScrollBar);
+        assert_eq!(node.controls(), &[body]);
+        assert!(!node.supports_action(Action::Focus), "not a Tab stop");
+        assert!(node.supports_action(Action::SetValue));
+    }
+
+    #[test]
+    fn an_overflowing_container_shows_its_bar_with_a_proportional_thumb_and_rows_lose_its_width() {
+        let (tree, body, bar, rows) = linked_scene(10);
+        let thickness = rect(&tree, bar).width;
+        assert!(thickness > 0, "shown");
+        let bar_box = rect(&tree, bar);
+        assert_eq!(bar_box.height, 100, "the bar spans the body's height");
+        assert_eq!(bar_box.x, i64::from(200 - thickness), "at the right edge");
+        // Showing the bar narrowed the body: one re-layout, inside
+        // `compute_text_layout`, gave the rows their new width.
+        assert_eq!(rect(&tree, body).width, 200 - thickness);
+        for &row in &rows {
+            assert_eq!(rect(&tree, row).width, 200 - thickness);
+        }
+        let state = bar_state(&tree, bar);
+        assert_eq!(tree.scroll_range(body), Some(100.0));
+        assert!((state.max - 100.0).abs() < 1e-9);
+        assert!((state.page_size - 100.0).abs() < 1e-9);
+        assert!(state.value.abs() < 1e-9);
+        let (_, top, _, thumb) = crate::paint::scrollbar_thumb_rect(&state, bar_box);
+        assert!(
+            (thumb - 50.0).abs() < 1.0,
+            "page / content = 100 / 200: {thumb}"
+        );
+        assert!((top - 0.0).abs() < 1.0, "at the top: {top}");
+        let Some(node) = tree.accessibility(bar) else {
+            unreachable!("inserted");
+        };
+        assert!(!node.is_hidden());
+    }
+
+    #[test]
+    fn the_bar_follows_the_containers_offset_after_layout_and_never_moves_itself() {
+        let (mut tree, body, bar, _) = linked_scene(10);
+        let before = rect(&tree, bar);
+        if let Err(err) = tree.set_scroll_y(body, 100.0) {
+            unreachable!("{err:?}");
+        }
+        crate::compute_text_layout(&mut tree, 200.0, 300.0, None);
+        let state = bar_state(&tree, bar);
+        assert!((state.value - 100.0).abs() < 1e-9, "{}", state.value);
+        assert_eq!(rect(&tree, bar), before, "the bar is not scrolled content");
+        let (_, top, _, thumb) = crate::paint::scrollbar_thumb_rect(&state, before);
+        assert!(
+            (top + thumb - 100.0).abs() < 1.0,
+            "thumb at the bottom: {top}+{thumb}"
+        );
+    }
+
+    #[test]
+    fn setting_a_linked_bars_value_scrolls_its_container_and_moves_the_rows() {
+        let (mut tree, body, bar, rows) = linked_scene(10);
+        let Some(&row0) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        let stored = match set_scrollbar_value(&mut tree, bar, 40.0) {
+            Ok(stored) => stored,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!((stored - 40.0).abs() < 1e-9);
+        assert_eq!(tree.scroll_y(body), Some(40.0));
+        assert_eq!(
+            rect(&tree, row0).y,
+            -40,
+            "content moved before any relayout"
+        );
+        // Past the end: the container's own clamp wins and the bar takes it.
+        let stored = match set_scrollbar_value(&mut tree, bar, 1.0e6) {
+            Ok(stored) => stored,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!((stored - 100.0).abs() < 1e-9);
+        assert_eq!(tree.scroll_y(body), Some(100.0));
+    }
+
+    #[test]
+    fn accessibility_value_actions_on_a_linked_bar_scroll_its_container() {
+        let (mut tree, body, bar, _) = linked_scene(10);
+        let mut focus = crate::FocusManager::new();
+        let request = |action, data| accesskit::ActionRequest {
+            action,
+            target_tree: crate::ACCESSIBILITY_TREE_ID,
+            target_node: bar,
+            data,
+        };
+        if let Err(err) = crate::handle_action(
+            &mut tree,
+            &mut focus,
+            &request(
+                Action::SetValue,
+                Some(accesskit::ActionData::NumericValue(30.0)),
+            ),
+        ) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.scroll_y(body), Some(30.0));
+        if let Err(err) =
+            crate::handle_action(&mut tree, &mut focus, &request(Action::Increment, None))
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            tree.scroll_y(body).is_some_and(|y| y > 30.0),
+            "{:?}",
+            tree.scroll_y(body)
+        );
+        if let Err(err) =
+            crate::handle_action(&mut tree, &mut focus, &request(Action::Decrement, None))
+        {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.scroll_y(body), Some(30.0));
+        assert!(
+            crate::handle_action(&mut tree, &mut focus, &request(Action::Focus, None)).is_err(),
+            "a linked bar is not focusable"
+        );
+    }
+
+    #[test]
+    fn a_pointer_press_on_a_linked_bars_track_scrolls_without_taking_focus() {
+        let (mut tree, body, bar, _) = linked_scene(10);
+        let mut focus = crate::FocusManager::new();
+        let mut click = crate::ClickTracker::default();
+        let bar_box = rect(&tree, bar);
+        #[allow(clippy::cast_precision_loss)]
+        let x = bar_box.x as f32 + 1.0;
+        let event = |phase, y| crate::PointerEvent {
+            phase,
+            position: (x, y),
+        };
+        if let Err(err) = crate::handle_pointer(
+            &mut tree,
+            &mut focus,
+            &mut click,
+            event(crate::PointerPhase::Down, 99.0),
+        ) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(100.0),
+            "a track press at the bottom"
+        );
+        assert_eq!(focus.focused(), None);
+        if let Err(err) = crate::handle_pointer(
+            &mut tree,
+            &mut focus,
+            &mut click,
+            event(crate::PointerPhase::Move, 50.0),
+        ) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(50.0),
+            "dragging the thumb to the middle"
+        );
+    }
+
+    /// Review I-2 (0.146.0): the settling pass never shows or hides a bar,
+    /// so the layout it follows stays the one the bar is drawn in.
+    #[test]
+    fn the_settling_pass_updates_a_bars_state_but_never_its_visibility() {
+        let (mut tree, body, bar, rows) = linked_scene(10);
+        assert!(rect(&tree, bar).width > 0, "shown");
+        for &row in rows.iter().skip(2) {
+            if let Err(err) = tree.remove(row) {
+                unreachable!("{err:?}");
+            }
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(body), Some(0.0), "now it fits");
+        assert!(super::settle_linked_scrollbars(&mut tree), "it would hide");
+        assert_eq!(
+            tree.style(bar).map(|style| style.display),
+            Some(taffy::Display::Flex),
+            "but the settling pass leaves it shown"
+        );
+        assert!(bar_state(&tree, bar).max.abs() < 1e-9, "its state did sync");
+        assert!(
+            super::sync_linked_scrollbars(&mut tree),
+            "the first pass hides it"
+        );
+        assert_eq!(
+            tree.style(bar).map(|style| style.display),
+            Some(taffy::Display::None)
         );
     }
 }

@@ -3172,6 +3172,10 @@ struct AccessibilityContext<'a> {
     tool: aurora_ui::Tool,
     tool_settings: &'a mut ToolSettings,
     tool_controls: Option<aurora_ui::ToolControls>,
+    /// What [`follow_scroll`] last saw (`App::scroll_follow`, 0.146.0
+    /// review I-1): a panel-bar action that closes the gallery's menu
+    /// records the focus hand-back here so the next layout keeps the scroll.
+    scroll_follow: &'a mut ScrollFollow,
 }
 
 /// What the caller of [`apply_accessibility_action`] still has to do —
@@ -3291,6 +3295,25 @@ fn end_pointer_opacity_drag(cx: &mut AccessibilityContext<'_>) {
     });
 }
 
+/// An assistive technology's action on a docked panel's own bar (0.146.0):
+/// the linked bar already scrolled its body inside `handle_action`, so a
+/// value change only closes open popovers ([`close_open_popovers`]).
+fn panel_bar_accessibility(
+    cx: &mut AccessibilityContext<'_>,
+    outcome: &aurora_widgets::ActionOutcome,
+) {
+    tracing::debug!(?outcome, "accessibility action scrolled a panel");
+    if matches!(outcome, aurora_widgets::ActionOutcome::ValueChanged { .. }) {
+        close_open_popovers(
+            &mut cx.workspace.tree,
+            cx.focus,
+            cx.gallery.as_mut(),
+            cx.layer_controls.controls.as_ref(),
+            cx.scroll_follow,
+        );
+    }
+}
+
 /// Routes one assistive-technology `request` ([`route_accessibility_action`])
 /// and performs the app-level reaction it names — [`run_dialog_action`]
 /// for a dialog button, [`press_layer_row`] (with the exact argument list
@@ -3307,16 +3330,26 @@ fn end_pointer_opacity_drag(cx: &mut AccessibilityContext<'_>) {
 /// same as outside an open dialog.
 ///
 /// A refusal changes nothing and asks for neither a relayout nor a
-/// redraw; every other reaction asks for both.
+/// redraw; every other reaction asks for both. An action on a docked
+/// panel's own scrollbar (0.146.0) scrolls that panel's body — the bar is
+/// linked, so `handle_action` itself scrolls — and a value change then
+/// closes open popovers ([`panel_bar_accessibility`]).
+#[allow(clippy::too_many_lines)]
 fn apply_accessibility_action(
     cx: &mut AccessibilityContext<'_>,
     request: &accesskit::ActionRequest,
 ) -> AccessibilityEffects {
     // Decided before routing: a menu item's `Click` removes the menu, so
-    // the target is gone by the time the outcome comes back.
-    let in_gallery = cx.gallery.as_ref().is_some_and(|gallery| {
-        aurora_ui::gallery_contains(&cx.workspace.tree, gallery, request.target_node)
-    });
+    // the target is gone by the time the outcome comes back. A docked
+    // panel's own bar (0.146.0) is never a gallery demo widget, even on the
+    // gallery's own panel.
+    let on_panel_bar =
+        aurora_widgets::widgets::scrollbar_target(&cx.workspace.tree, request.target_node)
+            .is_some();
+    let in_gallery = !on_panel_bar
+        && cx.gallery.as_ref().is_some_and(|gallery| {
+            aurora_ui::gallery_contains(&cx.workspace.tree, gallery, request.target_node)
+        });
     let reaction = match cx.palette {
         Some(palette)
             if cx.dialog.is_none()
@@ -3386,6 +3419,9 @@ fn apply_accessibility_action(
             {
                 tracing::warn!(?err, "gallery failed to apply an accessibility outcome");
             }
+        }
+        AccessibilityReaction::Handled(outcome) if on_panel_bar => {
+            panel_bar_accessibility(cx, &outcome);
         }
         AccessibilityReaction::Handled(outcome) => {
             if outcome_is_widget_local(&outcome) {
@@ -3895,6 +3931,115 @@ enum WidgetOwner {
     /// ([`aurora_ui::ToolControls`], 0.136.0): they edit the live tool
     /// settings, never the document.
     ToolControls,
+    /// A docked panel's own scrollbar (0.146.0, `aurora_ui::PanelHandle::
+    /// scrollbar`): a linked bar, so the widget layer has already scrolled
+    /// its panel body; the app only closes open popovers
+    /// ([`close_open_popovers`]) and lays out again.
+    PanelScrollbar,
+}
+
+/// Closes every open popover a panel scroll could leave stranded
+/// (0.146.0): the Layers panel's blend-mode list and the Widget Gallery's
+/// menu and dropdown list. A dropdown's list is a popover floating above
+/// its panel; once the panel scrolls its owner out of view the list stops
+/// painting and hit-testing (`WidgetTree::popover_owner_hidden`) but was
+/// still logically open, still claimed `Escape` and still announced
+/// itself as expanded. Run after a panel scroll that moved something — by
+/// the wheel ([`App::handle_mouse_wheel`]), by dragging or pressing a
+/// panel's bar ([`App::route_gallery`]), or by an assistive technology's
+/// value action on the bar ([`apply_accessibility_action`]) — the same
+/// close [`layer_controls_light_dismiss`] and
+/// [`aurora_ui::gallery_light_dismiss`] perform for a press elsewhere.
+/// Returns whether anything closed.
+fn close_open_popovers(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    gallery: Option<&mut aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    follow: &mut ScrollFollow,
+) -> bool {
+    let mut closed = false;
+    if let Some(controls) = layer_controls
+        && aurora_widgets::widgets::dropdown_state(tree, controls.blend)
+            .is_ok_and(aurora_widgets::widgets::DropdownState::is_open)
+    {
+        match aurora_widgets::widgets::set_dropdown_open(tree, controls.blend, false) {
+            Ok(_) => closed = true,
+            Err(err) => tracing::warn!(?err, "failed to close the blend-mode list"),
+        }
+    }
+    if let Some(open) = gallery {
+        match aurora_ui::gallery_close_popovers(tree, focus, open) {
+            Ok(gallery_closed) => closed |= gallery_closed,
+            Err(err) => tracing::warn!(?err, "failed to close the gallery's popovers"),
+        }
+    }
+    focus.validate(tree);
+    // Review I-1: closing the gallery's menu hands focus back to its
+    // opener. That is a focus change [`follow_scroll`] would answer by
+    // scrolling the opener back into view -- undoing the very scroll that
+    // closed the menu. Recording it as already seen keeps the scroll.
+    if closed {
+        follow.focus = focus.focused();
+    }
+    closed
+}
+
+/// The pointer half of a panel bar's reaction (0.146.0, called by
+/// [`App::route_gallery`]): when `routed` is a [`WidgetOwner::
+/// PanelScrollbar`] value change — a thumb drag or a track press, which the
+/// linked bar has already turned into a scroll of its body — closes open
+/// popovers ([`close_open_popovers`]). The caller lays out afterwards,
+/// which syncs the thumb. Returns whether it was such a change.
+///
+/// Any event the bar took also records the current focus in `follow`
+/// (review I-1): a `Down` on the bar first light-dismisses the gallery's
+/// menu, whose focus hand-back to its opener must not make
+/// [`follow_scroll`] scroll the panel back.
+fn panel_bar_scrolled(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    gallery: Option<&mut aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    follow: &mut ScrollFollow,
+    routed: &WidgetPointer,
+) -> bool {
+    if routed.owner == Some(WidgetOwner::PanelScrollbar) {
+        follow.focus = focus.focused();
+    }
+    let scrolled = routed.owner == Some(WidgetOwner::PanelScrollbar)
+        && matches!(
+            routed.outcome,
+            Some(PointerOutcome::Action(
+                aurora_widgets::ActionOutcome::ValueChanged { .. }
+            ))
+        );
+    if scrolled {
+        close_open_popovers(tree, focus, gallery, layer_controls, follow);
+    }
+    scrolled
+}
+
+/// [`scroll_panel`], then — only when something moved —
+/// [`close_open_popovers`] (0.146.0): [`App::handle_mouse_wheel`]'s panel
+/// branch. Returns whether anything moved.
+#[allow(clippy::too_many_arguments)]
+fn wheel_scroll_panel(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    gallery: Option<&mut aurora_ui::GalleryPanel>,
+    layer_controls: Option<&aurora_ui::LayerControls>,
+    follow: &mut ScrollFollow,
+    container: WidgetId,
+    delta: winit::event::MouseScrollDelta,
+    scale_factor: f64,
+    scales: &Scales,
+) -> bool {
+    let moved = scroll_panel(tree, container, delta, scale_factor, scales);
+    if moved {
+        close_open_popovers(tree, focus, gallery, layer_controls, follow);
+    }
+    moved
 }
 
 /// The owner of `id`, if it is (or lies inside) the open gallery or the
@@ -3907,6 +4052,11 @@ fn widget_owner(
     tool_controls: Option<&aurora_ui::ToolControls>,
     id: WidgetId,
 ) -> Option<WidgetOwner> {
+    // First: the Widget Gallery's own panel has a bar too, and it scrolls
+    // the gallery's body, not a demo widget.
+    if aurora_widgets::widgets::scrollbar_target(tree, id).is_some() {
+        return Some(WidgetOwner::PanelScrollbar);
+    }
     if gallery.is_some_and(|open| aurora_ui::gallery_contains(tree, open, id)) {
         return Some(WidgetOwner::Gallery);
     }
@@ -4076,9 +4226,9 @@ fn route_widget_pointer(
     modifiers: Modifiers,
     hit: &mut dyn TextHit,
 ) -> WidgetPointer {
-    if gallery.is_none() && layer_controls.is_none() && tool_controls.is_none() {
-        return WidgetPointer::default();
-    }
+    // No "nothing app-owned is open" early return any more (0.146.0): a
+    // docked panel's scrollbar ([`WidgetOwner::PanelScrollbar`]) is always
+    // there to route to.
     let owner_of =
         |tree: &WidgetTree<WidgetKind>, gallery: &Option<aurora_ui::GalleryPanel>, id: WidgetId| {
             widget_owner(tree, gallery.as_ref(), layer_controls, tool_controls, id)
@@ -7108,7 +7258,22 @@ enum WheelTarget {
 /// 4. Otherwise the scroll container under the pointer that has
 ///    somewhere to scroll (`WidgetTree::scroll_container_at`) scrolls;
 ///    one whose content fits, an open popover, or the bare rail is
-///    [`WheelTarget::Nothing`].
+///    [`WheelTarget::Nothing`]. **Over a panel's own scrollbar** (0.146.0)
+///    it scrolls the body that bar is linked to — the bar sits beside the
+///    body, not inside it, so `scroll_container_at` alone would miss it.
+///
+/// **The command palette is deliberately not in this list** (0.146.0,
+/// disclosed in 0.145.0's review): `modal_open` here is the dialog alone,
+/// so with the palette open the wheel still zooms the canvas and scrolls
+/// panels behind it — nothing the palette shows sits in a panel, so a
+/// scroll cannot strand it. **That is asymmetric with the bar:**
+/// [`App::route_gallery`] treats the palette as modal to widget presses
+/// (it passes `dialog || command_palette` as [`route_widget_pointer`]'s
+/// `modal_open`, the same as for the gallery and the Layers controls), so
+/// while the palette is open a press or drag on a panel's scrollbar does
+/// nothing, though the wheel over the same panel scrolls it. Kept as is:
+/// the wheel is the 0.145.0 behaviour, and the bar follows every other
+/// widget press.
 #[must_use]
 fn wheel_target(
     workspace: &aurora_ui::Workspace,
@@ -7125,9 +7290,13 @@ fn wheel_target(
     if pointer_owned {
         return WheelTarget::Nothing;
     }
-    workspace
-        .tree
-        .scroll_container_at(position)
+    let tree = &workspace.tree;
+    tree.scroll_container_at(position)
+        .or_else(|| {
+            tree.hit_test(position)
+                .and_then(|hit| aurora_widgets::widgets::scrollbar_target(tree, hit))
+                .filter(|&body| tree.scroll_range(body).is_some_and(|range| range > 0.0))
+        })
         .map_or(WheelTarget::Nothing, WheelTarget::Panel)
 }
 
@@ -17409,6 +17578,7 @@ impl App {
                 tool: self.tool,
                 tool_settings: &mut self.tool_settings,
                 tool_controls: self.tool_controls,
+                scroll_follow: &mut self.scroll_follow,
             },
             request,
         );
@@ -17479,7 +17649,8 @@ impl App {
             match owner {
                 WidgetOwner::LayerControls => self.apply_layer_control(&outcome),
                 WidgetOwner::ToolControls => self.apply_tool_control(&outcome),
-                WidgetOwner::Gallery => {}
+                // A linked panel bar is never focused, so no key reaches it.
+                WidgetOwner::Gallery | WidgetOwner::PanelScrollbar => {}
             }
             self.relayout_after_gallery();
             return;
@@ -19261,8 +19432,12 @@ impl App {
                 ),
             ),
             WheelTarget::Panel(container) => {
-                if scroll_panel(
+                if wheel_scroll_panel(
                     &mut self.workspace.tree,
+                    &mut self.focus,
+                    self.gallery.as_mut(),
+                    self.layer_controls.controls.as_ref(),
+                    &mut self.scroll_follow,
                     container,
                     delta,
                     self.scale_factor,
@@ -19453,6 +19628,14 @@ impl App {
             position,
             self.modifiers,
             hit,
+        );
+        panel_bar_scrolled(
+            &mut self.workspace.tree,
+            &mut self.focus,
+            self.gallery.as_mut(),
+            controls.as_ref(),
+            &mut self.scroll_follow,
+            &routed,
         );
         if routed.owner == Some(WidgetOwner::LayerControls)
             && let Some(outcome) = routed.outcome.as_ref()
@@ -21679,6 +21862,7 @@ mod tests {
                         tool: self.tool,
                         tool_settings: &mut self.tool_settings,
                         tool_controls: self.tool_controls,
+                        scroll_follow: &mut crate::ScrollFollow::default(),
                     },
                     request,
                 );
@@ -21703,6 +21887,74 @@ mod tests {
                     None => unreachable!("the gallery opened"),
                 }
             }
+        }
+
+        /// 0.146.0: an assistive technology's value actions on a docked
+        /// panel's bar really scroll its body (the same `handle_action`
+        /// path sliders use), and a scroll closes an open dropdown list.
+        #[test]
+        fn an_at_set_value_on_the_layers_bar_scrolls_its_body_and_closes_the_blend_list() {
+            let mut layers = aurora_doc::LayerTree::new();
+            let mut active = None;
+            for i in 0..200 {
+                match layers.add_pixel_layer(format!("Layer {i}"), layer_bounds(), None) {
+                    Ok(id) => active = Some(id),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                active,
+            );
+            aurora_widgets::compute_text_layout(&mut state.workspace.tree, WIDTH, HEIGHT, None);
+            let bar = state.workspace.layers.scrollbar;
+            let body = state.workspace.layers.body;
+            assert!(
+                state
+                    .workspace
+                    .tree
+                    .scroll_range(body)
+                    .is_some_and(|r| r > 100.0)
+            );
+            let Some(controls) = state.layer_controls.controls else {
+                unreachable!("built in `new`");
+            };
+            if let Err(err) = aurora_widgets::widgets::set_dropdown_open(
+                &mut state.workspace.tree,
+                controls.blend,
+                true,
+            ) {
+                unreachable!("{err:?}");
+            }
+            let mut request = a11y_request(bar, accesskit::Action::SetValue);
+            request.data = Some(accesskit::ActionData::NumericValue(100.0));
+            let effects = state.act(&request);
+            assert_eq!(effects, BOTH);
+            assert_eq!(state.workspace.tree.scroll_y(body), Some(100.0));
+            assert!(
+                !aurora_widgets::widgets::dropdown_state(&state.workspace.tree, controls.blend)
+                    .is_ok_and(aurora_widgets::widgets::DropdownState::is_open),
+                "the scroll closed the open list"
+            );
+            let _ = state.act(&a11y_request(bar, accesskit::Action::Increment));
+            assert!(
+                state
+                    .workspace
+                    .tree
+                    .scroll_y(body)
+                    .is_some_and(|y| y > 100.0)
+            );
+            let _ = state.act(&a11y_request(bar, accesskit::Action::Decrement));
+            // Back to 100 up to the f32 offset's rounding of the f64 step;
+            // layout applies whole pixels, so nothing on screen differs.
+            assert!(
+                state
+                    .workspace
+                    .tree
+                    .scroll_y(body)
+                    .is_some_and(|y| (y - 100.0).abs() < 0.01)
+            );
         }
 
         /// Critic C1: an assistive technology's `Click` on the gallery's
@@ -56713,6 +56965,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
             );
@@ -56959,6 +57212,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
             );
@@ -57019,6 +57273,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
             );
@@ -58066,6 +58321,597 @@ mod panel_scroll_tests {
             wheel_target(&workspace, point, false, true),
             WheelTarget::Nothing
         );
+    }
+
+    // -- the visible panel scrollbar (0.146.0) --
+
+    /// [`crowded`], laid out through the app's own `layout_workspace` —
+    /// the text-aware path that syncs every linked panel bar.
+    fn laid(
+        count: usize,
+    ) -> (
+        aurora_ui::Workspace,
+        HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+    ) {
+        let (mut workspace, _, rows) = crowded(count);
+        relayout(&mut workspace);
+        (workspace, rows)
+    }
+
+    fn relayout(workspace: &mut aurora_ui::Workspace) {
+        let scales = crate::test_workspace_scales();
+        crate::layout_workspace(workspace, None, &scales, 1.0, 1000.0, 400.0);
+    }
+
+    fn rect(workspace: &aurora_ui::Workspace, id: aurora_widgets::WidgetId) -> aurora_core::Rect {
+        match workspace.tree.bounds(id) {
+            Some(rect) => rect,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    fn bar_state(workspace: &aurora_ui::Workspace) -> aurora_widgets::widgets::ScrollbarState {
+        match workspace.tree.payload(workspace.layers.scrollbar) {
+            Some(aurora_widgets::widgets::WidgetKind::Scrollbar(state)) => state.clone(),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// One primary-button event through the app's real widget pointer
+    /// router, with nothing else app-owned open.
+    fn pointer(
+        workspace: &mut aurora_ui::Workspace,
+        focus: &mut crate::FocusManager,
+        click: &mut crate::ClickTracker,
+        phase: crate::PointerPhase,
+        position: (f32, f32),
+    ) -> crate::WidgetPointer {
+        let scales = crate::test_workspace_scales();
+        crate::route_widget_pointer(
+            workspace,
+            focus,
+            &mut None,
+            None,
+            None,
+            click,
+            &scales,
+            false,
+            phase,
+            position,
+            crate::Modifiers::none(),
+            &mut crate::NoTextHit,
+        )
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn point_in(rect: aurora_core::Rect, fx: f32, fy: f32) -> (f32, f32) {
+        (
+            rect.x as f32 + fx * rect.width as f32,
+            rect.y as f32 + fy * rect.height as f32,
+        )
+    }
+
+    #[test]
+    fn a_panel_whose_content_fits_shows_no_bar_and_gives_it_no_width() {
+        let (workspace, _) = laid(1);
+        for panel in [workspace.layers, workspace.properties, workspace.history] {
+            assert_eq!(workspace.tree.scroll_range(panel.body), Some(0.0));
+            assert_eq!(rect(&workspace, panel.scrollbar).width, 0);
+            assert_eq!(
+                rect(&workspace, panel.body).width,
+                rect(&workspace, panel.viewport).width,
+                "the body takes the whole width"
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_the_layers_thumb_scrolls_the_body_and_the_bar_stays_put() {
+        let (mut workspace, rows) = laid(200);
+        let bar = rect(&workspace, workspace.layers.scrollbar);
+        assert!(bar.width > 0, "a crowded Layers panel shows its bar");
+        let range = workspace
+            .tree
+            .scroll_range(workspace.layers.body)
+            .unwrap_or(0.0);
+        assert!(range > 0.0);
+        let Some((&first_row, _)) = rows.iter().min_by_key(|&(&id, _)| rect(&workspace, id).y)
+        else {
+            unreachable!("200 rows");
+        };
+        let row_top = rect(&workspace, first_row).y;
+        let state = bar_state(&workspace);
+        let (_, top, _, thumb) = aurora_widgets_thumb(&state, bar);
+        let mut focus = crate::FocusManager::default();
+        let mut click = crate::ClickTracker::default();
+        #[allow(clippy::cast_precision_loss)]
+        let x = bar.x as f32 + 1.0;
+        let grab = (x, top + thumb / 2.0);
+        let down = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Down,
+            grab,
+        );
+        assert_eq!(down.owner, Some(crate::WidgetOwner::PanelScrollbar));
+        assert_eq!(
+            workspace.tree.scroll_y(workspace.layers.body),
+            Some(0.0),
+            "a press on the thumb centre keeps it"
+        );
+        let moved = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Move,
+            (x, grab.1 + 100.0),
+        );
+        assert!(matches!(
+            moved.outcome,
+            Some(aurora_widgets::PointerOutcome::Action(
+                aurora_widgets::ActionOutcome::ValueChanged { .. }
+            ))
+        ));
+        let scrolled = workspace
+            .tree
+            .scroll_y(workspace.layers.body)
+            .unwrap_or(0.0);
+        assert!(scrolled > 0.0, "the drag scrolled the body: {scrolled}");
+        #[allow(clippy::cast_possible_truncation)]
+        let shift = scrolled.round() as i64;
+        assert_eq!(
+            rect(&workspace, first_row).y,
+            row_top - shift,
+            "the rows moved"
+        );
+        let _ = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Up,
+            (x, grab.1 + 100.0),
+        );
+        relayout(&mut workspace);
+        assert_eq!(
+            rect(&workspace, workspace.layers.scrollbar),
+            bar,
+            "the bar never scrolls"
+        );
+        assert!((bar_state(&workspace).value - f64::from(scrolled)).abs() < 1e-6);
+        assert_eq!(focus.focused(), None, "the bar takes no focus");
+    }
+
+    #[test]
+    fn a_press_on_the_layers_track_jumps_the_body_there() {
+        let (mut workspace, _) = laid(200);
+        let bar = rect(&workspace, workspace.layers.scrollbar);
+        let range = workspace
+            .tree
+            .scroll_range(workspace.layers.body)
+            .unwrap_or(0.0);
+        let mut focus = crate::FocusManager::default();
+        let mut click = crate::ClickTracker::default();
+        let bottom = point_in(bar, 0.5, 0.999);
+        let _ = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Down,
+            bottom,
+        );
+        let _ = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Up,
+            bottom,
+        );
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(range));
+    }
+
+    #[test]
+    fn a_wheel_moves_the_thumb_and_a_wheel_over_the_bar_scrolls_its_body() {
+        let (mut workspace, _) = laid(200);
+        let bar = rect(&workspace, workspace.layers.scrollbar);
+        let before = aurora_widgets_thumb(&bar_state(&workspace), bar).1;
+        let scales = crate::test_workspace_scales();
+        let point = inside_layers_body(&workspace);
+        let WheelTarget::Panel(body) = wheel_target(&workspace, point, false, false) else {
+            unreachable!("over a crowded body");
+        };
+        assert!(scroll_panel(
+            &mut workspace.tree,
+            body,
+            MouseScrollDelta::LineDelta(0.0, -5.0),
+            1.0,
+            &scales
+        ));
+        relayout(&mut workspace);
+        let scrolled = workspace
+            .tree
+            .scroll_y(workspace.layers.body)
+            .unwrap_or(0.0);
+        let state = bar_state(&workspace);
+        assert!(
+            (state.value - f64::from(scrolled)).abs() < 1e-6,
+            "{} vs {scrolled}",
+            state.value
+        );
+        let after = aurora_widgets_thumb(&state, bar).1;
+        assert!(after > before, "the thumb moved down: {before} -> {after}");
+        assert_eq!(
+            wheel_target(&workspace, point_in(bar, 0.5, 0.5), false, false),
+            WheelTarget::Panel(workspace.layers.body),
+            "a wheel over the bar scrolls the body it is linked to"
+        );
+    }
+
+    #[test]
+    fn rows_stay_clickable_across_their_full_width_up_to_the_bar() {
+        let (workspace, rows) = laid(200);
+        let bar = rect(&workspace, workspace.layers.scrollbar);
+        let body = rect(&workspace, workspace.layers.body);
+        assert_eq!(body.right(), bar.x, "the body ends where the bar starts");
+        let Some((&row, _)) = rows.iter().min_by_key(|&(&id, _)| rect(&workspace, id).y) else {
+            unreachable!("200 rows");
+        };
+        let row_box = rect(&workspace, row);
+        assert_eq!(row_box.right(), bar.x, "a row is the body's full width");
+        #[allow(clippy::cast_precision_loss)]
+        let (left, right, y) = (
+            row_box.x as f32 + 1.0,
+            row_box.right() as f32 - 1.0,
+            row_box.y as f32 + 2.0,
+        );
+        for x in [left, right] {
+            let hit = workspace.tree.hit_test((x, y));
+            assert!(
+                hit.is_some_and(|hit| workspace.tree.is_within(row, hit)),
+                "x = {x}: {hit:?}"
+            );
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let on_bar = (bar.x as f32 + 1.0, y);
+        assert_eq!(
+            workspace.tree.hit_test(on_bar),
+            Some(workspace.layers.scrollbar)
+        );
+    }
+
+    /// 0.145.0 review follow-up: an open dropdown list used to stay
+    /// logically open while its panel scrolled its owner out of view.
+    #[test]
+    fn scrolling_a_panel_by_wheel_or_bar_closes_an_open_blend_mode_list() {
+        let (mut workspace, layers, rows) = crowded(200);
+        let scales = crate::test_workspace_scales();
+        let controls = match aurora_ui::insert_layer_controls(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+        ) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let state = crate::LayerControlsState {
+            controls: Some(controls),
+            ..crate::LayerControlsState::default()
+        };
+        let active = rows.values().next().copied();
+        let _ = crate::sync_layer_controls(&mut workspace, &state, &layers, active, None);
+        relayout(&mut workspace);
+        let is_open = |workspace: &aurora_ui::Workspace| {
+            aurora_widgets::widgets::dropdown_state(&workspace.tree, controls.blend)
+                .is_ok_and(aurora_widgets::widgets::DropdownState::is_open)
+        };
+        let open = |workspace: &mut aurora_ui::Workspace| {
+            if let Err(err) = aurora_widgets::widgets::set_dropdown_open(
+                &mut workspace.tree,
+                controls.blend,
+                true,
+            ) {
+                unreachable!("{err:?}");
+            }
+        };
+        let mut focus = crate::FocusManager::default();
+        let mut follow = ScrollFollow::default();
+        open(&mut workspace);
+        assert!(is_open(&workspace));
+        let body = workspace.layers.body;
+        // A wheel that moves nothing (already at the top) leaves it open.
+        assert!(!crate::wheel_scroll_panel(
+            &mut workspace.tree,
+            &mut focus,
+            None,
+            Some(&controls),
+            &mut follow,
+            body,
+            MouseScrollDelta::LineDelta(0.0, 3.0),
+            1.0,
+            &scales,
+        ));
+        assert!(is_open(&workspace), "nothing scrolled, nothing closed");
+        assert!(crate::wheel_scroll_panel(
+            &mut workspace.tree,
+            &mut focus,
+            None,
+            Some(&controls),
+            &mut follow,
+            body,
+            MouseScrollDelta::LineDelta(0.0, -3.0),
+            1.0,
+            &scales,
+        ));
+        assert!(!is_open(&workspace), "a wheel scroll closed it");
+
+        open(&mut workspace);
+        relayout(&mut workspace);
+        let bar = rect(&workspace, workspace.layers.scrollbar);
+        let mut click = crate::ClickTracker::default();
+        let routed = pointer(
+            &mut workspace,
+            &mut focus,
+            &mut click,
+            crate::PointerPhase::Down,
+            point_in(bar, 0.5, 0.999),
+        );
+        // The router's own light dismiss is not in play here (no controls
+        // passed), so only the bar reaction can close it.
+        assert!(is_open(&workspace));
+        assert!(crate::panel_bar_scrolled(
+            &mut workspace.tree,
+            &mut focus,
+            None,
+            Some(&controls),
+            &mut follow,
+            &routed
+        ));
+        assert!(!is_open(&workspace), "a bar press closed it");
+    }
+
+    /// A crowded-enough Widget Gallery for review I-1: its body cut to
+    /// 60 px so it scrolls, the "Open menu" button scrolled into view and
+    /// clicked, so the menu is open with focus inside it, and a
+    /// [`ScrollFollow`] that has seen that focus.
+    #[allow(clippy::type_complexity)]
+    fn gallery_menu_open_in_a_scrolling_body() -> (
+        aurora_ui::Workspace,
+        HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+        crate::FocusManager,
+        Option<aurora_ui::GalleryPanel>,
+        crate::ClickTracker,
+        ScrollFollow,
+    ) {
+        let (mut workspace, rows) = laid(1);
+        let scales = crate::test_workspace_scales();
+        let mut focus = crate::FocusManager::default();
+        let mut gallery = None;
+        let mut click = crate::ClickTracker::default();
+        crate::toggle_gallery(
+            &mut workspace,
+            &mut focus,
+            &mut gallery,
+            &mut click,
+            &scales,
+        );
+        relayout(&mut workspace);
+        let Some(open) = gallery.as_ref() else {
+            unreachable!("the gallery opened");
+        };
+        let (root, body, button) = (open.panel.root, open.panel.body, open.menu_button);
+        let (root_box, body_box) = (rect(&workspace, root), rect(&workspace, body));
+        let Some(mut style) = workspace.tree.style(root).cloned() else {
+            unreachable!("inserted");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let cut = (body_box.y - root_box.y + 60) as f32;
+        style.size.height = taffy::style_helpers::length(cut);
+        if let Err(err) = workspace.tree.set_style(root, style) {
+            unreachable!("{err:?}");
+        }
+        relayout(&mut workspace);
+        assert!(workspace.tree.scroll_range(body).is_some_and(|r| r > 0.0));
+        assert!(workspace.tree.scroll_into_view(button));
+        relayout(&mut workspace);
+        let at = point_in(rect(&workspace, button), 0.5, 0.5);
+        for phase in [crate::PointerPhase::Down, crate::PointerPhase::Up] {
+            let _ = crate::route_gallery_pointer(
+                &mut workspace,
+                &mut focus,
+                &mut gallery,
+                &mut click,
+                &scales,
+                false,
+                phase,
+                at,
+            );
+        }
+        relayout(&mut workspace);
+        let Some(menu) = gallery.as_ref().and_then(|open| open.open_menu) else {
+            unreachable!("the click opened the menu");
+        };
+        assert!(
+            focus
+                .focused()
+                .is_some_and(|f| workspace.tree.is_within(menu, f))
+        );
+        let mut follow = ScrollFollow::default();
+        let _ = follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut follow,
+            focus.focused(),
+            None,
+        );
+        (workspace, rows, focus, gallery, click, follow)
+    }
+
+    fn opener_is_out_of_view(
+        workspace: &aurora_ui::Workspace,
+        body: aurora_widgets::WidgetId,
+        button: aurora_widgets::WidgetId,
+    ) -> bool {
+        rect(workspace, button).y < rect(workspace, body).y
+    }
+
+    /// Review I-1 (0.146.0): a wheel scroll that closes the gallery's menu
+    /// hands focus back to the menu's opener; `follow_scroll` must not
+    /// answer that focus change by scrolling the opener back into view.
+    #[test]
+    fn a_wheel_scroll_that_closes_the_gallery_menu_keeps_its_offset_after_layout() {
+        let (mut workspace, rows, mut focus, mut gallery, _, mut follow) =
+            gallery_menu_open_in_a_scrolling_body();
+        let scales = crate::test_workspace_scales();
+        let Some((body, button)) = gallery.as_ref().map(|g| (g.panel.body, g.menu_button)) else {
+            unreachable!("open");
+        };
+        assert!(crate::wheel_scroll_panel(
+            &mut workspace.tree,
+            &mut focus,
+            gallery.as_mut(),
+            None,
+            &mut follow,
+            body,
+            MouseScrollDelta::LineDelta(0.0, -20.0),
+            1.0,
+            &scales,
+        ));
+        assert_eq!(focus.focused(), Some(button), "the menu handed focus back");
+        let offset = workspace.tree.scroll_y(body);
+        relayout(&mut workspace);
+        assert!(opener_is_out_of_view(&workspace, body, button));
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut follow,
+            focus.focused(),
+            None
+        ));
+        assert_eq!(workspace.tree.scroll_y(body), offset, "the scroll is kept");
+    }
+
+    /// The same, for a press on the gallery panel's own bar: the router's
+    /// light dismiss closes the menu (focus back to its opener) before the
+    /// press scrolls, and the bar reaction records that focus.
+    #[test]
+    fn a_bar_press_that_light_dismisses_the_gallery_menu_keeps_its_offset_after_layout() {
+        let (mut workspace, rows, mut focus, mut gallery, mut click, mut follow) =
+            gallery_menu_open_in_a_scrolling_body();
+        let scales = crate::test_workspace_scales();
+        let Some((body, button, bar)) = gallery
+            .as_ref()
+            .map(|g| (g.panel.body, g.menu_button, g.panel.scrollbar))
+        else {
+            unreachable!("open");
+        };
+        let at = point_in(rect(&workspace, bar), 0.5, 0.999);
+        let routed = crate::route_gallery_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut gallery,
+            &mut click,
+            &scales,
+            false,
+            crate::PointerPhase::Down,
+            at,
+        );
+        assert!(routed.dismissed, "the press light-dismissed the menu");
+        assert_eq!(routed.owner, Some(crate::WidgetOwner::PanelScrollbar));
+        assert_eq!(focus.focused(), Some(button));
+        let _ = crate::panel_bar_scrolled(
+            &mut workspace.tree,
+            &mut focus,
+            gallery.as_mut(),
+            None,
+            &mut follow,
+            &routed,
+        );
+        let offset = workspace.tree.scroll_y(body);
+        relayout(&mut workspace);
+        assert!(opener_is_out_of_view(&workspace, body, button));
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut follow,
+            focus.focused(),
+            None
+        ));
+        assert_eq!(workspace.tree.scroll_y(body), offset, "the scroll is kept");
+    }
+
+    /// The palette is not modal to the wheel (documented on
+    /// `wheel_target`): with it open, the wheel still scrolls panels.
+    #[test]
+    fn the_command_palette_does_not_stop_the_wheel_scrolling_a_panel() {
+        let (workspace, _) = laid(200);
+        // `modal_open` is the dialog alone; the palette is never passed.
+        assert_eq!(
+            wheel_target(&workspace, inside_layers_body(&workspace), false, false),
+            WheelTarget::Panel(workspace.layers.body)
+        );
+    }
+
+    /// 0.145.0 review follow-up, end to end: an active-layer change while
+    /// Layers is collapsed no longer loses the saved offset.
+    #[test]
+    fn an_active_layer_change_while_layers_is_collapsed_keeps_its_offset() {
+        let (mut workspace, rows) = laid(200);
+        if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 300.0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) =
+            aurora_ui::set_panel_collapsed(&mut workspace.tree, workspace.layers, true)
+        {
+            unreachable!("{err:?}");
+        }
+        relayout(&mut workspace);
+        let Some((_, &first)) = rows.iter().min_by_key(|&(&id, _)| rect(&workspace, id).y) else {
+            unreachable!("200 rows");
+        };
+        let mut last = ScrollFollow::default();
+        let _ = follow_scroll(&mut workspace.tree, &rows, &mut last, None, Some(first));
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(300.0));
+        if let Err(err) =
+            aurora_ui::set_panel_collapsed(&mut workspace.tree, workspace.layers, false)
+        {
+            unreachable!("{err:?}");
+        }
+        relayout(&mut workspace);
+        assert_eq!(
+            workspace.tree.scroll_y(workspace.layers.body),
+            Some(300.0),
+            "expanded where it was"
+        );
+    }
+
+    /// `aurora_widgets::paint::scrollbar_thumb_rect` is crate-private;
+    /// the same proportional arithmetic, for a vertical bar.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn aurora_widgets_thumb(
+        state: &aurora_widgets::widgets::ScrollbarState,
+        bar: aurora_core::Rect,
+    ) -> (f32, f32, f32, f32) {
+        let track = f64::from(bar.height);
+        let span = (state.max - state.min) + state.page_size;
+        let thumb = if span > 0.0 {
+            track * state.page_size / span
+        } else {
+            track
+        }
+        .max(f64::from(bar.width))
+        .min(track);
+        let travel = track - thumb;
+        let fraction = if state.max > state.min {
+            (state.value - state.min) / (state.max - state.min)
+        } else {
+            0.0
+        };
+        (
+            bar.x as f32,
+            bar.y as f32 + (travel * fraction) as f32,
+            bar.width as f32,
+            thumb as f32,
+        )
     }
 
     #[test]
