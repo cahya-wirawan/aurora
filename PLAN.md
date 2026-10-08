@@ -26,7 +26,26 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.143.0): layers can be added and deleted.**
+**Latest (2026-10-08, 0.143.1): opening or saving a file never fails
+silently.** A real macOS session opened a `.psd` and nothing happened:
+`aurora_io::decode_by_extension` has no PSD reader, and `App::open_file`
+only logged. Every refused open — flat image or `.aur` — now raises a
+"Couldn't Open File" alert naming the file, the reason in plain language
+(an unsupported format lists what Aurora can open; missing/permission
+named; damaged files carry the decoder's own detail) and "Your current
+document has not changed."; every other refused save/export raises
+"Couldn't Save File" (a `.psd` export used to do nothing at all), while
+an incomplete composite keeps its own itemized dialog. **A real data-loss bug found on the
+way:** `aurora_io::read_aur`'s rollback forgets every tile it committed,
+and `App::open_aur_file` read straight into the live store, whose
+surface ids alias the incoming file's — so a damaged `.aur` erased tiles
+of the document left on screen. `.aur` opens now pre-check the bytes in a
+throwaway store first (`read_aur_for_open`). 10 new tests and 2 rewritten (2,625
+passing, `AURORA_REQUIRE_GPU=1`, RTX 3090). PSD reading itself is
+0.144.0. **Not yet verified on real hardware.** Details: M1.8's
+open-file bullet, "Update 0.143.1".
+
+**Previously (2026-10-08, 0.143.0): layers can be added and deleted.**
 New Layer (command palette, macOS Layer menu, `Ctrl+Shift+N`) inserts an
 empty, document-sized "Layer N" directly above the active node — above a
 group, never inside it — and selects it. Delete Layer (palette and menu;
@@ -41,7 +60,7 @@ one. 22 new tests (2,613 passing, `AURORA_REQUIRE_GPU=1`, RTX 3090), 14
 mutations all killed. **Not yet verified on real hardware**; Duplicate
 Layer is deferred. Details: M1.8's Layers-panel "Update 0.143.0".
 
-**Previously (2026-10-08, 0.142.0): the Layers panel is recognisable.** A
+**Before that (2026-10-08, 0.142.0): the Layers panel is recognisable.** A
 real macOS screenshot had shown the Layers panel as an unlabelled strip
 with no highlighted row, and the Properties readout cut mid-word ("No
 radius for Marque"). Three fixes. (1) The active layer's row is
@@ -8548,6 +8567,65 @@ structural design work.
   becomes exactly one pixel layer, matching what a flat image actually
   is); and everything else this bullet's own "still `[~]`" paragraph
   below already names.
+
+  **Update 0.143.1 — a refused open or save is shown, not just logged.**
+  Opening a `.psd` on real macOS did nothing visible: `open_image`
+  returned `None` and every other refusal on both open routes was a
+  `tracing::warn!` and a bare `return`. Now `open_image` returns
+  `Result<Image, OpenFailure>` (`Read`/`Decode`/`Aur`/`AurAfterCheck`/
+  `NoTileStorage`), and `App::report_open_failure` opens a
+  single-"OK" "Couldn't Open File" alert (`open_open_failed_dialog`,
+  relayout + accessibility push, logged in full if the modal slot is
+  taken) with `open_failure_message`: the sanitized file name
+  (`display_file_name` → `aurora_doc::sanitize_display_name`), the reason
+  in plain language, sanitized error details, and — every case but one —
+  "Your current document has not changed." Saves get the same treatment
+  (`SaveFailure::Encode`/`Write`, "Couldn't Save File", "Nothing was
+  saved, and any existing file with that name is unchanged.") for an
+  unsupported extension or encoder error and for every
+  write/verify/rename failure on both the flat and `.aur` paths; the
+  incomplete-composite refusal keeps its own itemized dialog.
+  **The `read_aur` partial-write check found a real bug.** `read_aur`
+  commits tiles as it decodes and, on a later failure, *forgets* every
+  one it committed (0.71.2); its doc comment called that safe because
+  "`aurora-app` never ... merge[s] one into a live document". But
+  `open_aur_file` read straight into the live store, and both documents'
+  surface ids restart from zero, so a damaged `.aur` overwrote and then
+  erased the current document's tiles on every shared surface — while
+  the open was refused. Pinned by
+  `a_damaged_aur_read_straight_into_a_live_store_erases_the_current_documents_tiles`
+  and fixed by `read_aur_for_open`: the same in-memory bytes are read
+  into a throwaway store first (`aur_scratch_store`, shared with
+  `verify_aur`), and the live store is touched only if that succeeds;
+  `load_scales` moved ahead of the read. Cost: every tile decoded twice
+  and the whole file held in memory. If the live read still fails after
+  a clean pre-check (scratch disk failing), the message
+  (`AurAfterCheck`) says the current document may have lost pixels
+  instead of promising it is unchanged. 12 tests (two replacing the old
+  `open_image_returns_none_*` pair). Mutations: 7 seam mutations killed
+  (dialog never opened; "has not changed" dropped; pre-check skipped;
+  `AurAfterCheck` claiming "unchanged"; name not sanitized; PSD name
+  dropped; save sentence dropped); 3 call-site mutations **survive**
+  (deleting `report_open_failure` from `open_file` or `read_chosen_aur`,
+  or `report_save_failure` from the encode branch) — a real `App` needs
+  an event loop, so the wiring is covered by inspection, as the
+  export-refusal wiring already was. Still log-only: a `load_scales`/
+  `replace_document` failure after the read (no dialog without scales; on
+  the `.aur` route the live store has already been written by then). The
+  `.aur` route still leaks the
+  outgoing document's tiles outside the incoming grids (0.82.1, unchanged).
+  **Needs a human:** open a `.psd`, a damaged PNG and a missing file on
+  real macOS, export to `.psd`, and hear the alert from a screen reader.
+  **Review revision (0.143.1, same version):** a judge (REVISE 0.895)
+  found the last silent export path — `composite_document` failing with
+  anything other than `IncompleteComposite` only logged — and the
+  no-live-tile-store export, both now shown through new
+  `SaveFailure::Composite` / `SaveFailure::NoTileStorage` variants (the
+  itemized incomplete-composite wording stays its own); the message test
+  covers both, and the call sites are inspection-only like the rest of
+  `App`'s wiring. Before that revision the full gate was green on the RTX
+  3090 with `AURORA_REQUIRE_GPU=1` (2,625 passed, 0 failed, 0 skipped;
+  doctests, strict rustdoc, `cargo deny` clean).
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -29946,6 +30024,16 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.143.1) — never fail silently when opening a
+file.** Patch for the real-macOS `.psd` report: refused opens and saves
+now raise an alert dialog, and a damaged `.aur` can no longer erase
+tiles of the open document (`read_aur_for_open` pre-checks in a
+throwaway store). Full account: M1.8's open-file bullet, "Update
+0.143.1". **Needs a human:** the alert on real macOS (open a `.psd`, a
+damaged PNG, a missing file; export to `.psd`) and a screen reader
+announcing it. **Suggested next (0.144.0):** PSD/PSB layered read
+(8/16-bit RGB) behind the same dialog.
 
 **Addendum 2026-10-08 (0.143.0) — New Layer / Delete Layer.** Done as
 0.142.0's addendum suggested, with one refinement: rows are rebuilt after

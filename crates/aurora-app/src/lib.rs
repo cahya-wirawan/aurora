@@ -784,24 +784,25 @@ fn document_from_image(
 
 /// Reads `path` from disk and decodes it via
 /// `aurora_io::decode_by_extension` — the real "open a file" read+decode
-/// step. `None` on any real failure (I/O, decode, unrecognised
-/// extension), logged as a warning rather than propagated: a bad chosen
+/// step. An [`OpenFailure`] on any real failure (I/O, decode,
+/// unrecognised extension), logged as a warning and handed back for
+/// [`App::open_file`] to show ([`open_failure_message`]): a bad chosen
 /// file must never crash or leave `App` in a half-updated state, the
-/// same honesty [`recover_document`] already applies to a bad autosave.
-#[must_use]
-fn open_image(path: &Path) -> Option<aurora_io::Image> {
+/// same honesty [`recover_document`] already applies to a bad autosave —
+/// and, since 0.143.1, it must not fail *silently* either.
+fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
-            return None;
+            return Err(OpenFailure::Read(err));
         }
     };
     match aurora_io::decode_by_extension(path, &bytes) {
-        Ok(image) => Some(image),
+        Ok(image) => Ok(image),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "failed to decode the chosen file");
-            None
+            Err(OpenFailure::Decode(err))
         }
     }
 }
@@ -1075,19 +1076,8 @@ fn verify_aur(path: &Path) -> bool {
         tracing::warn!(path = %path.display(), "failed to reopen the exported .aur file to verify it");
         return false;
     };
-    let Some(budget) = std::num::NonZeroUsize::new(16) else {
-        unreachable!("16 is non-zero");
-    };
-    let Some(scratch_dir) = aur_verify_scratch_dir() else {
-        tracing::warn!("no scratch directory for the .aur verification store");
+    let Some((_scratch_dir, mut store)) = aur_scratch_store() else {
         return false;
-    };
-    let mut store = match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
-        Ok(store) => store,
-        Err(err) => {
-            tracing::warn!(?err, "failed to open the .aur verification scratch store");
-            return false;
-        }
     };
     match aurora_io::read_aur(file, &mut store) {
         Ok(_) => true,
@@ -1096,6 +1086,70 @@ fn verify_aur(path: &Path) -> bool {
             false
         }
     }
+}
+
+/// A throwaway `aurora_tile::TileStore` for reading a `.aur` container
+/// somewhere that is *not* the live document's store — [`verify_aur`]'s
+/// read-back and [`read_aur_for_open`]'s pre-check. The returned
+/// `TempDir` owns the store's scratch files: keep it alive as long as
+/// the store, drop both together. `None` (logged) if either could not be
+/// created.
+fn aur_scratch_store() -> Option<(tempfile::TempDir, aurora_tile::TileStore)> {
+    let Some(budget) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("16 is non-zero");
+    };
+    let Some(scratch_dir) = aur_verify_scratch_dir() else {
+        tracing::warn!("no scratch directory for a throwaway .aur read store");
+        return None;
+    };
+    match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
+        Ok(store) => Some((scratch_dir, store)),
+        Err(err) => {
+            tracing::warn!(?err, "failed to open a throwaway .aur read store");
+            None
+        }
+    }
+}
+
+/// Reads a chosen `.aur` file's `bytes` into the **live** `store`, but
+/// only after the very same bytes have been read successfully into a
+/// throwaway one ([`aur_scratch_store`]) — [`App::open_aur_file`]'s own
+/// read step since 0.143.1.
+///
+/// **Why the pre-check exists (found in 0.143.1).** `aurora_io::read_aur`
+/// writes tiles into the store it is given as it decodes them, and on a
+/// failure part-way through it rolls back by *forgetting* every tile it
+/// had committed (0.71.2). Its own doc comment calls that safe because
+/// "`aurora-app` never ... merge one into a live document" — but
+/// `App::open_aur_file` reads straight into the live store while the
+/// current document is still in it, and both documents' surface ids
+/// derive from `LayerId`s that restart at zero. So a damaged `.aur` whose
+/// early tile entries decode and whose later one does not first
+/// overwrote, then deleted, the *current* document's tiles on every
+/// surface they share — a refused open that silently erased pixels of
+/// the document it claimed to leave alone. Pinned by
+/// `a_damaged_aur_read_straight_into_a_live_store_erases_the_current_documents_tiles`,
+/// and closed here by refusing before the live store is touched:
+/// `read_aur` is a pure function of its bytes and the store it writes,
+/// so bytes that read cleanly once read cleanly again — barring the
+/// store itself failing, which is [`OpenFailure::AurAfterCheck`].
+///
+/// The cost is decoding every tile twice (the pre-check pages them to
+/// its own scratch directory, under a 16-tile memory budget) and holding
+/// the whole file in memory, as the flat-image path already does.
+fn read_aur_for_open(
+    bytes: &[u8],
+    store: &mut aurora_tile::TileStore,
+) -> Result<aurora_io::AurDocument, OpenFailure> {
+    {
+        let Some((_scratch_dir, mut scratch)) = aur_scratch_store() else {
+            return Err(OpenFailure::NoTileStorage);
+        };
+        aurora_io::read_aur(std::io::Cursor::new(bytes), &mut scratch).map_err(OpenFailure::Aur)?;
+        // `scratch` and its directory drop here, before the live read
+        // starts, so the two never hold the file's tiles at once.
+    }
+    aurora_io::read_aur(std::io::Cursor::new(bytes), store).map_err(OpenFailure::AurAfterCheck)
 }
 
 /// Clears and repopulates `workspace`'s Layers/History/Properties panels
@@ -2270,6 +2324,305 @@ fn incomplete_composite_message(skipped: usize, first: &str) -> String {
          document, so the exported image would have been missing content. The first failure was: \
          {first}. Any existing file at that path is unchanged."
     )
+}
+
+/// Why an open was refused — [`App::open_file`]'s and
+/// [`App::open_aur_file`]'s own failure value, carried to
+/// [`open_failure_message`] so the user is told what happened instead
+/// of nothing at all (0.143.1).
+///
+/// Until 0.143.1 every one of these was a `tracing::warn!` and a bare
+/// `return`: choosing a file Aurora cannot read — a `.psd`, on real
+/// macOS hardware — closed the file picker and changed nothing on
+/// screen, which reads exactly like the app ignoring the click.
+#[derive(Debug)]
+enum OpenFailure {
+    /// The file could not be read from disk at all (missing, permission
+    /// denied, a device error).
+    Read(std::io::Error),
+    /// A flat image (`aurora_io::decode_by_extension`) refused it — an
+    /// unrecognised extension (`IoError::UnsupportedExtension`, which is
+    /// where a `.psd` lands today) or a file that does not decode as the
+    /// format its extension names.
+    Decode(aurora_io::IoError),
+    /// A `.aur` document refused it during [`read_aur_for_open`]'s own
+    /// throwaway pre-check, **before the live tile store was touched**.
+    Aur(aurora_io::IoError),
+    /// A `.aur` document passed that pre-check and then failed anyway
+    /// while being read into the live tile store (a scratch-disk write
+    /// failing mid-read, say). The one case where "your current document
+    /// has not changed" cannot be promised: `aurora_io::read_aur`'s own
+    /// rollback drops every tile it committed, and on surface ids the
+    /// current document shares (both restart from zero) some of those
+    /// were the current document's own. Said plainly in the message
+    /// rather than papered over.
+    AurAfterCheck(aurora_io::IoError),
+    /// There is nowhere to read a `.aur` document's tiles into: no live
+    /// tile store this session, or no scratch store for the pre-check.
+    NoTileStorage,
+}
+
+/// The sentence every refused open ends with — except
+/// [`OpenFailure::AurAfterCheck`], the one case that cannot honestly
+/// say it. Shared so a test can pin both halves of that rule.
+const OPEN_FAILED_UNCHANGED: &str = "Your current document has not changed.";
+
+/// The refused-open dialog's own title. Fixed, deliberately: the
+/// dialog's title is one row ([`insert_dialog`]), so the file name —
+/// arbitrary length — goes in the message, which wraps.
+const OPEN_FAILED_TITLE: &str = "Couldn't Open File";
+
+const OPEN_FAILED_DISMISS: &str = "open.failed.dismiss";
+
+/// The refused-open dialog's own action — a single "OK", for the same
+/// reason [`export_refused_dialog_actions`] has one: the open already
+/// failed and nothing changed, so acknowledging is the whole
+/// interaction.
+fn open_failed_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(OPEN_FAILED_DISMISS, "OK")]
+}
+
+/// The formats this build opens, in the words a user knows them by —
+/// the one list every "can't open that kind of file" message names.
+/// Kept next to [`open_failure_message`] rather than derived from
+/// `aurora_io`, because that crate dispatches on extensions, not names.
+const OPENABLE_FORMATS: &str = "PNG, JPEG, TIFF and Aurora documents (.aur)";
+
+/// The formats this build saves — [`save_failure_message`]'s own
+/// counterpart to [`OPENABLE_FORMATS`]. The same set today.
+const SAVEABLE_FORMATS: &str = "PNG, JPEG, TIFF or Aurora document (.aur)";
+
+/// `path`'s own file name for a dialog message, made safe to show.
+///
+/// The name is **outside text** — a file name can carry control and
+/// bidi-formatting characters, and it is heading for a rendered label
+/// and an `accesskit` announcement — so it goes through
+/// `aurora_doc::sanitize_display_name`, the same treatment layer names
+/// and [`skipped_tiles_message`]'s file-controlled reasons get. Falls
+/// back to the whole path for one with no file name component.
+fn display_file_name(path: &Path) -> String {
+    let raw = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    aurora_doc::sanitize_display_name(&raw).into_owned()
+}
+
+/// What a user would call a file with this (lower-cased) extension, for
+/// a "this isn't a valid ..." sentence. `None` for one this build has no
+/// name for.
+fn format_name_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "png" => Some("PNG"),
+        "jpg" | "jpeg" => Some("JPEG"),
+        "tif" | "tiff" => Some("TIFF"),
+        "aur" => Some("Aurora document"),
+        "psd" => Some("Photoshop (PSD)"),
+        "psb" => Some("Photoshop Large Document (PSB)"),
+        _ => None,
+    }
+}
+
+/// An error's own text, made safe and short enough to show — decoder
+/// messages can quote bytes out of the file being opened, so they get
+/// the same sanitizing-and-capping [`display_file_name`] gives names.
+fn display_error_detail(err: &dyn std::fmt::Display) -> String {
+    aurora_doc::sanitize_display_name(&err.to_string()).into_owned()
+}
+
+/// Which way a file is going, for the wording the two directions share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileDirection {
+    Open,
+    Save,
+}
+
+/// The clause naming why an extension this build cannot handle was
+/// refused, for both directions — the text after "Aurora can't open
+/// "name": " in [`open_failure_message`] and its save counterpart.
+fn unsupported_extension_clause(extension: &str, direction: FileDirection) -> String {
+    if extension.is_empty() {
+        return match direction {
+            FileDirection::Open => {
+                "it has no file extension, so Aurora can't tell what kind of file it is".to_owned()
+            }
+            FileDirection::Save => {
+                "it has no file extension, so Aurora can't tell which format to use".to_owned()
+            }
+        };
+    }
+    let verb = match direction {
+        FileDirection::Open => "read",
+        FileDirection::Save => "write",
+    };
+    match format_name_for_extension(extension) {
+        Some(format) => format!("this version can't {verb} {format} files yet"),
+        None => format!(
+            "Aurora doesn't recognise the \".{}\" file type",
+            display_error_detail(&extension)
+        ),
+    }
+}
+
+/// The plain-language message for a refused open — what the user sees
+/// in the [`OPEN_FAILED_TITLE`] dialog.
+///
+/// Every message names the file, says what went wrong in terms a user
+/// can act on (a format to convert to, a file that moved, a permission
+/// to grant), carries the underlying error's own text as `Details:`
+/// where there is one, and ends with [`OPEN_FAILED_UNCHANGED`] — the
+/// single most important fact after a failed open. The one exception is
+/// [`OpenFailure::AurAfterCheck`], which says instead what it cannot
+/// promise.
+fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure) -> String {
+    let body = match failure {
+        OpenFailure::Read(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "Aurora couldn't find \"{file_name}\". It may have been moved, renamed or deleted."
+            ),
+            std::io::ErrorKind::PermissionDenied => {
+                format!("Aurora doesn't have permission to read \"{file_name}\".")
+            }
+            _ => format!(
+                "Aurora couldn't read \"{file_name}\". Details: {}.",
+                display_error_detail(err)
+            ),
+        },
+        OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext)) => format!(
+            "Aurora can't open \"{file_name}\": {}. It can open {OPENABLE_FORMATS}.",
+            unsupported_extension_clause(ext, FileDirection::Open)
+        ),
+        OpenFailure::Decode(
+            err @ (aurora_io::IoError::UnexpectedColorType(_)
+            | aurora_io::IoError::UnexpectedJpegColorSpace(_)
+            | aurora_io::IoError::UnsupportedTiffColorType(_)
+            | aurora_io::IoError::UnsupportedTiffSampleFormat(_)),
+        ) => format!(
+            "\"{file_name}\" uses a kind of {} that Aurora can't open yet. Details: {}.",
+            format_name_for_extension(extension).unwrap_or("image"),
+            display_error_detail(err)
+        ),
+        OpenFailure::Decode(err) => format!(
+            "\"{file_name}\" isn't a valid {} file, or it is damaged. Details: {}.",
+            format_name_for_extension(extension).unwrap_or("image"),
+            display_error_detail(err)
+        ),
+        OpenFailure::Aur(err) => format!(
+            "\"{file_name}\" isn't a valid Aurora document, or it is damaged or was written by a \
+             newer version of Aurora. Details: {}.",
+            display_error_detail(err)
+        ),
+        OpenFailure::AurAfterCheck(err) => {
+            // Deliberately no `OPEN_FAILED_UNCHANGED`: see the variant.
+            return format!(
+                "\"{file_name}\" looked valid, but reading it into this session failed partway \
+                 through. Details: {}. Some of your current document's pixels may have been \
+                 cleared. Save it under a new name and check it before continuing.",
+                display_error_detail(err)
+            );
+        }
+        OpenFailure::NoTileStorage => format!(
+            "Aurora couldn't open \"{file_name}\" because this session has no storage for image \
+             data available."
+        ),
+    };
+    format!("{body} {OPEN_FAILED_UNCHANGED}")
+}
+
+/// Opens the refused-open dialog for `message` — [`open_dialog`] with
+/// [`OPEN_FAILED_TITLE`] and [`open_failed_dialog_actions`], and
+/// therefore a no-op (returning `false`) if a dialog is already open.
+/// The testable half of [`App::report_open_failure`], which adds the
+/// relayout, the announcement, and the log line for a suppressed one.
+fn open_open_failed_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    scales: &Scales,
+    message: &str,
+) -> bool {
+    open_dialog(
+        workspace,
+        focus,
+        dialog,
+        scales,
+        OPEN_FAILED_TITLE,
+        message,
+        open_failed_dialog_actions(),
+    )
+}
+
+/// Why a save or export was refused — [`App::save_file`]'s and
+/// [`App::save_aur_file`]'s own failure value for everything except
+/// the incomplete-composite refusal, which keeps its own itemized
+/// dialog ([`incomplete_composite_message`]).
+#[derive(Debug)]
+enum SaveFailure {
+    /// `aurora_io::encode_by_extension` refused — an extension this
+    /// build cannot write (`IoError::UnsupportedExtension`, where a
+    /// `.psd` lands today) or an encoder error (a JPEG past its own
+    /// dimension limit, say).
+    Encode(aurora_io::IoError),
+    /// Writing, verifying by reading back, or the final rename failed
+    /// ([`write_verified`]/[`App::save_aur_file`], or a save path with no
+    /// file name); each of those leaves
+    /// whatever was already at the path untouched and removes its own
+    /// temp file. The detailed cause is in the log.
+    Write,
+    /// The document's layers could not be combined into one image to
+    /// export (`composite_document` failed with anything other than the
+    /// itemized `IoError::IncompleteComposite`, which keeps its own
+    /// dialog). Nothing is written. 0.143.1 review: this was the last
+    /// silent export failure.
+    Composite(aurora_io::IoError),
+    /// This session has no live tile store, so there are no pixels to
+    /// export. Nothing is written.
+    NoTileStorage,
+}
+
+/// The refused-save dialog's own title.
+const SAVE_FAILED_TITLE: &str = "Couldn't Save File";
+
+const SAVE_FAILED_DISMISS: &str = "save.failed.dismiss";
+
+/// The refused-save dialog's own single "OK".
+fn save_failed_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(SAVE_FAILED_DISMISS, "OK")]
+}
+
+/// The sentence every refused save ends with: nothing was written, and
+/// whatever was already at that path is intact — both true on every
+/// path that produces a [`SaveFailure`].
+const SAVE_FAILED_UNCHANGED: &str =
+    "Nothing was saved, and any existing file with that name is unchanged.";
+
+/// The plain-language message for a refused save, ending with
+/// [`SAVE_FAILED_UNCHANGED`].
+fn save_failure_message(file_name: &str, failure: &SaveFailure) -> String {
+    let body = match failure {
+        SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension(ext)) => format!(
+            "Aurora can't save \"{file_name}\": {}. It can save as {SAVEABLE_FORMATS}.",
+            unsupported_extension_clause(ext, FileDirection::Save)
+        ),
+        SaveFailure::Encode(err) => format!(
+            "Aurora couldn't encode \"{file_name}\". Details: {}.",
+            display_error_detail(err)
+        ),
+        SaveFailure::Write => format!(
+            "Aurora couldn't write \"{file_name}\": creating the file, writing the document into \
+             it, or reading it back to check it failed. Aurora's log has the details."
+        ),
+        SaveFailure::Composite(err) => format!(
+            "Aurora couldn't export \"{file_name}\": the document's layers could not be combined \
+             into one image. Details: {}.",
+            display_error_detail(err)
+        ),
+        SaveFailure::NoTileStorage => format!(
+            "Aurora couldn't export \"{file_name}\": this session has no storage for image data, \
+             so there are no pixels to save."
+        ),
+    };
+    format!("{body} {SAVE_FAILED_UNCHANGED}")
 }
 
 const SKIPPED_TILES_DISMISS: &str = "skipped.tiles.dismiss";
@@ -17039,7 +17392,15 @@ impl App {
     /// A read/decode failure (bad file, unrecognised extension) is
     /// logged and leaves the current document completely untouched —
     /// the same honesty [`recover_document`] already applies to a bad
-    /// autosave, extended here to a bad chosen file.
+    /// autosave, extended here to a bad chosen file — and, since
+    /// 0.143.1, is **shown** too ([`Self::report_open_failure`]): until
+    /// then it was log-only, so opening a `.psd` simply did nothing on
+    /// screen. A later `load_scales`/[`replace_document`] failure is
+    /// still log-only (there is no dialog to build without the scales).
+    /// The wiring itself is covered by inspection — a real `App` needs a
+    /// window and an event loop — while the message
+    /// ([`open_failure_message`]) and dialog
+    /// ([`open_open_failed_dialog`]) halves are unit-tested.
     ///
     /// Resets `canvas_view`/`selection`/`drag` to their own fresh-
     /// session defaults — a newly opened document has no relationship
@@ -17061,8 +17422,12 @@ impl App {
             self.open_aur_file(path);
             return;
         }
-        let Some(image) = open_image(path) else {
-            return;
+        let image = match open_image(path) {
+            Ok(image) => image,
+            Err(failure) => {
+                self.report_open_failure(path, &failure);
+                return;
+            }
         };
         let name = path
             .file_stem()
@@ -17204,10 +17569,15 @@ impl App {
     /// document-replacement shape [`Self::open_file`]'s own flat-image
     /// path uses ([`replace_document`], resetting
     /// `canvas_view`/`selection`/`drag`), just fed by a real document
-    /// reader instead of a single decoded image. A silent no-op
-    /// (logged) if there's no live tile store, the file fails to open,
-    /// or `read_aur` itself fails (corrupt file, missing manifest/
-    /// history entry, or an unsupported future schema version).
+    /// reader instead of a single decoded image. Refused — logged *and*
+    /// shown since 0.143.1 ([`Self::report_open_failure`]), silent before
+    /// — if there's no live tile store, the file fails to read, or
+    /// `read_aur` itself fails (corrupt file, missing manifest/history
+    /// entry, or an unsupported future schema version). That last read
+    /// goes through [`read_aur_for_open`], which checks the bytes in a
+    /// throwaway store first: before 0.143.1 a damaged file read straight
+    /// into the live store could erase tiles of the document it left
+    /// open (see that function).
     ///
     /// **Unlike [`Self::open_file`], this deliberately does not sweep
     /// the outgoing document** — no [`replace_document_pixels`], no
@@ -17222,38 +17592,10 @@ impl App {
     /// change rather than a patch here.
     fn open_aur_file(&mut self, path: &Path) {
         self.commit_layer_controls_drag();
-        let Some(store) = self.tile_store.as_mut() else {
-            tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
-            return;
-        };
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to open the chosen .aur file");
-                return;
-            }
-        };
-        // The profile (4th element) is a real, checked value now
-        // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
-        // crate yet tracks a "current document profile" to restore it
-        // into -- no colour-management UI exists to have set one in the
-        // first place, so every `.aur` file this app has ever written
-        // only ever carries `None` in practice. Discarded here rather
-        // than invented a field to hold, honestly, until that UI exists.
-        let document = match aurora_io::read_aur(file, store) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
-                return;
-            }
-        };
-        let aurora_io::AurDocument {
-            layers,
-            history,
-            canvas_size,
-            profile: _profile,
-            skipped_tiles,
-        } = document;
+        // Before the read, not after it as until 0.143.1: once the live
+        // read has succeeded the current document's aliased tiles are
+        // already overwritten, so every refusal that can still happen
+        // without a document to show for it belongs ahead of that point.
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
@@ -17261,6 +17603,23 @@ impl App {
                 return;
             }
         };
+        let Some(document) = self.read_chosen_aur(path) else {
+            return;
+        };
+        // The profile (`_profile`) is a real, checked value now
+        // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
+        // crate yet tracks a "current document profile" to restore it
+        // into -- no colour-management UI exists to have set one in the
+        // first place, so every `.aur` file this app has ever written
+        // only ever carries `None` in practice. Discarded here rather
+        // than invented a field to hold, honestly, until that UI exists.
+        let aurora_io::AurDocument {
+            layers,
+            history,
+            canvas_size,
+            profile: _profile,
+            skipped_tiles,
+        } = document;
         let (layer_rows, active_layer) = match replace_document(
             &mut self.workspace,
             &scales,
@@ -17286,12 +17645,11 @@ impl App {
         // means a crash between opening a lossy file and acting on the
         // dialog leaves crash recovery a document that still knows.
         self.skipped_tiles = skipped_tiles;
-        // Re-borrowed rather than reusing the `store` binding above:
-        // that borrow of `self.tile_store` has to end before
-        // `replace_document`'s own `&mut self.workspace` above, and
-        // `read_aur` has already populated the store by now, so the
-        // container this writes carries the opened document's real
-        // tiles.
+        // Re-borrowed rather than kept from the read above: that borrow
+        // of `self.tile_store` has to end before `report_open_failure`/
+        // `replace_document` borrow `self`, and `read_aur` has already
+        // populated the store by now, so the container this writes
+        // carries the opened document's real tiles.
         if let Some(store) = self.tile_store.as_mut() {
             write_autosave(
                 &autosave_path(),
@@ -17364,6 +17722,110 @@ impl App {
                      the document is still missing what it names"
                 );
             }
+        }
+    }
+
+    /// [`Self::open_aur_file`]'s read step: the chosen file's bytes,
+    /// read into the live tile store through [`read_aur_for_open`]'s
+    /// pre-check. `None` once every refusal on the way — no live store,
+    /// an unreadable file, a damaged or unsupported container — has been
+    /// logged and shown ([`Self::report_open_failure`]).
+    fn read_chosen_aur(&mut self, path: &Path) -> Option<aurora_io::AurDocument> {
+        let read = match (self.tile_store.as_mut(), std::fs::read(path)) {
+            (None, _) => Err(OpenFailure::NoTileStorage),
+            (Some(_), Err(err)) => Err(OpenFailure::Read(err)),
+            (Some(store), Ok(bytes)) => read_aur_for_open(&bytes, store),
+        };
+        match read {
+            Ok(document) => Some(document),
+            Err(failure) => {
+                tracing::warn!(path = %path.display(), ?failure, "failed to open the chosen .aur file");
+                self.report_open_failure(path, &failure);
+                None
+            }
+        }
+    }
+
+    /// Tells the user an open was refused (0.143.1): builds
+    /// [`open_failure_message`] for `path` and `failure`, and opens the
+    /// [`OPEN_FAILED_TITLE`] dialog with it ([`open_open_failed_dialog`])
+    /// — then relays out and announces it, the same pair
+    /// [`Self::open_export_refused_dialog`] runs and for the same reason
+    /// (the macOS native-menu route reaches [`Self::open_file`] without
+    /// the keyboard path's own relayout).
+    ///
+    /// If the one modal slot is already occupied, the message is logged
+    /// in full instead — it is not allowed to vanish. A failure to load
+    /// the design scales is logged too: there is no dialog to build
+    /// without them.
+    fn report_open_failure(&mut self, path: &Path, failure: &OpenFailure) {
+        let extension = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let message = open_failure_message(&display_file_name(path), &extension, failure);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, %message, "failed to load design scales; cannot show why an open failed");
+                return;
+            }
+        };
+        let opened = open_open_failed_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            &message,
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        if !opened {
+            tracing::warn!(
+                path = %path.display(),
+                %message,
+                "the open failure could not be shown (a dialog is already open)"
+            );
+        }
+    }
+
+    /// [`Self::report_open_failure`]'s save-side counterpart (0.143.1):
+    /// the [`SAVE_FAILED_TITLE`] dialog with [`save_failure_message`],
+    /// relayout and announcement included, logged in full if the modal
+    /// slot is taken.
+    fn report_save_failure(&mut self, path: &Path, failure: &SaveFailure) {
+        let message = save_failure_message(&display_file_name(path), failure);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, %message, "failed to load design scales; cannot show why a save failed");
+                return;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            SAVE_FAILED_TITLE,
+            &message,
+            save_failed_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        if !opened {
+            tracing::warn!(
+                path = %path.display(),
+                %message,
+                "the save failure could not be shown (a dialog is already open)"
+            );
         }
     }
 
@@ -17524,11 +17986,17 @@ impl App {
     /// tile reads failed and what the first one said
     /// ([`incomplete_composite_message`]) — which is what CLAUDE.md's own
     /// "warn with an itemized list before any lossy save" rule asks for.
-    /// Every other error from this path stays log-only, deliberately: a
-    /// bad extension or a failed write is a different, narrower failure
-    /// than "the document itself could not be read," and widening the
-    /// match would put a modal alert in front of failures that don't
-    /// warrant one.
+    /// The match stays narrow, deliberately: that itemized dialog is
+    /// for "the document itself could not be read," and no other error
+    /// is allowed to reuse its wording. **Every other failure is shown
+    /// too since 0.143.1**, through its own [`SAVE_FAILED_TITLE`] dialog
+    /// ([`Self::report_save_failure`]): an extension this build cannot
+    /// write (a `.psd`, say — until then the export silently did
+    /// nothing, leaving the user to believe it had saved) or encode
+    /// failure, a failed write/verify/rename, any other composite
+    /// failure ([`SaveFailure::Composite`]) and a session with no live
+    /// tile store ([`SaveFailure::NoTileStorage`]) — after the 0.143.1
+    /// review no export failure is log-only.
     ///
     /// **The wiring line itself is covered by inspection, not by a
     /// test.** Reaching it needs a real `App` — a window, a GPU adapter,
@@ -17545,6 +18013,8 @@ impl App {
             return;
         }
         let Some(store) = self.tile_store.as_mut() else {
+            tracing::error!(path = %path.display(), "refusing to export: no live tile store");
+            self.report_save_failure(path, &SaveFailure::NoTileStorage);
             return;
         };
         let (width, height) = self.canvas_size;
@@ -17573,6 +18043,11 @@ impl App {
                              the file is still untouched"
                         );
                     }
+                } else {
+                    // Every other composite failure is shown too (0.143.1
+                    // review): the generic save-failure dialog, never the
+                    // itemized incomplete-composite wording above.
+                    self.report_save_failure(path, &SaveFailure::Composite(err));
                 }
                 return;
             }
@@ -17581,11 +18056,14 @@ impl App {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::warn!(path = %path.display(), ?err, "failed to encode the exported image");
+                self.report_save_failure(path, &SaveFailure::Encode(err));
                 return;
             }
         };
         if write_verified(path, &bytes, image.width(), image.height()) {
             tracing::info!(path = %path.display(), "exported the composited document");
+        } else {
+            self.report_save_failure(path, &SaveFailure::Write);
         }
     }
 
@@ -17624,6 +18102,7 @@ impl App {
 
         let Some(file_name) = path.file_name() else {
             tracing::warn!(path = %path.display(), "save path has no file name");
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         };
         let mut temp_name = file_name.to_os_string();
@@ -17651,18 +18130,21 @@ impl App {
         if let Err(err) = write_result {
             tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
 
         if !verify_aur(&temp_path) {
             tracing::warn!(path = %temp_path.display(), "exported .aur file failed to verify by reading it back");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
 
         if let Err(err) = std::fs::rename(&temp_path, path) {
             tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
             let _ = std::fs::remove_file(&temp_path);
+            self.report_save_failure(path, &SaveFailure::Write);
             return;
         }
         tracing::info!(path = %path.display(), "exported the document as .aur");
@@ -19759,20 +20241,22 @@ mod tests {
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
         Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS,
         GpuBlendDispatch, GpuBlendDispatches, GpuPaintOp, Key, KeyChord, MIN_WINDOW_HEIGHT,
-        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
+        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, OPEN_FAILED_DISMISS,
+        OPEN_FAILED_TITLE, OPEN_FAILED_UNCHANGED, OpenFailure, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, StartupPanels, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_roots_into_tile,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        RailResize, RecoveredDocument, SAVE_FAILED_UNCHANGED, SaveFailure, ShutdownState,
+        StartupPanels, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, display_file_name,
+        dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
@@ -19780,18 +20264,20 @@ mod tests {
         is_aur_path, layer_for_surface, layer_local_point, load_document_view, load_scales,
         load_theme, logical_point, logical_size, mark_active_layer_row, mark_move_refusal_reported,
         move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
-        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        open_command_palette, open_crash_recovery_dialog, open_dialog, open_failure_message,
+        open_image, open_open_failed_dialog, open_tile_store, palette_commands, pan_bounds,
+        partial_autosave_path, perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider,
+        press_layer_row, previous_session_left_a_marker, read_aur_for_open,
         recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
         replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
         route_accessibility_action, run_command, run_dialog_action, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, take_gpu_blend_dispatch_count,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
-        toggle_command_palette, topmost_pixel_layer, translate_blend_mode, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        sample_pixel, save_failure_message, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
+        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use super::{
         CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
@@ -22225,7 +22711,7 @@ mod tests {
             unreachable!("{err:?}");
         }
 
-        let Some(decoded) = open_image(&path) else {
+        let Ok(decoded) = open_image(&path) else {
             unreachable!("a real, freshly written PNG must decode");
         };
         assert_eq!(decoded.width(), 4);
@@ -22233,12 +22719,15 @@ mod tests {
     }
 
     #[test]
-    fn open_image_returns_none_for_a_path_that_does_not_exist() {
-        assert!(open_image(std::path::Path::new("/no/such/file.png")).is_none());
+    fn open_image_reports_a_read_failure_for_a_path_that_does_not_exist() {
+        match open_image(std::path::Path::new("/no/such/file.png")) {
+            Err(OpenFailure::Read(err)) => assert_eq!(err.kind(), std::io::ErrorKind::NotFound),
+            other => unreachable!("expected a not-found read failure, got {other:?}"),
+        }
     }
 
     #[test]
-    fn open_image_returns_none_for_an_unsupported_extension() {
+    fn open_image_reports_an_unsupported_extension_for_a_psd() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err:?}"),
@@ -22247,7 +22736,491 @@ mod tests {
         if let Err(err) = std::fs::write(&path, b"whatever") {
             unreachable!("{err:?}");
         }
-        assert!(open_image(&path).is_none());
+        match open_image(&path) {
+            Err(OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext))) => {
+                assert_eq!(ext, "psd");
+            }
+            other => unreachable!("expected an unsupported-extension failure, got {other:?}"),
+        }
+    }
+
+    /// The exact text the user who opened a `.psd` on macOS sees today
+    /// (0.143.1) — pinned word for word, because the whole round exists
+    /// so that this sentence reaches a screen instead of nothing.
+    #[test]
+    fn open_failure_message_for_a_psd_names_the_file_the_format_and_what_aurora_can_open() {
+        let message = open_failure_message(
+            "photo.psd",
+            "psd",
+            &OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension("psd".to_owned())),
+        );
+        assert_eq!(
+            message,
+            "Aurora can't open \"photo.psd\": this version can't read Photoshop (PSD) files yet. \
+             It can open PNG, JPEG, TIFF and Aurora documents (.aur). Your current document has \
+             not changed."
+        );
+    }
+
+    #[test]
+    fn open_failure_message_covers_every_failure_in_plain_language() {
+        let unsupported = |ext: &str| {
+            OpenFailure::Decode(aurora_io::IoError::UnsupportedExtension(ext.to_owned()))
+        };
+        let cases: Vec<(String, &str)> = vec![
+            (
+                open_failure_message("big.psb", "psb", &unsupported("psb")),
+                "this version can't read Photoshop Large Document (PSB) files yet",
+            ),
+            (
+                open_failure_message("x.xyz", "xyz", &unsupported("xyz")),
+                "Aurora doesn't recognise the \".xyz\" file type",
+            ),
+            (
+                open_failure_message("README", "", &unsupported("")),
+                "it has no file extension",
+            ),
+            (
+                open_failure_message(
+                    "gone.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ),
+                "Aurora couldn't find \"gone.png\". It may have been moved, renamed or deleted.",
+            ),
+            (
+                open_failure_message(
+                    "locked.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ),
+                "Aurora doesn't have permission to read \"locked.png\".",
+            ),
+            (
+                open_failure_message(
+                    "odd.png",
+                    "png",
+                    &OpenFailure::Read(std::io::Error::other("device on fire")),
+                ),
+                "Aurora couldn't read \"odd.png\". Details: device on fire.",
+            ),
+            (
+                open_failure_message(
+                    "broken.png",
+                    "png",
+                    &OpenFailure::Decode(
+                        match aurora_io::decode_by_extension(
+                            std::path::Path::new("broken.png"),
+                            b"not a png",
+                        ) {
+                            Err(err) => err,
+                            Ok(_) => unreachable!("garbage must not decode as a PNG"),
+                        },
+                    ),
+                ),
+                "\"broken.png\" isn't a valid PNG file, or it is damaged. Details:",
+            ),
+            (
+                open_failure_message(
+                    "cmyk.tif",
+                    "tif",
+                    &OpenFailure::Decode(aurora_io::IoError::UnsupportedTiffSampleFormat("int")),
+                ),
+                "\"cmyk.tif\" uses a kind of TIFF that Aurora can't open yet.",
+            ),
+            (
+                open_failure_message(
+                    "bad.aur",
+                    "aur",
+                    &OpenFailure::Aur(aurora_io::IoError::MissingEntry("manifest")),
+                ),
+                "\"bad.aur\" isn't a valid Aurora document",
+            ),
+            (
+                open_failure_message("doc.aur", "aur", &OpenFailure::NoTileStorage),
+                "this session has no storage for image data available",
+            ),
+        ];
+        for (message, expected) in &cases {
+            assert!(
+                message.contains(expected),
+                "{message:?} must contain {expected:?}"
+            );
+            assert!(
+                message.ends_with(OPEN_FAILED_UNCHANGED),
+                "every refused open before the live store is touched must end by saying the \
+                 current document has not changed: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_failure_message_after_the_check_does_not_promise_the_document_is_unchanged() {
+        let message = open_failure_message(
+            "doc.aur",
+            "aur",
+            &OpenFailure::AurAfterCheck(aurora_io::IoError::MissingEntry("history")),
+        );
+        assert!(
+            !message.contains(OPEN_FAILED_UNCHANGED),
+            "this is the one case that cannot honestly say so: {message:?}"
+        );
+        assert!(message.contains("may have been cleared"), "{message:?}");
+        assert!(message.contains("\"doc.aur\""), "{message:?}");
+    }
+
+    #[test]
+    fn display_file_name_strips_control_and_bidi_characters_from_the_name() {
+        let path = std::path::Path::new("/tmp/evil\u{202e}gpj.\u{7}photo.psd");
+        let name = display_file_name(path);
+        assert_eq!(name, "evilgpj.photo.psd");
+        assert_eq!(
+            display_file_name(std::path::Path::new("/")),
+            "/",
+            "a path with no file name component falls back to the whole path"
+        );
+    }
+
+    #[test]
+    fn save_failure_message_covers_every_failure_and_says_nothing_was_written() {
+        let psd = save_failure_message(
+            "export.psd",
+            &SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension("psd".to_owned())),
+        );
+        assert_eq!(
+            psd,
+            "Aurora can't save \"export.psd\": this version can't write Photoshop (PSD) files \
+             yet. It can save as PNG, JPEG, TIFF or Aurora document (.aur). Nothing was saved, \
+             and any existing file with that name is unchanged."
+        );
+        let jpeg = save_failure_message(
+            "huge.jpg",
+            &SaveFailure::Encode(aurora_io::IoError::JpegDimensionsTooLarge {
+                width: 70_000,
+                height: 10,
+            }),
+        );
+        assert!(
+            jpeg.contains("Aurora couldn't encode \"huge.jpg\". Details: image is 70000x10"),
+            "{jpeg:?}"
+        );
+        let write = save_failure_message("out.png", &SaveFailure::Write);
+        assert!(
+            write.starts_with("Aurora couldn't write \"out.png\""),
+            "{write:?}"
+        );
+        let composite = save_failure_message(
+            "flat.png",
+            &SaveFailure::Composite(aurora_io::IoError::UnsupportedExtension("x".to_owned())),
+        );
+        assert!(
+            composite.starts_with("Aurora couldn't export \"flat.png\": the document's layers"),
+            "{composite:?}"
+        );
+        let no_store = save_failure_message("flat.png", &SaveFailure::NoTileStorage);
+        assert!(
+            no_store.contains("no storage for image data"),
+            "{no_store:?}"
+        );
+        for message in [&psd, &jpeg, &write, &composite, &no_store] {
+            assert!(message.ends_with(SAVE_FAILED_UNCHANGED), "{message:?}");
+        }
+    }
+
+    /// The seam [`App::report_open_failure`] is built on: a refused open
+    /// raises a real alert dialog whose one action ("OK") takes focus and
+    /// whose message is the [`open_failure_message`] text — and leaves
+    /// the document it was raised over exactly as it was.
+    #[test]
+    fn a_refused_open_raises_a_focused_alert_and_leaves_the_document_alone() {
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (layers, history, current) = document_from_image("current", &fake_image(4, 4));
+        let roots_before = layers.roots().to_vec();
+        let bounds_before = layers.bounds(current);
+        let journal_before = history.journal_descriptions();
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("photo.psd");
+        if let Err(err) = std::fs::write(&path, b"8BPS") {
+            unreachable!("{err:?}");
+        }
+        let Err(failure) = open_image(&path) else {
+            unreachable!("a .psd must be refused in 0.143.1");
+        };
+        let message = open_failure_message(&display_file_name(&path), "psd", &failure);
+        assert!(open_open_failed_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            &message
+        ));
+
+        let Some(handle) = dialog.clone() else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the refused-open dialog always has one action");
+        };
+        assert_eq!(id, OPEN_FAILED_DISMISS);
+        assert_eq!(handle.actions.len(), 1);
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.message)
+                .and_then(accesskit::Node::label),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .and_then(accesskit::Node::label),
+            Some(OPEN_FAILED_TITLE)
+        );
+        assert_eq!(layers.roots(), roots_before.as_slice());
+        assert_eq!(layers.name(current), Some("current"));
+        assert_eq!(layers.bounds(current), bounds_before);
+        assert_eq!(history.journal_descriptions(), journal_before);
+
+        // The one modal slot is taken now: a second refusal is not
+        // shown over it (and `App::report_open_failure` logs it instead).
+        assert!(!open_open_failed_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "another"
+        ));
+        assert_eq!(dialog, Some(handle));
+    }
+
+    /// A real `.aur` container for the read tests below: one pixel layer
+    /// (`LayerId` 0, like every fresh document's first layer) carrying a
+    /// mask, its content tile real, plus a mask tile entry holding bytes
+    /// the tile codec refuses — so a read commits the content tile, then
+    /// fails. The content surface is the *same* surface the live
+    /// document's own first layer uses, which is the whole hazard.
+    fn damaged_aur_sharing_the_first_surface() -> (Vec<u8>, aurora_tile::SurfaceId) {
+        let (_dir, mut store) = real_tile_store();
+        let red: Vec<half::f16> = (0..16)
+            .flat_map(|_| [1.0, 0.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        let image = match aurora_io::Image::new(4, 4, aurora_color::IccProfile::srgb(), red) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut layers, history, id) = document_from_image("damaged", &image);
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&image, &mut store, surface) {
+            unreachable!("{err:?}");
+        }
+        let mask_rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        if let Err(err) = layers.add_mask(id, mask_rect) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a masked layer has a mask surface");
+        };
+        let mut written = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut written,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let mask_entry = format!("tiles/{}/0_0.tile", mask_surface.to_raw());
+        let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(written.into_inner())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut rebuilt = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let entry = match archive.by_index_raw(index) {
+                Ok(entry) => entry,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if entry.name() == mask_entry {
+                continue;
+            }
+            if let Err(err) = rebuilt.raw_copy_file(entry) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Err(err) = rebuilt.start_file(mask_entry, zip::write::SimpleFileOptions::default()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = std::io::Write::write_all(&mut rebuilt, b"this is not an encoded tile") {
+            unreachable!("{err:?}");
+        }
+        let bytes = match rebuilt.finish() {
+            Ok(cursor) => cursor.into_inner(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (bytes, surface)
+    }
+
+    /// The live store a damaged open lands in: the current document's
+    /// own first layer, painted green (`fake_image`), on `surface`.
+    fn live_store_with_the_current_document(
+        surface: aurora_tile::SurfaceId,
+    ) -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let (dir, mut store) = real_tile_store();
+        let (layers, _history, id) = document_from_image("current", &fake_image(4, 4));
+        assert_eq!(
+            layers.surface_id(id),
+            Some(surface),
+            "precondition: both documents' first layers share one surface id"
+        );
+        if let Err(err) = aurora_io::write_into_store(&fake_image(4, 4), &mut store, surface) {
+            unreachable!("{err:?}");
+        }
+        (dir, store)
+    }
+
+    /// The first texel of `surface`'s tile `(0, 0)`, as exact `f16` bits
+    /// (compared bit for bit — every value here is exactly representable).
+    fn first_texel(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+    ) -> [u16; 4] {
+        let tile = match store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut texel = [0; 4];
+        for (out, sample) in texel.iter_mut().zip(tile.texels()) {
+            *out = sample.to_bits();
+        }
+        texel
+    }
+
+    fn texel_bits(texel: [f32; 4]) -> [u16; 4] {
+        texel.map(|value| half::f16::from_f32(value).to_bits())
+    }
+
+    /// **The 0.143.1 finding, pinned.** `aurora_io::read_aur` read
+    /// straight into a live store that already holds the current
+    /// document: the damaged file's content tile overwrites the current
+    /// document's tile on their shared surface, the mask tile then fails
+    /// to decode, and the rollback *forgets* that tile — so the refused
+    /// open has erased a tile of the document it left on screen. This is
+    /// what `App::open_aur_file` did until 0.143.1; [`read_aur_for_open`]
+    /// exists so it no longer does (next test).
+    #[test]
+    fn a_damaged_aur_read_straight_into_a_live_store_erases_the_current_documents_tiles() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (bytes, surface) = damaged_aur_sharing_the_first_surface();
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([0.0, 1.0, 0.0, 1.0])
+        );
+
+        match aurora_io::read_aur(std::io::Cursor::new(&bytes), &mut live) {
+            Err(aurora_io::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+        assert!(
+            !live.contains_tile(surface, aurora_tile::TileId { x: 0, y: 0 }),
+            "pinned hazard: the rollback forgets the current document's own tile"
+        );
+    }
+
+    #[test]
+    fn read_aur_for_open_refuses_a_damaged_file_before_touching_the_live_store() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (bytes, surface) = damaged_aur_sharing_the_first_surface();
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+
+        match read_aur_for_open(&bytes, &mut live) {
+            Err(OpenFailure::Aur(aurora_io::IoError::Tile(_))) => {}
+            other => unreachable!("expected a pre-check refusal, got {other:?}"),
+        }
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([0.0, 1.0, 0.0, 1.0]),
+            "the current document's pixels must survive a refused open"
+        );
+    }
+
+    #[test]
+    fn read_aur_for_open_reads_a_sound_file_into_the_live_store() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_source_dir, mut source) = real_tile_store();
+        let red: Vec<half::f16> = (0..16)
+            .flat_map(|_| [1.0, 0.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        let image = match aurora_io::Image::new(4, 4, aurora_color::IccProfile::srgb(), red) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history, id) = document_from_image("sound", &image);
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("a pixel layer has a surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&image, &mut source, surface) {
+            unreachable!("{err:?}");
+        }
+        let mut written = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut written,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut source,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir, mut live) = live_store_with_the_current_document(surface);
+
+        let document = match read_aur_for_open(written.get_ref(), &mut live) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("a sound file must open: {failure:?}"),
+        };
+        assert_eq!(document.canvas_size, (4, 4));
+        assert_eq!(document.layers.name(id), Some("sound"));
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([1.0, 0.0, 0.0, 1.0])
+        );
     }
 
     /// Every Layers row's `TreeItemState::selected` payload, keyed by the
