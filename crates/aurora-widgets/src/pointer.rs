@@ -646,7 +646,15 @@ fn range_down(
     id: WidgetId,
     point: (f32, f32),
 ) -> Result<PointerOutcome, ActionRejection> {
-    focus_pointer(tree, focus, id)?;
+    // A linked scrollbar is not focusable (0.146.0,
+    // `widgets::link_scrollbar`): pressing it scrolls without taking focus,
+    // the way a platform's own scrollbar does.
+    if tree
+        .accessibility(id)
+        .is_some_and(|node| node.supports_action(Action::Focus))
+    {
+        focus_pointer(tree, focus, id)?;
+    }
     // Captured even when this point maps to no value: a later `Move` can.
     click.captured = Some(Capture::Range(id));
     let Some(value) = value_at(tree, id, point) else {

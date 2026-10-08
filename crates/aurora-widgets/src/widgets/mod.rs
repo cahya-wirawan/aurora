@@ -32,11 +32,12 @@
 //! no numeric value, range, or step semantics at all.
 //! `CommandPalette`, [`WidgetKind::Panel`] and [`WidgetKind::Dialog`]
 //! are not on the list in any form, so none of them moves this count.)
-//! `Scrollbar` is a deliberately narrow landing: a bounded position
-//! *model* with an accessibility node, a layout style, and a paint, but
-//! nothing yet drives it from real scrolled content (0.145.0 added
-//! scroll containers to [`crate::WidgetTree`] itself —
-//! [`crate::WidgetTree::set_scrollable`] — with no scrollbar attached). It has a real
+//! `Scrollbar` began as a deliberately narrow landing: a bounded position
+//! *model* with an accessibility node, a layout style, and a paint. As of
+//! 0.146.0 a bar can be **linked** to a [`crate::WidgetTree::set_scrollable`]
+//! container ([`link_scrollbar`]), and then it drives that container and
+//! follows it after every text-aware layout — every `aurora-ui` docked
+//! panel has one. It has a real
 //! component-gallery entry with a contrast check passing in every
 //! built-in theme; only its golden-image diff tests are unblessed
 //! (`#[ignore]`d pending a human bless on real GPU hardware, the same
@@ -201,7 +202,9 @@ pub use menu::{
     handle_menu_key, menu_state, open_menu,
 };
 pub use scrollbar::{
-    ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,
+    ScrollbarRange, ScrollbarState, insert_scrollbar, link_scrollbar, scrollbar_target,
+    set_scrollbar_disabled, set_scrollbar_value, settle_linked_scrollbars, sync_linked_scrollbars,
+    sync_scrollbar,
 };
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use tab_bar::{

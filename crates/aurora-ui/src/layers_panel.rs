@@ -1284,6 +1284,60 @@ mod tests {
         assert_eq!(ws.tree.scroll_y(ws.history.body), Some(0.0));
     }
 
+    /// 0.146.0: a crowded Layers panel shows its bar beside the body
+    /// (never inside it); the sibling panels, whose content fits, show
+    /// none; collapsing hides body and bar but keeps the title, and the
+    /// bar comes back with the saved offset on expand.
+    #[test]
+    fn a_crowded_layers_panel_shows_a_bar_that_hides_with_the_body_on_collapse() {
+        let mut ws = crowded_workspace(200, 400.0);
+        let lay = |ws: &mut crate::workspace::Workspace| {
+            aurora_widgets::compute_text_layout(&mut ws.tree, 1600.0, 400.0, None);
+        };
+        lay(&mut ws);
+        let width =
+            |ws: &crate::workspace::Workspace, id| ws.tree.bounds(id).map_or(0, |r| r.width);
+        assert!(width(&ws, ws.layers.scrollbar) > 0, "crowded: shown");
+        assert!(!ws.tree.is_within(ws.layers.body, ws.layers.scrollbar));
+        let (Some(body), Some(bar)) = (
+            ws.tree.bounds(ws.layers.body),
+            ws.tree.bounds(ws.layers.scrollbar),
+        ) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(bar.x, body.right(), "beside the body, on its right");
+        assert_eq!(bar.height, body.height);
+        for panel in [ws.properties, ws.history] {
+            assert_eq!(width(&ws, panel.scrollbar), 0, "content fits: no bar");
+        }
+        if let Err(err) = ws.tree.set_scroll_y(ws.layers.body, 120.0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = crate::panel::set_panel_collapsed(&mut ws.tree, ws.layers, true) {
+            unreachable!("{err:?}");
+        }
+        lay(&mut ws);
+        assert_eq!(width(&ws, ws.layers.scrollbar), 0, "collapsed: no bar");
+        assert_eq!(ws.tree.bounds(ws.layers.body).map(|r| r.height), Some(0));
+        assert!(
+            ws.tree
+                .bounds(ws.layers.header)
+                .is_some_and(|r| r.height > 0)
+        );
+        if let Err(err) = crate::panel::set_panel_collapsed(&mut ws.tree, ws.layers, false) {
+            unreachable!("{err:?}");
+        }
+        lay(&mut ws);
+        assert!(width(&ws, ws.layers.scrollbar) > 0, "expanded: back");
+        assert_eq!(ws.tree.scroll_y(ws.layers.body), Some(120.0));
+        match ws.tree.payload(ws.layers.scrollbar) {
+            Some(aurora_widgets::widgets::WidgetKind::Scrollbar(state)) => {
+                assert!((state.value - 120.0).abs() < 1e-9, "{}", state.value);
+            }
+            other => unreachable!("{other:?}"),
+        }
+    }
+
     #[test]
     fn every_panel_body_is_scrollable() {
         let ws = crowded_workspace(1, 900.0);

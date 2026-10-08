@@ -26,7 +26,33 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.145.0): the dock panels scroll.** The real-macOS
+**Latest (2026-10-08, 0.146.0): the dock panels have a visible
+scrollbar.** Every docked panel's body now sits in a non-scrolling
+`[body | scrollbar]` row (`PanelHandle::viewport`, `PanelHandle::
+scrollbar`), so the bar never moves with the content. It is the existing
+`Scrollbar` widget, now **linkable** to a scroll container
+(`aurora_widgets::widgets::link_scrollbar`): setting its value — a thumb
+drag, a track press, or an assistive technology's `SetValue`/`Increment`/
+`Decrement` through the same `handle_action` path sliders use — scrolls
+the body, and every text-aware layout (`compute_text_layout`) copies the
+body's offset, range and height back into the bar and hides it
+(`Display::None`, no width) while the content fits, laying out exactly
+once more when the bar appears or disappears. A wheel over the bar
+scrolls its body. A linked bar is not a `Tab` stop (like a platform
+scrollbar), announces the body as the region it `controls`, and is
+announced hidden while there is nothing to scroll; the body keeps its
+0.145.0 `scroll_y` properties. Thickness, colours and radius are the
+widget's existing token-derived ones — no new token. The four 0.145.0
+review follow-ups are closed: `scroll_into_view` leaves a zero-height
+(collapsed) or clipped-away container and its saved offset alone, and
+stops at popovers; a panel scroll by wheel, bar or assistive technology
+closes open dropdown lists and the gallery's menu; and the command
+palette being non-modal to the wheel is now documented on `wheel_target`.
+2,732 tests passing (`AURORA_REQUIRE_GPU=1`, RTX 3090). **Not yet verified on real hardware** — a
+human needs to drag the bar on macOS. Details: "Next action", addendum
+0.146.0.
+
+**Previously (2026-10-08, 0.145.0): the dock panels scroll.** The real-macOS
 report after 0.144.1 — a many-layer PSD in a short window, Layers rows
 past the bottom of the panel unreachable — is fixed in the widget tree
 itself: `aurora_widgets::WidgetTree` gains vertical scroll containers
@@ -6627,8 +6653,9 @@ structural design work.
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
   2026-08-03 (**update 0.145.0:** every panel body now scrolls, wheel
-  and trackpad — "Next action", addendum 0.145.0; no visible scrollbar
-  yet), `crates/aurora-ui/src/{panel,workspace}.rs` (`aurora-ui`'s
+  and trackpad — "Next action", addendum 0.145.0; **update 0.146.0:** a
+  visible, draggable scrollbar beside each panel body, linked to it —
+  addendum 0.146.0), `crates/aurora-ui/src/{panel,workspace}.rs` (`aurora-ui`'s
   first real code — was a placeholder `crate_name()`). Matches the
   structure of the owner-approved workspace mockup
   (`design/mockups/workspace.html`, Phase 0 0.5): a canvas area plus a
@@ -30200,6 +30227,125 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.146.0) — a visible panel scrollbar.** Done as
+0.145.0 suggested. **Shape:** `insert_panel` now builds `root → [header,
+viewport, …]` with `viewport` a non-scrolling `Row` (`viewport_style`:
+the vertical grow/zero-basis/zero-minimum role the body used to play)
+holding `[body | scrollbar]`; `PanelHandle` gains `viewport` and
+`scrollbar`, callers still populate `body`. The bar cannot be a
+descendant of the body — the offset moves every descendant. **Linking
+(aurora-widgets, document-agnostic):** `ScrollbarState::scrolls`,
+`link_scrollbar`, `scrollbar_target`, `sync_scrollbar`,
+`sync_linked_scrollbars`. `set_scrollbar_value` on a linked bar calls
+`WidgetTree::set_scroll_y` and stores the offset the container took, so a
+pointer drag, a track press (`pointer.rs` maps the pointer to the thumb
+centre) and AT `SetValue`/`Increment`/`Decrement` (`handle_action`, the
+slider path) all scroll the body. `compute_text_layout` syncs every
+linked bar after layout (value = `scroll_y`, `max = scroll_range`,
+`page = body height`) and shows/hides it with `Display::None`; a
+visibility change triggers exactly one more layout, then a settling pass
+(`settle_linked_scrollbars`) that syncs state but never shows or hides a
+bar, so the drawn bar always matches the final layout. One extra layout
+is enough **for content whose height does not shrink as it narrows**
+(text, rows, every shipped panel); content that shrinks (an
+aspect-ratio box) can keep its first-pass visibility — a full-length
+thumb, or no bar over still-scrollable content — logs a
+`tracing::warn!`, and may flip per layout (review I-2). Plain
+`compute_layout`, used by every golden, does none of this. A linked bar has
+no `Action::Focus` (not a Tab stop; `range_down` no longer requires
+focus), sets `controls = [body]`, and is `hidden` while range is 0; the
+body keeps 0.145.0's `scroll_y` properties. No new token: thickness is
+`type_size md`, colours/radius `paint_scrollbar`'s. **App:**
+`WidgetOwner::PanelScrollbar` (checked first in `widget_owner`, so the
+gallery panel's own bar is not a demo widget), `route_widget_pointer`
+lost its "nothing app-owned open" early return, `wheel_target` routes a
+wheel over a bar to its body, `close_open_popovers` (Layers blend list +
+`aurora_ui::gallery_close_popovers`) runs after a wheel scroll that moved
+(`wheel_scroll_panel`), a bar value change from the pointer
+(`panel_bar_scrolled`) or from an AT (`panel_bar_accessibility`).
+**0.145.0 follow-ups:** `scroll_into_view` returns `false` for a
+zero-height or clipped-away container (offset kept) and stops at a
+popover root; the palette's non-modality to the wheel is documented on
+`wheel_target`, behaviour unchanged — and, accurately (review I-3), the
+palette *is* modal to widget presses: `route_gallery` passes `dialog ||
+command_palette` as `modal_open`, so with the palette open the wheel
+scrolls a panel but a press or drag on its bar does nothing.
+**Review revision (same version, judge REVISE 0.873):** I-1 — closing
+the gallery's menu on a scroll hands focus back to its opener, which
+`follow_scroll` then answered by scrolling the opener back into view,
+undoing the scroll. `close_open_popovers` now records the new focus in
+`ScrollFollow` (threaded through `wheel_scroll_panel`,
+`panel_bar_scrolled` and a new `AccessibilityContext::scroll_follow`),
+and any event the panel bar takes records it too (a `Down` on the bar
+first light-dismisses the menu). The Layers blend list is not affected:
+`set_dropdown_open` never moves focus. I-2 — the settling pass above.
+I-3 — the asymmetry above, documented on `wheel_target`. I-4 — two stale
+passages in `scrollbar.rs` fixed. Three more mutations, all killed: R1
+(no focus record on close) by `a_wheel_scroll_that_closes_the_gallery_
+menu_keeps_its_offset_after_layout`; R2 (no focus record on a bar event)
+by `a_bar_press_that_light_dismisses_the_gallery_menu_keeps_its_offset_
+after_layout` — it **survived** until that test was added; R3 (settling
+pass toggles) by `the_settling_pass_updates_a_bars_state_but_never_its_
+visibility`. Both I-1 tests force the gallery body to overflow by
+cutting its root to 60 px: no shipped panel holds a menu that can
+scroll today, so I-1 was latent rather than reachable.
+**Mutations (17, really run under `AURORA_REQUIRE_GPU=1` against the
+widgets/ui/app lib tests, each file backed up to the scratchpad, restored
+and sha256-checked — all 17 restored OK). All 17 killed:**
+
+| # | Mutation | Killed by (count) |
+|---|---|---|
+| M1 | bar sync never called | 12, e.g. `the_bar_follows_the_containers_offset_after_layout_and_never_moves_itself` |
+| M2 | no relayout after show/hide | 8, e.g. `rows_stay_clickable_across_their_full_width_up_to_the_bar` |
+| M3 | bar value not applied to container | 6, e.g. `a_press_on_the_layers_track_jumps_the_body_there` |
+| M4 | hide condition inverted | 11 |
+| M5 | bar never hidden | 3, e.g. `a_panel_whose_content_fits_shows_no_bar_and_gives_it_no_width` |
+| M6 | linked bar stays a Tab stop | 6, incl. `tab_order_currently_stops_on_every_layer_row` |
+| M7 | sync ignores the offset | 3, e.g. `a_wheel_moves_the_thumb_and_a_wheel_over_the_bar_scrolls_its_body` |
+| M8 | `range_down` always focuses | 4 |
+| M9 | popover guard removed | 1, `scroll_into_view_does_not_scroll_a_popovers_owner` |
+| M10 | zero-height guard removed | 2, incl. `an_active_layer_change_while_layers_is_collapsed_keeps_its_offset` |
+| M11 | clipped-away guard removed | 1, `scroll_into_view_leaves_a_clipped_away_container_alone` |
+| M12 | wheel scroll does not close popovers | 1, `scrolling_a_panel_by_wheel_or_bar_closes_an_open_blend_mode_list` |
+| M13 | bar pointer scroll does not close popovers | 1, same test |
+| M14 | AT bar scroll does not close popovers | 1, `an_at_set_value_on_the_layers_bar_scrolls_its_body_and_closes_the_blend_list` |
+| M15 | bar not routed (no `PanelScrollbar` owner) | 3 |
+| M16 | wheel over the bar not routed to its body | 1 |
+| M17 | panel bar never linked | 9 |
+
+**Disclosed:** M12/M13 are tested through the extracted free functions
+(`wheel_scroll_panel`, `panel_bar_scrolled`) — the `App` methods that
+call them (`handle_mouse_wheel`, `route_gallery`) need a window and are
+covered by inspection only. No grab offset: pressing the thumb off-centre
+jumps its centre to the pointer (pre-existing `pointer.rs` behaviour).
+`Increment`/`Decrement` step 1% of the range, not one row, and an
+f64→f32 round trip can leave the stored offset ~1e-5 px off (layout
+applies whole pixels). No hover/pressed look on the bar, no minimum
+thumb beyond the bar's thickness, no horizontal bar. Closing popovers is
+all-or-nothing (every open dropdown/menu, not only those in the scrolled
+panel). The extra layout when a bar appears doubles that one frame's
+layout cost (not measured). Windows UIA reports `Role::ScrollBar` as
+read-only (pre-existing caveat in `scrollbar.rs`), so AT scrolling via
+the bar is unverified on any real screen reader. Accessibility actions
+were exercised only through `handle_action`/`apply_accessibility_action`
+headlessly. A panel whose content cannot take focus (History) has **no
+keyboard way to scroll**: the bar is not a Tab stop and focus-driven
+`scroll_into_view` needs a focusable row — already true in 0.145.0
+(review I-6). **Measured:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` on the revised tree — fmt, layering, style lint,
+`check --locked`, clippy `-D warnings`, 2,732 passed, 0 failed,
+0 skipped, strict rustdoc and `cargo deny` clean (2,729 before the
+review revision's three tests). Judge: REVISE 0.873 (I-1–I-6 above),
+then **PASS 0.922** after the revision; its leftovers, not done: the
+settle-pass warning is not rate-limited (only pathological content
+reaches it), and no test pins that an Escape-closed menu still scrolls
+its out-of-view opener back into view.
+**Needs a human:** on real macOS, drag the Layers bar with a
+many-layer PSD in a short window, press its track, check it tracks the
+trackpad, hides when the window is tall, and that VoiceOver announces it
+sensibly.
+**Suggested next (0.147.0):** PSD layer masks and Grayscale.
 
 **Addendum 2026-10-08 (0.145.0) — scrolling panels.** Done as 0.144.1
 suggested, for the same real-macOS report. `WidgetTree` scroll

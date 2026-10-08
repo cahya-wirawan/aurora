@@ -244,6 +244,14 @@ impl<W> WidgetTree<W> {
         self.nodes.len()
     }
 
+    /// Every widget id in this tree, in no particular order — for a
+    /// crate-internal pass that must visit every widget of one kind
+    /// (`widgets::sync_linked_scrollbars`) without [`Self::paint_order`]'s
+    /// ordering work.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = WidgetId> + '_ {
+        self.nodes.keys().copied()
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
@@ -1306,20 +1314,44 @@ impl<W> WidgetTree<W> {
     /// **One level only:** a container nested inside another scroll
     /// container is scrolled, but the outer one is not then scrolled to
     /// reveal the inner. No shipped panel nests scroll containers.
+    ///
+    /// **Two things are left alone (0.146.0), each returning `false`:**
+    ///
+    /// - **A target inside a popover**, unless a scroll container lies
+    ///   inside that same popover: the walk stops at the popover root, the
+    ///   same rule [`Self::scroll_container_at`] applies to the wheel. An
+    ///   open dropdown list floats above its panel and is not part of the
+    ///   panel's scrolling content, so focusing one of its rows must not
+    ///   scroll the panel that owns the dropdown.
+    /// - **A container that is not a viewport onto anything**: zero height
+    ///   (a collapsed panel's `Display::None` body) or wholly clipped away
+    ///   by its own clipping ancestors. Such a container reports a
+    ///   [`Self::scroll_range`] of `0.0` while it keeps its offset (see
+    ///   `clamp_scrolls`), so scrolling it here would clamp that saved
+    ///   offset to zero and expanding the panel would come back at the top.
     pub fn scroll_into_view(&mut self, id: WidgetId) -> bool {
         let Some(target) = self.bounds(id) else {
             return false;
         };
+        if self.layer(id) == Some(PaintLayer::Popover) {
+            return false;
+        }
         let mut current = self.parent(id);
         while let Some(ancestor) = current {
             if self.is_scrollable(ancestor) == Some(true) {
                 break;
+            }
+            if self.layer(ancestor) == Some(PaintLayer::Popover) {
+                return false;
             }
             current = self.parent(ancestor);
         }
         let (Some(container), Some(view)) = (current, current.and_then(|c| self.bounds(c))) else {
             return false;
         };
+        if view.height == 0 || self.visible_rect(container, view).is_none() {
+            return false;
+        }
         let Some(offset) = self.scroll_y(container) else {
             return false;
         };
@@ -2762,6 +2794,111 @@ mod tests {
             !tree.scroll_into_view(body),
             "nothing scrolls the container itself"
         );
+    }
+
+    /// 0.145.0 review follow-up: a collapsed (zero-height) body keeps its
+    /// offset through `clamp_scrolls`, but `scroll_into_view` used to clamp
+    /// it against that body's range of `0.0` -- an active-layer change
+    /// while Layers was collapsed lost the saved scroll position.
+    #[test]
+    fn scroll_into_view_leaves_a_collapsed_container_and_its_saved_offset_alone() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let Some(&row7) = rows.get(7) else {
+            unreachable!("ten rows");
+        };
+        assert!(scroll_to(&mut tree, body, 60.0));
+        let Some(shown) = tree.style(body).cloned() else {
+            unreachable!("laid out");
+        };
+        let hidden = Style {
+            display: taffy::Display::None,
+            ..shown.clone()
+        };
+        if let Err(err) = tree.set_style(body, hidden) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.bounds(body).map(|rect| rect.height), Some(0));
+        assert_eq!(tree.scroll_y(body), Some(60.0), "collapsing keeps it");
+        assert!(!tree.scroll_into_view(row7));
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(60.0),
+            "a zero-height container is not scrolled, so its offset survives"
+        );
+        if let Err(err) = tree.set_style(body, shown) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_y(body), Some(60.0), "expanding restores it");
+    }
+
+    /// The other half of the same guard: a container laid out wholly
+    /// inside a clipping ancestor's clipped-away area shows nothing, so it
+    /// is not scrolled either.
+    #[test]
+    fn scroll_into_view_leaves_a_clipped_away_container_alone() {
+        let column = |size: Style| Style {
+            flex_direction: FlexDirection::Column,
+            flex_shrink: 0.0,
+            ..size
+        };
+        let clipping = |size: Style| Style {
+            overflow: taffy::Point {
+                x: Overflow::Hidden,
+                y: Overflow::Hidden,
+            },
+            ..column(size)
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), column(sized(200.0, 300.0)), "root");
+        let insert = |tree: &mut WidgetTree<&'static str>, parent, style| match tree.insert(
+            parent,
+            style,
+            label("w"),
+            "w",
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let clip = insert(&mut tree, root, clipping(sized(200.0, 50.0)));
+        let _spacer = insert(&mut tree, clip, column(sized(200.0, 60.0)));
+        let body = insert(&mut tree, clip, clipping(sized(200.0, 100.0)));
+        if let Err(err) = tree.set_scrollable(body, true) {
+            unreachable!("{err:?}");
+        }
+        let rows: Vec<WidgetId> = (0..10)
+            .map(|_| insert(&mut tree, body, column(sized(200.0, 20.0))))
+            .collect();
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(body), Some(100.0));
+        let Some(&row7) = rows.get(7) else {
+            unreachable!("ten rows");
+        };
+        assert!(!tree.scroll_into_view(row7));
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+    }
+
+    /// 0.145.0 review follow-up: `scroll_into_view` now stops at a
+    /// popover, as `scroll_container_at` already did -- focus on an open
+    /// dropdown's row must not scroll the panel that owns the dropdown.
+    #[test]
+    fn scroll_into_view_does_not_scroll_a_popovers_owner() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let Some(&row0) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        let popover = ins(&mut tree, row0, "popover");
+        pop(&mut tree, popover);
+        place(&mut tree, popover, bounds(0, 150, 200, 40));
+        let item = ins(&mut tree, popover, "item");
+        place(&mut tree, item, bounds(0, 160, 200, 20));
+        assert!(!tree.scroll_into_view(item), "inside a popover");
+        assert!(!tree.scroll_into_view(popover), "the popover root itself");
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+        let Some(&row7) = rows.get(7) else {
+            unreachable!("ten rows");
+        };
+        assert!(tree.scroll_into_view(row7), "a plain row still scrolls");
     }
 
     #[test]

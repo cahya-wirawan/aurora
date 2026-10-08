@@ -436,6 +436,42 @@ pub fn gallery_light_dismiss(
     Ok(closed)
 }
 
+/// Closes the gallery's open menu and open dropdown list unconditionally
+/// (0.146.0) — what a panel scroll does to every open popover, since the
+/// control that opened one may just have scrolled out of view. Focus that
+/// was inside the closed menu goes back to the "Open menu" button, the
+/// same hand-back [`gallery_light_dismiss`] gives. Returns whether
+/// anything closed.
+///
+/// # Errors
+///
+/// Whatever `close_menu`/`set_dropdown_open` refuses.
+pub fn gallery_close_popovers(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    gallery: &mut GalleryPanel,
+) -> Result<bool, WidgetError> {
+    forget_stale_menu(tree, gallery);
+    let mut closed = false;
+    if let Some(menu) = gallery.open_menu {
+        let focus_was_inside = focus
+            .focused()
+            .is_some_and(|focused| tree.is_within(menu, focused));
+        widgets::close_menu(tree, menu)?;
+        gallery.open_menu = None;
+        closed = true;
+        if focus_was_inside {
+            focus.focus(tree, gallery.menu_button)?;
+        }
+    }
+    if widgets::dropdown_state(tree, gallery.dropdown)?.is_open() {
+        widgets::set_dropdown_open(tree, gallery.dropdown, false)?;
+        closed = true;
+    }
+    focus.validate(tree);
+    Ok(closed)
+}
+
 /// Reports the pointer's position (`None`: off the window, or owned by
 /// something else — a drag, a modal) to the demo button's tooltip:
 /// hovering the button arms it, hovering the shown tooltip itself keeps

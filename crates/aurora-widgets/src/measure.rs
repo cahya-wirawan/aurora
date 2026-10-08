@@ -20,7 +20,9 @@ use taffy::Size;
 
 use crate::text::{label_style, sanitize_label};
 use crate::tree::WidgetTree;
-use crate::widgets::{WidgetKind, checkbox_metrics, row_height};
+use crate::widgets::{
+    WidgetKind, checkbox_metrics, row_height, settle_linked_scrollbars, sync_linked_scrollbars,
+};
 
 /// What measuring needs: the application's one text engine, the token
 /// scales the widgets were built from, and the display's scale factor —
@@ -76,6 +78,19 @@ pub fn measure_widget(kind: &WidgetKind, measure: &mut TextMeasure<'_>) -> Optio
 /// the one entry point a production caller uses, so a missing text engine
 /// (the UI font failed to load) degrades to unlabelled boxes rather than
 /// to a different code path.
+///
+/// **Linked scrollbars follow the layout (0.146.0).** After laying out,
+/// every scrollbar linked to a scroll container
+/// ([`crate::widgets::link_scrollbar`]) takes that container's new offset,
+/// range and height ([`sync_linked_scrollbars`]); when one is shown or
+/// hidden — which changes its container's width — the tree is laid out
+/// exactly once more, never a third time, and a settling pass
+/// ([`settle_linked_scrollbars`]) syncs the bars again without showing or
+/// hiding any, so the drawn bars always match the final layout. For content
+/// whose height does not shrink as it narrows (text, rows, every shipped
+/// panel) one extra layout is always enough; content that does shrink can
+/// leave a bar in its first-pass state, logged as a warning. Plain
+/// [`WidgetTree::compute_layout`] does none of this.
 pub fn compute_text_layout(
     tree: &mut WidgetTree<WidgetKind>,
     width: f32,
@@ -83,12 +98,34 @@ pub fn compute_text_layout(
     text: Option<TextMeasure<'_>>,
 ) {
     match text {
-        None => tree.compute_layout(width, height),
+        None => {
+            tree.compute_layout(width, height);
+            if sync_linked_scrollbars(tree) {
+                tree.compute_layout(width, height);
+                warn_if_unsettled(settle_linked_scrollbars(tree));
+            }
+        }
         Some(mut measure) => {
             tree.compute_layout_with(width, height, &mut |kind| {
                 measure_widget(kind, &mut measure)
             });
+            if sync_linked_scrollbars(tree) {
+                tree.compute_layout_with(width, height, &mut |kind| {
+                    measure_widget(kind, &mut measure)
+                });
+                warn_if_unsettled(settle_linked_scrollbars(tree));
+            }
         }
+    }
+}
+
+/// The diagnostic for [`settle_linked_scrollbars`]'s one unstable case.
+fn warn_if_unsettled(unsettled: bool) {
+    if unsettled {
+        tracing::warn!(
+            "a linked scrollbar's visibility did not settle in two layouts: content \
+             whose height shrinks as it narrows; the bar keeps its first-pass visibility"
+        );
     }
 }
 
