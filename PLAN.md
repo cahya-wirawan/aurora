@@ -30175,6 +30175,25 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-10-08 (0.144.1) — Layers rows overlapped in a short
+window.** First real-macOS PSD run (a many-layer text-placeholder PSD):
+the file opened with its layers, but with the window low the Layers
+panel's rows overlapped — a group's child rows painted over the rows
+after the group. Cause: tree rows kept flex's default `flex_shrink: 1`,
+so in a container shorter than its rows a group row shrank to its
+one-row minimum while its children (laid out inside it) kept their own
+height. Fix: `tree_view::style` sets `flex_shrink: 0`, so rows that
+don't fit run off the bottom of the clipping panel body instead.
+Regression test `rows_never_overlap_in_a_container_shorter_than_its_rows`
+reproduces the screenshot exactly without the fix (row tops
+`[0, 21, 21, 42, 42, 63, 63, 84]`). Full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1`: 2,684 passed, 0 failed. **Still open, and now
+the visible limit:** the Layers list does not scroll, so rows past the
+bottom of the panel are unreachable until the window is taller — a
+scrolling panel body (wheel + the existing scrollbar widget) is the
+suggested next step. **Needs a human:** re-check the same PSD in a short
+window.
+
 **Addendum 2026-10-08 (0.144.0) — PSD/PSB layered read.** Done as
 0.143.1 suggested. Full account: M1.8's open-file bullet, "Update
 0.144.0". **Needs a human:** open the PSD that showed nothing on macOS,
