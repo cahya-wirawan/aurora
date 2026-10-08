@@ -30180,8 +30180,15 @@ here so they are not silently lost between phases.
 0.144.0". **Needs a human:** open the PSD that showed nothing on macOS,
 plus one with groups and one 16-bit file, and compare against Photoshop;
 check the "Opened With Changes" dialog reads well and is announced.
+**Review revision (same version):** a critic and a red team (46k
+hostile cases, 0 panics) found the view anchored to a cropped layer,
+an unreachable undo history, no active layer in all-groups files, and
+two resource amplifications (2 GiB from 144 bytes; 81 s from duplicate
+channels) — all fixed, measured gate 2,683 passed, judge PASS 0.903.
 **Suggested next (0.145.0):** apply layer masks (already decoded into
 `PsdMask`) through `add_mask`/`write_mask_coverage`, and Grayscale.
+Also named: decode off the UI thread and stream the file through the
+tile store (invariants §7.3.4/§7.3.1), and PSD write.
 
 **Addendum 2026-10-08 (0.143.1) — never fail silently when opening a
 file.** Patch for the real-macOS `.psd` report: refused opens and saves
