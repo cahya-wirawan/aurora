@@ -246,9 +246,10 @@ pub enum IoError {
     #[error("unsupported Photoshop file version {0}")]
     UnsupportedPsdVersion(u16),
     /// The file uses a colour mode this reader does not decode — only
-    /// RGB is read (0.144.0).
+    /// RGB and Grayscale are read (0.144.0, Grayscale 0.147.0).
     #[error(
-        "the file uses the {name} colour mode (code {code}); only RGB can be opened",
+        "the file uses the {name} colour mode (code {code}); only RGB and Grayscale can be \
+         opened",
         name = psd_color_mode_name(*.0),
         code = .0
     )]

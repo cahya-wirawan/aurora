@@ -26,7 +26,62 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.146.0): the dock panels have a visible
+**Latest (2026-10-08, 0.147.1): the History panel shows the user's
+steps.** A real-macOS report ("I don't see the changes in history
+panel"): the panel listed `History::journal_descriptions()`, the
+structural crash-recovery journal, so brush and eraser strokes (which
+live in `aurora_brush::PixelHistory`) never appeared, an undo or redo
+*appended* a row (both are journalled), only structural edits refreshed
+it, no row marked the current step — and, found during the round, no
+History row drew its text at all (`aurora_widgets::text_runs` drew a
+`ListRow` label only under a menu, dropdown or the palette). Now the
+panel is `aurora-app`'s `UndoOrder` sequence — the one Ctrl+Z walks —
+after an "Open"/"New Document" origin row: each stroke is one "Brush
+Stroke"/"Eraser Stroke" row (the label is fixed at the commit and
+travels with the step; `PixelHistory` still records no tool), each
+structural step keeps its journal description
+(`History::last_journal_description`, new). The newest applied step's
+row is `selected`, undone rows are `ListRowState::disabled`
+(`text.disabled`, no new token) and carry the accesskit state
+description "Undone"; undo/redo move the marker, a new edit drops the
+undone rows, and the panel refreshes on every stroke commit, undo, redo,
+structural edit and open — never per dab — and scrolls the current row
+into view. Cap kept: 1000 steps plus "… N earlier/later steps omitted".
+20 mutations, 20 killed (four only after a test was added). Full gate
+before the review revision: 2,770 passed, 0 failed, 0 skipped on the
+RTX 3090; after it, re-measured: **2,774 passed, 0 failed, 0 skipped**
+(`AURORA_REQUIRE_GPU=1`), judge round 2 **PASS 0.92**. Tested headlessly only — **not verified on real macOS or
+with a screen reader. Needs a human:** paint, undo and redo on macOS and
+watch History. Clicking a row does nothing yet. Details: "Next action",
+addendum 0.147.1.
+
+**Previously (2026-10-08, 0.147.0): PSD layer masks are applied, and
+Grayscale PSDs open.** A PSD layer's or group's user mask (channel `-2`)
+becomes a real `aurora_doc::LayerMask` with its coverage written into
+the tile store, with Photoshop's semantics: the rectangle is in document
+coordinates and the default colour fills outside it (hidden → the Aurora
+mask bounds are the PSD rectangle; shown → the layer's own bounds, the
+rest left unpainted), the disabled flag attaches the mask *disabled*,
+the (obsolete) invert flag is baked into the coverage, 16-bit masks keep
+their full depth. The "position relative to layer" flag does not move
+the mask (psd-tools ignores it too; reported where the two readings
+differ). Density/feather, vector masks and Photoshop's combined "real"
+mask stay listed in "Opened With Changes"; plain masks no longer are.
+Coverage goes through the tile store tile by tile (new
+`aurora_doc::write_mask_coverage_region`), written by `aurora-app` only
+after the outgoing document's tiles are swept (masks after pixels); the
+tree side is `History::add_imported_mask`. Grayscale (colour mode 1,
+8/16-bit) opens layered, grey expanded to R = G = B and tagged sRGB like
+RGB; Bitmap/Indexed/Duotone/CMYK/Lab stay refused by name. Corpus: 272
+files, 235 open (was 217), 37 unsupported, 0 damaged; 889/889 layer
+pixel sums (161 Grayscale) and 215/215 kept masks match psd-tools.
+18 mutations, 18 killed. Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`): 2,758 passed, 0 failed, 0 skipped; judge PASS
+≈0.92. **Not yet verified on real hardware** — compare a
+masked and a Grayscale PSD against Photoshop on macOS. Details: "Next
+action", addendum 0.147.0.
+
+**Previously (2026-10-08, 0.146.0): the dock panels have a visible
 scrollbar.** Every docked panel's body now sits in a non-scrolling
 `[body | scrollbar]` row (`PanelHandle::viewport`, `PanelHandle::
 scrollbar`), so the bar never moves with the content. It is the existing
@@ -7903,6 +7958,12 @@ structural design work.
   `cargo test --workspace --doc`, and `cargo doc --workspace --no-deps
   --all-features` all clean.
 
+  **Update 0.147.1 — History lists the user's undoable steps.** Strokes
+  and structural steps in `UndoOrder` (Ctrl+Z) order after an origin
+  row, labels drawn, current step selected, undone steps dimmed, undo
+  and redo move the marker. Click-to-jump still open; not yet verified
+  on real macOS. See "Next action", addendum 0.147.1.
+
   **History panel rows have a real, hittable size, 2026-09-02 (0.77.2)**
   — a latent bug in already-landed code, hence the patch bump. A History
   row was a `WidgetKind::Container` carrying `Style::default()`,
@@ -8829,6 +8890,52 @@ structural design work.
   (export is unaffected — `canvas_size` comes from the header); a
   per-open memory ceiling tied to available RAM; check whether a
   duplicate `-2`/`-3` mask channel is decoded once only.
+
+  **Update 0.147.0 — user masks applied; Grayscale.** `decode_mask` now
+  returns a mask only when the record has a `-2` channel (mask data
+  without one describes only a vector mask), and only the *first* `-2`
+  is decoded (`find`) — answering the carried duplicate-channel item.
+  Groups keep theirs (`PsdNode::Group { mask }`). `build_document`'s
+  `Builder::attach_mask` maps the PSD mask onto Aurora's model (inside
+  `LayerMask::bounds` unpainted = `1.0`, outside = `0.0`): effective
+  default hidden → bounds = the PSD rectangle; shown → bounds = the
+  layer's canvas-anchored bounds (the canvas for a group) and only the
+  overlap with the PSD rectangle is queued (`PsdDocument::masks`,
+  `PsdMaskPixels { layer, offset, width, height, coverage }`, cropped,
+  invert baked in). Disabled → `History::set_mask_enabled(false)`. The
+  tree edit is `History::add_imported_mask` (journal and undo entries
+  identical to `add_mask`, no store; documented as import-only — the
+  caller sweeps). `aurora_io::write_psd_mask` (= `psd::write_mask_pixels`)
+  writes one queued mask through `aurora_doc::write_mask_coverage_region`
+  (one `get_mut` and one `mark_dirty` per tile, closure-supplied values,
+  clamped, NaN → `1.0`). `aurora-app`'s `replace_document_pixels` takes
+  the masks and writes them after the sweep and the pixels; a failed
+  mask counts toward the "could not be loaded" report line. New report
+  notes: `MaskParametersNotApplied` (density < 255 or feather ≠ 0, read
+  in psd-tools' order after the 36-byte "real" fields), `RealMaskNotUsed`
+  (a `-3` channel), `MaskRelativePosition` (flag bit 0 on a layer not at
+  the origin); `MaskNotApplied` is gone; a mask rectangle past the
+  document range is now reported as unreadable instead of silently
+  dropped. Grayscale: `Header::color_mode`, `color_planes()`; channel 0
+  is grey and 1/2 are unknown channels; `replicate_gray` after decode;
+  the merged image maps plane 1 to alpha when merged transparency is
+  on; `sGray` counts as sRGB for the ICC note. `UnsupportedPsdColorMode`'s
+  text now says "only RGB and Grayscale can be opened". **Evidence:** 20
+  new `aurora-io` tests (masks: both defaults × 4 compressions with a
+  rectangle off the canvas, far outside, disabled, inverted, 16-bit ×
+  4 compressions, relative flag, density/feather, real mask, group mask;
+  hostile: empty/inverted rect, past the document range, a 16,000² rect
+  with a 4-byte channel × 4 compressions (dropped, < 2 s) and a 30,000²
+  one (`PsdPixelBudget`), wrong-depth and truncated RLE channels;
+  Grayscale: both depths × 4 compressions with alpha, mask, unknown
+  channels, merged fallback with and without alpha, every refused mode,
+  the real 8- and 16-bit fixtures; the truncation/mutation sweeps gained
+  a Grayscale file with a parameterised mask; a document-sized-mask
+  timing test), 3 `aurora-doc` tests (`write_mask_coverage_region` ×2,
+  `add_imported_mask`), 3 `aurora-app` tests through
+  `open_psd_document` → `replace_document_pixels` → `composite_document`.
+  New committed fixture `4x4_16bit_grayscale.psd` (psd-tools, sha256 in
+  `PROVENANCE.md`). Corpus and mutations: see addendum 0.147.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30227,6 +30334,237 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.147.1) — the History panel showed no strokes
+and never marked the current step.** Reported on real macOS: "I don't
+see the changes in history panel". **Cause:**
+`aurora_ui::populate_history_panel` listed
+`History::journal_descriptions()`, the structural crash-recovery
+journal. Strokes live in `aurora_brush::PixelHistory`, a separate
+store `aurora-app` interleaves with structural steps through
+`UndoOrder`, so they never appeared; `refresh_history_panel` ran only
+after structural edits; undo and redo are themselves journalled, so
+each *added* a row; nothing set `ListRowState::selected`; and History
+rows drew no text at all — `aurora_widgets::text_runs` drew a
+`ListRow`'s label only under a menu, a dropdown list or the command
+palette, so the panel was visually empty whatever it held (the round's
+plan assumed labels were drawn; reading `row_label` showed they were
+not). **Fix:** `UndoOrder` now carries one label per step
+(`undo_labels`/`redo_labels`, index-aligned, moved between the stacks by
+`step_back`/`step_forward`; a tag pushed directly gets its kind's
+generic label on the next sync). A stroke's label ("Brush Stroke",
+"Eraser Stroke") is fixed in `commit_ending_drag`, where the tool is
+known — no change to `aurora-brush`; a structural step's is
+`History::last_journal_description()` (new, `aurora-doc`) at record
+time, since the undo stack holds inverses. `populate_history_panel` now
+takes an origin label and `&[HistoryStep]` and returns the current row:
+origin ("Open" for any opened file, "New Document" at startup), applied
+steps oldest first, then undone steps in redo order; the newest applied
+row is `selected` (origin when none), undone rows `disabled`.
+Accessibility: every row reports `selected` true/false; an undone row
+keeps its plain label and carries accesskit `state_description`
+"Undone" (chosen over a "(undone)" label suffix so drawn text and name
+agree), and is not accesskit-disabled, since redo can reach it. Drawing:
+`row_label` now also draws a plain list row that opts in with
+`ListRowState::draws_label` (History rows do; the read-only Properties
+rows do not and stay undrawn — the opt-in replaced a first-draft rule
+keyed on accesskit `is_selected()`, review item I4). Refresh: every successful undo/redo (pixel
+and structural), every stroke or move commit
+(`commit_drag_into_history`, only when a step was recorded — never per
+dab, not for a pan), New/Delete Layer, layer-control commits, and
+`replace_document`. Scroll: `Workspace::history_current` records the
+current row and `follow_history_row` scrolls it into view after each
+refresh (once per change, like `follow_scroll`). Cap unchanged in
+effect: `aurora_doc::MAX_DESCRIPTIONS` (now `pub`) steps, plus an
+"… N earlier steps omitted" row; the window slides back so the current
+step is never cut off, with a trailing "… N later steps omitted".
+**Changed claims:** `an_opened_document_cannot_be_undone_and_the_history_
+panel_lists_its_journal` is now `..._starts_at_open` (one current "Open"
+row; the intent — an opened file is the undo baseline — kept);
+`run_command_undo_reverts_a_bounds_change_and_refreshes_the_history_
+panel` and New Layer's row-count assertion now count steps, not journal
+entries. **Mutations** (each file backed up, mutated, tested with
+`cargo test -p aurora-ui` and/or `AURORA_REQUIRE_GPU=1 cargo test -p
+aurora-app --lib` on the RTX 3090, restored, sha256 verified):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | stroke commit does not refresh | killed (3 app tests) |
+| M2 | marker one row late | killed (4 ui + 4 app) |
+| M3 | undone rows not dimmed | killed (3 ui + 3 app) |
+| M4 | undo/redo rows listed twice (an undo adds rows) | killed (5 app) |
+| M5 | applied steps reversed (interleave order) | killed (4 app) |
+| M6 | new edit keeps the redo steps (no truncation) | killed (1 app) |
+| M7 | pixel undo does not refresh | killed (2 app) |
+| M8 | structural redo does not refresh | **survived**, then killed after the interleave test gained a redo walk |
+| M9 | eraser stroke labelled "Brush Stroke" | killed (4 app) |
+| M10 | origin row never selected | killed (1 ui + 6 app) |
+| M11 | cap window ignores the current step | killed (1 ui) |
+| M12 | current row never scrolled into view | killed (1 app) |
+| M13 | History rows draw no label | killed (1 ui) |
+| M14 | undo drops the step's label | killed (2 app) |
+
+**Disclosed:** click-to-jump is out of scope — a row click does nothing.
+`history_steps` is linear in the session's step count before the cap
+applies (one `(label, undone)` pointer pair per step, collected on every
+refresh, i.e. per committed stroke — not windowed, see I3 below); the rebuild itself is bounded at 1002 rows
+but is still a whole-panel rebuild on the UI thread per step. Startup's
+"New Document" and every open's "Open" are fixed strings (no document
+name). Labels of directly pushed tags (tests only) are generic ("Pixel
+Edit", "Layer Change"). A structural step's label is the last journal
+entry at record time, which assumes each recorded step ends with its own
+entry (true of every current call site). Screen-reader behaviour of
+`state_description` is unverified. **Needs a human: paint, undo and redo
+on macOS and watch History.** **Suggested next:** click-to-jump (a row
+click undoes/redoes to that step; rows then become a `ListBox` and get
+`Action::Click`), then mask density (0.148.0).
+
+**Review revision (0.147.1).** The candidate passed the full gate
+(fmt, layering, style, `check --locked`, clippy, `AURORA_REQUIRE_GPU=1
+cargo test --workspace` **2,770 passed, 0 failed, 0 skipped**, strict
+rustdoc, `cargo deny`); the judge returned REVISE (0.88). After the
+revision the full gate was re-run on the revised tree: all steps green,
+**2,774 passed, 0 failed, 0 skipped**; judge round 2: **PASS 0.92**, no
+blocking issue. Outcomes:
+- **I1 (medium), fixed.** Three sites called `commit_ending_drag`
+  directly and never refreshed History: `perform_undo_redo` (every
+  palette/keyboard command, so a Redo or tool switch while a stroke was
+  still held recorded the stroke and cleared redo but left the panel
+  stale), `press_layer_row`, and `perform_layer_command` (including its
+  early return when New/Delete is refused). All three now go through
+  `commit_drag_into_history`. New tests, one per site:
+  `a_command_arriving_mid_stroke_shows_the_committed_stroke_in_history`
+  (Redo and `SelectTool`, through the real `perform_undo_redo`),
+  `pressing_a_layer_row_mid_stroke_shows_the_committed_stroke_in_history`
+  and `a_refused_layer_command_still_shows_the_stroke_it_committed`
+  (the early-return path).
+- **I2 (low), fixed.** `refresh_history_panel`'s doc now describes a
+  rebuild after every recorded step (strokes included), one row per
+  `UndoOrder` step plus the origin row, up to 1002.
+- **I3 (low), disclosed, not windowed.** Windowing `history_steps`
+  would mean passing the omitted counts into `populate_history_panel`
+  separately; the per-refresh cost is one pointer pair per session step,
+  stated in the doc and above.
+- **I4 (low), fixed.** Drawing no longer keys on accesskit
+  `is_selected()`: `ListRowState` gained an explicit `draws_label` opt-in
+  (14 mechanical struct-literal sites in `aurora-widgets` set it
+  `false`), History rows set it, Properties rows keep the default
+  (pinned by the new `a_properties_row_that_does_not_opt_in_draws_no_label`).
+- **I5 (low), fixed.** The "… N earlier/later steps omitted" notices no
+  longer set an accesskit selection state (asserted in
+  `a_long_history_is_capped_and_never_cuts_off_the_current_step`). The
+  "later" notice keeps `disabled` and "Undone", which is accurate: the
+  window always contains the current step, so everything past its end is
+  a redo step.
+
+Revision mutations (same backup/restore/sha256 procedure):
+
+| # | Mutation | Result |
+|---|---|---|
+| M15 | `perform_undo_redo` back to bare `commit_ending_drag` | killed (`a_command_arriving_mid_stroke…`) |
+| M16 | `press_layer_row` back to bare `commit_ending_drag` | survived at first; killed after `pressing_a_layer_row_mid_stroke…` was added |
+| M17 | `perform_layer_command` back to bare `commit_ending_drag` | survived at first; killed after `a_refused_layer_command_still_shows…` was added |
+| M18 | `row_label` ignores `draws_label` | survived at first; killed after `a_properties_row_that_does_not_opt_in_draws_no_label` was added |
+| M19 | notice rows report `selected: false` again | killed (`a_long_history_is_capped…`) |
+| M13b | opted-in rows draw no label (M13 re-aimed at the new code) | killed (`history_rows_draw_their_labels…`) |
+
+**Addendum 2026-10-08 (0.147.0) — PSD layer masks applied; Grayscale
+PSDs.** Done as 0.146.0 suggested. Full account: M1.8's open-file
+bullet, "Update 0.147.0". **Choices, stated:** a disabled mask is
+attached disabled (the model supports it), not reported; the invert
+flag is baked into the coverage rather than set as `LayerMask::inverted`;
+flags bit 0 does not move the mask (psd-tools ignores it; every flagged
+mask in its corpus is on a layer at the origin, where the readings
+agree), reported only where they would differ; a Grayscale file gets
+RGB's assumption — tagged sRGB, an embedded profile ignored and reported
+unless it names sRGB or sGray, no profile → no note. **Corpus** (psd-tools
+1.17.4 fixtures, 272 files): 235 opened, 37 unsupported (CMYK, Lab,
+Bitmap, Indexed, Duotone, Multichannel, 32-bit), 0 refused as damaged
+(0.144.0: 217/55/0). Differential (one-off scripts in the session
+scratchpad, not committed): 889 of 889 comparable layers' pixel sums
+equal psd-tools' (161 of them Grayscale; 16-bit samples compared after
+the same `f16` rounding on both sides), and 215 of 215 masks on kept
+layers equal in rectangle, default colour, disabled flag and coverage
+sum; the other 141 psd-tools masks belong to adjustment/fill layers
+Aurora leaves out. **Open time (measured, this Linux box):** a 4096 ×
+4096 RGB layer with a document-sized ZIP mask — read + build 491 ms,
+coverage write into a real tile store 131 ms (debug build); 190 ms /
+98 ms in release. **Mutations (18, each file backed up to the session
+scratchpad's `mut147/`, restored and sha256-checked — all 18 restored
+OK; `aurora-app` runs with `AURORA_REQUIRE_GPU=1`). 18 killed:**
+
+| # | Mutation | Killed by (count) |
+|---|---|---|
+| M1 | default colour ignored (always shown) | 10, e.g. `a_mask_is_applied_with_either_default_colour_and_a_rect_partly_off_the_canvas` |
+| M2 | rectangle offset dropped on write | 3 app, e.g. `an_opened_psds_layer_mask_is_composited_with_photoshop_semantics` |
+| M3 | disabled flag ignored | 6, incl. `a_disabled_mask_is_attached_disabled_with_its_coverage` |
+| M4 | invert flag ignored | 3, incl. `an_inverted_mask_flips_its_samples_and_its_default_colour` |
+| M5 | grey not replicated to G/B | 4, incl. `real_grayscale_fixture_matches_psd_tools` |
+| M6 | 16-bit mask read as its high byte | 1, `a_sixteen_bit_mask_keeps_its_low_byte` |
+| M7 | out-of-range mask rect not reported | 1, `a_mask_rect_past_the_document_range_is_reported_and_not_applied` |
+| M8 | no crop to the attached bounds | 3 |
+| M9 | masks written before the sweep | 1, `an_opened_psds_mask_is_written_after_the_outgoing_masks_are_swept` |
+| M10 | masks never written by the app | 3 app |
+| M11 | bulk writer leaves the presence flag unset | 4 doc |
+| M12 | bulk writer uses tile-local coordinates | 2, incl. `write_mask_coverage_region_matches_per_texel_writes_across_tiles` |
+| M13 | group masks not attached | 1, `a_group_mask_is_applied_to_the_group_over_the_canvas` |
+| M14 | relative-position note even where readings agree | 1 |
+| M15 | mask parameters never detected | 3 |
+| M16 | Grayscale channels 1/2 taken as colour | 1 |
+| M17 | `add_imported_mask` does not journal | 1, `add_imported_mask_journals_and_undoes_like_add_mask` |
+| M18 | merged Grayscale alpha plane in the wrong slot | 1, `a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha` — **survived** until that test was added |
+
+**Disclosed:** mask density and feather are reported, not applied
+(psd-tools applies density); Photoshop's combined pixel + vector "real"
+mask (`-3`) is not used — the `-2` mask applies and the vector part is
+reported, so a layer with both shows less masking than Photoshop; flags
+bit 0's meaning is unverified against Photoshop on an offset layer; a
+group's shown-outside mask is bounded by the canvas, so group content
+off the canvas is clipped by it (invisible today, visible after a move);
+mask coverage costs a full RGBA `f16` texel per pixel (the existing
+`aurora_doc::mask` trade-off) and a document-sized mask doubles that
+layer's tile memory; the decode is still whole-file in memory and on the
+UI thread (§7.3.1/§7.3.4, unchanged); a mask that fails to write is
+counted as an unwritten *layer* in the report wording; masks are applied
+through the CPU compositor path — whether a masked flat document still
+takes the GPU fast path was not re-examined this round; nothing paints
+or undoes mask pixels yet. Indexed, Duotone and Bitmap are refused, not
+converted. The app-level tests build PSDs with a small hand-rolled
+writer in `aurora-app`'s tests (the `aurora-io` writer is `cfg(test)`
+there); `App::open_psd_file`'s own new argument threading is covered by
+inspection only, like the rest of `App`. **Needs a human:** on real
+macOS, open a PSD with layer and group masks (default black and white,
+one disabled, one partly off the canvas) and a Grayscale PSD (8- and
+16-bit, with transparency and a mask) and compare each side by side
+with Photoshop; check the "Opened With Changes" wording for density/
+feather and a combined mask. **Measured after the review:** full gate
+green on the RTX 3090 with `AURORA_REQUIRE_GPU=1` — fmt, layering, style
+lint, `check --locked`, clippy `-D warnings`, 2,758 passed, 0 failed,
+0 skipped, strict rustdoc and `cargo deny` clean. Independent judge:
+**PASS ≈0.92**, no critical/high issue. Its review points, recorded
+rather than fixed: (L-02, now measured) the corpus has 427 layers with a
+`-2` user mask and 17 (in 12 files) with a `-3` combined "real" mask,
+**none** with `real_flags.parameters_applied` — so psd-tools' effective
+mask is the `-2` one on every corpus layer, the 215/215 comparison was
+against that `-2` channel, and the "Photoshop prefers `-3`" case is
+untested by the corpus, not merely by the unit tests; (L-01) a
+hidden-by-default mask whose rect has an edge past ±300,000 is dropped
+and reported (`MaskUnreadable`), so that layer opens fully visible
+rather than hidden — fail-open, disclosed, not fixed; (L-03, not
+checked) the journal records the mask struct but not its coverage, so a
+crash recovery that replayed the journal without an `.aur` autosave
+would restore the mask reading fully visible — whether any recovery
+path does that is unverified; (L-04) a failed mask write is counted
+under the report's "layers could not be loaded" line; (L-05) whether a
+masked flat document still takes the GPU fast path was not
+re-examined. **Suggested next (0.147.1):** the History panel shows only
+the structural journal, so brush/eraser strokes never appear and undo
+adds a row instead of moving a marker (a real-macOS report, 2026-10-08)
+— one merged list in `UndoOrder` order, a current-step marker, redoable
+steps dimmed, refreshed after every stroke/undo/redo. **Then (0.148.0):** apply mask
+density (psd-tools' `d·m + (1 − d)`), then vector masks (needs a path
+rasteriser — `aurora-vector`), or decode off the UI thread and stream
+layers through the tile store (§7.3.4/§7.3.1).
 
 **Addendum 2026-10-08 (0.146.0) — a visible panel scrollbar.** Done as
 0.145.0 suggested. **Shape:** `insert_panel` now builds `root → [header,

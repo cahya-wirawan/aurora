@@ -639,7 +639,7 @@ fn extra_channels_and_adjustment_layers_are_reported() {
 }
 
 #[test]
-fn a_layer_mask_is_decoded_but_reported_as_not_applied() {
+fn a_layer_mask_is_decoded_and_no_longer_reported() {
     let bytes = TestPsd::new(1, 2, 2, 8)
         .with(|p| {
             p.layers.push(
@@ -664,11 +664,7 @@ fn a_layer_mask_is_decoded_but_reported_as_not_applied() {
         mask.coverage.as_deref(),
         Some([f16::ONE, f16::ZERO].as_slice())
     );
-    assert!(
-        file.report().items.iter().any(|i| i.contains("layer mask")),
-        "{:?}",
-        file.report()
-    );
+    assert!(file.report().is_empty(), "{:?}", file.report());
 }
 
 // ---------------------------------------------------------------------
@@ -911,6 +907,23 @@ fn sweep_fixtures() -> Vec<Vec<u8>> {
                 .write(),
         );
         files.push(
+            TestPsd::new(1, 3, 3, 8)
+                .with(|p| {
+                    p.color_mode = 1;
+                    p.channels = 1;
+                    p.layers = vec![
+                        TestLayer::gray("g", 0, 0, 2, 2, 8, &[[1, 255], [2, 0], [3, 9], [4, 255]])
+                            .with(|l| {
+                                l.compression = compression;
+                                l.mask = Some((1, 1, 3, 3, 0, 0x15));
+                                l.mask_tail = Some(vec![0x03, 9, 0, 0, 0, 0, 0, 0, 0, 1]);
+                                l.channels.push((-2, vec![5, 6, 7, 8]));
+                            }),
+                    ];
+                })
+                .write(),
+        );
+        files.push(
             TestPsd::new(1, 2, 2, 8)
                 .with(|p| {
                     p.merged = Some(vec![vec![1, 2, 3, 4]; 3]);
@@ -1098,10 +1111,9 @@ fn real_unsupported_fixtures_give_their_specific_errors() {
         decode(fixture!("4x4_8bit_lab.psd")),
         Err(IoError::UnsupportedPsdColorMode(9))
     ));
-    assert!(matches!(
-        decode(fixture!("4x4_8bit_grayscale.psd")),
-        Err(IoError::UnsupportedPsdColorMode(1))
-    ));
+    // Grayscale opens since 0.147.0 — see
+    // `real_grayscale_fixture_matches_psd_tools`.
+    assert!(decode(fixture!("4x4_8bit_grayscale.psd")).is_ok());
 }
 
 #[test]
@@ -1569,4 +1581,597 @@ fn write_into_store_at_refuses_an_overflowing_offset() {
         "{result:?}"
     );
     assert_eq!(store.resident_len(), 0);
+}
+
+// ---------------------------------------------------------------------
+// 0.147.0: user masks applied, and Grayscale
+// ---------------------------------------------------------------------
+
+/// A mask as `(top, left, bottom, right, default colour, flags)`, the
+/// test writer's own tuple.
+type MaskSpec = (i32, i32, i32, i32, u8, u8);
+
+/// The coverage the opened document gives `id` at document `(x, y)`,
+/// read the way `aurora-app`'s compositor reads it: `0.0` outside the
+/// attached mask's bounds, the written value where `masks` covers it,
+/// `1.0` (never painted) elsewhere inside. `None` without a mask.
+fn effective_mask(document: &PsdDocument, id: LayerId, x: i64, y: i64) -> Option<f32> {
+    let mask = document.layers.mask(id)?;
+    assert!(
+        !mask.inverted,
+        "the import bakes inversion into the coverage"
+    );
+    if !mask.bounds.contains_point(x, y) {
+        return Some(0.0);
+    }
+    let (lx, ly) = (x - mask.bounds.x, y - mask.bounds.y);
+    for written in document.masks.iter().filter(|m| m.layer == id) {
+        let (ox, oy) = (i64::from(written.offset.0), i64::from(written.offset.1));
+        if lx >= ox
+            && ly >= oy
+            && lx < ox + i64::from(written.width)
+            && ly < oy + i64::from(written.height)
+        {
+            let i = usize::try_from((ly - oy) * i64::from(written.width) + (lx - ox)).ok()?;
+            return written.coverage.get(i).map(|v| v.to_f32());
+        }
+    }
+    Some(1.0)
+}
+
+/// Photoshop's own reading of a user mask at document `(x, y)`: the
+/// stored sample inside the rectangle, the default colour outside, both
+/// inverted when flags bit 2 says so.
+fn photoshop_mask(spec: MaskSpec, samples: &[f32], x: i64, y: i64) -> f32 {
+    let (top, left, bottom, right, default, flags) = spec;
+    let (top, left, bottom, right) = (
+        i64::from(top),
+        i64::from(left),
+        i64::from(bottom),
+        i64::from(right),
+    );
+    let value = if x >= left && x < right && y >= top && y < bottom {
+        let i = usize::try_from((y - top) * (right - left) + (x - left)).unwrap_or(usize::MAX);
+        samples.get(i).copied().unwrap_or(f32::NAN)
+    } else if default == 0 {
+        0.0
+    } else {
+        1.0
+    };
+    if flags & 0x04 != 0 {
+        1.0 - value
+    } else {
+        value
+    }
+}
+
+/// One opaque 3×3 layer at `(1, 1)` on a 4×4 canvas (so its bounds are
+/// the canvas), carrying `spec` and the raw `-2` channel `plane`.
+fn masked_file(depth: u16, spec: MaskSpec, plane: Vec<u8>, compression: u16) -> TestPsd {
+    TestPsd::new(1, 4, 4, depth).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 1, 1, 3, 3, depth, &[[200, 100, 50, 255]; 9]).with(|l| {
+                l.mask = Some(spec);
+                l.channels.push((-2, plane));
+                l.compression = compression;
+            }),
+        );
+    })
+}
+
+/// Every in-layer point of `document`'s only layer agrees with
+/// Photoshop's reading of `spec`.
+fn assert_mask_matches_photoshop(document: &PsdDocument, spec: MaskSpec, samples: &[f32]) {
+    let id = root(&document.layers, 0);
+    for y in 1..4 {
+        for x in 1..4 {
+            let got = effective_mask(document, id, x, y);
+            let want = f(photoshop_mask(spec, samples, x, y));
+            assert_eq!(got, Some(want), "({x}, {y}) for {spec:?}");
+        }
+    }
+}
+
+#[test]
+fn a_mask_is_applied_with_either_default_colour_and_a_rect_partly_off_the_canvas() {
+    // 4×4 rectangle at (2, -1): two columns and one row off the canvas.
+    let plane: Vec<u8> = (0..16).map(|i| i * 16).collect();
+    let samples: Vec<f32> = plane.iter().map(|v| f32::from(*v) / 255.0).collect();
+    for compression in 0..=3 {
+        for default in [0, 255] {
+            let spec = (-1, 2, 3, 6, default, 0);
+            let document = doc(&masked_file(8, spec, plane.clone(), compression).write());
+            assert_mask_matches_photoshop(&document, spec, &samples);
+            let id = root(&document.layers, 0);
+            let Some(mask) = document.layers.mask(id) else {
+                unreachable!("mask attached");
+            };
+            assert!(mask.enabled);
+            // Hidden outside: the PSD rectangle itself. Shown outside: the
+            // layer's own bounds, with only the overlap written.
+            if default == 0 {
+                assert_eq!(mask.bounds, rect(2, -1, 4, 4));
+            } else {
+                assert_eq!(mask.bounds, rect(0, 0, 4, 4));
+                let [written] = document.masks.as_slice() else {
+                    unreachable!("one mask written");
+                };
+                assert_eq!(
+                    (written.offset, written.width, written.height),
+                    ((2, 0), 2, 3)
+                );
+            }
+            assert!(
+                report_text(&document).is_empty(),
+                "{}",
+                report_text(&document)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_mask_rect_far_outside_the_layer_hides_or_shows_all_of_it() {
+    for default in [0, 255] {
+        let spec = (100_000, 100_000, 100_002, 100_002, default, 0);
+        let document = doc(&masked_file(8, spec, vec![0; 4], 0).write());
+        assert_mask_matches_photoshop(&document, spec, &[0.0; 4]);
+        if default == 255 {
+            assert!(document.masks.is_empty(), "no overlap, nothing written");
+        }
+    }
+}
+
+#[test]
+fn a_disabled_mask_is_attached_disabled_with_its_coverage() {
+    let spec = (1, 1, 3, 3, 0, 0x02);
+    let document = doc(&masked_file(8, spec, vec![0, 64, 128, 255], 0).write());
+    let id = root(&document.layers, 0);
+    assert_eq!(document.layers.mask(id).map(|m| m.enabled), Some(false));
+    let samples = [0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+    assert_mask_matches_photoshop(&document, spec, &samples);
+    assert!(report_text(&document).is_empty());
+}
+
+#[test]
+fn an_inverted_mask_flips_its_samples_and_its_default_colour() {
+    for default in [0, 255] {
+        let spec = (1, 1, 3, 3, default, 0x04);
+        let document = doc(&masked_file(8, spec, vec![0, 64, 128, 255], 0).write());
+        let samples = [0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+        let id = root(&document.layers, 0);
+        for y in 1..4 {
+            for x in 1..4 {
+                let want = f16::from_f32(photoshop_mask(spec, &samples, x, y)).to_f32();
+                // Inverted in f16 (1 - v, both f16), so compare loosely by
+                // one f16 step.
+                let got = effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+                assert!(
+                    (got - want).abs() <= 1.0 / 1024.0,
+                    "({x}, {y}): {got} vs {want}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sixteen_bit_mask_keeps_its_low_byte() {
+    let values: [u16; 4] = [0x0000, 0x8000, 0x0101, 0xFFFF];
+    let plane: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let samples: Vec<f32> = values.iter().map(|v| f32::from(*v) / 65535.0).collect();
+    for compression in 0..=3 {
+        let spec = (1, 1, 3, 3, 0, 0);
+        let document = doc(&masked_file(16, spec, plane.clone(), compression).write());
+        assert_mask_matches_photoshop(&document, spec, &samples);
+    }
+}
+
+#[test]
+fn a_relative_position_flag_does_not_move_the_mask_and_is_reported_where_it_matters() {
+    // Layer at (1, 1): the two readings would differ, so it is reported.
+    let spec = (1, 1, 3, 3, 0, 0x01);
+    let document = doc(&masked_file(8, spec, vec![255; 4], 0).write());
+    assert_mask_matches_photoshop(&document, spec, &[1.0; 4]);
+    assert!(report_text(&document).contains("positioned relative"));
+    // A layer at the origin: the same place either way, nothing said.
+    let at_origin = TestPsd::new(1, 2, 2, 8)
+        .with(|p| {
+            p.layers.push(
+                TestLayer::pixels("o", 0, 0, 2, 2, 8, &two_by_two(8)).with(|l| {
+                    l.mask = Some((0, 0, 1, 1, 0, 0x01));
+                    l.channels.push((-2, vec![255]));
+                }),
+            );
+        })
+        .write();
+    assert!(report_text(&doc(&at_origin)).is_empty());
+}
+
+#[test]
+fn mask_density_or_feather_is_reported_and_the_default_parameters_are_not() {
+    let with_tail = |tail: Vec<u8>| {
+        let spec = (1, 1, 3, 3, 0, 0x10);
+        let mut file = masked_file(8, spec, vec![255; 4], 0);
+        if let Some(layer) = file.layers.first_mut() {
+            layer.mask_tail = Some(tail);
+        }
+        report_text(&doc(&file.write()))
+    };
+    assert!(with_tail(vec![0x01, 128]).contains("density or feather"));
+    let mut feather = vec![0x02];
+    feather.extend_from_slice(&2.5_f64.to_be_bytes());
+    assert!(with_tail(feather).contains("density or feather"));
+    assert!(with_tail(vec![0x01, 255]).is_empty());
+    assert!(with_tail(vec![0x00]).is_empty());
+    // Truncated parameter block: lenient, nothing to report.
+    assert!(with_tail(Vec::new()).is_empty());
+}
+
+#[test]
+fn a_real_user_mask_is_not_used_and_is_reported_while_the_user_mask_applies() {
+    let spec = (1, 1, 3, 3, 0, 0);
+    let mut file = masked_file(8, spec, vec![0, 255, 255, 0], 0);
+    if let Some(layer) = file.layers.first_mut() {
+        // Real flags (bit 4), real background, real rectangle 0,0,4,4.
+        let mut tail = vec![0x10, 255];
+        for v in [0_i32, 0, 4, 4] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-3, vec![255; 9]));
+    }
+    let document = doc(&file.write());
+    assert_mask_matches_photoshop(&document, spec, &[0.0, 1.0, 1.0, 0.0]);
+    assert!(report_text(&document).contains("combined version"));
+}
+
+#[test]
+fn a_group_mask_is_applied_to_the_group_over_the_canvas() {
+    let bytes = TestPsd::new(1, 4, 4, 8)
+        .with(|p| {
+            p.layers = vec![
+                TestLayer::divider(),
+                TestLayer::pixels("in", 0, 0, 2, 2, 8, &two_by_two(8)),
+                TestLayer::group("G", *b"norm").with(|l| {
+                    l.mask = Some((0, 0, 1, 2, 255, 0));
+                    l.channels.push((-2, vec![0, 128]));
+                }),
+            ];
+        })
+        .write();
+    let document = doc(&bytes);
+    let group = root(&document.layers, 0);
+    assert_eq!(
+        document.layers.mask(group).map(|m| m.bounds),
+        Some(rect(0, 0, 4, 4))
+    );
+    assert_eq!(effective_mask(&document, group, 0, 0), Some(0.0));
+    assert_eq!(
+        effective_mask(&document, group, 1, 0),
+        Some(f(128.0 / 255.0))
+    );
+    assert_eq!(effective_mask(&document, group, 3, 3), Some(1.0));
+    assert!(
+        report_text(&document).is_empty(),
+        "{}",
+        report_text(&document)
+    );
+}
+
+// -- Hostile masks ------------------------------------------------------
+
+#[test]
+fn an_empty_or_inverted_mask_rect_is_the_default_colour_everywhere() {
+    for (spec, want) in [
+        ((0, 0, 0, 0, 0, 0), 0.0),
+        ((0, 0, 0, 0, 255, 0), 1.0),
+        ((3, 3, 1, 1, 0, 0), 0.0),
+        ((3, 3, 1, 1, 255, 0), 1.0),
+    ] {
+        let document = doc(&masked_file(8, spec, Vec::new(), 0).write());
+        let id = root(&document.layers, 0);
+        for (x, y) in [(1, 1), (2, 3), (3, 3)] {
+            assert_eq!(effective_mask(&document, id, x, y), Some(want), "{spec:?}");
+        }
+        assert!(document.masks.is_empty());
+    }
+}
+
+#[test]
+fn a_mask_rect_past_the_document_range_is_reported_and_not_applied() {
+    let far = i32::try_from(aurora_core::MAX_DOCUMENT_ORIGIN).unwrap_or(i32::MAX) + 10;
+    let spec = (0, far, 2, far + 2, 0, 0);
+    let document = doc(&masked_file(8, spec, vec![0; 4], 0).write());
+    assert_eq!(document.layers.mask(root(&document.layers, 0)), None);
+    assert!(report_text(&document).contains("could not be read"));
+}
+
+#[test]
+fn a_huge_mask_rect_with_a_tiny_channel_is_refused_before_allocating() {
+    // Under the pixel budget: the channel is far too short for the
+    // rectangle, so the mask is dropped and reported without the
+    // rectangle's buffer ever being allocated.
+    let spec = (0, 0, 16_000, 16_000, 0, 0);
+    for compression in 0..=3 {
+        let started = std::time::Instant::now();
+        let document = doc(&masked_file(8, spec, vec![0; 4], compression).write());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(document.layers.mask(root(&document.layers, 0)), None);
+        assert!(report_text(&document).contains("could not be read"));
+        assert_eq!(document.pixels.len(), 1, "the layer itself still opens");
+    }
+    // Over it: the whole file is refused by the budget, not decoded.
+    let spec = (0, 0, 30_000, 30_000, 0, 0);
+    assert!(matches!(
+        read(&masked_file(8, spec, vec![0; 4], 0).write()),
+        Err(IoError::PsdPixelBudget { .. })
+    ));
+}
+
+#[test]
+fn a_truncated_or_wrong_depth_mask_channel_is_reported_and_dropped() {
+    // A 16-bit file's 2×2 mask stored with 8-bit samples (half the bytes).
+    let spec = (1, 1, 3, 3, 0, 0);
+    let document = doc(&masked_file(16, spec, vec![0, 64, 128, 255], 0).write());
+    assert_eq!(document.layers.mask(root(&document.layers, 0)), None);
+    assert!(report_text(&document).contains("could not be read"));
+    // An RLE mask whose rows run out.
+    let mut file = masked_file(8, spec, vec![1, 2, 3, 4], 1);
+    if let Some((_, plane)) = file
+        .layers
+        .first_mut()
+        .and_then(|l| l.channels.iter_mut().find(|(id, _)| *id == -2))
+    {
+        plane.truncate(1);
+    }
+    let document = doc(&file.write());
+    assert_eq!(document.layers.mask(root(&document.layers, 0)), None);
+    assert!(report_text(&document).contains("could not be read"));
+}
+
+// -- Grayscale -------------------------------------------------------------
+
+#[test]
+fn grayscale_layers_expand_to_rgb_at_both_depths_with_alpha() {
+    for depth in [8_u16, 16] {
+        let max: u16 = if depth == 16 { 0xFFFF } else { 255 };
+        let samples = [[0, max], [max / 3, max / 2], [max, 0], [7, max]];
+        for compression in 0..=3 {
+            let bytes = TestPsd::new(1, 2, 2, depth)
+                .with(|p| {
+                    p.color_mode = 1;
+                    p.channels = 1;
+                    p.lr16 = depth == 16;
+                    p.layers.push(
+                        TestLayer::gray("g", 0, 0, 2, 2, depth, &samples)
+                            .with(|l| l.compression = compression),
+                    );
+                })
+                .write();
+            let document = doc(&bytes);
+            let Some(image) = image_of(&document, root(&document.layers, 0)) else {
+                unreachable!("gray layer has pixels");
+            };
+            for (i, [v, a]) in samples.iter().enumerate() {
+                let (x, y) = (i as u32 % 2, i as u32 / 2);
+                let [gv, ga] = [*v, *a].map(|s| f(f32::from(s) / f32::from(max)));
+                assert_eq!(
+                    px(image, x, y),
+                    [gv, gv, gv, ga],
+                    "{depth}-bit {compression}"
+                );
+            }
+            assert!(
+                report_text(&document).is_empty(),
+                "{}",
+                report_text(&document)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_grayscale_layer_with_a_mask_masks_like_rgb() {
+    let bytes = TestPsd::new(1, 4, 4, 8)
+        .with(|p| {
+            p.color_mode = 1;
+            p.channels = 1;
+            p.layers.push(
+                TestLayer::gray("g", 1, 1, 3, 3, 8, &[[90, 255]; 9]).with(|l| {
+                    l.mask = Some((1, 1, 3, 3, 0, 0));
+                    l.channels.push((-2, vec![0, 64, 128, 255]));
+                }),
+            );
+        })
+        .write();
+    let document = doc(&bytes);
+    let samples = [0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+    assert_mask_matches_photoshop(&document, (1, 1, 3, 3, 0, 0), &samples);
+}
+
+#[test]
+fn grayscale_ignores_colour_channels_one_and_two_and_its_merged_image_is_grey() {
+    let bytes = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.color_mode = 1;
+            p.channels = 1;
+            p.layers.push(
+                TestLayer::gray("g", 0, 0, 1, 1, 8, &[[40, 255]])
+                    .with(|l| l.channels.push((1, vec![99]))),
+            );
+        })
+        .write();
+    let document = doc(&bytes);
+    let Some(image) = image_of(&document, root(&document.layers, 0)) else {
+        unreachable!("pixels");
+    };
+    assert_eq!(px(image, 0, 0), u8px(40, 40, 40, 255));
+    assert!(report_text(&document).contains("extra layer channel"));
+
+    // No layers: the merged grey plane, plus one more saved channel.
+    for compression in 0..=3 {
+        let flat = TestPsd::new(1, 2, 1, 8)
+            .with(|p| {
+                p.color_mode = 1;
+                p.channels = 2;
+                p.merged = Some(vec![vec![10, 250], vec![1, 2]]);
+                p.merged_compression = compression;
+            })
+            .write();
+        let document = doc(&flat);
+        let Some(image) = document.pixels.first().map(|p| &p.image) else {
+            unreachable!("background");
+        };
+        assert_eq!(px(image, 0, 0), u8px(10, 10, 10, 255));
+        assert_eq!(px(image, 1, 0), u8px(250, 250, 250, 255));
+        assert!(report_text(&document).contains("1 saved channel"));
+    }
+}
+
+#[test]
+fn bitmap_indexed_duotone_and_friends_stay_refused_by_name() {
+    for mode in [0_u16, 2, 4, 7, 8, 9] {
+        let bytes = TestPsd::new(1, 1, 1, 8)
+            .with(|p| p.color_mode = mode)
+            .write();
+        assert!(
+            matches!(decode(&bytes), Err(IoError::UnsupportedPsdColorMode(m)) if m == mode),
+            "mode {mode}"
+        );
+    }
+}
+
+/// psd-tools 1.17.4 reads this file as a 4×4 Grayscale "Gradient Fill 1"
+/// layer over an empty "Layer 1", with an empty, default-255 mask.
+#[test]
+fn real_grayscale_fixture_matches_psd_tools() {
+    let document = doc(fixture!("4x4_8bit_grayscale.psd"));
+    let tree = &document.layers;
+    assert_eq!(names(tree, tree.roots()), ["Gradient Fill 1", "Layer 1"]);
+    let fill = root(tree, 0);
+    let Some(image) = image_of(&document, fill) else {
+        unreachable!("the fill has pixels");
+    };
+    let grey = [
+        [24, 50, 95, 172],
+        [50, 23, 50, 94],
+        [95, 51, 24, 50],
+        [173, 95, 50, 24],
+    ];
+    for (y, row) in grey.iter().enumerate() {
+        for (x, v) in row.iter().enumerate() {
+            assert_eq!(
+                px(image, x as u32, y as u32),
+                u8px(*v, *v, *v, 255),
+                "({x}, {y})"
+            );
+        }
+    }
+    // The empty default-255 mask shows everything.
+    assert_eq!(effective_mask(&document, fill, 3, 3), Some(1.0));
+    // The 16-bit sibling opens too. Its fill layer stores no pixels in
+    // `Lr16` (psd-tools' `numpy()` is `None` for it as well), so it is
+    // left out and reported, like any pixel-less fill.
+    let sixteen = doc(fixture!("4x4_16bit_grayscale.psd"));
+    assert_eq!(names(&sixteen.layers, sixteen.layers.roots()), ["Layer 1"]);
+    assert!(report_text(&sixteen).contains("no stored pixels"));
+}
+
+/// Open time for a document-sized mask (0.147.0): decode, build and
+/// write the coverage tile by tile into a real store. 512² by default;
+/// `AURORA_PSD_MASK_BENCH=4096` (any side) measures that size instead.
+/// Prints the timings; the assertion is only a loose sanity bound.
+#[test]
+fn a_document_sized_mask_opens_and_writes_through_the_tile_store() {
+    let side: u32 = std::env::var("AURORA_PSD_MASK_BENCH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(512);
+    let n = (side * side) as usize;
+    let s = i32::try_from(side).unwrap_or(512);
+    let bytes = TestPsd::new(1, side, side, 8)
+        .with(|p| {
+            p.layers
+                .push(TestLayer::pixels("big", 0, 0, s, s, 8, &[]).with(|l| {
+                    l.channels = vec![
+                        (-1, vec![255; n]),
+                        (0, vec![10; n]),
+                        (1, vec![20; n]),
+                        (2, vec![30; n]),
+                        (-2, (0..n).map(|i| (i % 251) as u8).collect()),
+                    ];
+                    l.mask = Some((0, 0, s, s, 0, 0));
+                    l.compression = 2;
+                }));
+        })
+        .write();
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let Some(budget) = std::num::NonZeroUsize::new(1024) else {
+        unreachable!("non-zero");
+    };
+    let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let started = std::time::Instant::now();
+    let document = doc(&bytes);
+    let decoded = started.elapsed();
+    let [mask] = document.masks.as_slice() else {
+        unreachable!("one mask");
+    };
+    let written = std::time::Instant::now();
+    ok(super::write_mask_pixels(mask, &document.layers, &mut store));
+    let write = written.elapsed();
+    println!(
+        "{side}x{side} mask: read+build {decoded:?}, coverage write {write:?} ({} file bytes)",
+        bytes.len()
+    );
+    // Spot-check the far corner through the store.
+    let id = root(&document.layers, 0);
+    let Some(surface) = document.layers.mask_surface_id(id) else {
+        unreachable!("mask surface");
+    };
+    let last = side - 1;
+    let tile = ok(store
+        .get(
+            surface,
+            aurora_tile::TileId {
+                x: last / aurora_tile::TILE,
+                y: last / aurora_tile::TILE,
+            },
+        )
+        .map_err(IoError::from));
+    let local = (last % aurora_tile::TILE) as usize;
+    let at = (local * aurora_tile::TILE as usize + local) * 4;
+    let expected = f(((n - 1) % 251) as f32 / 255.0);
+    assert_eq!(tile.texels().get(at).map(|v| v.to_f32()), Some(expected));
+    assert!(started.elapsed() < std::time::Duration::from_mins(2));
+}
+
+/// A Grayscale file whose only layer is left out falls back to its
+/// merged image, and with merged transparency (a negative layer count)
+/// the second plane is that image's alpha, not a colour.
+#[test]
+fn a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha() {
+    let bytes = TestPsd::new(1, 2, 1, 8)
+        .with(|p| {
+            p.color_mode = 1;
+            p.channels = 2;
+            p.negative_count = true;
+            p.layers
+                .push(TestLayer::empty("adj").with(|l| l.blocks.push((*b"levl", vec![0; 4]))));
+            p.merged = Some(vec![vec![60, 255], vec![255, 0]]);
+        })
+        .write();
+    let document = doc(&bytes);
+    let Some(image) = document.pixels.first().map(|p| &p.image) else {
+        unreachable!("background");
+    };
+    assert_eq!(px(image, 0, 0), u8px(60, 60, 60, 255));
+    assert_eq!(px(image, 1, 0)[3], 0.0);
+    assert!(!report_text(&document).contains("saved channel"));
 }

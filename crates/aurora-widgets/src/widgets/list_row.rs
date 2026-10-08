@@ -41,4 +41,11 @@ pub struct ListRowState {
     /// what a highlight actually paints.
     pub selected: bool,
     pub disabled: bool,
+    /// Whether [`crate::text_runs`] draws this row's own accessible label
+    /// as its text (0.147.1) — the opt-in for a plain list row, such as
+    /// `aurora-ui`'s History rows, whose owner is a bare container. A row
+    /// under a menu, a dropdown list or the command palette draws its
+    /// owner's label for it whatever this says; a row with this `false`
+    /// under a bare container (the read-only Properties rows) draws none.
+    pub draws_label: bool,
 }

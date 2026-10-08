@@ -6,8 +6,9 @@ commit `ad89f315777866c832bf82e0377226cb13250c36` — the same pin
 `corpora/psd/reference/fetch-samples.sh` fetches). psd-tools is
 MIT-licensed; its licence is reproduced in `LICENSE` beside this file and
 covers these fixtures (the repository's fixtures carry no separate
-licence). `4x4_8bit_lab.psd` and `4x4_8bit_grayscale.psd` come from that
-suite's `colormodes/` subdirectory.
+licence). `4x4_8bit_lab.psd`, `4x4_8bit_grayscale.psd` and
+`4x4_16bit_grayscale.psd` (added 0.147.0) come from that suite's
+`colormodes/` subdirectory.
 
 They are committed (unlike the gitignored corpus under `corpora/`) because
 `aurora-io`'s unit tests (`src/psd/tests.rs`) read them with
@@ -24,6 +25,7 @@ values in those tests were read independently with psd-tools 1.17.4.
 | `32bit5x5.psd` | `66a4260e6bb8a60deff94031a66fa502c74870d75a723b4180aef02c35a97d0e` |
 | `4x4_8bit_grayscale.psd` | `2811614db8536c363ffd4b9c97baf8965b58fda5c894ffeffe1067d1287edacf` |
 | `4x4_8bit_lab.psd` | `48e52730a29cf715f9df9be12d6730af9e8125d27c5293910fedd7d621cf03e9` |
+| `4x4_16bit_grayscale.psd` | `5ee15880f77c1a0e2566864d8770a26efe3aa261245e360267973ebdd542a49c` |
 | `group.psd` | `1aaf572b69f0b0fa7c04b7b3a14c97e310a0c7bbdc06e733c9dd0d0cdcf7df1c` |
 | `hidden-layer.psd` | `3aaadd20b5ff9d5e778239ee734c9c2bf57fc56bccc82c1b003c3719df46dba0` |
 | `layer-name-emoji.psd` | `2ed49149deeffbccb89aebbf8c5a19dee12a864b17641c7bc03a89e957f3eaa8` |

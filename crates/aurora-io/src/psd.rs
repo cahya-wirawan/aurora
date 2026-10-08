@@ -1,8 +1,8 @@
 //! PSD/PSB layered **read** (PRD FR-001, 0.144.0): Aurora's own reader —
-//! no third-party PSD crate — for 8- and 16-bit RGB Photoshop files,
-//! with every documented channel compression (raw, `PackBits` RLE, ZIP,
-//! ZIP with prediction), layer groups, names, opacity, fill opacity,
-//! blend modes and visibility.
+//! no third-party PSD crate — for 8- and 16-bit RGB and (0.147.0)
+//! Grayscale Photoshop files, with every documented channel compression
+//! (raw, `PackBits` RLE, ZIP, ZIP with prediction), layer groups, names,
+//! opacity, fill opacity, blend modes, visibility and user masks.
 //!
 //! Three entry points, layered:
 //!
@@ -56,18 +56,20 @@
 //!
 //! # Scope, stated rather than implied
 //!
-//! - RGB only (colour mode 3), 8 or 16 bits per channel; every other
-//!   mode and depth is a typed error ([`IoError::UnsupportedPsdColorMode`],
-//!   [`IoError::UnsupportedPsdDepth`]). Grayscale is 0.145.0.
+//! - RGB (colour mode 3) and Grayscale (colour mode 1, 0.147.0 — grey
+//!   expanded to R = G = B), 8 or 16 bits per channel; every other mode
+//!   and depth is a typed error ([`IoError::UnsupportedPsdColorMode`],
+//!   [`IoError::UnsupportedPsdDepth`]).
 //! - The whole file is decoded in memory — this does **not** honour
 //!   invariant §7.3.1 (nothing assumes a document fits in memory), and
 //!   does nothing toward the "2 GB PSD in under 5 s" budget. The
 //!   [`PIXEL_BUDGET`] is what keeps that from being an unbounded
 //!   allocation.
 //! - An embedded ICC profile is ignored and the pixels are tagged sRGB.
-//! - Layer masks are parsed and their pixels decoded ([`PsdMask`]) but
-//!   **not applied** (0.145.0); vector masks, clipping, layer effects,
-//!   blending ranges ("Blend If") and knockout are not applied either.
+//! - User layer masks are applied (0.147.0: [`PsdMask`] →
+//!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); mask
+//!   density and feather are reported, not applied; vector masks,
+//!   clipping, layer effects, blending ranges ("Blend If") and knockout are not applied either.
 //!   Adjustment and fill layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
 //!   one of those that a file actually uses is named in the report.
@@ -116,6 +118,17 @@ const MAX_CHANNELS: u16 = 56;
 /// Layer names longer than this (in `char`s) are cut — Photoshop itself
 /// stops at 255, so only a hostile file gets near it.
 const MAX_NAME_CHARS: usize = 1024;
+
+/// Mask flags bit 0: "position relative to layer". See
+/// `Builder::attach_mask` for why it does not move the mask.
+const MASK_RELATIVE: u8 = 0x01;
+/// Mask flags bit 1: the mask is disabled.
+const MASK_DISABLED: u8 = 0x02;
+/// Mask flags bit 2: "invert layer mask when blending" (obsolete in
+/// the spec, still honoured: the coverage is inverted on import).
+const MASK_INVERT: u8 = 0x04;
+/// Mask flags bit 4: a mask-parameter block (density, feather) follows.
+const MASK_PARAMETERS: u8 = 0x10;
 
 /// Tagged-block keys whose length field is 8 bytes rather than 4 in a
 /// PSB file (psd-tools' `_BIG_KEYS`, which is the de-facto reference —
@@ -173,10 +186,12 @@ impl PsdFile {
 #[derive(Debug)]
 pub enum PsdNode {
     Layer(PsdLayer),
-    /// A layer group. `children` are bottom-to-top.
+    /// A layer group. `children` are bottom-to-top. A group can carry a
+    /// user mask of its own (0.147.0), applied to its whole result.
     Group {
         props: PsdProps,
         children: Vec<PsdNode>,
+        mask: Option<PsdMask>,
     },
 }
 
@@ -190,7 +205,8 @@ pub struct PsdLayer {
     /// The layer's own pixels, straight (not premultiplied) alpha, `f16`
     /// RGBA, tagged sRGB. `None` for a layer with an empty rectangle.
     pub image: Option<Image>,
-    /// The layer's user mask, decoded but not applied yet (0.145.0).
+    /// The layer's user mask (channel `-2`), applied by
+    /// [`build_document`] (0.147.0).
     pub mask: Option<PsdMask>,
 }
 
@@ -211,19 +227,41 @@ pub struct PsdProps {
     pub pass_through: bool,
 }
 
-/// A layer's user mask (channel `-2`), parsed for 0.145.0.
+/// A layer's or group's user mask (channel `-2`), as stored: what
+/// [`build_document`] turns into a real `aurora_doc::LayerMask` plus its
+/// coverage tiles ([`PsdMaskPixels`]).
 #[derive(Debug)]
 pub struct PsdMask {
+    /// The mask's own rectangle, in **document** coordinates.
     pub bounds: Rect,
-    /// The coverage outside [`Self::bounds`]: `0` (hidden) or `255`.
+    /// The coverage outside [`Self::bounds`]: `0` (hidden) or `255`
+    /// (shown). Any value other than `0` is read as `255` (fail open).
     pub default_color: u8,
-    /// The record's own mask flags (bit 1: disabled, bit 2: inverted on
-    /// blend).
+    /// The record's own mask flags (bit 0: "position relative to
+    /// layer", bit 1: disabled, bit 2: inverted on blend, bit 4:
+    /// parameters follow).
     pub flags: u8,
     /// Per-pixel coverage `0.0..=1.0`, row-major over `bounds`. `None`
-    /// when the mask rectangle is empty or the record carried no `-2`
-    /// channel.
+    /// when the mask rectangle is empty.
     pub coverage: Option<Vec<f16>>,
+}
+
+/// One mask's coverage, ready to be written into its layer's mask
+/// surface after the outgoing document's tiles are swept
+/// ([`write_mask_pixels`]). Already *effective* coverage — the file's
+/// invert flag is applied — and already cropped to the
+/// `aurora_doc::LayerMask` bounds [`build_document`] attached.
+#[derive(Debug)]
+pub struct PsdMaskPixels {
+    pub layer: LayerId,
+    /// Where `coverage`'s top-left lands, relative to the attached
+    /// mask's own bounds origin (the mask frame `aurora_doc::mask`
+    /// documents), not the document's.
+    pub offset: (u32, u32),
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, `width * height` values.
+    pub coverage: Vec<f16>,
 }
 
 /// [`build_document`]'s result: everything a caller needs to show the
@@ -236,6 +274,11 @@ pub struct PsdDocument {
     /// Each pixel layer's own image and where it goes in that layer's
     /// tile-store surface ([`PsdPixels::offset`]).
     pub pixels: Vec<PsdPixels>,
+    /// Each attached mask's coverage (0.147.0). Written, like
+    /// [`Self::pixels`], only after the caller has swept the outgoing
+    /// document's tiles: mask surfaces are derived from layer ids, which
+    /// restart at zero for every new tree.
+    pub masks: Vec<PsdMaskPixels>,
     pub report: PsdImportReport,
 }
 
@@ -286,8 +329,10 @@ enum Note {
     SmartObjectRasterised,
     ShapeRasterised,
     FillRasterised,
-    MaskNotApplied,
     MaskUnreadable,
+    MaskParametersNotApplied,
+    RealMaskNotUsed,
+    MaskRelativePosition,
     VectorMaskNotApplied,
     ClippingDropped,
     EffectsNotShown,
@@ -331,6 +376,7 @@ impl Notes {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per report line, nothing else
 fn note_text(note: Note, n: u64) -> String {
     let one = n == 1;
     let s = if one { "" } else { "s" };
@@ -358,9 +404,23 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} fill layer{s} (solid colour, gradient or pattern) opened as pixels; the fill \
              can't be edited."
         ),
-        Note::MaskNotApplied => {
-            format!("{n} layer mask{s} {is} not applied yet, so areas the mask hides are visible.")
-        }
+        Note::MaskParametersNotApplied => format!(
+            "{n} layer mask{s} use{} density or feather, which Aurora doesn't apply yet; {} \
+             applied at full density with hard edges.",
+            if one { "s" } else { "" },
+            if one { "it is" } else { "they are" },
+        ),
+        Note::RealMaskNotUsed => format!(
+            "{n} layer{s} with both a pixel mask and a vector mask: the pixel mask is applied, \
+             but Photoshop's combined version of the two isn't used."
+        ),
+        Note::MaskRelativePosition => format!(
+            "{n} layer mask{s} {is} marked as positioned relative to {} layer; Aurora placed {} \
+             in document coordinates, as other readers do — check {} position.",
+            if one { "its" } else { "their" },
+            if one { "it" } else { "them" },
+            if one { "its" } else { "their" },
+        ),
         Note::MaskUnreadable => format!(
             "{n} layer mask{s} could not be read and {was} ignored, so areas the mask hides are \
              visible."
@@ -524,6 +584,9 @@ impl<'a> Reader<'a> {
 struct Header {
     version: u16,
     channels: u16,
+    /// `1` (Grayscale) or `3` (RGB) — the only two [`read_header`] lets
+    /// through.
+    color_mode: u16,
     width: u32,
     height: u32,
     depth: u16,
@@ -536,6 +599,17 @@ impl Header {
 
     fn bytes_per_sample(self) -> usize {
         if self.depth == 16 { 2 } else { 1 }
+    }
+
+    /// Whether this is a Grayscale file (colour mode 1, 0.147.0).
+    fn gray(self) -> bool {
+        self.color_mode == 1
+    }
+
+    /// How many colour channels a pixel has: `1` for Grayscale (channel
+    /// `0`, expanded to R = G = B on decode), `3` for RGB.
+    fn color_planes(self) -> usize {
+        if self.gray() { 1 } else { 3 }
     }
 }
 
@@ -574,18 +648,24 @@ fn read_header(r: &mut Reader<'_>) -> Result<Header, IoError> {
             max: u64::from(max),
         });
     }
-    if color_mode != 3 {
+    // Grayscale (1) and RGB (3) only. Bitmap (0), Indexed (2), CMYK (4),
+    // Multichannel (7), Duotone (8) and Lab (9) are refused by name
+    // rather than guessed at: Indexed needs its palette, Duotone its ink
+    // curves, and showing either as grey or RGB would be a silent
+    // mis-render.
+    if color_mode != 1 && color_mode != 3 {
         return Err(IoError::UnsupportedPsdColorMode(color_mode));
     }
     if depth != 8 && depth != 16 {
         return Err(IoError::UnsupportedPsdDepth(depth));
     }
-    if channels < 3 {
+    if color_mode == 3 && channels < 3 {
         return Err(malformed("an RGB file with fewer than three channels"));
     }
     Ok(Header {
         version,
         channels,
+        color_mode,
         width,
         height,
         depth,
@@ -637,6 +717,7 @@ fn scan_resources(data: &[u8], notes: &mut Notes) {
 /// never alters pixels.
 fn looks_like_srgb(profile: &[u8]) -> bool {
     profile.windows(4).any(|w| w == b"sRGB")
+        || profile.windows(5).any(|w| w == b"sGray")
         || profile
             .windows(8)
             .any(|w| w == [0, b's', 0, b'R', 0, b'G', 0, b'B'])
@@ -694,6 +775,9 @@ struct MaskInfo {
     bounds: Rect,
     default_color: u8,
     flags: u8,
+    /// The mask carries a user-mask density below 100 % or a non-zero
+    /// feather (flags bit 4's parameter block) — neither applied.
+    parameters: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -719,6 +803,10 @@ struct Record<'a> {
     clipping: u8,
     flags: u8,
     mask: Option<MaskInfo>,
+    /// The record has mask data, but its rectangle does not validate
+    /// (past the document range): no mask is applied, and when a `-2`
+    /// channel says there was one, that is reported.
+    mask_unreadable: bool,
     name: String,
     section: Option<Section>,
     fill_opacity: Option<u8>,
@@ -826,6 +914,7 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
     let mask_len = extra.length(false, "layer mask data length")?;
     let mut mask_data = extra.sub(mask_len, "layer mask data")?;
     let mask = read_mask_info(&mut mask_data);
+    let mask_unreadable = mask.is_none() && mask_len >= 18;
 
     let ranges_len = extra.length(false, "blending ranges length")?;
     let ranges = extra.take(ranges_len, "blending ranges")?;
@@ -878,6 +967,7 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
         clipping,
         flags,
         mask,
+        mask_unreadable,
         name,
         section: section.or(nested_section),
         fill_opacity,
@@ -898,7 +988,8 @@ fn blend_if_in_use(ranges: &[u8]) -> bool {
 /// flags. Anything shorter, or a rectangle that does not validate, is
 /// treated as "no usable mask" rather than failing the whole file.
 fn read_mask_info(r: &mut Reader<'_>) -> Option<MaskInfo> {
-    if r.remaining() < 18 {
+    let total = r.remaining();
+    if total < 18 {
         return None;
     }
     let top = r.i32("mask rectangle").ok()?;
@@ -912,7 +1003,37 @@ fn read_mask_info(r: &mut Reader<'_>) -> Option<MaskInfo> {
         bounds,
         default_color,
         flags,
+        parameters: flags & MASK_PARAMETERS != 0 && mask_parameters_in_use(r, total),
     })
+}
+
+/// Whether a mask's parameter block (present when flags bit 4 is set)
+/// asks for a user-mask density below 255 or a non-zero user-mask
+/// feather. Read in psd-tools' order — after the 18-byte "real" mask
+/// fields when the mask data is at least 36 bytes long — and leniently:
+/// a truncated block is "not in use", since nothing about it is applied
+/// either way and it can only add a report line.
+fn mask_parameters_in_use(r: &mut Reader<'_>, total: usize) -> bool {
+    if total >= 36 && r.skip(18, "real user mask").is_err() {
+        return false;
+    }
+    let Ok(present) = r.u8("mask parameters") else {
+        return false;
+    };
+    let mut in_use = false;
+    if present & 1 != 0 {
+        match r.u8("user mask density") {
+            Ok(density) => in_use |= density != 255,
+            Err(_) => return in_use,
+        }
+    }
+    if present & 2 != 0
+        && let Ok(bytes) = r.array::<8>("user mask feather")
+    {
+        let feather = f64::from_be_bytes(bytes);
+        in_use |= feather != 0.0;
+    }
+    in_use
 }
 
 fn read_section(data: &[u8]) -> Option<Section> {
@@ -1260,6 +1381,20 @@ fn write_plane(samples: &mut [f16], plane: &[u8], channel: usize, bps: usize) {
     }
 }
 
+/// Expands a Grayscale buffer whose grey sits in the red slot to
+/// R = G = B (0.147.0). The grey is tagged sRGB like RGB colour, so a
+/// grey value `v` shows as the sRGB colour `(v, v, v)` — the same
+/// assumption, and the same report line when an embedded profile is
+/// ignored, as an RGB file.
+fn replicate_gray(samples: &mut [f16]) {
+    for px in samples.chunks_exact_mut(4) {
+        if let [r, g, b, _] = px {
+            *g = *r;
+            *b = *r;
+        }
+    }
+}
+
 /// An RGBA buffer for `width * height` pixels, alpha `1.0` — what a
 /// layer with no transparency channel (a Background layer) is.
 /// Allocated fallibly.
@@ -1284,7 +1419,11 @@ fn opaque_buffer(width: usize, height: usize) -> Result<Vec<f16>, IoError> {
 /// never decompressed (a 56-channel record of one id would otherwise
 /// cost 56 decodes) — and an id this reader does not know is counted as
 /// unknown. User masks (`-2`, `-3`) are `decode_mask`'s.
-fn pixel_channels<'a>(record: &Record<'a>, notes: &mut Notes) -> [Option<&'a [u8]>; 4] {
+fn pixel_channels<'a>(
+    record: &Record<'a>,
+    color_planes: usize,
+    notes: &mut Notes,
+) -> [Option<&'a [u8]>; 4] {
     let mut slots: [Option<&'a [u8]>; 4] = [None; 4];
     let mut seen_ids: Vec<i16> = Vec::with_capacity(record.data.len());
     for (id, data) in &record.data {
@@ -1294,7 +1433,11 @@ fn pixel_channels<'a>(record: &Record<'a>, notes: &mut Notes) -> [Option<&'a [u8
         }
         seen_ids.push(*id);
         let slot = match id {
-            0..=2 => usize::from(id.cast_unsigned()),
+            // A Grayscale file's only colour channel is `0`; a `1` or `2`
+            // there is as unknown as a `7` is in RGB.
+            0..=2 if usize::from(id.cast_unsigned()) < color_planes => {
+                usize::from(id.cast_unsigned())
+            }
             -1 => 3,
             -2 | -3 => continue,
             _ => {
@@ -1321,7 +1464,8 @@ fn decode_layer_image(
         return Ok(None);
     }
     let bps = header.bytes_per_sample();
-    let slots = pixel_channels(record, notes);
+    let planes = header.color_planes();
+    let slots = pixel_channels(record, planes, notes);
     if slots.iter().all(Option::is_none) {
         // A rectangle with nothing to fill it: opened empty, and no
         // buffer is ever sized from the rectangle alone.
@@ -1343,8 +1487,11 @@ fn decode_layer_image(
             write_plane(&mut samples, &plane, channel, bps);
         }
     }
-    if slots.iter().take(3).any(Option::is_none) {
+    if slots.iter().take(planes).any(Option::is_none) {
         notes.add(Note::MissingColorChannel);
+    }
+    if header.gray() {
+        replicate_gray(&mut samples);
     }
     Image::new(
         record.bounds.width,
@@ -1355,10 +1502,17 @@ fn decode_layer_image(
     .map(Some)
 }
 
+/// The record's user mask, or `None` when it has none: no mask data, or
+/// mask data but no `-2` channel (the mask data then describes only a
+/// vector mask). A `-2` channel too short for the mask rectangle is an
+/// error — the caller reports it and opens the layer unmasked.
 fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, IoError> {
     let Some(info) = record.mask else {
         return Ok(None);
     };
+    if !record.has_channel(-2) {
+        return Ok(None);
+    }
     let mut coverage = None;
     let width = info.bounds.width as usize;
     let height = info.bounds.height as usize;
@@ -1494,8 +1648,25 @@ fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
     if record.clipping != 0 {
         notes.add(Note::ClippingDropped);
     }
-    if record.mask.is_some() && record.has_channel(-2) {
-        notes.add(Note::MaskNotApplied);
+    if record.mask_unreadable && record.has_channel(-2) {
+        notes.add(Note::MaskUnreadable);
+    }
+    if let Some(mask) = record.mask
+        && record.has_channel(-2)
+    {
+        if mask.parameters {
+            notes.add(Note::MaskParametersNotApplied);
+        }
+        if record.has_channel(-3) {
+            notes.add(Note::RealMaskNotUsed);
+        }
+        // Only where the two readings differ: on a layer whose own
+        // rectangle starts at the document origin (every group's does)
+        // "relative to the layer" and "in document coordinates" are the
+        // same place.
+        if mask.flags & MASK_RELATIVE != 0 && (record.bounds.x != 0 || record.bounds.y != 0) {
+            notes.add(Note::MaskRelativePosition);
+        }
     }
     if record.features.vector_mask && !record.features.fill {
         notes.add(Note::VectorMaskNotApplied);
@@ -1518,9 +1689,9 @@ fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
 fn subtree_has_blend(nodes: &[PsdNode]) -> bool {
     nodes.iter().any(|node| match node {
         PsdNode::Layer(layer) => layer.props.blend != BlendMode::Normal,
-        PsdNode::Group { props, children } => {
-            props.blend != BlendMode::Normal || subtree_has_blend(children)
-        }
+        PsdNode::Group {
+            props, children, ..
+        } => props.blend != BlendMode::Normal || subtree_has_blend(children),
     })
 }
 
@@ -1561,8 +1732,13 @@ fn build_tree(
                 if props.pass_through && subtree_has_blend(&children) {
                     notes.add(Note::PassThroughGroup);
                 }
+                let mask = mask_or_report(record, header, notes);
                 if let Some(parent) = stack.last_mut() {
-                    parent.push(PsdNode::Group { props, children });
+                    parent.push(PsdNode::Group {
+                        props,
+                        children,
+                        mask,
+                    });
                 }
             }
             _ => {
@@ -1616,19 +1792,22 @@ fn layer_node(
     note_unsupported(record, notes);
     let props = props_for(record, notes);
     let image = decode_layer_image(record, header, notes, profile)?;
-    // Masks are decoded but not applied yet (0.145.0), so a damaged one
-    // costs nothing visible: it is reported and dropped, and the rest of
-    // the file still opens. `MaskNotApplied` was already counted for it.
-    let mask = decode_mask(record, header).unwrap_or_else(|_| {
-        notes.add(Note::MaskUnreadable);
-        None
-    });
+    let mask = mask_or_report(record, header, notes);
     Ok(Some(PsdNode::Layer(PsdLayer {
         props,
         bounds: record.bounds,
         image,
         mask,
     })))
+}
+
+/// [`decode_mask`], with a damaged mask reported and dropped (the layer
+/// opens unmasked) rather than failing the whole file.
+fn mask_or_report(record: &Record<'_>, header: Header, notes: &mut Notes) -> Option<PsdMask> {
+    decode_mask(record, header).unwrap_or_else(|_| {
+        notes.add(Note::MaskUnreadable);
+        None
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1653,7 +1832,14 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
     let row_bytes = width.checked_mul(bps).ok_or_else(size)?;
     let plane_len = row_bytes.checked_mul(height).ok_or_else(size)?;
     let channels = usize::from(header.channels);
-    let planes = if alpha && channels >= 4 { 4 } else { 3 };
+    let color = header.color_planes();
+    let planes = if alpha && channels > color {
+        color + 1
+    } else {
+        color
+    };
+    // Plane `p`'s RGBA slot: the colour planes first, then alpha.
+    let slot = |p: usize| if p < color { p } else { 3 };
     let compression = r.u16("merged image compression")?;
     let samples = match compression {
         0 => {
@@ -1664,7 +1850,7 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
             let mut samples = opaque_buffer(width, height)?;
             for channel in 0..planes {
                 let plane = r.take(plane_len, "merged image data")?;
-                write_plane(&mut samples, plane, channel, bps);
+                write_plane(&mut samples, plane, slot(channel), bps);
             }
             samples
         }
@@ -1697,7 +1883,7 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
                     let src = r.take(count, "merged image RLE row")?;
                     unpack_bits(src, &mut plane, row_bytes)?;
                 }
-                write_plane(&mut samples, &plane, channel, bps);
+                write_plane(&mut samples, &plane, slot(channel), bps);
             }
             samples
         }
@@ -1725,14 +1911,17 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
                 if compression == 3 {
                     undo_prediction(&mut plane, row_bytes, bps);
                 }
-                write_plane(&mut samples, &plane, channel, bps);
+                write_plane(&mut samples, &plane, slot(channel), bps);
             }
             samples
         }
         other => return Err(IoError::UnsupportedPsdCompression(other)),
     };
     let mut samples = samples;
-    if planes == 4 {
+    if header.gray() {
+        replicate_gray(&mut samples);
+    }
+    if planes > color {
         remove_white_matte(&mut samples);
     }
     Image::new(header.width, header.height, IccProfile::srgb(), samples)
@@ -1826,9 +2015,10 @@ pub fn decode(bytes: &[u8]) -> Result<PsdFile, IoError> {
 
     let profile = SharedProfile::new();
     let layers = build_tree(&info.records, header, &mut notes, &profile)?;
-    let merged_alpha = info.merged_alpha && header.channels >= 4;
+    let color_planes = if header.gray() { 1 } else { 3 };
+    let merged_alpha = info.merged_alpha && header.channels > color_planes;
     let extra = u64::from(header.channels)
-        .saturating_sub(3)
+        .saturating_sub(u64::from(color_planes))
         .saturating_sub(u64::from(merged_alpha));
     notes.add_n(Note::ExtraChannels, extra);
 
@@ -1901,10 +2091,12 @@ pub fn build_document(file: PsdFile) -> Result<PsdDocument, IoError> {
     let mut layers = LayerTree::new();
     let mut history = History::new();
     let mut pixels: Vec<PsdPixels> = Vec::new();
+    let mut masks: Vec<PsdMaskPixels> = Vec::new();
     let mut builder = Builder {
         layers: &mut layers,
         history: &mut history,
         pixels: &mut pixels,
+        masks: &mut masks,
         canvas,
     };
     if file.layers.is_empty() {
@@ -1932,6 +2124,7 @@ pub fn build_document(file: PsdFile) -> Result<PsdDocument, IoError> {
         history,
         canvas_size: (file.width, file.height),
         pixels,
+        masks,
         report,
     })
 }
@@ -1941,6 +2134,7 @@ struct Builder<'b> {
     layers: &'b mut LayerTree,
     history: &'b mut History,
     pixels: &'b mut Vec<PsdPixels>,
+    masks: &'b mut Vec<PsdMaskPixels>,
     canvas: Rect,
 }
 
@@ -1989,6 +2183,9 @@ impl Builder<'_> {
                         parent,
                     )?;
                     self.apply(id, &layer.props)?;
+                    if let Some(mask) = layer.mask {
+                        self.attach_mask(id, mask, bounds)?;
+                    }
                     if let Some(image) = layer.image {
                         self.pixels.push(PsdPixels {
                             layer: id,
@@ -1997,15 +2194,108 @@ impl Builder<'_> {
                         });
                     }
                 }
-                PsdNode::Group { props, children } => {
+                PsdNode::Group {
+                    props,
+                    children,
+                    mask,
+                } => {
                     let id = self
                         .history
                         .add_group(self.layers, props.name.clone(), parent)?;
                     self.apply(id, &props)?;
+                    if let Some(mask) = mask {
+                        // A group has no rectangle of its own; its
+                        // content is shown on the canvas.
+                        self.attach_mask(id, mask, self.canvas)?;
+                    }
                     self.add_nodes(children, Some(id), depth + 1)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Attaches a PSD user mask to `id` as a real `aurora_doc::LayerMask`
+    /// and queues its coverage ([`PsdMaskPixels`]) — Photoshop's
+    /// semantics, mapped onto Aurora's: inside a `LayerMask`'s bounds an
+    /// unpainted texel is coverage `1.0` and outside them coverage is
+    /// `0.0`.
+    ///
+    /// - **Default colour.** Outside its rectangle a PSD mask is its
+    ///   default colour. When that is *hidden* (`0`), the Aurora bounds
+    ///   are the PSD rectangle itself, so "outside" is Aurora's own
+    ///   `0.0`. When it is *shown* (`255`), the bounds are `region` —
+    ///   everywhere the layer can have pixels (its canvas-anchored
+    ///   bounds, or the canvas for a group) — and texels outside the PSD
+    ///   rectangle are simply never painted, so they read `1.0` and cost
+    ///   no tile. Either way only the PSD rectangle's own samples are
+    ///   written; nothing is filled.
+    /// - **Rectangle.** In document coordinates, like the layer's own.
+    ///   Flags bit 0 ("position relative to layer") does **not** move
+    ///   it: psd-tools ignores it too, and every flagged mask in its
+    ///   test corpus sits on a layer at the document origin, where both
+    ///   readings agree. Where they would differ the report says so
+    ///   ([`Note::MaskRelativePosition`]).
+    /// - **Invert** (flags bit 2): baked into the coverage — the values
+    ///   become `1 - v` and the default colour flips — rather than set
+    ///   as `LayerMask::inverted`, so the attached mask means what it
+    ///   shows.
+    /// - **Disabled** (flags bit 1): attached *disabled*
+    ///   (`History::set_mask_enabled(false)`), coverage still written —
+    ///   the document model supports it, so nothing is reported, and
+    ///   enabling it later shows Photoshop's mask.
+    /// - **Depth.** The samples were promoted from 8 or 16 bits by
+    ///   [`decode_mask`] at the file's own depth.
+    fn attach_mask(&mut self, id: LayerId, mask: PsdMask, region: Rect) -> Result<(), IoError> {
+        let invert = mask.flags & MASK_INVERT != 0;
+        let shown_outside = (mask.default_color != 0) != invert;
+        let bounds = if shown_outside { region } else { mask.bounds };
+        self.history.add_imported_mask(self.layers, id, bounds)?;
+        if mask.flags & MASK_DISABLED != 0 {
+            self.history.set_mask_enabled(self.layers, id, false)?;
+        }
+        let Some(values) = mask.coverage else {
+            return Ok(());
+        };
+        let Some(target) = intersect(mask.bounds, bounds) else {
+            return Ok(());
+        };
+        let offset = (
+            u32::try_from(target.x - bounds.x).map_err(|_| malformed("mask position"))?,
+            u32::try_from(target.y - bounds.y).map_err(|_| malformed("mask position"))?,
+        );
+        let coverage = if target == mask.bounds && !invert {
+            values
+        } else {
+            let stride = mask.bounds.width as usize;
+            let (cx, cy) = (
+                usize::try_from(target.x - mask.bounds.x)
+                    .map_err(|_| malformed("mask position"))?,
+                usize::try_from(target.y - mask.bounds.y)
+                    .map_err(|_| malformed("mask position"))?,
+            );
+            let width = target.width as usize;
+            let mut out: Vec<f16> = try_alloc(width.saturating_mul(target.height as usize))?;
+            for row in 0..target.height as usize {
+                let start = (cy + row).saturating_mul(stride).saturating_add(cx);
+                let src = values
+                    .get(start..start.saturating_add(width))
+                    .ok_or_else(|| malformed("mask coverage"))?;
+                if invert {
+                    out.extend(src.iter().map(|v| f16::ONE - *v));
+                } else {
+                    out.extend_from_slice(src);
+                }
+            }
+            out
+        };
+        self.masks.push(PsdMaskPixels {
+            layer: id,
+            offset,
+            width: target.width,
+            height: target.height,
+            coverage,
+        });
         Ok(())
     }
 
@@ -2025,6 +2315,63 @@ impl Builder<'_> {
         }
         Ok(())
     }
+}
+
+/// The overlap of two rectangles, or `None` when they do not overlap.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    if !a.intersects(&b) {
+        return None;
+    }
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    Some(Rect {
+        x,
+        y,
+        width: u32::try_from(right - x).ok()?,
+        height: u32::try_from(bottom - y).ok()?,
+    })
+}
+
+/// Writes one [`PsdMaskPixels`] into its layer's mask surface in
+/// `store`, a tile at a time (`aurora_doc::write_mask_coverage_region`).
+/// Call it only after the outgoing document's tiles have been swept —
+/// see [`PsdDocument::masks`].
+///
+/// A `coverage` shorter than `width * height` fails open: the missing
+/// texels are written as `1.0` (shown), never as hidden.
+///
+/// # Errors
+///
+/// [`IoError::Doc`] if `layers` has no mask surface for the layer, or
+/// [`IoError::Tile`] if the store cannot page a tile in.
+pub fn write_mask_pixels(
+    mask: &PsdMaskPixels,
+    layers: &LayerTree,
+    store: &mut aurora_tile::TileStore,
+) -> Result<(), IoError> {
+    let surface = layers
+        .mask_surface_id(mask.layer)
+        .ok_or(aurora_doc::DocError::UnknownLayer(mask.layer))?;
+    let width = mask.width as usize;
+    aurora_doc::write_mask_coverage_region(
+        store,
+        surface,
+        mask.offset,
+        mask.width,
+        mask.height,
+        |column, row| {
+            mask.coverage
+                .get(
+                    (row as usize)
+                        .saturating_mul(width)
+                        .saturating_add(column as usize),
+                )
+                .map_or(1.0, |v| v.to_f32())
+        },
+    )?;
+    Ok(())
 }
 
 /// [`decode`] then [`build_document`].
