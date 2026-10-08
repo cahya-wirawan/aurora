@@ -280,9 +280,10 @@
 //! write the autosave, then dropped) — `Ctrl+Z`/`Ctrl+Shift+Z`
 //! (`AppCommand::Undo`/`Redo`, `run_command`) call `History::undo`/
 //! `redo` against it directly and refresh the History panel
-//! (`refresh_history_panel`) to show the result, since `History`'s own
-//! doc comment already establishes that undoing/redoing is itself a
-//! journaled step. `App::apply_move` now records through `history`
+//! (`refresh_history_panel`) to show the result. (Since 0.147.1 that
+//! panel lists `UndoOrder`'s steps — strokes included — and an undo moves
+//! its marker; before, it listed the journal, where an undo is itself a
+//! new entry.) `App::apply_move` now records through `history`
 //! instead of calling `LayerTree::set_bounds` directly, so a completed
 //! Move is really undoable — one undo step per pointer-move event
 //! during the drag, not one per whole drag gesture at the time (see the
@@ -780,7 +781,7 @@ fn document_from_image(
         Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
     };
     // The opened file is the undo baseline: the journal keeps the add
-    // (autosave/recovery replay it, the History panel lists it), the undo
+    // (autosave/recovery replay it), the undo
     // stack does not (0.144.0 review) -- `App::install_opened_document`
     // resets `undo_order` to match.
     history.clear_undo();
@@ -1282,7 +1283,7 @@ fn replace_document(
     workspace: &mut aurora_ui::Workspace,
     scales: &Scales,
     layers: &aurora_doc::LayerTree,
-    history: &aurora_doc::History,
+    undo_order: &UndoOrder,
     tool: aurora_ui::Tool,
     tool_settings: &ToolSettings,
 ) -> Result<
@@ -1308,7 +1309,11 @@ fn replace_document(
     workspace.tree.set_scroll_y(workspace.history.body, 0.0)?;
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
-    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
+    // The steps the incoming document can undo -- none, for an opened
+    // file (its import is the baseline, `History::clear_undo`), so the
+    // panel shows just its origin row (0.147.1; it listed the import's
+    // whole build journal before).
+    populate_history_rows(workspace, scales, undo_order)?;
     let options = tool_options(tool, tool_settings);
     aurora_ui::populate_properties_panel(
         &mut workspace.tree,
@@ -4642,12 +4647,12 @@ fn install_startup_panels(
     workspace: &mut aurora_ui::Workspace,
     scales: &Scales,
     layers: &aurora_doc::LayerTree,
-    history: &aurora_doc::History,
+    undo_order: &UndoOrder,
     tool: aurora_ui::Tool,
     tool_settings: &ToolSettings,
 ) -> StartupPanels {
     let (layer_rows, active_layer) =
-        match replace_document(workspace, scales, layers, history, tool, tool_settings) {
+        match replace_document(workspace, scales, layers, undo_order, tool, tool_settings) {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(
@@ -4784,7 +4789,7 @@ fn finish_opacity(cx: &mut LayerControlEdit<'_>) -> bool {
         Ok(()) => {
             cx.undo_order
                 .record(UndoKind::Structural, cx.history, cx.pixel_history);
-            refresh_history_panel(cx.workspace, cx.history);
+            refresh_history_panel(cx.workspace, cx.undo_order);
             true
         }
         Err(err) => {
@@ -4925,7 +4930,7 @@ fn apply_layer_control_outcome(
         Ok(dirtied) => {
             cx.undo_order
                 .record(UndoKind::Structural, cx.history, cx.pixel_history);
-            refresh_history_panel(cx.workspace, cx.history);
+            refresh_history_panel(cx.workspace, cx.undo_order);
             refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, active);
             structural_invalidation(dirtied)
         }
@@ -5621,13 +5626,158 @@ enum UndoKind {
 /// `StrokeSnapshot`) stays exactly where it already lived, in that
 /// backing store's own stack; undoing/redoing here means popping a tag
 /// from `self` and asking the matching backing store to actually do it.
-#[derive(Debug, Default)]
+///
+/// **Each step also carries the label its History-panel row shows**
+/// (0.147.1), in `undo_labels`/`redo_labels`, index-aligned with
+/// `undo`/`redo` (`undo_labels[i]` names `undo[i]`). The backing stores
+/// cannot supply it later: `aurora_brush::PixelHistory` records no tool,
+/// and `aurora_doc::History`'s undo stack holds each step's *inverse*.
+/// So the label is fixed when the step is recorded ([`Self::record`],
+/// [`Self::record_labelled`]) and travels with the step between the two
+/// stacks ([`Self::step_back`], [`Self::step_forward`]). A tag pushed
+/// onto `undo`/`redo` directly (some tests do) gets its kind's generic
+/// label ([`default_step_label`]) the next time the labels are synced.
+#[derive(Debug)]
 struct UndoOrder {
     undo: Vec<UndoKind>,
     redo: Vec<UndoKind>,
+    undo_labels: Vec<String>,
+    redo_labels: Vec<String>,
+    /// The History panel's first row: what the document started from.
+    origin: &'static str,
+}
+
+/// The History panel's first row for a document opened from a file.
+const OPEN_HISTORY_ORIGIN: &str = "Open";
+/// The History panel's first row for the startup document.
+const NEW_DOCUMENT_HISTORY_ORIGIN: &str = "New Document";
+/// The row label of a committed Brush stroke.
+const BRUSH_STROKE_LABEL: &str = "Brush Stroke";
+/// The row label of a committed Eraser stroke.
+const ERASER_STROKE_LABEL: &str = "Eraser Stroke";
+
+/// The generic label of a step recorded without one: a pixel step whose
+/// tool nobody named (only tests do that; the app names Brush and
+/// Eraser, the only pixel edits it records), or a structural step
+/// recorded against an empty journal.
+fn default_step_label(kind: UndoKind) -> &'static str {
+    match kind {
+        UndoKind::Structural => "Layer Change",
+        UndoKind::Pixel => "Pixel Edit",
+    }
+}
+
+/// Truncates or pads `labels` so it names exactly `kinds`.
+fn sync_step_labels(kinds: &[UndoKind], labels: &mut Vec<String>) {
+    labels.truncate(kinds.len());
+    for &kind in kinds.get(labels.len()..).unwrap_or_default() {
+        labels.push(default_step_label(kind).to_owned());
+    }
+}
+
+impl Default for UndoOrder {
+    fn default() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            undo_labels: Vec::new(),
+            redo_labels: Vec::new(),
+            origin: OPEN_HISTORY_ORIGIN,
+        }
+    }
 }
 
 impl UndoOrder {
+    /// An empty order for the startup document, whose History panel's
+    /// first row is "New Document" rather than "Open".
+    fn new_document() -> Self {
+        Self {
+            origin: NEW_DOCUMENT_HISTORY_ORIGIN,
+            ..Self::default()
+        }
+    }
+
+    fn sync_labels(&mut self) {
+        sync_step_labels(&self.undo, &mut self.undo_labels);
+        sync_step_labels(&self.redo, &mut self.redo_labels);
+    }
+
+    /// Moves the newest applied step, label and all, onto the redo side
+    /// — the bookkeeping half of an undo that has just succeeded.
+    fn step_back(&mut self) {
+        self.sync_labels();
+        if let Some(kind) = self.undo.pop() {
+            let label = self
+                .undo_labels
+                .pop()
+                .unwrap_or_else(|| default_step_label(kind).to_owned());
+            self.redo.push(kind);
+            self.redo_labels.push(label);
+        }
+    }
+
+    /// Moves the next redoable step back onto the applied side — the
+    /// bookkeeping half of a redo that has just succeeded.
+    fn step_forward(&mut self) {
+        self.sync_labels();
+        if let Some(kind) = self.redo.pop() {
+            let label = self
+                .redo_labels
+                .pop()
+                .unwrap_or_else(|| default_step_label(kind).to_owned());
+            self.undo.push(kind);
+            self.undo_labels.push(label);
+        }
+    }
+
+    /// The History panel's view of this order: every applied step
+    /// oldest first, then every undone step in the order redo would
+    /// replay them (the top of `redo` first).
+    fn history_steps(&self) -> Vec<aurora_ui::HistoryStep<'_>> {
+        fn label(labels: &[String], i: usize, kind: UndoKind) -> &str {
+            labels
+                .get(i)
+                .map_or(default_step_label(kind), String::as_str)
+        }
+        let applied = self
+            .undo
+            .iter()
+            .enumerate()
+            .map(|(i, &kind)| aurora_ui::HistoryStep {
+                label: label(&self.undo_labels, i, kind),
+                undone: false,
+            });
+        let undone = self
+            .redo
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, &kind)| aurora_ui::HistoryStep {
+                label: label(&self.redo_labels, i, kind),
+                undone: true,
+            });
+        applied.chain(undone).collect()
+    }
+
+    /// [`Self::record_labelled`] with the label `kind` implies: a
+    /// structural step is named by the journal entry its backing store
+    /// just wrote (`History::last_journal_description`, the same text
+    /// the pre-0.147.1 panel showed), a pixel step generically.
+    fn record(
+        &mut self,
+        kind: UndoKind,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) {
+        let label = match kind {
+            UndoKind::Structural => history
+                .last_journal_description()
+                .unwrap_or_else(|| default_step_label(kind).to_owned()),
+            UndoKind::Pixel => default_step_label(kind).to_owned(),
+        };
+        self.record_labelled(kind, label, history, pixel_history);
+    }
+
     /// Records that an edit of `kind` was just committed to its own
     /// backing store: pushes it onto the unified undo order and
     /// invalidates every pending redo — in this order's own
@@ -5639,14 +5789,18 @@ impl UndoOrder {
     /// recorded through (`History`'s/`PixelHistory`'s own `push`-style
     /// methods) — clearing it again here is a harmless no-op; the
     /// *other* store's clear is the one that actually matters.
-    fn record(
+    fn record_labelled(
         &mut self,
         kind: UndoKind,
+        label: String,
         history: &mut aurora_doc::History,
         pixel_history: &mut aurora_brush::PixelHistory,
     ) {
+        self.sync_labels();
         self.undo.push(kind);
+        self.undo_labels.push(label);
         self.redo.clear();
+        self.redo_labels.clear();
         history.clear_redo();
         pixel_history.clear_redo();
     }
@@ -5816,10 +5970,11 @@ fn structural_invalidation(dirtied: Option<aurora_core::Rect>) -> CompositeInval
 /// from outside `History`; a real `TileError` restoring a captured
 /// tile) is logged too, the same "a bad input mustn't crash the event
 /// loop" shape every other handler in this section already follows. A
-/// structural undo/redo refreshes the History panel afterward
-/// ([`refresh_history_panel`]) since undoing/redoing is itself a
-/// journaled step; a pixel undo/redo has no such panel to refresh — the
-/// canvas alone shows the result, on the next redraw.
+/// successful undo or redo, structural or pixel, moves the History
+/// panel's marker ([`UndoOrder::step_back`]/[`UndoOrder::step_forward`])
+/// and refreshes the panel ([`refresh_history_panel`], 0.147.1; pixel
+/// undo/redo refreshed nothing before, and a structural one appended its
+/// own journal entry as a new row).
 ///
 /// `NewLayer`/`DeleteLayer` (0.143.0) are **not** run here — see their
 /// arm; they go through [`perform_layer_command`].
@@ -5891,9 +6046,8 @@ fn run_command(
                 if history.can_undo() {
                     match history.undo(layers) {
                         Ok(dirty) => {
-                            undo_order.undo.pop();
-                            undo_order.redo.push(UndoKind::Structural);
-                            refresh_history_panel(workspace, history);
+                            undo_order.step_back();
+                            refresh_history_panel(workspace, undo_order);
                             structural_invalidation(dirty)
                         }
                         Err(err) => {
@@ -5913,8 +6067,8 @@ fn run_command(
                 if let Some(store) = store {
                     match apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo) {
                         Some(invalidation) => {
-                            undo_order.undo.pop();
-                            undo_order.redo.push(UndoKind::Pixel);
+                            undo_order.step_back();
+                            refresh_history_panel(workspace, undo_order);
                             invalidation
                         }
                         None => CompositeInvalidation::None,
@@ -5934,9 +6088,8 @@ fn run_command(
                 if history.can_redo() {
                     match history.redo(layers) {
                         Ok(dirty) => {
-                            undo_order.redo.pop();
-                            undo_order.undo.push(UndoKind::Structural);
-                            refresh_history_panel(workspace, history);
+                            undo_order.step_forward();
+                            refresh_history_panel(workspace, undo_order);
                             structural_invalidation(dirty)
                         }
                         Err(err) => {
@@ -5956,8 +6109,8 @@ fn run_command(
                 if let Some(store) = store {
                     match apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo) {
                         Some(invalidation) => {
-                            undo_order.redo.pop();
-                            undo_order.undo.push(UndoKind::Pixel);
+                            undo_order.step_forward();
+                            refresh_history_panel(workspace, undo_order);
                             invalidation
                         }
                         None => CompositeInvalidation::None,
@@ -5975,9 +6128,9 @@ fn run_command(
     }
 }
 
-/// Clears and repopulates the History panel from `history`'s own
-/// current journal — [`AppCommand::Undo`]/[`AppCommand::Redo`]'s own
-/// shared refresh step, the same `clear_panel_body` + `populate_*`
+/// Clears and repopulates the History panel from `undo_order`'s steps
+/// (0.147.1; from `history`'s journal before) — every recorded step's,
+/// undo's and redo's shared refresh step, the same `clear_panel_body` + `populate_*`
 /// pattern [`replace_document`] already uses for a freshly opened
 /// document, just for one panel instead of two.
 ///
@@ -5994,26 +6147,28 @@ fn run_command(
 /// out-of-date History panel, not a lost edit: the undo/redo it follows
 /// has already been applied to the real document.
 ///
-/// **This is an O(n) rebuild of the whole panel on every structural
-/// undo/redo, and re-reading the design file is the cheap part of it.**
-/// The scales parse was measured at roughly 20 µs — negligible. What
-/// costs is [`aurora_ui::populate_history_panel`] itself: it tears down
-/// every existing row widget and inserts one per journal entry, up to
-/// the 1001 `History::journal_descriptions` can return. And because
-/// undo and redo are themselves journaled steps, the journal grows with
-/// each one, so repeated `Ctrl+Z` makes every successive rebuild
-/// strictly larger — on the UI thread, which invariant §7.3.4 says must
-/// never block. It is tolerable today only because a real session's
-/// journal is short. The fix is the same one both panels already carry
-/// as an open item: an incremental refresh that touches only the rows
-/// that changed, or a virtualized list that only ever builds the
-/// visible ones (roughly 14 of them, `aurora_ui::history_panel`'s own
-/// doc comment).
+/// **This is a whole-panel rebuild after every recorded step** —
+/// every committed stroke or move, structural edit, undo and redo
+/// (0.147.1) — never per dab. The scales parse was measured at roughly
+/// 20 µs, negligible. What costs is [`aurora_ui::populate_history_panel`]
+/// itself: it tears down every existing row widget and inserts one per
+/// [`UndoOrder`] step plus the origin row, up to 1002 rows (1000 steps
+/// and two "… omitted" notices). An undo or redo moves the marker and
+/// adds no row, so repeated `Ctrl+Z` no longer grows the rebuild (it did
+/// while the panel listed the journal, where an undo is a new entry).
+/// Before the cap applies, [`UndoOrder::history_steps`] collects one
+/// `(label, undone)` pair per step of the whole session — linear in the
+/// session's step count, a pointer pair per step, disclosed rather than
+/// windowed. All of it runs on the UI thread, which invariant §7.3.4 says
+/// must never block; the fix both panels carry as an open item is an
+/// incremental refresh that touches only the rows that changed, or a
+/// virtualized list that only builds the visible ones (13 at offset 0,
+/// `aurora_ui::history_panel`'s own doc comment).
 ///
 /// No `clear_panel_body` call of its own: `populate_history_panel`
 /// empties the body itself as its first step (`0.77.2`), so an external
 /// clear here was doing the same work twice.
-fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_doc::History) {
+fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, undo_order: &UndoOrder) {
     let scales = match load_scales() {
         Ok(scales) => scales,
         Err(err) => {
@@ -6024,11 +6179,30 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
             return;
         }
     };
-    if let Err(err) =
-        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &scales, history)
-    {
+    if let Err(err) = populate_history_rows(workspace, &scales, undo_order) {
         tracing::warn!(?err, "failed to repopulate the History panel");
     }
+}
+
+/// Rebuilds the History panel from `undo_order` (0.147.1) — the user's
+/// own undoable steps, in `Ctrl+Z` order, with the current one marked —
+/// and records the current row in `workspace.history_current` for
+/// [`follow_history_row`] to scroll into view.
+fn populate_history_rows(
+    workspace: &mut aurora_ui::Workspace,
+    scales: &Scales,
+    undo_order: &UndoOrder,
+) -> Result<(), aurora_widgets::WidgetError> {
+    let steps = undo_order.history_steps();
+    let current = aurora_ui::populate_history_panel(
+        &mut workspace.tree,
+        workspace.history,
+        scales,
+        undo_order.origin,
+        &steps,
+    )?;
+    workspace.history_current = Some(current);
+    Ok(())
 }
 
 /// The real, non-hardcoded label/value pairs [`aurora_ui::
@@ -6879,6 +7053,11 @@ fn finish_move(
 /// and `None`, is a no-op — a pan, a marquee, an eyedropper sample and
 /// "no drag at all" have nothing to commit.
 ///
+/// Returns whether a step was recorded (0.147.1), which is when — and
+/// the only time — the caller refreshes the History panel: once per
+/// committed stroke or move, never per dab, and not for a pan or a
+/// click that painted nothing.
+///
 /// **The only place a stroke becomes undoable, and it is called from
 /// every path that ends one** (0.57.0). This logic used to live inside
 /// [`App::handle_pointer_released`], which is not the only way a drag
@@ -6941,25 +7120,29 @@ fn commit_ending_drag(
     view: &mut aurora_ui::CanvasView,
     active_layer: Option<aurora_doc::LayerId>,
     canvas_size: Option<(f32, f32)>,
-) {
+) -> bool {
+    let steps_before = undo_order.undo.len();
     match drag {
-        Some(
-            Drag::Brush {
-                stroke: Some(stroke),
-                ..
-            }
-            | Drag::Eraser {
-                stroke: Some(stroke),
-                ..
-            },
-        ) => {
-            // `push`'s own `bool` is what tells "a real stroke happened"
-            // apart from "a click that never touched a tile" without
-            // asking the snapshot itself.
-            if pixel_history.push(stroke) {
-                undo_order.record(UndoKind::Pixel, history, pixel_history);
-            }
-        }
+        Some(Drag::Brush {
+            stroke: Some(stroke),
+            ..
+        }) => record_stroke(
+            stroke,
+            BRUSH_STROKE_LABEL,
+            history,
+            pixel_history,
+            undo_order,
+        ),
+        Some(Drag::Eraser {
+            stroke: Some(stroke),
+            ..
+        }) => record_stroke(
+            stroke,
+            ERASER_STROKE_LABEL,
+            history,
+            pixel_history,
+            undo_order,
+        ),
         Some(Drag::Move {
             layer_id,
             start_bounds,
@@ -6986,6 +7169,60 @@ fn commit_ending_drag(
             clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
         }
         _ => {}
+    }
+    undo_order.undo.len() != steps_before
+}
+
+/// [`commit_ending_drag`], then — only when it recorded a step — the
+/// History panel refresh that shows it (0.147.1). Before this a committed
+/// stroke never reached the panel at all, and a committed move reached it
+/// only on the next structural refresh. [`App::commit_drag`] is the
+/// production caller; it is a free function so a headless test can drive
+/// it.
+#[allow(clippy::too_many_arguments)]
+fn commit_drag_into_history(
+    workspace: &mut aurora_ui::Workspace,
+    drag: Option<Drag>,
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    view: &mut aurora_ui::CanvasView,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
+) -> bool {
+    let recorded = commit_ending_drag(
+        drag,
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        view,
+        active_layer,
+        canvas_size,
+    );
+    if recorded {
+        refresh_history_panel(workspace, undo_order);
+    }
+    recorded
+}
+
+/// Pushes one ended Brush or Eraser stroke onto `pixel_history` and, if
+/// it really touched a tile, records it in `undo_order` under `label`
+/// (0.147.1: the History panel's "Brush Stroke"/"Eraser Stroke" row —
+/// the tool is known here, at the commit, and nowhere later).
+fn record_stroke(
+    stroke: aurora_brush::StrokeSnapshot,
+    label: &str,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+) {
+    // `push`'s own `bool` is what tells "a real stroke happened" apart
+    // from "a click that never touched a tile" without asking the
+    // snapshot itself.
+    if pixel_history.push(stroke) {
+        undo_order.record_labelled(UndoKind::Pixel, label.to_owned(), history, pixel_history);
     }
 }
 
@@ -7353,6 +7590,9 @@ fn scroll_panel(
 struct ScrollFollow {
     focus: Option<WidgetId>,
     active: Option<aurora_doc::LayerId>,
+    /// The History panel's current row at the previous layout (0.147.1,
+    /// [`follow_history_row`]).
+    history: Option<WidgetId>,
 }
 
 /// Keeps what the user is working on in view (0.145.0): after a layout,
@@ -7389,10 +7629,24 @@ fn follow_scroll(
     {
         moved |= tree.scroll_into_view(row);
     }
-    *last = ScrollFollow {
-        focus: focused,
-        active,
-    };
+    last.focus = focused;
+    last.active = active;
+    moved
+}
+
+/// Keeps the History panel's current step in view (0.147.1): when the
+/// current row changed since the previous layout — every refresh builds
+/// new rows, so every stroke commit, structural edit, undo, redo and open
+/// counts — scrolls the History body just far enough to show it. The
+/// same only-on-a-real-change rule as [`follow_scroll`]: a user who
+/// scrolls the marker out of sight keeps that view until the next step.
+fn follow_history_row(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    last: &mut ScrollFollow,
+    current: Option<WidgetId>,
+) -> bool {
+    let moved = current != last.history && current.is_some_and(|row| tree.scroll_into_view(row));
+    last.history = current;
     moved
 }
 
@@ -8006,7 +8260,13 @@ fn perform_undo_redo(
         active_layer,
         state: layer_controls,
     });
-    commit_ending_drag(
+    // Through `commit_drag_into_history`, not `commit_ending_drag`
+    // (0.147.1 review): a command can arrive while a stroke is still held
+    // (a keyboard Redo or tool switch mid-drag), and the stroke it commits
+    // here must reach the History panel even when the command itself then
+    // refreshes nothing.
+    commit_drag_into_history(
+        workspace,
         drag.take(),
         layers,
         history,
@@ -15128,7 +15388,10 @@ fn press_layer_row(
     drag: &mut Option<Drag>,
     layer_id: aurora_doc::LayerId,
 ) {
-    commit_ending_drag(
+    // Refreshes History when it commits a stroke (0.147.1 review).
+    let canvas_size = canvas_area_logical_size(workspace);
+    commit_drag_into_history(
+        workspace,
         drag.take(),
         layers,
         history,
@@ -15136,7 +15399,7 @@ fn press_layer_row(
         undo_order,
         view,
         *active_layer,
-        canvas_area_logical_size(workspace),
+        canvas_size,
     );
     // Read across `select_layer` alone, the one statement that moves
     // `*active_layer`. `layers` is immutable for this whole function, so
@@ -15514,7 +15777,11 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
         },
         cx.click,
     );
-    commit_ending_drag(
+    // Refreshes History when it commits a stroke (0.147.1 review), so a
+    // held stroke shows even when the New/Delete below is refused and
+    // this returns early.
+    commit_drag_into_history(
+        cx.workspace,
         cx.drag.take(),
         cx.layers,
         cx.history,
@@ -15545,7 +15812,7 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
         cx.view,
         next_active,
     );
-    refresh_history_panel(cx.workspace, cx.history);
+    refresh_history_panel(cx.workspace, cx.undo_order);
     let _ = sync_layer_controls(
         cx.workspace,
         cx.layer_controls,
@@ -17428,7 +17695,7 @@ impl App {
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::new_document(),
             aurora_ui::Tool::default(),
             &tool_settings,
         );
@@ -17503,7 +17770,7 @@ impl App {
             canvas_size,
             history,
             pixel_history: aurora_brush::PixelHistory::new(),
-            undo_order: UndoOrder::default(),
+            undo_order: UndoOrder::new_document(),
             composite_cache: CompositeCache::default(),
             active_layer,
             current_colour: DEFAULT_COLOUR,
@@ -18094,7 +18361,7 @@ impl App {
             &mut self.workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::default(),
             self.tool,
             &self.tool_settings,
         ) {
@@ -18179,8 +18446,9 @@ impl App {
         // into a document that's no longer open. That incoming history
         // is *not* empty -- its journal records every step that built
         // the document (one add per layer, one per non-default
-        // property), which autosave and crash recovery replay and the
-        // History panel lists -- but its undo/redo stacks were cleared
+        // property), which autosave and crash recovery replay (the
+        // History panel shows only its "Open" row since 0.147.1) -- but
+        // its undo/redo stacks were cleared
         // on the way in (`History::clear_undo`, 0.144.0 review), so a
         // fresh `undo_order` agrees with it: the opened file is the
         // baseline, and Ctrl+Z cannot take the import apart.
@@ -18280,7 +18548,7 @@ impl App {
             &mut self.workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::default(),
             self.tool,
             &self.tool_settings,
         ) {
@@ -19308,7 +19576,9 @@ impl App {
     /// the free function, which needs no `App` (and therefore no GPU
     /// adapter) to test.
     fn commit_drag(&mut self, drag: Option<Drag>) {
-        commit_ending_drag(
+        let canvas_size = canvas_area_logical_size(&self.workspace);
+        commit_drag_into_history(
+            &mut self.workspace,
             drag,
             &self.layers,
             &mut self.history,
@@ -19316,7 +19586,7 @@ impl App {
             &mut self.undo_order,
             &mut self.canvas_view,
             self.active_layer,
-            canvas_area_logical_size(&self.workspace),
+            canvas_size,
         );
     }
 
@@ -19940,13 +20210,20 @@ impl App {
             width,
             height,
         );
-        if follow_scroll(
+        let followed = follow_scroll(
             &mut self.workspace.tree,
             &self.layer_rows,
             &mut self.scroll_follow,
             self.focus.focused(),
             self.active_layer,
-        ) {
+        );
+        let history_current = self.workspace.history_current;
+        if follow_history_row(
+            &mut self.workspace.tree,
+            &mut self.scroll_follow,
+            history_current,
+        ) || followed
+        {
             layout_workspace(
                 &mut self.workspace,
                 self.text_engine.as_mut(),
@@ -24053,9 +24330,12 @@ mod tests {
     }
 
     /// C-02: an opened document is the undo baseline — Ctrl+Z has nothing
-    /// to take apart, and the History panel lists exactly the journal.
+    /// to take apart. Since 0.147.1 the History panel shows the steps
+    /// Ctrl+Z can walk, not the build journal, so an opened document's
+    /// panel is exactly one current "Open" row (it listed the journal
+    /// before, which read as undoable steps that were not).
     #[test]
-    fn an_opened_document_cannot_be_undone_and_the_history_panel_lists_its_journal() {
+    fn an_opened_document_cannot_be_undone_and_the_history_panel_starts_at_open() {
         let bytes = include_bytes!("../../aurora-io/tests/fixtures/psd/group.psd");
         let document = match open_psd_document(bytes) {
             Ok(document) => document,
@@ -24076,17 +24356,18 @@ mod tests {
             &mut workspace,
             &scales,
             &document.layers,
-            &document.history,
+            &UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
             unreachable!("{err:?}");
         }
-        let rows = workspace
-            .tree
-            .children(workspace.history.body)
-            .map_or(0, <[_]>::len);
-        assert_eq!(rows, document.history.journal_descriptions().len());
+        assert_eq!(
+            history_rows(&workspace),
+            [("Open".to_owned(), true, false)],
+            "one current origin row, not the {}-entry build journal",
+            document.history.journal_len()
+        );
     }
 
     #[test]
@@ -24700,12 +24981,12 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err:?}"),
         };
-        let (layers, history) = demo_document();
+        let (layers, _history) = demo_document();
         let (layer_rows, active) = match replace_document(
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
@@ -24726,12 +25007,12 @@ mod tests {
         // A second replace (the open routes) highlights the new document's
         // own active row, and nothing of the old one survives.
         let image = fake_image(8, 8);
-        let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
+        let (new_layers, _new_history, new_layer_id) = document_from_image("photo", &image);
         let (new_rows, new_active) = match replace_document(
             &mut workspace,
             &scales,
             &new_layers,
-            &new_history,
+            &UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
@@ -24752,12 +25033,12 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err:?}"),
         };
-        let (layers, history) = demo_document();
+        let (layers, _history) = demo_document();
         let (layer_rows, _) = match replace_document(
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
@@ -24769,6 +25050,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
         // Everything under the body, at every depth -- not just the
         // tree container's own direct children. Counting only the
@@ -24802,11 +25084,23 @@ mod tests {
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }
+        // Several old rows, so "only the new origin row is left" below
+        // is a real change rather than a count that happens to match.
+        let old_labels = old_history.journal_descriptions();
+        let old_steps: Vec<_> = old_labels
+            .iter()
+            .map(|label| aurora_ui::HistoryStep {
+                label,
+                undone: false,
+            })
+            .collect();
+        assert!(old_steps.len() > 1, "setup");
         if aurora_ui::populate_history_panel(
             &mut workspace.tree,
             workspace.history,
             &scales,
-            &old_history,
+            "Open",
+            &old_steps,
         )
         .is_err()
         {
@@ -24838,12 +25132,12 @@ mod tests {
         );
 
         let image = fake_image(8, 8);
-        let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
+        let (new_layers, _new_history, new_layer_id) = document_from_image("photo", &image);
         let (layer_rows, active_layer) = match replace_document(
             &mut workspace,
             &scales,
             &new_layers,
-            &new_history,
+            &UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
@@ -24891,7 +25185,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         let mut workspace = aurora_ui::build_workspace(&scales);
-        let (layers, history) = demo_document();
+        let (layers, _history) = demo_document();
         let StartupPanels {
             layer_rows,
             active_layer,
@@ -24901,7 +25195,7 @@ mod tests {
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &UndoOrder::new_document(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         );
@@ -25904,16 +26198,29 @@ mod tests {
         let Some(rows) = workspace.tree.children(workspace.history.body) else {
             unreachable!("populate_history_panel always inserts a body");
         };
-        // Compared against `journal_descriptions().len()`, not
-        // `journal_len()`: the panel is built from the former, which
-        // caps at 1000 entries, while the latter is the untruncated
-        // count. They agree for this test's tiny journal, but only for
-        // that reason -- pinning the relation the panel actually has
-        // keeps this correct if a later test builds a longer one.
+        // Since 0.147.1 the panel lists the steps, not the journal: the
+        // undo moves the marker back to the origin row and dims the move,
+        // adding no row (it appended the undo's own journal entry before).
         assert_eq!(
             rows.len(),
-            history.journal_descriptions().len(),
-            "the History panel must reflect the undo's own journal entry"
+            2,
+            "the History panel must show the origin row and the undone move"
+        );
+        assert_eq!(
+            history_rows(&workspace),
+            [
+                hrow("Open", true, false),
+                (
+                    format!(
+                        "Repositioned layer #{} to ({}, {})",
+                        id.to_raw(),
+                        moved.x,
+                        moved.y
+                    ),
+                    false,
+                    true
+                ),
+            ]
         );
 
         let _ = run_command(
@@ -51793,6 +52100,485 @@ mod tests {
     /// The load-bearing assertion is the last pair: the entry that
     /// exists has to be the interrupted stroke's own, not just *an*
     /// entry.
+    /// `(label, selected, disabled)` for every History row, top to bottom.
+    fn history_rows(workspace: &aurora_ui::Workspace) -> Vec<(String, bool, bool)> {
+        workspace
+            .tree
+            .children(workspace.history.body)
+            .unwrap_or_default()
+            .iter()
+            .map(|&row| {
+                let label = workspace
+                    .tree
+                    .accessibility(row)
+                    .and_then(accesskit::Node::label)
+                    .unwrap_or_default()
+                    .to_owned();
+                match workspace.tree.payload(row) {
+                    Some(aurora_widgets::widgets::WidgetKind::ListRow(state)) => {
+                        (label, state.selected, state.disabled)
+                    }
+                    other => unreachable!("a History row is a ListRow, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// `(label, selected, disabled)` shorthand.
+    fn hrow(label: &str, selected: bool, disabled: bool) -> (String, bool, bool) {
+        (label.to_owned(), selected, disabled)
+    }
+
+    /// Everything the History panel's headless tests drive: the real
+    /// workspace, both backing stores, the unified order and a real tile
+    /// store, with strokes committed through the same
+    /// [`super::commit_drag_into_history`] `App::commit_drag` calls and
+    /// undo/redo through the real [`super::run_command`].
+    struct HistoryRig {
+        workspace: aurora_ui::Workspace,
+        focus: super::FocusManager,
+        palette: Option<aurora_widgets::WidgetId>,
+        tool: aurora_ui::Tool,
+        layers: aurora_doc::LayerTree,
+        history: aurora_doc::History,
+        pixel_history: aurora_brush::PixelHistory,
+        undo_order: UndoOrder,
+        store: aurora_tile::TileStore,
+        strokes: usize,
+        _dir: tempfile::TempDir,
+    }
+
+    impl HistoryRig {
+        fn new() -> Self {
+            let (dir, store) = commit_test_store();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+            let undo_order = UndoOrder::default();
+            super::refresh_history_panel(&mut workspace, &undo_order);
+            Self {
+                workspace,
+                focus: super::FocusManager::default(),
+                palette: None,
+                tool: aurora_ui::Tool::default(),
+                layers: aurora_doc::LayerTree::new(),
+                history: aurora_doc::History::new(),
+                pixel_history: aurora_brush::PixelHistory::new(),
+                undo_order,
+                store,
+                strokes: 0,
+                _dir: dir,
+            }
+        }
+
+        fn stroke(&mut self, eraser: bool) {
+            // A fresh spot per stroke, so every dab really changes pixels.
+            self.strokes += 1;
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (20.5 + 30.0 * self.strokes as f32, 40.5);
+            let drag = if eraser {
+                an_eraser_drag_that_erased(&mut self.store, centre)
+            } else {
+                a_brush_drag_that_painted(&mut self.store, centre)
+            };
+            assert!(
+                super::commit_drag_into_history(
+                    &mut self.workspace,
+                    Some(drag),
+                    &self.layers,
+                    &mut self.history,
+                    &mut self.pixel_history,
+                    &mut self.undo_order,
+                    &mut CanvasView::new(),
+                    None,
+                    None,
+                ),
+                "a stroke that painted is a recorded step"
+            );
+        }
+
+        fn command(&mut self, command: AppCommand) {
+            let _ = super::run_command(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.palette,
+                &mut self.tool,
+                &crate::ToolSettings::default(),
+                &mut self.layers,
+                &mut self.history,
+                &mut self.pixel_history,
+                Some(&mut self.store),
+                &mut self.undo_order,
+                command,
+            );
+        }
+
+        /// A structural edit recorded the way every production call site
+        /// records one, plus the panel refresh they all follow it with.
+        fn structural(
+            &mut self,
+            edit: impl FnOnce(&mut aurora_doc::History, &mut aurora_doc::LayerTree),
+        ) {
+            edit(&mut self.history, &mut self.layers);
+            self.undo_order.record(
+                UndoKind::Structural,
+                &mut self.history,
+                &mut self.pixel_history,
+            );
+            super::refresh_history_panel(&mut self.workspace, &self.undo_order);
+        }
+
+        fn rows(&self) -> Vec<(String, bool, bool)> {
+            history_rows(&self.workspace)
+        }
+    }
+
+    /// AC-1/AC-3 (the reported bug): a committed stroke appears as one
+    /// row, named for its tool, and is the current step. A pan drag
+    /// records nothing and adds no row.
+    #[test]
+    fn a_committed_stroke_adds_one_history_row_named_for_its_tool() {
+        let mut rig = HistoryRig::new();
+        assert_eq!(rig.rows(), [hrow("Open", true, false)]);
+
+        rig.stroke(false);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", true, false)
+            ]
+        );
+        rig.stroke(true);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", false, false),
+                hrow("Eraser Stroke", true, false),
+            ]
+        );
+
+        assert!(!super::commit_drag_into_history(
+            &mut rig.workspace,
+            Some(Drag::Pan {
+                last_screen: (0.0, 0.0)
+            }),
+            &rig.layers,
+            &mut rig.history,
+            &mut rig.pixel_history,
+            &mut rig.undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        ));
+        assert_eq!(rig.rows().len(), 3, "a pan is not a step");
+    }
+
+    /// AC-2: undo moves the marker back and dims the undone row without
+    /// adding one; undoing everything selects the origin row; redo moves
+    /// the marker forward again.
+    #[test]
+    fn undo_and_redo_move_the_history_marker_without_adding_rows() {
+        let mut rig = HistoryRig::new();
+        rig.stroke(false);
+        rig.stroke(true);
+
+        rig.command(AppCommand::Undo);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", true, false),
+                hrow("Eraser Stroke", false, true),
+            ],
+            "the undone eraser stroke is dimmed, the brush stroke is current"
+        );
+        rig.command(AppCommand::Undo);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", true, false),
+                hrow("Brush Stroke", false, true),
+                hrow("Eraser Stroke", false, true),
+            ]
+        );
+        rig.command(AppCommand::Undo);
+        assert_eq!(rig.rows().len(), 3, "nothing left to undo, nothing changes");
+
+        rig.command(AppCommand::Redo);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", true, false),
+                hrow("Eraser Stroke", false, true),
+            ]
+        );
+        rig.command(AppCommand::Redo);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", false, false),
+                hrow("Eraser Stroke", true, false),
+            ]
+        );
+    }
+
+    /// AC-2: a new edit after an undo discards the redo rows, as
+    /// `UndoOrder::record`'s `clear_redo` discards the redo steps.
+    #[test]
+    fn a_new_stroke_after_an_undo_discards_the_redoable_rows() {
+        let mut rig = HistoryRig::new();
+        rig.stroke(false);
+        rig.stroke(false);
+        rig.command(AppCommand::Undo);
+        assert_eq!(rig.rows().len(), 3, "setup: one undone row");
+
+        rig.stroke(true);
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", false, false),
+                hrow("Eraser Stroke", true, false),
+            ]
+        );
+        rig.command(AppCommand::Redo);
+        assert_eq!(rig.rows().len(), 3, "there is nothing to redo any more");
+    }
+
+    /// AC-1: structural and pixel steps share one list, in the order
+    /// Ctrl+Z walks them, and each undo moves the marker exactly one row
+    /// up whichever store the step lives in.
+    #[test]
+    fn structural_and_pixel_history_rows_interleave_in_ctrl_z_order() {
+        let mut rig = HistoryRig::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut id = None;
+        rig.structural(|history, layers| {
+            id = history.add_pixel_layer(layers, "Ink", bounds, None).ok();
+        });
+        let Some(id) = id else {
+            unreachable!("setup: the layer was added");
+        };
+        rig.stroke(false);
+        rig.structural(|history, layers| {
+            assert!(history.set_opacity(layers, id, 0.5).is_ok(), "setup");
+        });
+        rig.stroke(true);
+
+        let labels: Vec<_> = rig.rows().into_iter().map(|(label, ..)| label).collect();
+        let opacity = format!("Set opacity of layer #{} to 50%", id.to_raw());
+        assert_eq!(
+            labels,
+            [
+                "Open",
+                "Added layer \"Ink\"",
+                "Brush Stroke",
+                opacity.as_str(),
+                "Eraser Stroke"
+            ]
+        );
+        for current in (0..4).rev() {
+            rig.command(AppCommand::Undo);
+            let rows = rig.rows();
+            assert_eq!(rows.len(), 5, "undo never adds a row");
+            for (index, (label, selected, disabled)) in rows.iter().enumerate() {
+                assert_eq!(
+                    *selected,
+                    index == current,
+                    "{label} after undo to {current}"
+                );
+                assert_eq!(
+                    *disabled,
+                    index > current,
+                    "{label} after undo to {current}"
+                );
+            }
+        }
+        assert!(rig.layers.is_empty(), "the add itself was undone last");
+
+        // And redo walks forward again: a structural redo first, then a
+        // pixel one, each moving the marker one row down.
+        for current in 1..=2 {
+            rig.command(AppCommand::Redo);
+            let rows = rig.rows();
+            assert_eq!(rows.len(), 5, "redo never adds a row");
+            for (index, (label, selected, disabled)) in rows.iter().enumerate() {
+                assert_eq!(
+                    *selected,
+                    index == current,
+                    "{label} after redo to {current}"
+                );
+                assert_eq!(
+                    *disabled,
+                    index > current,
+                    "{label} after redo to {current}"
+                );
+            }
+        }
+    }
+
+    /// 0.147.1 review (I1): a command that arrives while a stroke is
+    /// still held — a keyboard Redo or a tool switch mid-drag — commits
+    /// the stroke first, and the History panel must show it even when the
+    /// command itself refreshes nothing (Redo has nothing left to redo
+    /// once the commit cleared it).
+    #[test]
+    fn a_command_arriving_mid_stroke_shows_the_committed_stroke_in_history() {
+        for command in [
+            AppCommand::Redo,
+            AppCommand::SelectTool(aurora_ui::Tool::Eraser),
+        ] {
+            let mut rig = HistoryRig::new();
+            rig.stroke(false);
+            rig.command(AppCommand::Undo);
+            assert_eq!(rig.rows().len(), 2, "setup: one undone row");
+
+            rig.strokes += 1;
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (20.5 + 30.0 * rig.strokes as f32, 40.5);
+            let mut drag = Some(a_brush_drag_that_painted(&mut rig.store, centre));
+            let _ = super::perform_undo_redo(
+                &mut rig.workspace,
+                &mut rig.focus,
+                &mut rig.palette,
+                &mut rig.tool,
+                &crate::ToolSettings::default(),
+                &mut rig.layers,
+                &mut rig.history,
+                &mut rig.pixel_history,
+                Some(&mut rig.store),
+                &mut rig.undo_order,
+                &mut super::CompositeCache::default(),
+                &mut CanvasView::new(),
+                None,
+                &mut drag,
+                &mut crate::LayerControlsState::default(),
+                command,
+            );
+            assert!(drag.is_none(), "the held stroke was committed");
+            assert_eq!(
+                rig.rows(),
+                [
+                    hrow("Open", false, false),
+                    hrow("Brush Stroke", true, false)
+                ],
+                "{command:?}: the held stroke replaced the undone one, with no stale redo row"
+            );
+        }
+    }
+
+    /// 0.147.1 review (I1): clicking a Layers row mid-stroke commits the
+    /// stroke, and the History panel shows it.
+    #[test]
+    fn pressing_a_layer_row_mid_stroke_shows_the_committed_stroke_in_history() {
+        let mut rig = HistoryRig::new();
+        let mut drag = Some(a_brush_drag_that_painted(&mut rig.store, (40.5, 40.5)));
+        let mut active = None;
+        super::press_layer_row(
+            &mut rig.workspace,
+            &std::collections::HashMap::new(),
+            &mut active,
+            &mut CanvasView::new(),
+            &rig.layers,
+            &mut rig.history,
+            &mut rig.pixel_history,
+            &mut rig.undo_order,
+            &mut super::CompositeCache::default(),
+            &mut drag,
+            aurora_doc::LayerId::from_raw(1),
+        );
+        assert!(drag.is_none(), "the held stroke was committed");
+        assert_eq!(
+            rig.rows(),
+            [
+                hrow("Open", false, false),
+                hrow("Brush Stroke", true, false)
+            ]
+        );
+    }
+
+    /// AC-1/AC-3: replacing the document resets the panel to its origin
+    /// row — "Open" for an opened file, "New Document" at startup.
+    #[test]
+    fn opening_a_document_resets_the_history_panel_to_its_origin_row() {
+        let mut rig = HistoryRig::new();
+        rig.stroke(false);
+        rig.stroke(true);
+        rig.command(AppCommand::Undo);
+        assert_eq!(rig.rows().len(), 3, "setup");
+
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, _history) = demo_document();
+        for (order, origin) in [
+            (UndoOrder::default(), "Open"),
+            (UndoOrder::new_document(), "New Document"),
+        ] {
+            if let Err(err) = super::replace_document(
+                &mut rig.workspace,
+                &scales,
+                &layers,
+                &order,
+                aurora_ui::Tool::default(),
+                &crate::ToolSettings::default(),
+            ) {
+                unreachable!("{err:?}");
+            }
+            assert_eq!(rig.rows(), [hrow(origin, true, false)]);
+        }
+    }
+
+    /// AC-2: the panel follows the current row the way Layers follows
+    /// the active one — a long history scrolls the marker into view once
+    /// per refresh, and not again until the next one.
+    #[test]
+    fn the_history_panel_scrolls_its_current_row_into_view_after_a_refresh() {
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        for _ in 0..200 {
+            undo_order.record_labelled(
+                UndoKind::Pixel,
+                "Brush Stroke".to_owned(),
+                &mut history,
+                &mut pixel_history,
+            );
+        }
+        super::refresh_history_panel(&mut workspace, &undo_order);
+        workspace.tree.compute_layout(1600.0, 900.0);
+        let mut last = super::ScrollFollow::default();
+        let current = workspace.history_current;
+        assert!(current.is_some(), "a refresh records the current row");
+        assert!(super::follow_history_row(
+            &mut workspace.tree,
+            &mut last,
+            current
+        ));
+        workspace.tree.compute_layout(1600.0, 900.0);
+        let scrolled = workspace
+            .tree
+            .scroll_y(workspace.history.body)
+            .unwrap_or(0.0);
+        assert!(
+            scrolled > 0.0,
+            "the 201st row is far below the fold: {scrolled}"
+        );
+        assert!(
+            !super::follow_history_row(&mut workspace.tree, &mut last, current),
+            "an unchanged current row is not followed again"
+        );
+    }
+
     #[test]
     fn a_stroke_interrupted_by_a_second_press_becomes_its_own_undo_entry() {
         let (_dir, mut store) = commit_test_store();
@@ -56349,11 +57135,31 @@ mod tests {
             }
         }
 
+        /// 0.147.1 review (I1): a held stroke is committed into the
+        /// History panel even when the layer command that ended it is
+        /// refused and returns early (no active layer, so Delete has
+        /// nothing to delete).
+        #[test]
+        fn a_refused_layer_command_still_shows_the_stroke_it_committed() {
+            let (mut rig, _) = Rig::three();
+            let (_dir, mut store) = commit_test_store();
+            rig.drag = Some(a_brush_drag_that_painted(&mut store, (40.5, 40.5)));
+            rig.active = None;
+            assert!(!rig.run(LayerCommand::Delete), "setup: refused");
+            assert!(rig.drag.is_none(), "the held stroke was committed");
+            assert_eq!(
+                super::history_rows(&rig.workspace),
+                [
+                    super::hrow("Open", false, false),
+                    super::hrow("Brush Stroke", true, false)
+                ]
+            );
+        }
+
         #[test]
         fn new_layer_lands_directly_above_the_active_layer_and_becomes_active() {
             let (mut rig, [top, mid, bottom]) = Rig::three();
             rig.cache.mark_current(TILE);
-            let history_rows_before = rig.history_rows();
 
             assert!(rig.run(LayerCommand::New));
 
@@ -56374,8 +57180,14 @@ mod tests {
             assert_eq!(rig.undo_order.undo, vec![UndoKind::Structural]);
             assert!(rig.undo_order.redo.is_empty());
             assert!(!rig.cache.is_current(TILE), "the composite is invalidated");
-            assert_eq!(rig.history_rows(), history_rows_before + 1);
-            assert_eq!(rig.history_rows(), rig.history.journal_descriptions().len());
+            // The rig never populated History before the command; the
+            // refresh it runs shows the origin row plus the new step.
+            assert_eq!(rig.history_rows(), 2);
+            assert_eq!(
+                rig.history_rows(),
+                rig.undo_order.undo.len() + rig.undo_order.redo.len() + 1,
+                "one row per undoable step plus the origin row"
+            );
             rig.assert_coherent();
         }
 
@@ -58523,12 +59335,11 @@ mod panel_scroll_tests {
         let scales = crate::test_workspace_scales();
         let mut workspace = aurora_ui::build_workspace(&scales);
         let layers = layers_of(count);
-        let history = aurora_doc::History::new();
         let (rows, _) = match replace_document(
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &crate::UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {
@@ -59328,12 +60139,11 @@ mod panel_scroll_tests {
                 > 0.0
         );
         let layers = layers_of(200);
-        let history = aurora_doc::History::new();
         if let Err(err) = replace_document(
             &mut workspace,
             &scales,
             &layers,
-            &history,
+            &crate::UndoOrder::default(),
             aurora_ui::Tool::default(),
             &crate::ToolSettings::default(),
         ) {

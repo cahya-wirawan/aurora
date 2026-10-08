@@ -3783,6 +3783,7 @@ mod tests {
             WidgetKind::ListRow(ListRowState {
                 selected: true,
                 disabled: true,
+                draws_label: false,
             }),
         ) {
             Ok(id) => id,
@@ -4025,6 +4026,7 @@ mod tests {
             WidgetKind::ListRow(ListRowState {
                 selected: true,
                 disabled: false,
+                draws_label: false,
             }),
         ) {
             Ok(id) => id,
@@ -4079,6 +4081,7 @@ mod tests {
             WidgetKind::ListRow(ListRowState {
                 selected: true,
                 disabled: false,
+                draws_label: false,
             }),
         ) {
             Ok(id) => id,
@@ -4295,6 +4298,7 @@ mod tests {
                 WidgetKind::ListRow(ListRowState {
                     selected: true,
                     disabled: false,
+                    draws_label: false,
                 }),
             ) {
                 Ok(id) => rows.push(id),

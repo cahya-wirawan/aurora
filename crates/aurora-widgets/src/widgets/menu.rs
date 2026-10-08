@@ -436,6 +436,7 @@ fn expected_payload(item: &MenuItem, highlighted: bool) -> WidgetKind {
         MenuItemKind::Action => WidgetKind::ListRow(ListRowState {
             selected: highlighted,
             disabled: !item.enabled,
+            draws_label: false,
         }),
         MenuItemKind::Separator => WidgetKind::MenuSeparator,
     }
@@ -1183,7 +1184,13 @@ mod tests {
             .iter()
             .map(|&id| tree.payload(id))
             .collect();
-        let row = |selected, disabled| WidgetKind::ListRow(ListRowState { selected, disabled });
+        let row = |selected, disabled| {
+            WidgetKind::ListRow(ListRowState {
+                selected,
+                disabled,
+                draws_label: false,
+            })
+        };
         assert_eq!(
             payloads,
             vec![

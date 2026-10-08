@@ -26,7 +26,36 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.147.0): PSD layer masks are applied, and
+**Latest (2026-10-08, 0.147.1): the History panel shows the user's
+steps.** A real-macOS report ("I don't see the changes in history
+panel"): the panel listed `History::journal_descriptions()`, the
+structural crash-recovery journal, so brush and eraser strokes (which
+live in `aurora_brush::PixelHistory`) never appeared, an undo or redo
+*appended* a row (both are journalled), only structural edits refreshed
+it, no row marked the current step — and, found during the round, no
+History row drew its text at all (`aurora_widgets::text_runs` drew a
+`ListRow` label only under a menu, dropdown or the palette). Now the
+panel is `aurora-app`'s `UndoOrder` sequence — the one Ctrl+Z walks —
+after an "Open"/"New Document" origin row: each stroke is one "Brush
+Stroke"/"Eraser Stroke" row (the label is fixed at the commit and
+travels with the step; `PixelHistory` still records no tool), each
+structural step keeps its journal description
+(`History::last_journal_description`, new). The newest applied step's
+row is `selected`, undone rows are `ListRowState::disabled`
+(`text.disabled`, no new token) and carry the accesskit state
+description "Undone"; undo/redo move the marker, a new edit drops the
+undone rows, and the panel refreshes on every stroke commit, undo, redo,
+structural edit and open — never per dab — and scrolls the current row
+into view. Cap kept: 1000 steps plus "… N earlier/later steps omitted".
+20 mutations, 20 killed (four only after a test was added). Full gate
+before the review revision: 2,770 passed, 0 failed, 0 skipped on the
+RTX 3090; after it, re-measured: **2,774 passed, 0 failed, 0 skipped**
+(`AURORA_REQUIRE_GPU=1`), judge round 2 **PASS 0.92**. Tested headlessly only — **not verified on real macOS or
+with a screen reader. Needs a human:** paint, undo and redo on macOS and
+watch History. Clicking a row does nothing yet. Details: "Next action",
+addendum 0.147.1.
+
+**Previously (2026-10-08, 0.147.0): PSD layer masks are applied, and
 Grayscale PSDs open.** A PSD layer's or group's user mask (channel `-2`)
 becomes a real `aurora_doc::LayerMask` with its coverage written into
 the tile store, with Photoshop's semantics: the rectangle is in document
@@ -7928,6 +7957,12 @@ structural design work.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
   `cargo test --workspace --doc`, and `cargo doc --workspace --no-deps
   --all-features` all clean.
+
+  **Update 0.147.1 — History lists the user's undoable steps.** Strokes
+  and structural steps in `UndoOrder` (Ctrl+Z) order after an origin
+  row, labels drawn, current step selected, undone steps dimmed, undo
+  and redo move the marker. Click-to-jump still open; not yet verified
+  on real macOS. See "Next action", addendum 0.147.1.
 
   **History panel rows have a real, hittable size, 2026-09-02 (0.77.2)**
   — a latent bug in already-landed code, hence the patch bump. A History
@@ -30299,6 +30334,139 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.147.1) — the History panel showed no strokes
+and never marked the current step.** Reported on real macOS: "I don't
+see the changes in history panel". **Cause:**
+`aurora_ui::populate_history_panel` listed
+`History::journal_descriptions()`, the structural crash-recovery
+journal. Strokes live in `aurora_brush::PixelHistory`, a separate
+store `aurora-app` interleaves with structural steps through
+`UndoOrder`, so they never appeared; `refresh_history_panel` ran only
+after structural edits; undo and redo are themselves journalled, so
+each *added* a row; nothing set `ListRowState::selected`; and History
+rows drew no text at all — `aurora_widgets::text_runs` drew a
+`ListRow`'s label only under a menu, a dropdown list or the command
+palette, so the panel was visually empty whatever it held (the round's
+plan assumed labels were drawn; reading `row_label` showed they were
+not). **Fix:** `UndoOrder` now carries one label per step
+(`undo_labels`/`redo_labels`, index-aligned, moved between the stacks by
+`step_back`/`step_forward`; a tag pushed directly gets its kind's
+generic label on the next sync). A stroke's label ("Brush Stroke",
+"Eraser Stroke") is fixed in `commit_ending_drag`, where the tool is
+known — no change to `aurora-brush`; a structural step's is
+`History::last_journal_description()` (new, `aurora-doc`) at record
+time, since the undo stack holds inverses. `populate_history_panel` now
+takes an origin label and `&[HistoryStep]` and returns the current row:
+origin ("Open" for any opened file, "New Document" at startup), applied
+steps oldest first, then undone steps in redo order; the newest applied
+row is `selected` (origin when none), undone rows `disabled`.
+Accessibility: every row reports `selected` true/false; an undone row
+keeps its plain label and carries accesskit `state_description`
+"Undone" (chosen over a "(undone)" label suffix so drawn text and name
+agree), and is not accesskit-disabled, since redo can reach it. Drawing:
+`row_label` now also draws a plain list row that opts in with
+`ListRowState::draws_label` (History rows do; the read-only Properties
+rows do not and stay undrawn — the opt-in replaced a first-draft rule
+keyed on accesskit `is_selected()`, review item I4). Refresh: every successful undo/redo (pixel
+and structural), every stroke or move commit
+(`commit_drag_into_history`, only when a step was recorded — never per
+dab, not for a pan), New/Delete Layer, layer-control commits, and
+`replace_document`. Scroll: `Workspace::history_current` records the
+current row and `follow_history_row` scrolls it into view after each
+refresh (once per change, like `follow_scroll`). Cap unchanged in
+effect: `aurora_doc::MAX_DESCRIPTIONS` (now `pub`) steps, plus an
+"… N earlier steps omitted" row; the window slides back so the current
+step is never cut off, with a trailing "… N later steps omitted".
+**Changed claims:** `an_opened_document_cannot_be_undone_and_the_history_
+panel_lists_its_journal` is now `..._starts_at_open` (one current "Open"
+row; the intent — an opened file is the undo baseline — kept);
+`run_command_undo_reverts_a_bounds_change_and_refreshes_the_history_
+panel` and New Layer's row-count assertion now count steps, not journal
+entries. **Mutations** (each file backed up, mutated, tested with
+`cargo test -p aurora-ui` and/or `AURORA_REQUIRE_GPU=1 cargo test -p
+aurora-app --lib` on the RTX 3090, restored, sha256 verified):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | stroke commit does not refresh | killed (3 app tests) |
+| M2 | marker one row late | killed (4 ui + 4 app) |
+| M3 | undone rows not dimmed | killed (3 ui + 3 app) |
+| M4 | undo/redo rows listed twice (an undo adds rows) | killed (5 app) |
+| M5 | applied steps reversed (interleave order) | killed (4 app) |
+| M6 | new edit keeps the redo steps (no truncation) | killed (1 app) |
+| M7 | pixel undo does not refresh | killed (2 app) |
+| M8 | structural redo does not refresh | **survived**, then killed after the interleave test gained a redo walk |
+| M9 | eraser stroke labelled "Brush Stroke" | killed (4 app) |
+| M10 | origin row never selected | killed (1 ui + 6 app) |
+| M11 | cap window ignores the current step | killed (1 ui) |
+| M12 | current row never scrolled into view | killed (1 app) |
+| M13 | History rows draw no label | killed (1 ui) |
+| M14 | undo drops the step's label | killed (2 app) |
+
+**Disclosed:** click-to-jump is out of scope — a row click does nothing.
+`history_steps` is linear in the session's step count before the cap
+applies (one `(label, undone)` pointer pair per step, collected on every
+refresh, i.e. per committed stroke — not windowed, see I3 below); the rebuild itself is bounded at 1002 rows
+but is still a whole-panel rebuild on the UI thread per step. Startup's
+"New Document" and every open's "Open" are fixed strings (no document
+name). Labels of directly pushed tags (tests only) are generic ("Pixel
+Edit", "Layer Change"). A structural step's label is the last journal
+entry at record time, which assumes each recorded step ends with its own
+entry (true of every current call site). Screen-reader behaviour of
+`state_description` is unverified. **Needs a human: paint, undo and redo
+on macOS and watch History.** **Suggested next:** click-to-jump (a row
+click undoes/redoes to that step; rows then become a `ListBox` and get
+`Action::Click`), then mask density (0.148.0).
+
+**Review revision (0.147.1).** The candidate passed the full gate
+(fmt, layering, style, `check --locked`, clippy, `AURORA_REQUIRE_GPU=1
+cargo test --workspace` **2,770 passed, 0 failed, 0 skipped**, strict
+rustdoc, `cargo deny`); the judge returned REVISE (0.88). After the
+revision the full gate was re-run on the revised tree: all steps green,
+**2,774 passed, 0 failed, 0 skipped**; judge round 2: **PASS 0.92**, no
+blocking issue. Outcomes:
+- **I1 (medium), fixed.** Three sites called `commit_ending_drag`
+  directly and never refreshed History: `perform_undo_redo` (every
+  palette/keyboard command, so a Redo or tool switch while a stroke was
+  still held recorded the stroke and cleared redo but left the panel
+  stale), `press_layer_row`, and `perform_layer_command` (including its
+  early return when New/Delete is refused). All three now go through
+  `commit_drag_into_history`. New tests, one per site:
+  `a_command_arriving_mid_stroke_shows_the_committed_stroke_in_history`
+  (Redo and `SelectTool`, through the real `perform_undo_redo`),
+  `pressing_a_layer_row_mid_stroke_shows_the_committed_stroke_in_history`
+  and `a_refused_layer_command_still_shows_the_stroke_it_committed`
+  (the early-return path).
+- **I2 (low), fixed.** `refresh_history_panel`'s doc now describes a
+  rebuild after every recorded step (strokes included), one row per
+  `UndoOrder` step plus the origin row, up to 1002.
+- **I3 (low), disclosed, not windowed.** Windowing `history_steps`
+  would mean passing the omitted counts into `populate_history_panel`
+  separately; the per-refresh cost is one pointer pair per session step,
+  stated in the doc and above.
+- **I4 (low), fixed.** Drawing no longer keys on accesskit
+  `is_selected()`: `ListRowState` gained an explicit `draws_label` opt-in
+  (14 mechanical struct-literal sites in `aurora-widgets` set it
+  `false`), History rows set it, Properties rows keep the default
+  (pinned by the new `a_properties_row_that_does_not_opt_in_draws_no_label`).
+- **I5 (low), fixed.** The "… N earlier/later steps omitted" notices no
+  longer set an accesskit selection state (asserted in
+  `a_long_history_is_capped_and_never_cuts_off_the_current_step`). The
+  "later" notice keeps `disabled` and "Undone", which is accurate: the
+  window always contains the current step, so everything past its end is
+  a redo step.
+
+Revision mutations (same backup/restore/sha256 procedure):
+
+| # | Mutation | Result |
+|---|---|---|
+| M15 | `perform_undo_redo` back to bare `commit_ending_drag` | killed (`a_command_arriving_mid_stroke…`) |
+| M16 | `press_layer_row` back to bare `commit_ending_drag` | survived at first; killed after `pressing_a_layer_row_mid_stroke…` was added |
+| M17 | `perform_layer_command` back to bare `commit_ending_drag` | survived at first; killed after `a_refused_layer_command_still_shows…` was added |
+| M18 | `row_label` ignores `draws_label` | survived at first; killed after `a_properties_row_that_does_not_opt_in_draws_no_label` was added |
+| M19 | notice rows report `selected: false` again | killed (`a_long_history_is_capped…`) |
+| M13b | opted-in rows draw no label (M13 re-aimed at the new code) | killed (`history_rows_draw_their_labels…`) |
 
 **Addendum 2026-10-08 (0.147.0) — PSD layer masks applied; Grayscale
 PSDs.** Done as 0.146.0 suggested. Full account: M1.8's open-file

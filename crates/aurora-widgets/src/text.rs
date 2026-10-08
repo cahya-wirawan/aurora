@@ -268,10 +268,26 @@ fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bo
         }
         WidgetKind::Container => {
             // A command palette's result row: body container, then root.
-            let Some(WidgetKind::CommandPalette(state)) = tree.payload(tree.parent(parent)?) else {
+            if let Some(WidgetKind::CommandPalette(state)) =
+                tree.parent(parent).and_then(|root| tree.payload(root))
+            {
+                return state.row_title(row).map(|title| (title.to_owned(), true));
+            }
+            // A plain list row that opted in (0.147.1,
+            // `ListRowState::draws_label`; `aurora-ui`'s History panel):
+            // its own accessible name is its text. The read-only
+            // Properties rows do not opt in -- the tool-controls readout
+            // beside them already shows their text -- and stay undrawn.
+            // Enabled-ness is the payload's own `disabled`, which the
+            // caller folds in.
+            let Some(WidgetKind::ListRow(crate::widgets::ListRowState {
+                draws_label: true, ..
+            })) = tree.payload(row)
+            else {
                 return None;
             };
-            state.row_title(row).map(|title| (title.to_owned(), true))
+            let label = tree.accessibility(row)?.label()?;
+            Some((label.to_owned(), true))
         }
         _ => None,
     }

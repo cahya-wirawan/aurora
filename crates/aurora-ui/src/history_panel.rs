@@ -22,40 +22,60 @@
 //! than copied into each; see it for why both guards there are
 //! load-bearing.
 //!
-//! **Zero pixel difference, deliberately.** `aurora_widgets::paint`'s
-//! own `paint_list_row` returns `Ok(vec![])` for an *unselected* row,
-//! and nothing in the workspace selects a History row yet — no
-//! `set_*_selected` call site, no click routing, no "current step"
-//! marker of the kind the mockup's `.history-row.current` styling
-//! shows. So this change draws exactly what the old one drew (nothing)
-//! and changes only the geometry: a real, non-degenerate, hit-testable
-//! rect. The highlight becomes real the moment something sets
-//! `selected`, which is separate, still-open work.
+//! **The steps, not the journal** (0.147.1). Until then the panel listed
+//! `aurora_doc::History::journal_descriptions` — the structural
+//! crash-recovery journal — so brush and eraser strokes (which live in
+//! `aurora_brush::PixelHistory`) never appeared, and undo and redo, being
+//! journalled themselves, *added* rows instead of moving a marker. The
+//! caller now hands in the user's own undoable steps as
+//! [`HistoryStep`]s, in the order `Ctrl+Z` walks them (`aurora-app`'s
+//! `UndoOrder`): an origin row ("Open", "New Document") first, then every
+//! applied step oldest first, then every undone (redoable) step in the
+//! order redo would replay them.
 //!
-//! Still not drawn at all: the row's own text (a row's label reaches
-//! the accessibility node and nothing else — `aurora-vector`-backed
-//! glyph rendering doesn't exist yet) and any icon.
+//! **The current step is marked.** The newest applied step's row — the
+//! origin row when nothing is applied — is `ListRowState::selected`, so
+//! `aurora_widgets::paint`'s `paint_list_row` draws its `accent.primary`
+//! highlight and its text is `text.on_accent`. Every undone step's row is
+//! `ListRowState::disabled`, drawn in `text.disabled`; no new token.
 //!
-//! **Rows past the bottom of the panel are laid out but unreachable.**
-//! The same disclosed gap [`crate::layers_panel`] records, for the same
-//! reason: `crate::panel`'s own `body_style` gives the panel a
-//! content-independent share of the rail, and there is no scrolling
-//! container anywhere in `aurora-widgets` yet. With the rail's ~300 px
-//! History share and 21 px rows, exactly **14** of an up-to-**1001**-row
-//! journal are reachable; the rest are refused by `hit_test`, which will
-//! not descend into a parent whose own bounds exclude the point. A real
-//! scrolling or virtualized list is what closes this, and it is still
-//! open.
+//! **Rows draw their labels** (0.147.1). Before this round a row's label
+//! reached only the accessibility node — `aurora_widgets::text_runs`
+//! drew a `ListRow`'s text only under a menu, a dropdown list or the
+//! command palette — so the panel was visually empty. Every History row
+//! now opts in with `ListRowState::draws_label`; the read-only Properties
+//! rows do not, and stay undrawn. No icon yet.
 //!
-//! **1001, not 1000** — `History::journal_descriptions` caps the *real*
-//! journal steps it returns at `MAX_DESCRIPTIONS` (1000, matching
-//! Photoshop's own History-states maximum) and prepends a synthetic
-//! "N earlier steps omitted" notice at index 0 whenever anything was
-//! dropped, so its own `journal_descriptions_caps_entry_count_with_an_
-//! omission_notice` test asserts `len() == 1001`. That matters to
-//! whoever eventually wires row clicks up to a real "revert to this
-//! step" action: **row index is not journal index**, and on a truncated
-//! journal row 0 is not a step at all.
+//! **Accessibility of an undone step: an accesskit state description,
+//! not a label suffix.** An undone row keeps its plain label ("Brush
+//! Stroke") and carries `state_description` [`UNDONE_STATE`] ("Undone"),
+//! so the drawn text and the accessible name stay the same string and a
+//! screen reader still announces the step, plus its state. The origin
+//! row and every step row report `selected` true or false; the "… N
+//! earlier/later steps omitted" notice rows report no selection state at
+//! all, since they are not steps. The "later" notice is dimmed and
+//! "Undone" because it can only stand for redo steps: the window always
+//! contains the current step, so everything past its end is undone. The rows are not marked accesskit-`disabled`:
+//! redo can still reach them, so "unavailable" would be wrong. None of
+//! this has been checked against a real screen reader.
+//!
+//! **Rows past the bottom of the panel scroll into reach** (0.145.0's
+//! scrolling body, 0.146.0's scrollbar). `aurora-app` records the current
+//! row in `Workspace::history_current` and scrolls it into view after
+//! every refresh. At offset 0, with the rail's ~300 px History share and
+//! 21 px rows, 13 rows are visible.
+//!
+//! **At most 1000 steps, plus up to two notice rows** — the same cap
+//! (`aurora_doc::MAX_DESCRIPTIONS`, Photoshop's own History-states
+//! maximum) `History::journal_descriptions` applies. Past it, the oldest
+//! steps are dropped and the origin row becomes a synthetic "… N earlier
+//! steps omitted" notice — unless the current step would fall off the
+//! front, in which case the window starts at the current step and a
+//! trailing "… N later steps omitted" notice stands for the redo steps
+//! past its end. The current row is always shown. **Row index is not
+//! step index**: row 0 is the origin or a notice, never a step — which
+//! matters to whoever wires row clicks to "revert to this step", the
+//! open next step.
 //!
 //! **The damage rect a full journal produces is not yet safe to scissor
 //! with, and the rect is the whole tree's, not this panel's.**
@@ -63,7 +83,7 @@
 //! all three panels feed it — [`crate::properties_panel`]
 //! cross-references this paragraph rather than restating it. Measured in
 //! a real 1600×900 `build_workspace` with a
-//! capped 1001-row journal, 200 layers and ten tool options populated at
+//! capped 1001-row journal (the pre-0.147.1 panel), 200 layers and ten tool options populated at
 //! once: `Rect { 0, 0, 1600, 21621 }`, ~24× a 900 px-tall window. The
 //! same measurement with *only* History populated gives the identical
 //! number, because a full journal dominates the union outright (1001
@@ -78,66 +98,82 @@
 //! with the real surface size first — an oversized scissor rect is a
 //! `wgpu` validation error, in crates that deny `panic`/`unwrap`.
 //!
-//! **No `Action::Focus`/`Action::Click` on a row, deliberately.**
-//! Adding them would make every journal entry a `Tab` stop — up to 1001
+//! **No `Action::Focus`/`Action::Click` on a row, deliberately — and no
+//! click-to-jump yet.** Clicking a row does nothing (out of scope for
+//! 0.147.1; the suggested next step). Adding the actions would make every
+//! step a `Tab` stop — up to 1002
 //! of them inside one panel — which is the same crate-wide focus-model
 //! question `aurora_widgets::widgets::tree_view` already discloses and
 //! the Layers panel already pays. Making History pay it too, for rows
 //! that route nowhere, would be a worse experience, not a better one.
 //!
 //! **One-shot, not reactive** — a caller re-populates after every
-//! recorded step. Since 0.135.0 that includes the Layers panel's own
-//! controls (`aurora-app`'s `refresh_history_panel`), the first panel
-//! widgets that edit a live document.
+//! recorded step, undo and redo (`aurora-app`'s `refresh_history_panel`):
+//! a committed stroke, a structural edit, a layer-control commit, New and
+//! Delete Layer, and an opened document. Never per dab.
 
 use accesskit::{Node, Role};
-use aurora_doc::History;
+use aurora_doc::MAX_DESCRIPTIONS;
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{ListRowState, WidgetKind};
-use aurora_widgets::{WidgetError, WidgetTree};
+use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 
 use crate::panel::{PanelHandle, clear_panel_body, row_style};
 
+/// The accesskit `state_description` an undone (redoable) step's row
+/// carries — see this module's own doc comment for why a state rather
+/// than a label suffix.
+pub const UNDONE_STATE: &str = "Undone";
+
+/// One of the user's undoable steps, as the History panel shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryStep<'a> {
+    /// What the row says ("Brush Stroke", `Added layer "Layer 2"`).
+    pub label: &'a str,
+    /// `true` for a step that has been undone and can be redone.
+    pub undone: bool,
+}
+
+/// "… {n} earlier/later step(s) omitted", the notice row shape
+/// `aurora_doc::History::journal_descriptions` already uses.
+fn omitted(count: usize, which: &str) -> String {
+    format!(
+        "\u{2026} {count} {which} step{} omitted",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
 /// Empties `panel`'s body, replaces its accessibility with a real
-/// `Role::List`, then inserts one `Role::ListItem` row per journal entry
-/// in `history`, in chronological order (oldest first, matching
-/// `History::journal_descriptions`'s own order).
+/// `Role::List`, then inserts one `Role::ListItem` row for `origin` and
+/// one per step in `steps` (applied steps oldest first, then undone ones
+/// in redo order — see this module's own doc comment), marking the
+/// current one. Returns the current row's id, so the caller can scroll
+/// it into view.
+///
+/// The current step is the last step with `undone == false`; with none,
+/// the origin row is current.
 ///
 /// **The `Role::List` is deliberately unlabelled.** `panel.root` is
 /// already a `Role::Region` labelled "History" ([`crate::panel::
 /// insert_panel`]), so naming the list inside it "History" too was the
 /// same nested-duplicate-name shape [`crate::layers_panel`] had to fix
 /// in `0.77.1` — a screen reader announcing the name twice on entry —
-/// just one level shallower. Relabelling the body rather than nesting a
-/// second container did not avoid it; dropping the label does. A body
-/// label would only be right if it said something the region does not,
-/// the way [`crate::populate_properties_panel`]'s "Properties: Brush"
-/// names the active tool.
+/// just one level shallower.
 ///
 /// **The rows are `panel.body`'s own direct children**, unlike
 /// [`crate::populate_layers_panel`], which nests its rows inside a
-/// `Role::Tree` container of its own. Nothing here needs the extra
-/// level: since `0.77.2` the shared `body_style` stacks its children
-/// itself, and `Role::List` on the body plus `Role::ListItem` on the
-/// rows is already a well-formed list. Adding a container would also
-/// change what `children(panel.body)` means to `aurora-app`'s own
-/// tests, which count rows there directly.
+/// `Role::Tree` container of its own. `aurora-app`'s own tests count rows
+/// there directly.
 ///
 /// **`Role::List`/`Role::ListItem`, not `Role::ListBox`/
-/// `Role::ListBoxOption`.** The listbox pair is what
-/// `aurora_widgets::widgets::command_palette` uses, and correctly — it
-/// really is a single-selection chooser. History is not, yet: nothing
-/// selects a row, so a `ListBoxOption` would over-promise a selection
-/// interaction that does not exist, and `ListBoxOption` outside a
-/// `ListBox` parent is a malformed accessibility tree besides. **None
-/// of this has been checked against a real screen reader** — there is
-/// no display server in this workspace's sandbox — so it is a
-/// specification-level choice, not a verified one.
+/// `Role::ListBoxOption`.** Rows now report `selected` (the current
+/// step), but nothing chooses a row yet — click-to-jump is still open —
+/// so a listbox would over-promise an interaction that does not exist.
+/// Revisit when rows become clickable. **Not checked against a real
+/// screen reader.**
 ///
 /// **Repopulating is safe**: `panel.body`'s existing children are
-/// removed first ([`clear_panel_body`]), so calling this twice replaces
-/// the rows rather than appending a second set beside the first with
-/// the old, now-meaningless `WidgetId`s still live.
+/// removed first ([`clear_panel_body`]).
 ///
 /// # Errors
 ///
@@ -146,44 +182,77 @@ pub fn populate_history_panel(
     tree: &mut WidgetTree<WidgetKind>,
     panel: PanelHandle,
     scales: &Scales,
-    history: &History,
-) -> Result<(), WidgetError> {
+    origin: &str,
+    steps: &[HistoryStep<'_>],
+) -> Result<WidgetId, WidgetError> {
     clear_panel_body(tree, panel.body)?;
     tree.set_accessibility(panel.body, Node::new(Role::List))?;
 
     let style = row_style(scales);
-    for description in history.journal_descriptions() {
+    // `selected` is `None` for a notice row, which is not a step and
+    // reports no selection state at all.
+    let insert = |tree: &mut WidgetTree<WidgetKind>,
+                  label: &str,
+                  selected: Option<bool>,
+                  undone: bool|
+     -> Result<WidgetId, WidgetError> {
         let mut node = Node::new(Role::ListItem);
-        node.set_label(description);
+        node.set_label(label);
+        if let Some(selected) = selected {
+            node.set_selected(selected);
+        }
+        if undone {
+            node.set_state_description(UNDONE_STATE);
+        }
         tree.insert(
             panel.body,
             style.clone(),
             node,
-            WidgetKind::ListRow(ListRowState::default()),
-        )?;
+            WidgetKind::ListRow(ListRowState {
+                selected: selected.unwrap_or(false),
+                disabled: undone,
+                draws_label: true,
+            }),
+        )
+    };
+
+    let current = steps.iter().rposition(|step| !step.undone);
+    let len = steps.len();
+    // The window of steps shown: the newest `MAX_DESCRIPTIONS`, moved
+    // back far enough that the current step is never cut off the front.
+    let start = len
+        .saturating_sub(MAX_DESCRIPTIONS)
+        .min(current.unwrap_or(0));
+    let end = start.saturating_add(MAX_DESCRIPTIONS).min(len);
+
+    let first = if start == 0 {
+        insert(tree, origin, Some(current.is_none()), false)?
+    } else {
+        insert(tree, &omitted(start, "earlier"), None, false)?
+    };
+    let mut current_row = first;
+    for (index, step) in steps.iter().enumerate().take(end).skip(start) {
+        let selected = current == Some(index);
+        let row = insert(tree, step.label, Some(selected), step.undone)?;
+        if selected {
+            current_row = row;
+        }
     }
-    Ok(())
+    if end < len {
+        insert(tree, &omitted(len - end, "later"), None, true)?;
+    }
+    Ok(current_row)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::populate_history_panel;
+    use super::{HistoryStep, UNDONE_STATE, populate_history_panel};
     use crate::panel::insert_panel;
     use aurora_core::Rect;
-    use aurora_doc::{History, LayerTree};
     use aurora_theme::Scales;
     use aurora_widgets::widgets::{self, ListRowState, WidgetKind};
     use taffy::Style;
     use taffy::style_helpers::length;
-
-    fn bounds() -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100,
-        }
-    }
 
     // The real, committed, owner-approved scales -- the same file
     // `aurora-theme`'s own tests parse, so this exercises real token
@@ -196,42 +265,82 @@ mod tests {
         }
     }
 
-    /// `count` real journal entries, each one a distinct `add_pixel_layer`.
-    fn history_with(count: usize) -> History {
-        let mut layer_tree = LayerTree::new();
-        let mut history = History::new();
-        for i in 0..count {
-            if let Err(err) =
-                history.add_pixel_layer(&mut layer_tree, format!("Layer {i}"), bounds(), None)
-            {
-                unreachable!("{err:?}");
-            }
-        }
-        history
+    /// `count` distinct step labels, oldest first.
+    fn history_with(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|i| format!("Added layer \"Layer {i}\""))
+            .collect()
     }
 
-    #[test]
-    fn populate_history_panel_adds_one_row_per_journal_entry_in_order() {
-        let mut layer_tree = LayerTree::new();
-        let mut history = History::new();
-        if let Err(err) = history.add_pixel_layer(&mut layer_tree, "Background", bounds(), None) {
-            unreachable!("{err:?}");
-        }
-        let id = match history.add_pixel_layer(&mut layer_tree, "Retouch", bounds(), None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = history.set_opacity(&mut layer_tree, id, 0.8) {
-            unreachable!("{err:?}");
-        }
+    /// Every label as an applied step.
+    fn applied(labels: &[String]) -> Vec<HistoryStep<'_>> {
+        labels
+            .iter()
+            .map(|label| HistoryStep {
+                label,
+                undone: false,
+            })
+            .collect()
+    }
 
+    /// The first `applied` labels applied, the rest undone.
+    fn split(labels: &[String], applied: usize) -> Vec<HistoryStep<'_>> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| HistoryStep {
+                label,
+                undone: i >= applied,
+            })
+            .collect()
+    }
+
+    fn row_state(
+        tree: &aurora_widgets::WidgetTree<WidgetKind>,
+        row: aurora_widgets::WidgetId,
+    ) -> ListRowState {
+        match tree.payload(row) {
+            Some(WidgetKind::ListRow(state)) => *state,
+            other => unreachable!("a History row must be a ListRow, got {other:?}"),
+        }
+    }
+
+    fn panel_tree() -> (
+        aurora_widgets::WidgetTree<WidgetKind>,
+        crate::panel::PanelHandle,
+    ) {
         let (mut tree, root) = widgets::new_tree(Style::default());
         let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
+        (tree, panel)
+    }
+
+    fn labels_of(
+        tree: &aurora_widgets::WidgetTree<WidgetKind>,
+        panel: crate::panel::PanelHandle,
+    ) -> Vec<String> {
+        tree.children(panel.body)
+            .unwrap_or_default()
+            .iter()
+            .map(|&row| {
+                tree.accessibility(row)
+                    .and_then(accesskit::Node::label)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn populate_history_panel_adds_an_origin_row_then_one_row_per_step_in_order() {
+        let labels = history_with(3);
+        let (mut tree, panel) = panel_tree();
         let scales = test_scales();
-        if let Err(err) = populate_history_panel(&mut tree, panel, &scales, &history) {
+        if let Err(err) =
+            populate_history_panel(&mut tree, panel, &scales, "Open", &applied(&labels))
+        {
             unreachable!("{err:?}");
         }
 
@@ -243,17 +352,287 @@ mod tests {
         let Some(rows) = tree.children(panel.body) else {
             unreachable!("just populated");
         };
-        let expected = history.journal_descriptions();
-        assert_eq!(rows.len(), expected.len());
-        assert_eq!(rows.len(), 3, "add + add + set_opacity");
-
-        for (&row, description) in rows.iter().zip(expected.iter()) {
+        assert_eq!(rows.len(), 4, "origin + three steps");
+        let mut expected = vec!["Open".to_owned()];
+        expected.extend(labels.iter().cloned());
+        assert_eq!(labels_of(&tree, panel), expected);
+        for &row in rows {
             let Some(accessibility) = tree.accessibility(row) else {
                 unreachable!("just inserted");
             };
             assert_eq!(accessibility.role(), accesskit::Role::ListItem);
-            assert_eq!(accessibility.label(), Some(description.as_str()));
         }
+    }
+
+    /// AC-2: the newest applied step is the one selected row, every
+    /// undone step after it is disabled (dimmed), and the returned id is
+    /// that selected row.
+    #[test]
+    fn the_current_step_is_selected_and_the_undone_steps_after_it_are_dimmed() {
+        let labels = history_with(4);
+        let (mut tree, panel) = panel_tree();
+        let scales = test_scales();
+        let current =
+            match populate_history_panel(&mut tree, panel, &scales, "Open", &split(&labels, 2)) {
+                Ok(current) => current,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(rows.len(), 5);
+        let states: Vec<_> = rows.iter().map(|&row| row_state(&tree, row)).collect();
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| (state.selected, state.disabled))
+                .collect::<Vec<_>>(),
+            [
+                (false, false),
+                (false, false),
+                (true, false),
+                (false, true),
+                (false, true)
+            ],
+            "origin, step 0, step 1 (current), then two undone steps"
+        );
+        assert_eq!(rows.get(2), Some(&current));
+    }
+
+    /// With nothing applied the origin row is current and every step is
+    /// undone.
+    #[test]
+    fn with_every_step_undone_the_origin_row_is_current() {
+        let labels = history_with(2);
+        let (mut tree, panel) = panel_tree();
+        let scales = test_scales();
+        let current =
+            match populate_history_panel(&mut tree, panel, &scales, "Open", &split(&labels, 0)) {
+                Ok(current) => current,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(rows.first(), Some(&current));
+        assert!(row_state(&tree, current).selected);
+        for &row in rows.iter().skip(1) {
+            let state = row_state(&tree, row);
+            assert!(state.disabled && !state.selected, "{state:?}");
+        }
+    }
+
+    /// AC-4: the current row reports `selected`, other rows report
+    /// not-selected, and an undone row keeps its plain label and carries
+    /// the "Undone" state description instead.
+    #[test]
+    fn rows_report_selection_and_undone_state_to_accessibility() {
+        let labels = vec!["Brush Stroke".to_owned(), "Eraser Stroke".to_owned()];
+        let (mut tree, panel) = panel_tree();
+        let scales = test_scales();
+        if let Err(err) = populate_history_panel(
+            &mut tree,
+            panel,
+            &scales,
+            "New Document",
+            &split(&labels, 1),
+        ) {
+            unreachable!("{err:?}");
+        }
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        let node = |i: usize| match rows.get(i).and_then(|&row| tree.accessibility(row)) {
+            Some(node) => node,
+            None => unreachable!("row {i} exists"),
+        };
+        assert_eq!(node(0).label(), Some("New Document"));
+        assert_eq!(node(0).is_selected(), Some(false));
+        assert_eq!(node(1).label(), Some("Brush Stroke"));
+        assert_eq!(node(1).is_selected(), Some(true));
+        assert_eq!(node(1).state_description(), None);
+        assert_eq!(node(2).label(), Some("Eraser Stroke"), "no label suffix");
+        assert_eq!(node(2).is_selected(), Some(false));
+        assert_eq!(node(2).state_description(), Some(UNDONE_STATE));
+        assert!(!node(2).is_disabled(), "redo can still reach it");
+    }
+
+    /// The rows draw their labels (before 0.147.1 a History row's text
+    /// reached accessibility only): the current row in `text.on_accent`,
+    /// an undone one in `text.disabled`, and the rest in `text.primary`.
+    #[test]
+    fn history_rows_draw_their_labels_with_the_state_colours() {
+        const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
+        const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+        let labels = history_with(2);
+        let (mut tree, panel) = panel_tree();
+        let scales = test_scales();
+        if let Err(err) =
+            populate_history_panel(&mut tree, panel, &scales, "Open", &split(&labels, 1))
+        {
+            unreachable!("{err:?}");
+        }
+        let Ok(palette) = aurora_theme::Palette::from_toml_str(PALETTE_TOML) else {
+            unreachable!("the committed palette parses");
+        };
+        let mut themes = aurora_theme::ThemeSet::new();
+        if themes.register(DARK_THEME_TOML).is_err() {
+            unreachable!("the committed Dark theme registers");
+        }
+        let theme = match themes.resolve("Dark", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 21,
+        };
+        let colours: Vec<_> = rows
+            .iter()
+            .map(|&row| {
+                let runs =
+                    aurora_widgets::text_runs(&tree, row, bounds, bounds, None, &theme, &scales);
+                assert_eq!(runs.len(), 1, "one drawn label per row");
+                runs.first().map(|run| (run.text.clone(), run.color))
+            })
+            .collect();
+        let rgba = |c: aurora_theme::Color| {
+            let [r, g, b] = c.to_srgb_f32();
+            [r, g, b, 1.0]
+        };
+        assert_eq!(
+            colours,
+            [
+                Some(("Open".to_owned(), rgba(theme.text.primary))),
+                Some((
+                    labels.first().cloned().unwrap_or_default(),
+                    rgba(theme.text.on_accent)
+                )),
+                Some((
+                    labels.get(1).cloned().unwrap_or_default(),
+                    rgba(theme.text.disabled)
+                )),
+            ]
+        );
+    }
+
+    /// The other half of the `draws_label` opt-in (0.147.1 review): a
+    /// read-only Properties row under the same kind of bare panel body
+    /// does not opt in and still draws nothing, so its text is not drawn
+    /// twice beside the tool-controls readout.
+    #[test]
+    fn a_properties_row_that_does_not_opt_in_draws_no_label() {
+        const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
+        const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+        let Ok(palette) = aurora_theme::Palette::from_toml_str(PALETTE_TOML) else {
+            unreachable!("the committed palette parses");
+        };
+        let mut themes = aurora_theme::ThemeSet::new();
+        if themes.register(DARK_THEME_TOML).is_err() {
+            unreachable!("the committed Dark theme registers");
+        }
+        let theme = match themes.resolve("Dark", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, panel) = panel_tree();
+        let scales = test_scales();
+        let options = [("Radius", "12px".to_owned())];
+        if let Err(err) = crate::populate_properties_panel(
+            &mut tree,
+            panel,
+            &scales,
+            crate::Tool::Brush,
+            &options,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(rows.len(), 1, "setup");
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 21,
+        };
+        for row in rows {
+            assert!(
+                aurora_widgets::text_runs(&tree, row, bounds, bounds, None, &theme, &scales)
+                    .is_empty(),
+                "a row without draws_label draws no text"
+            );
+        }
+    }
+
+    /// AC-3's bound: past `MAX_DESCRIPTIONS` steps the oldest are folded
+    /// into a notice row, and a current step that would fall off the
+    /// front pulls the window back to it, with a trailing notice.
+    #[test]
+    fn a_long_history_is_capped_and_never_cuts_off_the_current_step() {
+        let labels = history_with(1005);
+        let scales = test_scales();
+
+        let (mut tree, panel) = panel_tree();
+        let current =
+            match populate_history_panel(&mut tree, panel, &scales, "Open", &applied(&labels)) {
+                Ok(current) => current,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let shown = labels_of(&tree, panel);
+        assert_eq!(shown.len(), 1001);
+        assert_eq!(
+            shown.first().map(String::as_str),
+            Some("\u{2026} 5 earlier steps omitted")
+        );
+        assert_eq!(shown.last(), labels.last());
+        assert_eq!(
+            tree.children(panel.body).and_then(<[_]>::last),
+            Some(&current)
+        );
+
+        let (mut tree, panel) = panel_tree();
+        let current =
+            match populate_history_panel(&mut tree, panel, &scales, "Open", &split(&labels, 2)) {
+                Ok(current) => current,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let shown = labels_of(&tree, panel);
+        assert_eq!(shown.len(), 1002, "notice + 1000 steps + notice");
+        assert_eq!(
+            shown.first().map(String::as_str),
+            Some("\u{2026} 1 earlier step omitted")
+        );
+        assert_eq!(
+            shown.get(1),
+            labels.get(1),
+            "the current step leads the window"
+        );
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("\u{2026} 4 later steps omitted")
+        );
+        let Some(rows) = tree.children(panel.body).map(<[_]>::to_vec) else {
+            unreachable!("just populated");
+        };
+        for notice in [rows.first(), rows.last()] {
+            let node = notice.and_then(|&row| tree.accessibility(row));
+            assert_eq!(
+                node.map(accesskit::Node::is_selected),
+                Some(None),
+                "a notice row is not a step and reports no selection state"
+            );
+        }
+        assert_eq!(
+            tree.children(panel.body).and_then(|rows| rows.get(1)),
+            Some(&current)
+        );
     }
 
     /// The regression test for the `0.77.2` bug. Before the fix, every
@@ -269,7 +648,13 @@ mod tests {
         let history = history_with(5);
         let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
-        if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
+        if let Err(err) = populate_history_panel(
+            &mut ws.tree,
+            ws.history,
+            &scales,
+            "Open",
+            &applied(&history),
+        ) {
             unreachable!("{err:?}");
         }
         ws.tree.compute_layout(1600.0, 900.0);
@@ -277,15 +662,20 @@ mod tests {
         let Some(rows) = ws.tree.children(ws.history.body) else {
             unreachable!("just populated");
         };
-        assert_eq!(rows.len(), 5, "one row per journal entry");
+        assert_eq!(rows.len(), 6, "an origin row plus one row per step");
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let one_row = widgets::row_height(&scales) as u32;
         assert_eq!(one_row, 21, "13px of type plus 4px above and below");
 
         for &row in rows {
-            assert_eq!(
-                ws.tree.payload(row),
-                Some(&WidgetKind::ListRow(ListRowState::default())),
+            assert!(
+                matches!(
+                    ws.tree.payload(row),
+                    Some(&WidgetKind::ListRow(ListRowState {
+                        disabled: false,
+                        ..
+                    }))
+                ),
                 "a row must be a real ListRow, not an unpainted Container"
             );
             let Some(row_bounds) = ws.tree.bounds(row) else {
@@ -330,7 +720,13 @@ mod tests {
         let history = history_with(6);
         let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
-        if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
+        if let Err(err) = populate_history_panel(
+            &mut ws.tree,
+            ws.history,
+            &scales,
+            "Open",
+            &applied(&history),
+        ) {
             unreachable!("{err:?}");
         }
         ws.tree.compute_layout(1600.0, 900.0);
@@ -375,7 +771,13 @@ mod tests {
             let history = history_with(count);
             let mut ws = crate::workspace::build_workspace(&test_scales());
             let scales = test_scales();
-            if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
+            if let Err(err) = populate_history_panel(
+                &mut ws.tree,
+                ws.history,
+                &scales,
+                "Open",
+                &applied(&history),
+            ) {
                 unreachable!("{err:?}");
             }
             ws.tree.compute_layout(1600.0, 900.0);
@@ -428,7 +830,13 @@ mod tests {
         let history = history_with(200);
         let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
-        if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
+        if let Err(err) = populate_history_panel(
+            &mut ws.tree,
+            ws.history,
+            &scales,
+            "Open",
+            &applied(&history),
+        ) {
             unreachable!("{err:?}");
         }
         ws.tree.compute_layout(1600.0, 900.0);
@@ -436,7 +844,11 @@ mod tests {
         let Some(rows) = ws.tree.children(ws.history.body) else {
             unreachable!("just populated");
         };
-        assert_eq!(rows.len(), 200, "every journal entry still gets a real row");
+        assert_eq!(
+            rows.len(),
+            201,
+            "every step still gets a real row, after the origin row"
+        );
         let reachable = rows
             .iter()
             .filter(|&&row| {
@@ -464,7 +876,7 @@ mod tests {
         assert_eq!(
             reachable, 13,
             "279px of History body (300px share less its 21px title row) divided by 21px rows \
-             -- the rows that fit really work, and the other 187 are clipped and unreachable"
+             -- the rows that fit really work, and the other 188 are clipped until scrolled"
         );
     }
 
@@ -483,7 +895,9 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let scales = test_scales();
-        if let Err(err) = populate_history_panel(&mut tree, panel, &scales, &history) {
+        if let Err(err) =
+            populate_history_panel(&mut tree, panel, &scales, "Open", &applied(&history))
+        {
             unreachable!("{err:?}");
         }
 
@@ -527,20 +941,22 @@ mod tests {
         };
         let scales = test_scales();
         for _ in 0..2 {
-            if let Err(err) = populate_history_panel(&mut tree, panel, &scales, &history) {
+            if let Err(err) =
+                populate_history_panel(&mut tree, panel, &scales, "Open", &applied(&history))
+            {
                 unreachable!("{err:?}");
             }
         }
         assert_eq!(
             tree.children(panel.body).map(<[_]>::len),
-            Some(history.journal_descriptions().len()),
+            Some(history.len() + 1),
             "a second call must replace the rows, not stack a second set beside them"
         );
     }
 
     #[test]
     fn populate_history_panel_rejects_an_unknown_panel_body() {
-        let history = History::new();
+        let history: Vec<String> = Vec::new();
         let (mut tree, root) = widgets::new_tree(Style::default());
         let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
@@ -550,7 +966,7 @@ mod tests {
             unreachable!("{err:?}");
         }
         let scales = test_scales();
-        match populate_history_panel(&mut tree, panel, &scales, &history) {
+        match populate_history_panel(&mut tree, panel, &scales, "Open", &applied(&history)) {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, panel.body),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }

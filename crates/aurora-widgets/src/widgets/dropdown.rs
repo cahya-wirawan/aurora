@@ -1029,6 +1029,7 @@ fn build_list(
             WidgetKind::ListRow(ListRowState {
                 selected: on,
                 disabled: false,
+                draws_label: false,
             }),
         )?);
     }
@@ -1523,7 +1524,8 @@ mod tests {
                 tree.payload(row),
                 Some(&WidgetKind::ListRow(ListRowState {
                     selected: on,
-                    disabled: false
+                    disabled: false,
+                    draws_label: false,
                 }))
             );
             selected += usize::from(on);
@@ -1559,7 +1561,8 @@ mod tests {
                 tree.payload(row),
                 Some(&WidgetKind::ListRow(ListRowState {
                     selected: on,
-                    disabled: false
+                    disabled: false,
+                    draws_label: false,
                 })),
                 "paint_widget reads the payload, so it must move too"
             );
@@ -2105,7 +2108,8 @@ mod tests {
                 tree.payload(row),
                 Some(&WidgetKind::ListRow(ListRowState {
                     selected: on,
-                    disabled: false
+                    disabled: false,
+                    draws_label: false,
                 })),
                 "row {index}"
             );

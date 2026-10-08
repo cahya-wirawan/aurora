@@ -72,6 +72,12 @@ pub struct Workspace {
     pub layers: PanelHandle,
     pub properties: PanelHandle,
     pub history: PanelHandle,
+    /// The History panel's current-step row (0.147.1) — the one
+    /// [`crate::populate_history_panel`] last returned, `None` until a
+    /// caller first populates it. `aurora-app` records it here so its
+    /// scroll-follow can bring the marker into view after every
+    /// refresh, the way it follows the active layer's row.
+    pub history_current: Option<WidgetId>,
 }
 
 /// The rail's own layout style at `width` (logical px) — shared by
@@ -244,6 +250,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         layers,
         properties,
         history,
+        history_current: None,
     }
 }
 
@@ -532,17 +539,17 @@ mod tests {
             }
         }
         if history_on {
-            let mut layer_tree = aurora_doc::LayerTree::new();
-            let mut history = aurora_doc::History::new();
-            for i in 0..count {
-                if let Err(err) =
-                    history.add_pixel_layer(&mut layer_tree, format!("Layer {i}"), bounds, None)
-                {
-                    unreachable!("{err:?}");
-                }
-            }
+            // `count` rows in all: the origin row plus `count - 1` steps.
+            let labels: Vec<String> = (1..count).map(|i| format!("Step {i}")).collect();
+            let steps: Vec<_> = labels
+                .iter()
+                .map(|label| crate::HistoryStep {
+                    label,
+                    undone: false,
+                })
+                .collect();
             if let Err(err) =
-                crate::populate_history_panel(&mut ws.tree, ws.history, scales, &history)
+                crate::populate_history_panel(&mut ws.tree, ws.history, scales, "Open", &steps)
             {
                 unreachable!("{err:?}");
             }

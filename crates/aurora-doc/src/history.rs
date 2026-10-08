@@ -283,7 +283,7 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
 /// Photoshop's own History-states maximum is 1000; matching that number
 /// keeps the panel's worst case in the same range a professional already
 /// expects, rather than growing with an untrusted file's journal length.
-const MAX_DESCRIPTIONS: usize = 1000;
+pub const MAX_DESCRIPTIONS: usize = 1000;
 
 /// How far into a `RemovedSubtree`'s own `entries` list [`describe`]
 /// will look for the root's recorded name.
@@ -554,6 +554,21 @@ impl History {
     /// carry the full, unmodified name and the full op sequence; nothing
     /// here edits what an undo or a replay will reproduce, and nothing
     /// here changes which journals [`Self::load_journal`] accepts.
+    /// The description [`Self::journal_descriptions`] would give the
+    /// most recent journal entry, without describing the rest (0.147.1).
+    ///
+    /// `aurora-app` calls this once, right after recording a structural
+    /// step, to label that step's row in the History panel. It cannot
+    /// read the label back off the undo stack later: that stack holds
+    /// each step's *inverse* (an added layer is stored as its removal),
+    /// and the journal keeps growing with every undo and redo. `None`
+    /// for an empty journal. Bounded exactly like one entry of
+    /// [`Self::journal_descriptions`].
+    #[must_use]
+    pub fn last_journal_description(&self) -> Option<String> {
+        self.journal.last().map(describe)
+    }
+
     #[must_use]
     pub fn journal_descriptions(&self) -> Vec<String> {
         let omitted = self.journal.len().saturating_sub(MAX_DESCRIPTIONS);
@@ -1867,6 +1882,38 @@ mod tests {
                 assert!(description.contains('\u{2026}'), "{description}");
             }
         }
+    }
+
+    #[test]
+    fn last_journal_description_describes_only_the_newest_entry() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        assert_eq!(history.last_journal_description(), None);
+        let id = match history.add_pixel_layer(
+            &mut tree,
+            "Ink",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            history.last_journal_description(),
+            history.journal_descriptions().last().cloned()
+        );
+        if let Err(err) = history.set_opacity(&mut tree, id, 0.5) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            history.last_journal_description().as_deref(),
+            Some(format!("Set opacity of layer #{} to 50%", id.to_raw()).as_str())
+        );
     }
 
     #[test]

@@ -358,6 +358,7 @@ fn rebuild_rows(
             WidgetKind::ListRow(ListRowState {
                 selected: position == 0,
                 disabled: false,
+                draws_label: false,
             }),
         )?;
         rows.push(row);
@@ -702,6 +703,7 @@ mod tests {
             Some(&WidgetKind::ListRow(super::ListRowState {
                 selected: true,
                 disabled: false,
+                draws_label: false,
             }))
         );
         assert_eq!(
@@ -709,6 +711,7 @@ mod tests {
             Some(&WidgetKind::ListRow(super::ListRowState {
                 selected: false,
                 disabled: false,
+                draws_label: false,
             }))
         );
     }
@@ -743,6 +746,7 @@ mod tests {
             Some(&WidgetKind::ListRow(super::ListRowState {
                 selected: false,
                 disabled: false,
+                draws_label: false,
             })),
             "the row moved away from must clear its own payload flag, not just its accessibility \
              one -- paint_widget reads the payload"
@@ -752,6 +756,7 @@ mod tests {
             Some(&WidgetKind::ListRow(super::ListRowState {
                 selected: true,
                 disabled: false,
+                draws_label: false,
             }))
         );
     }
