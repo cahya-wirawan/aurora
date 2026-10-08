@@ -1080,6 +1080,7 @@ mod text {
             align: HAlign::Start,
             clip,
             field: None,
+            overflow: crate::TextOverflow::Clip,
         }
     }
 
@@ -1893,6 +1894,7 @@ mod text {
                 height: 60,
             },
             field: None,
+            overflow: crate::TextOverflow::Clip,
         };
         let (stale, a, b) = ("ABCDEFGHIJKLMNOP", "abcdefgh", "qrstuvwxyz");
         let keys = |engine: &mut TextEngine, text: &str| -> Vec<GlyphKey> {

@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn populate_properties_panel_adds_one_row_per_option_in_order() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Properties") {
+        let panel = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn populate_properties_panel_with_no_options_leaves_an_empty_but_labeled_list() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Properties") {
+        let panel = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn populating_the_same_panel_twice_replaces_the_rows_instead_of_stacking_them() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Properties") {
+        let panel = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -338,7 +338,7 @@ mod tests {
     /// has a real resolved size to lay a row out against.
     #[test]
     fn properties_rows_are_real_list_row_widgets_with_a_hittable_size() {
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         let options = [
             ("Radius", "24px".to_owned()),
@@ -404,7 +404,7 @@ mod tests {
     /// fails this test rather than passing it by accident.
     #[test]
     fn properties_rows_stack_top_to_bottom_without_overlapping() {
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         let options = options_with(4);
         if let Err(err) =
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn a_crowded_properties_panel_never_starves_its_sibling_panels() {
         for count in [1_usize, 40, 200, 400] {
-            let mut ws = crate::workspace::build_workspace();
+            let mut ws = crate::workspace::build_workspace(&test_scales());
             let scales = test_scales();
             let options = options_with(count);
             if let Err(err) = populate_properties_panel(
@@ -539,7 +539,7 @@ mod tests {
             ("<script>alert(1)</script>", "<b>bold</b>".to_owned()),
         ];
 
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) =
             populate_properties_panel(&mut ws.tree, ws.properties, &scales, Tool::Brush, &options)
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn populate_properties_panel_rejects_an_unknown_panel_body() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Properties") {
+        let panel = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };

@@ -238,7 +238,7 @@ pub fn insert_gallery_panel(
     parent: WidgetId,
     scales: &Scales,
 ) -> Result<GalleryPanel, WidgetError> {
-    let panel = insert_panel(tree, parent, "Widget Gallery")?;
+    let panel = insert_panel(tree, parent, "Widget Gallery", scales)?;
     let built = tree
         .set_style(panel.root, root_style(scales))
         .and_then(|()| build(tree, panel, scales));
@@ -659,7 +659,7 @@ mod tests {
 
     fn opened_at(width: f32, height: f32) -> (Workspace, GalleryPanel, Scales) {
         let scales = test_scales();
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         let gallery = match insert_gallery_panel(&mut ws.tree, ws.root, &scales) {
             Ok(gallery) => gallery,
             Err(err) => unreachable!("{err:?}"),
@@ -765,8 +765,9 @@ mod tests {
         let min = (body.y + i64::from(content)) as f32;
         eprintln!("gallery minimum window height (logical px): {min}");
         // Pinned (red-team RT-4 / critic C12): a new widget or a token
-        // change that moves this must update it knowingly.
-        assert!((min - 422.0).abs() < f32::EPSILON, "{min}");
+        // change that moves this must update it knowingly. 443 since
+        // 0.142.0: the 422 px it was plus the panel's 21 px title row.
+        assert!((min - 443.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
@@ -790,7 +791,7 @@ mod tests {
     /// The same pin under the app's real, text-measured layout (0.140.0
     /// judge follow-up): a measured checkbox is a row tall, not a bare
     /// box, so the left column grows. The right column (the curve
-    /// editor) must still be the taller one, or the 422 px minimum above
+    /// editor) must still be the taller one, or the 443 px minimum above
     /// would describe a layout the app never uses.
     #[test]
     fn the_measured_layout_keeps_the_same_minimum_height() {
@@ -798,7 +799,7 @@ mod tests {
         let Ok(mut engine) = aurora_text::TextEngine::new() else {
             unreachable!("the bundled font loads")
         };
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         let g = match insert_gallery_panel(&mut ws.tree, ws.root, &scales) {
             Ok(g) => g,
             Err(err) => unreachable!("{err:?}"),
@@ -832,7 +833,7 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 422.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!((min - 443.0).abs() < f32::EPSILON, "measured minimum {min}");
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the

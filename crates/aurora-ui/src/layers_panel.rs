@@ -394,7 +394,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -482,7 +482,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -518,7 +518,7 @@ mod tests {
         };
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -597,7 +597,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -652,7 +652,7 @@ mod tests {
             }
 
             let (mut tree, root) = widgets::new_tree(Style::default());
-            let panel = match insert_panel(&mut tree, root, "Layers") {
+            let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
                 Ok(panel) => panel,
                 Err(err) => unreachable!("{err:?}"),
             };
@@ -702,7 +702,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -763,7 +763,7 @@ mod tests {
         };
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -803,7 +803,7 @@ mod tests {
             }
         }
 
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         let rows = match populate_layers_panel(&mut ws.tree, ws.layers, &scales, &layers) {
             Ok(rows) => rows,
@@ -842,7 +842,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -876,7 +876,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -941,7 +941,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1008,7 +1008,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1075,7 +1075,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1121,7 +1121,7 @@ mod tests {
                 }
             }
 
-            let mut ws = crate::workspace::build_workspace();
+            let mut ws = crate::workspace::build_workspace(&test_scales());
             let scales = test_scales();
             if let Err(err) = populate_layers_panel(&mut ws.tree, ws.layers, &scales, &layers) {
                 unreachable!("{err:?}");
@@ -1188,7 +1188,7 @@ mod tests {
             }
         }
 
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) = populate_layers_panel(&mut ws.tree, ws.layers, &scales, &layers) {
             unreachable!("{err:?}");
@@ -1226,7 +1226,7 @@ mod tests {
     fn populate_layers_panel_rejects_an_unknown_panel_body() {
         let layers = LayerTree::new();
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };

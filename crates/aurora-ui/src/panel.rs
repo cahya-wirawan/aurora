@@ -33,6 +33,14 @@ pub struct PanelHandle {
     /// The panel's own root — a labeled `Role::Region`, the accessible
     /// name a screen reader announces for the whole panel.
     pub root: WidgetId,
+    /// The panel's title slot (0.142.0): the root's **first** child, one
+    /// row tall, where `aurora_widgets::text_runs` draws the root's own
+    /// accessibility label — the panel's title, kept in exactly one place.
+    /// An unlabelled `Role::GenericContainer`, so a screen reader still
+    /// announces the title once (on the `Region`), never twice. Stays
+    /// visible while the panel is collapsed ([`set_panel_collapsed`]), so
+    /// a collapsed panel is still recognisable.
+    pub header: WidgetId,
     /// Where a caller adds this panel's real content once it exists
     /// (layer rows, property fields, history entries) — currently
     /// always empty.
@@ -56,6 +64,12 @@ pub struct PanelHandle {
 /// `Container`) gives the root a real painted background — see this
 /// module's own doc comment.
 ///
+/// The root's first child is the title slot ([`PanelHandle::header`],
+/// 0.142.0), one row tall (`row_height(scales)`), above the body — the
+/// same shape as a dialog's title slot (0.141.0). Until then nothing drew
+/// a panel's title at all: a real macOS screenshot showed the Layers
+/// panel as an anonymous strip of rows.
+///
 /// # Errors
 ///
 /// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
@@ -63,6 +77,7 @@ pub fn insert_panel(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
     title: impl Into<String>,
+    scales: &Scales,
 ) -> Result<PanelHandle, WidgetError> {
     let mut root_node = Node::new(Role::Region);
     root_node.set_label(title.into());
@@ -70,8 +85,38 @@ pub fn insert_panel(
     root_node.add_action(Action::Collapse);
     root_node.set_expanded(true);
     let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Panel)?;
+    let header = tree.insert(
+        root,
+        header_style(scales),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
     let body = widgets::insert_container(tree, root, body_style(false))?;
-    Ok(PanelHandle { root, body })
+    Ok(PanelHandle { root, header, body })
+}
+
+/// The title slot's own layout: exactly one row tall (`row_height`, the
+/// height a Layers or History row has, so the title reads as the panel's
+/// first line), never shrunk by a crowded panel (`flex_shrink: 0`, the
+/// same guard the controls strips carry), and full width by the root's
+/// default cross-axis stretch. No padding of its own: the title text is
+/// inset by `spacing.sm` where it is drawn, exactly as a tree row's label
+/// is. `min_size.width: 0` keeps it from ever flooring the rail's width
+/// (see [`root_style`]).
+fn header_style(scales: &Scales) -> Style {
+    let row = row_height(scales);
+    Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: auto(),
+            height: length(row),
+        },
+        min_size: Size {
+            width: Dimension::ZERO,
+            height: length(row),
+        },
+        ..Default::default()
+    }
 }
 
 /// A panel's own root style — `Column` (the body stacks under the
@@ -125,11 +170,29 @@ pub fn insert_panel(
 /// load-bearing the moment a panel root were ever docked into a `Row`
 /// container (drag-to-redock, this module's own doc comment). What is
 /// removed is the claim that it closes anything today.
+///
+/// **Collapsed, the basis is `auto` instead (0.142.0)**: a collapsed
+/// panel is exactly as tall as its title slot (every other child is
+/// `Display::None`), rather than zero tall with the title spilling over
+/// the panel below it. The content-sized basis is safe here for the
+/// reason the zero basis exists in the expanded state: the only content
+/// left is one fixed-height row.
+///
+/// **Collapsed, `flex_shrink` is `0` too (review revision, 0.142.0)**:
+/// otherwise a rail shorter than every collapsed title row combined
+/// shrank each collapsed root below its own (`flex_shrink: 0`) header,
+/// and the title spilled over the panel below it (measured: an 11 px
+/// root under a 21 px title). Now the collapsed panels keep their full
+/// row and overflow the bottom of the rail instead, where the window
+/// clips them. A *closed* panel ([`close_panel`]) uses this same style
+/// with its title hidden as well, so its content height — and with
+/// `flex_basis: auto` its height — is exactly zero.
 fn root_style(collapsed: bool) -> Style {
     Style {
         flex_direction: taffy::FlexDirection::Column,
         flex_grow: if collapsed { 0.0 } else { 1.0 },
-        flex_basis: Dimension::ZERO,
+        flex_shrink: if collapsed { 0.0 } else { 1.0 },
+        flex_basis: if collapsed { auto() } else { Dimension::ZERO },
         min_size: taffy::Size {
             width: Dimension::ZERO,
             height: Dimension::ZERO,
@@ -423,26 +486,31 @@ pub fn set_panel_collapsed(
     // Any *other* child of the root is panel content too (the Layers
     // panel's controls strip, `crate::layer_controls`, lives there so
     // repopulating the body cannot destroy it) and must hide with the
-    // body. Only `display` is touched, so each keeps its own style.
+    // body. Only `display` is touched, so each keeps its own style. The
+    // title slot is the one exception (0.142.0): it is what keeps a
+    // collapsed panel recognisable, so it stays shown in *both* states.
+    // Setting it explicitly (rather than leaving it alone) is what makes
+    // this function the reopen path for a closed panel too, whose title
+    // `close_panel` hid.
     let others: Vec<WidgetId> = tree
         .children(panel.root)
         .unwrap_or_default()
         .iter()
         .copied()
-        .filter(|&child| child != panel.body)
+        .filter(|&child| child != panel.body && child != panel.header)
         .collect();
     for child in others {
-        let mut style = tree
-            .style(child)
-            .cloned()
-            .ok_or(WidgetError::UnknownWidget(child))?;
-        style.display = if collapsed {
-            Display::None
-        } else {
-            Display::Flex
-        };
-        tree.set_style(child, style)?;
+        set_display(
+            tree,
+            child,
+            if collapsed {
+                Display::None
+            } else {
+                Display::Flex
+            },
+        )?;
     }
+    set_display(tree, panel.header, Display::Flex)?;
 
     let node = tree
         .accessibility(panel.root)
@@ -461,6 +529,8 @@ pub fn set_panel_collapsed(
 
 /// Closes `panel`: the same layout/accessibility change
 /// [`set_panel_collapsed`]`(tree, panel, true)` already makes, plus
+/// hiding the title row as well (so a closed panel takes no height,
+/// where a collapsed one keeps its title), plus
 /// really freeing its current content ([`clear_panel_body`]) rather
 /// than just hiding it. Unlike a plain collapse — which deliberately
 /// keeps content resident so a quick re-expand needs no rebuild, see
@@ -468,8 +538,8 @@ pub fn set_panel_collapsed(
 /// guarantee for actually reclaiming the memory and simplifying the
 /// accessibility tree down to just the region itself.
 ///
-/// Reopening is the ordinary `set_panel_collapsed(tree, panel, false)`:
-/// the body comes back empty until whatever populated it before
+/// Reopening is the ordinary `set_panel_collapsed(tree, panel, false)`,
+/// which shows the title row again: the body comes back empty until whatever populated it before
 /// (`populate_layers_panel`/`populate_history_panel`, `aurora-ui`'s own
 /// higher-level callers) runs again on the next real document-state
 /// change — the same "one-shot, not reactive" contract those functions
@@ -495,8 +565,27 @@ pub fn close_panel(
     panel: PanelHandle,
 ) -> Result<(), WidgetError> {
     set_panel_collapsed(tree, panel, true)?;
+    // Unlike a collapse, a close hides the title row too (review
+    // revision, 0.142.0): a closed panel takes no space at all. Any
+    // `set_panel_collapsed` call — the panel-toggle command's reopen
+    // path — shows it again.
+    set_display(tree, panel.header, Display::None)?;
     clear_panel_body(tree, panel.body)?;
     tree.set_accessibility(panel.body, Node::new(Role::GenericContainer))
+}
+
+/// Sets only `id`'s own `display`, keeping the rest of its style.
+fn set_display(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    display: Display,
+) -> Result<(), WidgetError> {
+    let mut style = tree
+        .style(id)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(id))?;
+    style.display = display;
+    tree.set_style(id, style)
 }
 
 #[cfg(test)]
@@ -509,10 +598,20 @@ mod tests {
     use taffy::Style;
     use taffy::style_helpers::TaffyZero;
 
+    // The real, committed, owner-approved scales -- the same file every
+    // other `aurora-ui` test module parses.
+    fn test_scales() -> aurora_theme::Scales {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        match aurora_theme::Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     #[test]
     fn insert_panel_adds_a_labeled_region_with_an_empty_body() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -539,7 +638,7 @@ mod tests {
     fn insert_panel_rejects_an_unknown_parent() {
         let (mut tree, _root) = widgets::new_tree(Style::default());
         let bogus = accesskit::NodeId(999);
-        match insert_panel(&mut tree, bogus, "Layers") {
+        match insert_panel(&mut tree, bogus, "Layers", &test_scales()) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
@@ -548,7 +647,7 @@ mod tests {
     #[test]
     fn clear_panel_body_removes_every_child_but_keeps_the_body_itself() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -582,7 +681,7 @@ mod tests {
     #[test]
     fn collapsing_a_panel_hides_its_body_and_survives_its_own_content() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -619,7 +718,7 @@ mod tests {
     #[test]
     fn expanding_a_collapsed_panel_restores_its_bodys_own_layout() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -653,11 +752,11 @@ mod tests {
             },
             ..Default::default()
         });
-        let first = match insert_panel(&mut tree, root, "Layers") {
+        let first = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
-        let second = match insert_panel(&mut tree, root, "Properties") {
+        let second = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -674,10 +773,22 @@ mod tests {
         let Some(after) = tree.bounds(second.root) else {
             unreachable!("just laid out");
         };
+        // Everything but the collapsed panel's own one-row title slot
+        // (0.142.0), which stays visible so the panel is recognisable.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let title_row = widgets::row_height(&test_scales()).round() as u32;
         assert_eq!(
-            after.height, 200,
+            after.height,
+            200 - title_row,
             "the collapsed panel's own share must go to its still-expanded sibling, ordinary \
-             flex_grow sharing, not a special case"
+             flex_grow sharing, not a special case -- all but its title row"
+        );
+        let Some(collapsed) = tree.bounds(first.root) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            collapsed.height, title_row,
+            "a collapsed panel is its title row"
         );
     }
 
@@ -696,7 +807,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -740,6 +851,7 @@ mod tests {
         let bogus = accesskit::NodeId(999);
         let panel = super::PanelHandle {
             root: bogus,
+            header: bogus,
             body: bogus,
         };
         match panel_is_collapsed(&tree, panel) {
@@ -754,6 +866,7 @@ mod tests {
         let bogus = accesskit::NodeId(999);
         let panel = super::PanelHandle {
             root: bogus,
+            header: bogus,
             body: bogus,
         };
         match set_panel_collapsed(&mut tree, panel, true) {
@@ -765,7 +878,7 @@ mod tests {
     #[test]
     fn closing_a_panel_collapses_it_and_really_empties_its_body() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -802,7 +915,7 @@ mod tests {
     #[test]
     fn reopening_a_closed_panel_restores_its_layout_with_an_empty_body() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "Layers") {
+        let panel = match insert_panel(&mut tree, root, "Layers", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -836,7 +949,7 @@ mod tests {
     #[test]
     fn closing_a_panel_resets_its_bodys_accessibility_to_a_neutral_container() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -890,7 +1003,7 @@ mod tests {
     #[test]
     fn a_panels_own_styles_never_impose_a_minimum_size_on_either_axis() {
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -915,12 +1028,294 @@ mod tests {
         }
     }
 
+    /// 0.142.0: every docked panel's first child is an unlabelled title
+    /// slot one row tall, the body starts exactly where it ends, and the
+    /// `Region` keeps its label as the one announcement of the title.
+    #[test]
+    fn every_docked_panel_has_an_unlabelled_one_row_title_slot_above_its_body() {
+        let scales = test_scales();
+        let mut ws = crate::build_workspace(&scales);
+        ws.tree.compute_layout(1600.0, 900.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = widgets::row_height(&scales).round() as u32;
+        for (panel, title) in [
+            (ws.layers, "Layers"),
+            (ws.properties, "Properties"),
+            (ws.history, "History"),
+        ] {
+            assert_eq!(
+                ws.tree.children(panel.root).and_then(<[_]>::first),
+                Some(&panel.header),
+                "{title}: the title slot is the root's first child"
+            );
+            let Some(header_node) = ws.tree.accessibility(panel.header) else {
+                unreachable!("just built");
+            };
+            assert_eq!(header_node.role(), accesskit::Role::GenericContainer);
+            assert_eq!(header_node.label(), None, "{title}: the slot is unlabelled");
+            let Some(root_node) = ws.tree.accessibility(panel.root) else {
+                unreachable!("just built");
+            };
+            assert_eq!(root_node.role(), accesskit::Role::Region);
+            assert_eq!(root_node.label(), Some(title));
+            let (Some(root_box), Some(header), Some(body)) = (
+                ws.tree.bounds(panel.root),
+                ws.tree.bounds(panel.header),
+                ws.tree.bounds(panel.body),
+            ) else {
+                unreachable!("just laid out");
+            };
+            assert_eq!(
+                header.y, root_box.y,
+                "{title}: the title is the panel's top row"
+            );
+            assert_eq!(header.height, row, "{title}: one row tall");
+            assert_eq!(header.width, root_box.width, "{title}: full panel width");
+            assert_eq!(
+                body.y,
+                header.bottom(),
+                "{title}: the body starts under the title"
+            );
+        }
+    }
+
+    /// The title is really drawn (0.142.0): `aurora_widgets::text_runs`
+    /// on each panel's title slot emits the panel's own name, inside the
+    /// slot's box, and nothing on the root, body or the Layers controls
+    /// strip.
+    #[test]
+    fn each_docked_panels_title_slot_draws_its_name_and_nothing_else_does() {
+        const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
+        const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+        let Ok(palette) = aurora_theme::Palette::from_toml_str(PALETTE_TOML) else {
+            unreachable!("the committed palette parses");
+        };
+        let mut themes = aurora_theme::ThemeSet::new();
+        if themes.register(DARK_THEME_TOML).is_err() {
+            unreachable!("the committed Dark theme registers");
+        }
+        let theme = match themes.resolve("Dark", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = test_scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        ws.tree.compute_layout(1600.0, 900.0);
+        let runs = |id| {
+            let Some(bounds) = ws.tree.bounds(id) else {
+                unreachable!("laid out");
+            };
+            aurora_widgets::text_runs(&ws.tree, id, bounds, bounds, None, &theme, &scales)
+        };
+        for (panel, title) in [
+            (ws.layers, "Layers"),
+            (ws.properties, "Properties"),
+            (ws.history, "History"),
+        ] {
+            let header_runs = runs(panel.header);
+            let [run] = &header_runs[..] else {
+                unreachable!("{title}: one title run, got {header_runs:?}");
+            };
+            assert_eq!(run.text, title);
+            let Some(header) = ws.tree.bounds(panel.header) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let (x, y, w, h) = (
+                header.x as f32,
+                header.y as f32,
+                header.width as f32,
+                header.height as f32,
+            );
+            assert!(
+                run.rect.0 >= x && run.rect.0 + run.rect.2 <= x + w,
+                "{title}: inside the slot horizontally: {run:?} vs {header:?}"
+            );
+            assert!((run.rect.1 - y).abs() < f32::EPSILON && (run.rect.3 - h).abs() < f32::EPSILON);
+            assert!(
+                runs(panel.root).is_empty(),
+                "{title}: the root draws nothing"
+            );
+            assert!(
+                runs(panel.body).is_empty(),
+                "{title}: the body draws nothing"
+            );
+        }
+        assert!(
+            runs(controls.root).is_empty(),
+            "the controls strip is not a title"
+        );
+    }
+
+    /// A crowded panel never squeezes its title away: the slot keeps its
+    /// row even when the panel's share is smaller than its content.
+    #[test]
+    fn a_tiny_panel_keeps_its_full_title_row() {
+        let scales = test_scales();
+        let (mut tree, root) = widgets::new_tree(Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(100.0_f32),
+                height: taffy::style_helpers::length(10.0_f32),
+            },
+            ..Default::default()
+        });
+        let panel = match insert_panel(&mut tree, root, "Layers", &scales) {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(100.0, 10.0);
+        let Some(header) = tree.bounds(panel.header) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = widgets::row_height(&scales).round() as u32;
+        assert_eq!(header.height, row);
+    }
+
+    /// Collapsing hides the body and the controls strips (0.135.0) but
+    /// never the title slot, so a collapsed panel is still recognisable;
+    /// expanding restores the strips.
+    #[test]
+    fn collapsing_keeps_the_title_visible_and_still_hides_the_controls_strips() {
+        let scales = test_scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let display = |ws: &crate::Workspace, id| match ws.tree.style(id) {
+            Some(style) => style.display,
+            None => unreachable!("exists"),
+        };
+        if let Err(err) = set_panel_collapsed(&mut ws.tree, ws.layers, true) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(display(&ws, ws.layers.header), taffy::Display::Flex);
+        assert_eq!(display(&ws, ws.layers.body), taffy::Display::None);
+        assert_eq!(display(&ws, controls.root), taffy::Display::None);
+        ws.tree.compute_layout(1600.0, 900.0);
+        let (Some(root_box), Some(header)) = (
+            ws.tree.bounds(ws.layers.root),
+            ws.tree.bounds(ws.layers.header),
+        ) else {
+            unreachable!("just laid out");
+        };
+        assert!(header.height > 0, "the collapsed title still has a row");
+        assert_eq!(
+            root_box.height, header.height,
+            "and the panel is exactly that row"
+        );
+        if let Err(err) = set_panel_collapsed(&mut ws.tree, ws.layers, false) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(display(&ws, ws.layers.header), taffy::Display::Flex);
+        assert_eq!(display(&ws, controls.root), taffy::Display::Flex);
+    }
+
+    /// Review revision (0.142.0): a collapsed panel is exactly its title
+    /// row and is never shrunk below it, so in a rail too short for all
+    /// three title rows the panels overflow the bottom of the rail
+    /// (clipped by the window) rather than shrinking under their own
+    /// headers. What is asserted is the stronger of the two possible
+    /// contracts: no header overlaps the next panel at all, not merely
+    /// "is clipped within its own root".
+    #[test]
+    fn collapsed_headers_never_overlap_the_next_panel_in_a_rail_shorter_than_three_titles() {
+        let scales = test_scales();
+        let mut ws = crate::build_workspace(&scales);
+        let panels = [ws.layers, ws.properties, ws.history];
+        for panel in panels {
+            if let Err(err) = set_panel_collapsed(&mut ws.tree, panel, true) {
+                unreachable!("{err:?}");
+            }
+        }
+        let row_f = widgets::row_height(&scales);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = row_f.round() as u32;
+        // Shorter than three title rows (and than two), whatever else the
+        // window spends height on.
+        ws.tree.compute_layout(1600.0, row_f * 1.5);
+        let mut boxes = Vec::new();
+        for panel in panels {
+            let (Some(root_box), Some(header)) =
+                (ws.tree.bounds(panel.root), ws.tree.bounds(panel.header))
+            else {
+                unreachable!("just laid out");
+            };
+            assert_eq!(header.height, row, "the title keeps its full row");
+            assert_eq!(
+                root_box.height, header.height,
+                "a collapsed panel is never shrunk below its title: {root_box:?} vs {header:?}"
+            );
+            boxes.push((root_box, header));
+        }
+        boxes.sort_by_key(|(root_box, _)| root_box.y);
+        for pair in boxes.windows(2) {
+            let [(_, header), (next_root, _)] = pair else {
+                unreachable!("windows(2)");
+            };
+            assert!(
+                header.bottom() <= next_root.y,
+                "a collapsed title spills over the next panel: {header:?} vs {next_root:?}"
+            );
+        }
+    }
+
+    /// Review revision (0.142.0): closing is not collapsing. A closed
+    /// panel hides its title as well and takes no height at all; the
+    /// ordinary reopen path (`set_panel_collapsed(.., false)`, which the
+    /// app's panel-toggle command calls on a collapsed-or-closed panel)
+    /// shows the title again.
+    #[test]
+    fn a_closed_panel_hides_its_title_and_takes_no_space_until_reopened() {
+        let scales = test_scales();
+        let mut ws = crate::build_workspace(&scales);
+        let display = |ws: &crate::Workspace, id| match ws.tree.style(id) {
+            Some(style) => style.display,
+            None => unreachable!("exists"),
+        };
+        if let Err(err) = close_panel(&mut ws.tree, ws.layers) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 900.0);
+        assert_eq!(display(&ws, ws.layers.header), taffy::Display::None);
+        let (Some(closed_root), Some(next_root)) = (
+            ws.tree.bounds(ws.layers.root),
+            ws.tree.bounds(ws.properties.root),
+        ) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(closed_root.height, 0, "a closed panel takes no space");
+        assert_eq!(
+            next_root.y, closed_root.y,
+            "the next panel starts where the closed one would have"
+        );
+
+        if let Err(err) = set_panel_collapsed(&mut ws.tree, ws.layers, false) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 900.0);
+        assert_eq!(display(&ws, ws.layers.header), taffy::Display::Flex);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = widgets::row_height(&scales).round() as u32;
+        let Some(header) = ws.tree.bounds(ws.layers.header) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(header.height, row, "reopened, the title row is back");
+    }
+
     #[test]
     fn close_panel_rejects_an_unknown_body() {
         let (mut tree, _root) = widgets::new_tree(Style::default());
         let bogus = accesskit::NodeId(999);
         let panel = super::PanelHandle {
             root: bogus,
+            header: bogus,
             body: bogus,
         };
         match close_panel(&mut tree, panel) {

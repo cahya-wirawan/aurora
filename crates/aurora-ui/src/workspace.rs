@@ -23,6 +23,7 @@
 //! (currently zero) layout footprint, not a rendered grab handle yet.
 
 use accesskit::{Action, Node, Role};
+use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
@@ -149,7 +150,7 @@ fn rail_style(width: f32) -> Style {
 /// same "can't fail against ids of its own making" shape
 /// `aurora_widgets::widgets::new_tree` itself already has).
 #[must_use]
-pub fn build_workspace() -> Workspace {
+pub fn build_workspace(scales: &Scales) -> Workspace {
     let (mut tree, root) = widgets::new_tree(Style {
         flex_direction: FlexDirection::Row,
         size: taffy::Size {
@@ -221,15 +222,15 @@ pub fn build_workspace() -> Workspace {
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
     };
 
-    let layers = match insert_panel(&mut tree, rail, "Layers") {
+    let layers = match insert_panel(&mut tree, rail, "Layers", scales) {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let properties = match insert_panel(&mut tree, rail, "Properties") {
+    let properties = match insert_panel(&mut tree, rail, "Properties", scales) {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let history = match insert_panel(&mut tree, rail, "History") {
+    let history = match insert_panel(&mut tree, rail, "History", scales) {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
@@ -307,7 +308,7 @@ mod tests {
     /// `spike/a11y-ime`'s own proven root, is what actually fixed it.
     #[test]
     fn build_workspace_roots_the_tree_as_a_labeled_window() {
-        let ws = build_workspace();
+        let ws = build_workspace(&test_scales());
         let Some(accessibility) = ws.tree.accessibility(ws.root) else {
             unreachable!("just built");
         };
@@ -317,7 +318,7 @@ mod tests {
 
     #[test]
     fn build_workspace_has_a_canvas_area_and_three_docked_panels() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         assert_eq!(ws.tree.parent(ws.canvas_area), Some(ws.root));
         assert_eq!(ws.tree.parent(ws.rail), Some(ws.root));
         assert_eq!(
@@ -371,7 +372,7 @@ mod tests {
 
     #[test]
     fn build_workspace_gives_the_divider_a_real_splitter_node() {
-        let ws = build_workspace();
+        let ws = build_workspace(&test_scales());
         assert_eq!(ws.tree.parent(ws.divider), Some(ws.root));
         let Some(accessibility) = ws.tree.accessibility(ws.divider) else {
             unreachable!("just inserted");
@@ -396,13 +397,13 @@ mod tests {
 
     #[test]
     fn rail_width_reads_back_the_real_starting_width() {
-        let ws = build_workspace();
+        let ws = build_workspace(&test_scales());
         assert_eq!(rail_width(&ws.tree, ws.rail), Some(250.0));
     }
 
     #[test]
     fn set_rail_width_changes_what_rail_width_reads_back_and_the_layout_bounds() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
 
         if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 300.0) {
             unreachable!("{err:?}");
@@ -425,7 +426,7 @@ mod tests {
 
     #[test]
     fn set_rail_width_updates_the_dividers_own_accessibility_value() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 300.0) {
             unreachable!("{err:?}");
         }
@@ -437,7 +438,7 @@ mod tests {
 
     #[test]
     fn set_rail_width_clamps_below_the_minimum() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 10.0) {
             unreachable!("{err:?}");
         }
@@ -446,7 +447,7 @@ mod tests {
 
     #[test]
     fn set_rail_width_clamps_above_the_maximum() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 5000.0) {
             unreachable!("{err:?}");
         }
@@ -455,7 +456,7 @@ mod tests {
 
     #[test]
     fn set_rail_width_rejects_an_unknown_rail() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         let bogus = accesskit::NodeId(999);
         match set_rail_width(&mut ws.tree, bogus, ws.divider, 300.0) {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -465,7 +466,7 @@ mod tests {
 
     #[test]
     fn set_rail_width_rejects_an_unknown_divider() {
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&test_scales());
         let bogus = accesskit::NodeId(999);
         match set_rail_width(&mut ws.tree, ws.rail, bogus, 300.0) {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -580,7 +581,7 @@ mod tests {
             (false, false, true),
             (true, true, true),
         ] {
-            let mut ws = build_workspace();
+            let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, which, 5);
             ws.tree.compute_layout(1.0, 200.0);
 
@@ -604,7 +605,7 @@ mod tests {
     fn all_three_panels_crowded_at_once_still_share_the_rail_and_stay_hittable() {
         let scales = test_scales();
         for count in [5_usize, 60, 200] {
-            let mut ws = build_workspace();
+            let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, (true, true, true), count);
             ws.tree.compute_layout(1600.0, 900.0);
 

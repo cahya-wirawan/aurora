@@ -809,7 +809,35 @@ impl LayerTree {
         bounds: Rect,
         parent: Option<LayerId>,
     ) -> Result<LayerId, DocError> {
-        self.insert(name.into(), parent, LayerKind::Pixel { bounds })
+        self.insert(name.into(), parent, LayerKind::Pixel { bounds }, 0)
+    }
+
+    /// [`Self::add_pixel_layer`], but inserted at sibling position
+    /// `index` of `parent` (or of the roots, if `parent` is `None`)
+    /// rather than always on top. Index `0` is the topmost sibling —
+    /// the same convention [`Self::roots`]/[`Self::children`] list in
+    /// and [`Self::add_pixel_layer`] inserts at — and an out-of-range
+    /// `index` is clamped to the end (the bottom), exactly as
+    /// [`Self::reparent`] clamps its own.
+    ///
+    /// One call, not an `add_pixel_layer` followed by a `reparent`, so
+    /// that a recorded add is one history step whose undo/redo puts the
+    /// layer back at the same position (see
+    /// `History::add_pixel_layer_at`).
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`Self::add_pixel_layer`]'s, under the same "nothing is
+    /// added and no id is consumed" rule. `index` itself can never be
+    /// an error, since it is clamped.
+    pub fn add_pixel_layer_at(
+        &mut self,
+        name: impl Into<String>,
+        bounds: Rect,
+        parent: Option<LayerId>,
+        index: usize,
+    ) -> Result<LayerId, DocError> {
+        self.insert(name.into(), parent, LayerKind::Pixel { bounds }, index)
     }
 
     /// Adds an empty group named `name`, as the new topmost child of
@@ -833,6 +861,7 @@ impl LayerTree {
             LayerKind::Group {
                 children: Vec::new(),
             },
+            0,
         )
     }
 
@@ -863,9 +892,10 @@ impl LayerTree {
         }
     }
 
-    /// [`Self::add_pixel_layer`]/[`Self::add_group`]'s shared body: the
-    /// depth guard, then [`Self::insert_unchecked`] for the insert
-    /// itself.
+    /// [`Self::add_pixel_layer`]/[`Self::add_pixel_layer_at`]/
+    /// [`Self::add_group`]'s shared body: the depth guard, then
+    /// [`Self::insert_unchecked`] for the insert itself, at sibling
+    /// position `index` (clamped; `0` is topmost).
     ///
     /// The guard lives here rather than inside `insert_unchecked` so
     /// that the two halves are separable -- `insert_unchecked` is what
@@ -877,6 +907,7 @@ impl LayerTree {
         name: String,
         parent: Option<LayerId>,
         kind: LayerKind,
+        index: usize,
     ) -> Result<LayerId, DocError> {
         // Validate `parent` before touching `self.layers` at all, so a
         // failed call adds nothing -- same "all or nothing" discipline
@@ -904,7 +935,7 @@ impl LayerTree {
             });
         }
 
-        self.insert_unchecked(name, parent, kind)
+        self.insert_unchecked(name, parent, kind, index)
     }
 
     /// [`Self::insert`] without the depth guard -- every other guard
@@ -926,6 +957,7 @@ impl LayerTree {
         name: String,
         parent: Option<LayerId>,
         kind: LayerKind,
+        index: usize,
     ) -> Result<LayerId, DocError> {
         // The same "all or nothing" parent validation `insert` already
         // ran. Re-run rather than assumed, because this is also the
@@ -981,7 +1013,10 @@ impl LayerTree {
                 )
             }
         };
-        siblings.insert(0, id);
+        // `index` is clamped, never an error -- the same rule
+        // `reparent` and `restore` apply to their own sibling index.
+        let clamped = index.min(siblings.len());
+        siblings.insert(clamped, id);
         Ok(id)
     }
 
@@ -1047,7 +1082,7 @@ impl LayerTree {
         bounds: Rect,
         parent: Option<LayerId>,
     ) -> Result<LayerId, DocError> {
-        self.insert_unchecked(name.into(), parent, LayerKind::Pixel { bounds })
+        self.insert_unchecked(name.into(), parent, LayerKind::Pixel { bounds }, 0)
     }
 
     /// Removes `id` from the tree. If `id` is a group, every descendant

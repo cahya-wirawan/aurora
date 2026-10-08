@@ -509,7 +509,7 @@
 //! development sandbox is Linux, where the dependency isn't even
 //! present).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1113,6 +1113,12 @@ fn verify_aur(path: &Path) -> bool {
 /// not threaded through here, since this function only needs to read
 /// them).
 ///
+/// Also the startup path's own panel population ([`App::new`], since
+/// 0.142.0), so there is exactly one place a freshly built set of Layers
+/// rows gets its active row marked selected ([`mark_active_layer_row`]):
+/// the returned active layer's row is already highlighted when this
+/// returns.
+///
 /// `tool` reseeds the Properties panel with `tool`'s own current
 /// options ([`tool_options`]) — opening a different document doesn't
 /// change which tool is selected, so the caller's own current
@@ -1159,7 +1165,12 @@ fn replace_document(
         tool,
         &options,
     )?;
-    Ok((layer_rows, topmost_pixel_layer(layers)))
+    let active = topmost_pixel_layer(layers);
+    // The new rows are built unselected; without this the freshly opened
+    // document's active layer has no highlighted row until a click
+    // (0.142.0, [`mark_active_layer_row`]).
+    mark_active_layer_row(&mut workspace.tree, &layer_rows, active);
+    Ok((layer_rows, active))
 }
 
 /// The store-side half of replacing the current document with a freshly
@@ -2959,6 +2970,14 @@ enum AppCommand {
     SelectTool(aurora_ui::Tool),
     Undo,
     Redo,
+    /// New Layer (0.143.0) — handed back to `App` as
+    /// [`ActivatedCommand::NewLayer`] and run by [`perform_layer_command`],
+    /// never inline in [`run_command`].
+    NewLayer,
+    /// Delete Layer (0.143.0) — as [`Self::NewLayer`]. Bound to no
+    /// shortcut (see [`default_shortcuts`]); reachable from the command
+    /// palette and the macOS `Layer` menu.
+    DeleteLayer,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -2979,6 +2998,12 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         // missing.
         ("Ctrl+Z", AppCommand::Undo),
         ("Ctrl+Shift+Z", AppCommand::Redo),
+        // Photoshop's own New Layer chord, and literally `Ctrl` for the
+        // same reason as Undo above (macOS `Cmd+Shift+N` does not resolve
+        // -- the same named gap). Delete Layer is deliberately unbound: a
+        // bare `Delete`/`Backspace` would collide with a focused text
+        // field's own editing and with a future "clear selection".
+        ("Ctrl+Shift+N", AppCommand::NewLayer),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
         // users already carry in muscle memory. Every tool here does
@@ -3123,6 +3148,11 @@ enum ActivatedCommand {
     /// `Scales` and click tracker, neither of which `activate_command`
     /// takes. See [`toggle_gallery`].
     ToggleWidgetGallery,
+    /// New Layer / Delete Layer (0.143.0) — returned rather than done
+    /// inline for the reason `Undo`/`Redo` are: they need live document
+    /// state (`App::run_layer_command`, [`perform_layer_command`]).
+    NewLayer,
+    DeleteLayer,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -3143,6 +3173,8 @@ const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
 const COMMAND_REDO: &str = "edit.redo";
 const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
+const COMMAND_LAYER_NEW: &str = "layer.new";
+const COMMAND_LAYER_DELETE: &str = "layer.delete";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -3176,7 +3208,9 @@ const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 /// undo/redo (see [`ActivatedCommand`]'s own doc comment for why
 /// `activate_command` itself doesn't run them directly). "Save As…",
 /// not "Save" — this crate tracks no "current document path" to reuse
-/// yet, so every save shows a picker.
+/// yet, so every save shows a picker. `COMMAND_LAYER_NEW`/
+/// `COMMAND_LAYER_DELETE` (0.143.0) resolve to [`ActivatedCommand::NewLayer`]/
+/// [`ActivatedCommand::DeleteLayer`], run by [`perform_layer_command`].
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -3193,6 +3227,8 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_UNDO, "Undo"),
         CommandEntry::new(COMMAND_REDO, "Redo"),
         CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
+        CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
+        CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
     ]
 }
 
@@ -3298,6 +3334,12 @@ fn activate_command(
     }
     if id == COMMAND_TOGGLE_WIDGET_GALLERY {
         return Some(ActivatedCommand::ToggleWidgetGallery);
+    }
+    if id == COMMAND_LAYER_NEW {
+        return Some(ActivatedCommand::NewLayer);
+    }
+    if id == COMMAND_LAYER_DELETE {
+        return Some(ActivatedCommand::DeleteLayer);
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -3924,6 +3966,69 @@ fn apply_layer_control_invalidation(
 struct PendingOpacity {
     layer: aurora_doc::LayerId,
     start: f32,
+}
+
+/// What [`install_startup_panels`] hands back to [`App::new`].
+struct StartupPanels {
+    layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: Option<aurora_doc::LayerId>,
+    layer_controls: LayerControlsState,
+    tool_controls: Option<aurora_ui::ToolControls>,
+}
+
+/// The startup document's whole panel installation, in order: the
+/// Layers/History/Properties population both open routes share
+/// ([`replace_document`], which marks the active layer's row selected —
+/// until 0.142.0 startup populated the panels inline and never did),
+/// then the Layers-panel controls strip and the Properties-panel tool
+/// controls, each synced to the document and `tool`.
+///
+/// Never panics (review revision, 0.142.0, replacing an `unreachable!`
+/// in shipping startup code): a failed population is logged and leaves
+/// an empty row map, with the active layer still the document's own
+/// topmost pixel layer ([`topmost_pixel_layer`]) so painting works; a
+/// failed control build is logged and leaves that control absent —
+/// the same degrade-and-warn every other step here already took.
+fn install_startup_panels(
+    workspace: &mut aurora_ui::Workspace,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    tool: aurora_ui::Tool,
+    tool_settings: &ToolSettings,
+) -> StartupPanels {
+    let (layer_rows, active_layer) =
+        match replace_document(workspace, scales, layers, history, tool, tool_settings) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to populate the panels for the startup document"
+                );
+                (HashMap::new(), topmost_pixel_layer(layers))
+            }
+        };
+    let mut layer_controls = LayerControlsState::default();
+    match aurora_ui::insert_layer_controls(&mut workspace.tree, workspace.layers, scales) {
+        Ok(controls) => layer_controls.controls = Some(controls),
+        Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
+    }
+    let _ = sync_layer_controls(workspace, &layer_controls, layers, active_layer, None);
+    let tool_controls =
+        match aurora_ui::insert_tool_controls(&mut workspace.tree, workspace.properties, scales) {
+            Ok(controls) => Some(controls),
+            Err(err) => {
+                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
+                None
+            }
+        };
+    let _ = sync_tool_controls(workspace, tool_controls, tool, tool_settings, None);
+    StartupPanels {
+        layer_rows,
+        active_layer,
+        layer_controls,
+        tool_controls,
+    }
 }
 
 /// The app's half of the Layers-panel controls: the widgets (`None` only
@@ -4571,10 +4676,11 @@ fn gpu_target_needs_resize(current: Option<(u32, u32)>, requested: (u32, u32)) -
 /// Builds the native menu's own cross-platform structure: an app menu
 /// (About/Services/Hide/Quit — see this function's own doc comment
 /// below for why this exists at all), File > Open File…/Save As…,
-/// Edit > Undo/Redo, View > Focus Layers/Properties/History Panel, then
+/// Edit > Undo/Redo, Layer > New Layer/Delete Layer (0.143.0), View >
+/// Focus Layers/Properties/History Panel, then
 /// (past a separator) Toggle Layers/Properties/History Panel, then
 /// (past another) Close Layers/Properties/History Panel — every one of
-/// those ten reusing the exact same `COMMAND_*` ids the
+/// those reusing the exact same `COMMAND_*` ids the
 /// command palette already uses (via `MenuItem::with_id`), so
 /// [`activate_command`] drives both UI surfaces identically; nothing
 /// here invents a second command vocabulary. No accelerator hint on
@@ -4656,6 +4762,21 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
+    // Between Edit and View, the order every mainstream editor uses. No
+    // accelerator hint on New Layer, for Undo's reason: `Ctrl+Shift+N`
+    // is literal `Ctrl` here, and a `⇧⌘N` hint would be a lie.
+    let layer_menu = match muda::Submenu::with_items(
+        "Layer",
+        true,
+        &[
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW, "New Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
+        ],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
+
     let view_menu = match muda::Submenu::with_items(
         "View",
         true,
@@ -4699,7 +4820,9 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
-    if let Err(err) = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &view_menu]) {
+    if let Err(err) =
+        menu.append_items(&[&app_menu, &file_menu, &edit_menu, &layer_menu, &view_menu])
+    {
         tracing::warn!(?err, "failed to build the native menu bar structure");
     }
     menu
@@ -5049,8 +5172,13 @@ fn structural_invalidation(dirtied: Option<aurora_core::Rect>) -> CompositeInval
 /// journaled step; a pixel undo/redo has no such panel to refresh — the
 /// canvas alone shows the result, on the next redraw.
 ///
+/// `NewLayer`/`DeleteLayer` (0.143.0) are **not** run here — see their
+/// arm; they go through [`perform_layer_command`].
+///
 /// **The return value is what the caller must invalidate in the
-/// composite cache**, and every arm except `Undo`/`Redo` returns
+/// composite cache**, and every arm except `Undo`/`Redo` (and the
+/// defensive `NewLayer`/`DeleteLayer` arm, which reports
+/// [`CompositeInvalidation::Everything`]) returns
 /// [`CompositeInvalidation::None`] — not because "nothing changed" is a
 /// deep truth about them, but because none of them touches the document
 /// model at all today (focus, the command palette, tool selection).
@@ -5192,6 +5320,9 @@ fn run_command(
             }
             None => CompositeInvalidation::None,
         },
+        // Never run here (`handle_key` hands both back; `perform_layer_command`
+        // runs them). `Everything`, never `None`, per the trap named above.
+        AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
     }
 }
 
@@ -5547,6 +5678,15 @@ fn handle_key(
             } else {
                 ActivatedCommand::Redo
             });
+        }
+        // New Layer (0.143.0) needs the same whole-sequence treatment
+        // (`perform_layer_command`: end gestures, commit the drag, one
+        // history step, rebuild the rows), so it is handed back too.
+        if command == AppCommand::NewLayer {
+            return Some(ActivatedCommand::NewLayer);
+        }
+        if command == AppCommand::DeleteLayer {
+            return Some(ActivatedCommand::DeleteLayer);
         }
         // Spelled out rather than discarded bare, and annotated so the
         // type is visible at the call site: every command that can reach
@@ -14206,24 +14346,512 @@ fn select_layer(
     // not.
     let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
-    for (&row, &id) in layer_rows {
-        // `warn!`, not `?`: this function returns `()`, and a row that
-        // has somehow gone missing must not take the rest of the
-        // selection with it -- nor become a panic, which this workspace
-        // denies outright.
-        if let Err(err) = aurora_widgets::widgets::set_tree_item_selected(
-            &mut workspace.tree,
-            row,
-            id == layer_id,
-        ) {
-            tracing::warn!(?err, "failed to update a layer row's selection state");
-        }
-    }
+    mark_active_layer_row(&mut workspace.tree, layer_rows, Some(layer_id));
     // After the row loop, not before: nothing here depends on the
     // ordering, but keeping the accessibility work untouched and the
     // new bound re-established at the end keeps this function's two
     // jobs readable as two jobs.
     clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
+}
+
+/// Marks exactly `active`'s Layers-panel row selected and every other row
+/// not — the row half of [`select_layer`], without its active-layer
+/// assignment or pan clamp, for the callers that install a freshly built
+/// set of rows for an already-chosen active layer (startup in
+/// [`App::new`], and [`replace_document`] for both open routes).
+///
+/// **Why this exists (0.142.0).** Until then [`select_layer`] was the only
+/// function that ever marked a row selected, and neither startup nor an
+/// open went through it: both assigned the active layer directly, so the
+/// panel came up with *no* highlighted row until the first click — the
+/// Layers panel a real macOS screenshot showed as one undifferentiated
+/// line. `None` (a document with no pixel layer) clears every row.
+///
+/// Through `aurora_widgets::widgets::set_tree_item_selected`, never a
+/// hand-written accessibility node, for the reasons [`select_layer`]'s own
+/// doc comment gives.
+fn mark_active_layer_row(
+    tree: &mut WidgetTree<WidgetKind>,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    active: Option<aurora_doc::LayerId>,
+) {
+    for (&row, &id) in layer_rows {
+        // `warn!`, not `?`: this function returns `()`, and a row that
+        // has somehow gone missing must not take the rest of the
+        // selection with it -- nor become a panic, which this workspace
+        // denies outright.
+        if let Err(err) =
+            aurora_widgets::widgets::set_tree_item_selected(tree, row, Some(id) == active)
+        {
+            tracing::warn!(?err, "failed to update a layer row's selection state");
+        }
+    }
+}
+
+// -- New Layer / Delete Layer (0.143.0) --
+//
+// The first two commands that change *which* layers exist. Everything
+// here is a free function over a borrowed context, the same split
+// `LayerControlEdit`/`AccessibilityContext` use, so a headless test can
+// drive the whole sequence with no window or adapter.
+
+/// One add-or-delete activation, from the command palette, the macOS
+/// `Layer` menu or (`New` only) `Ctrl+Shift+N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerCommand {
+    /// A new, empty pixel layer directly above the active node, which it
+    /// replaces as active. See [`new_layer_placement`].
+    New,
+    /// Removes the active node and its whole subtree, refusing when that
+    /// would leave no pixel layer at all. See [`delete_layer`].
+    Delete,
+}
+
+/// Everything [`perform_layer_command`] touches, borrowed from `App` (or
+/// a test rig) for one call.
+struct LayerCommandContext<'a> {
+    workspace: &'a mut aurora_ui::Workspace,
+    focus: &'a mut FocusManager,
+    scales: &'a Scales,
+    layers: &'a mut aurora_doc::LayerTree,
+    history: &'a mut aurora_doc::History,
+    pixel_history: &'a mut aurora_brush::PixelHistory,
+    undo_order: &'a mut UndoOrder,
+    layer_rows: &'a mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &'a mut Option<aurora_doc::LayerId>,
+    view: &'a mut aurora_ui::CanvasView,
+    composite_cache: &'a mut CompositeCache,
+    drag: &'a mut Option<Drag>,
+    layer_controls: &'a mut LayerControlsState,
+    /// The shared pointer tracker (`App::gallery_click`): ending a live
+    /// opacity drag drops the slider's capture.
+    click: &'a mut ClickTracker,
+    /// `App::canvas_size`, the document's own extent — what a new
+    /// layer's bounds are ([`new_layer_bounds`]).
+    canvas_size: (u32, u32),
+}
+
+/// Where a node sits: its parent (`None` = a root) and its sibling index
+/// (`0` = topmost, the order [`aurora_doc::LayerTree::roots`] lists in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerPosition {
+    parent: Option<aurora_doc::LayerId>,
+    index: usize,
+}
+
+/// `id`'s current [`LayerPosition`], or `None` if it is not in `layers`
+/// (or its recorded parent does not list it, which a validated tree
+/// cannot produce).
+fn layer_position(
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+) -> Option<LayerPosition> {
+    if !layers.contains(id) {
+        return None;
+    }
+    let parent = layers.parent(id);
+    let siblings = match parent {
+        None => layers.roots(),
+        Some(group) => layers.children(group)?,
+    };
+    let index = siblings.iter().position(|&sibling| sibling == id)?;
+    Some(LayerPosition { parent, index })
+}
+
+/// Every id in `layers`, top to bottom in panel order (a group before its
+/// own children) — an explicit stack, not recursion, and bounded by
+/// `layers.len()` so even a malformed tree cannot loop forever.
+fn layer_ids_in_order(layers: &aurora_doc::LayerTree) -> Vec<aurora_doc::LayerId> {
+    let mut out = Vec::with_capacity(layers.len());
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        if out.len() >= layers.len() {
+            break;
+        }
+        out.push(id);
+        if let Some(children) = layers.children(id) {
+            stack.extend(children.iter().rev().copied());
+        }
+    }
+    out
+}
+
+/// `root` and every descendant of it — the set a delete of `root` takes
+/// with it. Same explicit-stack, length-bounded walk as
+/// [`layer_ids_in_order`].
+fn subtree_ids(
+    layers: &aurora_doc::LayerTree,
+    root: aurora_doc::LayerId,
+) -> HashSet<aurora_doc::LayerId> {
+    let mut out = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if out.len() >= layers.len() || !out.insert(id) {
+            continue;
+        }
+        if let Some(children) = layers.children(id) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    out
+}
+
+/// What becomes active once the node that sat at `position` is gone: the
+/// sibling now at that same index (the one that was directly below it),
+/// else the nearest sibling above, else the parent group, else the
+/// topmost pixel layer of the whole document ([`topmost_pixel_layer`]).
+/// `None` only for a document with nothing left to select.
+fn layer_at_or_near(
+    layers: &aurora_doc::LayerTree,
+    position: LayerPosition,
+) -> Option<aurora_doc::LayerId> {
+    let parent = position.parent.filter(|&group| layers.contains(group));
+    let siblings: &[aurora_doc::LayerId] = match position.parent {
+        None => layers.roots(),
+        Some(group) => layers.children(group).unwrap_or(&[]),
+    };
+    siblings
+        .get(position.index)
+        .or_else(|| siblings.last())
+        .copied()
+        .or(parent)
+        .or_else(|| topmost_pixel_layer(layers))
+}
+
+/// "Layer N", with `N` one past the largest `n` any existing layer is
+/// literally named "Layer n" — so deleting "Layer 2" of three and adding
+/// again gives "Layer 4", never a second "Layer 3".
+fn next_layer_name(layers: &aurora_doc::LayerTree) -> String {
+    let highest = layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| layers.name(id)?.strip_prefix("Layer ")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("Layer {}", highest.saturating_add(1))
+}
+
+/// A new layer's `bounds`: the document's own extent (`canvas_size`,
+/// `App::canvas_size` — what save and the composite already treat as the
+/// canvas), or, for a document with no real extent, the union of every
+/// pixel layer's bounds, or an empty rectangle at the origin when there
+/// is none.
+fn new_layer_bounds(layers: &aurora_doc::LayerTree, canvas_size: (u32, u32)) -> aurora_core::Rect {
+    let (width, height) = canvas_size;
+    if width > 0 && height > 0 {
+        return aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+    }
+    let empty = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+    layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| layers.bounds(id))
+        .fold(empty, |acc, bounds| acc.union(&bounds))
+}
+
+/// Where New Layer inserts: directly above the active node, as its
+/// sibling (so above a group, never inside it), at the index the active
+/// node holds now — which pushes the active node one place down. With no
+/// valid active node, the top of the roots.
+fn new_layer_placement(
+    layers: &aurora_doc::LayerTree,
+    active: Option<aurora_doc::LayerId>,
+) -> LayerPosition {
+    active
+        .and_then(|id| layer_position(layers, id))
+        .unwrap_or(LayerPosition {
+            parent: None,
+            index: 0,
+        })
+}
+
+/// A layer command that really changed the document, and what should be
+/// active afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppliedLayerCommand {
+    next_active: Option<aurora_doc::LayerId>,
+}
+
+/// Adds the new layer through `history` ([`aurora_doc::History::add_pixel_layer_at`],
+/// one undo step). Returns its id, or `None` (logged) if the tree refused.
+fn new_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_layer_name(cx.layers);
+    let bounds = new_layer_bounds(cx.layers, cx.canvas_size);
+    match cx
+        .history
+        .add_pixel_layer_at(cx.layers, name, bounds, placement.parent, placement.index)
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(?err, "New Layer was refused by the layer tree");
+            None
+        }
+    }
+}
+
+/// Removes the active node and its subtree through `history` (one undo
+/// step, which restores the layers *and* — since a deleted layer's tiles
+/// stay in the store and its id is never reissued — their pixels).
+/// Returns what should become active ([`layer_at_or_near`]), or `None`
+/// with nothing changed when there is no active node or the delete is
+/// refused: a document must keep at least one pixel layer outside the
+/// removed subtree, or there would be nothing left to paint on.
+fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand> {
+    let Some(target) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
+        tracing::info!("Delete Layer with no active layer; nothing to delete");
+        return None;
+    };
+    let position = layer_position(cx.layers, target)?;
+    let doomed = subtree_ids(cx.layers, target);
+    let survivor = layer_ids_in_order(cx.layers).into_iter().any(|id| {
+        !doomed.contains(&id)
+            && matches!(
+                cx.layers.kind(id),
+                Some(aurora_doc::LayerKind::Pixel { .. })
+            )
+    });
+    if !survivor {
+        tracing::info!("Delete Layer refused: it would leave the document with no pixel layer");
+        return None;
+    }
+    match cx.history.remove(cx.layers, target) {
+        Ok(_) => Some(AppliedLayerCommand {
+            next_active: layer_at_or_near(cx.layers, position),
+        }),
+        Err(err) => {
+            tracing::warn!(?err, "Delete Layer was refused by the layer tree");
+            None
+        }
+    }
+}
+
+/// One New Layer / Delete Layer activation, whole, in this order:
+///
+/// 1. end every Layers-panel control gesture ([`end_layer_control_gestures`]
+///    — a live opacity drag becomes its own undo step first, so the
+///    command's own step lands *after* it);
+/// 2. commit whatever canvas drag is live ([`commit_ending_drag`]) — a
+///    held brush stroke is recorded before its layer can be deleted out
+///    from under it, the same reason [`perform_undo_redo`] commits first;
+/// 3. apply the command through `History` (exactly one step) and record
+///    it in [`UndoOrder`] as [`UndoKind::Structural`], which also clears
+///    every redo stack;
+/// 4. rebuild the Layers panel and select the new active node
+///    ([`rebuild_layer_rows`]); refresh the History panel and the
+///    Layers-panel controls; recomposite everything.
+///
+/// Returns whether the document's layer set changed (`false` for a
+/// refused delete, which records nothing). The caller relays out, pushes
+/// accessibility and redraws either way, since step 1 or 2 may have
+/// committed something.
+fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand) -> bool {
+    let canvas_area = canvas_area_logical_size(cx.workspace);
+    let _ = end_layer_control_gestures(
+        &mut LayerControlEdit {
+            workspace: cx.workspace,
+            layers: cx.layers,
+            history: cx.history,
+            pixel_history: cx.pixel_history,
+            undo_order: cx.undo_order,
+            layer_rows: cx.layer_rows,
+            active_layer: *cx.active_layer,
+            state: cx.layer_controls,
+        },
+        cx.click,
+    );
+    commit_ending_drag(
+        cx.drag.take(),
+        cx.layers,
+        cx.history,
+        cx.pixel_history,
+        cx.undo_order,
+        cx.view,
+        *cx.active_layer,
+        canvas_area,
+    );
+    let next_active = match command {
+        LayerCommand::New => new_layer(cx).map(|id| AppliedLayerCommand {
+            next_active: Some(id),
+        }),
+        LayerCommand::Delete => delete_layer(cx),
+    };
+    let Some(AppliedLayerCommand { next_active }) = next_active else {
+        return false;
+    };
+    cx.undo_order
+        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    rebuild_layer_rows(
+        cx.workspace,
+        cx.focus,
+        cx.scales,
+        cx.layers,
+        cx.layer_rows,
+        cx.active_layer,
+        cx.view,
+        next_active,
+    );
+    refresh_history_panel(cx.workspace, cx.history);
+    let _ = sync_layer_controls(
+        cx.workspace,
+        cx.layer_controls,
+        cx.layers,
+        *cx.active_layer,
+        None,
+    );
+    // A whole layer appeared or vanished: no narrower rect is honest
+    // here, for the reasons `structural_invalidation` gives.
+    cx.composite_cache.bump();
+    true
+}
+
+/// Repopulates the Layers panel from `layers` and re-establishes the
+/// active node: `preferred` if it is in the tree, else the current
+/// `*active_layer` if it still is, else [`topmost_pixel_layer`]. The
+/// active row is selected through [`select_layer`] (so the pan bound is
+/// re-clamped too); if focus was on a Layers-panel row it moves to the
+/// active node's new row, otherwise stale focus is validated away.
+///
+/// **Does not invalidate the composite cache; callers own that.** It is
+/// only ever called after the layer *set* changed, which is already a
+/// whole-document invalidation for [`structural_invalidation`]'s reasons,
+/// so both callers bump unconditionally ([`perform_layer_command`] after
+/// this returns, [`sync_layer_rows_after_undo_redo`] likewise). Until the
+/// 0.143.0 review revision this function also bumped "when the grid anchor
+/// ([`composite_reference_origin`]) moved", but its "before" was read
+/// *after* the tree had already changed, against an active id that could
+/// name a just-removed layer — not a real before/after comparison — so it
+/// was dropped rather than kept as a guard that looked load-bearing.
+///
+/// **Disclosed cost**, the same as [`reconcile_layer_rows`]'s: every row is
+/// rebuilt expanded, so a group an assistive technology had collapsed
+/// reopens.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_layer_rows(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    layer_rows: &mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    preferred: Option<aurora_doc::LayerId>,
+) {
+    let focus_was_on_a_row = focus
+        .focused()
+        .is_some_and(|focused| layer_rows.contains_key(&focused));
+    match aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers) {
+        Ok(rows) => *layer_rows = rows,
+        Err(err) => {
+            tracing::warn!(?err, "failed to rebuild the Layers panel");
+            layer_rows.retain(|&id, _| workspace.tree.contains(id));
+        }
+    }
+    let active = preferred
+        .filter(|&id| layers.contains(id))
+        .or_else(|| active_layer.filter(|&id| layers.contains(id)))
+        .or_else(|| topmost_pixel_layer(layers));
+    if let Some(id) = active {
+        select_layer(workspace, layer_rows, active_layer, view, layers, id);
+    } else {
+        *active_layer = None;
+        mark_active_layer_row(&mut workspace.tree, layer_rows, None);
+    }
+    focus.validate(&workspace.tree);
+    if focus_was_on_a_row
+        && let Some(id) = active
+        && let Some((&row, _)) = layer_rows.iter().find(|&(_, &layer)| layer == id)
+        && let Err(err) = focus.focus(&mut workspace.tree, row)
+    {
+        tracing::warn!(?err, "failed to refocus the active Layers-panel row");
+    }
+}
+
+/// The layer set and active node's position just before an `Undo`/`Redo`
+/// — what [`sync_layer_rows_after_undo_redo`] compares against. Taken by
+/// `App::run_undo_redo` immediately before [`perform_undo_redo`].
+#[derive(Debug, Clone)]
+struct LayerSetSnapshot {
+    ids: HashSet<aurora_doc::LayerId>,
+    active_position: Option<LayerPosition>,
+}
+
+impl LayerSetSnapshot {
+    fn capture(layers: &aurora_doc::LayerTree, active: Option<aurora_doc::LayerId>) -> Self {
+        Self {
+            ids: layer_ids_in_order(layers).into_iter().collect(),
+            active_position: active.and_then(|id| layer_position(layers, id)),
+        }
+    }
+}
+
+/// After a structural `Undo`/`Redo`: if the *set* of layers changed (an
+/// undone New Layer, a redone Delete, ...), rebuild the Layers panel —
+/// before 0.143.0 nothing could add or remove a layer, so no undo ever
+/// had to. A step that only changed a property (opacity, visibility,
+/// blend mode, bounds) leaves the set alone, and the panel's row ids,
+/// focus and any capture survive untouched.
+///
+/// The new active node: a layer that just *reappeared* (an undone Delete,
+/// a redone New — the topmost such in panel order), else the current
+/// active node if it survived, else whatever now sits where it was
+/// ([`layer_at_or_near`]) — so undoing New Layer reselects the layer that
+/// was active before it, and `*active_layer` is never left naming a
+/// removed layer for the brush to paint on. Returns whether it rebuilt.
+#[allow(clippy::too_many_arguments)]
+fn sync_layer_rows_after_undo_redo(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    layer_rows: &mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    composite_cache: &mut CompositeCache,
+    layer_controls: &LayerControlsState,
+    before: &LayerSetSnapshot,
+) -> bool {
+    let after = layer_ids_in_order(layers);
+    if after.len() == before.ids.len() && after.iter().all(|id| before.ids.contains(id)) {
+        return false;
+    }
+    let preferred = after
+        .iter()
+        .copied()
+        .find(|id| !before.ids.contains(id))
+        .or_else(|| active_layer.filter(|&id| layers.contains(id)))
+        .or_else(|| {
+            before
+                .active_position
+                .and_then(|position| layer_at_or_near(layers, position))
+        });
+    rebuild_layer_rows(
+        workspace,
+        focus,
+        scales,
+        layers,
+        layer_rows,
+        active_layer,
+        view,
+        preferred,
+    );
+    let _ = sync_layer_controls(workspace, layer_controls, layers, *active_layer, None);
+    // The layer set changed and the active node (hence the grid anchor,
+    // [`composite_reference_origin`]) may have moved *after*
+    // `perform_undo_redo` took its own anchor comparison against the old
+    // active id. Its structural step already reported `Everything`, but
+    // this caller owns the invalidation [`rebuild_layer_rows`] leaves to
+    // it, so it does not lean on that.
+    composite_cache.bump();
+    true
 }
 
 /// The name prefix every session's scratch directory carries — what
@@ -15916,7 +16544,7 @@ impl App {
         layout_path: Option<PathBuf>,
         reduced_motion: bool,
     ) -> Self {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&scales);
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace);
         }
@@ -15931,40 +16559,28 @@ impl App {
             skipped_tiles,
             was_recovered,
         } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
-        let layer_rows = match aurora_ui::populate_layers_panel(
-            &mut workspace.tree,
-            workspace.layers,
-            &scales,
-            &layers,
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                unreachable!("workspace.layers was just built by build_workspace above: {err:?}")
-            }
-        };
-        if let Err(err) = aurora_ui::populate_history_panel(
-            &mut workspace.tree,
-            workspace.history,
-            &scales,
-            &history,
-        ) {
-            unreachable!("workspace.history was just built by build_workspace above: {err:?}");
-        }
-        // Seeded from the tool this session actually starts with
+        // Every startup panel step lives in [`install_startup_panels`]
+        // (review revision, 0.142.0), so the startup "active row is
+        // selected" contract is unit-testable without a window. Seeded
+        // from the tool this session actually starts with
         // (`aurora_ui::Tool::default()`, `MarqueeSelect` — see
         // `Self::tool`'s own field assignment below), which has no real
-        // options yet, so the Properties panel legitimately starts
-        // empty here, not populated with a placeholder.
-        if let Err(err) = aurora_ui::populate_properties_panel(
-            &mut workspace.tree,
-            workspace.properties,
+        // options yet, so the Properties panel legitimately starts with
+        // only its readout.
+        let tool_settings = ToolSettings::default();
+        let StartupPanels {
+            layer_rows,
+            active_layer,
+            layer_controls,
+            tool_controls,
+        } = install_startup_panels(
+            &mut workspace,
             &scales,
+            &layers,
+            &history,
             aurora_ui::Tool::default(),
-            &tool_options(aurora_ui::Tool::default(), &ToolSettings::default()),
-        ) {
-            unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
-        }
-        let active_layer = topmost_pixel_layer(&layers);
+            &tool_settings,
+        );
         // The pan bound, established before the first frame. Crash
         // recovery reopens a real `.aur` container
         // (`recover_document`/`read_autosave_container`), so this
@@ -15997,32 +16613,6 @@ impl App {
             // rather than dropping it.
             None,
             1.0,
-        );
-
-        let mut layer_controls = LayerControlsState::default();
-        match aurora_ui::insert_layer_controls(&mut workspace.tree, workspace.layers, &scales) {
-            Ok(controls) => layer_controls.controls = Some(controls),
-            Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
-        }
-        let _ = sync_layer_controls(&mut workspace, &layer_controls, &layers, active_layer, None);
-        let tool_settings = ToolSettings::default();
-        let tool_controls = match aurora_ui::insert_tool_controls(
-            &mut workspace.tree,
-            workspace.properties,
-            &scales,
-        ) {
-            Ok(controls) => Some(controls),
-            Err(err) => {
-                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
-                None
-            }
-        };
-        let _ = sync_tool_controls(
-            &mut workspace,
-            tool_controls,
-            aurora_ui::Tool::default(),
-            &tool_settings,
-            None,
         );
 
         let mut focus = FocusManager::default();
@@ -16264,6 +16854,8 @@ impl App {
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
+            Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
+            Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -16300,6 +16892,12 @@ impl App {
     /// [`perform_undo_redo`] exists to order correctly. The paragraph
     /// this replaces still described that split, and had been false
     /// since.
+    ///
+    /// Since 0.143.0 it also snapshots the layer set first
+    /// ([`LayerSetSnapshot`]) and, after the command, rebuilds the Layers
+    /// panel when that set changed ([`sync_layer_rows_after_undo_redo`]) —
+    /// an undone New Layer or redone Delete must not leave rows, or the
+    /// active layer, naming a layer that is gone.
     fn run_undo_redo(&mut self, command: AppCommand) {
         // `perform_undo_redo` commits a live opacity drag first; the
         // slider's capture ends with it, so the rest of that drag is not
@@ -16313,6 +16911,9 @@ impl App {
         {
             self.gallery_click.release_capture();
         }
+        // Taken before the command: an undone New Layer or redone Delete
+        // changes the layer set, and the rows must follow (0.143.0).
+        let layers_before = LayerSetSnapshot::capture(&self.layers, self.active_layer);
         // Annotated rather than discarded bare, for the reason
         // `CompositeInvalidation`'s own `#[must_use]` exists: the report
         // has already been acted on *inside* `perform_undo_redo`, which
@@ -16335,13 +16936,68 @@ impl App {
             &mut self.layer_controls,
             command,
         );
+        let rebuilt = sync_layer_rows_after_undo_redo(
+            &mut self.workspace,
+            &mut self.focus,
+            &self.scales,
+            &self.layers,
+            &mut self.layer_rows,
+            &mut self.active_layer,
+            &mut self.canvas_view,
+            &mut self.composite_cache,
+            &self.layer_controls,
+            &layers_before,
+        );
         refresh_layer_row_descriptions(&mut self.workspace, &self.layer_rows, &self.layers);
+        if rebuilt {
+            // Fresh rows have no layout yet.
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+            self.needs_redraw = true;
+        }
         // `App` itself has nothing further to do with the report -- the
         // cache it names has already been invalidated inside. It is
         // returned so a test can assert *which* invalidation a given
         // undo/redo produced, which is the only way to pin the
         // anchor-moved guard down directly rather than by inferring it
         // from pixels that might agree by coincidence.
+    }
+
+    /// Runs New Layer / Delete Layer ([`perform_layer_command`]) against
+    /// `App`'s own fields, then relays out (the Layers panel's rows were
+    /// rebuilt), pushes accessibility and redraws. All three entry points
+    /// — the command palette, the macOS `Layer` menu and `Ctrl+Shift+N` —
+    /// converge here through [`ActivatedCommand`], as Undo/Redo converge
+    /// on [`Self::run_undo_redo`].
+    fn run_layer_command(&mut self, command: LayerCommand) {
+        let _ = perform_layer_command(
+            &mut LayerCommandContext {
+                workspace: &mut self.workspace,
+                focus: &mut self.focus,
+                scales: &self.scales,
+                layers: &mut self.layers,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                undo_order: &mut self.undo_order,
+                layer_rows: &mut self.layer_rows,
+                active_layer: &mut self.active_layer,
+                view: &mut self.canvas_view,
+                composite_cache: &mut self.composite_cache,
+                drag: &mut self.drag,
+                layer_controls: &mut self.layer_controls,
+                click: &mut self.gallery_click,
+                canvas_size: self.canvas_size,
+            },
+            command,
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -17695,6 +18351,8 @@ impl App {
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
+            Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
+            Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             None => {}
         }
         self.push_accessibility();
@@ -19078,6 +19736,18 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The committed scales every test workspace is built with
+/// ([`aurora_ui::build_workspace`] takes them since 0.142.0, for the
+/// panels' one-row title slots) — [`load_scales`]'s own file, so a test
+/// workspace and the scales the same test later loads always agree.
+#[cfg(test)]
+fn test_workspace_scales() -> Scales {
+    match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => unreachable!("the checked-in design file must parse: {err}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -19092,10 +19762,10 @@ mod tests {
         MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        RailResize, RecoveredDocument, ShutdownState, StartupPanels, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
         canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
         clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
@@ -19106,12 +19776,12 @@ mod tests {
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, install_startup_panels,
+        is_aur_path, layer_for_surface, layer_local_point, load_document_view, load_scales,
+        load_theme, logical_point, logical_size, mark_active_layer_row, mark_move_refusal_reported,
+        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
+        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
         replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
@@ -19404,7 +20074,7 @@ mod tests {
 
     #[test]
     fn select_layer_sets_active_layer_and_marks_only_its_own_row_selected() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -19553,7 +20223,7 @@ mod tests {
         aurora_doc::LayerId,
         aurora_doc::LayerId,
     ) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -19758,7 +20428,7 @@ mod tests {
     /// layer selected, and keeps focus on the group's (new) row.
     #[test]
     fn collapsing_and_expanding_a_layer_group_keeps_the_row_map_live() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let group = match layers.add_group("g", None) {
             Ok(id) => id,
@@ -20040,7 +20710,7 @@ mod tests {
         #[test]
         fn an_at_click_on_the_gallery_menu_button_opens_the_menu() {
             let mut state = AtState::new(
-                aurora_ui::build_workspace(),
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 aurora_doc::LayerTree::new(),
                 None,
             );
@@ -20073,7 +20743,7 @@ mod tests {
         #[test]
         fn an_at_click_on_a_gallery_tree_row_single_selects_it() {
             let mut state = AtState::new(
-                aurora_ui::build_workspace(),
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 aurora_doc::LayerTree::new(),
                 None,
             );
@@ -20149,7 +20819,11 @@ mod tests {
         #[test]
         fn rows_an_expand_rebuilt_are_laid_out() {
             let (layers, group, child, _) = group_child_and_top();
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(child),
+            );
             let group_row = row_of(&state.layer_rows, group);
             assert!(has_area(&state, group_row), "setup: laid out");
             let effects = state.act(&a11y_request(group_row, accesskit::Action::Collapse));
@@ -20181,7 +20855,11 @@ mod tests {
         #[test]
         fn an_expand_keeps_focus_on_another_layers_row() {
             let (layers, group, child, top) = group_child_and_top();
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(child),
+            );
             let group_row = row_of(&state.layer_rows, group);
             state.act(&a11y_request(group_row, accesskit::Action::Collapse));
             let top_row = row_of(&state.layer_rows, top);
@@ -20245,7 +20923,11 @@ mod tests {
             let fresh = || {
                 let (layers, _history) = demo_document();
                 let active = topmost_pixel_layer(&layers);
-                AtState::new(aurora_ui::build_workspace(), layers, active)
+                AtState::new(
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                    layers,
+                    active,
+                )
             };
             let probe = fresh();
             let mut ids = Vec::new();
@@ -20332,7 +21014,11 @@ mod tests {
         fn an_at_set_value_on_the_radius_slider_sets_the_radius_without_history() {
             let (layers, _history) = demo_document();
             let active = topmost_pixel_layer(&layers);
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                active,
+            );
             let Some(controls) = state.tool_controls else {
                 unreachable!("built");
             };
@@ -20371,7 +21057,11 @@ mod tests {
         fn an_at_set_value_mid_drag_ends_the_pointer_drag_of_the_radius_slider() {
             let (layers, _history) = demo_document();
             let active = topmost_pixel_layer(&layers);
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                active,
+            );
             let Some(controls) = state.tool_controls else {
                 unreachable!("built");
             };
@@ -20889,7 +21579,7 @@ mod tests {
     /// clamp from `after_undo_redo` fails here.
     #[test]
     fn undoing_a_move_re_establishes_the_pan_bound() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -21023,7 +21713,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -21314,7 +22004,7 @@ mod tests {
         aurora_doc::LayerId,
         aurora_doc::LayerId,
     ) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -21560,6 +22250,117 @@ mod tests {
         assert!(open_image(&path).is_none());
     }
 
+    /// Every Layers row's `TreeItemState::selected` payload, keyed by the
+    /// layer it shows — the state `aurora_widgets::paint_widget` reads to
+    /// draw the highlight — checked against its accessibility node's
+    /// `is_selected`, so neither can drift from the other unseen.
+    fn selected_layer_rows(
+        workspace: &aurora_ui::Workspace,
+        layer_rows: &std::collections::HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+    ) -> Vec<aurora_doc::LayerId> {
+        let mut selected = Vec::new();
+        for (&row, &layer) in layer_rows {
+            let painted = matches!(
+                workspace.tree.payload(row),
+                Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+            );
+            let announced = workspace
+                .tree
+                .accessibility(row)
+                .and_then(accesskit::Node::is_selected);
+            assert_eq!(
+                announced,
+                Some(painted),
+                "a row's announced selection must match its painted one"
+            );
+            if painted {
+                selected.push(layer);
+            }
+        }
+        selected
+    }
+
+    #[test]
+    fn replace_document_marks_exactly_the_active_layers_row_selected() {
+        // 0.142.0: until then nothing but `select_layer` (a click) ever
+        // marked a row selected, so a startup or freshly opened document
+        // showed no highlighted row at all. The multi-layer demo document
+        // is the shape both startup and an `.aur` open hand this function
+        // (groups and all); the single-image import is the other open
+        // route.
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history) = demo_document();
+        let (layer_rows, active) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(layer_rows.len() > 2, "the demo document has several rows");
+        let Some(active) = active else {
+            unreachable!("the demo document has a pixel layer");
+        };
+        assert_eq!(Some(active), topmost_pixel_layer(&layers));
+        assert_eq!(
+            selected_layer_rows(&workspace, &layer_rows),
+            vec![active],
+            "exactly the active layer's row is highlighted, before any click"
+        );
+
+        // A second replace (the open routes) highlights the new document's
+        // own active row, and nothing of the old one survives.
+        let image = fake_image(8, 8);
+        let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
+        let (new_rows, new_active) = match replace_document(
+            &mut workspace,
+            &scales,
+            &new_layers,
+            &new_history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(new_active, Some(new_layer_id));
+        assert_eq!(
+            selected_layer_rows(&workspace, &new_rows),
+            vec![new_layer_id]
+        );
+    }
+
+    #[test]
+    fn mark_active_layer_row_with_no_active_layer_clears_every_row() {
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history) = demo_document();
+        let (layer_rows, _) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        mark_active_layer_row(&mut workspace.tree, &layer_rows, None);
+        assert!(selected_layer_rows(&workspace, &layer_rows).is_empty());
+    }
+
     #[test]
     fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
         // Everything under the body, at every depth -- not just the
@@ -21578,7 +22379,7 @@ mod tests {
                 .sum()
         }
 
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err:?}"),
@@ -21669,6 +22470,66 @@ mod tests {
         assert_eq!(active_layer, Some(new_layer_id));
         assert_eq!(layer_rows.len(), 1);
         assert_eq!(layer_rows.values().copied().next(), Some(new_layer_id));
+    }
+
+    /// Review revision (0.142.0): the startup panel installation
+    /// [`App::new`] runs marks the active layer's row selected (and only
+    /// that row), and installs both control strips. Kills the "startup
+    /// clears the selection" mutation that no window-free test could
+    /// reach while this sequence was inline in `App::new`.
+    #[test]
+    fn startup_panel_installation_selects_the_active_layers_row() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let (layers, history) = demo_document();
+        let StartupPanels {
+            layer_rows,
+            active_layer,
+            layer_controls,
+            tool_controls,
+        } = install_startup_panels(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        );
+        assert_eq!(active_layer, topmost_pixel_layer(&layers));
+        assert!(active_layer.is_some(), "the demo document has pixel layers");
+        assert!(
+            layer_rows.len() > 1,
+            "several rows, so selection is a real choice"
+        );
+        let mut selected = 0;
+        for (&row, &layer) in &layer_rows {
+            let is_selected = workspace
+                .tree
+                .accessibility(row)
+                .and_then(accesskit::Node::is_selected);
+            if Some(layer) == active_layer {
+                assert_eq!(
+                    is_selected,
+                    Some(true),
+                    "the active layer's row is selected"
+                );
+                selected += 1;
+            } else {
+                assert_ne!(is_selected, Some(true), "{layer:?}'s row is not selected");
+            }
+        }
+        assert_eq!(selected, 1, "exactly one selected row");
+        assert!(
+            layer_controls.controls.is_some(),
+            "Layers controls installed"
+        );
+        assert!(
+            tool_controls.is_some(),
+            "Properties tool controls installed"
+        );
     }
 
     /// [`fake_image`] with a caller-chosen colour, so two documents in
@@ -22207,7 +23068,7 @@ mod tests {
 
     #[test]
     fn run_command_focus_next_visits_every_docked_panel_in_order() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22281,7 +23142,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_switches_the_active_tool() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22308,7 +23169,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_brush_populates_a_real_radius_row() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22347,7 +23208,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_eraser_populates_a_real_radius_row() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22386,7 +23247,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_move_leaves_the_properties_panel_empty() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22427,7 +23288,7 @@ mod tests {
     /// not an accumulated total.
     #[test]
     fn run_command_select_tool_clears_stale_rows_from_the_previous_tool() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22503,7 +23364,7 @@ mod tests {
 
     #[test]
     fn run_command_undo_reverts_a_bounds_change_and_refreshes_the_history_panel() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22612,7 +23473,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn structural_undo_falls_back_to_everything_because_paint_escapes_declared_bounds() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22768,7 +23629,7 @@ mod tests {
     /// predicate is what keeps it from passing vacuously.
     #[test]
     fn undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22865,7 +23726,7 @@ mod tests {
 
     #[test]
     fn run_command_undo_with_nothing_to_undo_is_a_safe_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22901,7 +23762,7 @@ mod tests {
     // `aurora_doc::history::apply` already documents for its own allow.
     #[allow(clippy::float_cmp, clippy::too_many_lines)]
     fn run_command_undo_redo_walk_structural_and_pixel_edits_in_true_chronological_order() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -23042,7 +23903,7 @@ mod tests {
 
     #[test]
     fn run_command_pixel_undo_with_no_live_store_leaves_the_unified_order_untouched() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -23088,7 +23949,7 @@ mod tests {
 
     #[test]
     fn toggle_command_palette_opens_then_closes() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
 
@@ -23129,7 +23990,7 @@ mod tests {
     /// genuinely centred horizontally, not just "not zero."
     #[test]
     fn opening_the_palette_gives_it_a_real_centred_size_and_position() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
 
@@ -23153,7 +24014,7 @@ mod tests {
 
     #[test]
     fn opening_the_palette_a_second_time_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23164,7 +24025,7 @@ mod tests {
 
     #[test]
     fn typing_into_the_open_palette_filters_to_a_matching_command() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23191,10 +24052,11 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "lay");
-        // "Focus Layers Panel", "Toggle Layers Panel", and "Close Layers
-        // Panel" all match -- the first inserted (`palette_commands`'s
-        // own order) is what ends up selected.
-        assert_eq!(state.results().len(), 3);
+        // "Focus Layers Panel", "Toggle Layers Panel", "Close Layers
+        // Panel", and (0.143.0) "New Layer" and "Delete Layer" all match
+        // -- the first inserted (`palette_commands`'s own order) is what
+        // ends up selected.
+        assert_eq!(state.results().len(), 5);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -23203,7 +24065,7 @@ mod tests {
 
     #[test]
     fn a_space_typed_into_the_palette_keeps_a_multi_word_query_matching() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23249,7 +24111,7 @@ mod tests {
 
     #[test]
     fn activating_a_command_with_enter_closes_the_palette_and_focuses_its_target() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23275,7 +24137,7 @@ mod tests {
 
     #[test]
     fn escape_closes_the_palette_without_focusing_any_command_target() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23294,7 +24156,7 @@ mod tests {
 
     #[test]
     fn close_command_palette_on_an_already_closed_palette_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         close_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23303,7 +24165,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_tab_to_focus_next_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23337,7 +24199,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_a_tool_letter_to_select_tool_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23380,7 +24242,7 @@ mod tests {
     /// be present after this call — the undo itself never runs here.
     #[test]
     fn handle_key_reports_ctrl_z_as_undo_instead_of_running_it_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23442,7 +24304,7 @@ mod tests {
     /// other command.
     #[test]
     fn handle_key_reports_ctrl_shift_z_as_redo_instead_of_running_it_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23506,7 +24368,7 @@ mod tests {
 
     #[test]
     fn handle_key_ignores_an_unbound_chord() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23544,7 +24406,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_typing_to_the_palette_instead_of_shortcuts_while_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23598,7 +24460,7 @@ mod tests {
 
     #[test]
     fn primary_c_copies_the_current_query_to_the_clipboard() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23632,7 +24494,7 @@ mod tests {
 
     #[test]
     fn primary_v_pastes_the_clipboard_into_the_query() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23667,7 +24529,7 @@ mod tests {
 
     #[test]
     fn pasting_an_empty_clipboard_leaves_the_query_unchanged() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23763,7 +24625,7 @@ mod tests {
 
     #[test]
     fn the_non_primary_modifier_and_altgr_do_not_paste_into_the_palette() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23801,7 +24663,7 @@ mod tests {
 
     #[test]
     fn a_palette_paste_is_filtered_and_capped_like_a_text_field() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23847,7 +24709,7 @@ mod tests {
 
     #[test]
     fn copying_an_empty_palette_query_leaves_the_clipboard_alone() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23867,7 +24729,7 @@ mod tests {
 
     #[test]
     fn activating_open_file_returns_the_picked_path() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23922,7 +24784,7 @@ mod tests {
 
     #[test]
     fn cancelling_the_file_dialog_returns_none_and_still_closes_the_palette() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23961,7 +24823,7 @@ mod tests {
     #[test]
     fn activate_command_focuses_the_matching_panel_for_every_known_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> WidgetId) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let expected = expected(&workspace);
@@ -23982,7 +24844,7 @@ mod tests {
     #[test]
     fn activate_command_toggles_collapse_for_every_known_toggle_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let panel = expected(&workspace);
@@ -24015,7 +24877,7 @@ mod tests {
     #[test]
     fn activate_command_closes_the_matching_panel_for_every_known_close_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let panel = expected(&workspace);
@@ -24057,7 +24919,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_the_picked_path_for_file_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog {
             next_pick: Some(PathBuf::from("/tmp/example.psd")),
@@ -24086,7 +24948,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_the_picked_path_for_file_save() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog {
             next_save: Some(PathBuf::from("/tmp/example.png")),
@@ -24115,7 +24977,7 @@ mod tests {
 
     #[test]
     fn activate_command_resolves_undo_and_redo_without_focusing_anything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog::default();
 
@@ -24151,7 +25013,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_none_for_a_cancelled_save_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         // `next_save: None` -- simulates the user cancelling the native
         // dialog rather than picking a destination.
@@ -24169,7 +25031,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_none_and_focuses_nothing_for_an_unknown_id() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog::default();
 
@@ -25007,7 +25869,12 @@ mod tests {
             store: Some(store),
             scratch: Some(scratch.clone()),
             aborted: aborted == Aborted::Yes,
-            layout: layout.map(|path| (path, aurora_ui::build_workspace())),
+            layout: layout.map(|path| {
+                (
+                    path,
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                )
+            }),
         };
         ShutdownFixture {
             _dir: dir,
@@ -32315,7 +33182,7 @@ mod tests {
     /// inferring it from pixels that could agree by coincidence.
     #[test]
     fn undoing_a_move_of_the_active_layer_still_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32412,7 +33279,7 @@ mod tests {
     /// everything", never "recomposite nothing".
     #[test]
     fn undoing_a_group_level_change_with_no_knowable_rect_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32472,7 +33339,7 @@ mod tests {
     #[test]
     fn undoing_a_stroke_whose_layer_was_deleted_invalidates_everything() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32544,7 +33411,7 @@ mod tests {
     #[test]
     fn undoing_a_stroke_invalidates_only_the_composite_tiles_it_touched() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32861,7 +33728,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn diff_world(context: &GpuTestContext, op: DiffOp) -> (DiffWorld, aurora_gpu::TileResidency) {
         let (dir, mut store) = diff_tile_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
@@ -45479,7 +46346,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         let path = dir.path().join("workspace-layout.postcard");
-        let mut original = aurora_ui::build_workspace();
+        let mut original = aurora_ui::build_workspace(&crate::test_workspace_scales());
         if let Err(err) =
             aurora_ui::set_rail_width(&mut original.tree, original.rail, original.divider, 300.0)
         {
@@ -45492,7 +46359,7 @@ mod tests {
         }
 
         super::save_workspace_layout(&path, &original);
-        let mut loaded = aurora_ui::build_workspace();
+        let mut loaded = aurora_ui::build_workspace(&crate::test_workspace_scales());
         super::load_workspace_layout(&path, &mut loaded);
 
         assert_eq!(
@@ -45520,7 +46387,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         let path = dir.path().join("does-not-exist.postcard");
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
 
         super::load_workspace_layout(&path, &mut workspace);
 
@@ -45544,7 +46411,7 @@ mod tests {
 
     #[test]
     fn open_crash_recovery_dialog_focuses_its_only_action() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45573,7 +46440,7 @@ mod tests {
 
     #[test]
     fn opening_the_crash_recovery_dialog_a_second_time_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45588,7 +46455,7 @@ mod tests {
 
     #[test]
     fn enter_on_the_focused_action_closes_the_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45614,7 +46481,7 @@ mod tests {
 
     #[test]
     fn escape_also_closes_the_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45665,7 +46532,7 @@ mod tests {
     /// alongside all three of the above.
     #[test]
     fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45744,7 +46611,7 @@ mod tests {
     /// layout.
     #[test]
     fn clicking_outside_the_dialog_under_real_layout_is_swallowed_without_closing_it() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45870,7 +46737,7 @@ mod tests {
         ];
 
         for (title, message, actions) in cases {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut dialog = None;
             assert!(
@@ -45998,7 +46865,7 @@ mod tests {
     #[test]
     fn a_dialogs_action_is_still_clickable_in_a_very_short_window() {
         for height in [68.0_f32, 80.0, 96.0, 108.0] {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut dialog = None;
             let scales = match load_scales() {
@@ -46054,7 +46921,7 @@ mod tests {
     /// the margin `MIN_WINDOW_HEIGHT`'s own doc comment claims.
     #[test]
     fn the_windows_own_minimum_size_keeps_every_real_dialog_clickable() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46154,7 +47021,7 @@ mod tests {
     // already allow this lint for.
     #[allow(clippy::float_cmp)]
     fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for(theme_name: &str) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46223,7 +47090,7 @@ mod tests {
 
     #[test]
     fn handle_dialog_pointer_returns_false_when_no_dialog_is_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         assert!(!handle_dialog_pointer(
@@ -46241,7 +47108,7 @@ mod tests {
     /// canvas loses while the dialog is open.
     #[test]
     fn an_open_dialog_does_not_take_any_width_from_the_canvas() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46269,7 +47136,7 @@ mod tests {
 
     #[test]
     fn the_open_dialog_is_centered_over_the_workspace_under_real_layout() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46443,7 +47310,7 @@ mod tests {
 
         // And the dialog that decision opens really opens, through the
         // same shared helper `App::open_skipped_tiles_dialog` uses.
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46838,7 +47705,7 @@ mod tests {
     /// (see that method's own doc comment).
     #[test]
     fn open_dialog_focuses_its_first_action() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46881,7 +47748,7 @@ mod tests {
 
     #[test]
     fn open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46909,7 +47776,7 @@ mod tests {
 
     #[test]
     fn escape_closes_the_export_refused_dialog_through_the_same_routing() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46943,7 +47810,7 @@ mod tests {
 
     #[test]
     fn enter_on_the_export_refused_dialogs_action_closes_it() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47069,7 +47936,7 @@ mod tests {
     /// drives, in the same order, rather than the method itself.
     #[test]
     fn a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47143,7 +48010,7 @@ mod tests {
     /// on its doc comment.
     #[test]
     fn a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47198,7 +48065,7 @@ mod tests {
 
     #[test]
     fn the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47244,7 +48111,7 @@ mod tests {
 
     #[test]
     fn close_dialog_on_an_already_closed_dialog_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         close_dialog(&mut workspace, &mut focus, &mut dialog);
@@ -47259,7 +48126,7 @@ mod tests {
         // startup, before any shortcut could open the palette), this
         // confirms the *routing rule itself*, not a reachable real
         // scenario.
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -47705,7 +48572,7 @@ mod tests {
     }
 
     fn laid_out_workspace() -> aurora_ui::Workspace {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         workspace.tree.compute_layout(1000.0, 800.0);
         workspace
     }
@@ -47787,7 +48654,7 @@ mod tests {
 
     #[test]
     fn pointer_in_canvas_returns_none_before_any_layout_has_run() {
-        let workspace = aurora_ui::build_workspace();
+        let workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         assert_eq!(pointer_in_canvas(&workspace, (10.0, 10.0)), None);
     }
 
@@ -47810,7 +48677,7 @@ mod tests {
         // once it exists, not `None`, before the first `compute_layout`
         // -- `canvas_area_physical_rect`'s own `Option` only covers a
         // genuinely unknown widget id, which `canvas_area` never is.
-        let workspace = aurora_ui::build_workspace();
+        let workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         assert_eq!(
             canvas_area_physical_rect(&workspace, 1.0),
             Some((0.0, 0.0, 0.0, 0.0))
@@ -51192,7 +52059,7 @@ mod tests {
                 Err(err) => unreachable!("{err}"),
             };
             let mut rig = Self {
-                workspace: aurora_ui::build_workspace(),
+                workspace: aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 focus: FocusManager::default(),
                 gallery: None,
                 click: ClickTracker::default(),
@@ -51503,7 +52370,7 @@ mod tests {
                 .any(|entry| entry.id == COMMAND_TOGGLE_WIDGET_GALLERY
                     && entry.title == "Toggle Widget Gallery")
         );
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let picked = activate_command(
             &mut workspace,
@@ -52770,6 +53637,721 @@ mod tests {
         );
     }
 
+    // -- New Layer / Delete Layer (0.143.0) ---------------------------------
+
+    #[allow(clippy::float_cmp)]
+    mod layer_commands {
+        use super::super::{
+            ActivatedCommand, AppCommand, COMMAND_LAYER_DELETE, COMMAND_LAYER_NEW, CompositeCache,
+            Drag, LayerCommand, LayerCommandContext, LayerControlsState, LayerSetSnapshot,
+            PendingOpacity, UndoKind, UndoOrder, activate_command, default_shortcuts, load_scales,
+            palette_commands, perform_layer_command, perform_undo_redo, sync_layer_controls,
+            sync_layer_rows_after_undo_redo,
+        };
+        use super::{
+            FakeFileDialog, GalleryRig, a_brush_drag_that_painted, commit_test_store, row_of,
+            selected_layer_rows,
+        };
+        use aurora_doc::{LayerId, LayerTree};
+        use aurora_theme::Scales;
+        use aurora_ui::Tool;
+        use aurora_widgets::shortcut::{Key, KeyChord, Modifiers};
+        use aurora_widgets::{ClickTracker, FocusManager, KeyOutcome, WidgetId};
+        use std::collections::HashMap;
+
+        const W: f32 = 1600.0;
+        const H: f32 = 900.0;
+        const CANVAS: (u32, u32) = (64, 48);
+        const SMALL: aurora_core::Rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+
+        /// `App`'s state, driven through the same free functions in the
+        /// same order as `App::run_layer_command` and `App::run_undo_redo`.
+        struct Rig {
+            workspace: aurora_ui::Workspace,
+            focus: FocusManager,
+            scales: Scales,
+            layers: LayerTree,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: UndoOrder,
+            layer_rows: HashMap<WidgetId, LayerId>,
+            active: Option<LayerId>,
+            state: LayerControlsState,
+            cache: CompositeCache,
+            view: aurora_ui::CanvasView,
+            drag: Option<Drag>,
+            click: ClickTracker,
+        }
+
+        impl Rig {
+            /// Three root pixel layers `[top, mid, bottom]` (panel order),
+            /// named "Layer 2", "Layer 1", "Background"; `mid` active.
+            fn three() -> (Self, [LayerId; 3]) {
+                let mut layers = LayerTree::new();
+                let mut add = |name: &str| match layers.add_pixel_layer(name, SMALL, None) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let bottom = add("Background");
+                let mid = add("Layer 1");
+                let top = add("Layer 2");
+                (Self::new(layers, Some(mid)), [top, mid, bottom])
+            }
+
+            fn new(layers: LayerTree, active: Option<LayerId>) -> Self {
+                let scales = match load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let layer_rows = match aurora_ui::populate_layers_panel(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                    &layers,
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let mut state = LayerControlsState::default();
+                match aurora_ui::insert_layer_controls(
+                    &mut workspace.tree,
+                    workspace.layers,
+                    &scales,
+                ) {
+                    Ok(controls) => state.controls = Some(controls),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+                let _ = sync_layer_controls(&mut workspace, &state, &layers, active, None);
+                workspace.tree.compute_layout(W, H);
+                Self {
+                    workspace,
+                    focus: FocusManager::default(),
+                    scales,
+                    layers,
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order: UndoOrder::default(),
+                    layer_rows,
+                    active,
+                    state,
+                    cache: CompositeCache::default(),
+                    view: aurora_ui::CanvasView::new(),
+                    drag: None,
+                    click: ClickTracker::default(),
+                }
+            }
+
+            /// `App::run_layer_command`.
+            fn run(&mut self, command: LayerCommand) -> bool {
+                let changed = perform_layer_command(
+                    &mut LayerCommandContext {
+                        workspace: &mut self.workspace,
+                        focus: &mut self.focus,
+                        scales: &self.scales,
+                        layers: &mut self.layers,
+                        history: &mut self.history,
+                        pixel_history: &mut self.pixel_history,
+                        undo_order: &mut self.undo_order,
+                        layer_rows: &mut self.layer_rows,
+                        active_layer: &mut self.active,
+                        view: &mut self.view,
+                        composite_cache: &mut self.cache,
+                        drag: &mut self.drag,
+                        layer_controls: &mut self.state,
+                        click: &mut self.click,
+                        canvas_size: CANVAS,
+                    },
+                    command,
+                );
+                self.workspace.tree.compute_layout(W, H);
+                changed
+            }
+
+            /// `App::run_undo_redo`: snapshot, `perform_undo_redo`, then
+            /// the row sync. Returns whether the rows were rebuilt.
+            fn undo_redo(&mut self, command: AppCommand) -> bool {
+                let before = LayerSetSnapshot::capture(&self.layers, self.active);
+                let mut palette = None;
+                let mut tool = Tool::default();
+                let _ = perform_undo_redo(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut palette,
+                    &mut tool,
+                    &crate::ToolSettings::default(),
+                    &mut self.layers,
+                    &mut self.history,
+                    &mut self.pixel_history,
+                    None,
+                    &mut self.undo_order,
+                    &mut self.cache,
+                    &mut self.view,
+                    self.active,
+                    &mut self.drag,
+                    &mut self.state,
+                    command,
+                );
+                let rebuilt = sync_layer_rows_after_undo_redo(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &self.scales,
+                    &self.layers,
+                    &mut self.layer_rows,
+                    &mut self.active,
+                    &mut self.view,
+                    &mut self.cache,
+                    &self.state,
+                    &before,
+                );
+                self.workspace.tree.compute_layout(W, H);
+                rebuilt
+            }
+
+            fn selected(&self) -> Vec<LayerId> {
+                selected_layer_rows(&self.workspace, &self.layer_rows)
+            }
+
+            fn history_rows(&self) -> usize {
+                self.workspace
+                    .tree
+                    .children(self.workspace.history.body)
+                    .map_or(0, <[WidgetId]>::len)
+            }
+
+            /// The rows map holds exactly the tree's layers, and the
+            /// active layer is one of them (never a removed id).
+            fn assert_coherent(&self) {
+                let mut row_ids: Vec<LayerId> = self.layer_rows.values().copied().collect();
+                row_ids.sort_by_key(|id| id.to_raw());
+                let mut tree_ids = super::super::layer_ids_in_order(&self.layers);
+                tree_ids.sort_by_key(|id| id.to_raw());
+                assert_eq!(row_ids, tree_ids, "one row per layer in the tree");
+                if let Some(active) = self.active {
+                    assert!(self.layers.contains(active), "active names a live layer");
+                    assert_eq!(
+                        self.selected(),
+                        vec![active],
+                        "only the active row is selected"
+                    );
+                }
+            }
+        }
+
+        fn only_new_root(rig: &Rig, before: &[LayerId]) -> LayerId {
+            let added: Vec<LayerId> = rig
+                .layers
+                .roots()
+                .iter()
+                .copied()
+                .filter(|id| !before.contains(id))
+                .collect();
+            match added.as_slice() {
+                [one] => *one,
+                other => unreachable!("expected one new root, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn new_layer_lands_directly_above_the_active_layer_and_becomes_active() {
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            rig.cache.mark_current(TILE);
+            let history_rows_before = rig.history_rows();
+
+            assert!(rig.run(LayerCommand::New));
+
+            let new = only_new_root(&rig, &[top, mid, bottom]);
+            assert_eq!(rig.layers.roots(), &[top, new, mid, bottom]);
+            assert_eq!(rig.active, Some(new));
+            assert_eq!(rig.layers.name(new), Some("Layer 3"));
+            assert_eq!(
+                rig.layers.bounds(new),
+                Some(aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: CANVAS.0,
+                    height: CANVAS.1,
+                }),
+                "a new layer covers the document's own extent"
+            );
+            assert_eq!(rig.undo_order.undo, vec![UndoKind::Structural]);
+            assert!(rig.undo_order.redo.is_empty());
+            assert!(!rig.cache.is_current(TILE), "the composite is invalidated");
+            assert_eq!(rig.history_rows(), history_rows_before + 1);
+            assert_eq!(rig.history_rows(), rig.history.journal_descriptions().len());
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn undoing_new_layer_removes_it_and_reselects_the_previous_layer_redo_restores_it() {
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            assert!(rig.run(LayerCommand::New));
+            let new = only_new_root(&rig, &[top, mid, bottom]);
+
+            assert!(rig.undo_redo(AppCommand::Undo), "the layer set changed");
+            assert_eq!(rig.layers.roots(), &[top, mid, bottom]);
+            assert_eq!(rig.active, Some(mid), "the layer active before New Layer");
+            rig.assert_coherent();
+
+            assert!(rig.undo_redo(AppCommand::Redo));
+            assert_eq!(rig.layers.roots(), &[top, new, mid, bottom], "same index");
+            assert_eq!(rig.active, Some(new), "a reappearing layer becomes active");
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn new_layer_with_a_group_active_lands_above_the_group_not_inside_it() {
+            let mut layers = LayerTree::new();
+            let base = match layers.add_pixel_layer("Background", SMALL, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let group = match layers.add_group("Group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let inner = match layers.add_pixel_layer("inner", SMALL, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let mut rig = Rig::new(layers, Some(group));
+
+            assert!(rig.run(LayerCommand::New));
+
+            let new = only_new_root(&rig, &[group, base]);
+            assert_eq!(rig.layers.roots(), &[new, group, base]);
+            assert_eq!(rig.layers.children(group), Some(&[inner][..]));
+            assert_eq!(rig.layers.parent(new), None);
+            assert_eq!(rig.layers.name(new), Some("Layer 1"));
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn new_layer_inside_a_group_lands_above_the_active_child() {
+            let mut layers = LayerTree::new();
+            let group = match layers.add_group("Group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let inner = match layers.add_pixel_layer("inner", SMALL, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let mut rig = Rig::new(layers, Some(inner));
+            assert!(rig.run(LayerCommand::New));
+            let (new, below) = match rig.layers.children(group) {
+                Some(&[new, below]) => (new, below),
+                other => unreachable!("two children expected: {other:?}"),
+            };
+            assert_eq!(below, inner);
+            assert_eq!(rig.active, Some(new));
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn delete_layer_removes_the_active_layer_and_selects_the_one_below() {
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            rig.cache.mark_current(TILE);
+            assert!(rig.run(LayerCommand::Delete));
+            assert_eq!(rig.layers.roots(), &[top, bottom]);
+            assert_eq!(rig.active, Some(bottom), "the one that was directly below");
+            assert_eq!(rig.undo_order.undo, vec![UndoKind::Structural]);
+            assert!(!rig.cache.is_current(TILE));
+            rig.assert_coherent();
+
+            // Undo puts it back, at its index, and selects it.
+            assert!(rig.undo_redo(AppCommand::Undo));
+            assert_eq!(rig.layers.roots(), &[top, mid, bottom]);
+            assert_eq!(rig.active, Some(mid));
+            rig.assert_coherent();
+
+            // Redo removes it again, and the one below is active again.
+            assert!(rig.undo_redo(AppCommand::Redo));
+            assert_eq!(rig.layers.roots(), &[top, bottom]);
+            assert_eq!(rig.active, Some(bottom));
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn delete_layer_with_nothing_below_selects_the_one_above() {
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            rig.active = Some(bottom);
+            assert!(rig.run(LayerCommand::Delete));
+            assert_eq!(rig.layers.roots(), &[top, mid]);
+            assert_eq!(rig.active, Some(mid));
+            rig.assert_coherent();
+        }
+
+        /// A group holding the document's only pixel layer.
+        fn group_holding_the_only_pixel_layer() -> (LayerTree, LayerId, LayerId) {
+            let mut layers = LayerTree::new();
+            let group = match layers.add_group("Group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let only = match layers.add_pixel_layer("only", SMALL, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            (layers, group, only)
+        }
+
+        #[test]
+        fn delete_layer_is_refused_for_the_last_pixel_layer_and_records_nothing() {
+            // Deleting the layer itself, or the group that holds it, would
+            // both leave no pixel layer.
+            for pick_group in [false, true] {
+                let (layers, group, only) = group_holding_the_only_pixel_layer();
+                let active = if pick_group { group } else { only };
+                let mut rig = Rig::new(layers, Some(active));
+                let rows_before = rig.layer_rows.clone();
+                assert!(
+                    !rig.run(LayerCommand::Delete),
+                    "refused with {active:?} active"
+                );
+                assert!(rig.layers.contains(only) && rig.layers.contains(group));
+                assert_eq!(rig.history.journal_len(), 0, "no history entry");
+                assert!(rig.undo_order.undo.is_empty());
+                assert_eq!(rig.active, Some(active));
+                assert_eq!(rig.layer_rows, rows_before, "the panel was not rebuilt");
+            }
+        }
+
+        #[test]
+        fn delete_layer_of_a_group_with_a_pixel_layer_outside_it_takes_the_whole_subtree() {
+            let (mut layers, group, only) = group_holding_the_only_pixel_layer();
+            let outside = match layers.add_pixel_layer("outside", SMALL, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let mut rig = Rig::new(layers, Some(group));
+            assert!(rig.run(LayerCommand::Delete));
+            assert!(!rig.layers.contains(group) && !rig.layers.contains(only));
+            assert_eq!(rig.layers.roots(), &[outside]);
+            assert_eq!(rig.active, Some(outside));
+            rig.assert_coherent();
+            assert!(rig.undo_redo(AppCommand::Undo));
+            assert_eq!(rig.layers.children(group), Some(&[only][..]));
+            assert_eq!(rig.active, Some(group), "the restored subtree's root");
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn undoing_a_delete_restores_the_layers_pixels() {
+            let (_dir, mut store) = commit_test_store();
+            let (mut rig, [_, mid, _]) = Rig::three();
+            let Some(surface) = rig.layers.surface_id(mid) else {
+                unreachable!("a pixel layer has a surface");
+            };
+            let _ = aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                (5.0, 5.0),
+                4.0,
+                [1.0, 0.0, 0.0],
+                None,
+            );
+            let alpha = |store: &mut aurora_tile::TileStore| match store.get(surface, TILE) {
+                Ok(tile) => tile
+                    .texels()
+                    .get((5 * aurora_tile::TILE as usize + 5) * aurora_tile::CHANNELS + 3)
+                    .map_or(f32::NAN, |alpha| alpha.to_f32()),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let painted = alpha(&mut store);
+            assert!(painted > 0.5, "setup: {painted}");
+
+            assert!(rig.run(LayerCommand::Delete));
+            assert!(!rig.layers.contains(mid));
+            assert!(rig.undo_redo(AppCommand::Undo));
+            assert_eq!(
+                rig.layers.surface_id(mid),
+                Some(surface),
+                "same id, same surface"
+            );
+            assert_eq!(alpha(&mut store), painted, "its pixels are still there");
+        }
+
+        /// Review revision (0.143.0): Delete -> Undo restores the whole
+        /// layer, not just its pixels. `RemovedSubtree` carries every
+        /// removed node's full `LayerEntry` (name, kind, bounds, opacity,
+        /// blend mode, visibility, mask), so each property the Layers
+        /// panel edits is set off its default here and checked after the
+        /// undo — and the redo must take it away again.
+        #[test]
+        #[allow(clippy::float_cmp)]
+        fn undoing_a_delete_restores_opacity_blend_mode_visibility_and_mask() {
+            use aurora_doc::BlendMode;
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            let mask_bounds = aurora_core::Rect {
+                x: 1,
+                y: 2,
+                width: 6,
+                height: 5,
+            };
+            let set = |result: Result<(), aurora_doc::DocError>| {
+                if let Err(err) = result {
+                    unreachable!("{err:?}");
+                }
+            };
+            set(rig.layers.set_opacity(mid, 0.25));
+            set(rig.layers.set_blend_mode(mid, BlendMode::Screen));
+            set(rig.layers.set_visible(mid, false));
+            set(rig.layers.add_mask(mid, mask_bounds));
+            let mask_before = rig.layers.mask(mid).cloned();
+            let mask_surface = rig.layers.mask_surface_id(mid);
+            assert!(mask_before.is_some() && mask_surface.is_some(), "setup");
+
+            assert!(rig.run(LayerCommand::Delete));
+            assert!(!rig.layers.contains(mid));
+            rig.assert_coherent();
+
+            assert!(rig.undo_redo(AppCommand::Undo));
+            assert_eq!(rig.layers.roots(), &[top, mid, bottom], "same place");
+            assert_eq!(rig.layers.name(mid), Some("Layer 1"));
+            assert_eq!(rig.layers.opacity(mid), Some(0.25), "opacity");
+            assert_eq!(
+                rig.layers.blend_mode(mid),
+                Some(BlendMode::Screen),
+                "blend mode"
+            );
+            assert_eq!(rig.layers.visible(mid), Some(false), "visibility");
+            assert_eq!(rig.layers.mask(mid).cloned(), mask_before, "mask");
+            assert_eq!(
+                rig.layers.mask_surface_id(mid),
+                mask_surface,
+                "the mask still addresses the same coverage surface"
+            );
+            assert_eq!(rig.layers.bounds(mid), Some(SMALL), "bounds");
+            assert_eq!(rig.active, Some(mid), "the restored layer is active");
+            rig.assert_coherent();
+
+            assert!(rig.undo_redo(AppCommand::Redo));
+            assert!(!rig.layers.contains(mid), "redo deletes it again");
+            assert_eq!(rig.layers.roots(), &[top, bottom]);
+            rig.assert_coherent();
+        }
+
+        /// Review revision (0.143.0): an `.aur` save is a snapshot of the
+        /// live tree, so a just-added, never-painted layer is written (at
+        /// the index New Layer put it) and a deleted one is not. The
+        /// journal-replay side of the same question — that replaying the
+        /// saved history reproduces the add index — is pinned in
+        /// `aurora-doc` by `add_pixel_layer_at_survives_a_journal_save_load_replay`.
+        #[test]
+        fn an_aur_save_writes_an_added_layer_and_omits_a_deleted_one() {
+            let (_dir, mut store) = commit_test_store();
+            let (mut rig, [_, mid, bottom]) = Rig::three();
+            assert!(rig.run(LayerCommand::New));
+            let Some(added) = rig.active else {
+                unreachable!("New Layer leaves the new layer active");
+            };
+            assert_ne!(added, mid);
+            // Make `bottom` active and delete it; which layer ends up
+            // active afterwards is irrelevant to the save — only the
+            // tree is written.
+            rig.active = Some(bottom);
+            assert!(rig.run(LayerCommand::Delete));
+            assert!(!rig.layers.contains(bottom) && rig.layers.contains(added));
+            let names = |tree: &LayerTree| -> Vec<String> {
+                tree.roots()
+                    .iter()
+                    .map(|&id| tree.name(id).unwrap_or("?").to_owned())
+                    .collect()
+            };
+            let expected = names(&rig.layers);
+            assert_eq!(expected.len(), 3, "two survivors plus the new layer");
+            assert!(!expected.iter().any(|name| name == "Background"));
+
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            if let Err(err) = aurora_io::write_aur(
+                &mut bytes,
+                &rig.layers,
+                &rig.history,
+                CANVAS,
+                None,
+                &aurora_io::SkippedTiles::new(),
+                &mut store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.set_position(0);
+            let (_dir2, mut store2) = commit_test_store();
+            let loaded = match aurora_io::read_aur(bytes, &mut store2) {
+                Ok(document) => document,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(names(&loaded.layers), expected, "same layers, same order");
+            assert!(loaded.layers.contains(added), "the never-painted layer");
+            assert!(!loaded.layers.contains(bottom), "the deleted layer");
+        }
+
+        #[test]
+        fn a_live_opacity_drag_is_committed_as_its_own_step_before_new_layer() {
+            let (mut rig, [top, mid, bottom]) = Rig::three();
+            // A drag that has moved `mid`'s opacity from 1.0 to 0.4 live.
+            rig.state.pending = Some(PendingOpacity {
+                layer: mid,
+                start: 1.0,
+            });
+            if let Err(err) = rig.layers.set_opacity(mid, 0.4) {
+                unreachable!("{err:?}");
+            }
+
+            assert!(rig.run(LayerCommand::New));
+            assert!(rig.state.pending.is_none());
+            assert_eq!(
+                rig.undo_order.undo,
+                vec![UndoKind::Structural, UndoKind::Structural],
+                "the drag, then New Layer"
+            );
+
+            // First undo removes the new layer only; the opacity holds.
+            assert!(rig.undo_redo(AppCommand::Undo));
+            assert_eq!(rig.layers.roots(), &[top, mid, bottom]);
+            assert_eq!(rig.layers.opacity(mid), Some(0.4));
+            // Second undo reverts the drag, without touching the rows.
+            let rows = rig.layer_rows.clone();
+            assert!(
+                !rig.undo_redo(AppCommand::Undo),
+                "opacity undo does not rebuild rows"
+            );
+            assert_eq!(rig.layers.opacity(mid), Some(1.0));
+            assert_eq!(rig.layer_rows, rows, "row ids are stable");
+            rig.assert_coherent();
+        }
+
+        #[test]
+        fn a_live_brush_stroke_is_committed_before_new_layer() {
+            let (_dir, mut store) = commit_test_store();
+            let (mut rig, _) = Rig::three();
+            rig.drag = Some(a_brush_drag_that_painted(&mut store, (30.5, 30.5)));
+            assert!(rig.run(LayerCommand::New));
+            assert!(rig.drag.is_none());
+            assert_eq!(
+                rig.undo_order.undo,
+                vec![UndoKind::Pixel, UndoKind::Structural],
+                "the stroke is recorded first"
+            );
+        }
+
+        #[test]
+        fn focus_on_a_layer_row_follows_the_new_active_row() {
+            let (mut rig, [_, mid, _]) = Rig::three();
+            let row = row_of(&rig.layer_rows, mid);
+            if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, row) {
+                unreachable!("{err:?}");
+            }
+            assert!(rig.run(LayerCommand::New));
+            let Some(active) = rig.active else {
+                unreachable!("New Layer leaves a layer active");
+            };
+            assert_eq!(rig.focus.focused(), Some(row_of(&rig.layer_rows, active)));
+        }
+
+        #[test]
+        fn layer_commands_are_palette_entries_that_activation_returns() {
+            let commands = palette_commands();
+            for (id, title) in [
+                (COMMAND_LAYER_NEW, "New Layer"),
+                (COMMAND_LAYER_DELETE, "Delete Layer"),
+            ] {
+                assert!(
+                    commands
+                        .iter()
+                        .any(|entry| entry.id == id && entry.title == title),
+                    "{id}"
+                );
+            }
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+            let mut focus = FocusManager::default();
+            let mut dialog = FakeFileDialog::default();
+            assert_eq!(
+                activate_command(&mut workspace, &mut focus, COMMAND_LAYER_NEW, &mut dialog),
+                Some(ActivatedCommand::NewLayer)
+            );
+            assert_eq!(
+                activate_command(
+                    &mut workspace,
+                    &mut focus,
+                    COMMAND_LAYER_DELETE,
+                    &mut dialog
+                ),
+                Some(ActivatedCommand::DeleteLayer)
+            );
+        }
+
+        #[test]
+        fn ctrl_shift_n_resolves_to_new_layer_and_delete_layer_has_no_binding() {
+            let shortcuts = default_shortcuts();
+            let chord = |source: &str| match KeyChord::parse(source) {
+                Ok(chord) => chord,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(
+                shortcuts.resolve(chord("Ctrl+Shift+N")),
+                Some(&AppCommand::NewLayer)
+            );
+            for unbound in ["Delete", "Backspace", "Ctrl+Delete", "Ctrl+Backspace"] {
+                assert_eq!(shortcuts.resolve(chord(unbound)), None, "{unbound}");
+            }
+        }
+
+        #[test]
+        fn ctrl_shift_n_is_handed_back_as_an_activated_command() {
+            let mut rig = GalleryRig::open();
+            let (_, picked, _) = rig.key_event(
+                Key::Character('n'),
+                Some("\u{e}"),
+                Modifiers {
+                    control: true,
+                    shift: true,
+                    alt: false,
+                    meta: false,
+                },
+            );
+            assert_eq!(picked, Some(ActivatedCommand::NewLayer));
+        }
+
+        /// Review revision (0.143.0): `Ctrl+Shift+N` with a text field
+        /// focused is *not* consumed by the field — it is not one of the
+        /// field's own editing chords, so `route_widget_key` hands it
+        /// back unhandled and it falls through to `handle_key`, which
+        /// fires New Layer. Pinned as the shipped behaviour (a global
+        /// layer shortcut firing from inside a text field, disclosed in
+        /// PLAN.md's 0.143.0 entry), and the field's content is
+        /// untouched — the chord's control character is not typed.
+        #[test]
+        fn ctrl_shift_n_in_a_focused_text_field_falls_through_to_new_layer() {
+            let mut rig = GalleryRig::open();
+            let field = rig.focus_text_field();
+            let content_before = rig.text();
+            let (routed, picked, _) = rig.key_event(
+                Key::Character('n'),
+                Some("\u{e}"),
+                Modifiers {
+                    control: true,
+                    shift: true,
+                    alt: false,
+                    meta: false,
+                },
+            );
+            assert!(
+                !matches!(routed, Some(KeyOutcome::Handled(_))),
+                "the field does not consume it: {routed:?}"
+            );
+            assert_eq!(picked, Some(ActivatedCommand::NewLayer));
+            assert_eq!(rig.text(), content_before, "nothing typed");
+            assert_eq!(rig.focus.focused(), Some(field), "focus stays put");
+        }
+    }
+
     // -- Layers-panel controls (0.135.0) ------------------------------------
 
     // Exact float equality is the point in several assertions here: one
@@ -52854,7 +54436,7 @@ mod tests {
                     Ok(scales) => scales,
                     Err(err) => unreachable!("{err}"),
                 };
-                let mut workspace = aurora_ui::build_workspace();
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let layer_rows = match aurora_ui::populate_layers_panel(
                     &mut workspace.tree,
                     workspace.layers,
@@ -53781,7 +55363,7 @@ mod tests {
                     Ok(scales) => scales,
                     Err(err) => unreachable!("{err}"),
                 };
-                let mut workspace = aurora_ui::build_workspace();
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let controls = match aurora_ui::insert_tool_controls(
                     &mut workspace.tree,
                     workspace.properties,
@@ -54346,7 +55928,7 @@ mod text_layout_tests {
     /// `App::new` builds it.
     fn workspace() -> (aurora_ui::Workspace, aurora_ui::LayerControls) {
         let scales = ok(load_scales());
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let controls = ok(aurora_ui::insert_layer_controls(
             &mut workspace.tree,
             workspace.layers,
