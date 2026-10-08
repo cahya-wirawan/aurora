@@ -1113,6 +1113,12 @@ fn verify_aur(path: &Path) -> bool {
 /// not threaded through here, since this function only needs to read
 /// them).
 ///
+/// Also the startup path's own panel population ([`App::new`], since
+/// 0.142.0), so there is exactly one place a freshly built set of Layers
+/// rows gets its active row marked selected ([`mark_active_layer_row`]):
+/// the returned active layer's row is already highlighted when this
+/// returns.
+///
 /// `tool` reseeds the Properties panel with `tool`'s own current
 /// options ([`tool_options`]) — opening a different document doesn't
 /// change which tool is selected, so the caller's own current
@@ -1159,7 +1165,12 @@ fn replace_document(
         tool,
         &options,
     )?;
-    Ok((layer_rows, topmost_pixel_layer(layers)))
+    let active = topmost_pixel_layer(layers);
+    // The new rows are built unselected; without this the freshly opened
+    // document's active layer has no highlighted row until a click
+    // (0.142.0, [`mark_active_layer_row`]).
+    mark_active_layer_row(&mut workspace.tree, &layer_rows, active);
+    Ok((layer_rows, active))
 }
 
 /// The store-side half of replacing the current document with a freshly
@@ -3924,6 +3935,69 @@ fn apply_layer_control_invalidation(
 struct PendingOpacity {
     layer: aurora_doc::LayerId,
     start: f32,
+}
+
+/// What [`install_startup_panels`] hands back to [`App::new`].
+struct StartupPanels {
+    layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: Option<aurora_doc::LayerId>,
+    layer_controls: LayerControlsState,
+    tool_controls: Option<aurora_ui::ToolControls>,
+}
+
+/// The startup document's whole panel installation, in order: the
+/// Layers/History/Properties population both open routes share
+/// ([`replace_document`], which marks the active layer's row selected —
+/// until 0.142.0 startup populated the panels inline and never did),
+/// then the Layers-panel controls strip and the Properties-panel tool
+/// controls, each synced to the document and `tool`.
+///
+/// Never panics (review revision, 0.142.0, replacing an `unreachable!`
+/// in shipping startup code): a failed population is logged and leaves
+/// an empty row map, with the active layer still the document's own
+/// topmost pixel layer ([`topmost_pixel_layer`]) so painting works; a
+/// failed control build is logged and leaves that control absent —
+/// the same degrade-and-warn every other step here already took.
+fn install_startup_panels(
+    workspace: &mut aurora_ui::Workspace,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    tool: aurora_ui::Tool,
+    tool_settings: &ToolSettings,
+) -> StartupPanels {
+    let (layer_rows, active_layer) =
+        match replace_document(workspace, scales, layers, history, tool, tool_settings) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to populate the panels for the startup document"
+                );
+                (HashMap::new(), topmost_pixel_layer(layers))
+            }
+        };
+    let mut layer_controls = LayerControlsState::default();
+    match aurora_ui::insert_layer_controls(&mut workspace.tree, workspace.layers, scales) {
+        Ok(controls) => layer_controls.controls = Some(controls),
+        Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
+    }
+    let _ = sync_layer_controls(workspace, &layer_controls, layers, active_layer, None);
+    let tool_controls =
+        match aurora_ui::insert_tool_controls(&mut workspace.tree, workspace.properties, scales) {
+            Ok(controls) => Some(controls),
+            Err(err) => {
+                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
+                None
+            }
+        };
+    let _ = sync_tool_controls(workspace, tool_controls, tool, tool_settings, None);
+    StartupPanels {
+        layer_rows,
+        active_layer,
+        layer_controls,
+        tool_controls,
+    }
 }
 
 /// The app's half of the Layers-panel controls: the widgets (`None` only
@@ -14206,24 +14280,46 @@ fn select_layer(
     // not.
     let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
-    for (&row, &id) in layer_rows {
-        // `warn!`, not `?`: this function returns `()`, and a row that
-        // has somehow gone missing must not take the rest of the
-        // selection with it -- nor become a panic, which this workspace
-        // denies outright.
-        if let Err(err) = aurora_widgets::widgets::set_tree_item_selected(
-            &mut workspace.tree,
-            row,
-            id == layer_id,
-        ) {
-            tracing::warn!(?err, "failed to update a layer row's selection state");
-        }
-    }
+    mark_active_layer_row(&mut workspace.tree, layer_rows, Some(layer_id));
     // After the row loop, not before: nothing here depends on the
     // ordering, but keeping the accessibility work untouched and the
     // new bound re-established at the end keeps this function's two
     // jobs readable as two jobs.
     clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
+}
+
+/// Marks exactly `active`'s Layers-panel row selected and every other row
+/// not — the row half of [`select_layer`], without its active-layer
+/// assignment or pan clamp, for the callers that install a freshly built
+/// set of rows for an already-chosen active layer (startup in
+/// [`App::new`], and [`replace_document`] for both open routes).
+///
+/// **Why this exists (0.142.0).** Until then [`select_layer`] was the only
+/// function that ever marked a row selected, and neither startup nor an
+/// open went through it: both assigned the active layer directly, so the
+/// panel came up with *no* highlighted row until the first click — the
+/// Layers panel a real macOS screenshot showed as one undifferentiated
+/// line. `None` (a document with no pixel layer) clears every row.
+///
+/// Through `aurora_widgets::widgets::set_tree_item_selected`, never a
+/// hand-written accessibility node, for the reasons [`select_layer`]'s own
+/// doc comment gives.
+fn mark_active_layer_row(
+    tree: &mut WidgetTree<WidgetKind>,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    active: Option<aurora_doc::LayerId>,
+) {
+    for (&row, &id) in layer_rows {
+        // `warn!`, not `?`: this function returns `()`, and a row that
+        // has somehow gone missing must not take the rest of the
+        // selection with it -- nor become a panic, which this workspace
+        // denies outright.
+        if let Err(err) =
+            aurora_widgets::widgets::set_tree_item_selected(tree, row, Some(id) == active)
+        {
+            tracing::warn!(?err, "failed to update a layer row's selection state");
+        }
+    }
 }
 
 /// The name prefix every session's scratch directory carries — what
@@ -15916,7 +16012,7 @@ impl App {
         layout_path: Option<PathBuf>,
         reduced_motion: bool,
     ) -> Self {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&scales);
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace);
         }
@@ -15931,40 +16027,28 @@ impl App {
             skipped_tiles,
             was_recovered,
         } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
-        let layer_rows = match aurora_ui::populate_layers_panel(
-            &mut workspace.tree,
-            workspace.layers,
-            &scales,
-            &layers,
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                unreachable!("workspace.layers was just built by build_workspace above: {err:?}")
-            }
-        };
-        if let Err(err) = aurora_ui::populate_history_panel(
-            &mut workspace.tree,
-            workspace.history,
-            &scales,
-            &history,
-        ) {
-            unreachable!("workspace.history was just built by build_workspace above: {err:?}");
-        }
-        // Seeded from the tool this session actually starts with
+        // Every startup panel step lives in [`install_startup_panels`]
+        // (review revision, 0.142.0), so the startup "active row is
+        // selected" contract is unit-testable without a window. Seeded
+        // from the tool this session actually starts with
         // (`aurora_ui::Tool::default()`, `MarqueeSelect` — see
         // `Self::tool`'s own field assignment below), which has no real
-        // options yet, so the Properties panel legitimately starts
-        // empty here, not populated with a placeholder.
-        if let Err(err) = aurora_ui::populate_properties_panel(
-            &mut workspace.tree,
-            workspace.properties,
+        // options yet, so the Properties panel legitimately starts with
+        // only its readout.
+        let tool_settings = ToolSettings::default();
+        let StartupPanels {
+            layer_rows,
+            active_layer,
+            layer_controls,
+            tool_controls,
+        } = install_startup_panels(
+            &mut workspace,
             &scales,
+            &layers,
+            &history,
             aurora_ui::Tool::default(),
-            &tool_options(aurora_ui::Tool::default(), &ToolSettings::default()),
-        ) {
-            unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
-        }
-        let active_layer = topmost_pixel_layer(&layers);
+            &tool_settings,
+        );
         // The pan bound, established before the first frame. Crash
         // recovery reopens a real `.aur` container
         // (`recover_document`/`read_autosave_container`), so this
@@ -15997,32 +16081,6 @@ impl App {
             // rather than dropping it.
             None,
             1.0,
-        );
-
-        let mut layer_controls = LayerControlsState::default();
-        match aurora_ui::insert_layer_controls(&mut workspace.tree, workspace.layers, &scales) {
-            Ok(controls) => layer_controls.controls = Some(controls),
-            Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
-        }
-        let _ = sync_layer_controls(&mut workspace, &layer_controls, &layers, active_layer, None);
-        let tool_settings = ToolSettings::default();
-        let tool_controls = match aurora_ui::insert_tool_controls(
-            &mut workspace.tree,
-            workspace.properties,
-            &scales,
-        ) {
-            Ok(controls) => Some(controls),
-            Err(err) => {
-                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
-                None
-            }
-        };
-        let _ = sync_tool_controls(
-            &mut workspace,
-            tool_controls,
-            aurora_ui::Tool::default(),
-            &tool_settings,
-            None,
         );
 
         let mut focus = FocusManager::default();
@@ -19078,6 +19136,18 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The committed scales every test workspace is built with
+/// ([`aurora_ui::build_workspace`] takes them since 0.142.0, for the
+/// panels' one-row title slots) — [`load_scales`]'s own file, so a test
+/// workspace and the scales the same test later loads always agree.
+#[cfg(test)]
+fn test_workspace_scales() -> Scales {
+    match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => unreachable!("the checked-in design file must parse: {err}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -19092,10 +19162,10 @@ mod tests {
         MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        RailResize, RecoveredDocument, ShutdownState, StartupPanels, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
         canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
         clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
@@ -19106,12 +19176,12 @@ mod tests {
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, install_startup_panels,
+        is_aur_path, layer_for_surface, layer_local_point, load_document_view, load_scales,
+        load_theme, logical_point, logical_size, mark_active_layer_row, mark_move_refusal_reported,
+        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
+        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
         replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
@@ -19404,7 +19474,7 @@ mod tests {
 
     #[test]
     fn select_layer_sets_active_layer_and_marks_only_its_own_row_selected() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -19553,7 +19623,7 @@ mod tests {
         aurora_doc::LayerId,
         aurora_doc::LayerId,
     ) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -19758,7 +19828,7 @@ mod tests {
     /// layer selected, and keeps focus on the group's (new) row.
     #[test]
     fn collapsing_and_expanding_a_layer_group_keeps_the_row_map_live() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let group = match layers.add_group("g", None) {
             Ok(id) => id,
@@ -20040,7 +20110,7 @@ mod tests {
         #[test]
         fn an_at_click_on_the_gallery_menu_button_opens_the_menu() {
             let mut state = AtState::new(
-                aurora_ui::build_workspace(),
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 aurora_doc::LayerTree::new(),
                 None,
             );
@@ -20073,7 +20143,7 @@ mod tests {
         #[test]
         fn an_at_click_on_a_gallery_tree_row_single_selects_it() {
             let mut state = AtState::new(
-                aurora_ui::build_workspace(),
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 aurora_doc::LayerTree::new(),
                 None,
             );
@@ -20149,7 +20219,11 @@ mod tests {
         #[test]
         fn rows_an_expand_rebuilt_are_laid_out() {
             let (layers, group, child, _) = group_child_and_top();
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(child),
+            );
             let group_row = row_of(&state.layer_rows, group);
             assert!(has_area(&state, group_row), "setup: laid out");
             let effects = state.act(&a11y_request(group_row, accesskit::Action::Collapse));
@@ -20181,7 +20255,11 @@ mod tests {
         #[test]
         fn an_expand_keeps_focus_on_another_layers_row() {
             let (layers, group, child, top) = group_child_and_top();
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, Some(child));
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(child),
+            );
             let group_row = row_of(&state.layer_rows, group);
             state.act(&a11y_request(group_row, accesskit::Action::Collapse));
             let top_row = row_of(&state.layer_rows, top);
@@ -20245,7 +20323,11 @@ mod tests {
             let fresh = || {
                 let (layers, _history) = demo_document();
                 let active = topmost_pixel_layer(&layers);
-                AtState::new(aurora_ui::build_workspace(), layers, active)
+                AtState::new(
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                    layers,
+                    active,
+                )
             };
             let probe = fresh();
             let mut ids = Vec::new();
@@ -20332,7 +20414,11 @@ mod tests {
         fn an_at_set_value_on_the_radius_slider_sets_the_radius_without_history() {
             let (layers, _history) = demo_document();
             let active = topmost_pixel_layer(&layers);
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                active,
+            );
             let Some(controls) = state.tool_controls else {
                 unreachable!("built");
             };
@@ -20371,7 +20457,11 @@ mod tests {
         fn an_at_set_value_mid_drag_ends_the_pointer_drag_of_the_radius_slider() {
             let (layers, _history) = demo_document();
             let active = topmost_pixel_layer(&layers);
-            let mut state = AtState::new(aurora_ui::build_workspace(), layers, active);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                active,
+            );
             let Some(controls) = state.tool_controls else {
                 unreachable!("built");
             };
@@ -20889,7 +20979,7 @@ mod tests {
     /// clamp from `after_undo_redo` fails here.
     #[test]
     fn undoing_a_move_re_establishes_the_pan_bound() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -21023,7 +21113,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -21314,7 +21404,7 @@ mod tests {
         aurora_doc::LayerId,
         aurora_doc::LayerId,
     ) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
             Ok(id) => id,
@@ -21560,6 +21650,117 @@ mod tests {
         assert!(open_image(&path).is_none());
     }
 
+    /// Every Layers row's `TreeItemState::selected` payload, keyed by the
+    /// layer it shows — the state `aurora_widgets::paint_widget` reads to
+    /// draw the highlight — checked against its accessibility node's
+    /// `is_selected`, so neither can drift from the other unseen.
+    fn selected_layer_rows(
+        workspace: &aurora_ui::Workspace,
+        layer_rows: &std::collections::HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+    ) -> Vec<aurora_doc::LayerId> {
+        let mut selected = Vec::new();
+        for (&row, &layer) in layer_rows {
+            let painted = matches!(
+                workspace.tree.payload(row),
+                Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+            );
+            let announced = workspace
+                .tree
+                .accessibility(row)
+                .and_then(accesskit::Node::is_selected);
+            assert_eq!(
+                announced,
+                Some(painted),
+                "a row's announced selection must match its painted one"
+            );
+            if painted {
+                selected.push(layer);
+            }
+        }
+        selected
+    }
+
+    #[test]
+    fn replace_document_marks_exactly_the_active_layers_row_selected() {
+        // 0.142.0: until then nothing but `select_layer` (a click) ever
+        // marked a row selected, so a startup or freshly opened document
+        // showed no highlighted row at all. The multi-layer demo document
+        // is the shape both startup and an `.aur` open hand this function
+        // (groups and all); the single-image import is the other open
+        // route.
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history) = demo_document();
+        let (layer_rows, active) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(layer_rows.len() > 2, "the demo document has several rows");
+        let Some(active) = active else {
+            unreachable!("the demo document has a pixel layer");
+        };
+        assert_eq!(Some(active), topmost_pixel_layer(&layers));
+        assert_eq!(
+            selected_layer_rows(&workspace, &layer_rows),
+            vec![active],
+            "exactly the active layer's row is highlighted, before any click"
+        );
+
+        // A second replace (the open routes) highlights the new document's
+        // own active row, and nothing of the old one survives.
+        let image = fake_image(8, 8);
+        let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
+        let (new_rows, new_active) = match replace_document(
+            &mut workspace,
+            &scales,
+            &new_layers,
+            &new_history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(new_active, Some(new_layer_id));
+        assert_eq!(
+            selected_layer_rows(&workspace, &new_rows),
+            vec![new_layer_id]
+        );
+    }
+
+    #[test]
+    fn mark_active_layer_row_with_no_active_layer_clears_every_row() {
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history) = demo_document();
+        let (layer_rows, _) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        mark_active_layer_row(&mut workspace.tree, &layer_rows, None);
+        assert!(selected_layer_rows(&workspace, &layer_rows).is_empty());
+    }
+
     #[test]
     fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
         // Everything under the body, at every depth -- not just the
@@ -21578,7 +21779,7 @@ mod tests {
                 .sum()
         }
 
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err:?}"),
@@ -21669,6 +21870,66 @@ mod tests {
         assert_eq!(active_layer, Some(new_layer_id));
         assert_eq!(layer_rows.len(), 1);
         assert_eq!(layer_rows.values().copied().next(), Some(new_layer_id));
+    }
+
+    /// Review revision (0.142.0): the startup panel installation
+    /// [`App::new`] runs marks the active layer's row selected (and only
+    /// that row), and installs both control strips. Kills the "startup
+    /// clears the selection" mutation that no window-free test could
+    /// reach while this sequence was inline in `App::new`.
+    #[test]
+    fn startup_panel_installation_selects_the_active_layers_row() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let (layers, history) = demo_document();
+        let StartupPanels {
+            layer_rows,
+            active_layer,
+            layer_controls,
+            tool_controls,
+        } = install_startup_panels(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        );
+        assert_eq!(active_layer, topmost_pixel_layer(&layers));
+        assert!(active_layer.is_some(), "the demo document has pixel layers");
+        assert!(
+            layer_rows.len() > 1,
+            "several rows, so selection is a real choice"
+        );
+        let mut selected = 0;
+        for (&row, &layer) in &layer_rows {
+            let is_selected = workspace
+                .tree
+                .accessibility(row)
+                .and_then(accesskit::Node::is_selected);
+            if Some(layer) == active_layer {
+                assert_eq!(
+                    is_selected,
+                    Some(true),
+                    "the active layer's row is selected"
+                );
+                selected += 1;
+            } else {
+                assert_ne!(is_selected, Some(true), "{layer:?}'s row is not selected");
+            }
+        }
+        assert_eq!(selected, 1, "exactly one selected row");
+        assert!(
+            layer_controls.controls.is_some(),
+            "Layers controls installed"
+        );
+        assert!(
+            tool_controls.is_some(),
+            "Properties tool controls installed"
+        );
     }
 
     /// [`fake_image`] with a caller-chosen colour, so two documents in
@@ -22207,7 +22468,7 @@ mod tests {
 
     #[test]
     fn run_command_focus_next_visits_every_docked_panel_in_order() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22281,7 +22542,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_switches_the_active_tool() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22308,7 +22569,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_brush_populates_a_real_radius_row() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22347,7 +22608,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_eraser_populates_a_real_radius_row() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22386,7 +22647,7 @@ mod tests {
 
     #[test]
     fn run_command_select_tool_to_move_leaves_the_properties_panel_empty() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22427,7 +22688,7 @@ mod tests {
     /// not an accumulated total.
     #[test]
     fn run_command_select_tool_clears_stale_rows_from_the_previous_tool() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22503,7 +22764,7 @@ mod tests {
 
     #[test]
     fn run_command_undo_reverts_a_bounds_change_and_refreshes_the_history_panel() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22612,7 +22873,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn structural_undo_falls_back_to_everything_because_paint_escapes_declared_bounds() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22768,7 +23029,7 @@ mod tests {
     /// predicate is what keeps it from passing vacuously.
     #[test]
     fn undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22865,7 +23126,7 @@ mod tests {
 
     #[test]
     fn run_command_undo_with_nothing_to_undo_is_a_safe_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -22901,7 +23162,7 @@ mod tests {
     // `aurora_doc::history::apply` already documents for its own allow.
     #[allow(clippy::float_cmp, clippy::too_many_lines)]
     fn run_command_undo_redo_walk_structural_and_pixel_edits_in_true_chronological_order() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -23042,7 +23303,7 @@ mod tests {
 
     #[test]
     fn run_command_pixel_undo_with_no_live_store_leaves_the_unified_order_untouched() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -23088,7 +23349,7 @@ mod tests {
 
     #[test]
     fn toggle_command_palette_opens_then_closes() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
 
@@ -23129,7 +23390,7 @@ mod tests {
     /// genuinely centred horizontally, not just "not zero."
     #[test]
     fn opening_the_palette_gives_it_a_real_centred_size_and_position() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
 
@@ -23153,7 +23414,7 @@ mod tests {
 
     #[test]
     fn opening_the_palette_a_second_time_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23164,7 +23425,7 @@ mod tests {
 
     #[test]
     fn typing_into_the_open_palette_filters_to_a_matching_command() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23203,7 +23464,7 @@ mod tests {
 
     #[test]
     fn a_space_typed_into_the_palette_keeps_a_multi_word_query_matching() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23249,7 +23510,7 @@ mod tests {
 
     #[test]
     fn activating_a_command_with_enter_closes_the_palette_and_focuses_its_target() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23275,7 +23536,7 @@ mod tests {
 
     #[test]
     fn escape_closes_the_palette_without_focusing_any_command_target() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23294,7 +23555,7 @@ mod tests {
 
     #[test]
     fn close_command_palette_on_an_already_closed_palette_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         close_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23303,7 +23564,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_tab_to_focus_next_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23337,7 +23598,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_a_tool_letter_to_select_tool_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23380,7 +23641,7 @@ mod tests {
     /// be present after this call — the undo itself never runs here.
     #[test]
     fn handle_key_reports_ctrl_z_as_undo_instead_of_running_it_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23442,7 +23703,7 @@ mod tests {
     /// other command.
     #[test]
     fn handle_key_reports_ctrl_shift_z_as_redo_instead_of_running_it_when_the_palette_is_closed() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23506,7 +23767,7 @@ mod tests {
 
     #[test]
     fn handle_key_ignores_an_unbound_chord() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23544,7 +23805,7 @@ mod tests {
 
     #[test]
     fn handle_key_routes_typing_to_the_palette_instead_of_shortcuts_while_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -23598,7 +23859,7 @@ mod tests {
 
     #[test]
     fn primary_c_copies_the_current_query_to_the_clipboard() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23632,7 +23893,7 @@ mod tests {
 
     #[test]
     fn primary_v_pastes_the_clipboard_into_the_query() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23667,7 +23928,7 @@ mod tests {
 
     #[test]
     fn pasting_an_empty_clipboard_leaves_the_query_unchanged() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23763,7 +24024,7 @@ mod tests {
 
     #[test]
     fn the_non_primary_modifier_and_altgr_do_not_paste_into_the_palette() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23801,7 +24062,7 @@ mod tests {
 
     #[test]
     fn a_palette_paste_is_filtered_and_capped_like_a_text_field() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23847,7 +24108,7 @@ mod tests {
 
     #[test]
     fn copying_an_empty_palette_query_leaves_the_clipboard_alone() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23867,7 +24128,7 @@ mod tests {
 
     #[test]
     fn activating_open_file_returns_the_picked_path() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23922,7 +24183,7 @@ mod tests {
 
     #[test]
     fn cancelling_the_file_dialog_returns_none_and_still_closes_the_palette() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -23961,7 +24222,7 @@ mod tests {
     #[test]
     fn activate_command_focuses_the_matching_panel_for_every_known_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> WidgetId) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let expected = expected(&workspace);
@@ -23982,7 +24243,7 @@ mod tests {
     #[test]
     fn activate_command_toggles_collapse_for_every_known_toggle_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let panel = expected(&workspace);
@@ -24015,7 +24276,7 @@ mod tests {
     #[test]
     fn activate_command_closes_the_matching_panel_for_every_known_close_id() {
         fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut file_dialog = FakeFileDialog::default();
             let panel = expected(&workspace);
@@ -24057,7 +24318,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_the_picked_path_for_file_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog {
             next_pick: Some(PathBuf::from("/tmp/example.psd")),
@@ -24086,7 +24347,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_the_picked_path_for_file_save() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog {
             next_save: Some(PathBuf::from("/tmp/example.png")),
@@ -24115,7 +24376,7 @@ mod tests {
 
     #[test]
     fn activate_command_resolves_undo_and_redo_without_focusing_anything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog::default();
 
@@ -24151,7 +24412,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_none_for_a_cancelled_save_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         // `next_save: None` -- simulates the user cancelling the native
         // dialog rather than picking a destination.
@@ -24169,7 +24430,7 @@ mod tests {
 
     #[test]
     fn activate_command_returns_none_and_focuses_nothing_for_an_unknown_id() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog::default();
 
@@ -25007,7 +25268,12 @@ mod tests {
             store: Some(store),
             scratch: Some(scratch.clone()),
             aborted: aborted == Aborted::Yes,
-            layout: layout.map(|path| (path, aurora_ui::build_workspace())),
+            layout: layout.map(|path| {
+                (
+                    path,
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                )
+            }),
         };
         ShutdownFixture {
             _dir: dir,
@@ -32315,7 +32581,7 @@ mod tests {
     /// inferring it from pixels that could agree by coincidence.
     #[test]
     fn undoing_a_move_of_the_active_layer_still_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32412,7 +32678,7 @@ mod tests {
     /// everything", never "recomposite nothing".
     #[test]
     fn undoing_a_group_level_change_with_no_knowable_rect_invalidates_everything() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32472,7 +32738,7 @@ mod tests {
     #[test]
     fn undoing_a_stroke_whose_layer_was_deleted_invalidates_everything() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32544,7 +32810,7 @@ mod tests {
     #[test]
     fn undoing_a_stroke_invalidates_only_the_composite_tiles_it_touched() {
         let (_dir, mut store) = commit_test_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
@@ -32861,7 +33127,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn diff_world(context: &GpuTestContext, op: DiffOp) -> (DiffWorld, aurora_gpu::TileResidency) {
         let (dir, mut store) = diff_tile_store();
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
@@ -45479,7 +45745,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         let path = dir.path().join("workspace-layout.postcard");
-        let mut original = aurora_ui::build_workspace();
+        let mut original = aurora_ui::build_workspace(&crate::test_workspace_scales());
         if let Err(err) =
             aurora_ui::set_rail_width(&mut original.tree, original.rail, original.divider, 300.0)
         {
@@ -45492,7 +45758,7 @@ mod tests {
         }
 
         super::save_workspace_layout(&path, &original);
-        let mut loaded = aurora_ui::build_workspace();
+        let mut loaded = aurora_ui::build_workspace(&crate::test_workspace_scales());
         super::load_workspace_layout(&path, &mut loaded);
 
         assert_eq!(
@@ -45520,7 +45786,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         let path = dir.path().join("does-not-exist.postcard");
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
 
         super::load_workspace_layout(&path, &mut workspace);
 
@@ -45544,7 +45810,7 @@ mod tests {
 
     #[test]
     fn open_crash_recovery_dialog_focuses_its_only_action() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45573,7 +45839,7 @@ mod tests {
 
     #[test]
     fn opening_the_crash_recovery_dialog_a_second_time_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45588,7 +45854,7 @@ mod tests {
 
     #[test]
     fn enter_on_the_focused_action_closes_the_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45614,7 +45880,7 @@ mod tests {
 
     #[test]
     fn escape_also_closes_the_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45665,7 +45931,7 @@ mod tests {
     /// alongside all three of the above.
     #[test]
     fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45744,7 +46010,7 @@ mod tests {
     /// layout.
     #[test]
     fn clicking_outside_the_dialog_under_real_layout_is_swallowed_without_closing_it() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -45870,7 +46136,7 @@ mod tests {
         ];
 
         for (title, message, actions) in cases {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut dialog = None;
             assert!(
@@ -45998,7 +46264,7 @@ mod tests {
     #[test]
     fn a_dialogs_action_is_still_clickable_in_a_very_short_window() {
         for height in [68.0_f32, 80.0, 96.0, 108.0] {
-            let mut workspace = aurora_ui::build_workspace();
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
             let mut focus = FocusManager::default();
             let mut dialog = None;
             let scales = match load_scales() {
@@ -46054,7 +46320,7 @@ mod tests {
     /// the margin `MIN_WINDOW_HEIGHT`'s own doc comment claims.
     #[test]
     fn the_windows_own_minimum_size_keeps_every_real_dialog_clickable() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46154,7 +46420,7 @@ mod tests {
     // already allow this lint for.
     #[allow(clippy::float_cmp)]
     fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for(theme_name: &str) {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46223,7 +46489,7 @@ mod tests {
 
     #[test]
     fn handle_dialog_pointer_returns_false_when_no_dialog_is_open() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         assert!(!handle_dialog_pointer(
@@ -46241,7 +46507,7 @@ mod tests {
     /// canvas loses while the dialog is open.
     #[test]
     fn an_open_dialog_does_not_take_any_width_from_the_canvas() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46269,7 +46535,7 @@ mod tests {
 
     #[test]
     fn the_open_dialog_is_centered_over_the_workspace_under_real_layout() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46443,7 +46709,7 @@ mod tests {
 
         // And the dialog that decision opens really opens, through the
         // same shared helper `App::open_skipped_tiles_dialog` uses.
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46838,7 +47104,7 @@ mod tests {
     /// (see that method's own doc comment).
     #[test]
     fn open_dialog_focuses_its_first_action() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46881,7 +47147,7 @@ mod tests {
 
     #[test]
     fn open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46909,7 +47175,7 @@ mod tests {
 
     #[test]
     fn escape_closes_the_export_refused_dialog_through_the_same_routing() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -46943,7 +47209,7 @@ mod tests {
 
     #[test]
     fn enter_on_the_export_refused_dialogs_action_closes_it() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47069,7 +47335,7 @@ mod tests {
     /// drives, in the same order, rather than the method itself.
     #[test]
     fn a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47143,7 +47409,7 @@ mod tests {
     /// on its doc comment.
     #[test]
     fn a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47198,7 +47464,7 @@ mod tests {
 
     #[test]
     fn the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = match load_scales() {
@@ -47244,7 +47510,7 @@ mod tests {
 
     #[test]
     fn close_dialog_on_an_already_closed_dialog_is_a_no_op() {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         close_dialog(&mut workspace, &mut focus, &mut dialog);
@@ -47259,7 +47525,7 @@ mod tests {
         // startup, before any shortcut could open the palette), this
         // confirms the *routing rule itself*, not a reachable real
         // scenario.
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
@@ -47705,7 +47971,7 @@ mod tests {
     }
 
     fn laid_out_workspace() -> aurora_ui::Workspace {
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         workspace.tree.compute_layout(1000.0, 800.0);
         workspace
     }
@@ -47787,7 +48053,7 @@ mod tests {
 
     #[test]
     fn pointer_in_canvas_returns_none_before_any_layout_has_run() {
-        let workspace = aurora_ui::build_workspace();
+        let workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         assert_eq!(pointer_in_canvas(&workspace, (10.0, 10.0)), None);
     }
 
@@ -47810,7 +48076,7 @@ mod tests {
         // once it exists, not `None`, before the first `compute_layout`
         // -- `canvas_area_physical_rect`'s own `Option` only covers a
         // genuinely unknown widget id, which `canvas_area` never is.
-        let workspace = aurora_ui::build_workspace();
+        let workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         assert_eq!(
             canvas_area_physical_rect(&workspace, 1.0),
             Some((0.0, 0.0, 0.0, 0.0))
@@ -51192,7 +51458,7 @@ mod tests {
                 Err(err) => unreachable!("{err}"),
             };
             let mut rig = Self {
-                workspace: aurora_ui::build_workspace(),
+                workspace: aurora_ui::build_workspace(&crate::test_workspace_scales()),
                 focus: FocusManager::default(),
                 gallery: None,
                 click: ClickTracker::default(),
@@ -51503,7 +51769,7 @@ mod tests {
                 .any(|entry| entry.id == COMMAND_TOGGLE_WIDGET_GALLERY
                     && entry.title == "Toggle Widget Gallery")
         );
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let picked = activate_command(
             &mut workspace,
@@ -52854,7 +53120,7 @@ mod tests {
                     Ok(scales) => scales,
                     Err(err) => unreachable!("{err}"),
                 };
-                let mut workspace = aurora_ui::build_workspace();
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let layer_rows = match aurora_ui::populate_layers_panel(
                     &mut workspace.tree,
                     workspace.layers,
@@ -53781,7 +54047,7 @@ mod tests {
                     Ok(scales) => scales,
                     Err(err) => unreachable!("{err}"),
                 };
-                let mut workspace = aurora_ui::build_workspace();
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let controls = match aurora_ui::insert_tool_controls(
                     &mut workspace.tree,
                     workspace.properties,
@@ -54346,7 +54612,7 @@ mod text_layout_tests {
     /// `App::new` builds it.
     fn workspace() -> (aurora_ui::Workspace, aurora_ui::LayerControls) {
         let scales = ok(load_scales());
-        let mut workspace = aurora_ui::build_workspace();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let controls = ok(aurora_ui::insert_layer_controls(
             &mut workspace.tree,
             workspace.layers,

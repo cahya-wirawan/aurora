@@ -236,7 +236,7 @@ mod tests {
 
     fn built(width: f32, height: f32) -> (crate::Workspace, ToolControls) {
         let scales = scales();
-        let mut workspace = build_workspace();
+        let mut workspace = build_workspace(&scales);
         let controls =
             match insert_tool_controls(&mut workspace.tree, workspace.properties, &scales) {
                 Ok(controls) => controls,
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn inserting_into_a_collapsed_panel_starts_hidden() {
         let scales = scales();
-        let mut ws = build_workspace();
+        let mut ws = build_workspace(&scales);
         if let Err(err) = crate::set_panel_collapsed(&mut ws.tree, ws.properties, true) {
             unreachable!("{err:?}");
         }

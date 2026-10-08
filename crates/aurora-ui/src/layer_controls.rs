@@ -311,7 +311,7 @@ mod tests {
 
     fn built(width: f32, height: f32) -> (crate::Workspace, LayerControls) {
         let scales = scales();
-        let mut workspace = build_workspace();
+        let mut workspace = build_workspace(&scales);
         let controls = match insert_layer_controls(&mut workspace.tree, workspace.layers, &scales) {
             Ok(controls) => controls,
             Err(err) => unreachable!("{err:?}"),

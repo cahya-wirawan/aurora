@@ -226,7 +226,7 @@ mod tests {
         }
 
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn history_rows_are_real_list_row_widgets_with_a_hittable_size() {
         let history = history_with(5);
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
             unreachable!("{err:?}");
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn history_rows_stack_top_to_bottom_without_overlapping() {
         let history = history_with(6);
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
             unreachable!("{err:?}");
@@ -373,7 +373,7 @@ mod tests {
     fn a_crowded_history_panel_never_starves_its_sibling_panels() {
         for count in [1_usize, 40, 200, 400] {
             let history = history_with(count);
-            let mut ws = crate::workspace::build_workspace();
+            let mut ws = crate::workspace::build_workspace(&test_scales());
             let scales = test_scales();
             if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
                 unreachable!("{err:?}");
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn rows_past_the_bottom_of_a_bounded_history_panel_are_clipped_and_not_yet_reachable() {
         let history = history_with(200);
-        let mut ws = crate::workspace::build_workspace();
+        let mut ws = crate::workspace::build_workspace(&test_scales());
         let scales = test_scales();
         if let Err(err) = populate_history_panel(&mut ws.tree, ws.history, &scales, &history) {
             unreachable!("{err:?}");
@@ -456,14 +456,16 @@ mod tests {
         // as "a scrolling container would close this gap," which it
         // would not make fail -- a scrolled-out row is exactly as
         // unreachable to `hit_test` as a clipped-out one. What is really
-        // being pinned is the arithmetic: a 300px panel share divided by
+        // being pinned is the arithmetic: a 300px panel share, less its title row, divided by
         // 21px rows, with no scrolling of any kind. Pinning the number
         // is what makes a silent change in the visible row count a test
         // failure rather than a shrug.
+        // 300px of share less the 21px title slot (0.142.0) leaves a
+        // 279px body: 13 whole 21px rows.
         assert_eq!(
-            reachable, 14,
-            "300px of History share divided by 21px rows -- the rows that fit really work, \
-             and the other 186 are clipped and unreachable"
+            reachable, 13,
+            "279px of History body (300px share less its 21px title row) divided by 21px rows \
+             -- the rows that fit really work, and the other 187 are clipped and unreachable"
         );
     }
 
@@ -477,7 +479,7 @@ mod tests {
     fn the_history_list_body_carries_no_name_of_its_own() {
         let history = history_with(3);
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -520,7 +522,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -541,7 +543,7 @@ mod tests {
     fn populate_history_panel_rejects_an_unknown_panel_body() {
         let history = History::new();
         let (mut tree, root) = widgets::new_tree(Style::default());
-        let panel = match insert_panel(&mut tree, root, "History") {
+        let panel = match insert_panel(&mut tree, root, "History", &test_scales()) {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };

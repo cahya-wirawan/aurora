@@ -821,6 +821,7 @@ mod tests {
                 height: 20,
             },
             field: None,
+            overflow: crate::TextOverflow::Clip,
         };
         resolve_text(engine, &run, scale)
     }

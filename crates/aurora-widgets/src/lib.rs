@@ -105,7 +105,8 @@ pub use render::{
 };
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use text::{
-    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextRun, field_offset_at, field_scroll,
-    label_style, resolve_run, resolve_text, sticky_scroll, text_runs, update_field_scrolls,
+    CARET_WIDTH, FieldDecor, HAlign, QuadGlyph, Resolved, TextOverflow, TextRun, field_offset_at,
+    field_scroll, label_style, resolve_run, resolve_text, sticky_scroll, text_runs,
+    update_field_scrolls,
 };
 pub use tree::{ACCESSIBILITY_TREE_ID, PaintLayer, WidgetId, WidgetTree};

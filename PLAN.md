@@ -26,7 +26,29 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-09-28, 0.141.0): dialog titles are drawn.** A dialog's
+**Latest (2026-10-08, 0.142.0): the Layers panel is recognisable.** A
+real macOS screenshot had shown the Layers panel as an unlabelled strip
+with no highlighted row, and the Properties readout cut mid-word ("No
+radius for Marque"). Three fixes. (1) The active layer's row is
+highlighted from the first frame and after every open — until now only a
+click ever marked a row selected; startup now builds its panels through
+the same `replace_document` both open routes use, which marks the row.
+(2) Every docked panel (and the Widget Gallery) draws its title in a
+one-row slot above its body, which stays visible when the panel is
+collapsed; the slot is presentational, so the title is still announced
+once, by the panel's own region. (3) A static label, a tree row's label
+and a panel title that do not fit end in "…", cut on a grapheme
+boundary; text fields and the command palette's query still clip. Panel
+bodies are one row (21 px) shorter; the gallery's minimum window height
+moved 422 → 443 px. No golden changed (no golden draws a panel). A
+review revision (same version) made startup panel installation
+non-panicking, kept collapsed titles from overlapping in a very short
+rail, and made a closed panel hide its title and take no space. **Not
+yet verified on real hardware: the highlight and the titles need a human
+on real macOS** (scale 1.0 and 2.0, plus a screen reader).
+Details: M1.7's widget-set "Update 0.142.0".
+
+**Previously (2026-09-28, 0.141.0): dialog titles are drawn.** A dialog's
 title now has its own one-row slot above the message, so the crash-
 recovery prompt and every other app dialog show their title as well as
 their message, in `text.primary` Regular (a heavier title weight is a
@@ -4674,6 +4696,146 @@ check licenses` clean with the new `toml` dependency.
   **Needs a human:** the crash-recovery dialog on real hardware at scale
   1.0 and 2.0 (title legibility and spacing), and a screen reader
   confirming the title is announced once.
+
+  **Update 0.142.0 — make the Layers panel recognisable.** Prompted by a
+  real macOS screenshot: the Layers panel showed as an anonymous line
+  ("frontend-01") with no highlighted row, and the Properties readout
+  read "No radius for Marque". *Highlight (`aurora-app`):* the root cause
+  was that `select_layer` (a row click) was the only function that ever
+  called `set_tree_item_selected`; startup and both open routes assigned
+  the active layer directly. A new `mark_active_layer_row` marks exactly
+  the active row selected (payload *and* node, through the widget
+  setter); `replace_document` calls it, and `App::new` now populates its
+  three panels through `replace_document` instead of three inline
+  `populate_*` calls, so startup, the image open and the `.aur` open share
+  one path. `select_layer`'s own row loop now delegates to the helper.
+  The selected row paints the existing `accent.primary` fill with
+  `text.on_accent` text (unchanged paint code). *Panel title slot
+  (`aurora-ui` `panel.rs`):* `insert_panel` takes `&Scales` and inserts an
+  **unlabelled `Role::GenericContainer` as the root's first child**
+  (`PanelHandle::header`, new field) — one `row_height` tall,
+  `flex_shrink: 0`, `min_size.height` one row, `min_size.width` 0 — before
+  the body; the `Region` keeps the title as its one label.
+  `build_workspace` therefore takes `&Scales` too (all 128 callers
+  updated; the app's tests use a new `test_workspace_scales`).
+  `set_panel_collapsed` exempts the header from the "hide every non-body
+  child" rule 0.135.0 added for the controls strips, and a collapsed root
+  now uses `flex_basis: auto`, so a collapsed panel is exactly its title
+  row rather than zero tall with the title spilling over its neighbour.
+  *Title drawing (`aurora-widgets` `text.rs`):* a new `panel_title`
+  recognises a `Panel`'s unlabelled `GenericContainer` **first** child
+  (the first-child test is load-bearing — a panel's body and controls
+  strips are unlabelled generic containers too, unlike the dialog case
+  carried from 0.141.0) and draws the panel's label there: one line, inset
+  `spacing.sm`, `text.secondary` (gated 4.5:1 on `surface.panel`), body
+  size, Regular. *Ellipsis:* `TextRun` gains `overflow: TextOverflow`
+  (`Clip` default, `Ellipsis`); only `Label`, `TreeItem` labels and the
+  panel title use `Ellipsis`. `fitted_line` (used by `place`) leaves a run
+  that fits (`width <= box`) untouched; otherwise it walks the full line's
+  own grapheme carets from the end, takes the longest cut whose caret plus
+  the "…" width fits, trims trailing whitespace, and reshapes to confirm;
+  if no prefix fits it draws "…" alone, clipped. A run with `field`
+  (text fields, the palette query) is never ellipsized, so caret,
+  selection and scroll maths are unchanged. Accessibility labels and the
+  readout's stored text stay complete; "No radius for X" wording kept.
+  *Layout numbers (measured, default scales):* each panel body is 21 px
+  shorter; the bounded History panel test now reaches 13 rows, not 14; the
+  two-panel collapse test gives the sibling 179 px, not 200; the Widget
+  Gallery's minimum window height pin 422 → **443 px** (both the
+  text-blind and measured twins). **Tests (+15, 2,588 total):** app (+2:
+  `replace_document` marks exactly the active row on the multi-layer demo
+  document and again after a single-image replace, payload and node
+  agreeing; `None` clears every row); ui (+4: every docked panel has an
+  unlabelled first-child title slot, one row, full width, body starting
+  at its bottom, Region label unchanged; a 10 px panel keeps its full
+  title row; collapsing keeps the title visible, still hides the Layers
+  controls strip, and the collapsed panel is exactly its title row;
+  `text_runs` draws each panel's name inside its slot and nothing on root,
+  body or strip); widgets (+9: longest-fitting prefix ends in "…" and
+  fits, one more grapheme would not; a fitting run, including one exactly
+  as wide as its box, resolves glyph-for-glyph identical to the clipped
+  run; a box narrower than "…" draws "…" with no panic, and the bundled
+  font has a real glyph for U+2026; multibyte cuts land on grapheme
+  boundaries across a width sweep; centred runs centre the shortened
+  line; an editable line is never ellipsized; Label/TreeItem ellipsize and
+  TextField clips; the title slot draws the panel label in
+  `text.secondary`, inset, ellipsized, and the root, body and strip draw
+  nothing; a labelled first child, an empty title and a non-panel parent
+  draw no title). **Goldens:** none changed and none re-blessed — no
+  golden draws a docked panel or the rail (the goldens are
+  `aurora-widgets` component galleries); `git status` shows no `.png`
+  change. **Mutations (all really run, RTX 3090, `AURORA_REQUIRE_GPU=1`,
+  backup and sha256-verified restore):** drop the mark in
+  `replace_document` (killed, 1); startup clears the selection after
+  `replace_document` (**survived** — `App::new` needs an event-loop proxy,
+  so no headless test constructs it; startup's coverage is only that it
+  routes through the tested function); header `flex_shrink: 1` alone
+  (**survived**, output-equivalent: `min_size.height` floors it); header
+  height 0 (killed, 7); header `min_size` dropped *and* `flex_shrink: 1`
+  (killed, 1); header labelled (killed, 2); field run set to `Ellipsis`
+  (killed, 1); `fitted_line`'s field guard removed (killed, 1); fit test
+  `<=` → `<` (killed, 1); candidate reshape check skipped (**survived** —
+  a probe over every printable-ASCII pair found no pair where the bundled
+  Inter kerns "…" wider than caret + mark width, so the confirm is
+  unreachable for this font; kept as a guard for other fonts/scripts);
+  caret pre-filter ignoring the mark width (**survived**, output-
+  equivalent — the reshape confirm catches it, costing only extra
+  shapes); collapse hides the header (killed, 2); title drawn from any
+  unlabelled generic child (killed, 1); `Label` clips (killed, 1).
+  **Disclosures:** title typography and colour (`text.secondary`, Regular,
+  body size) are provisional — no heading weight/size token exists, none
+  invented, Cahya to decide; "No radius for X" wording unchanged
+  (design-owner call); ellipsis reshapes up to a few strings per run per
+  frame, absorbed by the shape cache because the strings are stable (not
+  benchmarked); the cut is visual-order LTR only (single bundled font, no
+  RTL); checkbox labels, buttons, tabs, dropdown values, tooltips and
+  dialog text still clip; the 0.141.0 `dialog_title` "any
+  GenericContainer child" caveat is unchanged. **Needs a human:** the
+  Layers/Properties/History panels on real macOS at scale 1.0 and 2.0 —
+  the selected-row highlight at startup and after File > Open, the titles'
+  legibility, a collapsed panel's title row, the ellipsized readout — and
+  a screen reader confirming each panel title is announced once.
+
+  **Review revision (0.142.0, same version).** Four fixes from review, no
+  version bump. (1) `App::new`'s panel installation (the shared
+  `replace_document`, then the Layers controls strip and the Properties
+  tool controls, each synced) moved into a pure `install_startup_panels`
+  helper, and its `unreachable!` on a failed population, a panic path in
+  shipping startup code, is now a `tracing::warn!` that falls back to an
+  empty row map with the active layer still `topmost_pixel_layer`,
+  matching how a failed controls build was already handled. No other
+  production panic path was added this round (diff grep: every new
+  `unreachable!` is under `#[cfg(test)]`). (2) A collapsed panel root is
+  now `flex_shrink: 0` as well as `flex_basis: auto`: in a rail shorter
+  than three title rows the collapsed roots used to shrink below their own
+  `flex_shrink: 0` headers (measured: an 11 px root under a 21 px title),
+  so a title spilled over the next panel; now the collapsed panels keep
+  their full row and run off the bottom of the rail, where the window
+  clips them. (3) Closing is not collapsing any more: `close_panel` also
+  hides the title row, so a closed panel is 0 px tall; any
+  `set_panel_collapsed` call, which is what the panel-toggle command runs
+  on a collapsed or closed panel, shows the title again. (4) The
+  surviving "startup clears the selection" mutation is now **killed**:
+  injecting `mark_active_layer_row(.., None)` into
+  `install_startup_panels` fails exactly the new startup test (1 of 523
+  `aurora-app` lib tests; really run on the RTX 3090 under
+  `AURORA_REQUIRE_GPU=1`, sha256-verified restore). **Tests (+3):** ui
+  (+2: every panel collapsed in a rail 1.5 rows tall keeps each title one
+  full row, each root exactly its title, and no title's bottom past the
+  next panel's top, so the asserted contract is no overlap, not merely
+  clipping within the root; a closed panel's title is `Display::None`,
+  its root 0 px and the next panel starts where it was, and reopening
+  shows a one-row title again; both failed before the fix, first with an
+  11 px root under a 21 px title and then with the header still
+  `Display::Flex` after close); app (+1: `install_startup_panels` on the
+  multi-layer demo document selects exactly the active layer's row and
+  installs both control strips). **Still needs a human on real macOS**,
+  unchanged by this revision: the selected-row highlight at startup and
+  after File > Open, the panel titles (including a collapsed panel's
+  title row and a closed panel's absence), and a screen reader.
+  **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — 2,591 passed, 0 failed, 45 ignored, 0
+  skipped; doctests, strict rustdoc and `cargo deny check` clean.
 
 
   - [ ] **Dropdown options through AT actions.** Option rows declare no
@@ -29621,6 +29783,27 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.142.0) — the Layers panel is recognisable.**
+The active layer's row is highlighted at startup and after every open
+(startup now shares `replace_document` with both open routes); every
+docked panel draws its title in an unlabelled one-row slot that survives
+collapse; `Label`, tree-row labels and panel titles ellipsize on a
+grapheme boundary. Full account: M1.7's widget-set "Update 0.142.0".
+**Needs a human:** all three panels on real macOS at scale 1.0 and 2.0
+(highlight, titles, collapsed title row, ellipsized readout) and a screen
+reader confirming one title announcement per panel; Cahya to decide the
+panel-title style and the "No radius for X" wording. **Suggested next
+(0.143.0): New/Delete Layer.** `aurora-doc` `add_pixel_layer_at` with an
+indexed restore journal; insert above the active layer (or above a
+group), named "Layer N", sized to the document bounds; delete refused on
+the last pixel layer; next active = below, else above, else the parent,
+else the topmost. `perform_layer_command` ends layer-control gestures
+and commits an ending drag first, records a `Structural` `undo_order`
+entry, rebuilds the rows on structural undo/redo and bumps the composite
+cache. `AppCommand`/`ActivatedCommand` `NewLayer`/`DeleteLayer`, palette
+entries, a macOS Layer submenu, `Ctrl+Shift+N` for New Layer and no
+Delete shortcut. Duplicate Layer deferred.
 
 **Addendum 2026-09-28 (0.141.0) — dialog titles.** A dialog's title now
 has its own one-row slot above the message (an unlabelled

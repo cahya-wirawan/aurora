@@ -34,11 +34,20 @@
 //! [`field_scroll`]) — the command palette's query strip (query plus caret) and
 //! result rows, a tooltip's text (its accessibility label, the one copy
 //! `Tooltip::set_text` keeps current), and a dialog's message (one
-//! line). **Not yet**: `Checkbox` (its layout box *is* the 13 px square
-//! box — the label needs a measure-func layout pass to sit beside it), a
-//! dialog's title (no layout slot), and a text field's placeholder
-//! (`TextFieldState` has none). There is no ellipsis and no wrapping: a
-//! line wider than its box is clipped.
+//! line). Since 0.140.0 a measured `Checkbox`'s label, since 0.141.0 a
+//! dialog's title, and since 0.142.0 a docked panel's title (its root's
+//! label, drawn in the root's first child — [`panel_title`]). **Not
+//! yet**: a text field's placeholder (`TextFieldState` has none).
+//!
+//! **Overflow (0.142.0).** There is no wrapping. A run is clipped to its
+//! box by default ([`TextOverflow::Clip`]); a static `Label`, a
+//! `TreeItem`'s label and a panel title instead end in "…" when they do
+//! not fit ([`TextOverflow::Ellipsis`]), cut on a grapheme boundary —
+//! a label cut mid-letter ("No radius for Marque") reads as a typo, not
+//! as truncation. Only what is *drawn* is shortened: every accessibility
+//! label and stored string stays complete. Editable lines (text fields,
+//! the palette query) always clip, so their caret, selection and scroll
+//! maths index the real text.
 
 use std::ops::Range;
 
@@ -87,7 +96,26 @@ pub struct TextRun {
     /// `align` says) and scrolled horizontally so its caret stays inside
     /// `rect` ([`FieldDecor::scroll`]).
     pub field: Option<FieldDecor>,
+    /// What a line wider than `rect` does (0.142.0): clip (the default,
+    /// and always for a run with [`Self::field`]) or end in "…".
+    pub overflow: TextOverflow,
 }
+
+/// What a [`TextRun`] wider than its box does (0.142.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextOverflow {
+    /// Drawn whole and clipped at [`TextRun::clip`].
+    #[default]
+    Clip,
+    /// The longest grapheme-boundary prefix that fits with a trailing
+    /// "…" is drawn instead (just "…", clipped, if even that does not
+    /// fit). Ignored for a run with [`TextRun::field`]: an editable
+    /// line's offsets index its real text.
+    Ellipsis,
+}
+
+/// The mark an ellipsized run ends in (U+2026, in the bundled Inter).
+const ELLIPSIS: &str = "\u{2026}";
 
 impl TextRun {
     /// Applies `f` to every colour this run carries — its text colour and
@@ -361,6 +389,13 @@ pub fn text_runs(
         align,
         clip,
         field: None,
+        overflow: TextOverflow::Clip,
+    };
+    // A label that names something (a layer, a panel, a readout) ends in
+    // "…" rather than being cut mid-letter (0.142.0).
+    let ellipsized = |run: TextRun| TextRun {
+        overflow: TextOverflow::Ellipsis,
+        ..run
     };
     // An editable line: flush left in `bounds` inset by `spacing.sm`,
     // clipped to that inset box so scrolled-away text never reaches the
@@ -383,6 +418,7 @@ pub fn text_runs(
             align: HAlign::Start,
             clip: intersect(clip, clip_box)?,
             field: Some(decor),
+            overflow: TextOverflow::Clip,
         })
     };
     let runs = match kind {
@@ -414,12 +450,12 @@ pub fn text_runs(
             } else {
                 theme.text.primary
             };
-            vec![run(
+            vec![ellipsized(run(
                 &state.label,
                 rgba(color, opacity(state.disabled, theme)),
                 inset_x((full.0, full.1, full.2, height), pad),
                 HAlign::Start,
-            )]
+            ))]
         }
         WidgetKind::Dropdown(state) => state
             .selected_option()
@@ -515,7 +551,29 @@ pub fn text_runs(
             } else {
                 theme.text.secondary
             };
-            vec![run(&state.text, rgba(color, 1.0), full, HAlign::Start)]
+            vec![ellipsized(run(
+                &state.text,
+                rgba(color, 1.0),
+                full,
+                HAlign::Start,
+            ))]
+        }
+        // A docked panel's title (0.142.0): the panel's first child (its
+        // unlabelled title slot) draws the panel `Region`'s own label --
+        // the one copy of the title -- one line, flush left, inset by
+        // `spacing.sm` like a tree row's label, ellipsized. `text.secondary`
+        // (gated at 4.5:1 on `surface.panel`), Regular, body size: the
+        // title is a heading over the rows, not one of them, but no
+        // heading weight or size exists in the type tokens -- the title's
+        // typography and colour are the design owner's call, flagged
+        // rather than invented.
+        WidgetKind::Container if let Some(title) = panel_title(tree, id) => {
+            vec![ellipsized(run(
+                title,
+                rgba(theme.text.secondary, 1.0),
+                inset_x(full, pad),
+                HAlign::Start,
+            ))]
         }
         // A dialog's title (0.141.0): its presentational first child
         // draws the dialog's own label -- the one copy of the title --
@@ -567,6 +625,24 @@ fn dialog_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
     let parent = tree.parent(id)?;
     let is_slot = matches!(tree.payload(parent)?, WidgetKind::Dialog)
         && tree.accessibility(id)?.role() == accesskit::Role::GenericContainer;
+    is_slot
+        .then(|| tree.accessibility(parent)?.label())
+        .flatten()
+}
+
+/// The title a docked panel's title slot draws: its parent `Panel`'s own
+/// accessibility label, when `id` is that panel's unlabelled
+/// `Role::GenericContainer` **first** child (`aurora_ui`'s `insert_panel`
+/// builds exactly that). The first-child test is load-bearing, unlike the
+/// dialog's: a panel's body and its controls strips are unlabelled
+/// generic containers too. `None` for any other widget.
+fn panel_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
+    let parent = tree.parent(id)?;
+    let node = tree.accessibility(id)?;
+    let is_slot = matches!(tree.payload(parent)?, WidgetKind::Panel)
+        && node.role() == accesskit::Role::GenericContainer
+        && node.label().is_none()
+        && tree.children(parent)?.first() == Some(&id);
     is_slot
         .then(|| tree.accessibility(parent)?.label())
         .flatten()
@@ -696,7 +772,7 @@ fn place(engine: &mut TextEngine, run: &TextRun, scale_factor: f32, scroll: f32)
     {
         return None;
     }
-    let line = engine.shape(&run.text, &run.style, scale_factor);
+    let line = fitted_line(engine, run, scale_factor).1;
     if line.size_phys.is_nan() || line.size_phys > MAX_GLYPH_SIZE_PHYS {
         return None;
     }
@@ -715,6 +791,47 @@ fn place(engine: &mut TextEngine, run: &TextRun, scale_factor: f32, scroll: f32)
         baseline_logical,
         scale_factor,
     })
+}
+
+/// The text `run` actually draws and its shaped line: `run.text` itself,
+/// unless the run is [`TextOverflow::Ellipsis`] (and not an editable
+/// line) and strictly wider than its box — then the longest prefix, cut
+/// on a grapheme boundary and with trailing whitespace trimmed, that fits
+/// with a trailing [`ELLIPSIS`], or the ellipsis alone if no prefix does
+/// (drawn clipped when even it is too wide). The prefix is found from the
+/// full line's own grapheme carets — the cut whose caret plus the
+/// ellipsis's width fits, longest first — and each candidate is reshaped
+/// to confirm it, so kerning across the cut can only move it one
+/// boundary shorter, never past the box. Every string here is stable
+/// from frame to frame, so the engine's shape cache absorbs the reshape.
+fn fitted_line<'a>(
+    engine: &mut TextEngine,
+    run: &'a TextRun,
+    scale_factor: f32,
+) -> (std::borrow::Cow<'a, str>, std::sync::Arc<ShapedLine>) {
+    let line = engine.shape(&run.text, &run.style, scale_factor);
+    let width = run.rect.2;
+    if run.overflow != TextOverflow::Ellipsis || run.field.is_some() || line.width <= width {
+        return (std::borrow::Cow::Borrowed(run.text.as_str()), line);
+    }
+    let mark = engine.shape(ELLIPSIS, &run.style, scale_factor);
+    for &(byte, x) in line.carets.iter().rev() {
+        if byte >= run.text.len() || x + mark.width > width {
+            continue;
+        }
+        let Some(prefix) = run.text.get(..byte).map(str::trim_end) else {
+            continue;
+        };
+        if prefix.is_empty() {
+            break;
+        }
+        let candidate = format!("{prefix}{ELLIPSIS}");
+        let shaped = engine.shape(&candidate, &run.style, scale_factor);
+        if shaped.width <= width {
+            return (std::borrow::Cow::Owned(candidate), shaped);
+        }
+    }
+    (std::borrow::Cow::Borrowed(ELLIPSIS), mark)
 }
 
 /// `clip` (logical) on the physical grid, `[x0, y0, x1, y1]`.
@@ -1716,7 +1833,293 @@ mod tests {
             align: HAlign::Start,
             clip,
             field: None,
+            overflow: super::TextOverflow::Clip,
         }
+    }
+
+    /// `text` as an ellipsizing run `width` logical px wide at (10, 10).
+    fn ellipsis_run(text: &str, width: f32, align: HAlign) -> TextRun {
+        TextRun {
+            text: text.to_owned(),
+            rect: (10.0, 10.0, width, 20.0),
+            align,
+            overflow: super::TextOverflow::Ellipsis,
+            ..a_run(Rect {
+                x: -10_000,
+                y: -10_000,
+                width: 20_000,
+                height: 20_000,
+            })
+        }
+    }
+
+    fn fitted(engine: &mut TextEngine, run: &TextRun) -> (String, f32) {
+        let (text, line) = super::fitted_line(engine, run, 1.0);
+        (text.into_owned(), line.width)
+    }
+
+    /// 0.142.0: a label too wide for its box ends in "…", fits the box,
+    /// and keeps the *longest* prefix that does — one grapheme more would
+    /// not fit. The Properties readout that read "No radius for Marque".
+    #[test]
+    fn an_ellipsized_run_too_wide_for_its_box_keeps_the_longest_fitting_prefix() {
+        let mut engine = engine();
+        let full = "No radius for Marquee Select";
+        let style = super::label_style(&test_scales());
+        let full_width = engine.shape(full, &style, 1.0).width;
+        let width = (full_width * 0.6).floor();
+        let (text, drawn) = fitted(&mut engine, &ellipsis_run(full, width, HAlign::Start));
+        let Some(prefix) = text.strip_suffix('\u{2026}') else {
+            unreachable!("ends in an ellipsis: {text:?}");
+        };
+        assert!(!prefix.is_empty() && full.starts_with(prefix), "{text:?}");
+        assert!(drawn <= width, "{drawn} <= {width}");
+        let rest = full.get(prefix.len()..).unwrap_or("");
+        let skipped = rest.len() - rest.trim_start().len();
+        let next = rest.trim_start().chars().next().map_or(0, char::len_utf8);
+        let longer_prefix = full.get(..prefix.len() + skipped + next).unwrap_or(full);
+        let longer = format!("{longer_prefix}\u{2026}");
+        assert!(
+            engine.shape(&longer, &style, 1.0).width > width,
+            "one more grapheme ({longer:?}) would have fitted, so {text:?} is not the longest"
+        );
+        // The same run clipped draws the whole text: only Ellipsis cuts.
+        let clipped = TextRun {
+            overflow: super::TextOverflow::Clip,
+            ..ellipsis_run(full, width, HAlign::Start)
+        };
+        assert_eq!(fitted(&mut engine, &clipped).0, full);
+        // And what is drawn is that shorter line, not the full one.
+        let ellipsized = resolve_text(&mut engine, &ellipsis_run(full, width, HAlign::Start), 1.0);
+        let whole = resolve_text(&mut engine, &clipped, 1.0);
+        assert!(ellipsized.len() < whole.len());
+    }
+
+    /// A run exactly as wide as its box fits: it is drawn unchanged,
+    /// glyph for glyph, as is any run with room to spare.
+    #[test]
+    fn a_fitting_ellipsized_run_is_drawn_unchanged() {
+        let mut engine = engine();
+        let text = "Background";
+        let width = engine
+            .shape(text, &super::label_style(&test_scales()), 1.0)
+            .width;
+        for box_width in [width, width + 40.0] {
+            let run = ellipsis_run(text, box_width, HAlign::Start);
+            assert_eq!(fitted(&mut engine, &run).0, text, "box {box_width}");
+            let clipped = TextRun {
+                overflow: super::TextOverflow::Clip,
+                ..run.clone()
+            };
+            assert_eq!(
+                resolve_text(&mut engine, &run, 1.0),
+                resolve_text(&mut engine, &clipped, 1.0)
+            );
+        }
+    }
+
+    /// A box narrower than the ellipsis itself draws just the ellipsis
+    /// (clipped by the run's clip as usual) — no panic, no empty prefix.
+    #[test]
+    fn a_box_narrower_than_the_ellipsis_draws_only_the_ellipsis() {
+        let mut engine = engine();
+        // The bundled font really has the mark: one glyph, not `.notdef`.
+        let mark = engine.shape("\u{2026}", &super::label_style(&test_scales()), 1.0);
+        assert!(mark.width > 0.0);
+        assert!(!mark.glyphs.is_empty() && mark.glyphs.iter().all(|g| g.glyph_id != 0));
+        for width in [3.0, 0.5, 0.0, -5.0] {
+            let run = ellipsis_run("Layer 1", width, HAlign::Start);
+            assert_eq!(fitted(&mut engine, &run).0, "\u{2026}", "box {width}");
+            let _ = resolve_text(&mut engine, &run, 1.0);
+        }
+    }
+
+    /// The cut lands on a grapheme boundary of multibyte text: never inside
+    /// a UTF-8 sequence, an accent cluster or an emoji ZWJ sequence.
+    #[test]
+    fn an_ellipsized_multibyte_run_is_cut_on_a_grapheme_boundary() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut engine = engine();
+        let full = "Cafe\u{301} \u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{65E5}\u{672C}\u{8A9E} e\u{301}e\u{301}e\u{301}";
+        let style = super::label_style(&test_scales());
+        let full_width = engine.shape(full, &style, 1.0).width;
+        let boundaries: Vec<usize> = full
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([full.len()])
+            .collect();
+        let mut step = 1.0;
+        while step < full_width {
+            let (text, drawn) = fitted(&mut engine, &ellipsis_run(full, step, HAlign::Start));
+            if let Some(prefix) = text.strip_suffix('\u{2026}')
+                && !prefix.is_empty()
+            {
+                assert!(full.starts_with(prefix), "{text:?}");
+                assert!(
+                    boundaries.contains(&prefix.len()),
+                    "cut at byte {} is not a grapheme boundary ({text:?})",
+                    prefix.len()
+                );
+                assert!(drawn <= step, "{drawn} <= {step}");
+            }
+            step += 3.0;
+        }
+    }
+
+    /// A centred ellipsized run centres the *shortened* line in its box.
+    #[test]
+    fn a_centred_ellipsized_run_centres_the_shortened_line() {
+        let mut engine = engine();
+        let run = ellipsis_run("A rather long centred caption", 60.0, HAlign::Center);
+        let (_, drawn) = fitted(&mut engine, &run);
+        let Some(placed) = super::place(&mut engine, &run, 1.0, 0.0) else {
+            unreachable!("finite run");
+        };
+        assert!((placed.origin_x - (10.0 + (60.0 - drawn) / 2.0)).abs() < 1e-4);
+        assert!(
+            placed.origin_x >= 10.0,
+            "inside the box, not overflowing left"
+        );
+    }
+
+    /// An editable line never ellipsizes, even if a run claimed it should:
+    /// its caret, selection and scroll offsets index the real text.
+    #[test]
+    fn an_editable_line_is_never_ellipsized() {
+        let mut engine = engine();
+        let text = "a long field value that overflows its box";
+        let run = TextRun {
+            field: Some(super::FieldDecor {
+                scroll_anchor: 0,
+                scroll: None,
+                caret: None,
+                caret_color: [1.0; 4],
+                selection: None,
+                selection_fill: [1.0; 4],
+                selected_text: [1.0; 4],
+                underlines: Vec::new(),
+                underline_color: [1.0; 4],
+            }),
+            ..ellipsis_run(text, 40.0, HAlign::Start)
+        };
+        assert_eq!(fitted(&mut engine, &run).0, text);
+    }
+
+    /// Which widgets ellipsize: a static label and a tree row's label do;
+    /// a text field (and every other run) clips.
+    #[test]
+    fn labels_and_tree_rows_ellipsize_and_text_fields_clip() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let theme = dark_theme();
+        let label = ok(crate::widgets::insert_label(&mut tree, root, &scales, "L"));
+        let view = ok(insert_tree_view(&mut tree, root, Some("Layers")));
+        let row = ok(insert_tree_item(&mut tree, view, &scales, "Row", false));
+        let field = ok(crate::widgets::insert_text_field(
+            &mut tree, root, &scales, "Name", "value",
+        ));
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 21,
+        };
+        let overflow = |id| {
+            text_runs(&tree, id, bounds, bounds, None, &theme, &scales)
+                .first()
+                .map(|r| r.overflow)
+        };
+        assert_eq!(overflow(label), Some(super::TextOverflow::Ellipsis));
+        assert_eq!(overflow(row), Some(super::TextOverflow::Ellipsis));
+        assert_eq!(overflow(field), Some(super::TextOverflow::Clip));
+    }
+
+    /// A panel `Region` laid out like `aurora_ui`'s `insert_panel`: the
+    /// root, an unlabelled generic first child (the title slot), a body
+    /// and a controls strip (both unlabelled generic containers too).
+    fn panel_tree(title: &str) -> (WidgetTree<WidgetKind>, [WidgetId; 4]) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let mut node = accesskit::Node::new(accesskit::Role::Region);
+        node.set_label(title);
+        let panel = ok(tree.insert(root, taffy::Style::default(), node, WidgetKind::Panel));
+        let generic = |tree: &mut WidgetTree<WidgetKind>| {
+            ok(tree.insert(
+                panel,
+                taffy::Style::default(),
+                accesskit::Node::new(accesskit::Role::GenericContainer),
+                WidgetKind::Container,
+            ))
+        };
+        let header = generic(&mut tree);
+        let body = generic(&mut tree);
+        let strip = generic(&mut tree);
+        (tree, [panel, header, body, strip])
+    }
+
+    /// 0.142.0: a panel's first child draws the panel's label, inset like
+    /// a tree row's, in `text.secondary`, ellipsized; its root, body and
+    /// controls strip draw nothing.
+    #[test]
+    fn a_panels_title_slot_draws_the_panel_label_and_nothing_else_does() {
+        let (tree, [panel, header, body, strip]) = panel_tree("Layers");
+        let scales = test_scales();
+        let theme = dark_theme();
+        let bounds = Rect {
+            x: 1350,
+            y: 0,
+            width: 250,
+            height: 21,
+        };
+        let runs = |id| text_runs(&tree, id, bounds, bounds, None, &theme, &scales);
+        let title_runs = runs(header);
+        let [title] = &title_runs[..] else {
+            unreachable!("exactly one title run: {title_runs:?}");
+        };
+        assert_eq!(title.text, "Layers");
+        assert_eq!(title.color, rgba(theme.text.secondary, 1.0));
+        assert_eq!(title.align, HAlign::Start);
+        assert_eq!(title.overflow, super::TextOverflow::Ellipsis);
+        assert!(title.field.is_none());
+        let pad = super::token_px(scales.spacing.sm);
+        assert_eq!(title.rect, (1350.0 + pad, 0.0, 250.0 - 2.0 * pad, 21.0));
+        assert!(runs(panel).is_empty(), "the root draws nothing itself");
+        assert!(runs(body).is_empty(), "the body is not a title slot");
+        assert!(runs(strip).is_empty(), "nor is a controls strip");
+    }
+
+    /// The slot must be unlabelled and the panel's: a labelled first child
+    /// or a generic first child of a non-panel draws no title, and an
+    /// empty title draws nothing.
+    #[test]
+    fn only_a_panels_unlabelled_first_child_is_its_title_slot() {
+        let scales = test_scales();
+        let theme = dark_theme();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 21,
+        };
+        let (mut tree, [_, header, _, _]) = panel_tree("Layers");
+        let mut labelled = accesskit::Node::new(accesskit::Role::GenericContainer);
+        labelled.set_label("Something");
+        ok(tree.set_accessibility(header, labelled));
+        assert!(text_runs(&tree, header, bounds, bounds, None, &theme, &scales).is_empty());
+
+        let (tree, [_, header, _, _]) = panel_tree("");
+        assert!(text_runs(&tree, header, bounds, bounds, None, &theme, &scales).is_empty());
+
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let mut node = accesskit::Node::new(accesskit::Role::Region);
+        node.set_label("Not a panel");
+        let region = ok(tree.insert(root, taffy::Style::default(), node, WidgetKind::Container));
+        let first = ok(tree.insert(
+            region,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::GenericContainer),
+            WidgetKind::Container,
+        ));
+        assert!(text_runs(&tree, first, bounds, bounds, None, &theme, &scales).is_empty());
     }
 
     #[test]
@@ -2056,6 +2459,7 @@ mod field_tests {
                 height: 24,
             },
             field: Some(decor),
+            overflow: super::TextOverflow::Clip,
         }
     }
 
