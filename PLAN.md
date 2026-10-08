@@ -26,7 +26,31 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.144.0): PSD and PSB files open, layered.**
+**Latest (2026-10-08, 0.145.0): the dock panels scroll.** The real-macOS
+report after 0.144.1 — a many-layer PSD in a short window, Layers rows
+past the bottom of the panel unreachable — is fixed in the widget tree
+itself: `aurora_widgets::WidgetTree` gains vertical scroll containers
+(`set_scrollable`, `set_scroll_y`/`scroll_by`, `scroll_range`,
+`scroll_into_view`, `scroll_container_at`), whose descendants — never the
+container — move by the whole-pixel offset, re-clamped on every layout
+(a removed row pulls a stale offset back), with the position and range
+reported to accessibility (`scroll_y`/`scroll_y_min`/`scroll_y_max`).
+Every `aurora-ui` panel body is one, and the Layers tree container is now
+content-sized (a viewport-sized one would have moved with the offset and
+refused clicks on the rows below its shifted edge). `aurora-app` routes
+the mouse wheel and trackpad: a modal swallows it, the canvas still zooms
+first, a live drag or capture blocks panel scrolling, otherwise the panel
+under the pointer scrolls (a wheel notch is one row; a trackpad's
+physical-px delta is divided by the scale factor). Scrolling follows a
+real change of keyboard focus or of the active layer (row click,
+undo/redo, New/Delete Layer, an opened document), and opening a document
+resets Layers and History to the top. 2,710 tests passing
+(`AURORA_REQUIRE_GPU=1`, RTX 3090). **Not yet verified on real hardware**
+— trackpad feel, direction and momentum need a human. No visible
+scrollbar yet (0.146.0), so a mouse without a wheel still cannot scroll.
+Details: "Next action", addendum 0.145.0.
+
+**Previously (2026-10-08, 0.144.0): PSD and PSB files open, layered.**
 `aurora_io::psd` is Aurora's own reader (no third-party PSD crate) for
 8- and 16-bit RGB Photoshop files: raw, PackBits, ZIP and ZIP-with-
 prediction channels; layers from the layer-info section or a 16-bit
@@ -36,7 +60,7 @@ modes and visibility; the merged image for a file with no layers.
 `App::open_file` routes `.psd`/`.psb` to `App::open_psd_file`, which
 installs the whole tree exactly as a flat image is installed (old tiles
 swept first, then every layer written). Anything Aurora can't show yet
-— masks (decoded, not applied until 0.145.0), clipping, effects,
+— masks (decoded, not applied yet; now planned for 0.147.0), clipping, effects,
 adjustment/fill layers, Pass Through with blend modes inside — is listed
 in an "Opened With Changes" dialog; CMYK/Lab/Grayscale/32-bit get their
 own "Couldn't Open File" reason. Over the 272-file psd-tools corpus: 217
@@ -6602,7 +6626,9 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03, `crates/aurora-ui/src/{panel,workspace}.rs` (`aurora-ui`'s
+  2026-08-03 (**update 0.145.0:** every panel body now scrolls, wheel
+  and trackpad — "Next action", addendum 0.145.0; no visible scrollbar
+  yet), `crates/aurora-ui/src/{panel,workspace}.rs` (`aurora-ui`'s
   first real code — was a placeholder `crate_name()`). Matches the
   structure of the owner-approved workspace mockup
   (`design/mockups/workspace.html`, Phase 0 0.5): a canvas area plus a
@@ -8699,7 +8725,7 @@ structural design work.
   through the tile store (breaks invariant §7.3.1 for this path; the
   2 GB/5 s budget is not addressed); ICC ignored (reported only when the
   profile is not recognisably sRGB, a byte-match heuristic); Grayscale is
-  0.145.0, CMYK/Lab/32-bit refused; masks decoded but not applied, vector
+  planned (0.147.0, moved from 0.145.0), CMYK/Lab/32-bit refused; masks decoded but not applied, vector
   masks, clipping, effects (reported whenever an `lfx2`/`lrFX` block is
   present, even if disabled), Blend If and knockout not applied (the last
   two unreported); text/smart objects/shapes open as their stored pixels;
@@ -30174,6 +30200,83 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.145.0) — scrolling panels.** Done as 0.144.1
+suggested, for the same real-macOS report. `WidgetTree` scroll
+containers (aurora-widgets `tree.rs`): a per-widget flag separate from
+the style (a collapse's style reset keeps it), an offset stored exactly
+and applied rounded to whole px (sub-pixel trackpad deltas add up), a
+post-layout pass that measures each container's content from its
+descendants' laid-out bounds (skipping popovers, zero-height widgets and
+anything inside a nested clipping container) plus its bottom padding,
+records the range and clamps the offset — deepest container first. A
+collapsed (zero-height) body keeps its offset, so expanding restores the
+scroll position. `hit_test`/paint needed no change: the container's own
+bounds never move, so its clip already hides and refuses scrolled-out
+rows. **The one trap:** the Layers `Role::Tree` container was sized to
+the body (`percent(1.0)`); under an offset it moved up with the rows and
+the rows below its shifted bottom failed the hit test. `populate_
+layers_panel` now makes it content-sized (`height: auto`,
+`flex_shrink: 0`); `panel.rs` had claimed that "would silently
+reintroduce" the 0.77.1 rail starvation — it does not, measured:
+`a_crowded_layers_panel_never_starves_its_sibling_panels` passes
+unedited. The old `rows_past_the_bottom_of_a_bounded_panel_are_clipped_
+and_not_yet_reachable` became `a_layers_row_past_the_bottom_is_
+reachable_after_scrolling` (200 layers, a 400 px window, every row
+clickable after `scroll_into_view`). App: `wheel_target` (modal → nothing;
+canvas → zoom, first; pointer owned → nothing; else
+`scroll_container_at`), `panel_scroll_delta` (line → rows; `PixelDelta`
+÷ scale factor — winit 0.30's macOS backend converts points with
+`to_physical`, read in its source), `scroll_panel` (relayout only when
+something moved), `follow_scroll` in `App::layout` (only on a real
+change of focus or active layer; reset on open, since layer ids
+restart), and `replace_document` resets Layers/History to 0.
+**Mutations (17, really run, each restored from a scratchpad backup and
+sha256-checked):** killed — children not offset (7 widgets + 2 ui
+tests); offset applied to the container's own bounds too (7 + 1); no
+layout-time bottom clamp (`removing_rows_reclamps_a_stale_offset`, plus
+the ui round trip); no `.max(0)` on the range (2); content measured from
+direct children only (killed only after this round added
+`content_overflowing_an_unclipped_intermediate_container_still_counts` —
+it survived the first run); the walk descending into a nested scroller
+(the nested test, after moving its host to the last row so the inner
+content reaches past the outer's end); the Layers container back at
+`percent(1.0)` (the hit-test trap, `a_layers_row_past_the_bottom_is_
+reachable_after_scrolling`); swapped wheel sign; `PixelDelta` not
+divided by the scale factor; no reset on document replace; no
+accesskit `scroll_y_max`; follow ignoring an active-layer change; follow
+ignoring a focus change; a collapsed body clamped to 0 (ui round trip
+only); popovers counted in the range; `scroll_container_at` not refusing
+popovers. **Survived, one:** checking panels before the canvas in
+`wheel_target` — equivalent today, since no scroll container overlaps
+the canvas area; disclosed, not killed. **Disclosed:** trackpad direction, momentum and
+feel are unverified (Linux sandbox, no display); every momentum event
+mid-range relayouts once (not measured); no visible scrollbar and no
+accessibility scroll *actions* (properties only — a screen reader user
+reaches rows through focus-driven scroll-into-view); the Widget Gallery
+does not scroll (content-sized, range 0); no horizontal scrolling;
+a focused widget scrolled out of view keeps focus; a Layers repopulate
+gives rows new ids, so a focused row is brought back into view after
+one. **Needs a human:** the many-layer PSD in a short window — wheel and
+trackpad over Layers and History, direction, a click on a scrolled-in
+row, the canvas still zooming. **Measured after the review:** full gate
+green on the RTX 3090 with `AURORA_REQUIRE_GPU=1` — 2,710 passed,
+0 failed, 0 skipped; doctests, strict rustdoc and `cargo deny` clean.
+Independent review + judge: **PASS 0.912**, no blocking issue. Its
+low-severity follow-ups, carried into 0.146.0: a collapsed panel loses
+its saved offset if the active layer changes while it is collapsed
+(`scroll_into_view` clamps against the zero-height body's range of 0);
+`scroll_into_view` does not stop at popovers, unlike
+`scroll_container_at`, so focus on a popover item could scroll its
+owner's panel; a dropdown left open stays open while its owner scrolls
+out of view; and with the command palette open, which is not modal, the
+wheel still scrolls panels and zooms the canvas. **Needs a human, too:**
+text on a partly scrolled row is clipped. Only `visible_rect` is tested
+for this; the text path is unverified. **Suggested next (0.146.0):** a visible
+panel scrollbar (the existing `Scrollbar` widget; thickness already from
+the `type_size md` scale, no new token) plus accesskit scroll actions;
+then **0.147.0:** PSD layer masks and Grayscale (previously suggested
+for 0.145.0).
 
 **Addendum 2026-10-08 (0.144.1) — Layers rows overlapped in a short
 window.** First real-macOS PSD run (a many-layer text-placeholder PSD):

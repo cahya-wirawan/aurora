@@ -92,6 +92,10 @@ pub fn insert_panel(
         WidgetKind::Container,
     )?;
     let body = widgets::insert_container(tree, root, body_style(false))?;
+    // Every docked panel's body scrolls (0.145.0) -- see `body_style`.
+    // The flag is the tree's own, not part of the style, so
+    // `set_panel_collapsed`'s style resets keep it.
+    tree.set_scrollable(body, true)?;
     Ok(PanelHandle { root, header, body })
 }
 
@@ -219,13 +223,18 @@ fn root_style(collapsed: bool) -> Style {
 /// is invisible as well — rather than merely covered by whatever the
 /// paint order happens to draw next. This declaration is what that
 /// intersection reads; it is the only clipping overflow in the
-/// workspace. **What does not exist yet is any way to *reach* that
-/// content** — there is no scrolling container in `aurora-widgets` (see
-/// `aurora_widgets::widgets::tree_view`'s own module doc comment), so
-/// rows past the bottom of a crowded Layers panel are currently not
-/// reachable at all. That is a real, disclosed gap and the next piece of
-/// work here; it is strictly better than the alternative it replaced,
-/// which was losing the Properties and History panels entirely.
+/// workspace.
+///
+/// **That content is reachable by scrolling (0.145.0).** [`insert_panel`]
+/// makes every body a `WidgetTree::set_scrollable` container, so the
+/// mouse wheel (and a trackpad) over a panel moves the rows past its
+/// bottom into view — `aurora-app` routes the wheel — and the body's own
+/// bounds never move, so this clip is what keeps a scrolled-out row
+/// invisible and unclickable. Until then rows past the bottom of a
+/// crowded Layers panel were laid out but not reachable at all. What is
+/// still missing is a visible scrollbar (a mouse with no wheel cannot
+/// scroll yet) and the accessibility scroll *actions*; the body does
+/// report its position and range to a screen reader.
 ///
 /// **`FlexDirection::Column` is new in `0.77.2`, and it is a bug fix,
 /// not a preference.** The body previously inherited `Style::default()`'s
@@ -241,23 +250,26 @@ fn root_style(collapsed: bool) -> Style {
 ///
 /// What this does and does not change:
 ///
-/// - **Layers** is unaffected. `aurora_widgets::widgets::
-///   insert_tree_view` gives its own container an explicit
-///   `size: { width: percent(1.0), height: percent(1.0) }` on *both*
-///   axes, so its resolved box is identical under `Row` or `Column`.
-///   **The height being a *definite* `percent(1.0)`, not merely
-///   present, is what carries that** — and it is worth spelling out,
-///   because once height became the main axis the flex-item automatic
-///   minimum size became able to clamp the container *upward* to its
-///   content, and a Layers tree over a long document is easily 900 px of
-///   content inside a 300 px body. A definite main size caps the
-///   automatic minimum, so the container stays the body's height and its
-///   overflow is clipped rather than pushing the panel open. Changing
-///   that height to `auto()` would silently reintroduce exactly the
-///   rail-starvation bug `0.77.1` fixed on [`root_style`].
-///   That container is now redundant for Layers and is deliberately
-///   kept: removing it would mean rewriting every Layers test's
-///   tree-root traversal for no behavioural gain.
+/// - **Layers** was unaffected at the time: `aurora_widgets::widgets::
+///   insert_tree_view` gave its own container an explicit
+///   `size: { width: percent(1.0), height: percent(1.0) }` on both axes,
+///   identical under `Row` or `Column`. **As of 0.145.0
+///   `crate::populate_layers_panel` overrides that height to `auto()`
+///   (content-sized, `flex_shrink: 0`)**, and this paragraph used to say
+///   doing so "would silently reintroduce exactly the rail-starvation bug
+///   `0.77.1` fixed". It does not, and that is measured rather than
+///   argued: `a_crowded_layers_panel_never_starves_its_sibling_panels`
+///   (1 to 400 layers in a real `build_workspace`) passes unedited with
+///   the content-sized container. The container's automatic minimum can
+///   now grow it to its content, but it is the *body's* item, and the
+///   body (`flex_basis: 0`, `min_size: 0`, and a clipping overflow, whose
+///   automatic minimum is zero) is what the root and rail see — so the
+///   rows overflow the body, clipped, instead of pushing the panel open.
+///   The override is required, not cosmetic: a container held at the
+///   body's height moves with the scroll offset, and every row past its
+///   shifted bottom edge would fail `WidgetTree::hit_test` at the
+///   container even once scrolled into view. The container itself stays,
+///   for the `Role::Tree` node it carries.
 /// - **History** is what this fixes, together with its own rows'
 ///   real `min_size` ([`row_style`], which lived in
 ///   `crate::history_panel` when this was written).

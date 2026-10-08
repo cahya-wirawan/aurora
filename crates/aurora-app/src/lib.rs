@@ -1300,6 +1300,12 @@ fn replace_document(
     // caller can observe, including the error: a missing panel body is
     // still reported as the same `WidgetError::UnknownWidget`, just
     // raised by the populate call instead of the clear before it.
+    // A different document starts its Layers and History panels at the
+    // top (0.145.0): a scroll offset into the outgoing document's rows
+    // means nothing for the incoming one's. Properties is left alone --
+    // it shows the tool, which an open does not change.
+    workspace.tree.set_scroll_y(workspace.layers.body, 0.0)?;
+    workspace.tree.set_scroll_y(workspace.history.body, 0.0)?;
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
@@ -7036,6 +7042,170 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
         winit::event::MouseScrollDelta::LineDelta(_, y) => y,
         winit::event::MouseScrollDelta::PixelDelta(position) => (position.y / 20.0) as f32,
     }
+}
+
+/// How far, in logical px, one `WindowEvent::MouseWheel` over a dock
+/// panel scrolls it (0.145.0). **Positive is "scroll up"** — `winit`'s own
+/// sign convention, the same one [`zoom_steps_for_scroll`] reads: the
+/// content moves down and what is above comes into view, so the caller
+/// passes the *negated* value to `WidgetTree::scroll_by`.
+///
+/// - A wheel's `LineDelta` is in lines: one notch moves one panel row
+///   (`row`, `aurora_widgets::widgets::row_height`).
+/// - A trackpad's `PixelDelta` is in **physical** px (`winit` 0.30's
+///   macOS backend converts `scrollingDeltaY`'s points with
+///   `to_physical(scale_factor)`), so it is divided back by
+///   `scale_factor` into the logical px layout uses — otherwise a Retina
+///   trackpad would scroll panels twice as fast as the fingers move. A
+///   non-positive or non-finite `scale_factor` falls back to `1.0`, the
+///   same guard [`logical_size`] uses.
+///
+/// A non-finite result is `0.0`: `scroll_by` rejects one anyway, and a
+/// stray `NaN` from a driver should be no scroll rather than a logged
+/// error per event.
+#[must_use]
+fn panel_scroll_delta(delta: winit::event::MouseScrollDelta, scale_factor: f64, row: f32) -> f32 {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let dy = match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, lines) => lines * row,
+        winit::event::MouseScrollDelta::PixelDelta(position) => (position.y / scale_factor) as f32,
+    };
+    if dy.is_finite() { dy } else { 0.0 }
+}
+
+/// Where one `WindowEvent::MouseWheel` at `position` (logical px) goes —
+/// [`wheel_target`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WheelTarget {
+    /// Zoom the canvas around this canvas-area-relative point
+    /// ([`apply_scroll_zoom`]) — exactly the pre-0.145.0 behaviour.
+    Canvas((f32, f32)),
+    /// Scroll this panel body ([`scroll_panel`]).
+    Panel(WidgetId),
+    /// Nothing moves.
+    Nothing,
+}
+
+/// Routes a wheel event (0.145.0), in this order:
+///
+/// 1. **An open modal dialog swallows it** (`modal_open`), the same rule
+///    [`handle_key`] opens with — neither the canvas nor a panel behind a
+///    modal moves.
+/// 2. **Over the canvas it zooms, first and unconditionally** — checked
+///    before any panel, and regardless of `pointer_owned`, so a wheel
+///    over the canvas does exactly what it did before scrolling existed,
+///    zoom-while-stroking included ([`apply_scroll_zoom`]'s own drag
+///    re-anchoring).
+/// 3. **Anywhere else, while something owns the pointer**
+///    (`pointer_owned`: a live canvas drag, a rail resize, or a gallery
+///    widget's capture) nothing moves: scrolling a panel out from under a
+///    drag would move whatever the drag is pointing at.
+/// 4. Otherwise the scroll container under the pointer that has
+///    somewhere to scroll (`WidgetTree::scroll_container_at`) scrolls;
+///    one whose content fits, an open popover, or the bare rail is
+///    [`WheelTarget::Nothing`].
+#[must_use]
+fn wheel_target(
+    workspace: &aurora_ui::Workspace,
+    position: (f32, f32),
+    modal_open: bool,
+    pointer_owned: bool,
+) -> WheelTarget {
+    if modal_open {
+        return WheelTarget::Nothing;
+    }
+    if let Some(canvas_point) = pointer_in_canvas(workspace, position) {
+        return WheelTarget::Canvas(canvas_point);
+    }
+    if pointer_owned {
+        return WheelTarget::Nothing;
+    }
+    workspace
+        .tree
+        .scroll_container_at(position)
+        .map_or(WheelTarget::Nothing, WheelTarget::Panel)
+}
+
+/// Scrolls `container` by one wheel event's [`panel_scroll_delta`],
+/// negated into `WidgetTree::scroll_by`'s "positive reveals what is
+/// below" direction. Returns whether anything on screen moved — `false`
+/// against either end of the range, so a trackpad's momentum tail
+/// hitting the top or bottom costs no relayout.
+fn scroll_panel(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    container: WidgetId,
+    delta: winit::event::MouseScrollDelta,
+    scale_factor: f64,
+    scales: &Scales,
+) -> bool {
+    let dy = panel_scroll_delta(
+        delta,
+        scale_factor,
+        aurora_widgets::widgets::row_height(scales),
+    );
+    match tree.scroll_by(container, -dy) {
+        Ok(moved) => moved,
+        Err(err) => {
+            tracing::warn!(?err, "panel scroll failed");
+            false
+        }
+    }
+}
+
+/// What [`follow_scroll`] last saw (0.145.0): the focused widget and the
+/// active layer at the previous layout. Starts empty, so the first
+/// layout after startup — or after [`App::open_file`] resets it — counts
+/// both as changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScrollFollow {
+    focus: Option<WidgetId>,
+    active: Option<aurora_doc::LayerId>,
+}
+
+/// Keeps what the user is working on in view (0.145.0): after a layout,
+/// if keyboard focus moved to a different widget, scrolls that widget's
+/// panel just far enough to show it; if the active layer changed (a row
+/// click, undo/redo, New/Delete Layer, an opened document), does the same
+/// for that layer's Layers row. Returns whether either scrolled, so the
+/// caller lays out once more. **Only on a real change** — a widget or
+/// layer that stays put is never scrolled back into view, so a user who
+/// scrolls the active row out of sight keeps the view they chose.
+///
+/// The active row is followed second, so when one event moves both (a
+/// Layers row click focuses and activates the same row) it is the row
+/// that wins. A rebuilt Layers panel gives every row a new `WidgetId`, so
+/// focus on a row "changes" across a repopulate even when it stays on the
+/// same layer, and that row is brought back into view — disclosed rather
+/// than special-cased.
+fn follow_scroll(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    last: &mut ScrollFollow,
+    focused: Option<WidgetId>,
+    active: Option<aurora_doc::LayerId>,
+) -> bool {
+    let mut moved = false;
+    if focused != last.focus
+        && let Some(widget) = focused
+    {
+        moved |= tree.scroll_into_view(widget);
+    }
+    if active != last.active
+        && let Some(layer) = active
+        && let Some((&row, _)) = layer_rows.iter().find(|&(_, &id)| id == layer)
+    {
+        moved |= tree.scroll_into_view(row);
+    }
+    *last = ScrollFollow {
+        focus: focused,
+        active,
+    };
+    moved
 }
 
 /// Zooms `view` in/out around `anchor` (already canvas-area-relative) in
@@ -16813,6 +16983,11 @@ struct App {
     /// `WidgetTree::hit_test` result up in to turn a click into "select
     /// this layer."
     layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+    /// The focused widget and active layer the last layout saw — what
+    /// [`follow_scroll`] compares against to scroll a newly focused
+    /// widget or newly active layer's row into view (0.145.0). Reset to
+    /// empty when a document is opened, since layer ids restart there.
+    scroll_follow: ScrollFollow,
     /// This document's own shared tile store (ADR 0010) — `None` if it
     /// failed to open (e.g. an unwritable scratch directory), logged as
     /// a warning rather than treated as fatal, the same "must never stop
@@ -17145,6 +17320,7 @@ impl App {
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
+            scroll_follow: ScrollFollow::default(),
             tile_store,
             residency: None,
             canvas_pipeline: None,
@@ -17817,6 +17993,10 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
+        // Layer ids restart in a fresh document, so the incoming active
+        // layer may share the outgoing one's id: forget what was last
+        // followed, so the next layout scrolls its row into view.
+        self.scroll_follow = ScrollFollow::default();
         // Through `load_document_view`, never `reset_canvas_view` or
         // `CanvasView::default()` directly: the default drops the
         // atlas's zoom floor, and the reset on its own drops the pan
@@ -17954,6 +18134,10 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
+        // Layer ids restart in a fresh document, so the incoming active
+        // layer may share the outgoing one's id: forget what was last
+        // followed, so the next layout scrolls its row into view.
+        self.scroll_follow = ScrollFollow::default();
         // Through `load_document_view`, never `reset_canvas_view` or
         // `CanvasView::default()` directly: the default drops the
         // atlas's zoom floor, and the reset on its own drops the pan
@@ -19046,24 +19230,54 @@ impl App {
     /// one keeps the drag and re-anchors it against the moved view —
     /// see [`shift_drag_reference`] for why the pan clamp inside that
     /// zoom would otherwise paint a line the user never drew.
+    ///
+    /// **Over a dock panel it scrolls that panel (0.145.0)** — see
+    /// [`wheel_target`] for the full routing order (a modal dialog
+    /// swallows the event; the canvas check runs first) and
+    /// [`panel_scroll_delta`] for the units. A scroll that moved nothing
+    /// (either end of the range) relayouts nothing.
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         let Some(position) = self.pointer_position else {
             return;
         };
-        let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
-            return;
-        };
-        apply_scroll_zoom(
-            &mut self.canvas_view,
-            self.drag.as_mut(),
-            canvas_point,
-            delta,
-            pan_bounds(
-                &self.layers,
-                self.active_layer,
-                canvas_area_logical_size(&self.workspace),
+        let pointer_owned = self.drag.is_some()
+            || self.rail_resize.is_some()
+            || self.gallery_click.captured().is_some();
+        match wheel_target(
+            &self.workspace,
+            position,
+            self.dialog.is_some(),
+            pointer_owned,
+        ) {
+            WheelTarget::Canvas(canvas_point) => apply_scroll_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                canvas_point,
+                delta,
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             ),
-        );
+            WheelTarget::Panel(container) => {
+                if scroll_panel(
+                    &mut self.workspace.tree,
+                    container,
+                    delta,
+                    self.scale_factor,
+                    &self.scales,
+                ) {
+                    let window_size = self.window.as_ref().map(|window| window.inner_size());
+                    if let Some(size) = window_size {
+                        self.apply_resize((size.width, size.height));
+                    }
+                    self.push_accessibility();
+                    self.needs_redraw = true;
+                }
+            }
+            WheelTarget::Nothing => {}
+        }
     }
 
     /// Routes one native menu activation to [`activate_command`] — the
@@ -19504,6 +19718,11 @@ impl App {
     /// so every layout sizes checkboxes to their labels with the same
     /// engine, scales and scale factor the frame paints with. See
     /// [`layout_workspace`].
+    ///
+    /// Also where scrolling follows focus and the active layer
+    /// ([`follow_scroll`], 0.145.0): every relayout compares both against
+    /// the previous one, and lays out a second time only when that
+    /// scrolled a panel.
     fn layout(&mut self, width: f32, height: f32) {
         layout_workspace(
             &mut self.workspace,
@@ -19513,6 +19732,22 @@ impl App {
             width,
             height,
         );
+        if follow_scroll(
+            &mut self.workspace.tree,
+            &self.layer_rows,
+            &mut self.scroll_follow,
+            self.focus.focused(),
+            self.active_layer,
+        ) {
+            layout_workspace(
+                &mut self.workspace,
+                self.text_engine.as_mut(),
+                &self.scales,
+                self.scale_factor,
+                width,
+                height,
+            );
+        }
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -57676,5 +57911,278 @@ mod text_layout_tests {
         layout_workspace(&mut via_helper, None, &scales, 2.0, 1280.0, 800.0);
         blind.tree.compute_layout(1280.0, 800.0);
         assert_eq!(every_bounds(&via_helper.tree), every_bounds(&blind.tree));
+    }
+}
+
+/// Panel scrolling's app half (0.145.0): wheel routing, units, and
+/// scrolling that follows focus, the active layer and a document open.
+#[cfg(test)]
+mod panel_scroll_tests {
+    use super::{
+        ScrollFollow, WheelTarget, follow_scroll, panel_scroll_delta, pointer_in_canvas,
+        replace_document, scroll_panel, wheel_target,
+    };
+    use std::collections::HashMap;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseScrollDelta;
+
+    const ROW: f32 = 21.0;
+
+    fn layers_of(count: usize) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        for i in 0..count {
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            };
+            if let Err(err) = layers.add_pixel_layer(format!("Layer {i}"), bounds, None) {
+                unreachable!("{err:?}");
+            }
+        }
+        layers
+    }
+
+    /// A real workspace holding a `count`-layer document, laid out in a
+    /// short 1000x400 window.
+    fn crowded(
+        count: usize,
+    ) -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        HashMap<aurora_widgets::WidgetId, aurora_doc::LayerId>,
+    ) {
+        let scales = crate::test_workspace_scales();
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let layers = layers_of(count);
+        let history = aurora_doc::History::new();
+        let (rows, _) = match replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        workspace.tree.compute_layout(1000.0, 400.0);
+        (workspace, layers, rows)
+    }
+
+    fn inside_layers_body(workspace: &aurora_ui::Workspace) -> (f32, f32) {
+        let Some(body) = workspace.tree.bounds(workspace.layers.body) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = ((body.x + 20) as f32, (body.y + 20) as f32);
+        point
+    }
+
+    #[test]
+    fn panel_scroll_delta_converts_lines_and_physical_pixels_to_logical_px() {
+        let line = |y| MouseScrollDelta::LineDelta(0.0, y);
+        let pixels = |y| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        assert!((panel_scroll_delta(line(1.0), 2.0, ROW) - ROW).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(line(-1.0), 1.0, ROW) + ROW).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(pixels(30.0), 2.0, ROW) - 15.0).abs() < f32::EPSILON);
+        assert!((panel_scroll_delta(pixels(-30.0), 1.0, ROW) + 30.0).abs() < f32::EPSILON);
+        assert!(
+            (panel_scroll_delta(pixels(30.0), 0.0, ROW) - 30.0).abs() < f32::EPSILON,
+            "a nonsense scale factor falls back to 1"
+        );
+        assert!(panel_scroll_delta(pixels(f64::NAN), 2.0, ROW).abs() < f32::EPSILON);
+        assert!(panel_scroll_delta(line(f32::INFINITY), 1.0, ROW).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_wheel_over_the_layers_body_scrolls_it_down_and_back() {
+        let (mut workspace, _, _) = crowded(200);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(pointer_in_canvas(&workspace, point), None);
+        let WheelTarget::Panel(container) = wheel_target(&workspace, point, false, false) else {
+            unreachable!("the crowded Layers body is under the pointer");
+        };
+        assert_eq!(container, workspace.layers.body);
+        let scales = crate::test_workspace_scales();
+        // A wheel notch *towards* the user (negative y) reveals what is
+        // below: the offset grows by one row.
+        let down = MouseScrollDelta::LineDelta(0.0, -1.0);
+        assert!(scroll_panel(
+            &mut workspace.tree,
+            container,
+            down,
+            2.0,
+            &scales
+        ));
+        let row = aurora_widgets::widgets::row_height(&scales);
+        assert_eq!(workspace.tree.scroll_y(container), Some(row));
+        let up = MouseScrollDelta::LineDelta(0.0, 3.0);
+        assert!(scroll_panel(
+            &mut workspace.tree,
+            container,
+            up,
+            2.0,
+            &scales
+        ));
+        assert_eq!(workspace.tree.scroll_y(container), Some(0.0));
+        assert!(
+            !scroll_panel(&mut workspace.tree, container, up, 2.0, &scales),
+            "already at the top: nothing moves, so nothing relayouts"
+        );
+    }
+
+    #[test]
+    fn a_wheel_over_the_canvas_zooms_and_never_scrolls_a_panel() {
+        let (workspace, _, _) = crowded(200);
+        assert!(matches!(
+            wheel_target(&workspace, (100.0, 50.0), false, false),
+            WheelTarget::Canvas(_)
+        ));
+        // ...and still does while a drag owns the pointer.
+        assert!(matches!(
+            wheel_target(&workspace, (100.0, 50.0), false, true),
+            WheelTarget::Canvas(_)
+        ));
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+    }
+
+    #[test]
+    fn a_modal_dialog_or_an_owned_pointer_stops_the_wheel_moving_anything() {
+        let (workspace, _, _) = crowded(200);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(
+            wheel_target(&workspace, point, true, false),
+            WheelTarget::Nothing
+        );
+        assert_eq!(
+            wheel_target(&workspace, (100.0, 50.0), true, false),
+            WheelTarget::Nothing,
+            "not even the canvas zooms behind a modal"
+        );
+        assert_eq!(
+            wheel_target(&workspace, point, false, true),
+            WheelTarget::Nothing
+        );
+    }
+
+    #[test]
+    fn a_wheel_over_a_panel_whose_content_fits_does_nothing() {
+        let (workspace, _, _) = crowded(2);
+        let point = inside_layers_body(&workspace);
+        assert_eq!(
+            wheel_target(&workspace, point, false, false),
+            WheelTarget::Nothing
+        );
+    }
+
+    #[test]
+    fn an_active_layer_change_to_an_off_screen_row_scrolls_it_into_view() {
+        let (mut workspace, layers, rows) = crowded(200);
+        let mut last = ScrollFollow::default();
+        // The first follow (startup) settles on the topmost layer, already
+        // in view.
+        let top = layers.roots().first().copied();
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            top
+        ));
+        let bottom = layers.roots().last().copied();
+        assert!(follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            bottom
+        ));
+        workspace.tree.compute_layout(1000.0, 400.0);
+        let Some((&row, _)) = rows.iter().find(|&(_, &id)| Some(id) == bottom) else {
+            unreachable!("every layer has a row");
+        };
+        let (Some(row_bounds), Some(body)) = (
+            workspace.tree.bounds(row),
+            workspace.tree.bounds(workspace.layers.body),
+        ) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            row_bounds.y >= body.y && row_bounds.bottom() <= body.bottom(),
+            "{row_bounds:?} inside {body:?}"
+        );
+        // No change: the user's own scroll back to the top is left alone.
+        if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 0.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(!follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            None,
+            bottom
+        ));
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+    }
+
+    #[test]
+    fn a_focus_change_to_an_off_screen_row_scrolls_it_into_view() {
+        let (mut workspace, layers, rows) = crowded(200);
+        let mut last = ScrollFollow::default();
+        let Some(&layer) = layers.roots().get(150) else {
+            unreachable!("200 layers");
+        };
+        let Some((&row, _)) = rows.iter().find(|&(_, &id)| id == layer) else {
+            unreachable!("every layer has a row");
+        };
+        assert!(follow_scroll(
+            &mut workspace.tree,
+            &rows,
+            &mut last,
+            Some(row),
+            None
+        ));
+        assert!(
+            workspace
+                .tree
+                .scroll_y(workspace.layers.body)
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        assert_eq!(last.focus, Some(row));
+    }
+
+    #[test]
+    fn replacing_the_document_resets_layers_and_history_to_the_top() {
+        let (mut workspace, _, _) = crowded(200);
+        let scales = crate::test_workspace_scales();
+        if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 500.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            workspace
+                .tree
+                .scroll_y(workspace.layers.body)
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        let layers = layers_of(200);
+        let history = aurora_doc::History::new();
+        if let Err(err) = replace_document(
+            &mut workspace,
+            &scales,
+            &layers,
+            &history,
+            aurora_ui::Tool::default(),
+            &crate::ToolSettings::default(),
+        ) {
+            unreachable!("{err:?}");
+        }
+        workspace.tree.compute_layout(1000.0, 400.0);
+        assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
+        assert_eq!(workspace.tree.scroll_y(workspace.history.body), Some(0.0));
     }
 }

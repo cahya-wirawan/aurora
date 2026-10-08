@@ -6,12 +6,15 @@
 //! **Scope, stated honestly.** Five things a finished tree widget has
 //! and this one does not:
 //!
-//! - **No scrolling container.** A tree taller than its parent
-//!   overflows it; nothing here clips, and nothing observes a
-//!   [`super::ScrollbarState`] to move content. That is the same gap
-//!   `widgets`' own module doc comment records for `Scrollbar` (which
-//!   is a position *model*, not scrolling), and it is unchanged by this
-//!   module — a real scrolling container is separate, later work.
+//! - **No scrolling of its own.** A tree taller than its parent
+//!   overflows it; nothing here clips or scrolls. Scrolling belongs to
+//!   whatever holds the tree: as of 0.145.0 a
+//!   [`crate::WidgetTree::set_scrollable`] ancestor that clips its
+//!   vertical overflow (an `aurora-ui` panel body) scrolls the rows,
+//!   provided the tree's own container is sized to its content rather
+//!   than to that ancestor — see [`crate::WidgetTree::hit_test`] for why.
+//!   Nothing yet observes a [`super::ScrollbarState`] to move content:
+//!   there is no visible scrollbar on a scrolling tree.
 //! - **No disclosure triangle.** This crate draws no glyphs at all
 //!   (`paint`'s own module doc comment — solid fills only), so a
 //!   collapsed row is announced as collapsed but has no ▸ of its own;

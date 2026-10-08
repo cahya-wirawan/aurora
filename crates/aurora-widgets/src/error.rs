@@ -84,4 +84,12 @@ pub enum WidgetError {
     InvalidCurve(#[source] aurora_core::ToneCurveError),
     #[error("failed to tessellate a widget's own paint geometry: {0}")]
     Paint(#[source] aurora_vector::VectorError),
+    /// [`crate::WidgetTree::set_scroll_y`] or
+    /// [`crate::WidgetTree::scroll_by`] was handed a non-finite offset
+    /// (or delta). Rejected rather than stored: a `NaN` scroll offset
+    /// would survive every later clamp (`f32::min`/`max` drop a `NaN`
+    /// operand only on one side) and turn every descendant's bounds into
+    /// garbage on the next layout.
+    #[error("invalid scroll offset {offset} for widget {id:?}: it must be finite")]
+    InvalidScrollOffset { id: WidgetId, offset: f32 },
 }

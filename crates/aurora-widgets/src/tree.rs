@@ -119,6 +119,22 @@ struct WidgetNode<W> {
     /// hook ([`WidgetTree::compute_layout_with`] answering `Some`) rather
     /// than from its own style — see [`WidgetTree::is_measured`].
     measured: bool,
+    /// Whether this widget is a vertical scroll container (0.145.0) — see
+    /// [`WidgetTree::set_scrollable`]. Independent of `style`, so a
+    /// [`WidgetTree::set_style`] reset (a panel collapsing) never drops it.
+    scrollable: bool,
+    /// How far this scroll container's content is scrolled up, in logical
+    /// px — see [`WidgetTree::scroll_y`]. Always `0.0` on a widget that is
+    /// not [`Self::scrollable`]; always within `0.0..=scroll_max`.
+    scroll_y: f32,
+    /// The furthest [`Self::scroll_y`] the last layout allowed — content
+    /// height minus viewport height, never negative. `0.0` until the
+    /// first layout, and always `0.0` on a non-scrollable widget.
+    scroll_max: f32,
+    /// This widget's own bottom padding plus bottom border, as the last
+    /// layout resolved them — what a scroll container adds below its last
+    /// descendant so the content's end is not flush against the clip.
+    content_pad_bottom: f32,
     payload: W,
 }
 
@@ -194,6 +210,10 @@ impl<W> WidgetTree<W> {
                 damage_outset: 0,
                 layer: PaintLayer::Base,
                 measured: false,
+                scrollable: false,
+                scroll_y: 0.0,
+                scroll_max: 0.0,
+                content_pad_bottom: 0.0,
                 payload,
             },
         );
@@ -502,6 +522,10 @@ impl<W> WidgetTree<W> {
                 damage_outset: 0,
                 layer: PaintLayer::Base,
                 measured: false,
+                scrollable: false,
+                scroll_y: 0.0,
+                scroll_max: 0.0,
+                content_pad_bottom: 0.0,
                 payload,
             },
         );
@@ -623,6 +647,16 @@ impl<W> WidgetTree<W> {
     /// `point` is not descended into at all, on the assumption
     /// (already true of every widget this crate builds via flex layout)
     /// that a child never paints outside its parent's own bounds.
+    /// **Scrolled content (0.145.0) does lie outside its scroll
+    /// container's bounds**, and this is what keeps it unclickable there:
+    /// the container's own bounds never move with its offset, so a row
+    /// scrolled above or below it is not reached through the container,
+    /// matching paint, which clips it to the container's own clipping
+    /// overflow. The assumption therefore needs a scroll container's
+    /// *intermediate* descendants (a tree view's own container) to be
+    /// sized to their content, not to the container — one sized to the
+    /// viewport would move with the offset and refuse the rows below its
+    /// own shifted bottom edge.
     ///
     /// **Popovers are the one exception to that assumption** (0.127.0):
     /// a point outside the tree root's own bounds (the window) hits
@@ -915,6 +949,7 @@ impl<W> WidgetTree<W> {
         }
 
         self.apply_taffy_layout(self.root, &taffy, &taffy_ids, 0.0, 0.0);
+        self.clamp_scrolls(self.root);
 
         // No separate damage for a widget that became (or stopped being)
         // measured: `set_bounds` above already marked every laid-out
@@ -993,16 +1028,29 @@ impl<W> WidgetTree<W> {
         let abs_y = parent_y + layout.location.y;
         // `.max(0.0)` before the cast makes the sign-loss clippy warns
         // about unreachable in practice, but not provable statically.
+        //
+        // `y` is floored rather than truncated (0.145.0): content scrolled
+        // above the window's own top edge has a negative `abs_y`, where a
+        // truncating cast rounds toward zero instead of down and would put
+        // such a widget one pixel away from where `WidgetTree::set_scroll_y`'s
+        // integer shift puts it. For every non-negative `abs_y` -- every
+        // layout before scrolling existed -- the two casts are identical.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bounds = Rect {
             x: abs_x as i64,
-            y: abs_y as i64,
+            y: abs_y.floor() as i64,
             width: layout.size.width.max(0.0) as u32,
             height: layout.size.height.max(0.0) as u32,
         };
 
-        let children = match self.nodes.get(&id) {
-            Some(node) => node.children.clone(),
+        // A scroll container's own bounds never move with its offset --
+        // only its descendants do, by exactly the applied (whole-pixel)
+        // offset ([`WidgetTree::scroll_y`]).
+        let (children, offset) = match self.nodes.get_mut(&id) {
+            Some(node) => {
+                node.content_pad_bottom = layout.padding.bottom + layout.border.bottom;
+                (node.children.clone(), applied_scroll(node))
+            }
             None => unreachable!("id is known to exist: it was just looked up via taffy_ids"),
         };
 
@@ -1011,8 +1059,305 @@ impl<W> WidgetTree<W> {
         }
 
         for child in children {
-            self.apply_taffy_layout(child, taffy, taffy_ids, abs_x, abs_y);
+            self.apply_taffy_layout(child, taffy, taffy_ids, abs_x, abs_y - offset);
         }
+    }
+
+    /// The post-layout pass behind every scroll container's range
+    /// (0.145.0): visits the tree post-order, so a nested scroll
+    /// container is measured (and clamped) before the one around it, and
+    /// for every [`Self::set_scrollable`] widget records its
+    /// [`Self::scroll_range`] and pulls a stale offset back inside it.
+    ///
+    /// The content's extent is measured from the widget's descendants'
+    /// own laid-out bounds (`taffy`'s `Layout::content_size` is behind a
+    /// feature this workspace does not enable), plus the widget's own
+    /// bottom padding and border. Excluded from that walk: a popover
+    /// subtree (it floats above the panel and is clamped to the window,
+    /// not scrolled into), a zero-height widget (a `Display::None` one
+    /// among them, which `taffy` lays out at its parent's origin), and
+    /// everything *inside* a descendant that clips its own vertical
+    /// overflow — a nested scroll container among them — whose own box
+    /// counts but whose clipped content cannot be scrolled to from out
+    /// here.
+    ///
+    /// A zero-height container (collapsed, `Display::None`) keeps its
+    /// offset but reports no range, so nothing scrolls it while hidden.
+    ///
+    /// A changed offset shifts every descendant at once
+    /// ([`Self::shift_descendants`]), exactly as a fresh layout with the
+    /// new offset would have placed them.
+    // Exact float equality is the intent: both sides are the same
+    // stored or whole-pixel value when nothing changed.
+    #[allow(clippy::float_cmp)]
+    fn clamp_scrolls(&mut self, id: WidgetId) {
+        let children = match self.nodes.get(&id) {
+            Some(node) => node.children.clone(),
+            None => return,
+        };
+        for &child in &children {
+            self.clamp_scrolls(child);
+        }
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        if !node.scrollable {
+            return;
+        }
+        let applied = applied_scroll(node);
+        let top = node.bounds.y;
+        let viewport = node.bounds.height;
+        let pad = node.content_pad_bottom;
+        let mut bottom = None;
+        for &child in &children {
+            self.content_bottom(child, &mut bottom);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let max = bottom.map_or(0.0, |bottom: i64| {
+            let extent = (bottom - top) as f32 + applied + pad;
+            (extent - viewport as f32).max(0.0).round()
+        });
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        node.scroll_max = max;
+        // A container with no height at all (a collapsed panel's
+        // `Display::None` body) is not a viewport onto anything: its
+        // offset is kept, not clamped to zero, so expanding the panel
+        // again brings back the scroll position it was collapsed at.
+        if viewport == 0 {
+            node.scroll_max = 0.0;
+            return;
+        }
+        let clamped = node.scroll_y.min(max).max(0.0);
+        if clamped == node.scroll_y {
+            return;
+        }
+        node.scroll_y = clamped;
+        let new_applied = applied_scroll(node);
+        #[allow(clippy::cast_possible_truncation)]
+        let dy = (applied - new_applied) as i64;
+        self.shift_descendants(id, dy);
+    }
+
+    /// Folds into `bottom` the lowest laid-out edge of `id` and of every
+    /// descendant [`Self::clamp_scrolls`] counts as scrollable content —
+    /// see that method for what is skipped and why.
+    fn content_bottom(&self, id: WidgetId, bottom: &mut Option<i64>) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        if node.layer == PaintLayer::Popover {
+            return;
+        }
+        if node.bounds.height > 0 {
+            let edge = node.bounds.bottom();
+            *bottom = Some(bottom.map_or(edge, |current: i64| current.max(edge)));
+        }
+        if node.scrollable || node.style.overflow.y != Overflow::Visible {
+            return;
+        }
+        for &child in &node.children {
+            self.content_bottom(child, bottom);
+        }
+    }
+
+    /// Moves every strict descendant of `id` down by `dy` whole pixels
+    /// (up, for a negative `dy`) through [`Self::set_bounds`], so each one
+    /// reports its vacated and newly occupied regions as damage.
+    fn shift_descendants(&mut self, id: WidgetId, dy: i64) {
+        if dy == 0 {
+            return;
+        }
+        let mut stack = match self.nodes.get(&id) {
+            Some(node) => node.children.clone(),
+            None => return,
+        };
+        while let Some(current) = stack.pop() {
+            let Some(node) = self.nodes.get(&current) else {
+                continue;
+            };
+            let mut bounds = node.bounds;
+            stack.extend(node.children.iter().copied());
+            bounds.y = bounds.y.saturating_add(dy);
+            if let Err(err) = self.set_bounds(current, bounds) {
+                unreachable!("current was just looked up: {err:?}");
+            }
+        }
+    }
+
+    /// Marks `id` as a vertical scroll container — or, with `false`,
+    /// stops it being one, scrolling its content back to the top first.
+    /// The flag is this tree's own, separate from the widget's
+    /// [`LayoutStyle`], so a later [`Self::set_style`] never clears it. A
+    /// scroll container should also clip its own vertical overflow
+    /// (`Overflow::Hidden` in its style); otherwise content scrolled past
+    /// its edges is still painted there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist.
+    pub fn set_scrollable(&mut self, id: WidgetId, scrollable: bool) -> Result<(), WidgetError> {
+        if !scrollable {
+            self.set_scroll_y(id, 0.0)?;
+        }
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(WidgetError::UnknownWidget(id))?;
+        node.scrollable = scrollable;
+        if !scrollable {
+            node.scroll_max = 0.0;
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is a scroll container ([`Self::set_scrollable`]);
+    /// `None` for an unknown id.
+    #[must_use]
+    pub fn is_scrollable(&self, id: WidgetId) -> Option<bool> {
+        self.nodes.get(&id).map(|node| node.scrollable)
+    }
+
+    /// How far `id`'s content is scrolled up, in logical px (`0.0` is the
+    /// top); `None` for an unknown id, and always `0.0` for a widget that
+    /// is not a scroll container. Layout moves the content by this value
+    /// **rounded to a whole pixel** — the stored value keeps any fraction,
+    /// so a run of sub-pixel trackpad deltas still adds up instead of
+    /// each one rounding away.
+    ///
+    /// This is view state, not document state: nothing persists it, no
+    /// undo step records it, and a fresh tree starts every container at
+    /// the top.
+    #[must_use]
+    pub fn scroll_y(&self, id: WidgetId) -> Option<f32> {
+        self.nodes.get(&id).map(|node| node.scroll_y)
+    }
+
+    /// The furthest `id` can scroll — content height minus viewport
+    /// height, as the **last layout** measured it, never negative; `None`
+    /// for an unknown id, and `0.0` for a widget that is not a scroll
+    /// container or whose content fits.
+    #[must_use]
+    pub fn scroll_range(&self, id: WidgetId) -> Option<f32> {
+        self.nodes.get(&id).map(|node| node.scroll_max)
+    }
+
+    /// Scrolls `id`'s content to `offset` logical px from the top,
+    /// clamped to `0.0..=`[`Self::scroll_range`] (so a widget that is not
+    /// a scroll container, or that has not been laid out yet, stays at
+    /// `0.0`). Every descendant moves at once by the change in the
+    /// whole-pixel offset, exactly where the next layout would put it, so
+    /// hit-testing is right before any relayout. Returns whether that
+    /// whole-pixel offset — and so anything on screen — changed: a caller
+    /// needs to relayout and repaint only when it is `true`, which keeps a
+    /// burst of wheel events against either end of the range free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+    /// [`WidgetError::InvalidScrollOffset`] for a non-finite `offset`.
+    /// Nothing changes when either happens.
+    // Exact float equality is the intent: both sides are the same
+    // stored or whole-pixel value when nothing changed.
+    #[allow(clippy::float_cmp)]
+    pub fn set_scroll_y(&mut self, id: WidgetId, offset: f32) -> Result<bool, WidgetError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(WidgetError::UnknownWidget(id))?;
+        if !offset.is_finite() {
+            return Err(WidgetError::InvalidScrollOffset { id, offset });
+        }
+        let before = applied_scroll(node);
+        node.scroll_y = offset.min(node.scroll_max).max(0.0);
+        let after = applied_scroll(node);
+        if before == after {
+            return Ok(false);
+        }
+        node.dirty = true;
+        #[allow(clippy::cast_possible_truncation)]
+        let dy = (before - after) as i64;
+        self.shift_descendants(id, dy);
+        Ok(true)
+    }
+
+    /// [`Self::set_scroll_y`] relative to the current offset: a positive
+    /// `delta` scrolls the content up (reveals what is below).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_scroll_y`]; a non-finite `delta` is rejected.
+    pub fn scroll_by(&mut self, id: WidgetId, delta: f32) -> Result<bool, WidgetError> {
+        let current = self.scroll_y(id).ok_or(WidgetError::UnknownWidget(id))?;
+        if !delta.is_finite() {
+            return Err(WidgetError::InvalidScrollOffset { id, offset: delta });
+        }
+        self.set_scroll_y(id, current + delta)
+    }
+
+    /// Scrolls the nearest scroll container strictly above `id` just far
+    /// enough to bring `id`'s current bounds wholly inside the
+    /// container's own — or, for a widget taller than the container (a
+    /// Layers group row holding its children), to bring its top edge in.
+    /// A widget already wholly visible, or with no scroll container above
+    /// it, changes nothing. Returns whether anything moved.
+    ///
+    /// **One level only:** a container nested inside another scroll
+    /// container is scrolled, but the outer one is not then scrolled to
+    /// reveal the inner. No shipped panel nests scroll containers.
+    pub fn scroll_into_view(&mut self, id: WidgetId) -> bool {
+        let Some(target) = self.bounds(id) else {
+            return false;
+        };
+        let mut current = self.parent(id);
+        while let Some(ancestor) = current {
+            if self.is_scrollable(ancestor) == Some(true) {
+                break;
+            }
+            current = self.parent(ancestor);
+        }
+        let (Some(container), Some(view)) = (current, current.and_then(|c| self.bounds(c))) else {
+            return false;
+        };
+        let Some(offset) = self.scroll_y(container) else {
+            return false;
+        };
+        let (top, bottom) = (target.y, target.bottom());
+        let (view_top, view_bottom) = (view.y, view.bottom());
+        #[allow(clippy::cast_precision_loss)]
+        let wanted = if top < view_top || target.height > view.height {
+            offset - (view_top - top) as f32
+        } else if bottom > view_bottom {
+            offset + (bottom - view_bottom) as f32
+        } else {
+            return false;
+        };
+        self.set_scroll_y(container, wanted).unwrap_or(false)
+    }
+
+    /// The scroll container a wheel event at `point` should move: the
+    /// widget [`Self::hit_test`] finds there, or its nearest ancestor,
+    /// that is [`Self::set_scrollable`] **and** currently has somewhere to
+    /// scroll ([`Self::scroll_range`] above zero). `None` when nothing is
+    /// hit, when the hit widget sits inside a popover (an open dropdown
+    /// list floats above the panel and is not part of its scrolling
+    /// content), or when no such container encloses it.
+    #[must_use]
+    pub fn scroll_container_at(&self, point: (f32, f32)) -> Option<WidgetId> {
+        let hit = self.hit_test(point)?;
+        if self.popover_root_of(hit).is_some() {
+            return None;
+        }
+        let mut current = Some(hit);
+        while let Some(id) = current {
+            let node = self.nodes.get(&id)?;
+            if node.scrollable && node.scroll_max > 0.0 {
+                return Some(id);
+            }
+            current = node.parent;
+        }
+        None
     }
 
     /// Takes and clears the accumulated screen-space damage region, and
@@ -1061,6 +1406,21 @@ impl<W> WidgetTree<W> {
             .map(|(&id, node)| {
                 let mut accessibility = node.accessibility.clone();
                 accessibility.set_children(node.children.clone());
+                // A scroll container's position, from this tree's own
+                // state at update time rather than stored on the widget's
+                // node -- so a caller replacing that node
+                // (`set_accessibility`, a panel being closed and reopened)
+                // can never leave a stale or missing range behind. A
+                // container whose content fits declares no range at all.
+                if node.scrollable && node.scroll_max > 0.0 {
+                    accessibility.set_scroll_y(f64::from(applied_scroll(node)));
+                    accessibility.set_scroll_y_min(0.0);
+                    accessibility.set_scroll_y_max(f64::from(node.scroll_max));
+                } else if node.scrollable {
+                    accessibility.clear_scroll_y();
+                    accessibility.clear_scroll_y_min();
+                    accessibility.clear_scroll_y_max();
+                }
                 (id, accessibility)
             })
             .collect();
@@ -1084,6 +1444,17 @@ impl<W> WidgetTree<W> {
 /// (`crate::action::handle_action` rejects any other). One constant, so
 /// the two cannot drift apart.
 pub const ACCESSIBILITY_TREE_ID: TreeId = TreeId::ROOT;
+
+/// The whole-pixel offset layout actually moves `node`'s content by:
+/// its [`WidgetTree::scroll_y`] rounded, or `0.0` for a widget that is not
+/// a scroll container.
+fn applied_scroll<W>(node: &WidgetNode<W>) -> f32 {
+    if node.scrollable {
+        node.scroll_y.round()
+    } else {
+        0.0
+    }
+}
 
 /// Half-open containment — `point` is inside `rect` if `rect.x <=
 /// point.x < rect.right()` (and the same for `y`) — matching
@@ -1117,7 +1488,7 @@ mod tests {
     use accesskit::{Node, Role};
     use aurora_core::Rect;
     use taffy::style_helpers::{length, percent};
-    use taffy::{FlexDirection, Size, Size as LayoutSize, Style};
+    use taffy::{FlexDirection, Overflow, Size, Size as LayoutSize, Style};
 
     fn bounds(x: i64, y: i64, w: u32, h: u32) -> Rect {
         Rect {
@@ -2022,5 +2393,472 @@ mod tests {
         assert_eq!(tree.take_damage(), Some(bounds(10, 30, 40, 40)));
         assert_eq!(tree.popover_roots(), vec![p3]);
         assert!(!tree.contains(p2) && !tree.contains(q));
+    }
+
+    // -- scroll containers (0.145.0) --
+
+    /// A 200x300 window holding a 100 px tall, clipping, scrollable body
+    /// with `rows` 20 px rows in it -- so `rows * 20 - 100` px of scroll
+    /// range whenever there are more than five.
+    fn scroll_scene(rows: usize) -> (WidgetTree<&'static str>, WidgetId, Vec<WidgetId>) {
+        let column = |size: Style| Style {
+            flex_direction: FlexDirection::Column,
+            ..size
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), column(sized(200.0, 300.0)), "root");
+        let body_style = Style {
+            overflow: taffy::Point {
+                x: Overflow::Hidden,
+                y: Overflow::Hidden,
+            },
+            flex_shrink: 0.0,
+            ..column(sized(200.0, 100.0))
+        };
+        let body = match tree.insert(root, body_style, label("body"), "body") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_scrollable(body, true) {
+            unreachable!("{err:?}");
+        }
+        let rows = (0..rows)
+            .map(|_| {
+                let style = Style {
+                    flex_shrink: 0.0,
+                    ..sized(200.0, 20.0)
+                };
+                match tree.insert(body, style, label("row"), "row") {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            })
+            .collect();
+        tree.compute_layout(200.0, 300.0);
+        (tree, body, rows)
+    }
+
+    fn scroll_to(tree: &mut WidgetTree<&'static str>, id: WidgetId, y: f32) -> bool {
+        match tree.set_scroll_y(id, y) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn y_of(tree: &WidgetTree<&'static str>, id: WidgetId) -> i64 {
+        match tree.bounds(id) {
+            Some(rect) => rect.y,
+            None => unreachable!("known widget"),
+        }
+    }
+
+    #[test]
+    fn scroll_offset_moves_descendants_not_the_container() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert_eq!(tree.scroll_range(body), Some(100.0));
+        let [first, .., last] = rows.as_slice() else {
+            unreachable!("ten rows");
+        };
+        assert!(scroll_to(&mut tree, body, 30.0));
+        assert_eq!(
+            tree.bounds(body),
+            Some(bounds(0, 0, 200, 100)),
+            "set_scroll_y"
+        );
+        assert_eq!(y_of(&tree, *first), -30);
+        assert_eq!(y_of(&tree, *last), 150);
+        // A fresh layout puts everything exactly where the immediate
+        // shift did.
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.bounds(body), Some(bounds(0, 0, 200, 100)), "relayout");
+        assert_eq!(y_of(&tree, *first), -30);
+        assert_eq!(y_of(&tree, *last), 150);
+        assert_eq!(tree.scroll_y(body), Some(30.0));
+    }
+
+    #[test]
+    fn scroll_clamps_at_the_bottom() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert!(scroll_to(&mut tree, body, 1.0e6));
+        assert_eq!(tree.scroll_y(body), Some(100.0));
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_y(body), Some(100.0));
+        let Some(last) = rows.last().and_then(|&row| tree.bounds(row)) else {
+            unreachable!("ten rows");
+        };
+        assert_eq!(
+            last.bottom(),
+            100,
+            "the last row ends exactly at the body's bottom"
+        );
+        assert!(!scroll_to(&mut tree, body, 150.0), "already at the end");
+    }
+
+    #[test]
+    fn scroll_floor_is_zero_and_a_non_finite_offset_is_rejected() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert!(!scroll_to(&mut tree, body, -40.0));
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+        assert!(scroll_to(&mut tree, body, 20.0));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                tree.set_scroll_y(body, bad),
+                Err(WidgetError::InvalidScrollOffset { .. })
+            ));
+            assert!(matches!(
+                tree.scroll_by(body, bad),
+                Err(WidgetError::InvalidScrollOffset { .. })
+            ));
+        }
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(20.0),
+            "a rejected offset changes nothing"
+        );
+        let Some(&first) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        assert_eq!(y_of(&tree, first), -20);
+        assert!(matches!(tree.scroll_by(body, -500.0), Ok(true)));
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+    }
+
+    #[test]
+    fn content_shorter_than_the_viewport_never_scrolls() {
+        let (mut tree, body, rows) = scroll_scene(3);
+        assert_eq!(tree.scroll_range(body), Some(0.0));
+        assert!(!scroll_to(&mut tree, body, 50.0));
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+        assert_eq!(rows.first().map(|&row| y_of(&tree, row)), Some(0));
+        assert_eq!(tree.scroll_container_at((10.0, 10.0)), None);
+    }
+
+    #[test]
+    fn content_overflowing_an_unclipped_intermediate_container_still_counts() {
+        // body -> a 20 px wrapper that does not clip -> ten 20 px rows:
+        // the rows reach 200 px although the wrapper ends at 20.
+        let (mut tree, body, _) = scroll_scene(0);
+        let wrapper = match tree.insert(
+            body,
+            Style {
+                flex_direction: FlexDirection::Column,
+                flex_shrink: 0.0,
+                ..sized(200.0, 20.0)
+            },
+            label("wrapper"),
+            "wrapper",
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for _ in 0..10 {
+            let style = Style {
+                flex_shrink: 0.0,
+                ..sized(200.0, 20.0)
+            };
+            if let Err(err) = tree.insert(wrapper, style, label("row"), "row") {
+                unreachable!("{err:?}");
+            }
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(body), Some(100.0));
+    }
+
+    #[test]
+    fn removing_rows_reclamps_a_stale_offset() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert!(scroll_to(&mut tree, body, 100.0));
+        for &row in rows.iter().skip(6) {
+            if let Err(err) = tree.remove(row) {
+                unreachable!("{err:?}");
+            }
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(body), Some(20.0));
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(20.0),
+            "pulled back inside the new range"
+        );
+        let Some(&first) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        assert_eq!(y_of(&tree, first), -20, "and the rows moved with it");
+    }
+
+    #[test]
+    fn nested_scroll_offsets_compose_once() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        // The last row (180..200) becomes a 20 px scroll container of its
+        // own holding three 20 px children -- so its hidden content would
+        // reach 240, past the outer content's own end, if the outer
+        // measurement wrongly descended into it.
+        let Some(&host) = rows.last() else {
+            unreachable!("ten rows");
+        };
+        if let Err(err) = tree.set_style(
+            host,
+            Style {
+                flex_direction: FlexDirection::Column,
+                flex_shrink: 0.0,
+                overflow: taffy::Point {
+                    x: Overflow::Hidden,
+                    y: Overflow::Hidden,
+                },
+                ..sized(200.0, 20.0)
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_scrollable(host, true) {
+            unreachable!("{err:?}");
+        }
+        let inner: Vec<WidgetId> = (0..3)
+            .map(|_| {
+                let style = Style {
+                    flex_shrink: 0.0,
+                    ..sized(200.0, 20.0)
+                };
+                match tree.insert(host, style, label("inner"), "inner") {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            })
+            .collect();
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(host), Some(40.0));
+        assert_eq!(
+            tree.scroll_range(body),
+            Some(100.0),
+            "the nested container's hidden content is not the outer one's"
+        );
+        assert!(scroll_to(&mut tree, body, 10.0));
+        assert!(scroll_to(&mut tree, host, 20.0));
+        tree.compute_layout(200.0, 300.0);
+        let Some(&second) = inner.get(1) else {
+            unreachable!("three inner rows");
+        };
+        // Host at 9 * 20 - 10 = 170; its second child at 170 + 20 - 20,
+        // each offset applied exactly once.
+        assert_eq!(y_of(&tree, host), 170);
+        assert_eq!(y_of(&tree, second), 170);
+    }
+
+    #[test]
+    fn hit_test_reaches_a_row_scrolled_into_view_and_not_one_scrolled_out() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+            unreachable!("ten rows");
+        };
+        assert_eq!(
+            tree.hit_test((10.0, 190.0)),
+            Some(tree.root()),
+            "row 9 is below the body"
+        );
+        assert!(scroll_to(&mut tree, body, 100.0));
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.hit_test((10.0, 90.0)), Some(last));
+        // Row 0 now sits at y -100..-80: outside the window, and a point
+        // inside the body at the top hits row 5, not row 0.
+        assert_eq!(tree.hit_test((10.0, 5.0)), rows.get(5).copied());
+        assert_ne!(tree.hit_test((10.0, 5.0)), Some(first));
+        // Below the body (where row 9 used to be laid out) nothing scrolled
+        // hits.
+        assert_eq!(tree.hit_test((10.0, 150.0)), Some(tree.root()));
+    }
+
+    #[test]
+    fn a_row_scrolled_above_the_body_is_not_hit_from_the_area_above_it() {
+        // A header above the body: a row scrolled up under it must not
+        // take the header's clicks.
+        let (mut tree, root) = WidgetTree::new(
+            label("root"),
+            Style {
+                flex_direction: FlexDirection::Column,
+                ..sized(200.0, 300.0)
+            },
+            "root",
+        );
+        let header = match tree.insert(root, sized(200.0, 20.0), label("header"), "header") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let body = match tree.insert(
+            root,
+            Style {
+                flex_direction: FlexDirection::Column,
+                overflow: taffy::Point {
+                    x: Overflow::Hidden,
+                    y: Overflow::Hidden,
+                },
+                ..sized(200.0, 100.0)
+            },
+            label("body"),
+            "body",
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_scrollable(body, true) {
+            unreachable!("{err:?}");
+        }
+        for _ in 0..10 {
+            let style = Style {
+                flex_shrink: 0.0,
+                ..sized(200.0, 20.0)
+            };
+            if let Err(err) = tree.insert(body, style, label("row"), "row") {
+                unreachable!("{err:?}");
+            }
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert!(scroll_to(&mut tree, body, 15.0));
+        assert_eq!(tree.hit_test((10.0, 10.0)), Some(header));
+    }
+
+    #[test]
+    fn visible_rect_clips_a_partially_scrolled_row() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert!(scroll_to(&mut tree, body, 10.0));
+        let Some(&first) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        let Some(row_bounds) = tree.bounds(first) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(row_bounds, bounds(0, -10, 200, 20));
+        assert_eq!(
+            tree.visible_rect(first, row_bounds),
+            Some(bounds(0, 0, 200, 10)),
+            "only the half still inside the body is visible"
+        );
+        let Some(&far) = rows.get(8) else {
+            unreachable!("ten rows");
+        };
+        let Some(far_bounds) = tree.bounds(far) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(tree.visible_rect(far, far_bounds), None);
+    }
+
+    #[test]
+    fn scroll_into_view_scrolls_just_far_enough_either_way_and_only_when_needed() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let (Some(&row1), Some(&row7)) = (rows.get(1), rows.get(7)) else {
+            unreachable!("ten rows");
+        };
+        assert!(!tree.scroll_into_view(row1), "already visible");
+        assert!(tree.scroll_into_view(row7));
+        // Row 7 is laid out at 140..160: its bottom lands on the body's.
+        assert_eq!(tree.scroll_y(body), Some(60.0));
+        assert_eq!(tree.bounds(row7).map(|rect| rect.bottom()), Some(100));
+        assert!(!tree.scroll_into_view(row7), "now visible: no-op");
+        assert!(tree.scroll_into_view(row1));
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(20.0),
+            "its top lands on the body's"
+        );
+        assert!(
+            !tree.scroll_into_view(body),
+            "nothing scrolls the container itself"
+        );
+    }
+
+    #[test]
+    fn scroll_container_at_skips_popovers_and_non_overflowing_scrollers() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let Some(&row0) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        assert_eq!(tree.scroll_container_at((10.0, 10.0)), Some(body));
+        assert_eq!(
+            tree.scroll_container_at((10.0, 200.0)),
+            None,
+            "outside the body"
+        );
+        // A popover anchored to row 0, floating over the body.
+        let popover = ins(&mut tree, row0, "popover");
+        pop(&mut tree, popover);
+        place(&mut tree, popover, bounds(0, 40, 200, 40));
+        assert_eq!(tree.hit_test((10.0, 50.0)), Some(popover));
+        assert_eq!(tree.scroll_container_at((10.0, 50.0)), None);
+        // A scroll container whose content fits is passed over.
+        let (short, short_body, _) = scroll_scene(2);
+        assert_eq!(short.is_scrollable(short_body), Some(true));
+        assert_eq!(short.scroll_container_at((10.0, 10.0)), None);
+    }
+
+    #[test]
+    fn a_popover_does_not_count_toward_the_scroll_range() {
+        let (mut tree, body, rows) = scroll_scene(3);
+        let Some(&row0) = rows.first() else {
+            unreachable!("three rows");
+        };
+        let popover = ins(&mut tree, row0, "popover");
+        pop(&mut tree, popover);
+        if let Err(err) = tree.set_style(popover, sized(200.0, 400.0)) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.scroll_range(body), Some(0.0));
+    }
+
+    #[test]
+    fn the_accessibility_update_carries_the_scroll_position_and_range() {
+        let (mut tree, body, _) = scroll_scene(10);
+        assert!(scroll_to(&mut tree, body, 35.0));
+        let update = tree.accessibility_update(tree.root());
+        let Some((_, node)) = update.nodes.iter().find(|(id, _)| *id == body) else {
+            unreachable!("the body is in the update");
+        };
+        assert_eq!(node.scroll_y(), Some(35.0));
+        assert_eq!(node.scroll_y_min(), Some(0.0));
+        assert_eq!(node.scroll_y_max(), Some(100.0));
+
+        let (short, short_body, _) = scroll_scene(2);
+        let update = short.accessibility_update(short.root());
+        let Some((_, node)) = update.nodes.iter().find(|(id, _)| *id == short_body) else {
+            unreachable!("the body is in the update");
+        };
+        assert_eq!(node.scroll_y(), None, "content that fits declares no range");
+        assert_eq!(node.scroll_y_max(), None);
+    }
+
+    #[test]
+    fn the_scroll_flag_survives_a_style_reset_and_turning_it_off_returns_to_the_top() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        assert!(scroll_to(&mut tree, body, 40.0));
+        let Some(style) = tree.style(body).cloned() else {
+            unreachable!("known");
+        };
+        if let Err(err) = tree.set_style(body, style) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(tree.is_scrollable(body), Some(true));
+        assert_eq!(tree.scroll_y(body), Some(40.0));
+        if let Err(err) = tree.set_scrollable(body, false) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+        assert_eq!(rows.first().map(|&row| y_of(&tree, row)), Some(0));
+        assert_eq!(tree.scroll_range(body), Some(0.0));
+    }
+
+    #[test]
+    fn sub_pixel_deltas_accumulate_but_layout_moves_whole_pixels() {
+        let (mut tree, body, rows) = scroll_scene(10);
+        let Some(&first) = rows.first() else {
+            unreachable!("ten rows");
+        };
+        assert!(matches!(tree.scroll_by(body, 0.3), Ok(false)));
+        assert_eq!(y_of(&tree, first), 0);
+        assert!(
+            matches!(tree.scroll_by(body, 0.3), Ok(true)),
+            "0.6 rounds to 1"
+        );
+        assert_eq!(y_of(&tree, first), -1);
+        tree.compute_layout(200.0, 300.0);
+        assert_eq!(y_of(&tree, first), -1);
     }
 }
