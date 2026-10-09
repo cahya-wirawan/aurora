@@ -4141,6 +4141,73 @@ mod tests {
         }
     }
 
+    /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a
+    /// PSD import's `curv`) survives a save and reopen — manifest and
+    /// history — point for point. The points are stored as given, so a
+    /// build older than 0.158.0, which re-validates every decoded curve
+    /// with `x0 == 0` and `xn == 1`, refuses such a file (a typed decode
+    /// error) rather than opening it with a different curve.
+    #[test]
+    fn round_trips_a_curves_layer_with_moved_endpoints() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let curve = |points: &[(f32, f32)]| {
+            let points: Vec<_> = points
+                .iter()
+                .map(|&(x, y)| aurora_core::CurvePoint::new(x / 255.0, y / 255.0))
+                .collect();
+            match aurora_core::ToneCurve::new(&points) {
+                Ok(curve) => curve,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+        let params = aurora_core::CurvesParams {
+            composite: curve(&[(26.0, 3.0), (55.0, 84.0), (171.0, 170.0), (255.0, 255.0)]),
+            red: Some(curve(&[
+                (49.0, 60.0),
+                (94.0, 218.0),
+                (102.0, 0.0),
+                (195.0, 36.0),
+            ])),
+            green: None,
+            blue: Some(curve(&[(0.0, 0.0), (255.0 * 0.9, 255.0)])),
+        };
+        assert!(params.composite.input_range().0 > 0.0);
+        let wanted = aurora_doc::Adjustment::Curves(params);
+        let curves =
+            match history.add_adjustment_layer_at(&mut layers, "Curves 1", wanted.clone(), None, 0)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.adjustment(curves), Some(&wanted));
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.adjustment(curves), Some(&wanted)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     #[test]
     fn round_trips_mask_coverage_of_a_disabled_mask() {
         // `enabled` is a UI toggle (shift-click a thumbnail), not a

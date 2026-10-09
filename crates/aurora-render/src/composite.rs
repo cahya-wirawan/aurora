@@ -2104,6 +2104,10 @@ pub struct TileCompositor {
     sampler: wgpu::Sampler,
     shader: wgpu::ShaderModule,
     pipelines: PipelineCache,
+    /// The Curves adjustment pass (0.159.0), built on first use so a
+    /// compositor that never meets a Curves layer never compiles its
+    /// shader module. See [`Self::composite_curves_with_opacity`].
+    curves: Option<CurvesGpu>,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2358,6 +2362,7 @@ impl TileCompositor {
             sampler,
             shader,
             pipelines: PipelineCache::new(),
+            curves: None,
         }
     }
 
@@ -4679,6 +4684,330 @@ impl TileCompositor {
     }
 }
 
+/// The Curves pass's WGSL (0.159.0): `shaders/curves.wgsl` appended to
+/// `shaders/composite.wgsl`, whose blend-math helpers and
+/// `straight_backdrop` it calls. Its own module, so [`COMPOSITE_SHADER`]'s
+/// entry-point roster is unchanged.
+const CURVES_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/curves.wgsl")
+);
+const LABEL_CURVES: &str = "composite.curves";
+const LABEL_CURVES_LAYOUT: &str = "composite.curves.layout";
+const LABEL_CURVES_UNIFORM: &str = "composite.curves.params";
+const LABEL_CURVES_LUT: &str = "composite.curves.lut";
+const LABEL_CURVES_BIND_GROUP: &str = "composite.curves.bind_group";
+const LABEL_CURVES_PASS: &str = "composite.curves.pass";
+
+/// How many equal intervals each Curves table spans (0.159.0) — the
+/// shader's `CURVES_INTERVALS`, and `aurora_filters::CURVES_LUT_INTERVALS`,
+/// which this crate cannot name (it sits below `aurora-filters`);
+/// `aurora-app` asserts the two agree.
+pub const CURVES_GPU_LUT_INTERVALS: usize = 1 << 14;
+
+/// The `f32` length of a packed Curves table set, as
+/// `aurora_filters::CurvesLut::packed_for_gpu` builds it and
+/// `shaders/curves.wgsl` reads it: a 16-float header of four
+/// `[present, lo, hi, 0]` records (red, green, blue, composite), then four
+/// tables of [`CURVES_GPU_LUT_INTERVALS`]` + 1` samples. 262,224 bytes,
+/// about 1/500 of the 128 MiB `max_storage_buffer_binding_size` both
+/// `wgpu::Limits::default()` (what `aurora-gpu` requests) and
+/// `wgpu::Limits::downlevel_defaults()` guarantee.
+pub const CURVES_GPU_LUT_LEN: usize = 16 + 4 * (CURVES_GPU_LUT_INTERVALS + 1);
+
+/// How many distinct Curves parameter sets one [`TileCompositor`] keeps
+/// uploaded (0.159.0); the least recently used is dropped past it. Eight
+/// sets is about 2 MiB of GPU memory, a fixed bound.
+pub const CURVES_GPU_LUT_CACHE_LEN: usize = 8;
+
+/// `shaders/curves.wgsl`'s `curves_blend` code for `mode`, or `None` for
+/// a mode the Curves pass cannot express (0.159.0). The set is `Normal`
+/// plus the eighteen modes with their own blend-math entry point in
+/// `shaders/composite.wgsl` (`ALL_BLEND_PASSES`): every separable mode
+/// except `Exclusion`. `Exclusion`, the six non-separable modes and
+/// `Dissolve` (which the caller resolves itself, never by this enum) are
+/// refused.
+#[must_use]
+pub const fn curves_mode_code(mode: BlendMode) -> Option<u32> {
+    match mode {
+        BlendMode::Normal => Some(0),
+        BlendMode::Multiply => Some(1),
+        BlendMode::Darken => Some(2),
+        BlendMode::Lighten => Some(3),
+        BlendMode::Screen => Some(4),
+        BlendMode::Difference => Some(5),
+        BlendMode::LinearDodge => Some(6),
+        BlendMode::LinearBurn => Some(7),
+        BlendMode::ColorBurn => Some(8),
+        BlendMode::ColorDodge => Some(9),
+        BlendMode::Overlay => Some(10),
+        BlendMode::HardLight => Some(11),
+        BlendMode::LinearLight => Some(12),
+        BlendMode::VividLight => Some(13),
+        BlendMode::HardMix => Some(14),
+        BlendMode::PinLight => Some(15),
+        BlendMode::SoftLight => Some(16),
+        BlendMode::Subtract => Some(17),
+        BlendMode::Divide => Some(18),
+        BlendMode::Exclusion
+        | BlendMode::Hue
+        | BlendMode::Saturation
+        | BlendMode::Color
+        | BlendMode::Luminosity
+        | BlendMode::DarkerColor
+        | BlendMode::LighterColor => None,
+    }
+}
+
+/// The lazily built Curves pass: its layout, pipeline and LUT cache.
+struct CurvesGpu {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    /// Uploaded table sets keyed by their exact parameters, least
+    /// recently used first.
+    luts: Vec<(aurora_core::CurvesParams, wgpu::Buffer)>,
+    /// How many table sets have been uploaded, ever.
+    uploads: u64,
+}
+
+impl CurvesGpu {
+    fn new(device: &wgpu::Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(LABEL_CURVES_LAYOUT),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(LABEL_CURVES),
+            source: wgpu::ShaderSource::Wgsl(CURVES_SHADER.into()),
+        });
+        let key = PipelineKey {
+            shader: LABEL_CURVES,
+            vertex_entry: "vs_composite",
+            fragment_entry: "fs_composite_curves",
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            // The shader computes the whole result, as every blend-math
+            // pass does.
+            blend: Blend::None,
+        };
+        let pipeline = composite_pipeline(device, &shader, &key, &layout, LABEL_CURVES);
+        Self {
+            layout,
+            pipeline,
+            luts: Vec::new(),
+            uploads: 0,
+        }
+    }
+
+    /// Makes `params`' tables the most recently used entry (`self.luts`'
+    /// last), uploading `pack()` first when they are not cached. `false`
+    /// when `pack()` is not [`CURVES_GPU_LUT_LEN`] long (logged): the
+    /// caller falls back to the CPU.
+    fn ensure_lut(
+        &mut self,
+        context: &GpuContext,
+        params: &aurora_core::CurvesParams,
+        pack: impl FnOnce() -> Vec<f32>,
+    ) -> bool {
+        if let Some(position) = self.luts.iter().position(|(cached, _)| cached == params) {
+            // Most recently used last.
+            let entry = self.luts.remove(position);
+            self.luts.push(entry);
+        } else {
+            let samples = pack();
+            if samples.len() != CURVES_GPU_LUT_LEN {
+                tracing::warn!(
+                    len = samples.len(),
+                    expected = CURVES_GPU_LUT_LEN,
+                    "a packed Curves table set has the wrong length; not uploading it"
+                );
+                return false;
+            }
+            let mut bytes = Vec::with_capacity(samples.len() * 4);
+            for sample in samples {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            let buffer = context.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some(LABEL_CURVES_LUT),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            context.queue().write_buffer(&buffer, 0, &bytes);
+            self.uploads = self.uploads.saturating_add(1);
+            if self.luts.len() >= CURVES_GPU_LUT_CACHE_LEN {
+                self.luts.remove(0);
+            }
+            self.luts.push((params.clone(), buffer));
+        }
+        true
+    }
+}
+
+impl TileCompositor {
+    /// Records the Curves adjustment pass (0.159.0): reads `backdrop` (the
+    /// premultiplied accumulator), un-premultiplies it, maps it through
+    /// `params`' tables, blends the result with `mode` at `opacity` over
+    /// the backdrop made opaque, and writes it to `dst` premultiplied at
+    /// the backdrop's own alpha — `aurora-app`'s CPU
+    /// `apply_adjustment_layer`, which is the reference. See
+    /// `shaders/curves.wgsl` for the step-by-step correspondence.
+    ///
+    /// `pack` builds the tables (`aurora_filters::CurvesLut::packed_for_gpu`)
+    /// and is called **only when `params` is not already uploaded**: the
+    /// tables are cached per exact parameter set, so a frame of many tiles
+    /// uploads them once, and an edit — a different `params` — misses the
+    /// cache and uploads the new set. [`Self::curves_lut_uploads`] counts
+    /// uploads; at most [`CURVES_GPU_LUT_CACHE_LEN`] sets stay resident.
+    ///
+    /// Returns `false`, recording nothing, when `mode` has no Curves blend
+    /// math ([`curves_mode_code`]) or `pack` returned the wrong length; the
+    /// caller then composites on the CPU.
+    ///
+    /// The mask and `Dissolve` are not handled here: `aurora-app` keeps a
+    /// Curves layer with an enabled mask, or at `Dissolve`, on the CPU.
+    ///
+    /// Records into `encoder`; does not submit. `backdrop` and `dst` must
+    /// be different `Rgba16Float` textures of the same size, as for the
+    /// blend-math passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_curves_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &aurora_core::CurvesParams,
+        pack: impl FnOnce() -> Vec<f32>,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        let device = context.device();
+        let curves = self.curves.get_or_insert_with(|| CurvesGpu::new(device));
+        if !curves.ensure_lut(context, params, pack) {
+            return false;
+        }
+        let Some((_, lut)) = curves.luts.last() else {
+            return false;
+        };
+
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(LABEL_CURVES_UNIFORM),
+            size: OPACITY_UNIFORM_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut bytes = Vec::with_capacity(OPACITY_UNIFORM_SIZE as usize);
+        // `composite_layer_into` clamps the opacity, so the reference does.
+        bytes.extend_from_slice(&opacity.clamp(0.0, 1.0).to_le_bytes());
+        bytes.extend_from_slice(&code.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        context.queue().write_buffer(&uniform, 0, &bytes);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(LABEL_CURVES_BIND_GROUP),
+            layout: &curves.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(backdrop),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: lut.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(LABEL_CURVES_PASS),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Every texel is replaced, as in the blend passes.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&curves.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        true
+    }
+
+    /// How many Curves table sets this compositor has uploaded (0.159.0).
+    /// A frame that composites many tiles of one unchanged Curves layer
+    /// adds one at most; an edit adds one more.
+    #[must_use]
+    pub fn curves_lut_uploads(&self) -> u64 {
+        self.curves.as_ref().map_or(0, |curves| curves.uploads)
+    }
+
+    /// How many Curves table sets are resident (0.159.0), at most
+    /// [`CURVES_GPU_LUT_CACHE_LEN`].
+    #[must_use]
+    pub fn curves_lut_cache_len(&self) -> usize {
+        self.curves.as_ref().map_or(0, |curves| curves.luts.len())
+    }
+}
+
 impl std::fmt::Debug for TileCompositor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileCompositor")
@@ -4691,14 +5020,153 @@ impl std::fmt::Debug for TileCompositor {
 mod tests {
     use super::{
         ALL_BLEND_PASSES, BLEND_MATH_PASS_COUNT, BlendMode, CHUNK_SAMPLES, CHUNK_TEXELS,
-        COMPOSITE_SHADER, TileCompositor, blend_channel, blend_color, blend_darker_color,
-        blend_hue, blend_lighter_color, blend_luminosity, blend_rgb, blend_saturation, clip_color,
-        composite_layer_into, composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d,
-        transparent_tile, un_premultiply_in_place,
+        COMPOSITE_SHADER, CURVES_GPU_LUT_LEN, TileCompositor, blend_channel, blend_color,
+        blend_darker_color, blend_hue, blend_lighter_color, blend_luminosity, blend_rgb,
+        blend_saturation, clip_color, composite_layer_into, composite_tile_cpu, curves_mode_code,
+        lum, sat, set_lum, set_sat, soft_light_d, transparent_tile, un_premultiply_in_place,
     };
     use crate::test_support::real_context;
     use aurora_tile::{CHANNELS, SAMPLES, TILE};
     use half::f16;
+
+    /// 0.159.0 review (I2): the Curves pass's `curves_blend` switch, the
+    /// `curves_mode_code` codes and `ALL_BLEND_PASSES` cannot drift apart.
+    /// Every mode is either refused by `curves_mode_code` or, for every
+    /// mode but `Normal`, has a blend-math pass `fs_composite_<mode>` whose
+    /// blend term is the shared helper `blend_<mode>`, called by that entry
+    /// point **and** by the Curves switch under that mode's own code. A mode
+    /// ported to one place and not the other, a renumbered code, or an arm
+    /// re-inlining its formula instead of calling the helper fails here.
+    #[test]
+    fn curves_switch_matches_curves_mode_code_and_all_blend_passes() {
+        let curves_source = include_str!("shaders/curves.wgsl");
+        let modes = [
+            (BlendMode::Normal, "normal"),
+            (BlendMode::Darken, "darken"),
+            (BlendMode::Multiply, "multiply"),
+            (BlendMode::Lighten, "lighten"),
+            (BlendMode::Screen, "screen"),
+            (BlendMode::Difference, "difference"),
+            (BlendMode::Exclusion, "exclusion"),
+            (BlendMode::Subtract, "subtract"),
+            (BlendMode::Divide, "divide"),
+            (BlendMode::ColorDodge, "color_dodge"),
+            (BlendMode::LinearDodge, "linear_dodge"),
+            (BlendMode::ColorBurn, "color_burn"),
+            (BlendMode::LinearBurn, "linear_burn"),
+            (BlendMode::Overlay, "overlay"),
+            (BlendMode::SoftLight, "soft_light"),
+            (BlendMode::HardLight, "hard_light"),
+            (BlendMode::VividLight, "vivid_light"),
+            (BlendMode::LinearLight, "linear_light"),
+            (BlendMode::PinLight, "pin_light"),
+            (BlendMode::HardMix, "hard_mix"),
+            (BlendMode::Hue, "hue"),
+            (BlendMode::Saturation, "saturation"),
+            (BlendMode::Color, "color"),
+            (BlendMode::Luminosity, "luminosity"),
+            (BlendMode::DarkerColor, "darker_color"),
+            (BlendMode::LighterColor, "lighter_color"),
+        ];
+        let mut admitted = 0;
+        for (mode, snake) in modes {
+            let entry = format!("fs_composite_{snake}");
+            let has_pass = ALL_BLEND_PASSES
+                .iter()
+                .any(|pass| pass.fragment_entry == entry);
+            let code = curves_mode_code(mode);
+            assert_eq!(
+                code.is_some(),
+                mode == BlendMode::Normal || has_pass,
+                "{mode:?}: curves_mode_code must admit exactly Normal plus the modes in \
+                 ALL_BLEND_PASSES"
+            );
+            let Some(code) = code else { continue };
+            admitted += 1;
+            if mode == BlendMode::Normal {
+                assert_eq!(code, 0, "Normal is the switch's default arm");
+                continue;
+            }
+            let helper = format!("fn blend_{snake}(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {{");
+            assert!(
+                COMPOSITE_SHADER.contains(&helper),
+                "{mode:?}: missing {helper}"
+            );
+            let entry_call = format!("    let b = blend_{snake}(cb, s.rgb);");
+            assert!(
+                COMPOSITE_SHADER.contains(&entry_call),
+                "{mode:?}: {entry} must compute its blend term through blend_{snake}"
+            );
+            let arm = format!("        case {code}u: {{ return blend_{snake}(cb, cs); }}");
+            assert!(
+                curves_source.contains(&arm),
+                "{mode:?}: the Curves switch must call blend_{snake} under code {code}"
+            );
+        }
+        assert_eq!(admitted, BLEND_MATH_PASS_COUNT + 1);
+        assert_eq!(
+            curves_source.matches("        case ").count(),
+            BLEND_MATH_PASS_COUNT,
+            "one switch arm per blend-math pass, no stray arm"
+        );
+    }
+
+    /// 0.159.0 review (I6): a table set of the wrong length is refused
+    /// before anything is uploaded or recorded, so the caller falls back
+    /// to the CPU instead of reading a short buffer.
+    #[test]
+    fn composite_curves_refuses_a_malformed_table_set_without_uploading() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let texture = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: TILE,
+                    height: TILE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        };
+        let backdrop = texture("backdrop").create_view(&wgpu::TextureViewDescriptor::default());
+        let dst = texture("dst").create_view(&wgpu::TextureViewDescriptor::default());
+        let mut compositor = TileCompositor::new(device);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let params = aurora_core::CurvesParams::identity();
+        for short in [Vec::new(), vec![0.0; CURVES_GPU_LUT_LEN - 1]] {
+            assert!(!compositor.composite_curves_with_opacity(
+                &context,
+                &mut encoder,
+                &params,
+                || short,
+                &backdrop,
+                &dst,
+                1.0,
+                BlendMode::Normal,
+            ));
+        }
+        assert!(!compositor.composite_curves_with_opacity(
+            &context,
+            &mut encoder,
+            &params,
+            || vec![0.0; CURVES_GPU_LUT_LEN],
+            &backdrop,
+            &dst,
+            1.0,
+            BlendMode::Exclusion,
+        ));
+        assert_eq!(compositor.curves_lut_uploads(), 0);
+        assert_eq!(compositor.curves_lut_cache_len(), 0);
+    }
 
     /// The two `@fragment` entry points in `shaders/composite.wgsl` that
     /// are *not* blend math: `fs_composite` is the plain fixed-function

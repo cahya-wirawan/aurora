@@ -127,8 +127,9 @@ mod tests {
             Err(err) => unreachable!("must round trip: {err:?}"),
         }
 
-        // A point list that fails validation (x not starting at 0).
-        let bad: Vec<(f32, f32)> = vec![(0.1, 0.0), (1.0, 1.0)];
+        // A point list that fails validation: out of order (a moved
+        // endpoint, `(0.1, 0.0)` first, is valid since 0.158.0).
+        let bad: Vec<(f32, f32)> = vec![(0.5, 0.0), (0.1, 1.0)];
         let bytes = match postcard::to_allocvec(&bad) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),

@@ -62,9 +62,24 @@ use aurora_core::{CurvesParams, ToneCurve};
 /// `f32`). A power of two, so every sample position is exact in `f32`.
 pub const CURVES_LUT_INTERVALS: usize = 1 << 14;
 
-/// One sampled curve, `CURVES_LUT_INTERVALS + 1` values.
+/// One sampled curve, `CURVES_LUT_INTERVALS + 1` values, plus the
+/// curve's own input range (0.158.0, [`ToneCurve::input_range`]).
+///
+/// **Moved endpoints.** A curve whose first or last point is interior is
+/// flat beyond it. The samples are the spline *continued* past the
+/// endpoints ([`ToneCurve::evaluate_extrapolated`]) and the lookup clamps
+/// its input to the range before interpolating, so the flat extension's
+/// kink sits exactly at the clamp and never inside a table interval —
+/// sampling the flat curve itself would put a slope discontinuity of up
+/// to several hundred inside one interval (`slope * h / 4`, most of an
+/// 8-bit level). The interval straddling a moved endpoint interpolates
+/// the continued cubic, which is within one interval width of its knot,
+/// so the error bound in the module docs holds unchanged.
 #[derive(Debug, Clone, PartialEq)]
-struct Table(Vec<f32>);
+struct Table {
+    samples: Vec<f32>,
+    range: (f32, f32),
+}
 
 impl Table {
     /// `None` for an identity curve (skipped, so it passes values through
@@ -73,15 +88,16 @@ impl Table {
         let curve = curve.filter(|curve| !curve.is_identity())?;
         #[allow(clippy::cast_precision_loss)]
         let last = CURVES_LUT_INTERVALS as f32;
-        Some(Self(
-            (0..=CURVES_LUT_INTERVALS)
+        Some(Self {
+            samples: (0..=CURVES_LUT_INTERVALS)
                 .map(|i| {
                     #[allow(clippy::cast_precision_loss)]
                     let x = i as f32 / last;
-                    curve.evaluate_unclamped(x)
+                    curve.evaluate_extrapolated(x)
                 })
                 .collect(),
-        ))
+            range: curve.input_range(),
+        })
     }
 
     /// Linear interpolation between the two samples around `x`, which is
@@ -90,6 +106,10 @@ impl Table {
     /// once the interpolation is done (see the module docs).
     fn lookup(&self, x: f32) -> f32 {
         let x = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        // Flat beyond a moved endpoint (0.158.0): clamped to the curve's
+        // own range before the table is read, see [`Table`].
+        let (lo, hi) = self.range;
+        let x = x.clamp(lo, hi.max(lo));
         #[allow(clippy::cast_precision_loss)]
         let position = x * CURVES_LUT_INTERVALS as f32;
         // `position` is in `[0, INTERVALS]`, so the truncation is exact
@@ -99,7 +119,7 @@ impl Table {
         let index = (position as usize).min(CURVES_LUT_INTERVALS - 1);
         #[allow(clippy::cast_precision_loss)]
         let frac = position - index as f32;
-        match (self.0.get(index), self.0.get(index + 1)) {
+        match (self.samples.get(index), self.samples.get(index + 1)) {
             (Some(&low), Some(&high)) => (high - low).mul_add(frac, low).clamp(0.0, 1.0),
             // Unreachable: every table holds INTERVALS + 1 samples.
             _ => x,
@@ -163,6 +183,70 @@ impl CurvesLut {
     }
 }
 
+/// How many `f32`s lead [`CurvesLut::packed_for_gpu`]'s output: four
+/// `[present, range_lo, range_hi, 0.0]` records, red, green, blue,
+/// composite (0.159.0).
+pub const CURVES_PACKED_HEADER: usize = 16;
+
+/// The length of [`CurvesLut::packed_for_gpu`]'s output: the header plus
+/// four tables of [`CURVES_LUT_INTERVALS`]` + 1` samples (0.159.0) —
+/// 65,556 `f32`s, 262,224 bytes.
+pub const CURVES_PACKED_LEN: usize = CURVES_PACKED_HEADER + 4 * (CURVES_LUT_INTERVALS + 1);
+
+impl CurvesLut {
+    /// The tables flattened into one `f32` array for the GPU Curves pass
+    /// (0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`,
+    /// which documents and checks the same layout from its side — this
+    /// crate sits beside `aurora-render`, not below it, so neither can
+    /// name the other's constants; `aurora-app` asserts they agree).
+    ///
+    /// Layout, every value `f32`:
+    /// - `[0, 16)`: four records `[present, lo, hi, 0.0]` for red, green,
+    ///   blue and composite in that order. `present` is `1.0` for a
+    ///   tabulated curve and `0.0` for an identity one (the shader then
+    ///   passes the value through exactly, as [`Self::map_channel`]
+    ///   does); `lo`/`hi` are the table's own input range.
+    /// - `[16 + t * 16385, 16 + (t + 1) * 16385)`: table `t`'s samples,
+    ///   all zero for an identity curve.
+    ///
+    /// The samples are this table's own, bit for bit — no re-sampling and
+    /// no narrowing (invariant §7.3.1b: no 8-bit, and here no `f16`
+    /// either).
+    ///
+    /// **Empty** if any table does not hold exactly
+    /// [`CURVES_LUT_INTERVALS`]` + 1` samples (unreachable through
+    /// [`Self::new`]; 0.159.0 review). The GPU side refuses any length but
+    /// [`CURVES_PACKED_LEN`], so the caller composites on the CPU rather
+    /// than the GPU reading a flagged-present table of zeros (which would
+    /// black that channel out).
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> Vec<f32> {
+        let tables = [
+            self.channels.first().and_then(Option::as_ref),
+            self.channels.get(1).and_then(Option::as_ref),
+            self.channels.get(2).and_then(Option::as_ref),
+            self.composite.as_ref(),
+        ];
+        let mut out = Vec::with_capacity(CURVES_PACKED_LEN);
+        for table in tables {
+            match table {
+                Some(table) => out.extend([1.0, table.range.0, table.range.1, 0.0]),
+                None => out.extend([0.0; 4]),
+            }
+        }
+        for table in tables {
+            match table {
+                Some(table) if table.samples.len() == CURVES_LUT_INTERVALS + 1 => {
+                    out.extend_from_slice(&table.samples);
+                }
+                Some(_) => return Vec::new(),
+                None => out.extend(std::iter::repeat_n(0.0, CURVES_LUT_INTERVALS + 1)),
+            }
+        }
+        out
+    }
+}
+
 impl From<&CurvesParams> for CurvesLut {
     fn from(params: &CurvesParams) -> Self {
         Self::new(params)
@@ -171,7 +255,7 @@ impl From<&CurvesParams> for CurvesLut {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURVES_LUT_INTERVALS, CurvesLut};
+    use super::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut, Table};
     use aurora_core::{CurvePoint, CurvesParams, ToneCurve};
 
     fn curve(points: &[(f32, f32)]) -> ToneCurve {
@@ -359,5 +443,110 @@ mod tests {
         let params = composite_only(&[(0.0, 0.2), (1.0, 0.7)]);
         assert_eq!(CurvesLut::from(&params), CurvesLut::new(&params));
         assert!(!CurvesLut::new(&params).is_identity());
+    }
+
+    /// 0.158.0: a curve with moved endpoints — the steepest possible
+    /// rise right at a moved first point, and `curves_rgb.psd`'s own
+    /// `Curves 4` red — is flat beyond them and stays within the smooth
+    /// bound everywhere, the kink included (sampling the flat curve would
+    /// miss by `slope * h / 4` at the kink, ~4e-3 here).
+    #[test]
+    #[allow(clippy::float_cmp)] // flat means bit-for-bit the endpoint's own `y`
+    fn moved_endpoints_are_flat_beyond_and_within_the_bound_at_the_kink() {
+        let steep = [(0.3, 0.0), (0.3 + 1.0 / 256.0, 1.0), (0.7, 1.0)];
+        let psd = [
+            (49.0 / 255.0, 60.0 / 255.0),
+            (94.0 / 255.0, 218.0 / 255.0),
+            (102.0 / 255.0, 0.0),
+            (185.0 / 255.0, 229.0 / 255.0),
+            (195.0 / 255.0, 36.0 / 255.0),
+        ];
+        for points in [&steep[..], &psd[..]] {
+            let error = max_lut_error(points);
+            assert!(error < 1.9e-4, "{points:?}: {error}");
+            let lut = CurvesLut::new(&composite_only(points));
+            let (Some(first), Some(last)) = (points.first(), points.last()) else {
+                unreachable!("two points");
+            };
+            for i in 0..=100_u16 {
+                let x = f32::from(i) / 100.0;
+                let [got, _, _] = lut.apply([x, x, x]);
+                if x <= first.0 {
+                    assert_eq!(got, first.1, "below x0 at {x}");
+                }
+                if x >= last.0 {
+                    assert_eq!(got, last.1, "above xn at {x}");
+                }
+            }
+        }
+    }
+
+    /// 0.159.0: the GPU packing is the CPU tables bit for bit, in the
+    /// documented order, with identity curves flagged absent.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn packed_for_gpu_is_the_cpu_tables_in_order_with_identity_flagged_absent() {
+        let params = CurvesParams {
+            composite: curve(&[(0.1, 0.0), (0.5, 0.7), (0.9, 1.0)]),
+            green: Some(curve(&[(0.0, 1.0), (1.0, 0.0)])),
+            ..CurvesParams::identity()
+        };
+        let lut = CurvesLut::new(&params);
+        let packed = lut.packed_for_gpu();
+        assert_eq!(packed.len(), CURVES_PACKED_LEN);
+        let header = packed.get(..CURVES_PACKED_HEADER).unwrap_or_default();
+        assert_eq!(header.first(), Some(&0.0), "red is identity");
+        assert_eq!(header.get(4), Some(&1.0), "green is tabulated");
+        assert_eq!(header.get(8), Some(&0.0), "blue is identity");
+        assert_eq!(header.get(12), Some(&1.0), "composite is tabulated");
+        assert_eq!(
+            header.get(13),
+            Some(&0.1),
+            "composite range starts at its first point"
+        );
+        assert_eq!(header.get(14), Some(&0.9), "and ends at its last");
+        let samples = CURVES_LUT_INTERVALS + 1;
+        let table = |t: usize| {
+            packed
+                .get(CURVES_PACKED_HEADER + t * samples..CURVES_PACKED_HEADER + (t + 1) * samples)
+                .unwrap_or_default()
+        };
+        assert!(table(0).iter().all(|&v| v == 0.0));
+        // Reading the packed table back the way the shader does gives
+        // `map_channel`'s own answer, bit for bit.
+        for &x in &[0.0_f32, 0.05, 0.3, 0.5, 0.77, 0.95, 1.0] {
+            let green = table(1);
+            let position = x * CURVES_LUT_INTERVALS as f32;
+            let index = (position as usize).min(CURVES_LUT_INTERVALS - 1);
+            let frac = position - index as f32;
+            let (Some(&low), Some(&high)) = (green.get(index), green.get(index + 1)) else {
+                unreachable!("in range");
+            };
+            let got = (high - low).mul_add(frac, low).clamp(0.0, 1.0);
+            let want = CurvesLut::new(&CurvesParams {
+                green: params.green.clone(),
+                ..CurvesParams::identity()
+            })
+            .map_channel(1, x);
+            assert_eq!(got.to_bits(), want.to_bits(), "x = {x}");
+        }
+    }
+
+    /// 0.159.0 review (I6): a malformed table packs to nothing, so the GPU
+    /// side refuses it, rather than to a present-flagged table of zeros.
+    #[test]
+    fn packed_for_gpu_is_empty_for_a_malformed_table() {
+        let lut = CurvesLut {
+            composite: Some(Table {
+                samples: vec![0.5; 3],
+                range: (0.0, 1.0),
+            }),
+            channels: [None, None, None],
+        };
+        assert!(lut.packed_for_gpu().is_empty());
     }
 }
