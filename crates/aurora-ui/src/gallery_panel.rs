@@ -113,6 +113,11 @@ pub struct GalleryPanel {
     pub tree_rows: [WidgetId; 3],
     pub picker: WidgetId,
     pub curve: WidgetId,
+    /// The caption under [`Self::curve`] (0.161.0): a `Label` reading
+    /// [`GALLERY_CURVE_CAPTION`], so the demo editor's static bell can't
+    /// be mistaken for the open image's histogram — which it was, in the
+    /// 0.161.0 bug report, while the real editor was hidden.
+    pub curve_caption: WidgetId,
     /// Toggle buttons (0.160.0, the tools panel's kind): off, on, and
     /// disabled-on. A click flips an enabled one.
     pub toggle_buttons: [WidgetId; 3],
@@ -134,6 +139,9 @@ fn px(token: u32) -> f32 {
 pub fn gallery_editor_size(scales: &Scales) -> f32 {
     GALLERY_EDITOR_ROWS * row_height(scales)
 }
+
+/// The caption under the gallery's curve editor (0.161.0).
+pub const GALLERY_CURVE_CAPTION: &str = "Sample histogram (demo data)";
 
 /// The gallery curve editor's sample histogram (0.156.0): 256 bins of a
 /// smooth bell centred a little below mid-grey — demo data, the shape a
@@ -326,6 +334,11 @@ fn build(
     )?;
     // The histogram state (0.156.0): a sample bell behind the grid.
     widgets::set_curve_editor_histogram(tree, curve, Some(&gallery_sample_histogram()))?;
+    // A visible caption (0.161.0), a real `Label` with its own accessible
+    // text, rather than renaming the editor: the editor's label stays the
+    // widget's name, and the caption says what its data is to anyone
+    // looking at it, sighted or not.
+    let curve_caption = widgets::insert_label(tree, right, scales, GALLERY_CURVE_CAPTION)?;
     // One row of three, so the states sit side by side like the
     // tools panel's buttons would in a horizontal toolbar.
     let toggles = widgets::insert_container(tree, right, toggle_row_style(scales))?;
@@ -351,6 +364,7 @@ fn build(
         tree_rows: [parent_row, first_row, second_row],
         picker,
         curve,
+        curve_caption,
         toggle_buttons: [toggle_off, toggle_on, toggle_disabled],
         tooltip,
         open_menu: None,
@@ -766,10 +780,57 @@ mod tests {
             g.tree_view,
             g.picker,
             g.curve,
+            g.curve_caption,
         ];
         ids.extend(g.toggle_buttons);
         ids.extend(g.tree_rows);
         ids
+    }
+
+    /// AC-3 (0.161.0): the demo curve editor carries a visible,
+    /// accessible caption directly under it, inside the gallery's own
+    /// right column, so its static bell can't pass for the image's
+    /// histogram.
+    #[test]
+    fn the_demo_curve_editor_is_captioned_as_a_sample() {
+        let (ws, g, _) = opened(TALL);
+        let Some(column) = ws.tree.parent(g.curve) else {
+            unreachable!("the editor has a parent");
+        };
+        let Some(siblings) = ws.tree.children(column) else {
+            unreachable!("the column has children");
+        };
+        let Some(at) = siblings.iter().position(|&id| id == g.curve) else {
+            unreachable!("the editor is its parent's child");
+        };
+        assert_eq!(
+            siblings.get(at + 1),
+            Some(&g.curve_caption),
+            "the caption sits directly under the editor"
+        );
+        match widgets::label_state(&ws.tree, g.curve_caption) {
+            Ok(state) => assert_eq!(state.text, super::GALLERY_CURVE_CAPTION),
+            Err(err) => unreachable!("the caption is a label: {err:?}"),
+        }
+        assert!(
+            super::GALLERY_CURVE_CAPTION.contains("Sample"),
+            "it says the data is a sample"
+        );
+        let Some(node) = ws.tree.accessibility(g.curve_caption) else {
+            unreachable!("every widget has a node");
+        };
+        assert_eq!(node.role(), Role::Label);
+        assert_eq!(node.label(), Some(super::GALLERY_CURVE_CAPTION));
+        let (Some(editor), Some(caption)) =
+            (ws.tree.bounds(g.curve), ws.tree.bounds(g.curve_caption))
+        else {
+            unreachable!("laid out");
+        };
+        assert!(caption.height > 0 && caption.width > 0, "{caption:?}");
+        assert!(
+            caption.y >= editor.y + i64::from(editor.height),
+            "below the editor, not over it: {editor:?} {caption:?}"
+        );
     }
 
     fn role(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<Role> {
@@ -866,7 +927,9 @@ mod tests {
         // 0.142.0: the 422 px it was plus the panel's 21 px title row.
         // 500 since 0.160.0: plus the toggle-button row (one control row
         // and its padding, 29 px) and its column gap, in the right column.
-        assert!((min - 500.0).abs() < f32::EPSILON, "{min}");
+        // 533 since 0.161.0: plus the curve editor's "Sample histogram"
+        // caption (one row) and its column gap, in the right column.
+        assert!((min - 533.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
@@ -937,7 +1000,7 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 500.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!((min - 533.0).abs() < f32::EPSILON, "measured minimum {min}");
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the

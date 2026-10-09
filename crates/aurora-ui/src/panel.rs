@@ -61,6 +61,42 @@ pub struct PanelHandle {
     pub scrollbar: WidgetId,
 }
 
+/// How an expanded panel takes height from the column it is docked in
+/// (0.161.0). Collapsed, every panel is its title row whatever this says.
+///
+/// **Why there are two (0.161.0's bug).** Until 0.161.0 every docked
+/// panel was [`Self::Fill`], so the rail was split into equal thirds by
+/// `flex_grow` alone. Measured headlessly at the design owner's window
+/// (1274 x 672 logical, Widget Gallery open, a Curves layer active): each
+/// panel got 224 px, but the Properties panel's Curves strip needs 221 px
+/// under its 21 px title, so its body was squeezed to 0 and the strip
+/// overflowed into History's title by 18 px (40 px at 604 px) — while
+/// Layers, with two rows, held a 100 px body that was mostly empty.
+/// Content-sized panels fix the distribution: Layers and Properties take
+/// what their content needs, History absorbs the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PanelSizing {
+    /// Share the column by `flex_grow` from a zero basis — the
+    /// pre-0.161.0 rule, kept for History: it takes whatever the
+    /// content-sized panels leave, and scrolls.
+    #[default]
+    Fill,
+    /// Take the content's own height (`flex_basis: auto`, no growth), its
+    /// body rows counting up to [`CONTENT_PANEL_MAX_ROWS`] rows, shrinking
+    /// with the other panels — in proportion to that basis — when the
+    /// column is too short for everyone. A shrunk panel scrolls (its body, and the
+    /// Properties panel's Curves strip, are scroll containers).
+    Content,
+}
+
+/// The [`PanelSizing::Content`] cap, as a *count of rows* of the
+/// `row_height` token — the convention the Widget Gallery's
+/// `GALLERY_EDITOR_ROWS` set, since no "panel height" token exists. Past
+/// this many body rows a content-sized panel stops growing and scrolls.
+/// An engineering default, flagged to the design owner (PRD FR-027
+/// *Ownership*) rather than invented as a token.
+pub const CONTENT_PANEL_MAX_ROWS: f32 = 10.0;
+
 /// Adds a new, empty, titled panel as the last child of `parent`,
 /// initially expanded (not collapsed — see [`set_panel_collapsed`]).
 ///
@@ -98,14 +134,20 @@ pub fn insert_panel(
     root_node.add_action(Action::Focus);
     root_node.add_action(Action::Collapse);
     root_node.set_expanded(true);
-    let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Panel)?;
+    let root = tree.insert(
+        parent,
+        root_style(false, PanelSizing::Fill, 0.0),
+        root_node,
+        WidgetKind::Panel,
+    )?;
     let header = tree.insert(
         root,
         header_style(scales),
         Node::new(Role::GenericContainer),
         WidgetKind::Container,
     )?;
-    let viewport = widgets::insert_container(tree, root, viewport_style())?;
+    let viewport =
+        widgets::insert_container(tree, root, viewport_style(PanelSizing::Fill, scales))?;
     let body = widgets::insert_container(tree, viewport, body_style(false))?;
     // Every docked panel's body scrolls (0.145.0) -- see `body_style`.
     // The flag is the tree's own, not part of the style, so
@@ -128,13 +170,118 @@ pub fn insert_panel(
         },
     )?;
     widgets::link_scrollbar(tree, scrollbar, body)?;
-    Ok(PanelHandle {
+    let panel = PanelHandle {
         root,
         header,
         body,
         viewport,
         scrollbar,
+    };
+    refresh_panel_floor(tree, panel)?;
+    Ok(panel)
+}
+
+/// A panel's height floor while expanded (0.161.0, see [`root_style`]):
+/// the sum of its root's *shown* children's own declared minimum
+/// heights. A hidden child (`Display::None`) or one with an `auto`
+/// minimum adds nothing (review J6).
+fn panel_floor(tree: &WidgetTree<WidgetKind>, panel: PanelHandle) -> f32 {
+    tree.children(panel.root)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|&child| tree.style(child))
+        .filter(|style| style.display != Display::None)
+        .map(|style| {
+            let min = style.min_size.height;
+            if min.is_auto() { 0.0 } else { min.value() }
+        })
+        .sum()
+}
+
+/// Recomputes an expanded panel's height floor ([`panel_floor`]) after
+/// a child was added to its root — the controls strips
+/// ([`crate::insert_tool_controls`], [`crate::insert_layer_controls`])
+/// call it. A collapsed panel is left alone: [`set_panel_collapsed`]
+/// recomputes it on expanding.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.root` or
+/// `panel.body` doesn't exist.
+pub(crate) fn refresh_panel_floor(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
+    if panel_is_collapsed(tree, panel)? {
+        return Ok(());
+    }
+    let sizing = panel_sizing(tree, panel)?;
+    tree.set_style(
+        panel.root,
+        root_style(false, sizing, panel_floor(tree, panel)),
+    )
+}
+
+/// How `panel` shares its column's height while expanded — read from the
+/// tree, never from the handle (0.161.0 review J3): the viewport's own
+/// style records it (`flex_basis: auto` for [`PanelSizing::Content`],
+/// zero for [`PanelSizing::Fill`]) and nothing but [`set_panel_sizing`]
+/// changes that style ([`set_panel_collapsed`] touches only its
+/// `display`). So every copy of a handle, however old, agrees.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.viewport` doesn't
+/// exist.
+pub fn panel_sizing(
+    tree: &WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<PanelSizing, WidgetError> {
+    let style = tree
+        .style(panel.viewport)
+        .ok_or(WidgetError::UnknownWidget(panel.viewport))?;
+    Ok(if style.flex_basis.is_auto() {
+        PanelSizing::Content
+    } else {
+        PanelSizing::Fill
     })
+}
+
+/// Sets how `panel` shares its column's height while expanded (0.161.0,
+/// [`PanelSizing`]). It is recorded in the tree (the viewport's style,
+/// [`panel_sizing`]), so a later [`set_panel_collapsed`] keeps it
+/// through any copy of the handle. A collapsed panel stays collapsed;
+/// the new sizing applies when it expands. A caller re-runs layout.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.root`,
+/// `panel.viewport` or `panel.body` doesn't exist.
+pub fn set_panel_sizing(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    sizing: PanelSizing,
+    scales: &Scales,
+) -> Result<(), WidgetError> {
+    let collapsed = panel_is_collapsed(tree, panel)?;
+    if tree.style(panel.viewport).is_none() {
+        return Err(WidgetError::UnknownWidget(panel.viewport));
+    }
+    tree.set_style(
+        panel.root,
+        root_style(collapsed, sizing, panel_floor(tree, panel)),
+    )?;
+    let display = tree
+        .style(panel.viewport)
+        .map_or(Display::Flex, |style| style.display);
+    tree.set_style(
+        panel.viewport,
+        Style {
+            display,
+            ..viewport_style(sizing, scales)
+        },
+    )?;
+    Ok(())
 }
 
 /// The `[body | scrollbar]` row (0.146.0, [`PanelHandle::viewport`]):
@@ -143,14 +290,44 @@ pub fn insert_panel(
 /// impose a minimum on either axis — and lays the two out side by side.
 /// The body (`flex_grow: 1`, zero basis) takes the width the bar leaves,
 /// and both stretch to the row's height.
-fn viewport_style() -> Style {
+///
+/// **0.161.0: one row tall at least, and content-based for a
+/// [`PanelSizing::Content`] panel.** The one-row floor is what the
+/// panel root's automatic minimum (`min_size.height: auto`, see
+/// [`root_style`]) adds up — title row, one body row and any controls
+/// strip — so a crowded rail can shrink a panel's body to one row and
+/// never to zero. It is an explicit floor, not the body's content
+/// height, so a thousand rows still cannot starve the rail (0.77.1). A
+/// content-sized panel's viewport takes its rows' height as its basis,
+/// which is what makes the panel's own `flex_basis: auto` its content.
+fn viewport_style(sizing: PanelSizing, scales: &Scales) -> Style {
     Style {
         flex_direction: taffy::FlexDirection::Row,
         flex_grow: 1.0,
-        flex_basis: Dimension::ZERO,
+        flex_basis: match sizing {
+            PanelSizing::Fill => Dimension::ZERO,
+            PanelSizing::Content => auto(),
+        },
         min_size: taffy::Size {
             width: Dimension::ZERO,
-            height: Dimension::ZERO,
+            height: length(row_height(scales)),
+        },
+        // The content cap: a content-sized panel's rows count toward its
+        // basis up to `CONTENT_PANEL_MAX_ROWS` rows, then it scrolls.
+        max_size: taffy::Size {
+            width: auto(),
+            height: match sizing {
+                PanelSizing::Fill => auto(),
+                PanelSizing::Content => length(CONTENT_PANEL_MAX_ROWS * row_height(scales)),
+            },
+        },
+        // A scroll container's min-content contribution is its own
+        // `min_size`, not its rows: without this the panel root's
+        // automatic minimum summed every row (measured: a 200-step
+        // History floored at 4221 px and pushed off the rail).
+        overflow: taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
         },
         ..Default::default()
     }
@@ -181,17 +358,22 @@ fn header_style(scales: &Scales) -> Style {
 }
 
 /// A panel's own root style — `Column` (the body stacks under the
-/// header once one exists), `flex_grow` the one thing
-/// [`set_panel_collapsed`] actually toggles. `1.0` (share the rail's
-/// height with its siblings, same as every other docked panel) while
-/// expanded; `0.0` while collapsed, so it stops claiming a share at
-/// all and its siblings' own `flex_grow: 1.0` absorbs the space it
-/// gives up — the ordinary flexbox behaviour every sibling already
-/// has, not a special case.
+/// header once one exists). **Since 0.161.0 the expanded style depends
+/// on the panel's [`PanelSizing`]** (the last paragraph below): only a
+/// [`PanelSizing::Fill`] panel (History) keeps the `flex_grow: 1.0`,
+/// zero-basis rule the next two paragraphs describe; a
+/// [`PanelSizing::Content`] panel (Layers, Properties) is content-based
+/// and does not grow. Collapsed, every panel has `flex_grow: 0.0`, so it
+/// stops claiming a share at all and its siblings absorb the space it
+/// gives up — ordinary flexbox behaviour, not a special case.
 ///
-/// **A panel's share of the rail is its siblings' business, never its
-/// own content's** — `flex_basis: 0` plus `min_size.height: 0` are what
-/// make that true, and both are load-bearing (0.77.1). Real bug, with
+/// **History (written when every panel was `Fill`): a `Fill` panel's
+/// share of the rail is its siblings' business, never its own
+/// content's** — `flex_basis: 0` plus a fixed height minimum are what
+/// make that true, and both are load-bearing (0.77.1). A `Content`
+/// panel avoids the same starvation differently: its rows count only up
+/// to [`CONTENT_PANEL_MAX_ROWS`] (the viewport's `max_size`), and its
+/// minimum is its fixed floor, never its content. Real bug, with
 /// real numbers: with the default `flex_basis: auto`, a panel's base
 /// size is its *content* height, and flexbox's automatic minimum size
 /// then refuses to shrink a flex item below that content — so a Layers
@@ -248,15 +430,49 @@ fn header_style(scales: &Scales) -> Style {
 /// clips them. A *closed* panel ([`close_panel`]) uses this same style
 /// with its title hidden as well, so its content height — and with
 /// `flex_basis: auto` its height — is exactly zero.
-fn root_style(collapsed: bool) -> Style {
+///
+/// **Expanded, 0.161.0 adds [`PanelSizing`] and a height floor.**
+/// `min_size.height` is the panel's *floor* ([`panel_floor`]): the sum
+/// of its children's own declared minimum heights — the title row, the
+/// viewport's one-row floor ([`viewport_style`]) and each controls
+/// strip's one-row floor. So a crowded rail shrinks each panel's body
+/// and strips down to one row each and no further, instead of to zero
+/// with the title and strip overflowing into the next panel (the
+/// 0.144.1 lesson). Not `auto`: `taffy`'s automatic minimum is the
+/// min-content height, which counted every visible body row and the
+/// whole Curves strip — measured, it pinned Properties at 263 px and
+/// pushed History off a 300 px rail.
+/// The width stays pinned to `0` for the reason above. A
+/// [`PanelSizing::Content`] root is content-based (`flex_basis: auto`,
+/// `flex_grow: 0`), its viewport capped at [`CONTENT_PANEL_MAX_ROWS`]
+/// rows; a [`PanelSizing::Fill`] root keeps the zero basis and
+/// `flex_grow: 1`.
+fn root_style(collapsed: bool, sizing: PanelSizing, floor: f32) -> Style {
+    if collapsed {
+        return Style {
+            flex_direction: taffy::FlexDirection::Column,
+            flex_grow: 0.0,
+            flex_shrink: 0.0,
+            flex_basis: auto(),
+            min_size: taffy::Size {
+                width: Dimension::ZERO,
+                height: Dimension::ZERO,
+            },
+            ..Default::default()
+        };
+    }
+    let (grow, basis) = match sizing {
+        PanelSizing::Fill => (1.0, Dimension::ZERO),
+        PanelSizing::Content => (0.0, auto()),
+    };
     Style {
         flex_direction: taffy::FlexDirection::Column,
-        flex_grow: if collapsed { 0.0 } else { 1.0 },
-        flex_shrink: if collapsed { 0.0 } else { 1.0 },
-        flex_basis: if collapsed { auto() } else { Dimension::ZERO },
+        flex_grow: grow,
+        flex_shrink: 1.0,
+        flex_basis: basis,
         min_size: taffy::Size {
             width: Dimension::ZERO,
-            height: Dimension::ZERO,
+            height: length(floor),
         },
         ..Default::default()
     }
@@ -279,8 +495,10 @@ fn root_style(collapsed: bool) -> Style {
 /// paint geometry with any ancestor declaring a clipping overflow, so it
 /// is invisible as well — rather than merely covered by whatever the
 /// paint order happens to draw next. This declaration is what that
-/// intersection reads; it is the only clipping overflow in the
-/// workspace.
+/// intersection reads. It was the only clipping overflow in the
+/// workspace until 0.161.0, which made the viewport around it
+/// ([`viewport_style`]) and the two controls strips
+/// (`crate::tool_controls`, `crate::layer_controls`) clip too.
 ///
 /// **That content is reachable by scrolling (0.145.0).** [`insert_panel`]
 /// makes every body a `WidgetTree::set_scrollable` container, so the
@@ -523,6 +741,24 @@ pub fn panel_is_collapsed(
     Ok(style.display == Display::None)
 }
 
+/// Whether `panel` is **closed** ([`close_panel`]) rather than merely
+/// collapsed (0.161.0 review J1): a close also hides the title row,
+/// which a collapse keeps. A closed panel is collapsed too.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.header` or
+/// `panel.body` doesn't exist.
+pub fn panel_is_closed(
+    tree: &WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<bool, WidgetError> {
+    let header = tree
+        .style(panel.header)
+        .ok_or(WidgetError::UnknownWidget(panel.header))?;
+    Ok(header.display == Display::None && panel_is_collapsed(tree, panel)?)
+}
+
 /// Collapses (`collapsed: true`) or expands `panel`.
 ///
 /// Collapsing doesn't remove the body or its content from the tree —
@@ -557,8 +793,7 @@ pub fn set_panel_collapsed(
     panel: PanelHandle,
     collapsed: bool,
 ) -> Result<(), WidgetError> {
-    tree.set_style(panel.root, root_style(collapsed))?;
-
+    let sizing = panel_sizing(tree, panel)?;
     tree.set_style(panel.body, body_style(collapsed))?;
     // Any *other* child of the root is panel content too (the Layers
     // panel's controls strip, `crate::layer_controls`, lives there so
@@ -588,6 +823,12 @@ pub fn set_panel_collapsed(
         )?;
     }
     set_display(tree, panel.header, Display::Flex)?;
+    // The root last (0.161.0 review J6): its floor counts only the
+    // children shown, so it is computed once their `display` is final.
+    tree.set_style(
+        panel.root,
+        root_style(collapsed, sizing, panel_floor(tree, panel)),
+    )?;
 
     let node = tree
         .accessibility(panel.root)
@@ -1079,6 +1320,9 @@ mod tests {
     /// behaviour is `crate::workspace`'s own
     /// `a_populated_panel_never_floors_the_rails_own_width_to_a_row_height`.
     ///
+    /// 0.161.0: an expanded root's height minimum is now its fixed
+    /// two-row floor (`panel_floor`), still never its content's size.
+    ///
     /// What this one is still worth: the *height* pin is genuinely
     /// load-bearing (`0.77.1`'s rail-starvation bug), it must survive a
     /// collapse/expand round trip, and pinning it is cheap to assert
@@ -1094,7 +1338,20 @@ mod tests {
             if let Err(err) = set_panel_collapsed(&mut tree, panel, collapsed) {
                 unreachable!("{err:?}");
             }
-            for (name, id) in [("root", panel.root), ("body", panel.body)] {
+            // 0.161.0: an expanded root's height minimum is its fixed
+            // floor -- title row plus the viewport's one-row floor, from
+            // the `row_height` token -- never its content's size; the
+            // body's stays zero, and both widths stay zero.
+            let row = widgets::row_height(&test_scales());
+            let root_floor = if collapsed {
+                taffy::Dimension::ZERO
+            } else {
+                taffy::style_helpers::length(2.0 * row)
+            };
+            for (name, id, floor) in [
+                ("root", panel.root, root_floor),
+                ("body", panel.body, taffy::Dimension::ZERO),
+            ] {
                 let Some(style) = tree.style(id) else {
                     unreachable!("just inserted");
                 };
@@ -1102,7 +1359,7 @@ mod tests {
                     style.min_size,
                     taffy::Size {
                         width: taffy::Dimension::ZERO,
-                        height: taffy::Dimension::ZERO,
+                        height: floor,
                     },
                     "a panel's {name} must never impose its content's size on the rail \
                      (collapsed: {collapsed})"
@@ -1407,5 +1664,93 @@ mod tests {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+    }
+    /// 0.161.0 review J6: a hidden child of the root adds nothing to the
+    /// panel's floor; shown, its declared minimum does.
+    #[test]
+    fn a_panels_floor_counts_only_its_shown_children() {
+        let scales = test_scales();
+        let row = widgets::row_height(&scales);
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Properties", &scales) {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let floor = |tree: &aurora_widgets::WidgetTree<WidgetKind>| {
+            tree.style(panel.root).map(|style| style.min_size.height)
+        };
+        let strip = |display| Style {
+            display,
+            min_size: taffy::Size {
+                width: taffy::Dimension::ZERO,
+                height: taffy::style_helpers::length(50.0_f32),
+            },
+            ..Default::default()
+        };
+        let extra =
+            match widgets::insert_container(&mut tree, panel.root, strip(taffy::Display::None)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        if let Err(err) = super::refresh_panel_floor(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            floor(&tree),
+            Some(taffy::style_helpers::length(2.0 * row)),
+            "hidden: not counted"
+        );
+        if let Err(err) = tree.set_style(extra, strip(taffy::Display::Flex)) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = super::refresh_panel_floor(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            floor(&tree),
+            Some(taffy::style_helpers::length(2.0 * row + 50.0)),
+            "shown: counted"
+        );
+        // A collapse/expand round trip lands on the same floor: the root
+        // is restyled after its children are shown again.
+        for collapsed in [true, false] {
+            if let Err(err) = set_panel_collapsed(&mut tree, panel, collapsed) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(
+            floor(&tree),
+            Some(taffy::style_helpers::length(2.0 * row + 50.0)),
+            "after expand"
+        );
+    }
+
+    /// 0.161.0 review J1: closing is distinguishable from collapsing.
+    #[test]
+    fn a_closed_panel_is_closed_and_a_collapsed_one_is_not() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Properties", &test_scales()) {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let closed = |tree: &aurora_widgets::WidgetTree<WidgetKind>| match super::panel_is_closed(
+            tree, panel,
+        ) {
+            Ok(closed) => closed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(!closed(&tree), "expanded");
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, true) {
+            unreachable!("{err:?}");
+        }
+        assert!(!closed(&tree), "collapsed is not closed");
+        if let Err(err) = close_panel(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+        assert!(closed(&tree), "closed");
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, false) {
+            unreachable!("{err:?}");
+        }
+        assert!(!closed(&tree), "reopened");
     }
 }

@@ -40,7 +40,7 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, FlexDirection, Style};
 
-use crate::panel::{PanelHandle, insert_panel};
+use crate::panel::{PanelHandle, PanelSizing, insert_panel, set_panel_sizing};
 use crate::tool::Tool;
 use crate::tools_panel::{ToolsPanel, insert_tools_panel};
 
@@ -264,6 +264,15 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
+    // 0.161.0: Layers and Properties take their content's height (their
+    // rows up to `CONTENT_PANEL_MAX_ROWS`, then they scroll); History keeps the zero-basis
+    // `Fill` rule and absorbs what they leave. Equal thirds squeezed the
+    // Properties panel's Curves editor to nothing (`PanelSizing`).
+    for panel in [layers, properties] {
+        if let Err(err) = set_panel_sizing(&mut tree, panel, PanelSizing::Content, scales) {
+            unreachable!("the panel was just inserted into this same tree: {err:?}");
+        }
+    }
 
     Workspace {
         tree,
@@ -602,8 +611,11 @@ mod tests {
         // width (0.160.0), and the canvas column (the only growing
         // element) absorbs the rest; the options bar takes its own
         // height off the top of that column. Height (no explicit size)
-        // fills via the parent's own 100% root, and each of the 3 stacked
-        // panels shares the rail's height equally (flex_grow: 1.0 each).
+        // fills via the parent's own 100% root. Since 0.161.0 the rail is
+        // not split in equal thirds: Layers and Properties are
+        // content-sized (empty here: a title row plus the viewport's
+        // one-row floor) and History, the one `Fill` panel, takes the
+        // rest.
         ws.tree.compute_layout(1000.0, 800.0);
         let Some(canvas_bounds) = ws.tree.bounds(ws.canvas_area) else {
             unreachable!("just laid out");
@@ -629,9 +641,24 @@ mod tests {
         let Some(history_bounds) = ws.tree.bounds(ws.history.root) else {
             unreachable!("just laid out");
         };
-        assert!(
-            layers_bounds.height > 0 && layers_bounds.height == history_bounds.height,
-            "the three panels must share the rail's height equally: {layers_bounds:?} vs {history_bounds:?}"
+        let Some(properties_bounds) = ws.tree.bounds(ws.properties.root) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&test_scales()) as u32;
+        assert_eq!(
+            (layers_bounds.height, properties_bounds.height),
+            (2 * row, 2 * row),
+            "an empty content-sized panel is its title plus one row"
+        );
+        assert_eq!(
+            history_bounds.height,
+            800 - 4 * row,
+            "History takes what the content-sized panels leave"
+        );
+        assert_eq!(
+            history_bounds.y,
+            properties_bounds.y + i64::from(properties_bounds.height)
         );
     }
 
@@ -887,16 +914,42 @@ mod tests {
                 unreachable!("just laid out");
             };
 
-            assert_eq!(
-                (properties.height, history.height),
-                (layers.height, layers.height),
-                "three equally-crowded panels must still share the rail equally at {count} \
-                 rows each: {layers:?}, {properties:?}, {history:?}"
-            );
-            assert!(
-                layers.height > 0,
-                "and the share must be real, not zero: {layers:?}"
-            );
+            // 0.161.0: no longer equal thirds. Layers and Properties take
+            // their content, up to `CONTENT_PANEL_MAX_ROWS` rows each;
+            // History, the `Fill` panel, takes the rest.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let row = aurora_widgets::widgets::row_height(&scales) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cap = (1 + crate::panel::CONTENT_PANEL_MAX_ROWS as u32) * row;
+            for (name, panel, body) in [
+                ("layers", layers, ws.layers.body),
+                ("properties", properties, ws.properties.body),
+                ("history", history, ws.history.body),
+            ] {
+                assert!(
+                    name == "history" || panel.height <= cap,
+                    "{name} is capped at its title plus the row cap at {count} rows: {panel:?}"
+                );
+                let Some(body) = ws.tree.bounds(body) else {
+                    unreachable!("just laid out");
+                };
+                assert!(
+                    body.height >= row,
+                    "{name}'s body keeps at least one row at {count} rows: {body:?}"
+                );
+            }
+            if count >= 60 {
+                for (name, body) in [
+                    ("layers", ws.layers.body),
+                    ("properties", ws.properties.body),
+                    ("history", ws.history.body),
+                ] {
+                    assert!(
+                        ws.tree.scroll_range(body).is_some_and(|range| range > 0.0),
+                        "{name} scrolls at {count} rows"
+                    );
+                }
+            }
             assert!(
                 history.y + i64::from(history.height) <= 900,
                 "no panel may be pushed off the bottom of the window: {history:?}"
@@ -928,5 +981,295 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The 0.161.0 regression set: the Properties panel's Curves strip in
+    /// the real rail, shown the way `aurora-app` shows it.
+    fn with_curves_shown(
+        ws: &mut super::Workspace,
+        scales: &aurora_theme::Scales,
+    ) -> crate::ToolControls {
+        let controls = match crate::insert_tool_controls(
+            &mut ws.tree,
+            ws.options_bar,
+            ws.properties,
+            scales,
+        ) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let curves = match layers.add_adjustment_layer_at(
+            "Curves",
+            aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = crate::sync_curves_controls(
+            &mut ws.tree,
+            controls.curves,
+            &layers,
+            Some(curves),
+            None,
+            None,
+        ) {
+            unreachable!("{err:?}");
+        }
+        controls
+    }
+
+    fn bottom(rect: aurora_core::Rect) -> i64 {
+        rect.y + i64::from(rect.height)
+    }
+
+    /// Asserts the three docked panels stack inside the rail, each one
+    /// starting at or below the one above's bottom (the 0.144.1 lesson).
+    fn assert_stacked_inside_the_rail(ws: &super::Workspace, what: &str) {
+        let Some(rail) = ws.tree.bounds(ws.rail) else {
+            unreachable!("laid out");
+        };
+        let mut previous = rail.y;
+        for (name, panel) in [
+            ("layers", ws.layers),
+            ("properties", ws.properties),
+            ("history", ws.history),
+        ] {
+            let Some(bounds) = ws.tree.bounds(panel.root) else {
+                unreachable!("laid out");
+            };
+            assert!(
+                bounds.y >= previous,
+                "{what}: {name} overlaps the panel above: {bounds:?}, above ends at {previous}"
+            );
+            assert!(
+                bottom(bounds) <= bottom(rail),
+                "{what}: {name} overflows the rail: {bounds:?} vs {rail:?}"
+            );
+            previous = bottom(bounds);
+        }
+    }
+
+    /// AC-1/AC-4: at the design owner's window (2548 x 1344 physical at
+    /// scale 2, so 1274 x 672 logical — and 604 for the content area the
+    /// screenshot measured under the macOS title bar) with the Widget
+    /// Gallery open, the Curves editor gets its full square and its tabs,
+    /// inside the Properties panel, above History. Before 0.161.0 the
+    /// strip overflowed History by 18 px (672) and 40 px (604).
+    #[test]
+    fn the_curves_editor_gets_its_full_height_in_the_reported_window() {
+        let scales = test_scales();
+        let side = crate::gallery_panel::gallery_editor_size(&scales);
+        for height in [672.0, 604.0, 480.0] {
+            let mut ws = build_workspace(&scales);
+            let controls = with_curves_shown(&mut ws, &scales);
+            fill_panels(&mut ws, &scales, (true, false, true), 3);
+            if let Err(err) = crate::insert_gallery_panel(&mut ws.tree, ws.root, &scales) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(1274.0, height);
+            let what = format!("1274 x {height}");
+            assert_stacked_inside_the_rail(&ws, &what);
+            let (Some(properties), Some(tabs), Some(editor), Some(history)) = (
+                ws.tree.bounds(ws.properties.root),
+                ws.tree.bounds(controls.curves.channel),
+                ws.tree.bounds(controls.curves.editor),
+                ws.tree.bounds(ws.history.root),
+            ) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let (w, h) = (editor.width as f32, editor.height as f32);
+            assert!(
+                (w - side).abs() < 1.0 && (h - side).abs() < 1.0,
+                "{what}: the plot keeps its full square: {editor:?}"
+            );
+            assert!(tabs.height > 0 && tabs.width > 0, "{what}: {tabs:?}");
+            assert!(
+                tabs.y >= properties.y && bottom(editor) <= bottom(properties),
+                "{what}: tabs and plot sit inside the Properties panel: {tabs:?} {editor:?} \
+                 {properties:?}"
+            );
+            assert!(
+                bottom(editor) <= history.y,
+                "{what}: the plot ends above History: {editor:?} {history:?}"
+            );
+            assert_eq!(
+                ws.tree.scroll_range(controls.root),
+                Some(0.0),
+                "{what}: nothing to scroll while it fits"
+            );
+        }
+    }
+
+    /// AC-1/AC-4: a rail too short for everything shrinks the Curves strip
+    /// — never to zero — and makes it scroll, so the editor stays
+    /// reachable, while no panel overlaps another or leaves the rail.
+    #[test]
+    fn a_short_rail_scrolls_the_curves_strip_instead_of_squeezing_it_away() {
+        let scales = test_scales();
+        let row = aurora_widgets::widgets::row_height(&scales);
+        for height in [300.0, 200.0] {
+            let mut ws = build_workspace(&scales);
+            let controls = with_curves_shown(&mut ws, &scales);
+            fill_panels(&mut ws, &scales, (true, false, true), 20);
+            ws.tree.compute_layout(1274.0, height);
+            let what = format!("1274 x {height}");
+            assert_stacked_inside_the_rail(&ws, &what);
+            let Some(strip) = ws.tree.bounds(controls.root) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let strip_height = strip.height as f32;
+            assert!(
+                strip_height >= row,
+                "{what}: the strip keeps at least one row: {strip:?}"
+            );
+            assert!(
+                ws.tree
+                    .scroll_range(controls.root)
+                    .is_some_and(|range| range > 0.0),
+                "{what}: the squeezed strip scrolls"
+            );
+            assert_eq!(
+                ws.tree.is_scrollable(controls.root),
+                Some(true),
+                "{what}: the wheel reaches it (scroll_container_at)"
+            );
+        }
+    }
+
+    /// AC-4: Layers with many rows is capped at `CONTENT_PANEL_MAX_ROWS` and
+    /// scrolls, leaving the Curves editor its full square.
+    #[test]
+    fn a_long_layers_list_is_capped_and_scrolls_beside_the_curves_editor() {
+        let scales = test_scales();
+        let side = crate::gallery_panel::gallery_editor_size(&scales);
+        let mut ws = build_workspace(&scales);
+        let controls = with_curves_shown(&mut ws, &scales);
+        fill_panels(&mut ws, &scales, (true, false, true), 200);
+        ws.tree.compute_layout(1274.0, 672.0);
+        assert_stacked_inside_the_rail(&ws, "200 layers");
+        let (Some(layers), Some(editor)) = (
+            ws.tree.bounds(ws.layers.root),
+            ws.tree.bounds(controls.curves.editor),
+        ) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&scales) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cap = (1 + crate::panel::CONTENT_PANEL_MAX_ROWS as u32) * row;
+        assert!(layers.height <= cap, "capped at the row cap: {layers:?}");
+        assert!(
+            ws.tree
+                .scroll_range(ws.layers.body)
+                .is_some_and(|range| range > 0.0),
+            "the Layers body scrolls"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let h = editor.height as f32;
+        assert!((h - side).abs() < 1.0, "{editor:?}");
+    }
+
+    /// AC-4: the smallest window the app allows (640 x 480), narrow and
+    /// short, with the gallery open: still stacked, no overlap.
+    #[test]
+    fn the_minimum_window_with_the_gallery_open_keeps_the_rail_stacked() {
+        let scales = test_scales();
+        let mut ws = build_workspace(&scales);
+        let _ = with_curves_shown(&mut ws, &scales);
+        fill_panels(&mut ws, &scales, (true, true, true), 30);
+        if let Err(err) = crate::insert_gallery_panel(&mut ws.tree, ws.root, &scales) {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(640.0, 480.0);
+        assert_stacked_inside_the_rail(&ws, "640 x 480");
+    }
+
+    /// AC-4: a rail barely taller than every panel's floor (title, one
+    /// body row, one row per controls strip: 63 + 63 + 42 = 168 px) holds
+    /// every part of every panel at one row or more, each inside its own
+    /// panel — the Curves strip and the Layers controls strip included.
+    /// The floor is what M9/M10/M11 of 0.161.0's mutation matrix remove.
+    #[test]
+    fn a_rail_at_its_panels_floors_keeps_every_part_one_row_and_inside_its_panel() {
+        let scales = test_scales();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&scales) as u32;
+        let mut ws = build_workspace(&scales);
+        let curves = with_curves_shown(&mut ws, &scales);
+        let layer_controls = match crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        fill_panels(&mut ws, &scales, (true, false, true), 20);
+        ws.tree.compute_layout(1274.0, 172.0);
+        assert_stacked_inside_the_rail(&ws, "1274 x 172");
+        for (name, part, panel) in [
+            ("layers rows", ws.layers.viewport, ws.layers.root),
+            ("layers controls", layer_controls.root, ws.layers.root),
+            (
+                "properties rows",
+                ws.properties.viewport,
+                ws.properties.root,
+            ),
+            ("curves strip", curves.root, ws.properties.root),
+            ("history rows", ws.history.viewport, ws.history.root),
+        ] {
+            let (Some(part), Some(panel)) = (ws.tree.bounds(part), ws.tree.bounds(panel)) else {
+                unreachable!("laid out");
+            };
+            assert!(part.height >= row, "{name} keeps one row: {part:?}");
+            assert!(
+                part.y >= panel.y && bottom(part) <= bottom(panel),
+                "{name} stays inside its panel: {part:?} vs {panel:?}"
+            );
+        }
+    }
+    /// 0.161.0 review J3: the sizing lives in the tree, so collapsing and
+    /// expanding Properties — through the workspace's own handle or any
+    /// copy of it — keeps it content-sized, and the Curves editor keeps
+    /// its full square afterwards.
+    #[test]
+    fn properties_stays_content_sized_across_a_collapse_and_expand() {
+        let scales = test_scales();
+        let side = crate::gallery_panel::gallery_editor_size(&scales);
+        let mut ws = build_workspace(&scales);
+        let controls = with_curves_shown(&mut ws, &scales);
+        let copy = ws.properties;
+        for handle in [ws.properties, copy] {
+            for collapsed in [true, false] {
+                if let Err(err) = crate::set_panel_collapsed(&mut ws.tree, handle, collapsed) {
+                    unreachable!("{err:?}");
+                }
+            }
+            assert_eq!(
+                crate::panel_sizing(&ws.tree, ws.properties).ok(),
+                Some(crate::PanelSizing::Content)
+            );
+            let Some(root) = ws.tree.style(ws.properties.root) else {
+                unreachable!("inserted");
+            };
+            assert!(root.flex_basis.is_auto(), "content basis after expand");
+            assert!(
+                root.flex_grow.abs() < f32::EPSILON,
+                "no growth after expand"
+            );
+        }
+        assert_eq!(
+            crate::panel_sizing(&ws.tree, ws.history).ok(),
+            Some(crate::PanelSizing::Fill)
+        );
+        ws.tree.compute_layout(1274.0, 672.0);
+        let Some(editor) = ws.tree.bounds(controls.curves.editor) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let h = editor.height as f32;
+        assert!((h - side).abs() < 1.0, "{editor:?}");
+        assert_stacked_inside_the_rail(&ws, "after collapse and expand");
     }
 }
