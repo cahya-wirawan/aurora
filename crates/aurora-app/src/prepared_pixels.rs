@@ -849,6 +849,13 @@ mod tests {
         // Straight away: the inserted tiles are still in `pending`.
         let first = dir.path().join("first.aur");
         assert_eq!(worker.submit(snapshot(&first, &doc, &mut live)), Some(1));
+        // Let the first write land before submitting the second: the
+        // worker coalesces, so a second job submitted while the first is
+        // still *waiting* replaces it and `first.aur` is never written —
+        // the race CI hit on slower Linux/Windows runners (0.161.1). The
+        // snapshot was already taken at submit, so waiting changes nothing
+        // about what is tested: the bytes were still in `pending` then.
+        assert!(worker.wait_idle(WAIT));
         // And once the store's writer has put them on the scratch disk.
         if let Err(err) = live.flush() {
             unreachable!("{err:?}");

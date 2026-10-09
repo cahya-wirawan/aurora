@@ -26,6 +26,22 @@ than the tidiness.
 
 ## Where we are
 
+**Latest (2026-10-09, 0.161.1): a CI test race fixed.** GitHub Actions'
+Ubuntu (and Windows) runs failed in
+`prepared_pixels::tests::a_background_autosave_right_after_the_install_recovers_the_document`
+with `NotFound` on `first.aur`. Cause: the test submitted two autosave
+jobs back to back and expected both files, but `AutosaveWorker`
+*coalesces* by design (0.152.0) — a second job submitted while the first
+is still *waiting* replaces it, so `first.aur` is never written. The RTX
+3090 box's worker always started in time; slower CI runners did not.
+Measured on this box under 12 competing CPU-bound processes: the old
+test failed **16 of 40** runs, the fixed one **0 of 40**. Fix (test-only):
+wait for the first write to land before the second snapshot — the
+snapshot is taken at submit, so the bytes were still in `pending` either
+way and nothing about what is tested changes. Every other test that
+submits twice in a row was checked: they gate the first write or do not
+depend on it. No product code changed.
+
 **Latest (2026-10-09, 0.161.0): the Curves editor is reliably visible.**
 The design owner's real-macOS report (2548 x 1344 physical, Widget Gallery
 open, a new Curves layer active) showed the Properties panel as its title
