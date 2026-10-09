@@ -20,7 +20,7 @@ as something to actively revise, not rubber-stamp.
 |---|---|
 | `tokens/vocabulary.md` | The semantic token names and what each means — the interface widgets will resolve against. Read this first. |
 | `tokens/palette.toml` | Primitive color ramps (raw hex). Themes reference these; widgets never do. |
-| `tokens/scales.toml` | Type scale, spacing scale, radius, elevation, motion — shared across all themes and density modes. |
+| `tokens/scales.toml` | Type scale, spacing scale, control sizes (`size.options_control_width`, 0.160.0, provisional), radius, elevation, motion — shared across all themes and density modes. |
 | `themes/dark.toml` | The one required built-in theme (FR-027 deliverable 3), mapping semantic tokens to palette values. |
 | `check_contrast.py` | WCAG 2.1 AA check over `themes/dark.toml`'s resolved token pairs. Run after any edit to `tokens/palette.toml` or a theme file. |
 | `build_tokens_css.py` | Generates `tokens.css` (CSS custom properties) from the TOML sources, for the HTML mockups/gallery below. The TOML is the source of truth — never hand-edit `tokens.css`. |

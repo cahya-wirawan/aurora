@@ -92,6 +92,10 @@ def main():
         lines.append(f"  {css_var_name(f'spacing-{name}')}: {val}px;")
 
     lines.append("")
+    for name, val in scales["size"].items():
+        lines.append(f"  {css_var_name(f'size-{name}')}: {val}px;")
+
+    lines.append("")
     for name, val in scales["radius"].items():
         lines.append(f"  {css_var_name(f'radius-{name}')}: {val}px;")
 

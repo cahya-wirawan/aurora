@@ -66,6 +66,15 @@ pub struct SpacingScale {
     pub density_multiplier: DensityMultiplier,
 }
 
+/// Fixed control widths for workspace chrome (`[size]` in `scales.toml`,
+/// 0.160.0). Logical px, not scaled by density.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct SizeScale {
+    /// The width of a slider in the options bar — a provisional default
+    /// (224) for the design owner to tune.
+    pub options_control_width: u32,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct RadiusScale {
     pub none: u32,
@@ -118,6 +127,7 @@ pub struct Scales {
     #[serde(rename = "type")]
     pub typography: TypeScale,
     pub spacing: SpacingScale,
+    pub size: SizeScale,
     pub radius: RadiusScale,
     pub elevation: ElevationScale,
     pub motion: MotionScale,
@@ -308,6 +318,18 @@ mod tests {
             scales.motion.easing.standard,
             "cubic-bezier(0.4, 0.0, 0.2, 1)"
         );
+    }
+
+    /// 0.160.0: the options-bar control width token parses, at its
+    /// provisional default (7 x `spacing.xl`).
+    #[test]
+    fn the_options_control_width_token_parses() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(scales.size.options_control_width, 224);
+        assert_eq!(scales.size.options_control_width, 7 * scales.spacing.xl);
     }
 
     #[test]

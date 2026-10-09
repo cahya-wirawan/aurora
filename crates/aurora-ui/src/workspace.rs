@@ -9,10 +9,19 @@
 //! interactivity so far — dragging the rail's own width is real
 //! pointer-driven interaction `aurora-app` owns, this module only
 //! exposes the pure layout half (see both functions' own doc comments).
-//! The menubar, toolbar, and status bar the mockup also shows are left
-//! out of this pass too: they belong to other, separate M1.8 bullets
-//! (native menus, tools, general chrome), not the docking/panel
-//! structure this one is about.
+//! The menubar and status bar the mockup also shows are still left out:
+//! they belong to other, separate M1.8 bullets (native menus, general
+//! chrome).
+//!
+//! **Tools panel and options bar (0.160.0), the first workspace round.**
+//! Following Photoshop's layout convention (not its look), the root row
+//! is now: the tools panel ([`crate::tools_panel`], a vertical
+//! `Role::Toolbar` on the canvas's left edge) → a canvas column (the
+//! options bar, a horizontal `Role::Toolbar` across the top, over the
+//! canvas area itself) → the divider → the rail. The canvas area is
+//! therefore no longer at the window's origin: every caller mapping a
+//! pointer into it must subtract [`WidgetTree::bounds`]'s own `x`/`y`
+//! (`aurora-app`'s `pointer_in_canvas` always has).
 //!
 //! **No pixel rendering** — same "logical model now, painting later"
 //! boundary every widget in `aurora-widgets` already keeps (blocked on
@@ -32,6 +41,11 @@ use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, FlexDirection, Style};
 
 use crate::panel::{PanelHandle, insert_panel};
+use crate::tool::Tool;
+use crate::tools_panel::{ToolsPanel, insert_tools_panel};
+
+/// The options bar's accessible label.
+pub const OPTIONS_BAR_LABEL: &str = "Tool options";
 
 /// [`set_rail_width`]'s own clamp range, in logical px. Engineering
 /// defaults, not design tokens: `design/tokens/scales.toml` has no
@@ -56,6 +70,17 @@ const RAIL_WIDTH_DEFAULT: f32 = 250.0;
 pub struct Workspace {
     pub tree: WidgetTree<WidgetKind>,
     pub root: WidgetId,
+    /// The left tools panel (0.160.0) — the root's first child.
+    pub tools: ToolsPanel,
+    /// The column holding [`Self::options_bar`] above
+    /// [`Self::canvas_area`] (0.160.0); it is what grows and shrinks with
+    /// the window.
+    pub canvas_column: WidgetId,
+    /// The options bar (0.160.0): a horizontal `Role::Toolbar` across the
+    /// top of the canvas column, holding the active tool's options
+    /// (`aurora-app` puts [`crate::ToolControls`]' radius readout and
+    /// slider here).
+    pub options_bar: WidgetId,
     /// Where the document canvas will render — `Canvas: infinite zoom,
     /// rotation, pan, ...` is a separate, still-open M1.8 bullet; this
     /// is an empty container reserving its place in the layout.
@@ -190,21 +215,12 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         unreachable!("root was just created by new_tree above: {err:?}");
     }
 
-    // The only element that grows: once the rail claims a fixed width
-    // below and the divider claims none, the canvas absorbs whatever
-    // space is left, exactly as it did under the old 3:1 ratio at the
-    // same starting rail width.
-    let canvas_area = match widgets::insert_container(
-        &mut tree,
-        root,
-        Style {
-            flex_grow: 1.0,
-            ..Default::default()
-        },
-    ) {
-        Ok(id) => id,
+    let tools = match insert_tools_panel(&mut tree, root, scales, Tool::default()) {
+        Ok(tools) => tools,
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
     };
+
+    let (canvas_column, options_bar, canvas_area) = insert_canvas_column(&mut tree, root, scales);
 
     // Deliberately not `Action::Focus` yet: a real `Tab` stop with no
     // working keyboard handler behind it (no arrow-key-driven resize
@@ -252,6 +268,9 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     Workspace {
         tree,
         root,
+        tools,
+        canvas_column,
+        options_bar,
         canvas_area,
         divider,
         rail,
@@ -260,6 +279,95 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         history,
         history_current: None,
         history_rows: HashMap::new(),
+    }
+}
+
+/// The canvas column (0.160.0): the options bar over the canvas area,
+/// inserted into `root`. Infallible for the same reason
+/// [`build_workspace`] is: `root` is a node of this brand-new tree.
+fn insert_canvas_column(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+) -> (WidgetId, WidgetId, WidgetId) {
+    // The only element that grows: once the tools panel claims its
+    // content width, the rail its fixed width and the divider none, the
+    // canvas column absorbs whatever space is left. `min_size: 0` lets a
+    // narrow window squeeze it to nothing rather than overflow.
+    let canvas_column = match widgets::insert_container(
+        tree,
+        root,
+        Style {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            min_size: taffy::Size {
+                width: Dimension::ZERO,
+                height: Dimension::ZERO,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
+    };
+    let mut options_node = Node::new(Role::Toolbar);
+    options_node.set_label(OPTIONS_BAR_LABEL);
+    options_node.set_orientation(accesskit::Orientation::Horizontal);
+    let options_bar = match tree.insert(
+        canvas_column,
+        options_bar_style(scales),
+        options_node,
+        WidgetKind::Container,
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
+    };
+    let canvas_area = match widgets::insert_container(
+        tree,
+        canvas_column,
+        Style {
+            flex_grow: 1.0,
+            min_size: taffy::Size {
+                width: Dimension::ZERO,
+                height: Dimension::ZERO,
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(id) => id,
+        Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
+    };
+    (canvas_column, options_bar, canvas_area)
+}
+
+/// The options bar's style: a row, never shrinking on its column's main
+/// axis, padded by `spacing.xs` vertically and `spacing.sm`
+/// horizontally, its children `spacing.sm` apart and vertically centred.
+/// At least one control row tall even when empty, so the canvas never
+/// jumps when switching to a tool with no options.
+fn options_bar_style(scales: &Scales) -> Style {
+    #[allow(clippy::cast_precision_loss)]
+    let (xs, sm) = (scales.spacing.xs as f32, scales.spacing.sm as f32);
+    let row = widgets::row_height(scales);
+    Style {
+        flex_direction: FlexDirection::Row,
+        flex_shrink: 0.0,
+        align_items: Some(taffy::AlignItems::CENTER),
+        gap: taffy::Size {
+            width: taffy::style_helpers::length(sm),
+            height: taffy::style_helpers::length(sm),
+        },
+        padding: taffy::Rect {
+            left: taffy::style_helpers::length(sm),
+            right: taffy::style_helpers::length(sm),
+            top: taffy::style_helpers::length(xs),
+            bottom: taffy::style_helpers::length(xs),
+        },
+        min_size: taffy::Size {
+            width: Dimension::ZERO,
+            height: taffy::style_helpers::length(row + 2.0 * xs),
+        },
+        ..Default::default()
     }
 }
 
@@ -317,6 +425,136 @@ pub fn set_rail_width(
 mod tests {
     use super::{RAIL_MAX_WIDTH, RAIL_MIN_WIDTH, build_workspace, rail_width, set_rail_width};
 
+    fn bounds_of(ws: &super::Workspace, id: aurora_widgets::WidgetId) -> aurora_core::Rect {
+        match ws.tree.bounds(id) {
+            Some(bounds) => bounds,
+            None => unreachable!("{id:?} is laid out"),
+        }
+    }
+
+    fn tools_width(ws: &super::Workspace) -> u32 {
+        bounds_of(ws, ws.tools.root).width
+    }
+
+    fn options_bar_height(ws: &super::Workspace) -> u32 {
+        bounds_of(ws, ws.options_bar).height
+    }
+
+    fn overlaps(a: aurora_core::Rect, b: aurora_core::Rect) -> bool {
+        a.width > 0
+            && b.width > 0
+            && a.height > 0
+            && b.height > 0
+            && a.x < b.x + i64::from(b.width)
+            && b.x < a.x + i64::from(a.width)
+            && a.y < b.y + i64::from(b.height)
+            && b.y < a.y + i64::from(a.height)
+    }
+
+    /// 0.160.0, AC-1/AC-5: the tools panel's width and the options bar's
+    /// height come from spacing tokens (text-blind here: a toggle
+    /// button's own padding, no label width), the canvas sits exactly in
+    /// the space they and the rail leave, and nothing overlaps — at the
+    /// default rail, the widest and narrowest rail, and a narrow window
+    /// (the 0.144.1 overlap lesson).
+    #[test]
+    fn the_tools_panel_and_options_bar_take_token_sized_space_and_never_overlap() {
+        let scales = test_scales();
+        let (xs, md) = (scales.spacing.xs, scales.spacing.md);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&scales) as u32;
+        for (window, rail) in [
+            ((1000.0, 800.0), 250.0),
+            ((1600.0, 900.0), RAIL_MAX_WIDTH),
+            ((1600.0, 900.0), RAIL_MIN_WIDTH),
+            ((480.0, 480.0), 250.0),
+            ((120.0, 200.0), RAIL_MIN_WIDTH),
+        ] {
+            let mut ws = build_workspace(&scales);
+            if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, rail) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(window.0, window.1);
+            let tools = bounds_of(&ws, ws.tools.root);
+            let column = bounds_of(&ws, ws.canvas_column);
+            let bar = bounds_of(&ws, ws.options_bar);
+            let canvas = bounds_of(&ws, ws.canvas_area);
+            let rail_bounds = bounds_of(&ws, ws.rail);
+            let case = format!("window {window:?}, rail {rail}");
+
+            assert_eq!(tools.width, 2 * xs + 2 * md, "{case}: {tools:?}");
+            assert_eq!((tools.x, tools.y), (0, 0), "{case}");
+            assert_eq!(bar.height, row + 2 * xs, "{case}: {bar:?}");
+            assert_eq!(column.x, i64::from(tools.width), "{case}");
+            assert_eq!((bar.x, bar.y), (column.x, 0), "{case}");
+            // The bar's own padding is a floor on its width: in a window
+            // too narrow for even that (the last case), it overhangs its
+            // squeezed-to-nothing column — disclosed, not designed away.
+            let bar_fits = column.width >= 2 * scales.spacing.sm;
+            if bar_fits {
+                assert_eq!(bar.width, column.width, "{case}");
+                assert!(!overlaps(bar, rail_bounds), "{case}: bar/rail overlap");
+            } else {
+                assert!(
+                    bar.width > column.width,
+                    "{case}: only the bar's padding overhangs"
+                );
+            }
+            assert_eq!(
+                (canvas.x, canvas.y, canvas.width),
+                (column.x, i64::from(bar.height), column.width),
+                "{case}: the canvas sits under the bar, right of the tools"
+            );
+            assert_eq!(
+                column.x + i64::from(column.width),
+                rail_bounds.x,
+                "{case}: the canvas column ends where the rail begins"
+            );
+            for (name, a, b) in [
+                ("tools/column", tools, column),
+                ("tools/rail", tools, rail_bounds),
+                ("column/rail", column, rail_bounds),
+                ("bar/canvas", bar, canvas),
+            ] {
+                assert!(!overlaps(a, b), "{case}: {name} overlap: {a:?} {b:?}");
+            }
+            // Every tool button is laid out inside the strip, stacked.
+            let mut previous: Option<aurora_core::Rect> = None;
+            for (_, id) in ws.tools.buttons {
+                let button = bounds_of(&ws, id);
+                assert!(
+                    button.x >= tools.x
+                        && button.x + i64::from(button.width) <= tools.x + i64::from(tools.width),
+                    "{case}: {button:?} outside {tools:?}"
+                );
+                if let Some(before) = previous {
+                    assert!(button.y >= before.y + i64::from(before.height), "{case}");
+                }
+                previous = Some(button);
+            }
+        }
+    }
+
+    /// The tools panel has no scroll container: it is a fixed strip.
+    #[test]
+    fn the_tools_panel_does_not_scroll() {
+        let mut ws = build_workspace(&test_scales());
+        ws.tree.compute_layout(1000.0, 800.0);
+        let strip = bounds_of(&ws, ws.tools.root);
+        #[allow(clippy::cast_precision_loss)]
+        let centre = (
+            strip.x as f32 + strip.width as f32 / 2.0,
+            strip.y as f32 + strip.height as f32 / 2.0,
+        );
+        assert!(ws.tree.hit_test(centre).is_some());
+        assert_eq!(ws.tree.scroll_container_at(centre), None);
+        let Some(node) = ws.tree.accessibility(ws.options_bar) else {
+            unreachable!("built");
+        };
+        assert_eq!(node.role(), accesskit::Role::Toolbar);
+        assert_eq!(node.label(), Some(super::OPTIONS_BAR_LABEL));
+    }
+
     /// Real bug, found on real macOS hardware: a `Role::GenericContainer`
     /// root never anchored into the native window's own accessibility
     /// hierarchy at all (`VoiceOver`'s Rotor came back completely empty,
@@ -335,7 +573,10 @@ mod tests {
     #[test]
     fn build_workspace_has_a_canvas_area_and_three_docked_panels() {
         let mut ws = build_workspace(&test_scales());
-        assert_eq!(ws.tree.parent(ws.canvas_area), Some(ws.root));
+        assert_eq!(ws.tree.parent(ws.canvas_area), Some(ws.canvas_column));
+        assert_eq!(ws.tree.parent(ws.canvas_column), Some(ws.root));
+        assert_eq!(ws.tree.parent(ws.options_bar), Some(ws.canvas_column));
+        assert_eq!(ws.tree.parent(ws.tools.root), Some(ws.root));
         assert_eq!(ws.tree.parent(ws.rail), Some(ws.root));
         assert_eq!(
             ws.tree.children(ws.rail),
@@ -357,11 +598,12 @@ mod tests {
 
         // A real, computed layout -- not just tree shape. A 1000x800
         // viewport: the rail claims its own fixed starting width (250),
-        // the zero-width divider claims none, and the canvas (the only
-        // growing element) absorbs the rest (750); height (no explicit
-        // size) fills via the parent's own 100% root, and each of the 3
-        // stacked panels shares the rail's height equally
-        // (flex_grow: 1.0 each).
+        // the zero-width divider claims none, the tools panel its content
+        // width (0.160.0), and the canvas column (the only growing
+        // element) absorbs the rest; the options bar takes its own
+        // height off the top of that column. Height (no explicit size)
+        // fills via the parent's own 100% root, and each of the 3 stacked
+        // panels shares the rail's height equally (flex_grow: 1.0 each).
         ws.tree.compute_layout(1000.0, 800.0);
         let Some(canvas_bounds) = ws.tree.bounds(ws.canvas_area) else {
             unreachable!("just laid out");
@@ -369,10 +611,17 @@ mod tests {
         let Some(rail_bounds) = ws.tree.bounds(ws.rail) else {
             unreachable!("just laid out");
         };
-        assert_eq!(canvas_bounds.width, 750);
+        let tools = tools_width(&ws);
+        let bar = options_bar_height(&ws);
+        assert!(tools > 0 && bar > 0, "tools {tools}, bar {bar}");
+        assert_eq!(canvas_bounds.width, 750 - tools);
         assert_eq!(rail_bounds.width, 250);
-        assert_eq!(canvas_bounds.height, 800);
+        assert_eq!(canvas_bounds.height, 800 - bar);
         assert_eq!(rail_bounds.height, 800);
+        assert_eq!(
+            (canvas_bounds.x, canvas_bounds.y),
+            (i64::from(tools), i64::from(bar))
+        );
 
         let Some(layers_bounds) = ws.tree.bounds(ws.layers.root) else {
             unreachable!("just laid out");
@@ -435,7 +684,8 @@ mod tests {
         };
         assert_eq!(rail_bounds.width, 300);
         assert_eq!(
-            canvas_bounds.width, 700,
+            canvas_bounds.width,
+            700 - tools_width(&ws),
             "the canvas must give back exactly what the rail gained"
         );
     }
@@ -599,7 +849,11 @@ mod tests {
         ] {
             let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, which, 5);
-            ws.tree.compute_layout(1.0, 200.0);
+            // 0.160.0: the tools panel never shrinks, so "a 1 px
+            // window" is now 1 px beyond the tools panel's own width.
+            #[allow(clippy::cast_precision_loss)]
+            let tools = (2 * scales.spacing.xs + 2 * scales.spacing.md) as f32;
+            ws.tree.compute_layout(tools + 1.0, 200.0);
 
             let Some(rail) = ws.tree.bounds(ws.rail) else {
                 unreachable!("just laid out");

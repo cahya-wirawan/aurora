@@ -1217,7 +1217,22 @@ fn paint_button(
     } else {
         1.0
     };
-    let mut paints = vec![(mesh, [r, g, b, alpha])];
+    // An "off" toggle button (0.160.0, `widgets::button`'s doc comment)
+    // has no fill. Instead -- the design owner's decision (2026-10-09) --
+    // it is outlined in `border.strong` in every theme, so an unselected
+    // tool button is visible even where the shared control outline below
+    // is zero-opacity (`border.control_opacity` is 0 in Dark, Light and
+    // Colour-Critical and stays the global control scalar). The width is
+    // the existing control-outline width; `border.strong` on
+    // `surface.app` (the strip's background) is gated at 3:1 by
+    // `design/check_contrast.py`.
+    let mut paints = if state.fills_accent() {
+        vec![(mesh, [r, g, b, alpha])]
+    } else {
+        let outline = stroke(&path, CONTROL_BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+        let [r, g, b] = theme.border.strong.to_srgb_f32();
+        vec![(outline, [r, g, b, alpha])]
+    };
     if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
@@ -2813,6 +2828,76 @@ mod tests {
             [r, g, b, 1.0],
             "an enabled, unpressed button must use accent.primary at full opacity"
         );
+    }
+
+    /// 0.160.0: an "on" toggle is the accent fill; an "off" one paints no
+    /// fill but a `border.strong` outline (review revision), and a
+    /// held-down "off" toggle shows the active accent.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_toggle_button_fills_with_the_accent_only_when_on_or_held() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let theme = dark_theme();
+        let on = match crate::widgets::insert_toggle_button(&mut tree, root, &scales, "On", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let off = match crate::widgets::insert_toggle_button(&mut tree, root, &scales, "Off", false)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [on, off] {
+            if let Err(err) = tree.set_bounds(
+                id,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 32,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
+        }
+        let (_, color) = single_paint(&tree, on, &theme, &scales, 1.0);
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(color, [r, g, b, 1.0]);
+        // Off: no fill, one `border.strong` outline (the design owner's
+        // decision, 2026-10-09) -- a stroke, so its mesh is a ring, not the
+        // filled rect. On (above): the accent fill alone, no such outline.
+        let (outline, off_colour) = single_paint(&tree, off, &theme, &scales, 1.0);
+        let [r, g, b] = theme.border.strong.to_srgb_f32();
+        assert_eq!(
+            off_colour,
+            [r, g, b, 1.0],
+            "an off toggle is outlined in border.strong"
+        );
+        assert!(!outline.vertices.is_empty());
+        let (fill, _) = single_paint(&tree, on, &theme, &scales, 1.0);
+        assert_ne!(
+            outline.indices.len(),
+            fill.indices.len(),
+            "the off shape is a stroke, not the on fill"
+        );
+        if let Err(err) = set_button_disabled(&mut tree, off, true) {
+            unreachable!("{err:?}");
+        }
+        let (_, dimmed) = single_paint(&tree, off, &theme, &scales, 1.0);
+        assert_eq!(
+            dimmed[3], theme.state.disabled_opacity,
+            "a disabled outline dims"
+        );
+        if let Err(err) = set_button_disabled(&mut tree, off, false) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_button_pressed(&mut tree, off, true) {
+            unreachable!("{err:?}");
+        }
+        let (_, held) = single_paint(&tree, off, &theme, &scales, 1.0);
+        let [r, g, b] = theme.accent.primary_active.to_srgb_f32();
+        assert_eq!(held, [r, g, b, 1.0]);
     }
 
     #[test]

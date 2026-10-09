@@ -56,6 +56,13 @@ compact     = 0.75
 comfortable = 1.0
 spacious    = 1.25
 
+[size]
+# Fixed control widths for workspace chrome (0.160.0, design owner's
+# decision 2026-10-09: a token, not a local cap). PROVISIONAL default for
+# the design owner to tune: 224 = 7 x spacing.xl. Logical px; not scaled
+# by density (only the spacing scale is).
+options_control_width = 224 # a slider in the options bar
+
 [radius]
 none = 0
 sm   = 2

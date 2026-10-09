@@ -164,7 +164,10 @@ pub(crate) use text_field::floor_char_boundary;
 mod tooltip;
 mod tree_view;
 
-pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
+pub use button::{
+    ButtonState, insert_button, insert_toggle_button, set_button_disabled, set_button_pressed,
+    set_button_toggled,
+};
 pub use checkbox::{
     CheckboxState, insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox,
 };
@@ -427,7 +430,7 @@ pub fn insert_container(
 /// widget's own layout style goes through this rather than a literal, per
 /// invariant §7.3.10.
 #[allow(clippy::cast_precision_loss)]
-fn spacing(value: u32) -> f32 {
+pub(crate) fn spacing(value: u32) -> f32 {
     value as f32
 }
 

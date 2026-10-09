@@ -6,7 +6,11 @@
 //! [`WidgetTree::compute_layout_with`], asking [`measure_widget`] for each
 //! widget's size first. Today exactly one kind is measured: a `Checkbox`
 //! with a non-blank label becomes its box, a `spacing.sm` gap and its
-//! label, one line tall. Every other widget, and every checkbox without a
+//! label, one line tall. Since 0.160.0 a *toggle* `Button` (one with a
+//! [`crate::widgets::ButtonState::toggled`] state — the tools panel's)
+//! is measured too: its label plus its own padding. Plain push buttons
+//! are deliberately still unmeasured (sizing every dialog and gallery
+//! button from its text is a separate, wider change). Every other widget, and every checkbox without a
 //! text engine to measure with, keeps its style's size — which is why the
 //! headless goldens (laid out with no engine) are unchanged.
 //!
@@ -51,6 +55,9 @@ pub struct TextMeasure<'a> {
 /// scale factor), measures as `None`: the checkbox stays a bare box.
 #[must_use]
 pub fn measure_widget(kind: &WidgetKind, measure: &mut TextMeasure<'_>) -> Option<Size<f32>> {
+    if let WidgetKind::Button(state) = kind {
+        return measure_toggle_button(state, measure);
+    }
     let WidgetKind::Checkbox(state) = kind else {
         return None;
     };
@@ -69,6 +76,35 @@ pub fn measure_widget(kind: &WidgetKind, measure: &mut TextMeasure<'_>) -> Optio
     Some(Size {
         width: (side + gap + width).ceil(),
         height: row_height(measure.scales).max(side),
+    })
+}
+
+/// A toggle button's measured size (0.160.0): `ceil(label width +
+/// 2 * spacing.md)` wide — the same horizontal padding
+/// `widgets::button`'s style gives it — and `row_height + 2 * spacing.sm`
+/// tall. `None` for a push button, a blank label, or a width that shapes
+/// to nothing finite and positive.
+fn measure_toggle_button(
+    state: &crate::widgets::ButtonState,
+    measure: &mut TextMeasure<'_>,
+) -> Option<Size<f32>> {
+    state.toggled?;
+    let text = sanitize_label(&state.label);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let line = measure
+        .engine
+        .shape(&text, &label_style(measure.scales), measure.scale_factor);
+    let width = line.width;
+    if !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let pad_x = crate::widgets::spacing(measure.scales.spacing.md);
+    let pad_y = crate::widgets::spacing(measure.scales.spacing.sm);
+    Some(Size {
+        width: (width + 2.0 * pad_x).ceil(),
+        height: row_height(measure.scales) + 2.0 * pad_y,
     })
 }
 
@@ -380,6 +416,43 @@ mod tests {
             kinds += 1;
         }
         assert_eq!(kinds, 4);
+    }
+
+    /// 0.160.0: a toggle button measures as its label plus its padding,
+    /// wider for a longer label; a plain push button stays unmeasured.
+    #[test]
+    fn a_toggle_button_measures_its_label_and_a_push_button_does_not() {
+        let scales = test_scales();
+        let mut engine = engine();
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style::default());
+        let short = ok(crate::widgets::insert_toggle_button(
+            &mut tree, root, &scales, "Pan", false,
+        ));
+        let long = ok(crate::widgets::insert_toggle_button(
+            &mut tree,
+            root,
+            &scales,
+            "Marquee Select",
+            true,
+        ));
+        let push = ok(crate::widgets::insert_button(
+            &mut tree, root, &scales, "OK",
+        ));
+        let mut measure = TextMeasure {
+            engine: &mut engine,
+            scales: &scales,
+            scale_factor: 1.0,
+        };
+        let size = |id, measure: &mut TextMeasure<'_>| {
+            tree.payload(id)
+                .and_then(|kind| measure_widget(kind, measure))
+        };
+        let (Some(a), Some(b)) = (size(short, &mut measure), size(long, &mut measure)) else {
+            unreachable!("both toggles are measured");
+        };
+        let pad = 2.0 * crate::widgets::spacing(scales.spacing.md);
+        assert!(a.width > pad && b.width > a.width, "{a:?} {b:?}");
+        assert_eq!(size(push, &mut measure), None);
     }
 
     #[test]

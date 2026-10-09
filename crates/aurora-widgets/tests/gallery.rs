@@ -8546,3 +8546,150 @@ fn focus_ring_gallery_matches_the_golden_image_in_color_critical_theme() {
         "focus_ring_gallery_color_critical.png",
     );
 }
+
+// -- Toggle button (0.160.0, the tools panel's buttons) ----------------
+
+const TOGGLE_BUTTON_CELL: (u32, u32) = (64, 64);
+/// Six cells: off, on, held (off and pressed), disabled off, disabled on,
+/// focused (off, with its keyboard focus ring).
+const TOGGLE_BUTTON_GALLERY_SIZE: (u32, u32) = (TOGGLE_BUTTON_CELL.0 * 6, TOGGLE_BUTTON_CELL.1);
+
+/// A laid-out tree with one toggle button per state, plus the one cell
+/// the render must give a focus ring. No hover cell: no button tracks
+/// hover yet (`widgets::button`'s doc comment).
+fn toggle_button_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 6]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let mut ids = [root; 6];
+    let cells = [
+        ("Off", false, false, false),
+        ("On", true, false, false),
+        ("Held", false, true, false),
+        ("Off", false, false, true),
+        ("On", true, false, true),
+        ("Focus", false, false, false),
+    ];
+    for (slot, (label, on, held, disabled)) in ids.iter_mut().zip(cells) {
+        let id =
+            match aurora_widgets::widgets::insert_toggle_button(&mut tree, root, scales, label, on)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        if held && let Err(err) = set_button_pressed(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        if disabled && let Err(err) = set_button_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_style(id, sized_style(TOGGLE_BUTTON_CELL)) {
+            unreachable!("{err:?}");
+        }
+        *slot = id;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        TOGGLE_BUTTON_GALLERY_SIZE.0 as f32,
+        TOGGLE_BUTTON_GALLERY_SIZE.1 as f32,
+    );
+    (tree, ids)
+}
+
+fn render_toggle_button_gallery(
+    context: &GpuTestContext,
+    theme: &Theme,
+    clear: wgpu::Color,
+) -> aurora_testkit::Image {
+    let scales = scales();
+    let (mut tree, ids) = toggle_button_gallery_tree(&scales);
+    let focus = focus_paints(&mut tree, &ids[5..]);
+    render_gallery_focused(
+        context,
+        &tree,
+        &focus,
+        theme,
+        &scales,
+        TOGGLE_BUTTON_GALLERY_SIZE,
+        clear,
+    )
+}
+
+/// Not a golden: the on cell is the accent and the off cell is not, so
+/// the two read differently on real hardware even before a bless.
+#[test]
+fn render_gallery_tells_an_on_toggle_button_from_an_off_one() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let image = render_toggle_button_gallery(&context, &dark_theme(), wgpu::Color::BLACK);
+    let off = sample_cell_centre(&image, TOGGLE_BUTTON_CELL, 0);
+    let on = sample_cell_centre(&image, TOGGLE_BUTTON_CELL, 1);
+    let held = sample_cell_centre(&image, TOGGLE_BUTTON_CELL, 2);
+    assert_ne!(off, on, "an on toggle must not look like an off one");
+    assert_ne!(on, held, "accent.primary vs accent.primary_active");
+}
+
+fn toggle_button_golden(file: &str, theme: &Theme, clear: wgpu::Color) {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let image = render_toggle_button_gallery(&context, theme, clear);
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(file);
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+#[test]
+#[ignore = "golden pending a human bless on real GPU hardware (0.160.0)"]
+fn toggle_button_gallery_matches_the_golden_image() {
+    toggle_button_golden(
+        "toggle_button_gallery.png",
+        &dark_theme(),
+        wgpu::Color::BLACK,
+    );
+}
+
+#[test]
+#[ignore = "golden pending a human bless on real GPU hardware (0.160.0)"]
+fn toggle_button_gallery_matches_the_golden_image_in_light_theme() {
+    toggle_button_golden(
+        "toggle_button_gallery_light.png",
+        &light_theme(),
+        LIGHT_CLEAR,
+    );
+}
+
+#[test]
+#[ignore = "golden pending a human bless on real GPU hardware (0.160.0)"]
+fn toggle_button_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
+    toggle_button_golden(
+        "toggle_button_gallery_high_contrast_dark.png",
+        &high_contrast_dark_theme(),
+        HIGH_CONTRAST_DARK_CLEAR,
+    );
+}
+
+#[test]
+#[ignore = "golden pending a human bless on real GPU hardware (0.160.0)"]
+fn toggle_button_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    toggle_button_golden(
+        "toggle_button_gallery_high_contrast_light.png",
+        &high_contrast_light_theme(),
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+}
+
+#[test]
+#[ignore = "golden pending a human bless on real GPU hardware (0.160.0)"]
+fn toggle_button_gallery_matches_the_golden_image_in_color_critical_theme() {
+    toggle_button_golden(
+        "toggle_button_gallery_color_critical.png",
+        &color_critical_theme(),
+        COLOR_CRITICAL_CLEAR,
+    );
+}
