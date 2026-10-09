@@ -35,6 +35,7 @@
 //! in particular).
 
 pub mod canvas_view;
+pub mod curves_controls;
 pub mod gallery_panel;
 pub mod history_panel;
 pub mod layer_controls;
@@ -46,6 +47,11 @@ pub mod tool_controls;
 pub mod workspace;
 
 pub use canvas_view::CanvasView;
+pub use curves_controls::{
+    CurvesChannel, CurvesControls, channel_curve, curves_controls_contains, curves_controls_shown,
+    curves_params, curves_selected_channel, insert_curves_controls, select_curves_channel,
+    sync_curves_controls, with_channel_curve,
+};
 pub use gallery_panel::{
     GalleryPanel, apply_gallery_outcome, gallery_close_popovers, gallery_contains,
     gallery_content_height, gallery_hover, gallery_light_dismiss, gallery_next_deadline,

@@ -40,7 +40,9 @@ mod tree;
 
 pub use error::DocError;
 pub use history::{History, MAX_DESCRIPTIONS, forget_document_surfaces};
-pub use layer::{BlendMode, FULL_MASK_DENSITY, Layer, LayerId, LayerKind, LayerLock, LayerMask};
+pub use layer::{
+    Adjustment, BlendMode, FULL_MASK_DENSITY, Layer, LayerId, LayerKind, LayerLock, LayerMask,
+};
 pub use mask::{
     MASK_SURFACE_BIT, encode_mask_coverage_region, forget_mask_coverage, read_mask_coverage,
     write_mask_coverage, write_mask_coverage_region,

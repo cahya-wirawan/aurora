@@ -346,6 +346,7 @@ use aurora_widgets::widgets::{
 };
 use aurora_widgets::widgets::{
     curve_editor_state, insert_curve_editor, select_curve_point, set_curve_editor_disabled,
+    set_curve_editor_histogram,
 };
 use aurora_widgets::{
     FocusManager, FocusOrigin, FocusPaint, GlyphAtlas, GpuColorMesh, GpuMesh, GpuPaintOp,
@@ -7708,6 +7709,174 @@ curve_editor_golden_test!(
     curve_editor_gallery_matches_the_golden_image_in_color_critical_theme,
     color_critical_theme(),
     "curve_editor_gallery_color_critical.png"
+);
+
+/// The curve editor's histogram state (0.156.0): the same two editors
+/// as [`curve_editor_gallery_tree`], each with a 256-bin linear ramp
+/// behind its grid (bin `i` weighs `i`), so the bar at input `x` rises to
+/// about `x` of the plot's height.
+fn curve_editor_histogram_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let (mut tree, editors) = curve_editor_gallery_tree(scales);
+    #[allow(clippy::cast_precision_loss)]
+    let ramp: Vec<f32> = (0..256).map(|i| i as f32).collect();
+    for editor in editors {
+        if let Err(err) = set_curve_editor_histogram(&mut tree, editor, Some(&ramp)) {
+            unreachable!("{err:?}");
+        }
+    }
+    (tree, editors)
+}
+
+/// Inside the enabled editor's ramp (input 0.9, output 0.1) the plot is
+/// `text.secondary`; above the ramp (input 0.1, output 0.9) it is still
+/// the `surface.sunken` well — and the curve and the selected marker
+/// still paint over the histogram exactly as without one.
+fn assert_curve_editor_histogram_gallery(
+    image: &aurora_testkit::Image,
+    tree: &WidgetTree<WidgetKind>,
+    scales: &Scales,
+    theme: &Theme,
+    editors: [WidgetId; 2],
+    theme_name: &str,
+) {
+    let [enabled, _] = editors;
+    let rgb8 = |color: Color| to_rgb8(color.to_srgb_f32());
+    let (hx, hy) = curve_editor_pixel(tree, enabled, scales, 0.9, 0.1);
+    let bar = sample_at(image, hx, hy);
+    assert!(
+        within(bar, rgb8(theme.text.secondary), 3),
+        "{theme_name}: histogram pixel {bar:?} is not text.secondary"
+    );
+    let (wx, wy) = curve_editor_pixel(tree, enabled, scales, 0.1, 0.9);
+    let well = sample_at(image, wx, wy);
+    assert!(
+        within(well, rgb8(theme.surface.sunken), 3),
+        "{theme_name}: pixel above the ramp {well:?} is not surface.sunken"
+    );
+    let (x, y) = CURVE_EDITOR_POINTS[1];
+    let (cx, cy) = curve_editor_pixel(tree, enabled, scales, x, y);
+    let disc = sample_at(image, cx, cy);
+    assert!(
+        within(disc, rgb8(theme.accent.primary), 3),
+        "{theme_name}: the selected marker {disc:?} must paint over the histogram"
+    );
+}
+
+macro_rules! curve_editor_histogram_distinct_test {
+    ($name:ident, $theme:expr, $theme_name:expr) => {
+        #[test]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, editors) = curve_editor_histogram_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            assert_curve_editor_histogram_gallery(
+                &image,
+                &tree,
+                &scales,
+                &theme,
+                editors,
+                $theme_name,
+            );
+        }
+    };
+}
+
+curve_editor_histogram_distinct_test!(
+    render_gallery_curve_editor_paints_its_histogram_behind_the_grid_in_dark_theme,
+    dark_theme(),
+    "Dark"
+);
+curve_editor_histogram_distinct_test!(
+    render_gallery_curve_editor_paints_its_histogram_behind_the_grid_in_light_theme,
+    light_theme(),
+    "Light"
+);
+curve_editor_histogram_distinct_test!(
+    render_gallery_curve_editor_paints_its_histogram_behind_the_grid_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "High Contrast Dark"
+);
+curve_editor_histogram_distinct_test!(
+    render_gallery_curve_editor_paints_its_histogram_behind_the_grid_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "High Contrast Light"
+);
+curve_editor_histogram_distinct_test!(
+    render_gallery_curve_editor_paints_its_histogram_behind_the_grid_in_color_critical_theme,
+    color_critical_theme(),
+    "Colour-Critical"
+);
+
+/// The histogram state's five golden-diff tests (0.156.0), against
+/// goldens that **do not exist** — `#[ignore]`d exactly as
+/// `curve_editor_golden_test!`'s own are. A human blesses them
+/// (`AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored curve_editor_histogram`) after confirming each PNG shows
+/// the two editors of `curve_editor_gallery*.png` with a muted ramp
+/// rising left to right behind the grid — the right one dimmed.
+macro_rules! curve_editor_histogram_golden_test {
+    ($name:ident, $theme:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let theme = $theme;
+            let (tree, _editors) = curve_editor_histogram_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &theme,
+                &scales,
+                CURVE_EDITOR_GALLERY_SIZE,
+                tab_bar_clear(&theme),
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+curve_editor_histogram_golden_test!(
+    curve_editor_histogram_gallery_matches_the_golden_image,
+    dark_theme(),
+    "curve_editor_histogram_gallery.png"
+);
+curve_editor_histogram_golden_test!(
+    curve_editor_histogram_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    "curve_editor_histogram_gallery_light.png"
+);
+curve_editor_histogram_golden_test!(
+    curve_editor_histogram_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    "curve_editor_histogram_gallery_high_contrast_dark.png"
+);
+curve_editor_histogram_golden_test!(
+    curve_editor_histogram_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    "curve_editor_histogram_gallery_high_contrast_light.png"
+);
+curve_editor_histogram_golden_test!(
+    curve_editor_histogram_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    "curve_editor_histogram_gallery_color_critical.png"
 );
 
 /// The popover layer's (0.127.0) own gallery scene: a fixed-height panel

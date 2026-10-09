@@ -26,7 +26,126 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.154.0): PSD opens stream, one layer at a
+**Latest (2026-10-09, 0.157.0): curves interpolate like Photoshop's.**
+`aurora_core::ToneCurve` is now a natural cubic spline (second derivative
+`0` at both ends) with its output clamped to `[0, 1]`, replacing
+0.155.0's monotone Fritsch–Carlson spline, and holds up to **19** points
+(`MAX_POINTS`, was 16) — the design owner's decision that Aurora match
+Photoshop so imported PSD Curves layers look identical. Evidence, and
+how strong it is: psd-tools 1.17.4's Curves compositor uses
+`scipy.interpolate.CubicSpline(bc_type="natural")` clipped to `[0, 1]`;
+independently, Photoshop's **own merged composite** in the corpus
+fixture `adjustments/curves_rgb.psd` was compared against four models
+over that file's four Curves layers: the natural spline was within one
+8-bit level on all 674 cleanly exercised levels of three channel paths
+(672 exact), Fritsch–Carlson off by up to 10. That is a
+strong 8-bit match, not a proof of Photoshop's algorithm, and says
+nothing about 16-bit behaviour. `CurvesLut` now tabulates the spline
+*before* its clamp and clamps after interpolating (clamping first put
+the clamp's kink inside a table interval: measured `3.1e-3`); its
+re-derived bound is `1.83e-4`, measured `1.80e-4` on the worst legal
+curve. Existing Curves layers whose curve has interior points now
+composite differently (0.155.0/0.156.0 were never released); a `.aur`
+with a 17–19-point curve is refused by an older build. Photoshop's
+movable endpoints (a curve starting at input 26, flat beyond) are still
+not representable — the PSD `curv` import (0.158.0) must relax that.
+12 of 12 mutations killed. Full gate green on the RTX 3090 (`AURORA_REQUIRE_GPU=1`): 2,972 passed, 0 failed, 0 skipped; judge PASS 0.91.
+**Needs a human: compare a curve against Photoshop on the same
+points.** Details: "Next action", addendum 0.157.0.
+
+**Previously (2026-10-09, 0.156.0): the Curves UI — a channel selector,
+the curve editor bound to the layer, and a histogram behind it.** When
+the active layer is a Curves adjustment, the Properties panel shows an
+RGB / Red / Green / Blue tab bar above the curve editor
+(`aurora_ui::curves_controls`, built as the last child of the
+tool-controls strip so it reuses the `ToolControls` pointer/key routing;
+hidden and disabled otherwise). Editing points by pointer or keyboard
+updates the layer's `CurvesParams` live and invalidates the whole
+composite; a whole pointer drag (including the press that added a point)
+is **one** undo step (`PendingCurves`, the 0.135.0 opacity pattern:
+live edits on the tree, then the start parameters put back and the final
+ones recorded through `History::set_adjustment`), and a keyboard step,
+`Insert` and `Delete` are one step each. Undo/redo, a layer switch and an
+open are mirrored by a per-iteration catch-all (`sync_curves_ui`); an
+open ends a live drag, drops the histogram and resets the channel to RGB.
+0.155.0's `#[cfg(test)] set_layer_curves` hook is gone: its tests now go
+through the real `record_curves_step`. The curve editor gained an
+optional, document-agnostic histogram (`set_curve_editor_histogram`):
+one filled step area in `text.secondary` (the design owner's "muted
+foreground" decision; no new token) painted after the well and before the
+grid, decorative (no accessibility node). The app computes the
+256-bin histogram of the composite **below** the Curves layer (the layer
+and everything painted after it hidden for the read, then restored); RGB
+is Rec. 709 luma of the straight colour, R/G/B that channel. Read from at
+most 4 x 4 evenly spaced sampled tiles (exact up to 1024 x 1024 px), as an
+incremental job advanced once per event-loop iteration; its unit is one
+whole tile composite, so measured on the RTX 3090 box at the 300,000 px
+ceiling with three CPU-path layers that is 16 iterations of 9.3–9.7 ms
+UI-thread work each (one-shot 146–167 ms, debug and release alike) after
+each recorded step while a Curves layer is active — bounded, but not
+invariant 4 to the letter (its nominal 4 ms step budget does not bind). Staleness rule: recomputed when the Curves
+layer, the channel or `UndoOrder::revision` (bumped by every recorded,
+undone or redone step, fresh per document) changes; the layer's own
+Curves steps carry it forward. Gallery: a new histogram state for the
+curve editor (5 GPU tests plus 5 `#[ignore]`d unblessed goldens), and the
+in-app Widget Gallery's demo editor shows a sample bell. **Design-owner
+decision recorded (2026-10-09): Aurora will match Photoshop's Curves
+interpolation and 19-point limit — scheduled for 0.157.0, not done here.**
+The curve and every marker are drawn over a `surface.sunken` halo — the
+**design owner chose option 1 (outline), 2026-10-09** — after review found
+them as low as 1.00:1 over the bars; the halo pairs are now gated in
+`design/check_contrast.py` and pass in all five themes. Screen-reader
+`SetValue`/`Increment`/`Decrement` on a curve point now edit the document
+(one undo step each; review GA-1), and a key ending a select-only press
+drops the editor's capture (GA4-R). 28 new tests; 20 mutations, 19
+killed, one equivalent survivor (disclosed). Test count 2,969 (2,941 +
+28; the full gate passed at 2,964 and then 2,967 on the two review
+rounds, the last round's three crates re-run with `AURORA_REQUIRE_GPU=1`
+on the RTX 3090). The histogram read is still on the UI thread (open
+follow-up).
+**Needs a human: on macOS, add a Curves layer, edit the curve per
+channel, watch the histogram, compare with Photoshop.** Details: "Next
+action", addendum 0.156.0.
+
+**Previously (2026-10-09, 0.155.0): a non-destructive Curves adjustment
+layer.** The first adjustment, and `aurora-filters`' first real code
+(adjustments are Phase 2 scope per "Phase 2–3 — outline"; this lands one
+early, at the design owner's request, with no Phase 1 checkbox to tick).
+`aurora_doc::LayerKind::Adjustment(Adjustment::Curves(CurvesParams))`
+(`CurvesParams` in `aurora-core` beside `ToneCurve`: a composite RGB curve
+plus optional R/G/B curves, Photoshop's model) has opacity, blend mode,
+visibility and an optional mask like any layer, and no content surface or
+bounds. `aurora_filters::CurvesLut` samples each non-identity curve at
+16,385 `f32` points (2^14 intervals, linear interpolation; identity curves
+are skipped, so an exact passthrough), applied to straight RGB in the
+stored (encoded) working values, per-channel first then composite
+(psd-tools' Photoshop-checked order); measured max error against direct
+evaluation 5.96e-8 for a typical curve, 1.80e-4 for the steepest legal
+curve (derived bound 1.8e-4). The CPU compositor folds it in place
+(`fold_layer_into`/`apply_adjustment_layer`): the accumulator below it,
+un-premultiplied, is re-mapped, masked, blended with the layer's own mode
+and opacity over the backdrop made opaque, and written back at the
+backdrop's own alpha, so it never creates pixels. The GPU predicate
+already refused non-pixel roots; `begin_gpu_composite_tile` now also
+refuses a visible adjustment root, so such documents fall back to CPU
+(the WGSL port is a follow-up). History: add/remove reuse `Restore`/
+`RemoveById`; `LayerOp::SetAdjustment` is appended last (ordinal 15).
+`.aur`: the new `LayerKind` variant is appended (ordinal 2), so every old
+manifest and journal decodes unchanged and no manifest version bump or
+side entry is needed; an older build refuses a file holding one.
+**New Curves Layer** (palette, macOS Layer menu) adds an identity
+"Curves N" above the active node as one undo step and makes it active;
+its Layers row reads "Curves adjustment, Normal, 100%"; Delete Layer
+works on it. Groups are always isolated (Aurora has no Pass Through), so a Curves layer inside a group adjusts only that group's own layers, unlike Photoshop's default. No curve editor yet (0.156.0); tests drive a `#[cfg(test)]`
+`set_layer_curves` hook. PSD `curv` import deferred (Photoshop's natural
+cubic spline and 19-point curves differ from `ToneCurve`). 36 new tests;
+14 mutations, all killed (one only after a test was added). Test count
+2,941 (2,905 + 36; the touched crates were run with
+`AURORA_REQUIRE_GPU=1` on the RTX 3090, the full gate was not).
+**Needs a human: add a Curves layer on macOS and compare against
+Photoshop.** Details: "Next action", addendum 0.155.0.
+
+**Previously (2026-10-09, 0.154.0): PSD opens stream, one layer at a
 time.** Until 0.153.0 a PSD open read the whole file into memory, decoded
 every layer into an in-memory `Image`, then encoded every tile — peak
 roughly file + decoded document + encoded tiles. Now
@@ -30583,6 +30702,9 @@ Detailed when the preceding phase closes; planning further ahead than the
 evidence supports is how the original 6-month Phase 1 estimate happened.
 
 - **Phase 2** — selections, brush engine, masks, filters, adjustments.
+  (One adjustment, Curves, landed early in 0.155.0: model, CPU
+  compositing, persistence and a New Curves Layer command — see "Next
+  action", addendum 0.155.0.)
   *Gate: an illustrator completes a real piece without leaving Aurora.*
   Unchanged, zero spike evidence — see 0.8.
 - **Phase 3** — smart objects, Camera RAW, colour management, PSD/PSB
@@ -30675,6 +30797,430 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.157.0) — Photoshop-matching curve
+interpolation.** The design owner (Cahya, 2026-10-09, final) decided
+Aurora's curves match Photoshop: its interpolation and its 19-point
+limit. Files: `aurora-core` `tone_curve.rs` (natural cubic spline:
+`natural_second_derivatives`, a Thomas-algorithm solve in `f64`, and
+`ToneCurve::spline`, the one evaluation formula — the whole model sits
+behind those two functions so a later correction touches one place;
+`evaluate` clamps to `[0, 1]`; new `evaluate_unclamped`; `MAX_POINTS`
+16 → 19), `curves.rs` (decode tests), `aurora-filters` `curves.rs`
+(table of the unclamped spline, clamp after lookup, re-derived bound),
+`aurora-widgets` `widgets/curve_editor.rs` (docs only: the cap was
+already `aurora_core::MAX_POINTS`, never a literal, and the
+widest-segment fallback's bound is now "seventeen segments, at least
+`1/17` wide"). The curve editor's paint and the Properties Curves UI use
+`ToneCurve::evaluate` unchanged; `.aur` and the journal decode through
+`ToneCurve`'s own `Deserialize`, so they accept 19 points with no format
+change.
+
+*Research findings and confidence.* (1) psd-tools 1.17.4,
+`psd_tools/composite/adjustments.py::apply_curves`: per channel,
+`scipy.interpolate.CubicSpline(x, y, bc_type="natural")` over the
+stored points (`/ 255`), input clamped to the first/last point's `x`,
+output clipped to `[0, 1]`, a 256-entry LUT for 8-bit; per-channel
+curves before the composite (RGB) curve. (2) An independent oracle:
+Photoshop's own merged composite stored in
+`corpora/psd/reference/psd-tools-fixtures/adjustments/curves_rgb.psd`
+(four masked Curves layers over an image). For each layer, the pixels
+where its mask is fully on and every other Curves mask fully off were
+compared with the layers below (composited by psd-tools, Curves
+hidden) mapped through four candidate models. Mean absolute error per
+8-bit sample, 30,000 samples per layer: natural spline 0.012–0.016
+(322 of 119,985 samples off by more than one level, all in the
+fixture's palette strip at the bottom rows); Fritsch–Carlson 4.6–14.0;
+zero-end-slope cubic 12.8–23.9; linear 10.0–17.8. Per input level,
+three channel paths whose curves Aurora can represent (endpoints at 0
+and 255) — "Curves 3" red, "Curves 1" green-then-RGB and
+blue-then-RGB — the natural spline matched 672 of 674 levels exactly
+and the other two within one level; Fritsch–Carlson missed by up to 10.
+Those 674 pairs are embedded in
+`matches_photoshop_on_curves_from_its_own_merged_composite`. (3) The
+widely documented reconstruction (natural cubic spline, zero second
+derivative at the ends, evaluated per output level, clamped) agrees
+with both. **Confidence: high for 8-bit RGB** (two independent sources,
+one of them Photoshop's own pixels, and the competing models are
+decisively worse); **unverified** for 16-bit documents (Photoshop may
+evaluate a 256-entry table and interpolate it; Aurora evaluates the
+spline directly), for Grayscale (`curves_grayscale.psd` did **not**
+match any model under the naive channel mapping I used — Photoshop's
+grayscale curves likely use a different convention such as ink
+percentage; unresolved), and Photoshop's source is of course not
+available.
+
+*`CurvesLut` bound, re-derived.* The natural spline's `f''` is linear
+on each interval between its knot values `M_i`; diagonal dominance of
+the tridiagonal system gives `|M_i| <= 6 / (h_{i-1} h_i) <= 6 * 256^2`
+(points `>= 1/256` apart, outputs in `[0, 1]`), so linear interpolation
+at `h = 1/16384` errs by at most `6 * 256^2 / (8 * 16384^2) ~= 1.83e-4`
+— the same figure as 0.155.0's, by a different argument. That bound
+only holds for a smooth function, and the clamp is not one: a table of
+the *clamped* curve measured `3.1e-3` on the minimum-separation
+zigzag (most of an 8-bit level). So the table now stores the spline
+before its clamp and the lookup clamps after interpolating
+(`1`-Lipschitz). Measured: typical S-curve `6.0e-8`, one-step rise
+`7.2e-7`, 19-point minimum-separation zigzag `1.80e-4` (asserted
+`< 1.9e-4`).
+
+*Tests changed, and why.* Removed or replaced in `tone_curve.rs`
+because they asserted Fritsch–Carlson properties a natural spline does
+not have: `monotone_data_gives_a_monotone_curve` and
+`the_unclamped_spline_never_overshoots_its_knots` (replaced by
+`an_overshoot_leaves_the_unit_range_and_is_clamped`, which asserts the
+reverse and that the clamp is applied),
+`adversarial_curves_stay_within_each_intervals_own_knots` (replaced by
+`adversarial_curves_stay_finite_and_inside_the_unit_range`),
+`a_local_extremum_is_flat_and_not_overshot` (FC tangent `0` at an
+extremum; replaced by
+`the_spline_is_natural_at_the_ends_and_smooth_across_knots`),
+`a_plateau_is_exactly_flat` (replaced by
+`a_plateau_between_rises_rings_rather_than_staying_flat`),
+`a_seventeenth_point_is_refused` (replaced by
+`nineteen_points_are_accepted_and_a_twentieth_is_refused`), and
+`identity_is_the_identity_within_1e_6` (tightened to
+`identity_is_the_identity_bit_for_bit`). Added:
+`two_points_give_a_straight_line`,
+`a_three_point_curve_matches_the_hand_solved_natural_spline`,
+`matches_photoshop_on_curves_from_its_own_merged_composite`, and in
+`curves.rs` `nineteen_points_decode_and_sixteen_still_do`; the
+oversized-decode case moved from 17 to 20 points. `aurora-filters`'
+accuracy test gained the 19-point zigzag; its monotone-LUT test is kept
+(monotone *for that data*, now said so). Counts: `aurora-core` 52 → 55, every other crate unchanged, **2,969 → 2,972**.
+
+*Mutations* (each file backed up to the scratchpad, mutated, the named
+crates' tests run, restored, `touch`ed, sha256 checked equal):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | Fritsch–Carlson tangents + Hermite back in `spline` | killed | 5 `tone_curve` tests incl. the Photoshop oracle |
+| M2 | Parabolic-runout end condition instead of natural | killed | hand-solved, Photoshop oracle, natural-ends |
+| M3 | No output clamp in `evaluate` | killed | overshoot, adversarial, `CurvesLut` accuracy |
+| M4 | `MAX_POINTS = 16` | killed | `nineteen_points_are_accepted…`, `nineteen_points_decode…` |
+| M5 | Cap unbounded (`validate`, `add_point`, decode) | killed | construction, nineteen/twenty, oversized decode |
+| M6 | `CurvesLut` table from clamped `evaluate` | killed | `lut_accuracy…` (`3.1e-3`) |
+| M7 | `CurvesLut` lookup without the post-clamp | killed | `lut_accuracy…`, monotone LUT |
+| M8 | Thomas elimination sign slip | killed | Photoshop oracle, natural-ends |
+| M9 | Back substitution ignores the coupling | killed | Photoshop oracle, natural-ends |
+| M10 | Curvature term `h^2/3` for `h^2/6` | killed | hand-solved, Photoshop oracle, natural-ends |
+| M11 | `M_k`/`M_{k+1}` swapped in the formula | killed | Photoshop oracle, natural-ends |
+| M12 | Decode cap literal `16` | killed | `nineteen_points_decode_and_sixteen_still_do` |
+
+The editor has no cap literal of its own to mutate (it relies on
+`ToneCurve::add_point`); under M4 the editor's tests stayed green, which
+is correct — they are written against `MAX_POINTS`.
+
+*Disclosures.* (a) **Compositing changes** for every existing Curves
+layer with an interior point; 0.155.0/0.156.0 were never released, so
+accepted. (b) **Forward compatibility:** a `.aur` (or journal) holding a
+17–19-point curve is refused by a 0.155.0/0.156.0 build (its decoder
+stops at 16); files with 16 or fewer still decode both ways. (c) A
+natural spline **can invent tone reversals** the user did not place —
+Photoshop's behaviour, chosen deliberately; the clamp is now
+load-bearing. (d) **Endpoints still pinned** at `x == 0`/`x == 1`;
+Photoshop allows movable endpoints with flat extension, and adding flat
+points is not equivalent for a natural spline, so `curv` import needs
+the invariant relaxed. (e) 16-bit and Grayscale behaviour unverified
+(above). (f) The oracle's backdrop is psd-tools' own composite of the
+layers below, so a psd-tools compositing error there would show as
+noise (it shows as 0.3% of samples, all in one strip) — the per-level
+reference pairs keep only levels where at least 90% of pixels agree.
+(g) Checks run per crate (`aurora-core`, `-filters`, `-widgets`, `-ui`,
+`-io`, `-doc`, `-app`, the last four with `AURORA_REQUIRE_GPU=1`),
+`cargo clippy -D warnings` on the three edited crates, `cargo fmt
+--check`, rustdoc on the edited crates, `cargo check --workspace`.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,972 passed, 0 failed, 55 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast check exit 0. Independent judge:
+**PASS 0.91**, no critical or high issue (the Thomas solve's diagonal
+dominance, pivots, panic-freedom and the LUT bound were each re-derived).
+Its notes, applied: the `|M_i|` bound is now stated as the global
+`max_j 6/(h_{j-1}h_j)` rather than per knot; the oracle test's doc now
+says the 8-bit rounding between curves models Photoshop's 8-bit *file*
+only and that it checks `ToneCurve`, not `CurvesLut` end to end; a
+mis-worded "17 before" comment fixed; and the oracle extraction is now
+committed and reproducible as `scripts/oracles/psd_curves_oracle.py`
+(re-run: natural spline within one level on all 674 kept levels,
+Fritsch–Carlson up to 10). Recorded, not changed: the minimum separation
+is checked with a rounded `f32` subtraction while widths are computed in
+exact `f64`, so a true width can sit below `1/256` by up to half an ulp —
+about a `1e-5` relative effect on the bound, well inside the test's
+ceiling.
+
+**Needs a human: compare a curve against Photoshop on the same
+points** — e.g. `(0,0) (64,40) (128,160) (255,255)` on a gradient, in
+an 8-bit and a 16-bit document, reading values with the Info panel.
+
+**Suggested next (0.158.0): PSD `curv` import with an exact match**
+(relaxing the endpoint invariant for movable endpoints, checked against
+`curves_rgb.psd`'s merged image), **then the Curves GPU port, then the
+workspace rounds.**
+
+**Addendum 2026-10-09 (0.156.0) — the Curves UI.** Done as specified
+above ("Where we are"). Files: `aurora-widgets` `widgets/curve_editor.rs`
+(histogram state, `set_curve_editor_histogram`, `MAX_HISTOGRAM_BINS`),
+`paint.rs` (`curve_editor_histogram_area`, step 2 of the editor's
+paint), `tests/gallery.rs` (histogram state); `aurora-ui`
+`curves_controls.rs` (new), `tool_controls.rs` (`ToolControls::curves`),
+`gallery_panel.rs` (sample histogram); `aurora-app` `lib.rs`
+(`CurvesUiState`, `PendingCurves`, `CurvesHistogram`/`CurvesHistogramJob`,
+`record_curves_step`, `finish_curves`, `settle_pending_curves`,
+`apply_curves_outcome`, `end_curves_gestures`, `hide_curves_and_above`,
+`refresh_curves_histogram`, `sync_curves_ui`, `UndoRevision`);
+`design/check_contrast.py` gains the gated pair `text.secondary on
+surface.sunken` at 3.0 (passes in all five themes: 10.28, 8.96, 21.00,
+21.00, 10.68:1); `aurora-core` `tone_curve.rs` comment only.
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | histogram painted after (over) the grid | killed | `a_histogram_paints_one_text_secondary_area_between_the_well_and_the_grid`, `a_histogram_is_dimmed_with_a_disabled_editor` |
+| 2 | histogram in `text.primary` | killed | same two |
+| 3 | nothing above the Curves layer hidden (histogram of content above) | killed | `the_histogram_is_of_the_content_below_not_above` |
+| 4 | Green tab edits the red curve | killed | `an_absent_channel_curve_is_the_identity_and_editing_it_makes_it_present`, `a_channel_tab_edits_that_channels_curve_only` |
+| 5 | drag records one step per move | killed | `a_pointer_drag_edits_the_layer_live_and_records_one_undo_step`, `opening_a_document_ends_a_live_drag_and_drops_the_editor_state` |
+| 6 | sync never rewrites the editor's points (undo/redo/rebind stale) | killed | 5 tests incl. the drag/undo, keyboard, channel and layer-switch tests |
+| 7 | editor not hidden for a non-Curves layer | killed | `sync_shows_the_selected_channel_for_a_curves_layer_and_hides_otherwise`, `the_editor_shows_only_for_a_curves_layer_and_rebinds_on_a_layer_switch` |
+| 8 | live drag move does not invalidate the composite | killed | `a_pointer_drag_edits_the_layer_live_and_records_one_undo_step` |
+| 9 | drag end never records its step | killed | the drag test, `the_histogram_is_recomputed_after_a_step_below_but_not_after_its_own_edit` |
+| 10 | staleness ignores the undo revision | killed | `the_histogram_is_recomputed_after_a_step_below_but_not_after_its_own_edit` |
+| 11 | RGB luma weights for R and G swapped | killed | `the_histogram_follows_the_selected_channel` (+1) |
+| 12 | an open keeps the old histogram | killed | `opening_a_document_ends_a_live_drag_and_drops_the_editor_state` |
+| 13 | colour divided by alpha (straight read as premultiplied) | killed after a test was added | `the_histogram_reads_straight_colour_from_a_translucent_backdrop` |
+| 14 | the Curves layer's own step no longer carries the histogram forward | killed after the test was tightened | `the_histogram_is_recomputed_after_a_step_below_but_not_after_its_own_edit` |
+
+Mutation 13 first ran against code that **un-premultiplied** the
+composite and survived; the added test then showed
+`composite_roots_into_tile` returns straight RGBA (a 0.6 grey at 50%
+read 255, not 153), so the division was a real bug, fixed, and the
+mutation re-inverted. Each mutated file was backed up outside the repo,
+restored, `touch`ed and its sha256 checked.
+
+**Disclosures.** (a) The editor is inside the tool-controls strip, so it
+shares `WidgetOwner::ToolControls`; `App::apply_tool_control` dispatches
+Curves outcomes first. (b) *Fixed in the review revision (GA-1):* an
+assistive technology's value action on a curve point reaches
+`apply_curves_outcome` (a pending pointer drag is committed first, its
+capture dropped). (c) A key that falls through to the shortcuts mid-drag
+(an Undo) commits the drag first and, since the revision (GA-4), drops the
+editor's capture so the rest of the gesture edits nothing; a History-row
+press mid-drag relies on the press's own routing having ended the
+capture. (d) The histogram of a Curves layer
+inside a group is of the whole document below it, but the adjustment
+acts only on the group's isolated content (Aurora has no Pass Through):
+an approximation. Live, unrecorded edits below (a stroke in progress, a
+live opacity drag) show at the gesture's end. (e) A document larger than
+1024 px per side is sampled at 16 whole tiles, not all pixels; each tile
+is one iteration of ~9.5 ms UI-thread work (GA-3, above). (f) The
+editor's side is the gallery's square-editor size; no layout check at the
+narrowest rail beyond the existing panel clipping. (g) **Contrast:** the curve (`text.primary`) and the selected
+marker (`accent.primary`) over the `text.secondary` bars measured 1.64 /
+1.28:1 Dark, 1.15 / 2.12:1 Light, 1.00 / 1.07:1 High Contrast Dark,
+1.00 / 2.44:1 High Contrast Light, 1.45 / 1.18:1 Colour-Critical. **The
+design owner chose option 1 (outline), 2026-10-09:** a `surface.sunken`
+halo under the curve (one `MARKER_RING_WIDTH` wider on each side) and
+under every marker (a disc one ring width wider). Now gated: curve on
+halo (`text.primary on surface.sunken`, 10.28–21.00:1), marker on halo
+(`accent.primary on surface.sunken`, 4.23–19.56:1), halo against bars
+(`text.secondary on surface.sunken`, 8.96–21.00:1) — every built-in
+theme passes; `KNOWN_FAILURES` is kept, empty. The halo width reuses the
+existing `MARKER_RING_WIDTH` engineering constant (no stroke-weight token
+exists), not a new literal. The GPU gallery tests do not detect a missing
+halo; the headless paint tests do.
+(h) Gallery goldens for the histogram state are not blessed. (i) The
+event loop is kept awake (`needs_redraw`) while a histogram job runs —
+16 extra frames at most. (j) **Design-owner decision (2026-10-09):**
+imported PSD Curves layers must look identical to Photoshop, so
+`ToneCurve` will switch to Photoshop's natural-cubic-style interpolation
+(outputs clamped to `[0, 1]`) and its 19-point limit in 0.157.0; this
+round deliberately builds on the current monotone, 16-point `ToneCurve`
+and adds no 16-point literal of its own (the editor and model use
+`aurora_core::MAX_POINTS`). The `tone_curve.rs` module comment records
+the decision.
+
+**Review revision.** The full gate passed on the candidate
+(`AURORA_REQUIRE_GPU=1`: 2,964 passed, 0 failed, 55 ignored, 0 skipped;
+clippy, strict rustdoc, deny and the contrast script clean); the judge
+returned REVISE (0.84). Outcomes: **GA-1** fixed — `AccessibilityContext`
+gained `curves_ui`; `apply_tool_control_accessibility` routes a Curves
+outcome through `end_curves_drag` + `apply_curves_outcome`; new test
+`an_at_value_action_on_a_curve_point_edits_the_layer_and_survives_sync`
+(SetValue and Increment, one step each, surviving the sync), and the
+a11y sweep now runs every tool-control value action through
+`apply_accessibility_action` with a non-identity Curves layer active and
+asserts it changed the radius or the layer (≥ 12 applied, ≥ 9 Curves
+edits). **GA-2** fixed by the design owner's option 1 (halo, above); new
+test `the_curve_and_the_selected_marker_are_drawn_over_a_surface_sunken_halo`.
+**GA-3** documented honestly (one tile per iteration, ~9.5 ms; sub-tile
+strips are impossible because `composite_roots_into_tile` composites a
+whole tile). **GA-4** fixed — `end_curves_drag` drops the capture; new
+test `a_key_mid_drag_commits_it_and_drops_the_capture`. **GA-5** "Where
+we are" updated. **GA-6** `design/__pycache__/` removed and ignored
+(`.gitignore`: `__pycache__/`, `*.pyc`).
+
+| # | Mutation (revision) | Result | Killed by |
+|---|---|---|---|
+| 15 | AT curve-point edits not wired (GA-1 reverted) | killed | `every_action_the_live_workspace_declares_is_mapped_or_widget_local` |
+| 16 | a key mid-drag keeps the editor's capture (GA-4 reverted) | killed | `a_key_mid_drag_commits_it_and_drops_the_capture` |
+| 17 | curve halo removed | killed | the halo test and three paint-order tests |
+| 18 | marker halo removed | killed | the halo test and two paint-order tests |
+
+Mutations 1, 2 and 3–14 were re-run after the revision: all still killed.
+
+**Measured after round 2:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,969 passed, 0 failed, 55 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, and `design/check_contrast.py` exit 0 in
+every theme. Judge round 3: **PASS 0.92**, no blocking issue (judge
+trail: REVISE 0.84 → REVISE 0.89 → PASS 0.92). Its optional notes, not
+done: confirm by test that a bare modifier key maps to `None` and so never
+ends a Curves drag; kill M20 if the `AtState` harness can seed a held
+capture.
+
+**Review revision (round 2).** Gate on the first revision: 2,967 passed,
+0 failed, 0 skipped, all clean; judge REVISE 0.89 for **GA4-R**: the key
+path skipped ending a Curves gesture when the editor held the capture
+with nothing pending (a press that only selected a point, or a detached
+drag), so after Ctrl+Z the next Move wrote the pre-undo curve back.
+Fixed: the decision is the free function `end_curves_gesture_before_key`
+(the condition `end_curves_gestures` uses: pending **or** the editor
+captured), which `App::end_curves_drag_for_key` calls; `App` is not built
+headlessly, so the test drives that function in `App::handle_key_event`'s
+order — `an_undo_after_a_select_only_press_stands_against_the_next_move`
+(select-only press, Ctrl+Z, Move: the undo stands, the capture is
+dropped). Also added `an_at_edit_during_a_pending_drag_is_two_undo_steps_and_bumps_the_cache`
+(the pending drag simulated on the tree, since `AtState` has no pointer
+rig): exactly two undo steps, the cache invalidated, undo walks back both.
+
+| # | Mutation (round 2) | Result | Killed by |
+|---|---|---|---|
+| 19 | the key path's early return on "nothing pending" restored | killed | `an_undo_after_a_select_only_press_stands_against_the_next_move` |
+| 20 | the AT path no longer ends the pending drag first | **survived** | — equivalent in that fixture: `apply_curves_outcome`'s own `settle_pending_curves(…, None)` finishes the drag anyway, and the AT edit's own invalidation bumps the cache; what the call adds is dropping a held pointer capture, which `AtState` cannot set up (`ClickTracker`'s capture is crate-private to `aurora-widgets`) |
+
+The halo is **1 logical px** wide on each side (`MARKER_RING_WIDTH`;
+1 physical px at 1x): making it thicker is a design-owner option, not
+decided here.
+
+**Needs a human: on macOS, add a Curves layer, edit the curve per
+channel, watch the histogram, compare with Photoshop.**
+
+**Open follow-up (GA-3):** move the Curves histogram read off the UI
+thread (today one whole-tile composite, ~9.5 ms, per event-loop
+iteration for up to 16 iterations after each recorded step) — needs a
+tile-store snapshot or a worker-side compositor.
+
+**Suggested next:** (1) **0.157.0:** switch `ToneCurve` to Photoshop's
+interpolation and 19-point cap, verified against psd-tools or Photoshop
+reference curves — including the curve editor's point cap, the LUT
+accuracy bound and the existing tests that assume a monotone curve;
+(2) **then** PSD `curv` import with an exact match; (3) **then** the
+Curves GPU port, and the workspace rounds (left tools panel plus options
+bar first).
+
+**Addendum 2026-10-09 (0.155.0) — a non-destructive Curves adjustment
+layer.** Done as 0.155.0. Files: `crates/aurora-core/src/curves.rs`
+(new: `CurvesParams`), `tone_curve.rs` (`ToneCurve::is_identity`;
+`Serialize` as the point list, `Deserialize` re-validated through
+`ToneCurve::new`, at most `MAX_POINTS` elements read), `lib.rs`;
+`crates/aurora-filters/src/curves.rs` (new: `CurvesLut`,
+`CURVES_LUT_INTERVALS`), `lib.rs`, `Cargo.toml` (`half` dev-dependency);
+`crates/aurora-doc/src/layer.rs` (`LayerKind::Adjustment`, `Adjustment`,
+`LayerKind::is_adjustment`), `tree.rs` (`add_adjustment_layer_at`,
+`adjustment`, `set_adjustment`), `history.rs`
+(`History::add_adjustment_layer_at`, `History::set_adjustment`,
+`LayerOp::SetAdjustment`), `error.rs` (`NotAnAdjustment`), `lib.rs`;
+`crates/aurora-ui/src/layers_panel.rs` (row description);
+`crates/aurora-io/src/aur.rs` (round-trip test only);
+`crates/aurora-app/src/lib.rs` (`admit_composite_node` extracted from
+`resolve_tile`, `fold_layer_into`, `apply_adjustment_layer`,
+`curves_lut` with a per-thread cache, the GPU-path refusal, New Curves
+Layer: `COMMAND_LAYER_NEW_CURVES`, `ActivatedCommand::NewCurvesLayer`,
+`LayerCommand::NewCurves`, `new_curves_layer`, `next_curves_name`, the
+`#[cfg(test)]` `set_layer_curves` hook).
+
+*Decisions.* **Encoded values, not linear light**: Aurora stores the
+source's own encoded values in `f16` and every blend mode works on them,
+as Photoshop's do; Photoshop's Curves maps encoded code values, so the
+same curve gives the same result only on the same numbers. **Order**:
+per-channel, then composite (psd-tools `_apply_luts`). **Precision**:
+2^14-interval `f32` LUT with interpolation, identity skipped; measured
+5.96e-8 typical, 1.80e-4 worst (steepest legal curve), no 8-bit step.
+**Out of range**: a non-identity curve clamps its input to `[0, 1]` (and
+NaN to 0), as `ToneCurve::evaluate` does; values meeting only identity
+curves are untouched. **Compositing**: `lerp(Cb, B(Cb, f(Cb)),
+opacity * mask)` at the backdrop's alpha, through the existing
+`apply_mask`, `dissolve_gate` and `composite_layer_into`.
+**Persistence**: append-only variants, the `ColorSpaceTag::Icc`
+precedent; no version bump and no side entry, because an appended
+ordinal never changes an old file's bytes (pinned by
+`old_layer_kind_bytes_decode_unchanged_and_the_new_variant_round_trips`
+and `set_adjustment_is_appended_after_every_older_layer_op`). Not
+forward compatible: a pre-0.155.0 build refuses such a file loudly.
+
+*Mutations* (each file backed up to the session scratchpad `mut155/`,
+restored, `touch`ed and sha256-checked; tests run with
+`AURORA_REQUIRE_GPU=1` on the RTX 3090):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | curve not applied | killed | 10 `curves_adjustment` tests |
+| M2 | curve applied to alpha | killed | 8 tests, e.g. `an_inverting_curves_layer_inverts_the_composite_below_and_keeps_alpha` |
+| M3 | composite curve before per-channel | killed | `channel_curve_applies_before_the_composite_curve` |
+| M4 | LUT samples shifted by one | killed | 5 `aurora-filters` tests incl. the accuracy test |
+| M5 | blend mode ignored (always Normal) | killed | `curves_blends_with_its_own_blend_mode` |
+| M6 | opacity ignored | killed | `curves_opacity_mixes_the_adjusted_colour_with_the_backdrop` |
+| M7 | mask ignored | killed | `a_curves_mask_limits_where_it_applies` |
+| M8 | applied to the whole root composite (layers above too) | killed | `curves_affects_only_the_layers_below_it_not_above`, the group test |
+| M9 | GPU predicate admits adjustments | killed | `the_gpu_predicate_refuses_...`, `gpu_and_cpu_agree_with_and_without_a_curves_layer` |
+| M10 | GPU-path local refusal removed | killed | `begin_gpu_composite_tile_falls_back_for_a_curves_layer` |
+| M11 | red curve not persisted (`serde(skip)`) | killed | `round_trips_a_curves_adjustment_layer_and_its_history` |
+| M12 | undo records the new params, not the old | killed | `setting_an_adjustment_is_undoable_...`, `setting_curves_is_one_undo_step_...` |
+| M13 | backdrop not made opaque before the blend | **survived first**, killed after adding `a_blended_curves_layer_reads_a_translucent_backdrops_true_colour` | that test |
+| M14 | LUT cache ignores the parameters | killed | `changing_a_curves_layers_params_changes_the_next_composite` |
+
+*Disclosures.* No GPU port: any visible Curves root sends the whole
+document to the CPU path, so a document with one composites slower.
+Groups are always isolated (no Pass Through), so a Curves layer inside a
+group never reaches layers below the group, unlike Photoshop's default.
+Fill opacity is not applied (as for pixel layers). `ToneCurve`
+interpolates with monotone Fritsch–Carlson, Photoshop with a natural
+cubic spline: the same points give a different curve between points (a
+design-owner question already flagged in `tone_curve.rs`), which is also
+why PSD `curv` import (AC-4) is deferred: applying a Photoshop curve
+with a different interpolator, or truncating its up to 19 points to 16,
+would silently show different pixels; it stays in "adjustment layers not
+shown". A Curves layer's dirty rect is `None`, so its edits rely on full
+composite-cache bumps (structural undo already bumps everything). The
+LUT cache is per thread, 8 entries, rebuilt (about 65k curve
+evaluations) on a miss. Out-of-gamut float values meeting a non-identity
+curve are clipped to `[0, 1]`. The new-layer name is "Curves N" with no
+localisation.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,941 passed, 0 failed, 50 ignored, 0 skipped**
+(matching 2,905 + 36), strict rustdoc, `cargo deny`. Independent judge:
+**PASS 0.906**, no critical or high issue. Its notes: the CLAUDE.md
+"not started" bullet contradicted itself (reworded) and group isolation
+was disclosed only in code (now stated above). Not changed, recorded:
+`apply_adjustment_layer` rounds colour to `f16` twice (straight result,
+then premultiplied) where a fused `f32` path would round once; and for a
+backdrop of tiny alpha the un-premultiplied colour can overflow `f16` to
+infinity, which a non-Normal blend mode could carry into the output as
+inf/NaN times that tiny alpha — the same class of edge as the existing
+pixel-layer path, not new. **Design-owner question raised:** Photoshop
+draws curves with a natural cubic spline and allows 19 points;
+`ToneCurve` uses monotone Fritsch–Carlson and 16 — this decides whether
+PSD `curv` import can match Photoshop between points.
+
+**Needs a human: add a Curves layer on macOS (via a test-set curve or a
+PSD) and compare against Photoshop.**
+
+**Suggested next (0.156.0): the Curves UI: curve editor bound to the
+layer in Properties, histogram in `text.secondary`, channel selector;
+then the GPU port.**
 
 **Addendum 2026-10-09 (0.154.0) — PSD opens stream, one layer at a
 time.** Done as 0.154.0. Files: `crates/aurora-io/src/psd.rs`

@@ -3710,6 +3710,11 @@ struct AccessibilityContext<'a> {
     tool: aurora_ui::Tool,
     tool_settings: &'a mut ToolSettings,
     tool_controls: Option<aurora_ui::ToolControls>,
+    /// The Properties-panel Curves editor's live drag and histogram
+    /// (0.156.0 review GA-1): an assistive technology's `SetValue`,
+    /// `Increment` or `Decrement` on a curve point edits the document
+    /// through [`apply_curves_outcome`], one undo step each.
+    curves_ui: &'a mut CurvesUiState,
     /// What [`follow_scroll`] last saw (`App::scroll_follow`, 0.146.0
     /// review I-1): a panel-bar action that closes the gallery's menu
     /// records the focus hand-back here so the next layout keeps the scroll.
@@ -3800,13 +3805,38 @@ fn apply_tool_control_accessibility(
         ?outcome,
         "accessibility action on a Properties-panel tool control"
     );
+    let outcome = PointerOutcome::Action(outcome);
+    if let Some(controls) = cx.tool_controls
+        && is_curves_outcome(controls.curves, &outcome)
+    {
+        // Its own gesture (review GA-1): a pointer drag still pending
+        // ends first, as one step, with the editor's capture dropped;
+        // then the AT's edit is one more step (`record_curves_step`).
+        let mut edit = CurvesEdit {
+            workspace: cx.workspace,
+            layers: cx.layers,
+            history: cx.history,
+            pixel_history: cx.pixel_history,
+            undo_order: cx.undo_order,
+            layer_rows: cx.layer_rows,
+            active_layer: *cx.active_layer,
+            controls: Some(controls.curves),
+            state: cx.curves_ui,
+        };
+        if end_curves_drag(&mut edit, cx.click) {
+            cx.composite_cache.bump();
+        }
+        let invalidation = apply_curves_outcome(&mut edit, &outcome, None);
+        apply_layer_control_invalidation(cx.composite_cache, &invalidation);
+        return;
+    }
     let _ = release_radius_capture(cx.click, cx.tool_controls);
     let _ = apply_tool_control_outcome(
         cx.workspace,
         cx.tool_controls,
         cx.tool,
         cx.tool_settings,
-        &PointerOutcome::Action(outcome),
+        &outcome,
         None,
     );
 }
@@ -4238,6 +4268,10 @@ enum ActivatedCommand {
     /// state (`App::run_layer_command`, [`perform_layer_command`]).
     NewLayer,
     DeleteLayer,
+    /// New Curves Layer (0.155.0): palette and the macOS `Layer` menu
+    /// only, no shortcut. Run by [`perform_layer_command`] as
+    /// [`LayerCommand::NewCurves`].
+    NewCurvesLayer,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -4260,6 +4294,7 @@ const COMMAND_REDO: &str = "edit.redo";
 const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
+const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -4314,6 +4349,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
         CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
     ]
 }
 
@@ -4425,6 +4461,9 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_DELETE {
         return Some(ActivatedCommand::DeleteLayer);
+    }
+    if id == COMMAND_LAYER_NEW_CURVES {
+        return Some(ActivatedCommand::NewCurvesLayer);
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -5572,6 +5611,654 @@ fn apply_tool_control_outcome(
     true
 }
 
+// -- The Properties-panel Curves editor (0.156.0) --------------------------
+
+/// A live Curves-editor pointer drag: the layer it started on and that
+/// layer's parameters before it — the [`PendingOpacity`] pattern, so the
+/// whole gesture becomes **one** undo step ([`finish_curves`]).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingCurves {
+    layer: aurora_doc::LayerId,
+    start: aurora_core::CurvesParams,
+}
+
+/// The histogram last computed for the Curves editor, and what it was
+/// computed for. **Staleness rule:** it is current while the active
+/// Curves layer, the selected channel and the [`UndoOrder::revision`]
+/// are all unchanged — every completed undoable step anywhere in the
+/// document (a stroke, a structural edit, an undo, a redo) and every
+/// newly opened document moves the revision. The one exception is the
+/// Curves layer's *own* parameter step ([`record_curves_step`]), which
+/// cannot change the content below it and carries a current histogram
+/// forward. Live, not-yet-recorded edits below (a stroke in progress, a
+/// live opacity drag) show at their gesture's end, not per move.
+/// `bins: None` caches "no tile store", so it is not retried every
+/// iteration. A stale histogram for the same layer and channel stays on
+/// screen while its replacement is computed ([`CurvesHistogramJob`]).
+#[derive(Debug, Clone, PartialEq)]
+struct CurvesHistogram {
+    layer: aurora_doc::LayerId,
+    channel: aurora_ui::CurvesChannel,
+    revision: UndoRevision,
+    bins: Option<Vec<f32>>,
+}
+
+/// A histogram being computed incrementally (0.156.0): the sampled tiles
+/// still to read and the counts so far. [`refresh_curves_histogram`]
+/// advances it per event-loop iteration and the app keeps the loop awake
+/// until it finishes. **Honestly (review GA-3): the unit of work is one
+/// whole tile composite** (`composite_roots_into_tile` cannot composite
+/// part of a tile), measured at about 9.5 ms for three CPU-path layers on
+/// the RTX 3090 box — more than [`CURVES_HISTOGRAM_STEP_BUDGET`] — so in
+/// practice each iteration reads exactly one tile: up to 16 iterations of
+/// ~9.5 ms UI-thread work after each recorded step while a Curves layer
+/// is active. That bounds the stall but does not meet invariant 4 (the UI
+/// thread never blocks on rendering) to the letter; moving the read off
+/// the UI thread needs a store snapshot this round does not have.
+#[derive(Debug, Clone, PartialEq)]
+struct CurvesHistogramJob {
+    layer: aurora_doc::LayerId,
+    channel: aurora_ui::CurvesChannel,
+    revision: UndoRevision,
+    remaining: Vec<aurora_tile::TileId>,
+    counts: Vec<u64>,
+}
+
+/// The app's half of the Curves editor: a live drag and the histogram
+/// cache. `detached` mirrors [`LayerControlsState::detached`]: the rest
+/// of a drag already committed (the active layer changed under it, or a
+/// key press ended it) edits nothing until its capture ends.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CurvesUiState {
+    pending: Option<PendingCurves>,
+    detached: bool,
+    histogram: Option<CurvesHistogram>,
+    job: Option<CurvesHistogramJob>,
+}
+
+/// Everything a Curves edit touches — [`LayerControlEdit`]'s shape.
+struct CurvesEdit<'a> {
+    workspace: &'a mut aurora_ui::Workspace,
+    layers: &'a mut aurora_doc::LayerTree,
+    history: &'a mut aurora_doc::History,
+    pixel_history: &'a mut aurora_brush::PixelHistory,
+    undo_order: &'a mut UndoOrder,
+    layer_rows: &'a HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: Option<aurora_doc::LayerId>,
+    controls: Option<aurora_ui::CurvesControls>,
+    state: &'a mut CurvesUiState,
+}
+
+/// Sets Curves layer `id`'s parameters as **one** undoable structural
+/// step — the one path every committed Curves edit takes (a keyboard
+/// step, a point add or delete from the keyboard, an ended drag; and,
+/// since 0.156.0 replaced 0.155.0's test-only `set_layer_curves`, the
+/// tests). The caller invalidates the composite. `false` (nothing
+/// changed) when `id` is not a Curves layer.
+fn record_curves_step(
+    cx: &mut CurvesEdit<'_>,
+    id: aurora_doc::LayerId,
+    params: aurora_core::CurvesParams,
+) -> bool {
+    let before = cx.undo_order.revision;
+    if let Err(err) =
+        cx.history
+            .set_adjustment(cx.layers, id, aurora_doc::Adjustment::Curves(params))
+    {
+        tracing::warn!(?err, "a Curves edit was refused by the layer tree");
+        return false;
+    }
+    cx.undo_order
+        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    refresh_history_panel(cx.workspace, cx.undo_order);
+    refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, id);
+    // The layer's own curve is not the content below it.
+    if let Some(histogram) = cx.state.histogram.as_mut()
+        && histogram.layer == id
+        && histogram.revision == before
+    {
+        histogram.revision = cx.undo_order.revision;
+    }
+    if let Some(job) = cx.state.job.as_mut()
+        && job.layer == id
+        && job.revision == before
+    {
+        job.revision = cx.undo_order.revision;
+    }
+    true
+}
+
+/// Ends a live Curves drag: one undo step for the whole gesture, onto
+/// the layer the drag started on, if its parameters really changed. The
+/// drag applied every move to the tree directly; the step is recorded by
+/// putting the starting parameters back and setting the final ones
+/// through [`record_curves_step`], so `History` holds exactly
+/// start → final. Returns whether a step was recorded.
+fn finish_curves(cx: &mut CurvesEdit<'_>) -> bool {
+    let Some(pending) = cx.state.pending.take() else {
+        return false;
+    };
+    let Some(now) = aurora_ui::curves_params(cx.layers, pending.layer).cloned() else {
+        return false;
+    };
+    if now == pending.start {
+        return false;
+    }
+    if let Err(err) = cx
+        .layers
+        .set_adjustment(pending.layer, aurora_doc::Adjustment::Curves(pending.start))
+    {
+        tracing::warn!(?err, "failed to rewind a Curves drag before recording it");
+        return false;
+    }
+    record_curves_step(cx, pending.layer, now)
+}
+
+/// Commits a pending Curves drag once the editor no longer holds the
+/// pointer capture — [`settle_pending_opacity`]'s twin, run after every
+/// routed pointer event and once per event-loop iteration.
+fn settle_pending_curves(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
+    let editor = cx.controls.map(|controls| controls.editor);
+    if editor.is_none() || captured != editor {
+        cx.state.detached = false;
+        if cx.state.pending.is_some() {
+            return finish_curves(cx);
+        }
+    }
+    false
+}
+
+/// Whether `outcome` belongs to the Curves editor (its channel tab bar
+/// or its curve editor), which `App::apply_tool_control` hands to
+/// [`apply_curves_outcome`] instead of the radius handler.
+fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
+    use aurora_widgets::ActionOutcome as Outcome;
+    match outcome {
+        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == controls.channel,
+        PointerOutcome::Action(Outcome::CurveChanged { editor }) => *editor == controls.editor,
+        _ => false,
+    }
+}
+
+/// Turns one Curves-editor outcome into a document edit and reports what
+/// it invalidated.
+///
+/// - **A channel tab** changes no document state: the caller re-syncs,
+///   so the editor shows that channel's curve and histogram.
+/// - **`CurveChanged` while the editor holds the capture** (a pointer
+///   press that added a point, then its drag): applied to the tree
+///   directly, no history — live — with the starting parameters kept in
+///   [`PendingCurves`]; one step is recorded when the drag ends.
+/// - **`CurveChanged` with no capture** (an arrow key, `Delete`,
+///   `Insert`): one [`record_curves_step`] per change.
+///
+/// A change that leaves the parameters equal (a press that only selects
+/// a point) records nothing. Every real change is `Everything` — the
+/// adjustment recolours its whole stack below.
+fn apply_curves_outcome(
+    cx: &mut CurvesEdit<'_>,
+    outcome: &PointerOutcome,
+    captured: Option<WidgetId>,
+) -> CompositeInvalidation {
+    let Some(controls) = cx.controls else {
+        return CompositeInvalidation::None;
+    };
+    let _ = settle_pending_curves(cx, captured);
+    let PointerOutcome::Action(aurora_widgets::ActionOutcome::CurveChanged { editor }) = outcome
+    else {
+        return CompositeInvalidation::None;
+    };
+    if *editor != controls.editor {
+        return CompositeInvalidation::None;
+    }
+    let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
+        return CompositeInvalidation::None;
+    };
+    let Some(current) = aurora_ui::curves_params(cx.layers, active).cloned() else {
+        return CompositeInvalidation::None;
+    };
+    let channel =
+        aurora_ui::curves_selected_channel(&cx.workspace.tree, controls).unwrap_or_default();
+    let Ok(state) =
+        aurora_widgets::widgets::curve_editor_state(&cx.workspace.tree, controls.editor)
+    else {
+        return CompositeInvalidation::None;
+    };
+    let next = aurora_ui::with_channel_curve(&current, channel, state.curve().clone());
+    if captured == Some(controls.editor) {
+        if cx
+            .state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.layer != active)
+        {
+            let _ = finish_curves(cx);
+            cx.state.detached = true;
+        }
+        if cx.state.detached || next == current {
+            return CompositeInvalidation::None;
+        }
+        if cx.state.pending.is_none() {
+            cx.state.pending = Some(PendingCurves {
+                layer: active,
+                start: current,
+            });
+        }
+        return match cx
+            .layers
+            .set_adjustment(active, aurora_doc::Adjustment::Curves(next))
+        {
+            Ok(()) => CompositeInvalidation::Everything,
+            Err(err) => {
+                tracing::warn!(?err, "a live Curves drag move was refused");
+                CompositeInvalidation::None
+            }
+        };
+    }
+    if next == current || !record_curves_step(cx, active, next) {
+        return CompositeInvalidation::None;
+    }
+    CompositeInvalidation::Everything
+}
+
+/// Ends a live Curves drag outright, as its own gesture — a key that
+/// reaches the shortcuts (an Undo mid-drag) or an assistive technology's
+/// edit: one step for the drag ([`finish_curves`]) and the editor's
+/// pointer capture dropped, so the rest of the pointer gesture edits
+/// nothing and the next sync shows the document's curve (review GA-4).
+/// Returns whether a step was recorded.
+fn end_curves_drag(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
+    let editor = cx.controls.map(|controls| controls.editor);
+    if editor.is_some() && click.captured() == editor {
+        click.release_capture();
+    }
+    cx.state.detached = false;
+    finish_curves(cx)
+}
+
+/// What a key that reaches the shortcuts does to the Curves editor first
+/// (`App::end_curves_drag_for_key`): if a drag is pending **or the editor
+/// merely holds the pointer capture** (a press that only selected a point,
+/// or a detached drag — review GA4-R), the gesture ends
+/// ([`end_curves_drag`]), so the Undo that follows is not silently
+/// overwritten by the next Move writing the editor's stale curve back.
+/// The same condition [`end_curves_gestures`] uses. Returns whether a step
+/// was recorded.
+fn end_curves_gesture_before_key(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
+    let editor = cx.controls.map(|controls| controls.editor);
+    if cx.state.pending.is_none() && (editor.is_none() || click.captured() != editor) {
+        return false;
+    }
+    end_curves_drag(cx, click)
+}
+
+/// Ends every Curves-editor gesture belonging to the document about to
+/// be replaced (every open route): a live drag is committed with the
+/// editor's capture dropped, the histogram cache is dropped and the
+/// channel resets to RGB, so nothing of the old document survives.
+fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
+    let Some(controls) = cx.controls else {
+        return false;
+    };
+    if cx.state.pending.is_some() || click.captured() == Some(controls.editor) {
+        click.release_capture();
+    }
+    let committed = finish_curves(cx);
+    cx.state.detached = false;
+    cx.state.histogram = None;
+    cx.state.job = None;
+    if let Err(err) = aurora_ui::select_curves_channel(
+        &mut cx.workspace.tree,
+        controls,
+        aurora_ui::CurvesChannel::Rgb,
+    ) {
+        tracing::warn!(?err, "failed to reset the Curves channel");
+    }
+    committed
+}
+
+/// The Curves histogram's bin count: one per 8-bit level.
+const CURVES_HISTOGRAM_BINS: usize = 256;
+
+/// At most this many tiles per axis are composited for the histogram
+/// (so at most 16 tiles, ~1 M pixels, whatever the document's size): a
+/// document up to 1024 x 1024 px is read exactly, a larger one is
+/// sampled at evenly spaced whole tiles including both corners — the
+/// "downsampled read" that keeps the computation off any O(document)
+/// path on the UI thread (measured in
+/// `curves_histogram_cost_is_bounded_on_a_large_document`).
+const CURVES_HISTOGRAM_TILES_PER_AXIS: u32 = 4;
+
+/// The tile indices sampled along an axis of `count` tiles.
+fn curves_histogram_tiles(count: u32) -> Vec<u32> {
+    let k = CURVES_HISTOGRAM_TILES_PER_AXIS;
+    if count <= k {
+        return (0..count).collect();
+    }
+    (0..k)
+        .map(|i| {
+            let at = u64::from(i) * u64::from(count - 1) / u64::from(k - 1);
+            u32::try_from(at).unwrap_or(count - 1)
+        })
+        .collect()
+}
+
+/// Hides Curves layer `id` and everything painted after it (above it in
+/// its own stack, and above each of its ancestors in theirs), returning
+/// the prior visibility of everything it touched — so a composite of
+/// what is left is the content **below** the Curves layer. For a Curves
+/// layer inside a group that is the whole document below it, not the
+/// group's isolated backdrop: a documented approximation.
+fn hide_curves_and_above(
+    layers: &mut aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+) -> Vec<(aurora_doc::LayerId, bool)> {
+    let mut hidden = Vec::new();
+    let mut node = id;
+    let mut inclusive = true;
+    loop {
+        let parent = layers.parent(node);
+        let siblings: Vec<aurora_doc::LayerId> = match parent {
+            Some(parent) => layers
+                .children(parent)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default(),
+            None => layers.roots().to_vec(),
+        };
+        let at = siblings
+            .iter()
+            .position(|&sibling| sibling == node)
+            .unwrap_or(0);
+        let end = if inclusive { at + 1 } else { at };
+        for &above in siblings.iter().take(end) {
+            if let Some(visible) = layers.visible(above)
+                && layers.set_visible(above, false).is_ok()
+            {
+                hidden.push((above, visible));
+            }
+        }
+        inclusive = false;
+        match parent {
+            Some(parent) => node = parent,
+            None => return hidden,
+        }
+    }
+}
+
+/// How much tile compositing one [`refresh_curves_histogram`] call may
+/// spend before it yields to the event loop. At least one whole tile is
+/// always read, so a job always progresses — and since one tile costs
+/// more than this today (~9.5 ms measured), the budget only binds for
+/// cheaper stacks; see [`CurvesHistogramJob`].
+const CURVES_HISTOGRAM_STEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Every tile the histogram samples for a `canvas`-sized document
+/// ([`curves_histogram_tiles`] on each axis), row-major.
+fn curves_histogram_tile_ids(canvas: (u32, u32)) -> Vec<aurora_tile::TileId> {
+    let tile = aurora_tile::TILE;
+    let columns = curves_histogram_tiles(canvas.0.div_ceil(tile));
+    curves_histogram_tiles(canvas.1.div_ceil(tile))
+        .into_iter()
+        .flat_map(|y| columns.iter().map(move |&x| aurora_tile::TileId { x, y }))
+        .collect()
+}
+
+/// Adds one tile of the composite **below** Curves layer `id` to
+/// `counts`, for `channel` — `Red`/`Green`/`Blue` that channel, `Rgb` the
+/// Rec. 709 luma `0.2126 R + 0.7152 G + 0.0722 B` of the straight colour
+/// (Photoshop's RGB histogram is luminosity-like; this is the documented
+/// choice). Each pixel inside the document with any coverage counts once
+/// at `round(255 * value)`, clamped to `[0, 1]`; a fully transparent one
+/// counts nowhere. The tree's visibility is changed for the read
+/// ([`hide_curves_and_above`]) and restored before returning.
+fn curves_histogram_tile(
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    id: aurora_doc::LayerId,
+    channel: aurora_ui::CurvesChannel,
+    canvas: (u32, u32),
+    tile_id: aurora_tile::TileId,
+    counts: &mut [u64],
+) {
+    let hidden = hide_curves_and_above(layers, id);
+    composite_histogram_tile(layers, store, channel, canvas, tile_id, counts);
+    for (layer, visible) in hidden.into_iter().rev() {
+        if let Err(err) = layers.set_visible(layer, visible) {
+            tracing::warn!(
+                ?err,
+                "failed to restore a layer's visibility after the histogram"
+            );
+        }
+    }
+}
+
+/// The whole histogram in one call — what a finished
+/// [`CurvesHistogramJob`] holds; the tests' and the cost measurement's
+/// entry point.
+#[cfg(test)]
+fn curves_histogram(
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    id: aurora_doc::LayerId,
+    channel: aurora_ui::CurvesChannel,
+    canvas: (u32, u32),
+) -> Vec<f32> {
+    let mut counts = vec![0_u64; CURVES_HISTOGRAM_BINS];
+    for tile_id in curves_histogram_tile_ids(canvas) {
+        curves_histogram_tile(layers, store, id, channel, canvas, tile_id, &mut counts);
+    }
+    histogram_bins(&counts)
+}
+
+fn histogram_bins(counts: &[u64]) -> Vec<f32> {
+    #[allow(clippy::cast_precision_loss)]
+    counts.iter().map(|&count| count as f32).collect()
+}
+
+fn composite_histogram_tile(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    channel: aurora_ui::CurvesChannel,
+    (width, height): (u32, u32),
+    tile_id: aurora_tile::TileId,
+    counts: &mut [u64],
+) {
+    let tile = aurora_tile::TILE;
+    let stride = tile as usize * aurora_tile::CHANNELS;
+    let mut budget = CompositeBudget::for_pass(layers);
+    budget.next_tile(layers);
+    let (tx, ty) = (tile_id.x, tile_id.y);
+    let doc_origin = (
+        i64::from(tx) * i64::from(tile),
+        i64::from(ty) * i64::from(tile),
+    );
+    let (texels, _) =
+        composite_roots_into_tile(layers, store, tile_id, doc_origin, (0, 0), &mut budget);
+    let columns = width.saturating_sub(tx.saturating_mul(tile)).min(tile) as usize;
+    let rows = height.saturating_sub(ty.saturating_mul(tile)).min(tile) as usize;
+    for line in texels.chunks_exact(stride).take(rows) {
+        for texel in line.chunks_exact(aurora_tile::CHANNELS).take(columns) {
+            let [r, g, b, a] = *texel else {
+                continue;
+            };
+            let a = a.to_f32();
+            // Not `a <= 0.0`: a NaN alpha must count nowhere too.
+            if a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                continue;
+            }
+            // `composite_roots_into_tile` hands back **straight** RGBA
+            // (measured: a 0.6 grey at 50% opacity reads 0.6, not 0.3 —
+            // `the_histogram_reads_straight_colour_from_a_translucent_
+            // backdrop`), so the colour is read as is.
+            let (r, g, b) = (r.to_f32(), g.to_f32(), b.to_f32());
+            let value = match channel {
+                aurora_ui::CurvesChannel::Rgb => {
+                    0.0722f32.mul_add(b, 0.2126f32.mul_add(r, 0.7152 * g))
+                }
+                aurora_ui::CurvesChannel::Red => r,
+                aurora_ui::CurvesChannel::Green => g,
+                aurora_ui::CurvesChannel::Blue => b,
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let bin = (value.clamp(0.0, 1.0) * 255.0).round() as usize;
+            if let Some(count) = counts.get_mut(bin) {
+                *count += 1;
+            }
+        }
+    }
+}
+
+/// Brings the histogram in line with the active Curves layer (`None`:
+/// drop it): if the finished one is stale ([`CurvesHistogram`]'s rule),
+/// starts or continues a [`CurvesHistogramJob`] for at most
+/// [`CURVES_HISTOGRAM_STEP_BUDGET`], and installs its result when it
+/// finishes. Returns whether a job is still running (the caller keeps
+/// the event loop awake).
+fn refresh_curves_histogram(
+    state: &mut CurvesUiState,
+    layers: &mut aurora_doc::LayerTree,
+    store: Option<&mut aurora_tile::TileStore>,
+    curves_layer: Option<aurora_doc::LayerId>,
+    channel: aurora_ui::CurvesChannel,
+    revision: UndoRevision,
+    canvas: (u32, u32),
+) -> bool {
+    let Some(layer) = curves_layer else {
+        state.histogram = None;
+        state.job = None;
+        return false;
+    };
+    let matches = |l: aurora_doc::LayerId, c: aurora_ui::CurvesChannel, r: UndoRevision| {
+        l == layer && c == channel && r == revision
+    };
+    if state
+        .histogram
+        .as_ref()
+        .is_some_and(|h| matches(h.layer, h.channel, h.revision))
+    {
+        state.job = None;
+        return false;
+    }
+    let Some(store) = store else {
+        state.job = None;
+        state.histogram = Some(CurvesHistogram {
+            layer,
+            channel,
+            revision,
+            bins: None,
+        });
+        return false;
+    };
+    if !state
+        .job
+        .as_ref()
+        .is_some_and(|job| matches(job.layer, job.channel, job.revision))
+    {
+        let mut remaining = curves_histogram_tile_ids(canvas);
+        remaining.reverse();
+        state.job = Some(CurvesHistogramJob {
+            layer,
+            channel,
+            revision,
+            remaining,
+            counts: vec![0; CURVES_HISTOGRAM_BINS],
+        });
+    }
+    let Some(job) = state.job.as_mut() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    while let Some(tile_id) = job.remaining.pop() {
+        curves_histogram_tile(
+            layers,
+            store,
+            layer,
+            channel,
+            canvas,
+            tile_id,
+            &mut job.counts,
+        );
+        if started.elapsed() >= CURVES_HISTOGRAM_STEP_BUDGET {
+            break;
+        }
+    }
+    tracing::trace!(elapsed = ?started.elapsed(), left = job.remaining.len(), "Curves histogram step");
+    if !job.remaining.is_empty() {
+        return true;
+    }
+    let bins = histogram_bins(&job.counts);
+    state.job = None;
+    state.histogram = Some(CurvesHistogram {
+        layer,
+        channel,
+        revision,
+        bins: Some(bins),
+    });
+    false
+}
+
+/// The Curves editor's catch-all sync (0.156.0), run once per event-loop
+/// iteration and after every Curves outcome: settles a drag whose
+/// capture ended, refreshes the histogram if stale, then mirrors the
+/// document into the editor ([`aurora_ui::sync_curves_controls`]) — so an
+/// undo, a redo, a layer switch and an open all rebind or hide it
+/// without each path having to remember. Returns whether anything shown
+/// changed.
+#[allow(clippy::too_many_arguments)]
+fn sync_curves_ui(
+    cx: &mut CurvesEdit<'_>,
+    composite_cache: &mut CompositeCache,
+    store: Option<&mut aurora_tile::TileStore>,
+    canvas: (u32, u32),
+    captured: Option<WidgetId>,
+) -> bool {
+    let Some(controls) = cx.controls else {
+        return false;
+    };
+    let settled = settle_pending_curves(cx, captured);
+    if settled {
+        composite_cache.bump();
+    }
+    let channel =
+        aurora_ui::curves_selected_channel(&cx.workspace.tree, controls).unwrap_or_default();
+    let curves_layer = cx
+        .active_layer
+        .filter(|&id| aurora_ui::curves_params(cx.layers, id).is_some());
+    let revision = cx.undo_order.revision;
+    let _ = refresh_curves_histogram(
+        cx.state,
+        cx.layers,
+        store,
+        curves_layer,
+        channel,
+        revision,
+        canvas,
+    );
+    let bins = cx
+        .state
+        .histogram
+        .as_ref()
+        .filter(|histogram| Some(histogram.layer) == curves_layer && histogram.channel == channel)
+        .and_then(|histogram| histogram.bins.as_deref());
+    match aurora_ui::sync_curves_controls(
+        &mut cx.workspace.tree,
+        controls,
+        cx.layers,
+        cx.active_layer,
+        captured,
+        bins,
+    ) {
+        Ok(changed) => changed || settled,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the Properties-panel Curves editor");
+            settled
+        }
+    }
+}
+
 /// Drops the pointer capture of the Properties panel's radius slider, if
 /// it holds it (review RT136-4). A radius drag has no pending state of
 /// its own to settle — every `Move` already set the radius — so ending it
@@ -5970,6 +6657,7 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW, "New Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -6190,6 +6878,30 @@ struct UndoOrder {
     redo_labels: Vec<String>,
     /// The History panel's first row: what the document started from.
     origin: &'static str,
+    /// Changes on every recorded, undone or redone step (0.156.0), and
+    /// is fresh for every new order — the Curves histogram's staleness
+    /// key ([`refresh_curves_histogram`]).
+    revision: UndoRevision,
+}
+
+/// A process-unique stamp for an [`UndoOrder`]'s state (0.156.0): drawn
+/// from one global counter, so two documents' orders (a new one per
+/// open) can never share a value, and a step undone and then replaced by
+/// a different one never repeats the stamp it had before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UndoRevision(u64);
+
+impl UndoRevision {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for UndoRevision {
+    fn default() -> Self {
+        Self::next()
+    }
 }
 
 /// The History panel's first row for a document opened from a file.
@@ -6228,6 +6940,7 @@ impl Default for UndoOrder {
             undo_labels: Vec::new(),
             redo_labels: Vec::new(),
             origin: OPEN_HISTORY_ORIGIN,
+            revision: UndoRevision::next(),
         }
     }
 }
@@ -6258,6 +6971,7 @@ impl UndoOrder {
                 .unwrap_or_else(|| default_step_label(kind).to_owned());
             self.redo.push(kind);
             self.redo_labels.push(label);
+            self.revision = UndoRevision::next();
         }
     }
 
@@ -6272,6 +6986,7 @@ impl UndoOrder {
                 .unwrap_or_else(|| default_step_label(kind).to_owned());
             self.undo.push(kind);
             self.undo_labels.push(label);
+            self.revision = UndoRevision::next();
         }
     }
 
@@ -6348,6 +7063,7 @@ impl UndoOrder {
         self.redo_labels.clear();
         history.clear_redo();
         pixel_history.clear_redo();
+        self.revision = UndoRevision::next();
     }
 }
 
@@ -10218,23 +10934,17 @@ impl CompositeBudget {
 // threading the same eight arguments through two more signatures and
 // separating each arm from the doc comment that explains it; the length
 // here is one `match` with two arms, not accumulated logic.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn resolve_tile(
+/// The checks every node of a composite walk passes before it is folded,
+/// shared by [`resolve_tile`] and [`apply_adjustment_layer`] (0.155.0,
+/// extracted from `resolve_tile` unchanged): the tree-depth bound, the
+/// per-pass node budget, and visibility. `false` means "skip this node
+/// for this tile".
+fn admit_composite_node(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
-    tile_id: aurora_tile::TileId,
-    doc_origin: (i64, i64),
-    reference_origin: (i64, i64),
     depth: usize,
     budget: &mut CompositeBudget,
-) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
-    // Both bounds are checked before anything else this function does,
-    // including the visibility test below: `aurora-doc`'s own shape
-    // validator is the primary guarantee that this recursion terminates,
-    // and these are the independent second one. See this function's own
-    // doc comment for the depth convention, and why bounding depth alone
-    // is not enough to bound the work.
+) -> bool {
     if depth > aurora_doc::MAX_LAYER_TREE_DEPTH {
         if budget.should_report() {
             tracing::warn!(
@@ -10245,7 +10955,7 @@ fn resolve_tile(
                  composite tile"
             );
         }
-        return None;
+        return false;
     }
     // Charged after the depth check, not before it: a call refused for
     // depth does no work worth charging, and the number of such refused
@@ -10263,9 +10973,32 @@ fn resolve_tile(
                  this branch for this composite tile"
             );
         }
-        return None;
+        return false;
     }
     if layers.visible(id) != Some(true) {
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resolve_tile(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
+    // Both bounds are checked before anything else this function does,
+    // including the visibility test below: `aurora-doc`'s own shape
+    // validator is the primary guarantee that this recursion terminates,
+    // and these are the independent second one. See this function's own
+    // doc comment for the depth convention, and why bounding depth alone
+    // is not enough to bound the work.
+    if !admit_composite_node(id, layers, depth, budget) {
         return None;
     }
     let opacity = layers.opacity(id)?;
@@ -10415,6 +11148,13 @@ fn resolve_tile(
             }
             Some((texels, opacity, blend_mode))
         }
+        // An adjustment has no texels of its own to hand back: it
+        // transforms the accumulator *below* it, so it is folded by
+        // `fold_layer_into`/`apply_adjustment_layer`, which see that
+        // accumulator, and never resolved here. A caller that reaches this
+        // arm (the GPU path, whose predicate refuses adjustments first)
+        // gets "nothing to fold", never a wrong composite of the layer.
+        aurora_doc::LayerKind::Adjustment(_) => None,
         aurora_doc::LayerKind::Group { children } => {
             // Folded in place, one child at a time, rather than collected
             // into a `Vec` of every child's own full tile buffer for a
@@ -10444,23 +11184,15 @@ fn resolve_tile(
             // `composite_layer_into_folded_matches_hand_computed_golden_values`.)
             let mut isolated = aurora_render::transparent_tile();
             for &child_id in children.iter().rev() {
-                // Stop as soon as the budget is spent rather than still
-                // making one no-op `resolve_tile` call per remaining
-                // listed child -- see `CompositeBudget::is_exhausted`'s
-                // own doc comment for why this matters for a crafted
-                // tree, not just a well-formed one (where this never
-                // fires, since every child that gets this far is real).
                 if budget.is_exhausted() {
                     break;
                 }
-                // `saturating_add` rather than plain `+`, mirroring
-                // `aurora-doc`'s own `validate_shape`: the guard at the
-                // top of this function makes an overflow structurally
-                // unreachable (`depth` can never get past
-                // `MAX_LAYER_TREE_DEPTH + 1` here), so this is about
-                // matching the validator's style, not about a real
-                // wrap this code could hit.
-                if let Some(resolved) = resolve_tile(
+                // Through `fold_layer_into` (0.155.0) rather than
+                // `resolve_tile` + `composite_layer_into` directly, so an
+                // adjustment child sees exactly the siblings below it in
+                // this group's own isolated accumulator.
+                let _ = fold_layer_into(
+                    &mut isolated,
                     child_id,
                     layers,
                     store,
@@ -10469,42 +11201,8 @@ fn resolve_tile(
                     reference_origin,
                     depth.saturating_add(1),
                     budget,
-                ) {
-                    let (child, child_opacity, child_blend_mode) = resolved;
-                    aurora_render::composite_layer_into(
-                        &mut isolated,
-                        &child,
-                        child_opacity,
-                        child_blend_mode,
-                    );
-                }
+                );
             }
-            // Un-premultiply: `composite_layer_into` accumulates straight-
-            // alpha "over" math onto a starting-*transparent* destination,
-            // which yields a *premultiplied* result whenever the
-            // accumulated alpha ends up fractional (see this function's
-            // own doc comment's worked example: a lone `opacity = 0.5`
-            // child alone on transparent gives `(0, 0, 0.5, 0.5)`, not the
-            // straight `(0, 0, 1.0, 0.5)`). Every other branch of this
-            // function returns true straight-alpha texels, and the
-            // caller's own `composite_layer_into` call one level up
-            // expects straight-alpha inputs too -- so divide `r`/`g`/`b`
-            // by `a`
-            // here to convert this group's own isolated buffer back to
-            // straight alpha before handing it back as `id`'s own
-            // pseudo-layer texels. Guarded against `a == 0.0` (fully
-            // transparent texels have no meaningful colour to recover;
-            // leave them at `0.0` rather than dividing by zero).
-            //
-            // The loop itself lives in
-            // `aurora_render::un_premultiply_in_place` — this arm was
-            // the only place it existed until `composite_roots_into_tile`
-            // and the GPU compositing path's own readback
-            // (`finish_tile_readback`) were found to be missing the
-            // identical step; see that function's own doc comment for
-            // the invariant (straighten exactly once, at the top of an
-            // accumulation, never inside `composite_layer_into`'s own
-            // fold).
             aurora_render::un_premultiply_in_place(&mut isolated);
             // A group's own mask masks its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
@@ -10550,6 +11248,199 @@ fn resolve_tile(
             Some((isolated, opacity, blend_mode))
         }
     }
+}
+
+/// Folds one layer into a premultiplied accumulator (0.155.0): an
+/// adjustment layer through [`apply_adjustment_layer`], which transforms
+/// what is already in `accumulator`; anything else exactly as before,
+/// [`resolve_tile`] then `aurora_render::composite_layer_into`. `true`
+/// when the layer changed the accumulator.
+#[allow(clippy::too_many_arguments)]
+fn fold_layer_into(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_))) {
+        return apply_adjustment_layer(accumulator, id, layers, store, doc_origin, depth, budget);
+    }
+    match resolve_tile(
+        id,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth,
+        budget,
+    ) {
+        Some((texels, opacity, blend_mode)) => {
+            aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How many distinct Curves parameter sets [`curves_lut`] keeps built per
+/// thread. A document rarely has more Curves layers than this visible at
+/// once; past it, the oldest entry is rebuilt on its next use.
+const CURVES_LUT_CACHE_LEN: usize = 8;
+
+/// A thread's built Curves lookup tables, keyed by their exact parameters.
+type CurvesLutCache = Vec<(
+    aurora_core::CurvesParams,
+    std::rc::Rc<aurora_filters::CurvesLut>,
+)>;
+
+thread_local! {
+    /// Built Curves lookup tables, so a composite pass builds each table
+    /// once rather than once per tile (one build samples up to four
+    /// curves at 16,385 points each).
+    static CURVES_LUTS: std::cell::RefCell<CurvesLutCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `params`' lookup tables, from this thread's cache when they have been
+/// built before.
+fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters::CurvesLut> {
+    CURVES_LUTS.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(aurora_filters::CurvesLut::new(params));
+        };
+        if let Some((_, lut)) = cache.iter().find(|(cached, _)| cached == params) {
+            return std::rc::Rc::clone(lut);
+        }
+        let lut = std::rc::Rc::new(aurora_filters::CurvesLut::new(params));
+        if cache.len() >= CURVES_LUT_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((params.clone(), std::rc::Rc::clone(&lut)));
+        lut
+    })
+}
+
+/// Applies an adjustment layer (0.155.0) to `accumulator`, the
+/// premultiplied composite of everything below it in its own group (or
+/// the document), in place. Photoshop's adjustment-layer model:
+///
+/// 1. the backdrop `Cb` is the accumulator un-premultiplied;
+/// 2. the adjusted colour `f(Cb)` (`aurora_filters::CurvesLut`, straight
+///    RGB) becomes a source layer with alpha `1`, times the layer's own
+///    mask coverage when it has an enabled mask (`apply_mask`, the same
+///    call a pixel layer's mask goes through), and through `dissolve_gate`
+///    for `Dissolve`, the same as a pixel layer;
+/// 3. that source is blended with the layer's own blend mode and opacity
+///    (`aurora_render::composite_layer_into`) over the backdrop **made
+///    opaque**, which gives exactly `lerp(Cb, B(Cb, f(Cb)), opacity * mask)`;
+/// 4. the result is written back at the backdrop's own alpha, bit for bit.
+///
+/// Step 3's opaque backdrop and step 4's alpha are what make an adjustment
+/// re-colour existing pixels without creating any: a fully transparent
+/// region stays fully transparent and a half-transparent one keeps its
+/// alpha, which a plain source-over of the adjusted copy would raise.
+///
+/// Identity curves under `Normal`/`Dissolve` are skipped outright, so they
+/// are an exact passthrough rather than an `f16` un-/re-premultiply round
+/// trip. Returns `true` when the layer was applied.
+///
+/// Known differences from Photoshop, disclosed: groups here are always
+/// isolated (Aurora has no Pass Through mode), so an adjustment inside a
+/// group never reaches layers below the group; and fill opacity is not
+/// applied, matching how pixel layers composite today.
+#[allow(clippy::too_many_arguments)]
+fn apply_adjustment_layer(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    doc_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !admit_composite_node(id, layers, depth, budget) {
+        return false;
+    }
+    let Some(aurora_doc::Adjustment::Curves(params)) = layers.adjustment(id) else {
+        return false;
+    };
+    let Some(opacity) = layers.opacity(id) else {
+        return false;
+    };
+    let raw_blend_mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    let lut = curves_lut(params);
+    if lut.is_identity()
+        && matches!(
+            raw_blend_mode,
+            aurora_doc::BlendMode::Normal | aurora_doc::BlendMode::Dissolve
+        )
+    {
+        return true;
+    }
+
+    let mut backdrop = accumulator.to_vec();
+    aurora_render::un_premultiply_in_place(&mut backdrop);
+
+    let one = half::f16::from_f32(1.0);
+    let mut source = Vec::with_capacity(backdrop.len());
+    for texel in backdrop.chunks_exact(4) {
+        if let [r, g, b, _] = *texel {
+            let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+            source.extend([
+                half::f16::from_f32(r),
+                half::f16::from_f32(g),
+                half::f16::from_f32(b),
+                one,
+            ]);
+        }
+    }
+    if let Some(mask) = layers.mask(id)
+        && mask.enabled
+    {
+        source = apply_mask(
+            &source,
+            mask,
+            layers.mask_surface_id(id),
+            store,
+            doc_origin,
+            budget,
+        );
+    }
+    let (source, opacity, blend_mode) = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+        (
+            dissolve_gate(&source, opacity, doc_origin),
+            1.0,
+            aurora_render::BlendMode::Normal,
+        )
+    } else {
+        (source, opacity, translate_blend_mode(raw_blend_mode))
+    };
+
+    let mut mixed = backdrop;
+    for texel in mixed.chunks_exact_mut(4) {
+        if let [_, _, _, alpha] = texel {
+            *alpha = one;
+        }
+    }
+    aurora_render::composite_layer_into(&mut mixed, &source, opacity, blend_mode);
+
+    for (out, mixed) in accumulator.chunks_exact_mut(4).zip(mixed.chunks_exact(4)) {
+        if let ([r, g, b, alpha], [mr, mg, mb, _]) = (out, mixed) {
+            let a = alpha.to_f32();
+            *r = half::f16::from_f32(mr.to_f32() * a);
+            *g = half::f16::from_f32(mg.to_f32() * a);
+            *b = half::f16::from_f32(mb.to_f32() * a);
+        }
+    }
+    true
 }
 
 /// Composites one tile of `layers`' **root level** on the CPU: every
@@ -10655,7 +11546,8 @@ fn composite_roots_into_tile(
     let mut composited = aurora_render::transparent_tile();
     let mut folded = 0_usize;
     for &id in layers.roots().iter().rev() {
-        if let Some((texels, opacity, blend_mode)) = resolve_tile(
+        if fold_layer_into(
+            &mut composited,
             id,
             layers,
             store,
@@ -10665,7 +11557,6 @@ fn composite_roots_into_tile(
             1,
             budget,
         ) {
-            aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
             folded = folded.saturating_add(1);
         }
     }
@@ -13552,6 +14443,17 @@ fn begin_gpu_composite_tile(
     let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
     for &id in layers.roots().iter().rev() {
+        // 0.155.0: an adjustment layer has no WGSL port yet (a named
+        // follow-on), and `resolve_tile` hands it back as "nothing to
+        // fold", so a GPU pass reaching one would silently drop it. The
+        // predicate refuses such documents before this is ever called;
+        // this is the second, local refusal, so the tile falls back to the
+        // CPU path rather than compositing without the adjustment.
+        if layers.visible(id) == Some(true)
+            && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_)))
+        {
+            return None;
+        }
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
         // validator starts its budget at. One `budget` for all of this
         // tile's roots, not one each: in a well-formed tree their
@@ -16335,6 +17237,10 @@ enum LayerCommand {
     /// Removes the active node and its whole subtree, refusing when that
     /// would leave no pixel layer at all. See [`delete_layer`].
     Delete,
+    /// New Curves Layer (0.155.0): an identity Curves adjustment layer
+    /// directly above the active node, placed exactly where
+    /// [`Self::New`] places a pixel layer, made active.
+    NewCurves,
 }
 
 /// Everything [`perform_layer_command`] touches, borrowed from `App` (or
@@ -16535,6 +17441,44 @@ fn new_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
 /// with nothing changed when there is no active node or the delete is
 /// refused: a document must keep at least one pixel layer outside the
 /// removed subtree, or there would be nothing left to paint on.
+/// `"Curves N"`, one past the highest `N` any existing "Curves N" layer
+/// already uses — the same rule [`next_layer_name`] follows for
+/// "Layer N".
+fn next_curves_name(layers: &aurora_doc::LayerTree) -> String {
+    let highest = layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| {
+            layers
+                .name(id)?
+                .strip_prefix("Curves ")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("Curves {}", highest.saturating_add(1))
+}
+
+/// New Curves Layer (0.155.0): an identity Curves adjustment, one undo
+/// step (`History::add_adjustment_layer_at`), at [`new_layer_placement`].
+fn new_curves_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_curves_name(cx.layers);
+    match cx.history.add_adjustment_layer_at(
+        cx.layers,
+        name,
+        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+        placement.parent,
+        placement.index,
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(?err, "New Curves Layer was refused by the layer tree");
+            None
+        }
+    }
+}
+
 fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand> {
     let Some(target) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         tracing::info!("Delete Layer with no active layer; nothing to delete");
@@ -16617,6 +17561,9 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
             next_active: Some(id),
         }),
         LayerCommand::Delete => delete_layer(cx),
+        LayerCommand::NewCurves => new_curves_layer(cx).map(|id| AppliedLayerCommand {
+            next_active: Some(id),
+        }),
     };
     let Some(AppliedLayerCommand { next_active }) = next_active else {
         return false;
@@ -18363,6 +19310,9 @@ struct App {
     /// only if building them failed, which is logged). The slider shares
     /// [`Self::gallery_click`] with every other app-owned widget.
     tool_controls: Option<aurora_ui::ToolControls>,
+    /// The Properties-panel Curves editor's live drag and histogram cache
+    /// (0.156.0); its widgets are `tool_controls.curves`.
+    curves_ui: CurvesUiState,
     /// Whether IME is currently allowed on the window — only while the
     /// gallery's text field is focused ([`Self::sync_ime`]).
     ime_allowed: bool,
@@ -18668,6 +19618,7 @@ impl App {
             layer_controls,
             tool_settings,
             tool_controls,
+            curves_ui: CurvesUiState::default(),
             ime_allowed: false,
             ime_cursor_area: None,
             residency_viewport: None,
@@ -18745,6 +19696,7 @@ impl App {
                 tool: self.tool,
                 tool_settings: &mut self.tool_settings,
                 tool_controls: self.tool_controls,
+                curves_ui: &mut self.curves_ui,
                 scroll_follow: &mut self.scroll_follow,
             },
             request,
@@ -18822,6 +19774,11 @@ impl App {
             self.relayout_after_gallery();
             return;
         }
+        // A key that reaches the shortcuts (an Undo, typically) ends a
+        // live Curves drag first, so it undoes the drag rather than what
+        // preceded it; its capture is dropped, so the rest of that drag
+        // edits nothing and the editor follows the document (0.156.0).
+        self.end_curves_drag_for_key();
         let tool_before = self.tool;
         let picked = handle_key(
             &mut self.workspace,
@@ -18858,6 +19815,9 @@ impl App {
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
+            Some(ActivatedCommand::NewCurvesLayer) => {
+                self.run_layer_command(LayerCommand::NewCurves);
+            }
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -19208,6 +20168,21 @@ impl App {
         let started = std::time::Instant::now();
         // A live opacity drag belongs to the document being replaced.
         self.commit_layer_controls_drag();
+        // So does a live Curves drag, its histogram and its channel.
+        let _ = end_curves_gestures(
+            &mut CurvesEdit {
+                workspace: &mut self.workspace,
+                layers: &mut self.layers,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                undo_order: &mut self.undo_order,
+                layer_rows: &self.layer_rows,
+                active_layer: self.active_layer,
+                controls: self.tool_controls.map(|controls| controls.curves),
+                state: &mut self.curves_ui,
+            },
+            &mut self.gallery_click,
+        );
         match decoded {
             DecodedFile::Image(image) => self.open_image_file(&path, image),
             DecodedFile::Psd(document) => self.open_psd_file(&path, document),
@@ -20824,6 +21799,9 @@ impl App {
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
+            Some(ActivatedCommand::NewCurvesLayer) => {
+                self.run_layer_command(LayerCommand::NewCurves);
+            }
             None => {}
         }
         self.push_accessibility();
@@ -21138,6 +22116,12 @@ impl App {
     /// ([`apply_tool_control_outcome`]): a radius change re-announces and
     /// redraws. No history step — tool settings are not document state.
     fn apply_tool_control(&mut self, outcome: &PointerOutcome) {
+        if let Some(controls) = self.tool_controls
+            && is_curves_outcome(controls.curves, outcome)
+        {
+            self.apply_curves_control(outcome);
+            return;
+        }
         let captured = self.gallery_click.captured();
         if apply_tool_control_outcome(
             &mut self.workspace,
@@ -21172,10 +22156,96 @@ impl App {
         }
     }
 
-    /// [`settle_pending_opacity`] against the shared tracker's capture.
+    /// [`settle_pending_opacity`] (and, 0.156.0, [`settle_pending_curves`])
+    /// against the shared tracker's capture.
     fn settle_layer_controls_drag(&mut self) {
         let captured = self.gallery_click.captured();
         if settle_pending_opacity(&mut self.layer_control_edit(), captured) {
+            self.needs_redraw = true;
+        }
+        if settle_pending_curves(&mut self.curves_edit(), captured) {
+            self.composite_cache.bump();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// A live Curves gesture ends before a key reaches the shortcuts
+    /// ([`end_curves_gesture_before_key`]).
+    fn end_curves_drag_for_key(&mut self) {
+        let committed = end_curves_gesture_before_key(
+            &mut CurvesEdit {
+                workspace: &mut self.workspace,
+                layers: &mut self.layers,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                undo_order: &mut self.undo_order,
+                layer_rows: &self.layer_rows,
+                active_layer: self.active_layer,
+                controls: self.tool_controls.map(|controls| controls.curves),
+                state: &mut self.curves_ui,
+            },
+            &mut self.gallery_click,
+        );
+        if committed {
+            self.composite_cache.bump();
+        }
+    }
+
+    fn curves_edit(&mut self) -> CurvesEdit<'_> {
+        CurvesEdit {
+            workspace: &mut self.workspace,
+            layers: &mut self.layers,
+            history: &mut self.history,
+            pixel_history: &mut self.pixel_history,
+            undo_order: &mut self.undo_order,
+            layer_rows: &self.layer_rows,
+            active_layer: self.active_layer,
+            controls: self.tool_controls.map(|controls| controls.curves),
+            state: &mut self.curves_ui,
+        }
+    }
+
+    /// Applies one routed Curves-editor outcome ([`apply_curves_outcome`])
+    /// — a pointer edit, a key, or a channel tab — invalidates the
+    /// composite it changed, and re-syncs the editor at once (a channel
+    /// tab shows its own curve and histogram in the same frame).
+    fn apply_curves_control(&mut self, outcome: &PointerOutcome) {
+        let captured = self.gallery_click.captured();
+        let invalidation = apply_curves_outcome(&mut self.curves_edit(), outcome, captured);
+        apply_layer_control_invalidation(&mut self.composite_cache, &invalidation);
+        self.sync_curves_controls_now();
+        self.needs_redraw = true;
+    }
+
+    /// The Curves editor's catch-all ([`sync_curves_ui`]), run once per
+    /// event-loop iteration beside [`Self::sync_tool_controls_now`].
+    /// Re-lays out when it changed anything (showing or hiding the editor
+    /// changes the Properties panel's layout).
+    fn sync_curves_controls_now(&mut self) {
+        let captured = self.gallery_click.captured();
+        let mut cx = CurvesEdit {
+            workspace: &mut self.workspace,
+            layers: &mut self.layers,
+            history: &mut self.history,
+            pixel_history: &mut self.pixel_history,
+            undo_order: &mut self.undo_order,
+            layer_rows: &self.layer_rows,
+            active_layer: self.active_layer,
+            controls: self.tool_controls.map(|controls| controls.curves),
+            state: &mut self.curves_ui,
+        };
+        if sync_curves_ui(
+            &mut cx,
+            &mut self.composite_cache,
+            self.tile_store.as_mut(),
+            self.canvas_size,
+            captured,
+        ) {
+            self.relayout_after_gallery();
+        }
+        // A histogram still being computed: keep the loop turning so the
+        // next iteration advances it (`refresh_curves_histogram`).
+        if self.curves_ui.job.is_some() {
             self.needs_redraw = true;
         }
     }
@@ -22113,6 +23183,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.sync_ime();
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
+        self.sync_curves_controls_now();
         // The caret blink (0.139.0): after everything above that can move
         // focus or edit a field, so the signature it observes is this
         // iteration's. A flip the last frame did not draw asks for one
@@ -23717,6 +24788,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    curves_ui: &mut crate::CurvesUiState::default(),
                     scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 request,
@@ -23846,6 +24918,7 @@ mod tests {
                         tool: aurora_ui::Tool::default(),
                         tool_settings: &mut tool_settings,
                         tool_controls: None,
+                        curves_ui: &mut crate::CurvesUiState::default(),
                         scroll_follow: &mut follow,
                     },
                     &request,
@@ -23931,6 +25004,7 @@ mod tests {
             tool: aurora_ui::Tool,
             tool_settings: crate::ToolSettings,
             tool_controls: Option<aurora_ui::ToolControls>,
+            curves_ui: crate::CurvesUiState,
         }
 
         impl AtState {
@@ -23993,8 +25067,23 @@ mod tests {
                     &tool_settings,
                     None,
                 );
+                // The Curves editor follows the active layer (0.156.0),
+                // as `App`'s catch-all sync does.
+                if let Some(controls) = tool_controls
+                    && let Err(err) = aurora_ui::sync_curves_controls(
+                        &mut workspace.tree,
+                        controls.curves,
+                        &layers,
+                        active_layer,
+                        None,
+                        None,
+                    )
+                {
+                    unreachable!("{err:?}");
+                }
                 workspace.tree.compute_layout(WIDTH, HEIGHT);
                 Self {
+                    curves_ui: crate::CurvesUiState::default(),
                     tool,
                     tool_settings,
                     tool_controls,
@@ -24016,6 +25105,28 @@ mod tests {
                     gallery: None,
                     layer_controls,
                 }
+            }
+
+            /// `App::sync_curves_controls_now` (0.156.0).
+            fn sync_curves(&mut self) {
+                let _ = crate::sync_curves_ui(
+                    &mut crate::CurvesEdit {
+                        workspace: &mut self.workspace,
+                        layers: &mut self.layers,
+                        history: &mut self.history,
+                        pixel_history: &mut self.pixel_history,
+                        undo_order: &mut self.undo_order,
+                        layer_rows: &self.layer_rows,
+                        active_layer: self.active_layer,
+                        controls: self.tool_controls.map(|controls| controls.curves),
+                        state: &mut self.curves_ui,
+                    },
+                    &mut self.composite_cache,
+                    None,
+                    (256, 256),
+                    self.gallery_click.captured(),
+                );
+                self.workspace.tree.compute_layout(WIDTH, HEIGHT);
             }
 
             /// Runs one request, then performs the relayout the effects
@@ -24045,6 +25156,7 @@ mod tests {
                         tool: self.tool,
                         tool_settings: &mut self.tool_settings,
                         tool_controls: self.tool_controls,
+                        curves_ui: &mut self.curves_ui,
                         scroll_follow: &mut crate::ScrollFollow::default(),
                     },
                     request,
@@ -24357,15 +25469,20 @@ mod tests {
         /// colour picker or curve editor fails this until it is mapped.
         #[test]
         fn every_action_the_live_workspace_declares_is_mapped_or_widget_local() {
+            // A non-identity Curves layer on top, active (0.156.0 review
+            // GA-1), so the curve editor is shown and every one of its
+            // points declares a value action that really moves it.
             let fresh = || {
-                let (layers, _history) = demo_document();
-                let active = topmost_pixel_layer(&layers);
+                let (mut layers, _history) = demo_document();
+                let curves = curves_sweep_layer(&mut layers);
                 AtState::new(
                     aurora_ui::build_workspace(&crate::test_workspace_scales()),
                     layers,
-                    active,
+                    Some(curves),
                 )
             };
+            let mut tool_controls_applied = 0_usize;
+            let mut curves_applied = 0_usize;
             let probe = fresh();
             let mut ids = Vec::new();
             let mut stack = vec![probe.workspace.root];
@@ -24412,6 +25529,20 @@ mod tests {
                     }
                     if matches!(reaction, AccessibilityReaction::ToolControl(_)) {
                         tool_controls_routed += 1;
+                        // Routed is not enough (review GA-1): a value
+                        // action must really change the radius or the
+                        // document, and survive the catch-all sync.
+                        if matches!(
+                            action,
+                            accesskit::Action::SetValue
+                                | accesskit::Action::Increment
+                                | accesskit::Action::Decrement
+                        ) {
+                            if tool_control_action_applied(fresh(), &request) {
+                                curves_applied += 1;
+                            }
+                            tool_controls_applied += 1;
+                        }
                     }
                     routed += 1;
                     if let AccessibilityReaction::Handled(outcome) = &reaction {
@@ -24439,6 +25570,214 @@ mod tests {
             assert!(
                 tool_controls_routed >= 3,
                 "only {tool_controls_routed} actions reached the Properties-panel tool controls"
+            );
+            // ...and are applied: the radius slider's three, plus three
+            // value actions on each of the Curves layer's three points.
+            assert!(
+                tool_controls_applied >= 12 && curves_applied >= 9,
+                "applied {tool_controls_applied} tool-control actions, {curves_applied} Curves edits"
+            );
+        }
+
+        /// Applies one routed tool-control value action to `state` through
+        /// `apply_accessibility_action`, then the catch-all sync, and
+        /// asserts it really changed something (review GA-1): the Curves
+        /// layer (one undo step — returns `true`) or the radius.
+        fn tool_control_action_applied(
+            mut state: AtState,
+            request: &accesskit::ActionRequest,
+        ) -> bool {
+            let radius = state.tool_settings.radius(state.tool);
+            let Some(curves) = state.active_layer else {
+                unreachable!("the sweep's Curves layer is active");
+            };
+            let params = aurora_ui::curves_params(&state.layers, curves).cloned();
+            let steps = state.undo_order.undo.len();
+            let _ = state.act(request);
+            state.sync_curves();
+            let now = aurora_ui::curves_params(&state.layers, curves).cloned();
+            if now == params {
+                assert_ne!(
+                    state.tool_settings.radius(state.tool),
+                    radius,
+                    "{request:?} reached a tool control and changed nothing"
+                );
+                return false;
+            }
+            assert_eq!(
+                state.undo_order.undo.len(),
+                steps + 1,
+                "{request:?}: one undo step"
+            );
+            true
+        }
+
+        /// Review round 2: an AT edit arriving while a pointer drag is
+        /// pending commits the drag first, then records its own edit —
+        /// exactly two undo steps — and invalidates the composite. The
+        /// pending drag is simulated (its live parameters set on the tree
+        /// and `PendingCurves` stored), as `AtState` has no pointer rig.
+        #[test]
+        fn an_at_edit_during_a_pending_drag_is_two_undo_steps_and_bumps_the_cache() {
+            let (mut layers, _history) = demo_document();
+            let curves = curves_sweep_layer(&mut layers);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(curves),
+            );
+            let Some(controls) = state.tool_controls.map(|c| c.curves) else {
+                unreachable!("the tool controls are built");
+            };
+            let Some(start) = aurora_ui::curves_params(&state.layers, curves).cloned() else {
+                unreachable!("a Curves layer")
+            };
+            let dragged = aurora_ui::with_channel_curve(
+                &start,
+                aurora_ui::CurvesChannel::Rgb,
+                match aurora_core::ToneCurve::new(&[
+                    aurora_core::CurvePoint::new(0.0, 0.2),
+                    aurora_core::CurvePoint::new(0.5, 0.65),
+                    aurora_core::CurvePoint::new(1.0, 0.8),
+                ]) {
+                    Ok(curve) => curve,
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            );
+            if let Err(err) = state
+                .layers
+                .set_adjustment(curves, aurora_doc::Adjustment::Curves(dragged.clone()))
+            {
+                unreachable!("{err:?}");
+            }
+            state.curves_ui.pending = Some(crate::PendingCurves {
+                layer: curves,
+                start: start.clone(),
+            });
+            state.sync_curves();
+            let tile = aurora_tile::TileId { x: 0, y: 0 };
+            state.composite_cache.mark_current(tile);
+            let Some(middle) = (match aurora_widgets::widgets::curve_editor_state(
+                &state.workspace.tree,
+                controls.editor,
+            ) {
+                Ok(editor) => editor.point_id(1),
+                Err(err) => unreachable!("{err:?}"),
+            }) else {
+                unreachable!("three points")
+            };
+            let _ = state.act(&a11y_request(middle, accesskit::Action::Increment));
+            state.sync_curves();
+            assert_eq!(state.undo_order.undo.len(), 2, "the drag, then the AT edit");
+            assert!(state.curves_ui.pending.is_none());
+            assert!(
+                !state.composite_cache.is_current(tile),
+                "the composite is invalidated"
+            );
+            let Some(now) = aurora_ui::curves_params(&state.layers, curves).cloned() else {
+                unreachable!()
+            };
+            assert!(now.composite.evaluate(0.5) > dragged.composite.evaluate(0.5));
+            // Undo walks back the AT edit, then the drag.
+            for want in [&dragged, &start] {
+                if let Err(err) = state.history.undo(&mut state.layers) {
+                    unreachable!("{err:?}");
+                }
+                assert_eq!(aurora_ui::curves_params(&state.layers, curves), Some(want));
+            }
+        }
+
+        /// The sweep's Curves layer: three points, none at an output
+        /// rail, so `SetValue(1.0)`, `Increment` and `Decrement` all move
+        /// every one of them.
+        fn curves_sweep_layer(layers: &mut aurora_doc::LayerTree) -> aurora_doc::LayerId {
+            let points = [
+                aurora_core::CurvePoint::new(0.0, 0.2),
+                aurora_core::CurvePoint::new(0.5, 0.5),
+                aurora_core::CurvePoint::new(1.0, 0.8),
+            ];
+            let composite = match aurora_core::ToneCurve::new(&points) {
+                Ok(curve) => curve,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            match layers.add_adjustment_layer_at(
+                "Curves 1",
+                aurora_doc::Adjustment::Curves(aurora_core::CurvesParams {
+                    composite,
+                    ..aurora_core::CurvesParams::identity()
+                }),
+                None,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// An assistive technology's `SetValue` and `Increment` on a
+        /// curve point (review GA-1) each edit the Curves layer as one
+        /// undo step, and the edit survives the next catch-all sync
+        /// (before the fix the sync silently put the old curve back).
+        #[test]
+        fn an_at_value_action_on_a_curve_point_edits_the_layer_and_survives_sync() {
+            let (mut layers, _history) = demo_document();
+            let curves = curves_sweep_layer(&mut layers);
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                layers,
+                Some(curves),
+            );
+            let Some(controls) = state.tool_controls.map(|c| c.curves) else {
+                unreachable!("the tool controls are built");
+            };
+            let point = |state: &AtState| match aurora_widgets::widgets::curve_editor_state(
+                &state.workspace.tree,
+                controls.editor,
+            ) {
+                Ok(editor) => editor.point_id(1),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let output = |state: &AtState| {
+                aurora_ui::curves_params(&state.layers, curves)
+                    .map(|params| params.composite.evaluate(0.5))
+            };
+            let Some(middle) = point(&state) else {
+                unreachable!("three points")
+            };
+            let mut request = a11y_request(middle, accesskit::Action::SetValue);
+            request.data = Some(accesskit::ActionData::NumericValue(0.75 * 255.0));
+            let _ = state.act(&request);
+            state.sync_curves();
+            assert_eq!(state.undo_order.undo.len(), 1, "one undo step");
+            let Some(set) = output(&state) else {
+                unreachable!("a Curves layer")
+            };
+            assert!((set - 0.75).abs() < 0.01, "SetValue moved the point: {set}");
+            state.sync_curves();
+            assert_eq!(output(&state), Some(set), "the edit survives the sync");
+            let Some(middle) = point(&state) else {
+                unreachable!("three points")
+            };
+            let _ = state.act(&a11y_request(middle, accesskit::Action::Increment));
+            state.sync_curves();
+            assert_eq!(state.undo_order.undo.len(), 2, "one more undo step");
+            let Some(raised) = output(&state) else {
+                unreachable!("a Curves layer")
+            };
+            assert!(raised > set, "Increment raised it: {set} -> {raised}");
+            state.sync_curves();
+            assert_eq!(output(&state), Some(raised), "and survives the sync too");
+            let editor = match aurora_widgets::widgets::curve_editor_state(
+                &state.workspace.tree,
+                controls.editor,
+            ) {
+                Ok(editor) => editor.curve().clone(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(
+                aurora_ui::curves_params(&state.layers, curves).map(|p| &p.composite),
+                Some(&editor),
+                "the editor shows the document's curve"
             );
         }
 
@@ -28795,10 +30134,10 @@ mod tests {
         };
         assert_eq!(state.query(), "lay");
         // "Focus Layers Panel", "Toggle Layers Panel", "Close Layers
-        // Panel", and (0.143.0) "New Layer" and "Delete Layer" all match
-        // -- the first inserted (`palette_commands`'s own order) is what
-        // ends up selected.
-        assert_eq!(state.results().len(), 5);
+        // Panel", (0.143.0) "New Layer" and "Delete Layer", and
+        // (0.155.0) "New Curves Layer" all match -- the first inserted
+        // (`palette_commands`'s own order) is what ends up selected.
+        assert_eq!(state.results().len(), 6);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -59892,6 +61231,172 @@ mod tests {
             assert_eq!(rig.text(), content_before, "nothing typed");
             assert_eq!(rig.focus.focused(), Some(field), "focus stays put");
         }
+
+        // -- New Curves Layer (0.155.0) -----------------------------------
+        mod curves_commands {
+            use super::*;
+            use aurora_doc::{Adjustment, LayerKind};
+
+            fn invert() -> aurora_core::CurvesParams {
+                match aurora_core::ToneCurve::new(&[
+                    aurora_core::CurvePoint::new(0.0, 1.0),
+                    aurora_core::CurvePoint::new(1.0, 0.0),
+                ]) {
+                    Ok(composite) => aurora_core::CurvesParams {
+                        composite,
+                        ..aurora_core::CurvesParams::identity()
+                    },
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+
+            impl Rig {
+                /// The real committed-edit path the Properties-panel Curves
+                /// editor takes (0.156.0 replaced 0.155.0's test-only hook).
+                fn set_curves(&mut self, id: LayerId, params: aurora_core::CurvesParams) -> bool {
+                    let mut ui = crate::CurvesUiState::default();
+                    let recorded = crate::record_curves_step(
+                        &mut crate::CurvesEdit {
+                            workspace: &mut self.workspace,
+                            layers: &mut self.layers,
+                            history: &mut self.history,
+                            pixel_history: &mut self.pixel_history,
+                            undo_order: &mut self.undo_order,
+                            layer_rows: &self.layer_rows,
+                            active_layer: self.active,
+                            controls: None,
+                            state: &mut ui,
+                        },
+                        id,
+                        params,
+                    );
+                    if recorded {
+                        self.cache.bump();
+                    }
+                    recorded
+                }
+
+                fn curves(&self, id: LayerId) -> Option<aurora_core::CurvesParams> {
+                    match self.layers.kind(id) {
+                        Some(LayerKind::Adjustment(Adjustment::Curves(params))) => {
+                            Some(params.clone())
+                        }
+                        _ => None,
+                    }
+                }
+            }
+
+            #[test]
+            fn new_curves_layer_lands_above_the_active_layer_as_identity_and_becomes_active() {
+                let (mut rig, [top, mid, bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let added = only_new_root(&rig, &before);
+                assert_eq!(rig.layers.roots(), &[top, added, mid, bottom]);
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                assert_eq!(rig.layers.name(added), Some("Curves 1"));
+                assert_eq!(rig.layers.surface_id(added), None, "no pixel surface");
+                assert_eq!(rig.active, Some(added));
+                assert_eq!(
+                    aurora_ui::layer_row_description(&rig.layers, added),
+                    "Curves adjustment, Normal, 100%"
+                );
+                rig.assert_coherent();
+
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let second = only_new_root(&rig, &before);
+                assert_eq!(rig.layers.name(second), Some("Curves 2"));
+            }
+
+            #[test]
+            fn new_curves_layer_is_one_undo_step() {
+                let (mut rig, [_top, mid, _bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let added = only_new_root(&rig, &before);
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(!rig.layers.contains(added));
+                assert_eq!(rig.layers.roots(), before.as_slice());
+                assert_eq!(rig.active, Some(mid));
+                rig.assert_coherent();
+                assert!(rig.undo_redo(AppCommand::Redo));
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                rig.assert_coherent();
+            }
+
+            #[test]
+            fn setting_curves_is_one_undo_step_that_restores_the_previous_params() {
+                let (mut rig, [top, ..]) = Rig::three();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let Some(added) = rig.active else {
+                    unreachable!("the new layer is active");
+                };
+                assert!(rig.set_curves(added, invert()));
+                assert_eq!(rig.curves(added), Some(invert()));
+                let _ = rig.undo_redo(AppCommand::Undo);
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                let _ = rig.undo_redo(AppCommand::Redo);
+                assert_eq!(rig.curves(added), Some(invert()));
+
+                let undo_len = rig.undo_order.undo.len();
+                assert!(
+                    !rig.set_curves(top, invert()),
+                    "a pixel layer has no curves"
+                );
+                assert_eq!(
+                    rig.undo_order.undo.len(),
+                    undo_len,
+                    "a refused set records nothing"
+                );
+            }
+
+            #[test]
+            fn delete_layer_removes_a_curves_layer_and_undo_restores_its_params() {
+                let (mut rig, _) = Rig::three();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let Some(added) = rig.active else {
+                    unreachable!("the new layer is active");
+                };
+                assert!(rig.set_curves(added, invert()));
+                assert!(rig.run(LayerCommand::Delete));
+                assert!(!rig.layers.contains(added));
+                rig.assert_coherent();
+                let _ = rig.undo_redo(AppCommand::Undo);
+                assert_eq!(rig.curves(added), Some(invert()));
+            }
+
+            #[test]
+            fn new_curves_layer_is_in_the_palette_and_activates() {
+                assert!(
+                    palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::COMMAND_LAYER_NEW_CURVES
+                            && entry.title == "New Curves Layer")
+                );
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let mut focus = FocusManager::default();
+                let mut dialog = FakeFileDialog::default();
+                assert_eq!(
+                    activate_command(
+                        &mut workspace,
+                        &mut focus,
+                        crate::COMMAND_LAYER_NEW_CURVES,
+                        &mut dialog
+                    ),
+                    Some(ActivatedCommand::NewCurvesLayer)
+                );
+            }
+        }
     }
 
     // -- Layers-panel controls (0.135.0) ------------------------------------
@@ -60329,6 +61834,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    curves_ui: &mut crate::CurvesUiState::default(),
                     scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
@@ -60577,6 +62083,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    curves_ui: &mut crate::CurvesUiState::default(),
                     scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
@@ -60639,6 +62146,7 @@ mod tests {
                     tool: aurora_ui::Tool::default(),
                     tool_settings: &mut crate::ToolSettings::default(),
                     tool_controls: None,
+                    curves_ui: &mut crate::CurvesUiState::default(),
                     scroll_follow: &mut crate::ScrollFollow::default(),
                 },
                 &request,
@@ -62842,6 +64350,1309 @@ mod tests {
             aur_verify_scratch_dir_unless(false).is_some(),
             "a live session still gets one"
         );
+    }
+    // -- The Properties-panel Curves editor (0.156.0) ---------------------
+    // Exact float equality is the point: histogram bins are pixel counts.
+    #[allow(clippy::float_cmp)]
+    mod curves_editor_ui {
+        use super::*;
+        use aurora_doc::{BlendMode, LayerId};
+        use aurora_ui::{CurvesChannel, ToolControls};
+        use aurora_widgets::shortcut::Modifiers;
+        use aurora_widgets::widgets::CurveEditorKey;
+        use aurora_widgets::{ClickTracker, FocusManager, PointerOutcome, PointerPhase, WidgetId};
+        use std::collections::HashMap;
+
+        const W: f32 = 1600.0;
+        const H: f32 = 900.0;
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+        const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        /// The document-size ceiling, for the histogram cost measurement.
+        const SIDE: u32 = 300_000;
+        const TOLERANCE: f32 = 3e-3;
+
+        /// Everything `App` holds that the Curves editor touches, driven
+        /// through the same free functions `App::route_gallery`,
+        /// `App::apply_curves_control` and `App::about_to_wait`'s
+        /// catch-all (`sync_curves_ui`) run.
+        struct Rig {
+            _dir: tempfile::TempDir,
+            store: aurora_tile::TileStore,
+            workspace: aurora_ui::Workspace,
+            focus: FocusManager,
+            gallery: Option<aurora_ui::GalleryPanel>,
+            click: ClickTracker,
+            scales: Scales,
+            controls: ToolControls,
+            layers: aurora_doc::LayerTree,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: crate::UndoOrder,
+            layer_rows: HashMap<WidgetId, LayerId>,
+            active: Option<LayerId>,
+            cache: crate::CompositeCache,
+            ui: crate::CurvesUiState,
+            canvas: (u32, u32),
+        }
+
+        macro_rules! edit {
+            ($rig:expr) => {
+                crate::CurvesEdit {
+                    workspace: &mut $rig.workspace,
+                    layers: &mut $rig.layers,
+                    history: &mut $rig.history,
+                    pixel_history: &mut $rig.pixel_history,
+                    undo_order: &mut $rig.undo_order,
+                    layer_rows: &$rig.layer_rows,
+                    active_layer: $rig.active,
+                    controls: Some($rig.controls.curves),
+                    state: &mut $rig.ui,
+                }
+            };
+        }
+
+        fn curve(points: &[(f32, f32)]) -> aurora_core::ToneCurve {
+            let points: Vec<aurora_core::CurvePoint> = points
+                .iter()
+                .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+                .collect();
+            match aurora_core::ToneCurve::new(&points) {
+                Ok(curve) => curve,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn add_curves(
+            layers: &mut aurora_doc::LayerTree,
+            params: aurora_core::CurvesParams,
+            index: usize,
+        ) -> LayerId {
+            match layers.add_adjustment_layer_at(
+                "Curves",
+                aurora_doc::Adjustment::Curves(params),
+                None,
+                index,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        impl Rig {
+            /// `layers` (built in `store`) with an identity Curves layer
+            /// added at the top and made active.
+            fn new(
+                dir: tempfile::TempDir,
+                store: aurora_tile::TileStore,
+                mut layers: aurora_doc::LayerTree,
+                canvas: (u32, u32),
+            ) -> (Self, LayerId) {
+                let scales = match crate::load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let controls = match aurora_ui::insert_tool_controls(
+                    &mut workspace.tree,
+                    workspace.properties,
+                    &scales,
+                ) {
+                    Ok(controls) => controls,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let curves = add_curves(&mut layers, aurora_core::CurvesParams::identity(), 0);
+                let mut rig = Self {
+                    _dir: dir,
+                    store,
+                    workspace,
+                    focus: FocusManager::default(),
+                    gallery: None,
+                    click: ClickTracker::default(),
+                    scales,
+                    controls,
+                    layers,
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order: crate::UndoOrder::default(),
+                    layer_rows: HashMap::new(),
+                    active: Some(curves),
+                    cache: crate::CompositeCache::default(),
+                    ui: crate::CurvesUiState::default(),
+                    canvas,
+                };
+                rig.sync();
+                (rig, curves)
+            }
+
+            fn backdrop() -> (Self, LayerId) {
+                let (dir, mut store) = real_tile_store();
+                let layers =
+                    solid_root_stack(&mut store, &[("bottom", BlendMode::Normal, 1.0, BACKDROP)]);
+                Self::new(dir, store, layers, (256, 256))
+            }
+
+            /// `App::sync_curves_controls_now`, repeated (as the app's
+            /// kept-awake event loop does) until no histogram job is left.
+            fn sync(&mut self) -> bool {
+                let mut changed = false;
+                for _ in 0..64 {
+                    let captured = self.click.captured();
+                    changed |= crate::sync_curves_ui(
+                        &mut edit!(self),
+                        &mut self.cache,
+                        Some(&mut self.store),
+                        self.canvas,
+                        captured,
+                    );
+                    if self.ui.job.is_none() {
+                        break;
+                    }
+                }
+                self.workspace.tree.compute_layout(W, H);
+                changed
+            }
+
+            /// `App::route_gallery`'s tool half, then its settle.
+            fn pointer(&mut self, phase: PointerPhase, at: (f32, f32)) {
+                let controls = self.controls;
+                let routed = crate::route_widget_pointer(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    None,
+                    Some(&controls),
+                    &mut self.click,
+                    &self.scales,
+                    false,
+                    phase,
+                    at,
+                    Modifiers::none(),
+                    &mut crate::NoTextHit,
+                );
+                if routed.owner == Some(crate::WidgetOwner::ToolControls)
+                    && let Some(outcome) = routed.outcome.as_ref()
+                    && crate::is_curves_outcome(controls.curves, outcome)
+                {
+                    self.apply(outcome);
+                }
+                let captured = self.click.captured();
+                if crate::settle_pending_curves(&mut edit!(self), captured) {
+                    self.cache.bump();
+                }
+                self.sync();
+            }
+
+            /// `App::apply_curves_control`.
+            fn apply(&mut self, outcome: &PointerOutcome) {
+                let captured = self.click.captured();
+                let invalidation = crate::apply_curves_outcome(&mut edit!(self), outcome, captured);
+                crate::apply_layer_control_invalidation(&mut self.cache, &invalidation);
+            }
+
+            /// A focused point's key, as `route_widget_key` hands it on.
+            fn key(&mut self, key: CurveEditorKey) {
+                let editor = self.controls.curves.editor;
+                if let Err(err) = aurora_widgets::widgets::handle_curve_editor_key(
+                    &mut self.workspace.tree,
+                    editor,
+                    key,
+                    false,
+                ) {
+                    unreachable!("{err:?}");
+                }
+                self.apply(&PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::CurveChanged { editor },
+                ));
+                self.sync();
+            }
+
+            /// `perform_undo_redo`'s structural half.
+            fn undo(&mut self) {
+                if let Err(err) = self.history.undo(&mut self.layers) {
+                    unreachable!("{err:?}");
+                }
+                self.undo_order.step_back();
+                self.cache.bump();
+                self.sync();
+            }
+
+            fn redo(&mut self) {
+                if let Err(err) = self.history.redo(&mut self.layers) {
+                    unreachable!("{err:?}");
+                }
+                self.undo_order.step_forward();
+                self.cache.bump();
+                self.sync();
+            }
+
+            /// Curve space `(x, y)` as a window point inside the editor's plot.
+            fn at(&self, x: f32, y: f32) -> (f32, f32) {
+                let Some(b) = self.workspace.tree.bounds(self.controls.curves.editor) else {
+                    unreachable!("the editor is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let reach = self.scales.spacing.xs as f32 + 1.0;
+                #[allow(clippy::cast_precision_loss)]
+                let side = b.width as f32 - 2.0 * reach;
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + reach + x * side,
+                    b.y as f32 + reach + (1.0 - y) * side,
+                );
+                point
+            }
+
+            fn centre(&self, id: WidgetId) -> (f32, f32) {
+                let Some(b) = self.workspace.tree.bounds(id) else {
+                    unreachable!("{id:?} is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + b.width as f32 / 2.0,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            fn params(&self, id: LayerId) -> aurora_core::CurvesParams {
+                match aurora_ui::curves_params(&self.layers, id) {
+                    Some(params) => params.clone(),
+                    None => unreachable!("{id:?} is a Curves layer"),
+                }
+            }
+
+            fn shown_curve(&self) -> aurora_core::ToneCurve {
+                match aurora_widgets::widgets::curve_editor_state(
+                    &self.workspace.tree,
+                    self.controls.curves.editor,
+                ) {
+                    Ok(state) => state.curve().clone(),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+
+            fn shown_histogram(&self) -> Option<Vec<f32>> {
+                match aurora_widgets::widgets::curve_editor_state(
+                    &self.workspace.tree,
+                    self.controls.curves.editor,
+                ) {
+                    Ok(state) => state.histogram().map(<[f32]>::to_vec),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+
+            fn shown(&self) -> bool {
+                aurora_ui::curves_controls_shown(&self.workspace.tree, self.controls.curves)
+            }
+
+            fn first(&mut self) -> [f32; 4] {
+                let mut budget = crate::CompositeBudget::for_pass(&self.layers);
+                let (texels, _) = crate::composite_roots_into_tile(
+                    &self.layers,
+                    &mut self.store,
+                    TILE0,
+                    (0, 0),
+                    (0, 0),
+                    &mut budget,
+                );
+                match texels.get(..4) {
+                    Some(&[r, g, b, a]) => [r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()],
+                    _ => unreachable!("a tile has texels"),
+                }
+            }
+
+            fn select_channel(&mut self, channel: CurvesChannel) {
+                let Some(tab) = self
+                    .workspace
+                    .tree
+                    .children(self.controls.curves.channel)
+                    .and_then(|tabs| tabs.get(channel.index()).copied())
+                else {
+                    unreachable!("the channel bar has four tabs");
+                };
+                let at = self.centre(tab);
+                self.pointer(PointerPhase::Down, at);
+                self.pointer(PointerPhase::Up, at);
+                assert_eq!(
+                    aurora_ui::curves_selected_channel(&self.workspace.tree, self.controls.curves)
+                        .ok(),
+                    Some(channel),
+                    "the tab press selects {channel:?}"
+                );
+            }
+
+            /// A press on empty plot at `from` (adding a point), dragged
+            /// through `to`, then released.
+            fn drag(&mut self, from: (f32, f32), to: &[(f32, f32)]) {
+                let down = self.at(from.0, from.1);
+                self.pointer(PointerPhase::Down, down);
+                let mut last = down;
+                for &(x, y) in to {
+                    last = self.at(x, y);
+                    self.pointer(PointerPhase::Move, last);
+                }
+                self.pointer(PointerPhase::Up, last);
+            }
+        }
+
+        fn close(got: f32, want: f32, what: &str) {
+            assert!(
+                (got - want).abs() <= TOLERANCE,
+                "{what}: got {got}, want {want}"
+            );
+        }
+
+        #[test]
+        fn the_editor_shows_only_for_a_curves_layer_and_rebinds_on_a_layer_switch() {
+            let (mut rig, first) = Rig::backdrop();
+            assert!(rig.shown(), "the active Curves layer shows the editor");
+            assert_eq!(rig.shown_curve(), aurora_core::ToneCurve::identity());
+            let lifted = curve(&[(0.0, 0.0), (0.5, 0.75), (1.0, 1.0)]);
+            let second = add_curves(
+                &mut rig.layers,
+                aurora_core::CurvesParams {
+                    composite: lifted.clone(),
+                    ..aurora_core::CurvesParams::identity()
+                },
+                0,
+            );
+            let pixel = rig.layers.roots().last().copied();
+            rig.active = pixel;
+            rig.sync();
+            assert!(!rig.shown(), "a pixel layer hides the editor");
+            assert_eq!(rig.shown_histogram(), None);
+            assert!(
+                rig.workspace
+                    .tree
+                    .bounds(rig.controls.curves.editor)
+                    .is_none_or(|b| b.width == 0)
+            );
+            rig.active = Some(second);
+            rig.sync();
+            assert!(rig.shown());
+            assert_eq!(rig.shown_curve(), lifted, "rebound to the second layer");
+            rig.active = Some(first);
+            rig.sync();
+            assert_eq!(rig.shown_curve(), aurora_core::ToneCurve::identity());
+            rig.active = None;
+            rig.sync();
+            assert!(!rig.shown(), "no active layer hides it");
+        }
+
+        #[test]
+        fn a_pointer_drag_edits_the_layer_live_and_records_one_undo_step() {
+            let (mut rig, curves) = Rig::backdrop();
+            let before = rig.first();
+            let steps = rig.undo_order.undo.len();
+            rig.cache.mark_current(TILE0);
+            let down = rig.at(0.5, 0.7);
+            rig.pointer(PointerPhase::Down, down);
+            assert_eq!(rig.click.captured(), Some(rig.controls.curves.editor));
+            assert_eq!(
+                rig.params(curves).composite.points().len(),
+                3,
+                "the press added a point"
+            );
+            assert!(
+                !rig.cache.is_current(TILE0),
+                "a live edit invalidates the composite"
+            );
+            for y in [0.75, 0.8, 0.85] {
+                rig.cache.mark_current(TILE0);
+                let at = rig.at(0.5, y);
+                rig.pointer(PointerPhase::Move, at);
+                assert!(!rig.cache.is_current(TILE0), "every move invalidates");
+                assert_eq!(rig.undo_order.undo.len(), steps, "no step mid-drag");
+            }
+            let at = rig.at(0.5, 0.85);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(
+                rig.undo_order.undo.len(),
+                steps + 1,
+                "one step for the whole drag"
+            );
+            let edited = rig.params(curves);
+            close(edited.composite.evaluate(0.5), 0.85, "the dragged point");
+            let after = rig.first();
+            assert!(
+                after[0] > before[0] + 0.05,
+                "the canvas recomposites: {before:?} -> {after:?}"
+            );
+            assert_eq!(rig.shown_curve(), edited.composite);
+
+            rig.undo();
+            assert_eq!(rig.params(curves), aurora_core::CurvesParams::identity());
+            assert_eq!(
+                rig.shown_curve(),
+                aurora_core::ToneCurve::identity(),
+                "undo refreshes the editor"
+            );
+            rig.redo();
+            assert_eq!(rig.params(curves), edited);
+            assert_eq!(
+                rig.shown_curve(),
+                edited.composite,
+                "redo refreshes the editor"
+            );
+        }
+
+        #[test]
+        fn a_keyboard_step_and_a_point_delete_are_one_undo_step_each() {
+            let (mut rig, curves) = Rig::backdrop();
+            rig.drag((0.5, 0.7), &[]);
+            let steps = rig.undo_order.undo.len();
+            let added = rig.params(curves);
+            assert_eq!(added.composite.points().len(), 3);
+            rig.key(CurveEditorKey::Up);
+            assert_eq!(rig.undo_order.undo.len(), steps + 1);
+            assert!(rig.params(curves).composite.evaluate(0.5) > added.composite.evaluate(0.5));
+            rig.key(CurveEditorKey::Delete);
+            assert_eq!(rig.undo_order.undo.len(), steps + 2);
+            assert_eq!(rig.params(curves).composite.points().len(), 2);
+            rig.undo();
+            assert_eq!(
+                rig.params(curves).composite.points().len(),
+                3,
+                "undo restores the point"
+            );
+            assert_eq!(rig.shown_curve().points().len(), 3);
+        }
+
+        #[test]
+        fn a_channel_tab_edits_that_channels_curve_only() {
+            let (mut rig, curves) = Rig::backdrop();
+            let before = rig.first();
+            rig.select_channel(CurvesChannel::Green);
+            assert_eq!(
+                rig.shown_curve(),
+                aurora_core::ToneCurve::identity(),
+                "absent shows identity"
+            );
+            rig.drag((0.5, 0.75), &[(0.5, 0.9)]);
+            let params = rig.params(curves);
+            assert_eq!(params.composite, aurora_core::ToneCurve::identity());
+            assert_eq!(
+                (params.red.is_some(), params.blue.is_some()),
+                (false, false)
+            );
+            let Some(green) = params.green.as_ref() else {
+                unreachable!("the green curve was edited: {params:?}");
+            };
+            close(green.evaluate(0.5), 0.9, "green");
+            let after = rig.first();
+            close(after[0], before[0], "red untouched");
+            close(after[2], before[2], "blue untouched");
+            assert!(
+                after[1] > before[1] + 0.05,
+                "green lifted: {before:?} -> {after:?}"
+            );
+            rig.select_channel(CurvesChannel::Red);
+            assert_eq!(rig.shown_curve(), aurora_core::ToneCurve::identity());
+            rig.select_channel(CurvesChannel::Green);
+            assert_eq!(&rig.shown_curve(), green, "the green curve is shown again");
+        }
+
+        /// Review GA-4: a key that reaches the shortcuts mid-drag (an
+        /// Undo) ends the drag as one step and drops the editor's
+        /// capture, so the rest of the pointer gesture edits nothing and
+        /// the editor follows the document — here, the undo that follows.
+        #[test]
+        fn a_key_mid_drag_commits_it_and_drops_the_capture() {
+            let (mut rig, curves) = Rig::backdrop();
+            let steps = rig.undo_order.undo.len();
+            let down = rig.at(0.5, 0.8);
+            rig.pointer(PointerPhase::Down, down);
+            let moved = rig.at(0.5, 0.9);
+            rig.pointer(PointerPhase::Move, moved);
+            assert_eq!(rig.click.captured(), Some(rig.controls.curves.editor));
+            assert!(crate::end_curves_drag(&mut edit!(rig), &mut rig.click));
+            assert_eq!(rig.undo_order.undo.len(), steps + 1, "one step");
+            assert_eq!(rig.click.captured(), None, "the capture is dropped");
+            rig.undo();
+            assert_eq!(rig.params(curves), aurora_core::CurvesParams::identity());
+            assert_eq!(
+                rig.shown_curve(),
+                aurora_core::ToneCurve::identity(),
+                "the editor follows the undo instead of keeping the dragged curve"
+            );
+            let later = rig.at(0.5, 0.95);
+            rig.pointer(PointerPhase::Move, later);
+            assert_eq!(
+                rig.params(curves),
+                aurora_core::CurvesParams::identity(),
+                "no more edits"
+            );
+        }
+
+        /// Review GA4-R: a press that only selects an existing point holds
+        /// the editor's capture with nothing pending. A key reaching the
+        /// shortcuts (Ctrl+Z) must still end that gesture, or the undo is
+        /// silently overwritten by the next Move writing the editor's
+        /// stale curve back.
+        #[test]
+        fn an_undo_after_a_select_only_press_stands_against_the_next_move() {
+            let (mut rig, curves) = Rig::backdrop();
+            rig.drag((0.5, 0.7), &[]);
+            let added = rig.params(curves);
+            assert_eq!(added.composite.points().len(), 3, "precondition: a point");
+            let on_point = rig.at(0.5, added.composite.evaluate(0.5));
+            rig.pointer(PointerPhase::Down, on_point);
+            assert_eq!(
+                rig.click.captured(),
+                Some(rig.controls.curves.editor),
+                "grabbed"
+            );
+            assert!(
+                rig.ui.pending.is_none(),
+                "a select-only press changes nothing"
+            );
+            // `App::handle_key_event`'s order: the Curves gesture first,
+            // then the shortcut (here Undo).
+            let _ = crate::end_curves_gesture_before_key(&mut edit!(rig), &mut rig.click);
+            assert_eq!(rig.click.captured(), None, "the capture is dropped");
+            rig.undo();
+            assert_eq!(rig.params(curves), aurora_core::CurvesParams::identity());
+            let moved = rig.at(0.5, 0.95);
+            rig.pointer(PointerPhase::Move, moved);
+            rig.pointer(PointerPhase::Up, moved);
+            assert_eq!(
+                rig.params(curves),
+                aurora_core::CurvesParams::identity(),
+                "the undo stands: the Move wrote nothing back"
+            );
+            assert_eq!(rig.shown_curve(), aurora_core::ToneCurve::identity());
+        }
+
+        #[test]
+        fn opening_a_document_ends_a_live_drag_and_drops_the_editor_state() {
+            let (mut rig, curves) = Rig::backdrop();
+            rig.select_channel(CurvesChannel::Blue);
+            let steps = rig.undo_order.undo.len();
+            let down = rig.at(0.5, 0.8);
+            rig.pointer(PointerPhase::Down, down);
+            assert!(rig.ui.pending.is_some());
+            assert!(rig.ui.histogram.is_some());
+            let committed = crate::end_curves_gestures(&mut edit!(rig), &mut rig.click);
+            assert!(committed, "the live drag is committed to the old document");
+            assert_eq!(rig.undo_order.undo.len(), steps + 1);
+            assert_eq!(rig.click.captured(), None, "the capture is dropped");
+            assert_eq!(rig.ui, crate::CurvesUiState::default());
+            assert_eq!(
+                aurora_ui::curves_selected_channel(&rig.workspace.tree, rig.controls.curves).ok(),
+                Some(CurvesChannel::Rgb)
+            );
+            assert!(rig.params(curves).blue.is_some());
+        }
+
+        fn bins(rig: &Rig) -> Vec<f32> {
+            match rig.shown_histogram() {
+                Some(bins) => bins,
+                None => unreachable!("a shown editor has a histogram"),
+            }
+        }
+
+        fn nonzero(bins: &[f32]) -> Vec<(usize, f32)> {
+            bins.iter()
+                .copied()
+                .enumerate()
+                .filter(|&(_, count)| count > 0.0)
+                .collect()
+        }
+
+        #[test]
+        fn a_half_black_half_white_backdrop_gives_two_spikes() {
+            let (dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("halves", BlendMode::Normal, 1.0, [0.0, 0.0, 0.0, 1.0])],
+            );
+            let Some(surface) = layers.roots().first().and_then(|&id| layers.surface_id(id)) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(
+                &mut store,
+                surface,
+                aurora_tile::TileId { x: 1, y: 0 },
+                [1.0; 4],
+            );
+            let _ = &mut layers;
+            let (rig, _) = Rig::new(dir, store, layers, (512, 256));
+            assert_eq!(
+                nonzero(&bins(&rig)),
+                vec![(0, 65_536.0), (255, 65_536.0)],
+                "one spike per half"
+            );
+        }
+
+        #[test]
+        fn the_histogram_is_of_the_content_below_not_above() {
+            let (dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("black below", BlendMode::Normal, 1.0, [0.0, 0.0, 0.0, 1.0]),
+                    ("white above", BlendMode::Normal, 1.0, [1.0, 1.0, 1.0, 1.0]),
+                ],
+            );
+            // `solid_root_stack` stacks each entry over the last, so
+            // "white above" is roots[0]: put the Curves layer between.
+            let (mut rig, curves) = {
+                let _ = &mut layers;
+                Rig::new(dir, store, layers, (256, 256))
+            };
+            let Some(index) = rig.layers.roots().iter().position(|&id| id == curves) else {
+                unreachable!()
+            };
+            assert_eq!(index, 0, "added at the top");
+            let ids = rig.layers.roots().to_vec();
+            // Move Curves below "white above" by rebuilding the order:
+            // remove and re-add at index 1.
+            if let Err(err) = rig.layers.remove(curves) {
+                unreachable!("{err:?}");
+            }
+            let curves = add_curves(&mut rig.layers, aurora_core::CurvesParams::identity(), 1);
+            rig.active = Some(curves);
+            rig.ui = crate::CurvesUiState::default();
+            rig.sync();
+            assert_eq!(rig.layers.roots().get(1), Some(&curves), "{ids:?}");
+            close(rig.first()[0], 1.0, "the canvas is the white layer above");
+            assert_eq!(
+                nonzero(&bins(&rig)),
+                vec![(0, 65_536.0)],
+                "only the black below"
+            );
+            // Every layer is visible again afterwards.
+            for id in rig.layers.roots().to_vec() {
+                assert_eq!(rig.layers.visible(id), Some(true));
+            }
+        }
+
+        /// The histogram reads the straight colour of the composite
+        /// below, so a half-transparent grey layer counts at its own
+        /// level (153 for 0.6), neither halved nor divided by its alpha.
+        #[test]
+        fn the_histogram_reads_straight_colour_from_a_translucent_backdrop() {
+            let (dir, mut store) = real_tile_store();
+            let layers = solid_root_stack(
+                &mut store,
+                &[("translucent", BlendMode::Normal, 0.5, [0.6, 0.6, 0.6, 1.0])],
+            );
+            let (rig, _) = Rig::new(dir, store, layers, (256, 256));
+            assert_eq!(nonzero(&bins(&rig)), vec![(153, 65_536.0)]);
+        }
+
+        #[test]
+        fn the_histogram_follows_the_selected_channel() {
+            let (mut rig, _) = Rig::backdrop();
+            // Rec. 709 luma of (0.2, 0.4, 0.6): 0.37192 -> level 95.
+            assert_eq!(nonzero(&bins(&rig)), vec![(95, 65_536.0)], "RGB is luma");
+            for (channel, level) in [
+                (CurvesChannel::Red, 51),
+                (CurvesChannel::Green, 102),
+                (CurvesChannel::Blue, 153),
+            ] {
+                rig.select_channel(channel);
+                assert_eq!(nonzero(&bins(&rig)), vec![(level, 65_536.0)], "{channel:?}");
+            }
+        }
+
+        #[test]
+        fn the_histogram_is_recomputed_after_a_step_below_but_not_after_its_own_edit() {
+            let (mut rig, _) = Rig::backdrop();
+            let Some(bottom) = rig.layers.roots().last().copied() else {
+                unreachable!()
+            };
+            // Repaint the content below with no undoable step: the
+            // histogram is (by its documented rule) stale until one.
+            let Some(surface) = rig.layers.surface_id(bottom) else {
+                unreachable!()
+            };
+            fill_solid(&mut rig.store, surface, TILE0, [1.0, 1.0, 1.0, 1.0]);
+            rig.sync();
+            assert_eq!(
+                nonzero(&bins(&rig)),
+                vec![(95, 65_536.0)],
+                "stale until a step"
+            );
+            let revision_before = rig.undo_order.revision;
+            rig.drag((0.5, 0.7), &[(0.5, 0.8)]);
+            assert_ne!(
+                rig.undo_order.revision, revision_before,
+                "the drag recorded a step"
+            );
+            assert_eq!(
+                rig.ui.histogram.as_ref().map(|h| h.revision),
+                Some(rig.undo_order.revision),
+                "its own step carries the histogram forward"
+            );
+            assert_eq!(
+                nonzero(&bins(&rig)),
+                vec![(95, 65_536.0)],
+                "...without recomputing (the repaint below is still unseen)"
+            );
+            if let Err(err) = rig.history.set_opacity(&mut rig.layers, bottom, 0.999) {
+                unreachable!("{err:?}");
+            }
+            rig.undo_order.record(
+                UndoKind::Structural,
+                &mut rig.history,
+                &mut rig.pixel_history,
+            );
+            rig.sync();
+            assert_eq!(
+                nonzero(&bins(&rig)),
+                vec![(255, 65_536.0)],
+                "recomputed after the step"
+            );
+        }
+
+        /// The histogram's cost (AC-2): at the 300,000 px ceiling, with
+        /// real content in every sampled tile of three layers, the read
+        /// stays at 16 tiles. Prints the measured time; the assertion is
+        /// a loose CI-safety bound, not a budget claim.
+        #[test]
+        fn curves_histogram_cost_is_bounded_on_a_large_document() {
+            let (dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("a", BlendMode::Normal, 1.0, BACKDROP),
+                    ("b", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                    ("c", BlendMode::Screen, 0.5, [0.1, 0.8, 0.2, 0.5]),
+                ],
+            );
+            let tiles = crate::curves_histogram_tiles(SIDE.div_ceil(aurora_tile::TILE));
+            assert_eq!(tiles.len(), 4);
+            for id in layers.roots().to_vec() {
+                let Some(surface) = layers.surface_id(id) else {
+                    unreachable!()
+                };
+                for &ty in &tiles {
+                    for &tx in &tiles {
+                        fill_solid(
+                            &mut store,
+                            surface,
+                            aurora_tile::TileId { x: tx, y: ty },
+                            BACKDROP,
+                        );
+                    }
+                }
+            }
+            let curves = add_curves(&mut layers, aurora_core::CurvesParams::identity(), 0);
+            let mut times = Vec::new();
+            let mut total = 0.0_f32;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                let bins = crate::curves_histogram(
+                    &mut layers,
+                    &mut store,
+                    curves,
+                    CurvesChannel::Rgb,
+                    (SIDE, SIDE),
+                );
+                times.push(started.elapsed());
+                total = bins.iter().sum();
+            }
+            println!("curves histogram at {SIDE} x {SIDE}, 3 layers, 16 sampled tiles: {times:?}");
+            // What the UI thread actually pays: one budgeted step per
+            // event-loop iteration.
+            let mut state = crate::CurvesUiState::default();
+            let revision = crate::UndoRevision::next();
+            let mut steps = Vec::new();
+            loop {
+                let started = std::time::Instant::now();
+                let busy = crate::refresh_curves_histogram(
+                    &mut state,
+                    &mut layers,
+                    Some(&mut store),
+                    Some(curves),
+                    CurvesChannel::Rgb,
+                    revision,
+                    (SIDE, SIDE),
+                );
+                steps.push(started.elapsed());
+                if !busy || steps.len() > 64 {
+                    break;
+                }
+            }
+            println!(
+                "  incremental: {} steps, longest {:?}: {steps:?}",
+                steps.len(),
+                steps.iter().max()
+            );
+            assert!(state.histogram.as_ref().is_some_and(|h| {
+                h.bins.as_ref().map(|b| b.iter().sum::<f32>()) == Some(992.0 * 992.0)
+            }));
+            assert!(steps.len() > 1, "the read is spread over iterations");
+            // Three whole tiles and the last, 224 px partial one per axis
+            // (300,000 = 1171 * 256 + 224): 992 x 992 pixels read.
+            assert_eq!(total, 992.0 * 992.0, "16 sampled tiles were read");
+            assert!(
+                times.iter().all(|t| t.as_millis() < 2_000),
+                "loose CI bound: {times:?}"
+            );
+            drop(dir);
+        }
+    }
+    // -- Curves adjustment layers in the compositor (0.155.0) -------------
+    #[allow(clippy::float_cmp)]
+    mod curves_adjustment {
+        use super::*;
+        use aurora_doc::BlendMode;
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        /// `f16` holds about 3 significant digits near 1.0; an adjustment
+        /// round-trips the accumulator through un-premultiply, the LUT, a
+        /// blend and a re-premultiply, each rounding to `f16`.
+        const TOLERANCE: f32 = 3e-3;
+
+        fn curve(points: &[(f32, f32)]) -> aurora_core::ToneCurve {
+            let points: Vec<aurora_core::CurvePoint> = points
+                .iter()
+                .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+                .collect();
+            match aurora_core::ToneCurve::new(&points) {
+                Ok(curve) => curve,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn invert() -> aurora_core::CurvesParams {
+            aurora_core::CurvesParams {
+                composite: curve(&[(0.0, 1.0), (1.0, 0.0)]),
+                ..aurora_core::CurvesParams::identity()
+            }
+        }
+
+        /// Adds a Curves layer at `index` under `parent` (`0` is the top).
+        fn add_curves(
+            layers: &mut aurora_doc::LayerTree,
+            params: aurora_core::CurvesParams,
+            parent: Option<aurora_doc::LayerId>,
+            index: usize,
+        ) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at(
+                "Curves 1",
+                aurora_doc::Adjustment::Curves(params),
+                parent,
+                index,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// The CPU composite of tile `(0, 0)`, straight RGBA per texel.
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+        const INVERTED: [f32; 4] = [0.8, 0.6, 0.4, 1.0];
+
+        fn backdrop_stack(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
+            solid_root_stack(store, &[("bottom", BlendMode::Normal, 1.0, BACKDROP)])
+        }
+
+        #[test]
+        fn an_identity_curves_layer_is_an_exact_passthrough() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            let without = composite(&layers, &mut store);
+            let _ = add_curves(&mut layers, aurora_core::CurvesParams::identity(), None, 0);
+            let with = composite(&layers, &mut store);
+            assert_eq!(
+                with.iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                without
+                    .iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn an_inverting_curves_layer_inverts_the_composite_below_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let got = first(&layers, &mut store);
+            assert_close(got, INVERTED, "inverted");
+            assert_eq!(got[3], 1.0, "alpha untouched");
+        }
+
+        #[test]
+        fn curves_opacity_mixes_the_adjusted_colour_with_the_backdrop() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_opacity(id, 0.25) {
+                unreachable!("{err:?}");
+            }
+            // lerp(Cb, 1 - Cb, 0.25)
+            assert_close(first(&layers, &mut store), [0.35, 0.45, 0.55, 1.0], "25%");
+        }
+
+        #[test]
+        fn curves_blends_with_its_own_blend_mode() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            // Cb * (1 - Cb)
+            assert_close(
+                first(&layers, &mut store),
+                [0.16, 0.24, 0.24, 1.0],
+                "Multiply",
+            );
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Screen) {
+                unreachable!("{err:?}");
+            }
+            // 1 - (1 - Cb) * Cb
+            assert_close(
+                first(&layers, &mut store),
+                [0.84, 0.76, 0.76, 1.0],
+                "Screen",
+            );
+        }
+
+        #[test]
+        fn a_curves_mask_limits_where_it_applies() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = layers.add_mask(id, bounds) {
+                unreachable!("{err:?}");
+            }
+            let Some(mask_surface) = layers.mask_surface_id(id) else {
+                unreachable!("an adjustment layer can carry a mask");
+            };
+            for (column, coverage) in [(0, 1.0), (1, 0.0), (2, 0.5)] {
+                if let Err(err) = aurora_doc::write_mask_coverage(
+                    &mut store,
+                    mask_surface,
+                    TILE,
+                    column,
+                    0,
+                    coverage,
+                ) {
+                    unreachable!("{err:?}");
+                }
+            }
+            let texels = composite(&layers, &mut store);
+            let at = |i: usize| texels.get(i).copied().unwrap_or([f32::NAN; 4]);
+            assert_close(at(0), INVERTED, "full coverage");
+            assert_close(at(1), BACKDROP, "zero coverage");
+            assert_close(at(2), [0.5, 0.5, 0.5, 1.0], "half coverage");
+
+            if let Err(err) = layers.set_mask_enabled(id, false) {
+                unreachable!("{err:?}");
+            }
+            let texels = composite(&layers, &mut store);
+            assert_close(
+                texels.get(1).copied().unwrap_or([f32::NAN; 4]),
+                INVERTED,
+                "a disabled mask masks nothing",
+            );
+        }
+
+        #[test]
+        fn a_hidden_curves_layer_changes_nothing() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), BACKDROP, "hidden");
+        }
+
+        #[test]
+        fn curves_affects_only_the_layers_below_it_not_above() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let top = match layers.add_pixel_layer("top", bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(top) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.1, 0.1, 0.1, 0.5]);
+            // top (0.1 @ 0.5) over the inverted backdrop, top itself untouched.
+            assert_close(first(&layers, &mut store), [0.45, 0.35, 0.25, 1.0], "above");
+        }
+
+        #[test]
+        fn curves_inside_a_group_adjusts_only_that_groups_own_layers_and_keeps_their_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("outside", BlendMode::Normal, 1.0, [1.0, 0.0, 0.0, 1.0])],
+            );
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let inner = match layers.add_pixel_layer("inner", bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(inner) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
+            let _ = add_curves(&mut layers, invert(), Some(group), 0);
+            // The group's isolated result is (0.8, 0.6, 0.4) at alpha 0.5,
+            // over the untouched red outside layer.
+            assert_close(first(&layers, &mut store), [0.9, 0.3, 0.2, 1.0], "group");
+        }
+
+        #[test]
+        fn curves_keeps_a_translucent_backdrops_alpha_and_creates_no_pixels() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("half", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.8, 0.6, 0.4, 0.5], "translucent");
+            assert_eq!(got[3], 0.5, "alpha bit-exact");
+
+            let (_dir2, mut empty_store) = real_tile_store();
+            let mut empty = aurora_doc::LayerTree::new();
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = empty.add_pixel_layer("never painted", bounds, None) {
+                unreachable!("{err:?}");
+            }
+            let _ = add_curves(&mut empty, invert(), None, 0);
+            assert!(
+                composite(&empty, &mut empty_store)
+                    .iter()
+                    .all(|texel| *texel == [0.0; 4]),
+                "an adjustment over nothing stays transparent"
+            );
+        }
+
+        #[test]
+        fn a_blended_curves_layer_reads_a_translucent_backdrops_true_colour() {
+            // Multiply against the backdrop's *straight* colour, at its own
+            // alpha: the blend must see Cb = (0.2, 0.4, 0.6), not the
+            // accumulator's premultiplied (0.1, 0.2, 0.3) or a backdrop
+            // misread as premultiplied.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("half", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.16, 0.24, 0.24, 0.5], "Multiply over translucent");
+            assert_eq!(got[3], 0.5, "alpha bit-exact");
+        }
+
+        #[test]
+        fn a_per_channel_curve_moves_only_its_own_channel_through_the_compositor() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let params = aurora_core::CurvesParams {
+                green: Some(curve(&[(0.0, 1.0), (1.0, 0.0)])),
+                ..aurora_core::CurvesParams::identity()
+            };
+            let _ = add_curves(&mut layers, params, None, 0);
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.6, 0.6, 1.0],
+                "green only",
+            );
+        }
+
+        #[test]
+        fn changing_a_curves_layers_params_changes_the_next_composite() {
+            // Same thread, two parameter sets: the per-thread LUT cache must
+            // key on the parameters, never hand back the first table built.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            assert_close(first(&layers, &mut store), INVERTED, "first params");
+            let lifted = aurora_core::CurvesParams {
+                composite: curve(&[(0.0, 0.5), (1.0, 1.0)]),
+                ..aurora_core::CurvesParams::identity()
+            };
+            if let Err(err) = layers.set_adjustment(id, aurora_doc::Adjustment::Curves(lifted)) {
+                unreachable!("{err:?}");
+            }
+            assert_close(
+                first(&layers, &mut store),
+                [0.6, 0.7, 0.8, 1.0],
+                "second params",
+            );
+        }
+
+        #[test]
+        fn the_gpu_predicate_refuses_a_visible_curves_layer_and_admits_a_hidden_one() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "setup"
+            );
+            let id = add_curves(&mut layers, invert(), None, 0);
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+
+        #[test]
+        fn begin_gpu_composite_tile_falls_back_for_a_curves_layer() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let pending = crate::begin_gpu_composite_tile(
+                &context,
+                &mut compositor,
+                &layers,
+                &mut store,
+                TILE,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            assert!(
+                pending.is_none(),
+                "a Curves layer has no GPU port: the tile must fall back, not drop the layer"
+            );
+        }
+
+        #[test]
+        fn gpu_and_cpu_agree_with_and_without_a_curves_layer() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "setup"
+            );
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(gpu.len(), cpu.len());
+            for (g, c) in gpu.iter().zip(&cpu) {
+                assert!(
+                    (g - c).abs() <= 2.0 * f32::from(half::f16::EPSILON),
+                    "{g} vs {c}"
+                );
+            }
+            let without_curves = cpu.clone();
+
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(gpu.len(), cpu.len());
+            for (g, c) in gpu.iter().zip(&cpu) {
+                assert!(
+                    (g - c).abs() <= 2.0 * f32::from(half::f16::EPSILON),
+                    "{g} vs {c}"
+                );
+            }
+            // And the fallback really applied the curve: colour inverted,
+            // alpha kept.
+            for (texel, before) in cpu
+                .chunks_exact(4)
+                .zip(without_curves.chunks_exact(4))
+                .take(1)
+            {
+                if let ([r, g, b, a], [br, bg, bb, ba]) = (texel, before) {
+                    for (after, was) in [(r, br), (g, bg), (b, bb)] {
+                        assert!(
+                            (after - (1.0 - was)).abs() <= TOLERANCE,
+                            "{after} vs 1 - {was}"
+                        );
+                    }
+                    assert_eq!(a, ba);
+                }
+            }
+        }
     }
 }
 

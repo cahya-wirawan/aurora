@@ -4048,6 +4048,99 @@ mod tests {
         }
     }
 
+    /// 0.155.0: a Curves adjustment layer, with its opacity, blend mode,
+    /// visibility and mask, inside a group, survives a save and reopen —
+    /// manifest and history both — with no manifest version bump, and a
+    /// document without one still writes the same manifest it always did
+    /// (the variant is appended, so old ordinals are unchanged).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn round_trips_a_curves_adjustment_layer_and_its_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let params = match aurora_core::ToneCurve::new(&[
+            aurora_core::CurvePoint::new(0.0, 0.1),
+            aurora_core::CurvePoint::new(0.4, 0.7),
+            aurora_core::CurvePoint::new(1.0, 0.95),
+        ]) {
+            Ok(red) => aurora_core::CurvesParams {
+                red: Some(red),
+                ..aurora_core::CurvesParams::identity()
+            },
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let curves = match history.add_adjustment_layer_at(
+            &mut layers,
+            "Curves 1",
+            aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+            Some(group),
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let wanted = aurora_doc::Adjustment::Curves(params);
+        if let Err(err) = history.set_adjustment(&mut layers, curves, wanted.clone()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_opacity(&mut layers, curves, 0.25) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) =
+            history.set_blend_mode(&mut layers, curves, aurora_doc::BlendMode::Multiply)
+        {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_visible(&mut layers, curves, false) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.add_mask(&mut layers, &mut store, curves, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let reopened = &document.layers;
+        assert!(reopened.contains(pixel));
+        assert_eq!(reopened.parent(curves), Some(group));
+        assert_eq!(reopened.adjustment(curves), Some(&wanted));
+        assert_eq!(reopened.opacity(curves), Some(0.25));
+        assert_eq!(
+            reopened.blend_mode(curves),
+            Some(aurora_doc::BlendMode::Multiply)
+        );
+        assert_eq!(reopened.visible(curves), Some(false));
+        assert!(reopened.mask(curves).is_some());
+        assert_eq!(reopened.surface_id(curves), None);
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.adjustment(curves), Some(&wanted)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     #[test]
     fn round_trips_mask_coverage_of_a_disabled_mask() {
         // `enabled` is a UI toggle (shift-click a thumbnail), not a

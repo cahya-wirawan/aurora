@@ -865,6 +865,59 @@ impl LayerTree {
         )
     }
 
+    /// Adds an adjustment layer (0.155.0) at position `index` among
+    /// `parent`'s children (`0` is the top), clamped exactly as
+    /// [`Self::add_pixel_layer_at`] clamps it. An adjustment layer has no
+    /// content surface and no bounds; see [`LayerKind::Adjustment`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::add_pixel_layer_at`], minus the bounds checks.
+    pub fn add_adjustment_layer_at(
+        &mut self,
+        name: impl Into<String>,
+        adjustment: crate::Adjustment,
+        parent: Option<LayerId>,
+        index: usize,
+    ) -> Result<LayerId, DocError> {
+        self.insert(
+            name.into(),
+            parent,
+            LayerKind::Adjustment(adjustment),
+            index,
+        )
+    }
+
+    /// The adjustment an [`LayerKind::Adjustment`] layer applies; `None`
+    /// for an unknown id or any other kind of layer.
+    #[must_use]
+    pub fn adjustment(&self, id: LayerId) -> Option<&crate::Adjustment> {
+        match self.kind(id)? {
+            LayerKind::Adjustment(adjustment) => Some(adjustment),
+            LayerKind::Pixel { .. } | LayerKind::Group { .. } => None,
+        }
+    }
+
+    /// Replaces an adjustment layer's parameters.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::NotAnAdjustment`] if it names a pixel layer or a group.
+    /// Nothing is changed when either happens.
+    pub fn set_adjustment(
+        &mut self,
+        id: LayerId,
+        adjustment: crate::Adjustment,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        let LayerKind::Adjustment(current) = &mut entry.kind else {
+            return Err(DocError::NotAnAdjustment(id));
+        };
+        *current = adjustment;
+        Ok(())
+    }
+
     /// Whether `parent` names something a new child may hang under:
     /// `None` (a new root) always may; `Some(id)` must exist and must be
     /// a group.
@@ -1686,7 +1739,9 @@ impl LayerTree {
                     .ok_or(DocError::UnknownLayer(parent_id))?;
                 match &mut entry.kind {
                     LayerKind::Group { children } => Ok(children),
-                    LayerKind::Pixel { .. } => Err(DocError::NotAGroup(parent_id)),
+                    LayerKind::Pixel { .. } | LayerKind::Adjustment(_) => {
+                        Err(DocError::NotAGroup(parent_id))
+                    }
                 }
             }
         }
@@ -1762,7 +1817,7 @@ impl LayerTree {
         }
         match self.kind(id)? {
             LayerKind::Pixel { .. } => Some(aurora_tile::SurfaceId::from_raw(id.to_raw())),
-            LayerKind::Group { .. } => None,
+            LayerKind::Group { .. } | LayerKind::Adjustment(_) => None,
         }
     }
 
@@ -1924,7 +1979,7 @@ impl LayerTree {
     pub fn bounds(&self, id: LayerId) -> Option<Rect> {
         match self.kind(id)? {
             LayerKind::Pixel { bounds } => Some(*bounds),
-            LayerKind::Group { .. } => None,
+            LayerKind::Group { .. } | LayerKind::Adjustment(_) => None,
         }
     }
 
@@ -2161,7 +2216,7 @@ impl LayerTree {
     pub fn children(&self, id: LayerId) -> Option<&[LayerId]> {
         match self.kind(id)? {
             LayerKind::Group { children } => Some(children.as_slice()),
-            LayerKind::Pixel { .. } => None,
+            LayerKind::Pixel { .. } | LayerKind::Adjustment(_) => None,
         }
     }
 
@@ -2255,7 +2310,10 @@ impl LayerTree {
             match self.kind(id) {
                 Some(LayerKind::Pixel { .. }) => out.push(id),
                 Some(LayerKind::Group { children }) => stack.extend(children.iter().copied()),
-                None => {}
+                // An adjustment has no pixels of its own to draw; it is
+                // applied by the compositor's own tree walk, never through
+                // this pixel-layer list.
+                Some(LayerKind::Adjustment(_)) | None => {}
             }
         }
         out

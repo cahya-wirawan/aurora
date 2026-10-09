@@ -310,8 +310,10 @@ fn insert_layer_row(
     Ok(row)
 }
 
-/// `"Group"` / `"Normal, 100%"` / `"Multiply, 80%, hidden"` — blend
-/// mode and opacity for a pixel layer, just the kind for a group.
+/// `"Group"` / `"Normal, 100%"` / `"Multiply, 80%, hidden"` /
+/// `"Curves adjustment, Normal, 100%"` — blend mode and opacity for a
+/// pixel layer, the same led by the adjustment's name for an adjustment
+/// layer (0.155.0), just the kind for a group.
 /// `LayerTree` stores opacity/blend mode on groups too, but describing
 /// a group only by its kind avoids implying group-level compositing
 /// already does something — no compositor honours it yet (`aurora-render`
@@ -330,15 +332,29 @@ pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     match layers.kind(id) {
         Some(LayerKind::Group { .. }) => format!("Group{suffix}"),
         Some(LayerKind::Pixel { .. }) => {
-            let blend = layers.blend_mode(id).unwrap_or_default();
-            let opacity = layers.opacity(id).unwrap_or(1.0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let percent = (opacity * 100.0).round() as u32;
-            let blend = crate::layer_controls::blend_mode_label(blend);
-            format!("{blend}, {percent}%{suffix}")
+            format!("{}{suffix}", blend_and_opacity(layers, id))
         }
+        // 0.155.0: an adjustment layer leads with what it is, so a
+        // "Curves 1" row reads "Curves adjustment, Normal, 100%" and can
+        // never be mistaken for a pixel layer by name alone.
+        Some(LayerKind::Adjustment(adjustment)) => format!(
+            "{} adjustment, {}{suffix}",
+            adjustment.label(),
+            blend_and_opacity(layers, id)
+        ),
         None => "Unknown layer".to_owned(),
     }
+}
+
+/// `"Multiply, 80%"`: a layer's blend mode by its user-facing name and
+/// its opacity as a whole percentage.
+fn blend_and_opacity(layers: &LayerTree, id: LayerId) -> String {
+    let blend = layers.blend_mode(id).unwrap_or_default();
+    let opacity = layers.opacity(id).unwrap_or(1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let percent = (opacity * 100.0).round() as u32;
+    let blend = crate::layer_controls::blend_mode_label(blend);
+    format!("{blend}, {percent}%")
 }
 
 #[cfg(test)]

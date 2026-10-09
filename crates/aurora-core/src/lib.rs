@@ -7,12 +7,14 @@
 //! crate-specific (no pixel storage, no tile concept, no document model).
 
 pub mod color;
+pub mod curves;
 pub mod error;
 pub mod geometry;
 pub mod id;
 pub mod tone_curve;
 
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
+pub use curves::CurvesParams;
 pub use error::CoreError;
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use id::{Id, IdGenerator};
