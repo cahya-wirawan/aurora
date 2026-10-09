@@ -19,3 +19,8 @@ aurora-graph = { workspace = true }
 aurora-color = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The Curves tests sweep every `f16` value in `[0, 1]`: the inputs a
+# straight `f16` tile can actually hand the lookup tables.
+half = { workspace = true }

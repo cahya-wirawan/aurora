@@ -20,6 +20,10 @@ pub enum DocError {
     /// names a pixel layer instead.
     #[error("layer {0:?} is not a group and cannot contain other layers")]
     NotAGroup(LayerId),
+    /// [`crate::LayerTree::set_adjustment`] was called on a layer that is
+    /// not an adjustment layer (0.155.0).
+    #[error("layer {0:?} is not an adjustment layer")]
+    NotAnAdjustment(LayerId),
     /// [`crate::LayerTree::set_bounds`] was called on a layer that names
     /// a group — a group has no `bounds` of its own to move (see
     /// [`crate::LayerKind::Group`]).

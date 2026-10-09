@@ -26,7 +26,45 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.154.0): PSD opens stream, one layer at a
+**Latest (2026-10-09, 0.155.0): a non-destructive Curves adjustment
+layer.** The first adjustment, and `aurora-filters`' first real code
+(adjustments are Phase 2 scope per "Phase 2–3 — outline"; this lands one
+early, at the design owner's request, with no Phase 1 checkbox to tick).
+`aurora_doc::LayerKind::Adjustment(Adjustment::Curves(CurvesParams))`
+(`CurvesParams` in `aurora-core` beside `ToneCurve`: a composite RGB curve
+plus optional R/G/B curves, Photoshop's model) has opacity, blend mode,
+visibility and an optional mask like any layer, and no content surface or
+bounds. `aurora_filters::CurvesLut` samples each non-identity curve at
+16,385 `f32` points (2^14 intervals, linear interpolation; identity curves
+are skipped, so an exact passthrough), applied to straight RGB in the
+stored (encoded) working values, per-channel first then composite
+(psd-tools' Photoshop-checked order); measured max error against direct
+evaluation 5.96e-8 for a typical curve, 1.80e-4 for the steepest legal
+curve (derived bound 1.8e-4). The CPU compositor folds it in place
+(`fold_layer_into`/`apply_adjustment_layer`): the accumulator below it,
+un-premultiplied, is re-mapped, masked, blended with the layer's own mode
+and opacity over the backdrop made opaque, and written back at the
+backdrop's own alpha, so it never creates pixels. The GPU predicate
+already refused non-pixel roots; `begin_gpu_composite_tile` now also
+refuses a visible adjustment root, so such documents fall back to CPU
+(the WGSL port is a follow-up). History: add/remove reuse `Restore`/
+`RemoveById`; `LayerOp::SetAdjustment` is appended last (ordinal 15).
+`.aur`: the new `LayerKind` variant is appended (ordinal 2), so every old
+manifest and journal decodes unchanged and no manifest version bump or
+side entry is needed; an older build refuses a file holding one.
+**New Curves Layer** (palette, macOS Layer menu) adds an identity
+"Curves N" above the active node as one undo step and makes it active;
+its Layers row reads "Curves adjustment, Normal, 100%"; Delete Layer
+works on it. Groups are always isolated (Aurora has no Pass Through), so a Curves layer inside a group adjusts only that group's own layers, unlike Photoshop's default. No curve editor yet (0.156.0); tests drive a `#[cfg(test)]`
+`set_layer_curves` hook. PSD `curv` import deferred (Photoshop's natural
+cubic spline and 19-point curves differ from `ToneCurve`). 36 new tests;
+14 mutations, all killed (one only after a test was added). Test count
+2,941 (2,905 + 36; the touched crates were run with
+`AURORA_REQUIRE_GPU=1` on the RTX 3090, the full gate was not).
+**Needs a human: add a Curves layer on macOS and compare against
+Photoshop.** Details: "Next action", addendum 0.155.0.
+
+**Previously (2026-10-09, 0.154.0): PSD opens stream, one layer at a
 time.** Until 0.153.0 a PSD open read the whole file into memory, decoded
 every layer into an in-memory `Image`, then encoded every tile — peak
 roughly file + decoded document + encoded tiles. Now
@@ -30583,6 +30621,9 @@ Detailed when the preceding phase closes; planning further ahead than the
 evidence supports is how the original 6-month Phase 1 estimate happened.
 
 - **Phase 2** — selections, brush engine, masks, filters, adjustments.
+  (One adjustment, Curves, landed early in 0.155.0: model, CPU
+  compositing, persistence and a New Curves Layer command — see "Next
+  action", addendum 0.155.0.)
   *Gate: an illustrator completes a real piece without leaving Aurora.*
   Unchanged, zero spike evidence — see 0.8.
 - **Phase 3** — smart objects, Camera RAW, colour management, PSD/PSB
@@ -30675,6 +30716,109 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.155.0) — a non-destructive Curves adjustment
+layer.** Done as 0.155.0. Files: `crates/aurora-core/src/curves.rs`
+(new: `CurvesParams`), `tone_curve.rs` (`ToneCurve::is_identity`;
+`Serialize` as the point list, `Deserialize` re-validated through
+`ToneCurve::new`, at most `MAX_POINTS` elements read), `lib.rs`;
+`crates/aurora-filters/src/curves.rs` (new: `CurvesLut`,
+`CURVES_LUT_INTERVALS`), `lib.rs`, `Cargo.toml` (`half` dev-dependency);
+`crates/aurora-doc/src/layer.rs` (`LayerKind::Adjustment`, `Adjustment`,
+`LayerKind::is_adjustment`), `tree.rs` (`add_adjustment_layer_at`,
+`adjustment`, `set_adjustment`), `history.rs`
+(`History::add_adjustment_layer_at`, `History::set_adjustment`,
+`LayerOp::SetAdjustment`), `error.rs` (`NotAnAdjustment`), `lib.rs`;
+`crates/aurora-ui/src/layers_panel.rs` (row description);
+`crates/aurora-io/src/aur.rs` (round-trip test only);
+`crates/aurora-app/src/lib.rs` (`admit_composite_node` extracted from
+`resolve_tile`, `fold_layer_into`, `apply_adjustment_layer`,
+`curves_lut` with a per-thread cache, the GPU-path refusal, New Curves
+Layer: `COMMAND_LAYER_NEW_CURVES`, `ActivatedCommand::NewCurvesLayer`,
+`LayerCommand::NewCurves`, `new_curves_layer`, `next_curves_name`, the
+`#[cfg(test)]` `set_layer_curves` hook).
+
+*Decisions.* **Encoded values, not linear light**: Aurora stores the
+source's own encoded values in `f16` and every blend mode works on them,
+as Photoshop's do; Photoshop's Curves maps encoded code values, so the
+same curve gives the same result only on the same numbers. **Order**:
+per-channel, then composite (psd-tools `_apply_luts`). **Precision**:
+2^14-interval `f32` LUT with interpolation, identity skipped; measured
+5.96e-8 typical, 1.80e-4 worst (steepest legal curve), no 8-bit step.
+**Out of range**: a non-identity curve clamps its input to `[0, 1]` (and
+NaN to 0), as `ToneCurve::evaluate` does; values meeting only identity
+curves are untouched. **Compositing**: `lerp(Cb, B(Cb, f(Cb)),
+opacity * mask)` at the backdrop's alpha, through the existing
+`apply_mask`, `dissolve_gate` and `composite_layer_into`.
+**Persistence**: append-only variants, the `ColorSpaceTag::Icc`
+precedent; no version bump and no side entry, because an appended
+ordinal never changes an old file's bytes (pinned by
+`old_layer_kind_bytes_decode_unchanged_and_the_new_variant_round_trips`
+and `set_adjustment_is_appended_after_every_older_layer_op`). Not
+forward compatible: a pre-0.155.0 build refuses such a file loudly.
+
+*Mutations* (each file backed up to the session scratchpad `mut155/`,
+restored, `touch`ed and sha256-checked; tests run with
+`AURORA_REQUIRE_GPU=1` on the RTX 3090):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | curve not applied | killed | 10 `curves_adjustment` tests |
+| M2 | curve applied to alpha | killed | 8 tests, e.g. `an_inverting_curves_layer_inverts_the_composite_below_and_keeps_alpha` |
+| M3 | composite curve before per-channel | killed | `channel_curve_applies_before_the_composite_curve` |
+| M4 | LUT samples shifted by one | killed | 5 `aurora-filters` tests incl. the accuracy test |
+| M5 | blend mode ignored (always Normal) | killed | `curves_blends_with_its_own_blend_mode` |
+| M6 | opacity ignored | killed | `curves_opacity_mixes_the_adjusted_colour_with_the_backdrop` |
+| M7 | mask ignored | killed | `a_curves_mask_limits_where_it_applies` |
+| M8 | applied to the whole root composite (layers above too) | killed | `curves_affects_only_the_layers_below_it_not_above`, the group test |
+| M9 | GPU predicate admits adjustments | killed | `the_gpu_predicate_refuses_...`, `gpu_and_cpu_agree_with_and_without_a_curves_layer` |
+| M10 | GPU-path local refusal removed | killed | `begin_gpu_composite_tile_falls_back_for_a_curves_layer` |
+| M11 | red curve not persisted (`serde(skip)`) | killed | `round_trips_a_curves_adjustment_layer_and_its_history` |
+| M12 | undo records the new params, not the old | killed | `setting_an_adjustment_is_undoable_...`, `setting_curves_is_one_undo_step_...` |
+| M13 | backdrop not made opaque before the blend | **survived first**, killed after adding `a_blended_curves_layer_reads_a_translucent_backdrops_true_colour` | that test |
+| M14 | LUT cache ignores the parameters | killed | `changing_a_curves_layers_params_changes_the_next_composite` |
+
+*Disclosures.* No GPU port: any visible Curves root sends the whole
+document to the CPU path, so a document with one composites slower.
+Groups are always isolated (no Pass Through), so a Curves layer inside a
+group never reaches layers below the group, unlike Photoshop's default.
+Fill opacity is not applied (as for pixel layers). `ToneCurve`
+interpolates with monotone Fritsch–Carlson, Photoshop with a natural
+cubic spline: the same points give a different curve between points (a
+design-owner question already flagged in `tone_curve.rs`), which is also
+why PSD `curv` import (AC-4) is deferred: applying a Photoshop curve
+with a different interpolator, or truncating its up to 19 points to 16,
+would silently show different pixels; it stays in "adjustment layers not
+shown". A Curves layer's dirty rect is `None`, so its edits rely on full
+composite-cache bumps (structural undo already bumps everything). The
+LUT cache is per thread, 8 entries, rebuilt (about 65k curve
+evaluations) on a miss. Out-of-gamut float values meeting a non-identity
+curve are clipped to `[0, 1]`. The new-layer name is "Curves N" with no
+localisation.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,941 passed, 0 failed, 50 ignored, 0 skipped**
+(matching 2,905 + 36), strict rustdoc, `cargo deny`. Independent judge:
+**PASS 0.906**, no critical or high issue. Its notes: the CLAUDE.md
+"not started" bullet contradicted itself (reworded) and group isolation
+was disclosed only in code (now stated above). Not changed, recorded:
+`apply_adjustment_layer` rounds colour to `f16` twice (straight result,
+then premultiplied) where a fused `f32` path would round once; and for a
+backdrop of tiny alpha the un-premultiplied colour can overflow `f16` to
+infinity, which a non-Normal blend mode could carry into the output as
+inf/NaN times that tiny alpha — the same class of edge as the existing
+pixel-layer path, not new. **Design-owner question raised:** Photoshop
+draws curves with a natural cubic spline and allows 19 points;
+`ToneCurve` uses monotone Fritsch–Carlson and 16 — this decides whether
+PSD `curv` import can match Photoshop between points.
+
+**Needs a human: add a Curves layer on macOS (via a test-set curve or a
+PSD) and compare against Photoshop.**
+
+**Suggested next (0.156.0): the Curves UI: curve editor bound to the
+layer in Properties, histogram in `text.secondary`, channel selector;
+then the GPU port.**
 
 **Addendum 2026-10-09 (0.154.0) — PSD opens stream, one layer at a
 time.** Done as 0.154.0. Files: `crates/aurora-io/src/psd.rs`

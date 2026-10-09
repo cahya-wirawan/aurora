@@ -131,6 +131,16 @@ enum LayerOp {
         id: LayerId,
         value: f32,
     },
+    /// Replace an adjustment layer's parameters (0.155.0). **Appended
+    /// last, and new variants must keep being appended**: the journal is
+    /// positional `postcard`, so every older journal's ordinals stay
+    /// valid only if no variant before this one moves. A build older than
+    /// 0.155.0 refuses a journal holding it (an unknown ordinal), which
+    /// is the loud downgrade refusal `SetMaskDensity` already relies on.
+    SetAdjustment {
+        id: LayerId,
+        value: crate::Adjustment,
+    },
 }
 
 /// Every `(layer, density)` pair a journaled `op` carries in a mask whose
@@ -165,7 +175,9 @@ fn reduced_mask_densities(op: &LayerOp) -> Vec<(LayerId, f32)> {
 fn layer_dirty_rect(tree: &LayerTree, id: LayerId) -> Option<Rect> {
     match tree.kind(id)? {
         LayerKind::Pixel { bounds } => Some(*bounds),
-        LayerKind::Group { .. } => None,
+        // An adjustment has no bounds either: it re-maps everything under
+        // it, so its extent is the composite's, not its own.
+        LayerKind::Group { .. } | LayerKind::Adjustment(_) => None,
     }
 }
 
@@ -180,7 +192,7 @@ fn subtree_dirty_rect(removed: &RemovedSubtree) -> Option<Rect> {
         .iter()
         .filter_map(|(_, entry)| match &entry.kind {
             LayerKind::Pixel { bounds } => Some(*bounds),
-            LayerKind::Group { .. } => None,
+            LayerKind::Group { .. } | LayerKind::Adjustment(_) => None,
         })
         .reduce(|a, b| a.union(&b))
 }
@@ -308,6 +320,17 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             tree.set_mask_density(id, value)?;
             Ok((
                 LayerOp::SetMaskDensity { id, value: old },
+                layer_dirty_rect(tree, id),
+            ))
+        }
+        LayerOp::SetAdjustment { id, value } => {
+            let old = tree
+                .adjustment(id)
+                .ok_or(DocError::NotAnAdjustment(id))?
+                .clone();
+            tree.set_adjustment(id, value)?;
+            Ok((
+                LayerOp::SetAdjustment { id, value: old },
                 layer_dirty_rect(tree, id),
             ))
         }
@@ -440,6 +463,9 @@ fn describe(op: &LayerOp) -> String {
         // "Repositioned," not "Moved" -- `Reparent` already claims that
         // verb for changing a layer's place in the tree/z-order, a
         // different operation from changing its own on-canvas bounds.
+        LayerOp::SetAdjustment { id, value } => {
+            format!("Changed {} on layer #{}", value.label(), id.to_raw())
+        }
         LayerOp::SetBounds { id, value } => {
             format!(
                 "Repositioned layer #{} to ({}, {})",
@@ -1293,6 +1319,62 @@ impl History {
         tree.set_mask_density(id, value)?;
         self.journal.push(LayerOp::SetMaskDensity { id, value });
         self.push(LayerOp::SetMaskDensity { id, value: old });
+        Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// Same as [`LayerTree::add_adjustment_layer_at`], recorded for undo
+    /// (0.155.0): one step, journaled as the same `Restore` an added pixel
+    /// layer is, so no new add/remove op exists.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::add_adjustment_layer_at`]. Nothing is
+    /// recorded when it fails.
+    pub fn add_adjustment_layer_at(
+        &mut self,
+        tree: &mut LayerTree,
+        name: impl Into<String>,
+        adjustment: crate::Adjustment,
+        parent: Option<LayerId>,
+        index: usize,
+    ) -> Result<LayerId, DocError> {
+        let name = name.into();
+        let id = tree.add_adjustment_layer_at(name.clone(), adjustment.clone(), parent, index)?;
+        let landed = current_index(tree, id, parent).unwrap_or(index);
+        self.journal.push(LayerOp::Restore(RemovedSubtree {
+            root: id,
+            parent,
+            index: landed,
+            entries: vec![(
+                id,
+                LayerEntry::new(name, parent, LayerKind::Adjustment(adjustment)),
+            )],
+        }));
+        self.push(LayerOp::RemoveById(id));
+        Ok(id)
+    }
+
+    /// Same as [`LayerTree::set_adjustment`], recorded for undo as one
+    /// `LayerOp::SetAdjustment` step holding the previous parameters.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_adjustment`]. Nothing is recorded when it
+    /// fails.
+    pub fn set_adjustment(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: crate::Adjustment,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = match tree.kind(id) {
+            None => return Err(DocError::UnknownLayer(id)),
+            Some(LayerKind::Adjustment(old)) => old.clone(),
+            Some(_) => return Err(DocError::NotAnAdjustment(id)),
+        };
+        tree.set_adjustment(id, value.clone())?;
+        self.journal.push(LayerOp::SetAdjustment { id, value });
+        self.push(LayerOp::SetAdjustment { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
 
@@ -4782,5 +4864,161 @@ mod tests {
             "and must leave it byte-exact"
         );
         assert!(exactly(coverage_at(&mut store, mask, 3, 4), PAINTED));
+    }
+}
+
+/// Curves adjustment layers through `History` (0.155.0).
+#[cfg(test)]
+mod adjustment_tests {
+    use super::{History, LayerOp};
+    use crate::{Adjustment, DocError, LayerKind, LayerTree};
+    use aurora_core::{CurvePoint, CurvesParams, Rect, ToneCurve};
+
+    fn invert() -> Adjustment {
+        match ToneCurve::new(&[CurvePoint::new(0.0, 1.0), CurvePoint::new(1.0, 0.0)]) {
+            Ok(composite) => Adjustment::Curves(CurvesParams {
+                composite,
+                ..CurvesParams::identity()
+            }),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn identity() -> Adjustment {
+        Adjustment::Curves(CurvesParams::identity())
+    }
+
+    fn bounds() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        }
+    }
+
+    #[test]
+    fn adding_a_curves_layer_is_one_undoable_step_with_no_surface_or_bounds() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let id = match history.add_adjustment_layer_at(&mut tree, "Curves 1", invert(), None, 0) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), &[id, pixel]);
+        assert_eq!(tree.kind(id), Some(&LayerKind::Adjustment(invert())));
+        assert!(tree.kind(id).is_some_and(LayerKind::is_adjustment));
+        assert_eq!(tree.surface_id(id), None);
+        assert_eq!(tree.bounds(id), None);
+        assert_eq!(tree.children(id), None);
+        assert!(tree.paint_order().iter().all(|&layer| layer != id));
+        assert!(matches!(
+            tree.add_pixel_layer("child", bounds(), Some(id)),
+            Err(DocError::NotAGroup(_))
+        ));
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(id));
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.adjustment(id),
+            Some(&invert()),
+            "redo restores the params"
+        );
+    }
+
+    #[test]
+    fn setting_an_adjustment_is_undoable_and_refused_on_a_pixel_layer() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let id = match history.add_adjustment_layer_at(&mut tree, "c", identity(), None, 0) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_adjustment(&mut tree, id, invert()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.adjustment(id), Some(&invert()));
+        assert_eq!(
+            history.last_journal_description().as_deref(),
+            Some(format!("Changed Curves on layer #{}", id.to_raw()).as_str())
+        );
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.adjustment(id),
+            Some(&identity()),
+            "undo restores the old params"
+        );
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.adjustment(id), Some(&invert()));
+
+        let journal = history.journal_len();
+        assert!(matches!(
+            history.set_adjustment(&mut tree, pixel, invert()),
+            Err(DocError::NotAnAdjustment(_))
+        ));
+        assert_eq!(history.journal_len(), journal, "nothing recorded");
+        assert_eq!(tree.adjustment(pixel), None);
+    }
+
+    #[test]
+    fn the_journal_round_trips_and_replays_an_adjustment() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_adjustment_layer_at(&mut tree, "c", identity(), None, 0) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_adjustment(&mut tree, id, invert()) {
+            unreachable!("{err:?}");
+        }
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let loaded = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match loaded.replay() {
+            Ok(replayed) => assert_eq!(replayed.adjustment(id), Some(&invert())),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn set_adjustment_is_appended_after_every_older_layer_op() {
+        let ordinal = |op: &LayerOp| match postcard::to_allocvec(op) {
+            Ok(bytes) => bytes.first().copied(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let id = crate::LayerId::from_raw(1);
+        assert_eq!(
+            ordinal(&LayerOp::SetMaskDensity { id, value: 0.5 }),
+            Some(14)
+        );
+        assert_eq!(
+            ordinal(&LayerOp::SetAdjustment {
+                id,
+                value: identity()
+            }),
+            Some(15)
+        );
     }
 }

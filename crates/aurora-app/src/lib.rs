@@ -4238,6 +4238,10 @@ enum ActivatedCommand {
     /// state (`App::run_layer_command`, [`perform_layer_command`]).
     NewLayer,
     DeleteLayer,
+    /// New Curves Layer (0.155.0): palette and the macOS `Layer` menu
+    /// only, no shortcut. Run by [`perform_layer_command`] as
+    /// [`LayerCommand::NewCurves`].
+    NewCurvesLayer,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -4260,6 +4264,7 @@ const COMMAND_REDO: &str = "edit.redo";
 const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
+const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -4314,6 +4319,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
         CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
     ]
 }
 
@@ -4425,6 +4431,9 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_DELETE {
         return Some(ActivatedCommand::DeleteLayer);
+    }
+    if id == COMMAND_LAYER_NEW_CURVES {
+        return Some(ActivatedCommand::NewCurvesLayer);
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -5970,6 +5979,7 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW, "New Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -10218,23 +10228,17 @@ impl CompositeBudget {
 // threading the same eight arguments through two more signatures and
 // separating each arm from the doc comment that explains it; the length
 // here is one `match` with two arms, not accumulated logic.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn resolve_tile(
+/// The checks every node of a composite walk passes before it is folded,
+/// shared by [`resolve_tile`] and [`apply_adjustment_layer`] (0.155.0,
+/// extracted from `resolve_tile` unchanged): the tree-depth bound, the
+/// per-pass node budget, and visibility. `false` means "skip this node
+/// for this tile".
+fn admit_composite_node(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
-    tile_id: aurora_tile::TileId,
-    doc_origin: (i64, i64),
-    reference_origin: (i64, i64),
     depth: usize,
     budget: &mut CompositeBudget,
-) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
-    // Both bounds are checked before anything else this function does,
-    // including the visibility test below: `aurora-doc`'s own shape
-    // validator is the primary guarantee that this recursion terminates,
-    // and these are the independent second one. See this function's own
-    // doc comment for the depth convention, and why bounding depth alone
-    // is not enough to bound the work.
+) -> bool {
     if depth > aurora_doc::MAX_LAYER_TREE_DEPTH {
         if budget.should_report() {
             tracing::warn!(
@@ -10245,7 +10249,7 @@ fn resolve_tile(
                  composite tile"
             );
         }
-        return None;
+        return false;
     }
     // Charged after the depth check, not before it: a call refused for
     // depth does no work worth charging, and the number of such refused
@@ -10263,9 +10267,32 @@ fn resolve_tile(
                  this branch for this composite tile"
             );
         }
-        return None;
+        return false;
     }
     if layers.visible(id) != Some(true) {
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resolve_tile(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
+    // Both bounds are checked before anything else this function does,
+    // including the visibility test below: `aurora-doc`'s own shape
+    // validator is the primary guarantee that this recursion terminates,
+    // and these are the independent second one. See this function's own
+    // doc comment for the depth convention, and why bounding depth alone
+    // is not enough to bound the work.
+    if !admit_composite_node(id, layers, depth, budget) {
         return None;
     }
     let opacity = layers.opacity(id)?;
@@ -10415,6 +10442,13 @@ fn resolve_tile(
             }
             Some((texels, opacity, blend_mode))
         }
+        // An adjustment has no texels of its own to hand back: it
+        // transforms the accumulator *below* it, so it is folded by
+        // `fold_layer_into`/`apply_adjustment_layer`, which see that
+        // accumulator, and never resolved here. A caller that reaches this
+        // arm (the GPU path, whose predicate refuses adjustments first)
+        // gets "nothing to fold", never a wrong composite of the layer.
+        aurora_doc::LayerKind::Adjustment(_) => None,
         aurora_doc::LayerKind::Group { children } => {
             // Folded in place, one child at a time, rather than collected
             // into a `Vec` of every child's own full tile buffer for a
@@ -10444,23 +10478,15 @@ fn resolve_tile(
             // `composite_layer_into_folded_matches_hand_computed_golden_values`.)
             let mut isolated = aurora_render::transparent_tile();
             for &child_id in children.iter().rev() {
-                // Stop as soon as the budget is spent rather than still
-                // making one no-op `resolve_tile` call per remaining
-                // listed child -- see `CompositeBudget::is_exhausted`'s
-                // own doc comment for why this matters for a crafted
-                // tree, not just a well-formed one (where this never
-                // fires, since every child that gets this far is real).
                 if budget.is_exhausted() {
                     break;
                 }
-                // `saturating_add` rather than plain `+`, mirroring
-                // `aurora-doc`'s own `validate_shape`: the guard at the
-                // top of this function makes an overflow structurally
-                // unreachable (`depth` can never get past
-                // `MAX_LAYER_TREE_DEPTH + 1` here), so this is about
-                // matching the validator's style, not about a real
-                // wrap this code could hit.
-                if let Some(resolved) = resolve_tile(
+                // Through `fold_layer_into` (0.155.0) rather than
+                // `resolve_tile` + `composite_layer_into` directly, so an
+                // adjustment child sees exactly the siblings below it in
+                // this group's own isolated accumulator.
+                let _ = fold_layer_into(
+                    &mut isolated,
                     child_id,
                     layers,
                     store,
@@ -10469,42 +10495,8 @@ fn resolve_tile(
                     reference_origin,
                     depth.saturating_add(1),
                     budget,
-                ) {
-                    let (child, child_opacity, child_blend_mode) = resolved;
-                    aurora_render::composite_layer_into(
-                        &mut isolated,
-                        &child,
-                        child_opacity,
-                        child_blend_mode,
-                    );
-                }
+                );
             }
-            // Un-premultiply: `composite_layer_into` accumulates straight-
-            // alpha "over" math onto a starting-*transparent* destination,
-            // which yields a *premultiplied* result whenever the
-            // accumulated alpha ends up fractional (see this function's
-            // own doc comment's worked example: a lone `opacity = 0.5`
-            // child alone on transparent gives `(0, 0, 0.5, 0.5)`, not the
-            // straight `(0, 0, 1.0, 0.5)`). Every other branch of this
-            // function returns true straight-alpha texels, and the
-            // caller's own `composite_layer_into` call one level up
-            // expects straight-alpha inputs too -- so divide `r`/`g`/`b`
-            // by `a`
-            // here to convert this group's own isolated buffer back to
-            // straight alpha before handing it back as `id`'s own
-            // pseudo-layer texels. Guarded against `a == 0.0` (fully
-            // transparent texels have no meaningful colour to recover;
-            // leave them at `0.0` rather than dividing by zero).
-            //
-            // The loop itself lives in
-            // `aurora_render::un_premultiply_in_place` — this arm was
-            // the only place it existed until `composite_roots_into_tile`
-            // and the GPU compositing path's own readback
-            // (`finish_tile_readback`) were found to be missing the
-            // identical step; see that function's own doc comment for
-            // the invariant (straighten exactly once, at the top of an
-            // accumulation, never inside `composite_layer_into`'s own
-            // fold).
             aurora_render::un_premultiply_in_place(&mut isolated);
             // A group's own mask masks its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
@@ -10550,6 +10542,199 @@ fn resolve_tile(
             Some((isolated, opacity, blend_mode))
         }
     }
+}
+
+/// Folds one layer into a premultiplied accumulator (0.155.0): an
+/// adjustment layer through [`apply_adjustment_layer`], which transforms
+/// what is already in `accumulator`; anything else exactly as before,
+/// [`resolve_tile`] then `aurora_render::composite_layer_into`. `true`
+/// when the layer changed the accumulator.
+#[allow(clippy::too_many_arguments)]
+fn fold_layer_into(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_))) {
+        return apply_adjustment_layer(accumulator, id, layers, store, doc_origin, depth, budget);
+    }
+    match resolve_tile(
+        id,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth,
+        budget,
+    ) {
+        Some((texels, opacity, blend_mode)) => {
+            aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How many distinct Curves parameter sets [`curves_lut`] keeps built per
+/// thread. A document rarely has more Curves layers than this visible at
+/// once; past it, the oldest entry is rebuilt on its next use.
+const CURVES_LUT_CACHE_LEN: usize = 8;
+
+/// A thread's built Curves lookup tables, keyed by their exact parameters.
+type CurvesLutCache = Vec<(
+    aurora_core::CurvesParams,
+    std::rc::Rc<aurora_filters::CurvesLut>,
+)>;
+
+thread_local! {
+    /// Built Curves lookup tables, so a composite pass builds each table
+    /// once rather than once per tile (one build samples up to four
+    /// curves at 16,385 points each).
+    static CURVES_LUTS: std::cell::RefCell<CurvesLutCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `params`' lookup tables, from this thread's cache when they have been
+/// built before.
+fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters::CurvesLut> {
+    CURVES_LUTS.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(aurora_filters::CurvesLut::new(params));
+        };
+        if let Some((_, lut)) = cache.iter().find(|(cached, _)| cached == params) {
+            return std::rc::Rc::clone(lut);
+        }
+        let lut = std::rc::Rc::new(aurora_filters::CurvesLut::new(params));
+        if cache.len() >= CURVES_LUT_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((params.clone(), std::rc::Rc::clone(&lut)));
+        lut
+    })
+}
+
+/// Applies an adjustment layer (0.155.0) to `accumulator`, the
+/// premultiplied composite of everything below it in its own group (or
+/// the document), in place. Photoshop's adjustment-layer model:
+///
+/// 1. the backdrop `Cb` is the accumulator un-premultiplied;
+/// 2. the adjusted colour `f(Cb)` (`aurora_filters::CurvesLut`, straight
+///    RGB) becomes a source layer with alpha `1`, times the layer's own
+///    mask coverage when it has an enabled mask (`apply_mask`, the same
+///    call a pixel layer's mask goes through), and through `dissolve_gate`
+///    for `Dissolve`, the same as a pixel layer;
+/// 3. that source is blended with the layer's own blend mode and opacity
+///    (`aurora_render::composite_layer_into`) over the backdrop **made
+///    opaque**, which gives exactly `lerp(Cb, B(Cb, f(Cb)), opacity * mask)`;
+/// 4. the result is written back at the backdrop's own alpha, bit for bit.
+///
+/// Step 3's opaque backdrop and step 4's alpha are what make an adjustment
+/// re-colour existing pixels without creating any: a fully transparent
+/// region stays fully transparent and a half-transparent one keeps its
+/// alpha, which a plain source-over of the adjusted copy would raise.
+///
+/// Identity curves under `Normal`/`Dissolve` are skipped outright, so they
+/// are an exact passthrough rather than an `f16` un-/re-premultiply round
+/// trip. Returns `true` when the layer was applied.
+///
+/// Known differences from Photoshop, disclosed: groups here are always
+/// isolated (Aurora has no Pass Through mode), so an adjustment inside a
+/// group never reaches layers below the group; and fill opacity is not
+/// applied, matching how pixel layers composite today.
+#[allow(clippy::too_many_arguments)]
+fn apply_adjustment_layer(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    doc_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !admit_composite_node(id, layers, depth, budget) {
+        return false;
+    }
+    let Some(aurora_doc::Adjustment::Curves(params)) = layers.adjustment(id) else {
+        return false;
+    };
+    let Some(opacity) = layers.opacity(id) else {
+        return false;
+    };
+    let raw_blend_mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    let lut = curves_lut(params);
+    if lut.is_identity()
+        && matches!(
+            raw_blend_mode,
+            aurora_doc::BlendMode::Normal | aurora_doc::BlendMode::Dissolve
+        )
+    {
+        return true;
+    }
+
+    let mut backdrop = accumulator.to_vec();
+    aurora_render::un_premultiply_in_place(&mut backdrop);
+
+    let one = half::f16::from_f32(1.0);
+    let mut source = Vec::with_capacity(backdrop.len());
+    for texel in backdrop.chunks_exact(4) {
+        if let [r, g, b, _] = *texel {
+            let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+            source.extend([
+                half::f16::from_f32(r),
+                half::f16::from_f32(g),
+                half::f16::from_f32(b),
+                one,
+            ]);
+        }
+    }
+    if let Some(mask) = layers.mask(id)
+        && mask.enabled
+    {
+        source = apply_mask(
+            &source,
+            mask,
+            layers.mask_surface_id(id),
+            store,
+            doc_origin,
+            budget,
+        );
+    }
+    let (source, opacity, blend_mode) = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+        (
+            dissolve_gate(&source, opacity, doc_origin),
+            1.0,
+            aurora_render::BlendMode::Normal,
+        )
+    } else {
+        (source, opacity, translate_blend_mode(raw_blend_mode))
+    };
+
+    let mut mixed = backdrop;
+    for texel in mixed.chunks_exact_mut(4) {
+        if let [_, _, _, alpha] = texel {
+            *alpha = one;
+        }
+    }
+    aurora_render::composite_layer_into(&mut mixed, &source, opacity, blend_mode);
+
+    for (out, mixed) in accumulator.chunks_exact_mut(4).zip(mixed.chunks_exact(4)) {
+        if let ([r, g, b, alpha], [mr, mg, mb, _]) = (out, mixed) {
+            let a = alpha.to_f32();
+            *r = half::f16::from_f32(mr.to_f32() * a);
+            *g = half::f16::from_f32(mg.to_f32() * a);
+            *b = half::f16::from_f32(mb.to_f32() * a);
+        }
+    }
+    true
 }
 
 /// Composites one tile of `layers`' **root level** on the CPU: every
@@ -10655,7 +10840,8 @@ fn composite_roots_into_tile(
     let mut composited = aurora_render::transparent_tile();
     let mut folded = 0_usize;
     for &id in layers.roots().iter().rev() {
-        if let Some((texels, opacity, blend_mode)) = resolve_tile(
+        if fold_layer_into(
+            &mut composited,
             id,
             layers,
             store,
@@ -10665,7 +10851,6 @@ fn composite_roots_into_tile(
             1,
             budget,
         ) {
-            aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
             folded = folded.saturating_add(1);
         }
     }
@@ -13552,6 +13737,17 @@ fn begin_gpu_composite_tile(
     let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
     for &id in layers.roots().iter().rev() {
+        // 0.155.0: an adjustment layer has no WGSL port yet (a named
+        // follow-on), and `resolve_tile` hands it back as "nothing to
+        // fold", so a GPU pass reaching one would silently drop it. The
+        // predicate refuses such documents before this is ever called;
+        // this is the second, local refusal, so the tile falls back to the
+        // CPU path rather than compositing without the adjustment.
+        if layers.visible(id) == Some(true)
+            && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_)))
+        {
+            return None;
+        }
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
         // validator starts its budget at. One `budget` for all of this
         // tile's roots, not one each: in a well-formed tree their
@@ -16335,6 +16531,10 @@ enum LayerCommand {
     /// Removes the active node and its whole subtree, refusing when that
     /// would leave no pixel layer at all. See [`delete_layer`].
     Delete,
+    /// New Curves Layer (0.155.0): an identity Curves adjustment layer
+    /// directly above the active node, placed exactly where
+    /// [`Self::New`] places a pixel layer, made active.
+    NewCurves,
 }
 
 /// Everything [`perform_layer_command`] touches, borrowed from `App` (or
@@ -16535,6 +16735,68 @@ fn new_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
 /// with nothing changed when there is no active node or the delete is
 /// refused: a document must keep at least one pixel layer outside the
 /// removed subtree, or there would be nothing left to paint on.
+/// `"Curves N"`, one past the highest `N` any existing "Curves N" layer
+/// already uses — the same rule [`next_layer_name`] follows for
+/// "Layer N".
+fn next_curves_name(layers: &aurora_doc::LayerTree) -> String {
+    let highest = layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| {
+            layers
+                .name(id)?
+                .strip_prefix("Curves ")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("Curves {}", highest.saturating_add(1))
+}
+
+/// New Curves Layer (0.155.0): an identity Curves adjustment, one undo
+/// step (`History::add_adjustment_layer_at`), at [`new_layer_placement`].
+fn new_curves_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_curves_name(cx.layers);
+    match cx.history.add_adjustment_layer_at(
+        cx.layers,
+        name,
+        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+        placement.parent,
+        placement.index,
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(?err, "New Curves Layer was refused by the layer tree");
+            None
+        }
+    }
+}
+
+/// Sets a Curves layer's parameters as one undoable structural step —
+/// the programmatic hook 0.155.0's tests drive, since the curve editor
+/// that will call this from Properties lands in 0.156.0. `false` (and
+/// nothing changed) when `id` is not a Curves layer.
+#[cfg(test)]
+fn set_layer_curves(
+    cx: &mut LayerCommandContext<'_>,
+    id: aurora_doc::LayerId,
+    params: aurora_core::CurvesParams,
+) -> bool {
+    if let Err(err) =
+        cx.history
+            .set_adjustment(cx.layers, id, aurora_doc::Adjustment::Curves(params))
+    {
+        tracing::warn!(?err, "setting curves was refused by the layer tree");
+        return false;
+    }
+    cx.undo_order
+        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    refresh_history_panel(cx.workspace, cx.undo_order);
+    cx.composite_cache.bump();
+    true
+}
+
 fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand> {
     let Some(target) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         tracing::info!("Delete Layer with no active layer; nothing to delete");
@@ -16617,6 +16879,9 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
             next_active: Some(id),
         }),
         LayerCommand::Delete => delete_layer(cx),
+        LayerCommand::NewCurves => new_curves_layer(cx).map(|id| AppliedLayerCommand {
+            next_active: Some(id),
+        }),
     };
     let Some(AppliedLayerCommand { next_active }) = next_active else {
         return false;
@@ -18858,6 +19123,9 @@ impl App {
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
+            Some(ActivatedCommand::NewCurvesLayer) => {
+                self.run_layer_command(LayerCommand::NewCurves);
+            }
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -20824,6 +21092,9 @@ impl App {
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
+            Some(ActivatedCommand::NewCurvesLayer) => {
+                self.run_layer_command(LayerCommand::NewCurves);
+            }
             None => {}
         }
         self.push_accessibility();
@@ -28795,10 +29066,10 @@ mod tests {
         };
         assert_eq!(state.query(), "lay");
         // "Focus Layers Panel", "Toggle Layers Panel", "Close Layers
-        // Panel", and (0.143.0) "New Layer" and "Delete Layer" all match
-        // -- the first inserted (`palette_commands`'s own order) is what
-        // ends up selected.
-        assert_eq!(state.results().len(), 5);
+        // Panel", (0.143.0) "New Layer" and "Delete Layer", and
+        // (0.155.0) "New Curves Layer" all match -- the first inserted
+        // (`palette_commands`'s own order) is what ends up selected.
+        assert_eq!(state.results().len(), 6);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -59892,6 +60163,171 @@ mod tests {
             assert_eq!(rig.text(), content_before, "nothing typed");
             assert_eq!(rig.focus.focused(), Some(field), "focus stays put");
         }
+
+        // -- New Curves Layer (0.155.0) -----------------------------------
+        mod curves_commands {
+            use super::*;
+            use aurora_doc::{Adjustment, LayerKind};
+
+            fn invert() -> aurora_core::CurvesParams {
+                match aurora_core::ToneCurve::new(&[
+                    aurora_core::CurvePoint::new(0.0, 1.0),
+                    aurora_core::CurvePoint::new(1.0, 0.0),
+                ]) {
+                    Ok(composite) => aurora_core::CurvesParams {
+                        composite,
+                        ..aurora_core::CurvesParams::identity()
+                    },
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+
+            impl Rig {
+                fn set_curves(&mut self, id: LayerId, params: aurora_core::CurvesParams) -> bool {
+                    crate::set_layer_curves(
+                        &mut LayerCommandContext {
+                            workspace: &mut self.workspace,
+                            focus: &mut self.focus,
+                            scales: &self.scales,
+                            layers: &mut self.layers,
+                            history: &mut self.history,
+                            pixel_history: &mut self.pixel_history,
+                            undo_order: &mut self.undo_order,
+                            layer_rows: &mut self.layer_rows,
+                            active_layer: &mut self.active,
+                            view: &mut self.view,
+                            composite_cache: &mut self.cache,
+                            drag: &mut self.drag,
+                            layer_controls: &mut self.state,
+                            click: &mut self.click,
+                            canvas_size: CANVAS,
+                        },
+                        id,
+                        params,
+                    )
+                }
+
+                fn curves(&self, id: LayerId) -> Option<aurora_core::CurvesParams> {
+                    match self.layers.kind(id) {
+                        Some(LayerKind::Adjustment(Adjustment::Curves(params))) => {
+                            Some(params.clone())
+                        }
+                        _ => None,
+                    }
+                }
+            }
+
+            #[test]
+            fn new_curves_layer_lands_above_the_active_layer_as_identity_and_becomes_active() {
+                let (mut rig, [top, mid, bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let added = only_new_root(&rig, &before);
+                assert_eq!(rig.layers.roots(), &[top, added, mid, bottom]);
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                assert_eq!(rig.layers.name(added), Some("Curves 1"));
+                assert_eq!(rig.layers.surface_id(added), None, "no pixel surface");
+                assert_eq!(rig.active, Some(added));
+                assert_eq!(
+                    aurora_ui::layer_row_description(&rig.layers, added),
+                    "Curves adjustment, Normal, 100%"
+                );
+                rig.assert_coherent();
+
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let second = only_new_root(&rig, &before);
+                assert_eq!(rig.layers.name(second), Some("Curves 2"));
+            }
+
+            #[test]
+            fn new_curves_layer_is_one_undo_step() {
+                let (mut rig, [_top, mid, _bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let added = only_new_root(&rig, &before);
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(!rig.layers.contains(added));
+                assert_eq!(rig.layers.roots(), before.as_slice());
+                assert_eq!(rig.active, Some(mid));
+                rig.assert_coherent();
+                assert!(rig.undo_redo(AppCommand::Redo));
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                rig.assert_coherent();
+            }
+
+            #[test]
+            fn setting_curves_is_one_undo_step_that_restores_the_previous_params() {
+                let (mut rig, [top, ..]) = Rig::three();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let Some(added) = rig.active else {
+                    unreachable!("the new layer is active");
+                };
+                assert!(rig.set_curves(added, invert()));
+                assert_eq!(rig.curves(added), Some(invert()));
+                let _ = rig.undo_redo(AppCommand::Undo);
+                assert_eq!(
+                    rig.curves(added),
+                    Some(aurora_core::CurvesParams::identity())
+                );
+                let _ = rig.undo_redo(AppCommand::Redo);
+                assert_eq!(rig.curves(added), Some(invert()));
+
+                let undo_len = rig.undo_order.undo.len();
+                assert!(
+                    !rig.set_curves(top, invert()),
+                    "a pixel layer has no curves"
+                );
+                assert_eq!(
+                    rig.undo_order.undo.len(),
+                    undo_len,
+                    "a refused set records nothing"
+                );
+            }
+
+            #[test]
+            fn delete_layer_removes_a_curves_layer_and_undo_restores_its_params() {
+                let (mut rig, _) = Rig::three();
+                assert!(rig.run(LayerCommand::NewCurves));
+                let Some(added) = rig.active else {
+                    unreachable!("the new layer is active");
+                };
+                assert!(rig.set_curves(added, invert()));
+                assert!(rig.run(LayerCommand::Delete));
+                assert!(!rig.layers.contains(added));
+                rig.assert_coherent();
+                let _ = rig.undo_redo(AppCommand::Undo);
+                assert_eq!(rig.curves(added), Some(invert()));
+            }
+
+            #[test]
+            fn new_curves_layer_is_in_the_palette_and_activates() {
+                assert!(
+                    palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::COMMAND_LAYER_NEW_CURVES
+                            && entry.title == "New Curves Layer")
+                );
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let mut focus = FocusManager::default();
+                let mut dialog = FakeFileDialog::default();
+                assert_eq!(
+                    activate_command(
+                        &mut workspace,
+                        &mut focus,
+                        crate::COMMAND_LAYER_NEW_CURVES,
+                        &mut dialog
+                    ),
+                    Some(ActivatedCommand::NewCurvesLayer)
+                );
+            }
+        }
     }
 
     // -- Layers-panel controls (0.135.0) ------------------------------------
@@ -62842,6 +63278,466 @@ mod tests {
             aur_verify_scratch_dir_unless(false).is_some(),
             "a live session still gets one"
         );
+    }
+    // -- Curves adjustment layers in the compositor (0.155.0) -------------
+    #[allow(clippy::float_cmp)]
+    mod curves_adjustment {
+        use super::*;
+        use aurora_doc::BlendMode;
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        /// `f16` holds about 3 significant digits near 1.0; an adjustment
+        /// round-trips the accumulator through un-premultiply, the LUT, a
+        /// blend and a re-premultiply, each rounding to `f16`.
+        const TOLERANCE: f32 = 3e-3;
+
+        fn curve(points: &[(f32, f32)]) -> aurora_core::ToneCurve {
+            let points: Vec<aurora_core::CurvePoint> = points
+                .iter()
+                .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+                .collect();
+            match aurora_core::ToneCurve::new(&points) {
+                Ok(curve) => curve,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn invert() -> aurora_core::CurvesParams {
+            aurora_core::CurvesParams {
+                composite: curve(&[(0.0, 1.0), (1.0, 0.0)]),
+                ..aurora_core::CurvesParams::identity()
+            }
+        }
+
+        /// Adds a Curves layer at `index` under `parent` (`0` is the top).
+        fn add_curves(
+            layers: &mut aurora_doc::LayerTree,
+            params: aurora_core::CurvesParams,
+            parent: Option<aurora_doc::LayerId>,
+            index: usize,
+        ) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at(
+                "Curves 1",
+                aurora_doc::Adjustment::Curves(params),
+                parent,
+                index,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// The CPU composite of tile `(0, 0)`, straight RGBA per texel.
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+        const INVERTED: [f32; 4] = [0.8, 0.6, 0.4, 1.0];
+
+        fn backdrop_stack(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
+            solid_root_stack(store, &[("bottom", BlendMode::Normal, 1.0, BACKDROP)])
+        }
+
+        #[test]
+        fn an_identity_curves_layer_is_an_exact_passthrough() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            let without = composite(&layers, &mut store);
+            let _ = add_curves(&mut layers, aurora_core::CurvesParams::identity(), None, 0);
+            let with = composite(&layers, &mut store);
+            assert_eq!(
+                with.iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                without
+                    .iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn an_inverting_curves_layer_inverts_the_composite_below_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let got = first(&layers, &mut store);
+            assert_close(got, INVERTED, "inverted");
+            assert_eq!(got[3], 1.0, "alpha untouched");
+        }
+
+        #[test]
+        fn curves_opacity_mixes_the_adjusted_colour_with_the_backdrop() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_opacity(id, 0.25) {
+                unreachable!("{err:?}");
+            }
+            // lerp(Cb, 1 - Cb, 0.25)
+            assert_close(first(&layers, &mut store), [0.35, 0.45, 0.55, 1.0], "25%");
+        }
+
+        #[test]
+        fn curves_blends_with_its_own_blend_mode() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            // Cb * (1 - Cb)
+            assert_close(
+                first(&layers, &mut store),
+                [0.16, 0.24, 0.24, 1.0],
+                "Multiply",
+            );
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Screen) {
+                unreachable!("{err:?}");
+            }
+            // 1 - (1 - Cb) * Cb
+            assert_close(
+                first(&layers, &mut store),
+                [0.84, 0.76, 0.76, 1.0],
+                "Screen",
+            );
+        }
+
+        #[test]
+        fn a_curves_mask_limits_where_it_applies() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = layers.add_mask(id, bounds) {
+                unreachable!("{err:?}");
+            }
+            let Some(mask_surface) = layers.mask_surface_id(id) else {
+                unreachable!("an adjustment layer can carry a mask");
+            };
+            for (column, coverage) in [(0, 1.0), (1, 0.0), (2, 0.5)] {
+                if let Err(err) = aurora_doc::write_mask_coverage(
+                    &mut store,
+                    mask_surface,
+                    TILE,
+                    column,
+                    0,
+                    coverage,
+                ) {
+                    unreachable!("{err:?}");
+                }
+            }
+            let texels = composite(&layers, &mut store);
+            let at = |i: usize| texels.get(i).copied().unwrap_or([f32::NAN; 4]);
+            assert_close(at(0), INVERTED, "full coverage");
+            assert_close(at(1), BACKDROP, "zero coverage");
+            assert_close(at(2), [0.5, 0.5, 0.5, 1.0], "half coverage");
+
+            if let Err(err) = layers.set_mask_enabled(id, false) {
+                unreachable!("{err:?}");
+            }
+            let texels = composite(&layers, &mut store);
+            assert_close(
+                texels.get(1).copied().unwrap_or([f32::NAN; 4]),
+                INVERTED,
+                "a disabled mask masks nothing",
+            );
+        }
+
+        #[test]
+        fn a_hidden_curves_layer_changes_nothing() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), BACKDROP, "hidden");
+        }
+
+        #[test]
+        fn curves_affects_only_the_layers_below_it_not_above() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let top = match layers.add_pixel_layer("top", bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(top) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.1, 0.1, 0.1, 0.5]);
+            // top (0.1 @ 0.5) over the inverted backdrop, top itself untouched.
+            assert_close(first(&layers, &mut store), [0.45, 0.35, 0.25, 1.0], "above");
+        }
+
+        #[test]
+        fn curves_inside_a_group_adjusts_only_that_groups_own_layers_and_keeps_their_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("outside", BlendMode::Normal, 1.0, [1.0, 0.0, 0.0, 1.0])],
+            );
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let inner = match layers.add_pixel_layer("inner", bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(inner) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
+            let _ = add_curves(&mut layers, invert(), Some(group), 0);
+            // The group's isolated result is (0.8, 0.6, 0.4) at alpha 0.5,
+            // over the untouched red outside layer.
+            assert_close(first(&layers, &mut store), [0.9, 0.3, 0.2, 1.0], "group");
+        }
+
+        #[test]
+        fn curves_keeps_a_translucent_backdrops_alpha_and_creates_no_pixels() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("half", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.8, 0.6, 0.4, 0.5], "translucent");
+            assert_eq!(got[3], 0.5, "alpha bit-exact");
+
+            let (_dir2, mut empty_store) = real_tile_store();
+            let mut empty = aurora_doc::LayerTree::new();
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = empty.add_pixel_layer("never painted", bounds, None) {
+                unreachable!("{err:?}");
+            }
+            let _ = add_curves(&mut empty, invert(), None, 0);
+            assert!(
+                composite(&empty, &mut empty_store)
+                    .iter()
+                    .all(|texel| *texel == [0.0; 4]),
+                "an adjustment over nothing stays transparent"
+            );
+        }
+
+        #[test]
+        fn a_blended_curves_layer_reads_a_translucent_backdrops_true_colour() {
+            // Multiply against the backdrop's *straight* colour, at its own
+            // alpha: the blend must see Cb = (0.2, 0.4, 0.6), not the
+            // accumulator's premultiplied (0.1, 0.2, 0.3) or a backdrop
+            // misread as premultiplied.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("half", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let id = add_curves(&mut layers, invert(), None, 0);
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.16, 0.24, 0.24, 0.5], "Multiply over translucent");
+            assert_eq!(got[3], 0.5, "alpha bit-exact");
+        }
+
+        #[test]
+        fn a_per_channel_curve_moves_only_its_own_channel_through_the_compositor() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let params = aurora_core::CurvesParams {
+                green: Some(curve(&[(0.0, 1.0), (1.0, 0.0)])),
+                ..aurora_core::CurvesParams::identity()
+            };
+            let _ = add_curves(&mut layers, params, None, 0);
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.6, 0.6, 1.0],
+                "green only",
+            );
+        }
+
+        #[test]
+        fn changing_a_curves_layers_params_changes_the_next_composite() {
+            // Same thread, two parameter sets: the per-thread LUT cache must
+            // key on the parameters, never hand back the first table built.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            assert_close(first(&layers, &mut store), INVERTED, "first params");
+            let lifted = aurora_core::CurvesParams {
+                composite: curve(&[(0.0, 0.5), (1.0, 1.0)]),
+                ..aurora_core::CurvesParams::identity()
+            };
+            if let Err(err) = layers.set_adjustment(id, aurora_doc::Adjustment::Curves(lifted)) {
+                unreachable!("{err:?}");
+            }
+            assert_close(
+                first(&layers, &mut store),
+                [0.6, 0.7, 0.8, 1.0],
+                "second params",
+            );
+        }
+
+        #[test]
+        fn the_gpu_predicate_refuses_a_visible_curves_layer_and_admits_a_hidden_one() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "setup"
+            );
+            let id = add_curves(&mut layers, invert(), None, 0);
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+
+        #[test]
+        fn begin_gpu_composite_tile_falls_back_for_a_curves_layer() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let pending = crate::begin_gpu_composite_tile(
+                &context,
+                &mut compositor,
+                &layers,
+                &mut store,
+                TILE,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            assert!(
+                pending.is_none(),
+                "a Curves layer has no GPU port: the tile must fall back, not drop the layer"
+            );
+        }
+
+        #[test]
+        fn gpu_and_cpu_agree_with_and_without_a_curves_layer() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "setup"
+            );
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(gpu.len(), cpu.len());
+            for (g, c) in gpu.iter().zip(&cpu) {
+                assert!(
+                    (g - c).abs() <= 2.0 * f32::from(half::f16::EPSILON),
+                    "{g} vs {c}"
+                );
+            }
+            let without_curves = cpu.clone();
+
+            let _ = add_curves(&mut layers, invert(), None, 0);
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(gpu.len(), cpu.len());
+            for (g, c) in gpu.iter().zip(&cpu) {
+                assert!(
+                    (g - c).abs() <= 2.0 * f32::from(half::f16::EPSILON),
+                    "{g} vs {c}"
+                );
+            }
+            // And the fallback really applied the curve: colour inverted,
+            // alpha kept.
+            for (texel, before) in cpu
+                .chunks_exact(4)
+                .zip(without_curves.chunks_exact(4))
+                .take(1)
+            {
+                if let ([r, g, b, a], [br, bg, bb, ba]) = (texel, before) {
+                    for (after, was) in [(r, br), (g, bg), (b, bb)] {
+                        assert!(
+                            (after - (1.0 - was)).abs() <= TOLERANCE,
+                            "{after} vs 1 - {was}"
+                        );
+                    }
+                    assert_eq!(a, ba);
+                }
+            }
+        }
     }
 }
 

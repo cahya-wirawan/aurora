@@ -178,6 +178,20 @@ impl ToneCurve {
         &self.points
     }
 
+    /// Whether this is exactly the two-point identity `(0, 0)`–`(1, 1)`,
+    /// which [`Self::evaluate`] maps to itself for every `x` in `[0, 1]`.
+    /// A curve with extra points on the diagonal is *not* reported as
+    /// identity: its spline is the identity in exact arithmetic, but this
+    /// check is about the stored shape, not a numeric property.
+    #[must_use]
+    #[allow(clippy::float_cmp)]
+    pub fn is_identity(&self) -> bool {
+        matches!(
+            self.points.as_slice(),
+            [a, b] if a.x == 0.0 && a.y == 0.0 && b.x == 1.0 && b.y == 1.0
+        )
+    }
+
     /// The curve's output at input `x`. `x` is clamped to `[0, 1]`, and a
     /// NaN `x` is treated as `0.0`. Exact (`==`) at every control point.
     /// The result is clamped to `[0, 1]` — a rounding safety net only;
@@ -476,6 +490,58 @@ fn tangents(points: &[CurvePoint]) -> Vec<f64> {
         }
     }
     m
+}
+
+/// A curve is written as its point list, `(x, y)` pairs in order — the
+/// tangents are derived data and never stored (0.155.0, for the Curves
+/// adjustment layer's `.aur`/journal encoding).
+impl serde::Serialize for ToneCurve {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.points.len()))?;
+        for point in &self.points {
+            seq.serialize_element(&(point.x, point.y))?;
+        }
+        seq.end()
+    }
+}
+
+/// Decoding re-validates through [`ToneCurve::new`], so a hostile or
+/// corrupt file can never produce a curve that breaks this module's
+/// invariants. At most [`MAX_POINTS`] elements are ever read: a longer
+/// sequence is refused at element `MAX_POINTS + 1` rather than buffered,
+/// whatever length prefix it claims.
+impl<'de> serde::Deserialize<'de> for ToneCurve {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PointsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PointsVisitor {
+            type Value = ToneCurve;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a sequence of {MIN_POINTS}..={MAX_POINTS} (x, y) tone-curve points"
+                )
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ToneCurve, A::Error> {
+                let mut points = Vec::with_capacity(MAX_POINTS);
+                while let Some((x, y)) = seq.next_element::<(f32, f32)>()? {
+                    if points.len() == MAX_POINTS {
+                        return Err(serde::de::Error::custom(ToneCurveError::TooManyPoints));
+                    }
+                    points.push(CurvePoint::new(x, y));
+                }
+                ToneCurve::new(&points).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_seq(PointsVisitor)
+    }
 }
 
 #[cfg(test)]

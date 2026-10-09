@@ -41,12 +41,55 @@ pub enum LayerKind {
     /// topmost — see [`crate::LayerTree`]'s own doc comment for the
     /// ordering convention this crate uses throughout).
     Group { children: Vec<LayerId> },
+    /// An adjustment layer (0.155.0): no pixel content of its own, it
+    /// re-maps the composite of everything below it in its own group
+    /// (or the document), then blends that result back over it with its
+    /// own opacity, blend mode and mask, exactly like Photoshop's
+    /// adjustment layers. It has no content surface
+    /// ([`crate::LayerTree::surface_id`] is `None`) and no `bounds`.
+    ///
+    /// **Declared last, and it must stay last.** `postcard` encodes an
+    /// enum variant by its ordinal, and every `.aur` manifest and history
+    /// journal written before 0.155.0 holds only ordinals `0` (`Pixel`)
+    /// and `1` (`Group`), so appending keeps every old file decoding
+    /// unchanged (the same additive rule `ColorSpaceTag::Icc` follows in
+    /// `aurora-io`). A build older than 0.155.0 refuses a file holding
+    /// this variant outright (an unknown ordinal), rather than opening it
+    /// without the adjustment.
+    Adjustment(Adjustment),
+}
+
+/// What an [`LayerKind::Adjustment`] layer does to the composite below
+/// it. One variant per adjustment; like [`LayerKind`], new variants are
+/// appended, never inserted (positional `postcard`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Adjustment {
+    /// Photoshop-model Curves: a composite RGB curve plus optional
+    /// per-channel curves ([`aurora_core::CurvesParams`]), applied by
+    /// `aurora_filters::CurvesLut`.
+    Curves(aurora_core::CurvesParams),
+}
+
+impl Adjustment {
+    /// A short, user-facing name for the adjustment ("Curves").
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Curves(_) => "Curves",
+        }
+    }
 }
 
 impl LayerKind {
     #[must_use]
     pub const fn is_group(&self) -> bool {
         matches!(self, Self::Group { .. })
+    }
+
+    /// Whether this is an [`Self::Adjustment`] layer.
+    #[must_use]
+    pub const fn is_adjustment(&self) -> bool {
+        matches!(self, Self::Adjustment(_))
     }
 }
 
@@ -496,5 +539,68 @@ mod tests {
              another; a missing index means the variant it belongs to is absent, so every count \
              derived by iterating ALL is short by one and no length assertion can see it."
         );
+    }
+}
+
+/// `LayerKind::Adjustment` is appended, so every pre-0.155.0 encoding
+/// still decodes (0.155.0).
+#[cfg(test)]
+mod adjustment_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `LayerKind` exactly as it was before 0.155.0.
+    #[derive(serde::Serialize)]
+    enum OldLayerKind {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+    }
+
+    #[test]
+    fn old_layer_kind_bytes_decode_unchanged_and_the_new_variant_round_trips() {
+        let rect = aurora_core::Rect {
+            x: -3,
+            y: 4,
+            width: 5,
+            height: 6,
+        };
+        let children = vec![super::LayerId::from_raw(7), super::LayerId::from_raw(9)];
+        for (old, new) in [
+            (
+                OldLayerKind::Pixel { bounds: rect },
+                LayerKind::Pixel { bounds: rect },
+            ),
+            (
+                OldLayerKind::Group {
+                    children: children.clone(),
+                },
+                LayerKind::Group {
+                    children: children.clone(),
+                },
+            ),
+        ] {
+            let old_bytes = match postcard::to_allocvec(&old) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            match postcard::from_bytes::<LayerKind>(&old_bytes) {
+                Ok(decoded) => assert_eq!(decoded, new),
+                Err(err) => unreachable!("old bytes must still decode: {err:?}"),
+            }
+            match postcard::to_allocvec(&new) {
+                Ok(bytes) => assert_eq!(bytes, old_bytes, "old variants encode unchanged"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let curves =
+            LayerKind::Adjustment(Adjustment::Curves(aurora_core::CurvesParams::identity()));
+        let bytes = match postcard::to_allocvec(&curves) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(bytes.first(), Some(&2), "appended as ordinal 2");
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, curves),
+            Err(err) => unreachable!("{err:?}"),
+        }
     }
 }
