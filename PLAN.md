@@ -26,7 +26,60 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.150.0): PSD vector masks are applied.**
+**Latest (2026-10-09, 0.151.0): opening a file decodes it off the UI
+thread.** `App::open_file` now only *starts* an open (invariant
+§7.3.4): a new `crates/aurora-app/src/background_open.rs` `OpenWorker`
+runs `decode_chosen_file` on its own `std::thread` (`aurora-app` has no
+async runtime and none was added) — the read and decode of a
+PNG/JPEG/TIFF, the whole PSD/PSB decode, and a `.aur` file's read plus
+0.143.1's throwaway-store pre-check (`precheck_aur`, split out of
+`read_aur_for_open`) — and hands back plain `Send` data
+(`DecodedFile`). The thread sends its result, *then* wakes the loop
+through an `EventLoopProxy` user event: the loop's user event type is
+now `AppEvent` (`Accessibility(accesskit_winit::Event)` |
+`OpenFinished`; `accesskit_winit` takes any `T: From<Event>`), and
+`about_to_wait` installs the result (`poll_background_open`). The
+install stays on the UI thread — the live `aurora_tile::TileStore` is
+`App`'s, not shared — and is the unchanged synchronous code: panels,
+sweep, pixel and mask writes, autosave, and for `.aur` the live read
+(`read_prechecked_aur`), which only ever sees bytes that passed the
+pre-check. **Measured install cost, and it is not small:** a 4096²,
+four-layer, uncompressed 8-bit PSD (304 MiB), dev test profile,
+RTX 3090 box, two runs — background decode 1.69 s; UI-thread install
+2.55–2.57 s (panels < 0.1 ms, tile writes 0.68 s, autosave
+1.88–1.89 s). So for a large file the UI thread still freezes for
+longer at install than the decode this round moved off it; not
+chunked, disclosed. While an open is pending the window title reads
+"Opening <file>… — Aurora" and the accessibility tree carries a
+`Role::Status`, polite-live node with the same text as the root's last
+child (`with_opening_status`); both clear on every outcome. A second
+open while one is pending **supersedes** it (newest wins): the old
+thread cannot be interrupted, runs to completion detached, and its
+result is dropped by generation id (`OpenWorker::take_finished`). The
+current document stays editable meanwhile; those edits are discarded
+when the new document replaces it, as an open always did. Quitting
+joins a decode thread that finishes within 100 ms
+(`SHUTDOWN_JOIN_BOUND`) and detaches the rest. A failed decode raises
+the same "Couldn't Open File" messages; a decode panic is caught and
+shown as a new `OpenFailure::Background` — **except in release
+builds, whose profile is `panic = "abort"`, where a decode panic still
+ends the process** (there the protection is `aurora-io`'s own
+`panic`/`unwrap`/`expect`/`indexing_slicing` denials; running out of
+memory aborts in every profile). After review (judge REVISE 0.80): an
+open that finishes while a modal dialog is up waits in the worker and
+installs — report or failure shown — once the dialog closes
+(`background_open_step`), at most one superseded decode may still run
+beside the pending one (a third open is refused, shown as "Couldn't
+Open File"), and a decode detached at quit can no longer recreate the
+session scratch directory (`SESSION_ENDING`). 19 new tests (10 worker,
+9 app-level) plus one `#[ignore]`d measurement; 17 of 18 mutations killed (the survivor is the one `about_to_wait` call line, which no headless test can reach). Test count
+2,863 (2,844 + 19; the pre-revision candidate's full gate measured
+2,858 passed, 0 failed, 47 ignored, 0 skipped with
+`AURORA_REQUIRE_GPU=1`; the revision's 5 new tests were measured in
+`aurora-app`'s own run). **Needs a human: open a large PSD on macOS and check the window
+stays responsive.** Details: "Next action", addendum 0.151.0.
+
+**Previously (2026-10-09, 0.150.0): PSD vector masks are applied.**
 `aurora-io` parses the `vmsk`/`vsms` block (version 3; invert, not-link
 and disable flags; subpath length records, linked/unlinked closed/open
 knots in signed 8.24 fixed point, vertical first, normalised to the
@@ -9089,6 +9142,17 @@ structural design work.
   `VectorMaskRasterised`, `VectorMaskUnreadable`, `VectorMaskTooLarge`,
   `VectorMaskDisabledDropped`; `VectorMaskNotApplied` is gone and
   `RealMaskNotUsed` fires only when the vector mask was not applied.
+  **Update 0.151.0 — the decode runs off the UI thread.** Closes the
+  §7.3.4 half of 0.144.0's "decode runs synchronously on the UI thread"
+  disclosure, for the decode only: `App::open_file` starts an
+  `OpenWorker` thread (`background_open.rs`) running
+  `decode_chosen_file`, and the loop installs the result when woken
+  (`AppEvent::OpenFinished`). The install — tile writes, mask writes,
+  autosave, and a `.aur`'s live read — is still on the UI thread and was
+  measured at ~2.6 s for a 4096² four-layer PSD, more than its decode.
+  An open that finishes under a modal dialog waits for it to close (review
+  E1). The §7.3.1 half (the whole file in memory, not streamed through the
+  tile store) is still open. "Next action", addendum 0.151.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30487,6 +30551,265 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.151.0) — opening a file decodes it off the UI
+thread.** Done as 0.151.0 (`crates/aurora-app/src/background_open.rs`,
+new; `crates/aurora-app/src/lib.rs`).
+
+*Shape.* `App::open_file` calls `OpenWorker::start(path,
+decode_chosen_file, wake)` and returns. `decode_chosen_file` is the
+whole background half: `open_image` for PNG/JPEG/TIFF,
+`std::fs::read` + `open_psd_document` for PSD/PSB, `std::fs::read` +
+`precheck_aur` for `.aur` (the 0.143.1 throwaway-store read, now on the
+decode thread; the throwaway store is created and dropped there). Its
+result is `DecodedFile` (`Image` | `Psd(PsdDocument)` | `Aur(Vec<u8>)`),
+plain `Send` data. The thread runs the decode under `catch_unwind`,
+sends `FinishedOpen { generation, path, result, decode_time }` on an
+`mpsc` channel, and only then calls `wake`, which in the app is
+`proxy.send_event(AppEvent::OpenFinished)`. The event loop's user event
+type changed from `accesskit_winit::Event` to `AppEvent`
+(`Accessibility(..)` | `OpenFinished`), with `From<accesskit_winit::Event>`
+so `Adapter::with_event_loop_proxy` is unchanged; `user_event` sets
+`needs_redraw` for `OpenFinished`, and `about_to_wait` calls
+`poll_background_open` first, which takes the result, clears the
+"Opening" state, installs (`install_finished_open` → `open_image_file`
+/ `open_psd_file` / `open_aur_file`, the old install bodies, now handed
+decoded data) and relays out. No tokio runtime exists in `aurora-app`
+and none was added.
+
+*Why the install stays on the UI thread.* The live `aurora_tile::TileStore`
+is owned by `App` and every writer of it runs on the UI thread; this
+round did not make it shared. A `.aur`'s live read
+(`read_prechecked_aur`) is therefore still a UI-thread decode of every
+tile — the pre-check moved off, the second read did not.
+
+*Measured install cost* (`measure_installing_a_large_psd_on_the_ui_thread`,
+`#[ignore]`d; `cargo test -p aurora-app --lib -- --ignored --nocapture
+measure_installing`; dev test profile — workspace crates at
+`opt-level = 1` — on the RTX 3090 box, two runs): a 4096², four-layer,
+uncompressed 8-bit PSD of 304 MiB decodes in 1.69 s on the background
+thread; the UI thread then spends 2.55–2.57 s installing it — panels
+< 0.1 ms, sweep + tile writes 0.68 s, autosave (`write_autosave`, a whole
+`.aur` written from the live store) 1.88–1.89 s. **The install is
+longer than the decode this round moved off the UI thread**, and the
+autosave is most of it. Not chunked this round; release numbers not
+measured.
+
+*Rules, and where each is pinned.*
+- Newest wins: a second open supersedes the pending one; the old thread
+  runs to completion detached and its result is dropped because its
+  generation is no longer the pending one
+  (`a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`,
+  `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one`).
+- A failure clears the pending state and comes back as its own
+  `OpenFailure` (`a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`),
+  with byte-identical messages to the synchronous path
+  (`a_failed_background_open_raises_the_same_couldnt_open_file_message`).
+- A panic becomes `OpenFailure::Background(BackgroundFailure::Panicked)`
+  and is shown in the real "Couldn't Open File" dialog
+  (`a_panicking_decode_is_reported_as_a_failed_open_and_does_not_take_the_caller_down`,
+  `a_caught_decode_panic_is_shown_as_couldnt_open_file`).
+- The decode really runs on another thread and wakes the caller
+  (`a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready`).
+- Quit is bounded: `OpenWorker::shutdown(SHUTDOWN_JOIN_BOUND = 100 ms)`
+  from `App::finish_shutdown` joins finished threads and detaches running
+  ones (`shutting_down_with_a_decode_still_running_returns_within_its_bound`,
+  `shutting_down_after_a_decode_finished_joins_its_thread`).
+- Same document as the synchronous path: layers (paint order, parents,
+  names, kinds, opacity, fill, blend, bounds, visibility, masks,
+  surfaces), `History::save_journal` bytes (the History panel's "Open"
+  origin), every layer's samples and offset, mask coverage, the import
+  report (the fixture carries an `lfx2` block, so "Opened With Changes"
+  has an item), and the composite after the install's own
+  `replace_document_pixels`
+  (`a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path`,
+  `a_background_image_open_decodes_the_same_pixels_as_the_synchronous_path`).
+- The `.aur` pre-check runs on the decode thread and refuses a damaged
+  file there; a sound file's checked bytes read into a live store as
+  before
+  (`a_background_aur_open_prechecks_in_a_throwaway_store_and_refuses_a_damaged_file`).
+- Loading state: title "Opening <file>… — Aurora" (`window_title`, file
+  name sanitised by `display_file_name`) and a `Role::Status`,
+  `Live::Polite` node labelled "Opening <file>…" appended as the root's
+  last child (`with_opening_status`, `OPENING_STATUS_NODE =
+  NodeId(u64::MAX)`), both gone once the result — here a failure — is
+  taken
+  (`the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure`).
+- Edits while pending are allowed and discarded at install, exactly as
+  an open always replaced the document; documented on `App::open_file`,
+  not tested (no headless `App`).
+
+*Mutations* — each file backed up to the session scratchpad
+(`mut151/`), mutated, `AURORA_REQUIRE_GPU=1 cargo test -q -p aurora-app
+--lib` run (631 tests, 1 ignored), restored, and checked against its
+recorded sha256 (all restores matched):
+
+| # | Mutation | Result | Killed by (among others) |
+|---|---|---|---|
+| M1 | decode run on the calling (UI) thread before spawning | killed, 4 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready`, `shutting_down_with_a_decode_still_running_returns_within_its_bound` |
+| M2 | generation check removed (every result taken as current) | killed, 3 | `a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`, `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one` |
+| M3 | `catch_unwind` removed | killed, 2 | `a_panicking_decode_is_reported_as_a_failed_open_and_does_not_take_the_caller_down`, `a_caught_decode_panic_is_shown_as_couldnt_open_file` |
+| M4 | a failed result is never returned (error not reported) | killed, 6 | `a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`, `a_failed_background_open_raises_the_same_couldnt_open_file_message` |
+| M5 | pending ("Opening") state not cleared on a failure | killed, 5 | `a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`, `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M6 | second-open rule inverted (oldest kept, newest dropped) | killed, 2 | `a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`, `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one` |
+| M7 | the thread's `wake` call removed | killed, 13 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready` and every app-level background test |
+| M8 | shutdown waits unbounded for running threads | killed, 1 | `shutting_down_with_a_decode_still_running_returns_within_its_bound` |
+| M9 | `.aur` pre-check removed from `decode_chosen_file` | killed, 1 | `a_background_aur_open_prechecks_in_a_throwaway_store_and_refuses_a_damaged_file` |
+| M10 | status node never added to the accessibility update | killed, 1 | `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M11 | window title ignores the pending open | killed, 1 | `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M12 | PSD routed to the flat-image decoder | killed, 2 | `a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path`, `a_failed_background_open_raises_the_same_couldnt_open_file_message` |
+| M13 | wake sent *before* the result (20 ms gap) | killed, 11 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready` and every app-level background test |
+| M14 | `poll_background_open` removed from `about_to_wait` | **survived** | none — the `App` wiring has no headless test (disclosed) |
+
+13 of 14 killed. M1's first run hung rather than failed (two test
+decodes waited unboundedly on a gate that only the test thread, now
+blocked inside the decode, could open); both gates were bounded at 10 s
+and the whole table above was re-run against the final tests.
+
+*Disclosures.*
+- **Install still blocks the UI thread** for as long as tile writes,
+  mask writes, autosave and (for `.aur`) the live read take — ~2.6 s for
+  the measured 4096² four-layer PSD, more than its decode.
+- **§7.3.1 still open:** the whole file is read into memory and the
+  whole document decoded before anything is installed; streaming it
+  layer by layer through the tile store is not done.
+- **Release builds abort on a decode panic** (`[profile.release] panic =
+  "abort"`): `catch_unwind` only works in unwinding (dev/test) builds.
+  In release the protection is the decoders' own lints — `aurora-io`,
+  like every workspace crate, denies `panic`, `unwrap`, `expect` and
+  `indexing_slicing` — so a panic there takes an arithmetic overflow or
+  a dependency's panic, not an ordinary bug. Allocation failure (out of
+  memory) aborts the process in **every** profile.
+- **The `App` wiring is inspection-only**: `poll_background_open` in
+  `about_to_wait`, the proxy wake closure, `user_event`'s
+  `OpenFinished` arm, the title updates and `finish_shutdown`'s
+  `shutdown` call — `App` needs a live `EventLoopProxy`, so no test
+  constructs it (M14 survives).
+- A superseded decode cannot be cancelled. Since the review (D1) at
+  most one may still run beside the pending one (`MAX_SUPERSEDED`), so
+  at most two whole files and documents are in memory at once; a third
+  open is refused as `BackgroundFailure::Busy`. A just-installed open's
+  thread counts as running until its `wake` call returns, so a third
+  open in that microsecond window is refused spuriously.
+- An open that finishes while a modal dialog is up waits (review E1),
+  and the "Opening …" title and status stay up until the dialog closes.
+  A live brush or eraser drag is dropped at install, as before.
+- On quit, a detached `.aur` pre-check may still be writing into the
+  session scratch directory that shutdown cleanup removes; its writes
+  then fail and the process exits. Since the review (C1) it can no
+  longer *recreate* that directory: `SESSION_ENDING` is set before the
+  cleanup and `aur_verify_scratch_dir` refuses once it is. A pre-check
+  that read the flag just before it was set can still recreate it (a
+  check-then-act window, not closed by a lock). Reasoned, not observed.
+- The status node is an accessibility node outside the widget tree, and
+  the visible state is the OS title bar only (nothing drawn in-app);
+  neither the title nor the announcement has been seen or heard on real
+  hardware or with a screen reader. The thread-spawn failure path
+  (`BackgroundFailure::Spawn`) is untested.
+- Measured in the dev test profile only.
+
+*Verified:* `cargo fmt --all --check`; `cargo clippy -p aurora-app
+--all-targets --all-features -- -D warnings`; `cargo check --workspace`;
+`AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --lib` (630 passed, 1
+ignored; 635 after the review revision); `cargo doc -p aurora-app --no-deps --all-features --document-private-items` (no warnings); `python3 scripts/check_layering.py`; `python3 scripts/check_no_hardcoded_style.py`. The coordinator's full gate on the
+pre-revision candidate: 2,858 passed, 0 failed, 47 ignored, 0 skipped.
+Test count after the revision 2,863 (2,844 + 19 new).
+
+*Review revision (0.151.0, same version).* The candidate's full gate
+passed (`AURORA_REQUIRE_GPU=1`: 2,858 passed, 0 failed, 47 ignored, 0
+skipped; clippy, strict rustdoc, `cargo deny` clean); judge REVISE 0.80.
+- **E1 (blocking) — fixed.** An install landing under a modal lost its
+  report: `open_psd_report_dialog` and `report_open_failure` only log
+  when the slot is taken, and async open made that reachable. Now
+  `background_open_step` (`background_open.rs`, behind an
+  `OpenInstaller` trait `App` implements) leaves a finished open in the
+  worker while `App::dialog` is set and installs it on the first
+  `about_to_wait` after the dialog closes — every close path (key,
+  click, accessibility action, menu) is an event the loop follows with
+  `about_to_wait`, so none needs its own hook. Install-later rather than
+  queue-the-message, so the document is never swapped beneath an alert
+  about the old one. Tests:
+  `the_open_step_defers_a_finished_open_while_a_modal_is_up_and_installs_it_after`,
+  `a_finished_open_waits_for_an_open_dialog_to_close_then_installs_and_shows_its_report`,
+  `a_failed_open_waits_for_an_open_dialog_to_close_then_shows_couldnt_open_file`
+  (the last two over a real workspace and dialog slot; their installer
+  calls the same report functions `App` does, but builds no document —
+  `App` is not constructible headlessly).
+- **D1 — fixed, refuse.** `MAX_SUPERSEDED = 1`: an open while one is
+  pending and a superseded decode still runs is refused with
+  `BackgroundFailure::Busy`, shown as "Couldn't Open File" ("Aurora is
+  still reading files you opened earlier…"). Test:
+  `a_third_open_while_two_decodes_still_run_is_refused_as_busy`.
+- **C1 — fixed.** `SESSION_ENDING` (an `AtomicBool`) is set in
+  `App::finish_shutdown` before the cleanup; `aur_verify_scratch_dir`
+  delegates to `aur_verify_scratch_dir_unless`, which returns `None` and
+  creates nothing once it is set. Test:
+  `no_aur_scratch_store_is_created_once_the_session_is_ending`. The
+  check-then-act window remains (disclosed above).
+- **W1 — done, partly.** The per-iteration step is now the free
+  `background_open_step` and is tested (M14b killed); deleting its one
+  call in `about_to_wait` (M14) still survives — that line is in `App`.
+- **B1, R1, A1 — done** (disclosures above; README now gives the
+  measured ~2.6 s; the autosave follow-on is named above).
+- **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+  clippy `-D warnings`, **2,863 passed, 0 failed, 0 skipped** (47
+  ignored), strict rustdoc, `cargo deny`. Judge round 2: **PASS 0.903**,
+  no blocking issue. Its notes, recorded: (J1) `aur_verify_scratch_dir`'s
+  doc now states the `SESSION_ENDING` exception, which also skips the
+  independent-temp fallback; (J2) the E1 tests' `DialogRig` re-implements
+  the dialog half of `App::install_finished_open` with the same helper
+  functions rather than calling it — a regression inside that method's
+  report path would not be caught (inherent while `App` cannot be built
+  headlessly); (J3) M14 survives, as above; (J4) a deferred result can
+  still be superseded when a dialog-closing event and a new open arrive
+  in the same event batch (every open route is blocked while a dialog is
+  up, so only then) — the older result is dropped by generation and its
+  report is never shown, acceptable because that document was never
+  installed and the user asked for a newer one.
+- **S1 — verified by inspection, no test.** All in-progress brush and
+  eraser state lives in `Drag::Brush`/`Drag::Eraser` (`stroke`,
+  `carry`, `last_doc`, `warned`) — `App` has no separate brush scratch
+  layer — and the install sets `self.drag = None` and replaces
+  `pixel_history`; the stroke's dabs are in the outgoing document's
+  tiles, which the install sweeps first. `handle_pointer_moved` only
+  advances an existing drag, so a still-held button paints nothing more
+  until the next press, and its release commits nothing.
+
+Mutations after the revision (all 18 re-run against the revised tests,
+same procedure):
+
+| # | Mutation | Result (failing tests) |
+|---|---|---|
+| M1–M13 | as in the table above | all killed again (M1: 5, M2: 3, M3: 2, M4: 7, M5: 5, M6: 3, M7: 17, M8: 1, M9: 1, M10: 1, M11: 1, M12: 3, M13: 14) |
+| M14 | `poll_background_open` call removed from `about_to_wait` | **survived** (the one line in `App`) |
+| M14b | `background_open_step` drops the result instead of installing it | killed, 3: `the_open_step_defers_…`, both `…_waits_for_an_open_dialog_to_close_…` |
+| M15 | E1 deferral removed (`modal_open` ignored) | killed, 3: the same three |
+| M16 | D1 cap removed | killed, 1: `a_third_open_while_two_decodes_still_run_is_refused_as_busy` |
+| M17 | C1 `session_ending` refusal removed | killed, 1: `no_aur_scratch_store_is_created_once_the_session_is_ending` |
+
+17 of 18 killed; `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --lib`
+on the revised code: 635 passed, 0 failed, 1 ignored.
+
+**Needs a human: open a large PSD on macOS and check the window stays
+responsive** (repaints, the canvas pans, panels scroll, the title reads
+"Opening …", VoiceOver announces it), and note how long the end-of-open
+pause is.
+
+*Named follow-on: the post-open autosave (review A1).*
+`install_opened_document` writes a whole `.aur` autosave from the live
+store right after an open — ~1.9 s of the measured ~2.6 s install. That
+write exists so a crash right after opening recovers the opened
+document. Candidate designs, each a crash-recovery semantics change and
+therefore not done here: (a) on open, delete the stale autosave and
+record the source path, recovering by re-opening the source file (the
+source must still exist and be unchanged; a hash or mtime check); or
+(b) an incremental or chunked autosave that writes the container a few
+tiles per frame, or from a compressed-tile snapshot on a worker thread.
+
+*Suggested next:* A1 above, then chunk the tile and mask writes across
+frames; after that, stream a PSD's layers through the tile store
+(§7.3.1) instead of decoding the whole file in memory.
 
 **Addendum 2026-10-09 (0.150.0) — PSD vector masks applied.** Done as
 0.150.0 (`crates/aurora-io/src/psd/vector.rs`, `psd.rs`, `psd/tests.rs`,
