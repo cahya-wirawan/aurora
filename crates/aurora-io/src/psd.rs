@@ -67,8 +67,10 @@
 //!   allocation.
 //! - An embedded ICC profile is ignored and the pixels are tagged sRGB.
 //! - User layer masks are applied (0.147.0: [`PsdMask`] →
-//!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); mask
-//!   density and feather are reported, not applied; vector masks,
+//!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); user-mask
+//!   density is applied as `aurora_doc::LayerMask::density` (0.149.0,
+//!   [`PsdMask::density`]); feather (user or vector) and vector-mask
+//!   density are reported, not applied; vector masks,
 //!   clipping, layer effects, blending ranges ("Blend If") and knockout are not applied either.
 //!   Adjustment and fill layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
@@ -244,6 +246,12 @@ pub struct PsdMask {
     /// Per-pixel coverage `0.0..=1.0`, row-major over `bounds`. `None`
     /// when the mask rectangle is empty.
     pub coverage: Option<Vec<f16>>,
+    /// The user-mask density to apply, `0..=255` (`255`, full, when the
+    /// file has no parameter block or the block names none) — see
+    /// `MaskParameters::applied_density` for the vector-density fallback
+    /// (0.149.0). Applied to the *effective* coverage, after the file's
+    /// invert flag, as psd-tools does.
+    pub density: u8,
 }
 
 /// One mask's coverage, ready to be written into its layer's mask
@@ -405,8 +413,8 @@ fn note_text(note: Note, n: u64) -> String {
              can't be edited."
         ),
         Note::MaskParametersNotApplied => format!(
-            "{n} layer mask{s} use{} density or feather, which Aurora doesn't apply yet; {} \
-             applied at full density with hard edges.",
+            "{n} layer mask{s} use{} a feather or a vector-mask density, which Aurora doesn't \
+             apply yet; {} applied with hard edges.",
             if one { "s" } else { "" },
             if one { "it is" } else { "they are" },
         ),
@@ -775,9 +783,41 @@ struct MaskInfo {
     bounds: Rect,
     default_color: u8,
     flags: u8,
-    /// The mask carries a user-mask density below 100 % or a non-zero
-    /// feather (flags bit 4's parameter block) — neither applied.
-    parameters: bool,
+    /// Flags bit 4's parameter block, as far as it could be read.
+    parameters: MaskParameters,
+}
+
+/// A mask's parameter block (flags bit 4), each field present only when
+/// the block's own presence byte says so *and* its bytes were there.
+/// psd-tools' `MaskParameters`, field for field.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MaskParameters {
+    user_density: Option<u8>,
+    user_feather: Option<f64>,
+    vector_density: Option<u8>,
+    vector_feather: Option<f64>,
+}
+
+impl MaskParameters {
+    /// The density Aurora applies to the user (pixel) mask, as a byte:
+    /// the user-mask density, else the vector-mask density, else full —
+    /// psd-tools' own rule (`composite.py` `_get_mask`). The vector
+    /// fallback is psd-tools' convention, followed so the two readers
+    /// agree; it is not verified against Photoshop.
+    fn applied_density(self) -> u8 {
+        self.user_density.or(self.vector_density).unwrap_or(u8::MAX)
+    }
+
+    /// Whether the block asks for anything Aurora does not apply: a
+    /// non-zero user or vector feather, or a vector-mask density that
+    /// [`Self::applied_density`] did not already use (a user density is
+    /// there too) and that is below full.
+    fn has_unapplied(self) -> bool {
+        let feathered = |f: Option<f64>| f.is_some_and(|f| f != 0.0);
+        feathered(self.user_feather)
+            || feathered(self.vector_feather)
+            || (self.user_density.is_some() && self.vector_density.is_some_and(|d| d != u8::MAX))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1003,37 +1043,54 @@ fn read_mask_info(r: &mut Reader<'_>) -> Option<MaskInfo> {
         bounds,
         default_color,
         flags,
-        parameters: flags & MASK_PARAMETERS != 0 && mask_parameters_in_use(r, total),
+        parameters: if flags & MASK_PARAMETERS != 0 {
+            read_mask_parameters(r, total)
+        } else {
+            MaskParameters::default()
+        },
     })
 }
 
-/// Whether a mask's parameter block (present when flags bit 4 is set)
-/// asks for a user-mask density below 255 or a non-zero user-mask
-/// feather. Read in psd-tools' order — after the 18-byte "real" mask
-/// fields when the mask data is at least 36 bytes long — and leniently:
-/// a truncated block is "not in use", since nothing about it is applied
-/// either way and it can only add a report line.
-fn mask_parameters_in_use(r: &mut Reader<'_>, total: usize) -> bool {
+/// A mask's parameter block (present when flags bit 4 is set). Read in
+/// psd-tools' order — after the 18-byte "real" mask fields when the mask
+/// data is at least 36 bytes long; then a presence byte whose bits 0–3
+/// announce user density (`u8`), user feather (`f64`), vector density
+/// (`u8`) and vector feather (`f64`), in that order — and leniently: a
+/// truncated block keeps whatever was read before the bytes ran out and
+/// stops there, since a short block is damage, not a request.
+fn read_mask_parameters(r: &mut Reader<'_>, total: usize) -> MaskParameters {
+    let mut params = MaskParameters::default();
     if total >= 36 && r.skip(18, "real user mask").is_err() {
-        return false;
+        return params;
     }
     let Ok(present) = r.u8("mask parameters") else {
-        return false;
+        return params;
     };
-    let mut in_use = false;
     if present & 1 != 0 {
-        match r.u8("user mask density") {
-            Ok(density) => in_use |= density != 255,
-            Err(_) => return in_use,
-        }
+        let Ok(density) = r.u8("user mask density") else {
+            return params;
+        };
+        params.user_density = Some(density);
     }
-    if present & 2 != 0
-        && let Ok(bytes) = r.array::<8>("user mask feather")
-    {
-        let feather = f64::from_be_bytes(bytes);
-        in_use |= feather != 0.0;
+    if present & 2 != 0 {
+        let Ok(bytes) = r.array::<8>("user mask feather") else {
+            return params;
+        };
+        params.user_feather = Some(f64::from_be_bytes(bytes));
     }
-    in_use
+    if present & 4 != 0 {
+        let Ok(density) = r.u8("vector mask density") else {
+            return params;
+        };
+        params.vector_density = Some(density);
+    }
+    if present & 8 != 0 {
+        let Ok(bytes) = r.array::<8>("vector mask feather") else {
+            return params;
+        };
+        params.vector_feather = Some(f64::from_be_bytes(bytes));
+    }
+    params
 }
 
 fn read_section(data: &[u8]) -> Option<Section> {
@@ -1540,6 +1597,7 @@ fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, I
         default_color: info.default_color,
         flags: info.flags,
         coverage,
+        density: info.parameters.applied_density(),
     }))
 }
 
@@ -1654,7 +1712,7 @@ fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
     if let Some(mask) = record.mask
         && record.has_channel(-2)
     {
-        if mask.parameters {
+        if mask.parameters.has_unapplied() {
             notes.add(Note::MaskParametersNotApplied);
         }
         if record.has_channel(-3) {
@@ -2244,6 +2302,10 @@ impl Builder<'_> {
     ///   (`History::set_mask_enabled(false)`), coverage still written —
     ///   the document model supports it, so nothing is reported, and
     ///   enabling it later shows Photoshop's mask.
+    /// - **Density** (0.149.0, [`PsdMask::density`]): set as the
+    ///   attached mask's own `LayerMask::density`
+    ///   (`History::set_mask_density`), not baked into the coverage, so
+    ///   it stays editable; `255` (full) sets nothing.
     /// - **Depth.** The samples were promoted from 8 or 16 bits by
     ///   [`decode_mask`] at the file's own depth.
     fn attach_mask(&mut self, id: LayerId, mask: PsdMask, region: Rect) -> Result<(), IoError> {
@@ -2253,6 +2315,14 @@ impl Builder<'_> {
         self.history.add_imported_mask(self.layers, id, bounds)?;
         if mask.flags & MASK_DISABLED != 0 {
             self.history.set_mask_enabled(self.layers, id, false)?;
+        }
+        // Density (0.149.0) as the editable `LayerMask::density`, not
+        // baked into the coverage: `255` is full, and stays the default
+        // so a file without a parameter block builds exactly the
+        // document 0.148.0 built (no extra undo step either).
+        if mask.density != u8::MAX {
+            self.history
+                .set_mask_density(self.layers, id, f32::from(mask.density) / 255.0)?;
         }
         let Some(values) = mask.coverage else {
             return Ok(());

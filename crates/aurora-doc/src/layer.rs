@@ -239,11 +239,44 @@ impl LayerLock {
 /// yet (`spike/psd-write/FINDINGS.md`: masks are still unspiked). `enabled`
 /// and `inverted` are the two toggles the modern UI actually exposes
 /// (shift-click a mask thumbnail to disable; Ctrl/Cmd+I to invert).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// **`density`** (0.149.0) is Photoshop's user-mask density, `0.0..=1.0`:
+/// how strongly the mask hides. The coverage a compositor applies is
+/// `density * c + (1 - density)`, where `c` is the coverage *after*
+/// `inverted` (psd-tools' own order and formula, `composite.py`
+/// `_get_mask`), so `1.0` is the mask exactly as painted and `0.0` is no
+/// mask at all. It is stored here, not baked into the coverage, so it
+/// stays editable (invariant §7.3.2) — [`crate::History::set_mask_density`].
+///
+/// **Why it is `#[serde(skip)]`.** `LayerMask` is `postcard`-encoded inside
+/// the `.aur` manifest *and* inside the history journal, and `postcard` is
+/// positional: a new field would make every existing `.aur` file and
+/// autosave fail to decode (`aurora-io`'s `aur.rs` module doc and its
+/// `postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`
+/// pin that down). So the field never reaches the wire as part of this
+/// struct: it decodes as `1.0`, and travels separately — as an optional
+/// `mask-density` entry in a `.aur` container, and as an appended
+/// `LayerOp::SetMaskDensity` that [`crate::History::save_journal`] emits
+/// after any journaled op that carries a reduced-density mask.
+///
+/// `PartialEq` but no longer `Eq`, since an `f32` is not; every public
+/// path that stores a density checks it is in `0.0..=1.0`
+/// ([`crate::LayerTree::set_mask_density`]), so a stored `NaN` is not
+/// reachable through this crate's own API.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LayerMask {
     pub bounds: Rect,
     pub enabled: bool,
     pub inverted: bool,
+    #[serde(skip, default = "full_mask_density")]
+    pub density: f32,
+}
+
+/// [`LayerMask::density`]'s default: the mask exactly as painted.
+pub const FULL_MASK_DENSITY: f32 = 1.0;
+
+fn full_mask_density() -> f32 {
+    FULL_MASK_DENSITY
 }
 
 /// One layer's bookkeeping: identity data plus its position in the tree.
@@ -281,6 +314,57 @@ impl LayerEntry {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pre-0.149.0 wire shape of [`super::LayerMask`], field for field.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct OldLayerMask {
+        bounds: aurora_core::Rect,
+        enabled: bool,
+        inverted: bool,
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn layer_mask_density_is_off_the_wire_so_old_bytes_decode_at_full_density() {
+        let rect = aurora_core::Rect {
+            x: 3,
+            y: -4,
+            width: 5,
+            height: 6,
+        };
+        let old = OldLayerMask {
+            bounds: rect,
+            enabled: false,
+            inverted: true,
+        };
+        let old_bytes = match postcard::to_allocvec(&old) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let decoded: super::LayerMask = match postcard::from_bytes(&old_bytes) {
+            Ok(mask) => mask,
+            Err(err) => unreachable!("an old mask must still decode: {err:?}"),
+        };
+        assert_eq!(decoded.bounds, rect);
+        assert!(!decoded.enabled);
+        assert!(decoded.inverted);
+        assert_eq!(decoded.density, super::FULL_MASK_DENSITY);
+
+        // And the new type writes exactly the old bytes, at any density —
+        // which is why the density needs its own carrier.
+        for density in [1.0, 0.5, 0.0] {
+            let new = super::LayerMask {
+                bounds: rect,
+                enabled: false,
+                inverted: true,
+                density,
+            };
+            match postcard::to_allocvec(&new) {
+                Ok(bytes) => assert_eq!(bytes, old_bytes, "{density}"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+    }
     use super::BlendMode;
 
     /// Zero if `I` is a valid index into [`BlendMode::ALL`], and a **compile

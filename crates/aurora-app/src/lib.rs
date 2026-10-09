@@ -9103,7 +9103,12 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// `mask.inverted` is applied to the **combined** coverage
 /// (`1.0 - c`), not to the containment test alone — inverting a
 /// half-painted mask has to flip the painted greys too, not just swap
-/// which side of the rectangle shows. That mirrors the two toggles
+/// which side of the rectangle shows. `mask.density` (0.149.0) is applied after that,
+/// to the post-invert coverage `c`, as `density * c + (1 - density)`
+/// (psd-tools' `_get_mask`) — so density `0.0` is no mask at all, `1.0`
+/// is the mask exactly as before, and outside `mask.bounds` (coverage
+/// `0.0`) a reduced-density mask shows the layer at `1 - density`. The
+/// fail-open `None` case below stays `1.0` whatever the density. That mirrors the two toggles
 /// [`aurora_doc::LayerMask`] itself exposes
 /// (`LayerTree::set_mask_enabled`/`set_mask_inverted`).
 ///
@@ -9231,10 +9236,18 @@ fn apply_mask(
         };
         let coverage = match raw {
             Some(raw) => {
-                if mask.inverted {
-                    1.0 - raw
+                let shown = if mask.inverted { 1.0 - raw } else { raw };
+                // Density (0.149.0) applies to the *post-invert*
+                // coverage, psd-tools' order and formula
+                // (`d * c + (1 - d)`). Only below full density, so a
+                // full-density mask -- every mask before 0.149.0 --
+                // takes exactly the arithmetic it always did, bit for
+                // bit (`1.0 * c + 0.0` is `c` too, but this does not
+                // lean on that).
+                if mask.density < aurora_doc::FULL_MASK_DENSITY {
+                    mask.density * shown + (1.0 - mask.density)
                 } else {
-                    raw
+                    shown
                 }
             }
             // Fail open *after* `inverted`, never before. Substituting
@@ -32431,6 +32444,7 @@ mod tests {
             },
             enabled: true,
             inverted: false,
+            density: aurora_doc::FULL_MASK_DENSITY,
         }
     }
 
@@ -35153,6 +35167,214 @@ mod tests {
                     coverage(mask.bounds.x + offset_x, mask.bounds.y + offset_y),
                 ) {
                     unreachable!("{err:?}");
+                }
+            }
+        }
+    }
+
+    // -- 0.149.0: mask density ------------------------------------------
+
+    /// Opaque red at the bottom, opaque blue on top, 10x10. The top is
+    /// either a pixel layer carrying the mask itself or (`in_group`) a
+    /// pixel layer inside a group that carries it. The mask covers
+    /// `x < 5`, painted `0.25` on row 0 and `1.0` below; `inverted` and
+    /// `density` (`None`: never set) are applied after.
+    fn density_fixture(
+        store: &mut aurora_tile::TileStore,
+        in_group: bool,
+        inverted: bool,
+        density: Option<f32>,
+    ) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (top, masked) = if in_group {
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            match layers.add_pixel_layer("top", bounds, Some(group)) {
+                Ok(id) => (id, group),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        } else {
+            match layers.add_pixel_layer("top", bounds, None) {
+                Ok(id) => (id, id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(store, surface, tile_id, rgba);
+        }
+        let mask_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 10,
+        };
+        if let Err(err) = layers.add_mask(masked, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+        paint_mask(
+            store,
+            &layers,
+            masked,
+            |_, y| if y == 0 { 0.25 } else { 1.0 },
+        );
+        if let Err(err) = layers.set_mask_inverted(masked, inverted) {
+            unreachable!("{err:?}");
+        }
+        if let Some(density) = density
+            && let Err(err) = layers.set_mask_density(masked, density)
+        {
+            unreachable!("{err:?}");
+        }
+        layers
+    }
+
+    /// The top layer's effective coverage `density_fixture` should give
+    /// at `(x, y)`: `d * c + (1 - d)` over the post-invert coverage.
+    fn density_fixture_coverage(x: u32, y: u32, inverted: bool, density: f32) -> f32 {
+        let raw = if x < 5 {
+            if y == 0 { 0.25 } else { 1.0 }
+        } else {
+            0.0
+        };
+        let shown = if inverted { 1.0 - raw } else { raw };
+        density * shown + (1.0 - density)
+    }
+
+    #[test]
+    fn composite_document_applies_mask_density_linearly_after_invert_on_a_layer_and_a_group() {
+        for in_group in [false, true] {
+            for inverted in [false, true] {
+                for density in [0.0, 0.25, 0.5, 1.0] {
+                    let (_dir, mut store) = real_tile_store();
+                    let layers = density_fixture(&mut store, in_group, inverted, Some(density));
+                    let image = match composite_document(&layers, &mut store, 10, 10) {
+                        Ok(image) => image,
+                        Err(err) => unreachable!("{err:?}"),
+                    };
+                    for (x, y) in [(1, 0), (1, 3), (7, 0), (7, 3)] {
+                        let want = density_fixture_coverage(x, y, inverted, density);
+                        let [r, g, b, a] = image_pixel(&image, x, y);
+                        let case = format!(
+                            "group={in_group} inverted={inverted} density={density} ({x}, {y})"
+                        );
+                        assert!((a - 1.0).abs() < 1e-3, "{case}: alpha {a}");
+                        assert!(g.abs() < 1e-3, "{case}: green {g}");
+                        assert!(
+                            (b - want).abs() < 2e-3 && (r - (1.0 - want)).abs() < 2e-3,
+                            "{case}: want blue {want}, got ({r}, {g}, {b}, {a})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composite_document_at_full_density_is_bit_identical_to_a_mask_never_given_one() {
+        // Density 1.0 must take the pre-0.149.0 arithmetic exactly, not
+        // merely within a tolerance.
+        for in_group in [false, true] {
+            for inverted in [false, true] {
+                let (_dir, mut store) = real_tile_store();
+                let untouched = density_fixture(&mut store, in_group, inverted, None);
+                let before = match composite_document(&untouched, &mut store, 10, 10) {
+                    Ok(image) => image,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let (_dir2, mut store2) = real_tile_store();
+                let explicit = density_fixture(&mut store2, in_group, inverted, Some(1.0));
+                let after = match composite_document(&explicit, &mut store2, 10, 10) {
+                    Ok(image) => image,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                for y in 0..10 {
+                    for x in 0..10 {
+                        assert_eq!(
+                            image_pixel(&before, x, y).map(f32::to_bits),
+                            image_pixel(&after, x, y).map(f32::to_bits),
+                            "group={in_group} inverted={inverted} ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_reduced_density_mask() {
+        // Masks reach the GPU path through `resolve_tile`, which runs
+        // `apply_mask` on the CPU per root before the GPU blends, so the
+        // GPU path must see the density too.
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        for inverted in [false, true] {
+            for density in [0.0, 0.5, 1.0] {
+                let (_dir, mut store) = real_tile_store();
+                let layers = density_fixture(&mut store, false, inverted, Some(density));
+                assert!(
+                    document_qualifies_for_gpu_compositing(&layers),
+                    "two root Normal pixel layers must take the GPU path"
+                );
+                let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+                let residency =
+                    aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+                let _ = take_gpu_composite_submit_count();
+                let mut gpu_cache = CompositeCache::default();
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                recomposite_visible_tiles(
+                    &residency,
+                    &layers,
+                    None,
+                    &mut store,
+                    &mut gpu_cache,
+                    Some(&context),
+                    Some(&mut compositor),
+                );
+                assert!(
+                    take_gpu_composite_submit_count() > 0,
+                    "the GPU path really submitted"
+                );
+                let gpu = read_first_texel(&mut store, composite_surface_id(), tile_id);
+                let mut cpu_cache = CompositeCache::default();
+                recomposite_visible_tiles(
+                    &residency,
+                    &layers,
+                    None,
+                    &mut store,
+                    &mut cpu_cache,
+                    None,
+                    None,
+                );
+                let cpu = read_first_texel(&mut store, composite_surface_id(), tile_id);
+                // Texel (0, 0): painted 0.25.
+                let want = density_fixture_coverage(0, 0, inverted, density);
+                for (result, path) in [(gpu, "GPU"), (cpu, "CPU")] {
+                    let (r, g, b, a) = result;
+                    assert!(
+                        (b - want).abs() < 2e-3
+                            && (r - (1.0 - want)).abs() < 2e-3
+                            && g.abs() < 1e-3
+                            && (a - 1.0).abs() < 1e-3,
+                        "{path} inverted={inverted} density={density}: want blue {want}, \
+                         got {result:?}"
+                    );
                 }
             }
         }
