@@ -25276,6 +25276,8 @@ mod tests {
         rect: (i32, i32, i32, i32),
         channels: Vec<(i16, Vec<u8>)>,
         mask: Option<(i32, i32, i32, i32, u8, u8)>,
+        /// Tagged blocks after the name (0.150.0: a `vmsk`).
+        blocks: Vec<([u8; 4], Vec<u8>)>,
     }
 
     /// A minimal, uncompressed 8-bit PSD (0.147.0) — just enough of the
@@ -25333,6 +25335,12 @@ mod tests {
             }
             be32(&mut extra, 0);
             extra.extend_from_slice(&[1, b'L', 0, 0]);
+            for (key, data) in &layer.blocks {
+                extra.extend_from_slice(b"8BIM");
+                extra.extend_from_slice(key);
+                be32(&mut extra, data.len());
+                extra.extend_from_slice(data);
+            }
             be32(&mut info, extra.len());
             info.extend_from_slice(&extra);
         }
@@ -25366,6 +25374,7 @@ mod tests {
                 (2, vec![rgb[2]; n]),
             ],
             mask: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -25456,6 +25465,59 @@ mod tests {
         }
     }
 
+    /// 0.150.0: a PSD vector mask is rasterised and composited — a blue
+    /// layer masked by the rectangle x 2.5..6, y 2..6 (normalised in the
+    /// file's 8.24 fixed point, vertical first) over a red one on 8×8:
+    /// blue inside, red outside, an even mix in the half-covered column.
+    #[test]
+    fn an_opened_psds_vector_mask_is_composited() {
+        let fixed = |v: f64| ((v * f64::from(1_u32 << 24)).round() as i32).to_be_bytes();
+        let mut block = 3_u32.to_be_bytes().to_vec();
+        block.extend_from_slice(&0_u32.to_be_bytes());
+        let mut subpath = vec![0_u8, 0, 0, 4, 0, 1];
+        subpath.resize(26, 0);
+        block.extend_from_slice(&subpath);
+        for (x, y) in [(0.3125, 0.25), (0.75, 0.25), (0.75, 0.75), (0.3125, 0.75)] {
+            block.extend_from_slice(&1_u16.to_be_bytes());
+            for _ in 0..3 {
+                block.extend_from_slice(&fixed(y));
+                block.extend_from_slice(&fixed(x));
+            }
+        }
+        let (_scratch, mut store) = real_tile_store();
+        let mut top = tiny_solid((0, 0, 8, 8), [0, 0, 255]);
+        top.blocks.push((*b"vmsk", block));
+        let bytes = tiny_psd(8, 8, 3, &[tiny_solid((0, 0, 8, 8), [255, 0, 0]), top]);
+        let (document, image) = open_and_composite_psd(
+            &bytes,
+            &mut store,
+            (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+        );
+        assert!(
+            document
+                .report
+                .items
+                .iter()
+                .any(|item| item.contains("converted to a pixel mask")),
+            "{:?}",
+            document.report
+        );
+        for (x, y, m) in [
+            (0, 0, 0.0),
+            (1, 4, 0.0),
+            (2, 4, 0.5),
+            (3, 2, 1.0),
+            (5, 5, 1.0),
+            (6, 5, 0.0),
+            (4, 6, 0.0),
+            (7, 7, 0.0),
+        ] {
+            let want = [1.0 - m, 0.0, m, 1.0];
+            let got = image_pixel(&image, x, y);
+            assert!(near(got, want), "({x}, {y}): {got:?}");
+        }
+    }
+
     /// 0.147.0, the aliasing trap: the outgoing document's layer 0 had a
     /// mask painted fully hidden on the same derived mask surface the
     /// incoming PSD's layer 0 gets. The sweep must run first (no stale
@@ -25535,6 +25597,7 @@ mod tests {
                 (-2, vec![0]),
             ],
             mask: Some((1, 1, 2, 2, 255, 0)),
+            blocks: Vec::new(),
         };
         let (_document, image) = open_and_composite_psd(
             &tiny_psd(2, 2, 1, &[layer]),

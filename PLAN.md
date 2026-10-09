@@ -26,7 +26,58 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.149.0): PSD mask density is applied, and
+**Latest (2026-10-09, 0.150.0): PSD vector masks are applied.**
+`aurora-io` parses the `vmsk`/`vsms` block (version 3; invert, not-link
+and disable flags; subpath length records, linked/unlinked closed/open
+knots in signed 8.24 fixed point, vertical first, normalised to the
+document; fill-rule, clipboard and initial-fill records) in a new
+`psd/vector.rs`, and rasterises it with its own scanline filler
+(`scripts/layering.json` does not let `aurora-io` depend on
+`aurora-vector`; that edge was not added): cubic Béziers flattened by
+Wang's bound at 0.05 px, each subpath filled non-zero with exact
+horizontal and 16-sub-scanline vertical coverage, subpaths grouped and
+combined with psd-tools' own operation rules (exclude/combine/subtract/
+intersect, the first subtract/intersect starting from everything,
+`-1` joining the previous group), psd-tools' initial-fill rule, and
+the invert flag (which psd-tools ignores). The mask flags' bit 3 ("came
+from rendering other data") turned out to matter: on every vector-masked
+corpus layer the `-2` channel is Photoshop's *own rendering* of the
+vector mask (with the real user mask, `-3`, when there is one), so it is
+not applied again; the pixel part is the real user mask, and Aurora's
+coverage is `real user mask × vector`, each density baked into its own
+part when both exist (one `LayerMask::density` cannot hold two), the
+vector density kept editable when the vector mask stands alone.
+Corpus: 18 layers in 8 fixtures — against Photoshop's own rendering
+the per-pixel maximum difference is 0.0298 (curved), 0.0444 (two
+intersected subpaths) and 0.0000 on the other 13 compared layers;
+against psd-tools' `draw_vector_mask` Aurora is lower by ~63/255 per
+edge pixel, which is `aggdraw`'s own outward band. All 16 mutations
+killed (34 of 34 after the two review revisions). "Opened With Changes" now says
+a vector mask was *converted to a pixel mask* (no longer editable or
+resolution-independent), and lists unreadable, too-large and turned-off
+ones — or, when one can't be converted but the file carries Photoshop's
+own rendering of it, that the rendering was applied instead. Review
+revisions (judge REVISE 0.77, then 0.85, both on unbounded work):
+parsing, flattening and every scanline pass are now charged to one
+per-file work budget before they run, empty subpath groups are folded
+into a constant, and once the budget is spent no further vector mask
+is even parsed. Measured worst case, release, **on the UI thread**:
+~0.5 s for one mask at the per-mask cap, ~2.1 s for a whole file of
+scanline-heavy masks, ~1.2 s for a ~117 MB file of 1,100
+flattening-heavy, off-canvas masks. The work caps also limit real
+files: one mask converts at most ~38 Mpx of raster (about 6,000²), one
+file ~150 Mpx in all; past that a mask is reported "too large or
+complex". Not bounded by the work budget, only by the pixel budget:
+`combine_masks` over its rectangle and the `-3` decode. Gate before the
+revisions: 2,832, then 2,842 (round 2), passed, 0 failed, 0 skipped
+(`AURORA_REQUIRE_GPU=1`); round 3 measured 2,845 passed, then 2,844
+passed / 46 ignored once the heavy worst-case test became `#[ignore]`d;
+judge round 3 PASS 0.91. Tested headlessly and on a
+real GPU only — **not compared against Photoshop directly. Needs a
+human: compare a vector-masked PSD against Photoshop.** Details: "Next
+action", addendum 0.150.0.
+
+**Previously (2026-10-09, 0.149.0): PSD mask density is applied, and
 editable.** `aurora_doc::LayerMask` gains `density: f32` (default
 `FULL_MASK_DENSITY` = `1.0`); `aurora-app`'s `apply_mask` (the one
 mask path — the GPU path reaches it too, through `resolve_tile` per
@@ -9021,6 +9072,23 @@ structural design work.
   fallback did not use; its text names "a feather or a vector-mask
   density". The model side (`LayerMask::density`, `.aur`
   `mask-density`, the journal carrier) is in addendum 0.149.0.
+
+  **Update 0.150.0 — vector masks applied.** `Record::vector` keeps the
+  first `vmsk`/`vsms` block; `MaskInfo::real` reads the 18 real-mask
+  bytes (real flags, real default colour, real rectangle — psd-tools'
+  order, before the parameter block). `masks_for` replaces
+  `mask_or_report` for layers and groups: without an applicable vector
+  mask it *is* 0.149.0's path; with one, `vector::parse` +
+  `vector::rasterize` produce coverage over the paths' bounding box
+  (clipped to the canvas, charged against what the declared rectangles
+  leave of `PIXEL_BUDGET`), `pixel_part` picks `-3` (with the real
+  frame) when flags bit 3 marks `-2` as a rendering, else `-2`, and
+  `combine_masks` multiplies them with each density baked in. A shape
+  layer's (fill + vector) mask is still not applied — its pixels are the
+  rendered shape, and psd-tools does not apply it either. New notes:
+  `VectorMaskRasterised`, `VectorMaskUnreadable`, `VectorMaskTooLarge`,
+  `VectorMaskDisabledDropped`; `VectorMaskNotApplied` is gone and
+  `RealMaskNotUsed` fires only when the vector mask was not applied.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30419,6 +30487,296 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.150.0) — PSD vector masks applied.** Done as
+0.150.0 (`crates/aurora-io/src/psd/vector.rs`, `psd.rs`, `psd/tests.rs`,
+`aurora-app`'s `an_opened_psds_vector_mask_is_composited`).
+
+*Semantics (psd-tools 1.17.4, `composite/vector.py`).* Knots are
+`preceding, anchor, leaving`, each `(y, x)` in 8.24 fixed point times
+the document's height and width; the edge between knots `a`, `b` is
+the cubic `a.anchor, a.leaving, b.preceding, b.anchor`; closed subpaths
+also join last to first, open ones are closed by a straight line; a
+subpath with fewer than two knots draws nothing. Each subpath is filled
+non-zero (AGG's default, which `aggdraw` uses) and the subpaths of one
+group are composited with "over". Groups combine in order: `0` exclude,
+`1` combine, `2` subtract, `3` intersect; the first subtract/intersect
+inverts the starting value; any other operation is skipped. The
+starting value is `1` only for a non-zero initial-fill record *and no
+subpaths at all*. The invert flag is applied as `1 − m` (psd-tools does
+not apply it). A disabled vector mask is left out (and reported, since
+it cannot be turned back on). Vector feather stays reported, not
+applied.
+
+*The `-2` channel is a rendering.* Measured on the corpus: every
+vector-masked layer with a `-2` channel has mask flags bit 3 set, and
+there `-2` is Photoshop's own rendering — of the vector mask alone, or
+of the real user mask (`-3`) times the vector mask. Applying `-2` and
+then the vector mask (what psd-tools does) squares the edges and the
+density. So with an applied vector mask Aurora uses `-3` (real frame)
+as the pixel part when bit 3 is set, `-2` only when it is not.
+Measured: at full density `real user mask × Aurora's vector raster`
+equals Photoshop's `-2` rendering with max per-pixel |Δ| **0.0000** on
+`mask-density-layervectormask.psd` "Layer 1 copy 3",
+`vector-mask2.psd` "Masked Rectangle 1" and `vector-mask3.psd`
+"Group 1".
+
+*Density.* Vector only: coverage = the raster, `LayerMask::density` =
+the vector density (exact and editable). Both: `(d_u·U + 1 − d_u) ×
+(d_v·V + 1 − d_v)` baked into the coverage, density 1 — one density
+cannot express two, so the densities stop being editable on such
+layers. psd-tools instead applies "user, else vector" density to the
+rendered `-2`, multiplies by the vector mask and applies the vector
+density again; Aurora does not follow that. As a result four layers
+left 0.149.0's density table (`mask-density-layervectormask.psd`, now
+baked) and `mask_parameters.psd` "Rectangle 1" (its user density 204
+now applies only to an empty, shown real user mask).
+
+*Corpus differential* (`corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering`;
+expected values computed by psd-tools 1.17.4 with `aggdraw` 1.4.1 and
+committed as data — 18 layers, 8 files; the three `vector-mask*.ps[db]`
+32-bit files are refused by Aurora and so are not compared):
+
+| Layer | Aurora sum | psd-tools sum | Δ (edge px) | vs Photoshop's own `-2`, max \|Δ\| |
+|---|---|---|---|---|
+| clipping-mask2 "Rounded Rectangle 1" | 190,008.666 | 190,429.020 | −420.354 (1748) | 0.0298 |
+| mask-density-vectormask ×4, mask-vector-density ×4 | 128.000 | 133.988 / 138.000 | −5.988 / −10.000 (25 / 42) | 0.0000 |
+| mask_parameters "Rectangle 1" | 25,600.001 | 25,757.725 | −157.724 (661) | 0.0000 |
+| passthrough_vector_mask "Group 1" | 256.000 | 263.965 | −7.965 (33) | 0.0000 |
+| vector-mask2 "Color Fill 1" (two intersects) | 11.605 | 13.241 | −1.636 (20) | 0.0444 |
+| mask-density-layervectormask ×4 | 128.000 | 133.988 / 138.000 | −5.988 / −10.000 | combined: 0.0000 at full density |
+| vector-mask2 "Masked Rectangle 1" | 81.000 | 90.129 | −9.129 (40) | combined: 0.0000 |
+| vector-mask3 "Group 1" (initial fill) | 65,536.000 | 65,536.000 | 0.000 | combined: 0.0000 |
+
+Against psd-tools the per-pixel maximum is 0.2471 (= 63/255) on every
+layer with an edge, measured offline from dumped planes: `aggdraw`
+paints a 63/255 band outside every edge (Photoshop does not), so the
+committed tolerance is 63/255 per psd-tools edge pixel plus 0.5 on the
+sum, and the per-pixel check (≤ 1/16: 16 sub-scanlines put one edge
+within 1/32, two edges can share a pixel) is against Photoshop's own
+rendering instead.
+
+*Bounds.* ≤ 65,536 records; ≤ 256 segments per cubic and ≤ 2^20 per
+mask; scanline work (edge crossings + each subpath's box area) ≤ 2^28;
+the raster rectangle and any `-3` or combined rectangle are charged
+against `PIXEL_BUDGET` minus the declared rectangles; every buffer is
+`try_reserve`d. Exceeding any of them is a "too large or complex"
+report line and the 0.149.0 behaviour for that layer — never a refused
+file. Truncation and 3,000-mutation sweeps over two vector-masked
+files (one with `-2`, `-3`, real fields and a full parameter block):
+no panics.
+
+*Mutations* (each file backed up to the session scratchpad, restored,
+sha256 checked; `cargo test -p aurora-io --lib psd::`):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | invert flag ignored | killed | `an_inverted_vector_mask_shows_outside_and_hides_inside` |
+| 2 | subpath operation ignored (all combine) | killed | `subpath_operations_combine_…`, `a_first_subtract_or_intersect_…`, corpus vector |
+| 3 | even-odd instead of non-zero | killed | `a_self_overlapping_subpath_is_filled_with_the_nonzero_rule` |
+| 4 | knot x/y swapped | killed | 8 tests incl. the parser test and both corpus tests |
+| 5 | width/height swapped | killed | `x_is_scaled_by_the_width_and_y_by_the_height` |
+| 6 | Bézier as straight lines | killed | ellipse test, corpus vector, segment-cap test |
+| 7 | no pixel × vector intersection | killed | `a_rendered_user_mask_is_replaced_…`, corpus vector |
+| 8 | disabled flag ignored | killed | `a_disabled_vector_mask_is_ignored_…` |
+| 9 | record cap removed | killed | `too_many_records_or_segments_are_bounded_and_reported` |
+| 10 | flatten tolerance 50 px | killed | ellipse test, corpus vector |
+| 11 | first-group inversion ignored | killed | `a_first_subtract_or_intersect_starts_from_everything` |
+| 12 | render flag ignored (`-2` reused) | killed | `a_rendered_user_mask_is_replaced_…`, corpus density |
+| 13 | segment cap removed | killed | `too_many_records_or_segments_are_bounded_and_reported` |
+| 14 | vector density dropped | killed | 3 tests |
+| 15 | initial fill used with subpaths | killed | `the_initial_fill_shows_…`, corpus vector |
+| 16 | raster not charged to budget | killed | `the_raster_is_charged_against_the_budget_…` |
+
+*Disclosures.* The path is not kept: "converted to a pixel mask" is a
+report line, not a footnote, because enlarging or re-editing the shape
+is a real loss a user would not otherwise see. Vector-mask coverage
+outside the canvas is the mask's outside constant (the raster is
+clipped to the canvas). With both masks, the densities are baked and
+no longer editable; a turned-off pixel mask next to an applied vector
+mask is dropped. When the vector mask is disabled Aurora keeps 0.149.0's
+behaviour (it applies `-2`), which assumes Photoshop does not render a
+disabled vector mask into `-2` — no corpus file shows either way. The
+non-zero rule is AGG's default as `aggdraw` uses it, read from the
+code, not confirmed by a self-intersecting corpus path; the fill-rule
+record is ignored, as psd-tools ignores it. A leading `-1` operation is
+read as combine (psd-tools raises there). A raster pixel peaks at 10
+bytes (two `f32` planes plus the `f16` result) and is charged 2 budget
+pixels (16 bytes) of `PIXEL_BUDGET` (review revision, G7). The decode still runs on the UI
+thread (invariant §7.3.4). Flattening loses up to ~(2/3)·0.05 px of area
+per unit perimeter (chords lie inside curves). Test count left at
+2,810 for the coordinator to measure.
+
+*Review revision (judge REVISE 0.77; gate before revision 2,832
+passed, 0 failed, 0 skipped, `AURORA_REQUIRE_GPU=1`; 2,842 after it — 10
+new `aurora-io` tests, counted, not yet re-measured as a full gate).*
+
+- **G1 (unbounded work).** The whole-raster passes were not charged and
+  zero-knot subpaths formed groups that cost a full pass each (~2.2e12
+  operations for 65,530 of them on 4,096²). Now `vector::work_for`
+  charges, before any raster exists: every edge crossing times
+  `1 + log2(edges)`, a step per sub-scanline and two passes over each
+  subpath's box (the per-row resets now touch only that box's columns),
+  three whole-raster passes per group that draws anything, and two for
+  the result. A group that draws nothing is folded into a constant (on a
+  uniform mask its operation is applied to the constant; on a
+  materialised one it is the identity, or a reset to `0` for
+  intersect), so it costs no per-pixel pass — matching psd-tools, whose
+  plane for such a group is all zero. Regression:
+  `a_flood_of_empty_subpaths_costs_no_per_pixel_pass` (65,530 empty
+  subpaths on 2,048², < 5 s asserted, ~ms measured) and
+  `many_drawn_groups_are_refused_by_their_whole_raster_passes`.
+  Corner-to-corner cubics (handles on their anchors) are now one exact
+  segment instead of a Wang-bound split of a straight line.
+- **G2 (per-file work, sort cost).** A `vector::Budget { pixels, work }`
+  is threaded through the whole layer tree; `MAX_FILE_VECTOR_WORK` =
+  2^30 (four masks at the 2^28 per-mask cap). Measured on this machine
+  (release; debug in parentheses): the worst case at the per-mask cap —
+  a 4,096-edge zigzag spanning a 4,096 × 256 canvas, work 242,291,218 —
+  **0.21 s in order and 0.51 s with the crossings shuffled** (0.22 s /
+  0.82 s); a file of five such masks converts four and reports one, the
+  whole open taking **2.03 s** (3.37 s). (Round 2 found parsing and
+  flattening were still outside this budget — see below; the bounded
+  ceilings are restated there.) A legitimate cost: a full-canvas mask costs
+  ~7 work per pixel, so a single mask is refused past ~38 Mpx (about
+  6,000²) and one file converts only ~150 Mpx of vector-mask raster in
+  all; past that, the mask is reported "too large or complex".
+- **G3.** With the vector mask applied, densities are no longer reported;
+  a feather is, as a new "uses a feather" line — also on a vector-only
+  layer with no `-2` channel (previously missed: G8's second question).
+- **G4.** When a vector mask cannot be converted and `-2` is flagged as
+  Photoshop's rendering, the report now says that rendering (pixel and
+  vector mask combined) was applied, and that the pixel mask on its own
+  (`-3`) isn't kept — instead of "areas the mask hides are visible" and
+  "the combined version isn't used".
+- **G5.** `corpus_masks_with_both_densities_are_the_product_of_each_part`:
+  for `mask-density-layervectormask.psd`'s density 64/128/191 layers,
+  Aurora's coverage against `(d_u·U + 1 − d_u)(d_v·V + 1 − d_v)` from the
+  decoded `-3` plane and the vector plane — max |Δ| 0.00024 (f16).
+- **G6.** Every pixel charge (raster, `-3`, combined rectangle) is
+  refunded when a layer falls back; spent work is not.
+- **G7.** A raster pixel is charged 2 budget pixels (16 bytes) against a
+  10-byte peak; the docs now say which allocations are fallible (input-
+  sized lists, polygons, edges, planes, result) and which grow normally
+  (per-group index lists, a fill's active and crossing lists — bounded by
+  the record cap and one polygon's edges).
+- **G8.** psd-tools' `Subpath.read` reads its `length` following
+  records as items, whatever their selector, so fill-rule, clipboard and
+  initial-fill records inside a subpath count toward its knots (as
+  Aurora already did); an initial-fill record there is a subpath item
+  that `VectorMask` never reads, so Aurora no longer takes it as the
+  path's initial fill. A length record inside a subpath (which
+  psd-tools would read as a nested subpath) is still unreadable here.
+
+Mutations, revision round: 28 run, 28 killed (one, "segment cap
+removed", first survived because the new work cap made it redundant on
+the existing test; a raster-less 2 Mi-segment path now kills it):
+
+| # | Mutation | Killed by |
+|---|---|---|
+| 16 | raster not charged | `the_raster_is_charged_…`, `a_layer_that_falls_back_…` |
+| 17 | group passes uncharged | `many_drawn_groups_…`, `the_work_estimate_…` |
+| 18 | sort uncharged | `the_work_estimate_…`, worst case, per-file |
+| 19 | per-file budget ignored | `one_files_vector_masks_share_…`, per-file, budget test |
+| 20 | empty-group folding disabled | `a_flood_of_empty_subpaths_…` |
+| 21 | box passes uncharged | `the_work_estimate_counts_every_pass_the_fill_makes` |
+| 22 | fallback refund removed | `a_layer_that_falls_back_gets_its_pixel_charges_back` |
+| 23 | applied densities reported | `applied_densities_are_not_reported_…` |
+| 24 | rendered-combination wording dropped | `an_unconvertible_vector_mask_falls_back_…` |
+| 25 | initial fill read inside a subpath | parser test |
+| 26 | vector feather unreported | `applied_densities_are_not_reported_…` |
+| 27 | straight-edge exact flattening removed | work estimate, worst case, per-file |
+| 28 | fallback note ignores the rendering | `an_unconvertible_vector_mask_falls_back_…` |
+| 13 | segment cap removed (re-run) | `too_many_records_or_segments_…` (new case) |
+
+The original 1–15 were re-run and are all still killed; none was run
+against the app test.
+
+*Review revision, round 2 (judge REVISE 0.85; gate before it 2,842
+passed, 0 failed, 0 skipped; 2,845 after it — 3 new `aurora-io` tests,
+counted, not re-measured as a full gate).*
+
+- **Parsing and flattening are charged to the file's work budget**
+  (blocking). `vector_for` charges one unit per 26-byte record (plus
+  one) *before* parsing and refuses when that does not fit, so once the
+  file's 2^30 is spent no further vector mask is parsed at all.
+  `rasterize` counts the segments the path will flatten into
+  (`segment_total`, the same Wang bounds as `flatten`, no allocation),
+  refuses past `MAX_FLATTENED_SEGMENTS` or the file's remaining work,
+  and charges `SEGMENT_CHARGE` = 8 units per segment *before*
+  flattening — kept even when a later bound refuses, since the work is
+  done, and taken on the off-canvas `area == 0` path too, which had
+  cost nothing. The weight is measured, not guessed: at 1 unit per
+  segment a file of flattening-heavy masks took 8.3 s; one segment costs
+  ~8 ns (release), about eight scanline units. Regressions:
+  `parsing_and_flattening_draw_on_the_files_work_budget` (50 off-canvas
+  layers, a budget for three: 3 converted, 47 refused unparsed, < 5 s),
+  `an_off_canvas_mask_is_charged_exactly_its_parse_and_flattening`
+  (exact charge; a budget one short refuses with only the parse kept),
+  and the env-gated `the_worst_case_of_parsing_and_flattening_at_the_file_budget`
+  (`AURORA_PSD_WORST_CASE=1`).
+- **Measured hostile ceilings** (release, this machine, UI thread):
+  one mask at the scanline cap 0.50 s (shuffled crossings; 0.20 s in
+  order); a file of scanline-heavy masks (four convert, the fifth is
+  refused) 2.07 s; a ~117 MB file of 1,100 off-canvas masks of ≈2^20
+  segments each (127 convert, 973 refused) 1.15 s for the whole open.
+  Those are what the work budget bounds. **Bounded only by the pixel
+  budget, not the work budget:** `combine_masks`, one multiply per pixel
+  of its rectangle (at most the region, charged to the pixels), and the
+  decode of a `-3` real user mask (charged to the pixels; ZIP may cost
+  ~2,000× its bytes, as for any channel). Neither was measured at the
+  2^28-pixel extreme.
+- **Charge accuracy.** The result passes are now charged as three (two
+  planes and the result), not two; box sides round up by a pixel or two,
+  so a box is charged its area plus about its perimeter, never less.
+  `MAX_RASTER_WORK`'s doc now lists everything `work_for` counts; an
+  orphaned doc fragment that opened `Budget`'s doc is gone.
+- **G5 honesty.** The both-densities corpus test now fails on a `NaN`
+  (as does the Photoshop differential) and is described as what it is:
+  a self-consistency check of `combine_masks`' arithmetic, since its
+  oracle reuses Aurora's own vector raster.
+- **Wording.** The fallback line for a layer with both masks no longer
+  claims the saved mask is "the combination of the two" (unverified for
+  a disabled vector mask): it says the mask Photoshop saved already
+  rendered is applied as one pixel mask.
+
+Mutations, round 3 (backed up, restored, sha256 checked): parse charge
+removed — killed (`an_off_canvas_mask_is_charged_exactly_…`); early
+refusal before parsing removed — killed
+(`parsing_and_flattening_draw_on_the_files_work_budget`); flattening
+charge removed — killed (4 tests); flattening pre-check against the file
+budget removed — killed (`an_off_canvas_mask_…`, after a first run where
+it survived because no test reached it); off-canvas path refunded its
+charge — killed (`parsing_and_flattening_…`); three result passes
+charged as two — killed (`the_work_estimate_…`). The earlier 28 were
+re-run against this tree: 27 killed; "segment cap removed" survived
+because `flatten` re-checked the same cap the new pre-flatten count
+already enforces. The redundant inner check was removed, and the
+mutation re-run against the one remaining check is killed
+(`too_many_records_or_segments_are_bounded_and_reported`). 34 of 34
+killed.
+
+*Review revision, round 3 — measured.* Full gate on the round-3 tree,
+RTX 3090, `AURORA_REQUIRE_GPU=1`: fmt, layering, style lint,
+`check --locked`, clippy `-D warnings`, 2,845 passed, 0 failed, strict
+rustdoc and `cargo deny` all green. Judge round 3: **PASS 0.91**, no
+blocking issue (the round-2 blocker — parsing and flattening outside the
+file budget — confirmed closed; `segment_total` was read to agree
+exactly with `flatten`'s real count). Its follow-ups, applied before the
+commit: the heavy worst-case test is now `#[ignore]`d instead of
+printing `SKIPPED` (that word is this workspace's "a real-GPU test did
+not run" signal), which moves it from the passed to the ignored count —
+**2,844 passed, 46 ignored** from here; a stale "one per segment"
+comment and the "Latest" mutation count corrected. Disclosed, not
+changed: a mask refused at the pre-flatten check keeps only its parse
+charge (one unit per record), which under-weights parsing plus
+`segment_total` by a constant factor — bounded by input size (at most
+2^30 records per file, ≈ 28 GB of `vmsk` data), not measured.
+
+**Needs a human: compare a vector-masked PSD against Photoshop.**
+
+**Suggested next (0.151.0): decode PSDs off the UI thread and stream
+through the tile store.**
 
 **Addendum 2026-10-09 (0.149.0) — PSD mask density applied, and
 editable.** Done as the 0.147.0 disclosures asked. **Choice: a stored
