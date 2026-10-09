@@ -21,8 +21,23 @@
 //! `spacing.md`, as the mockup's CSS has. Labels are not text-measured
 //! (`aurora_widgets::measure` measures checkboxes and toggle buttons
 //! only), so the zoom item is `spacing.xxxl` wide — room for the widest
-//! reading, `6400%` — and the document item takes the rest, ending in
-//! "…" when the column is too narrow.
+//! whole reading, `12800%` ([`crate::canvas_view::MAX_ZOOM`] on a 2x
+//! display) — and the document item takes the rest, ending in "…" when
+//! the column is too narrow.
+//!
+//! **Zoom is physical, as in Photoshop (design-owner decision, Cahya,
+//! 2026-10-09).** 100% means one document pixel per *physical* screen
+//! pixel: the readout is [`crate::CanvasView::zoom`] (logical — `1.0` is
+//! one document pixel per logical pixel) times the window's DPI scale
+//! factor ([`physical_zoom`]). So on a 2x Retina display the startup
+//! view (logical `1.0`) reads `200%`, and logical `0.5` reads `100%`.
+//! The internal zoom, its clamps ([`crate::canvas_view::MIN_ZOOM`],
+//! [`crate::canvas_view::MAX_ZOOM`]) and every pointer mapping stay
+//! logical; only the readout converts. Rounding is [`zoom_text`]'s one
+//! rule at every scale factor, fractional ones included: a whole number
+//! when the percentage is within `0.005` of one (`125%` at 1.25x — which
+//! also absorbs `f32` noise such as `0.8 × 1.25`), otherwise two
+//! decimals (`41.67%`).
 //!
 //! **Accessibility.** The container is a `Role::Status` node labelled
 //! [`STATUS_BAR_LABEL`]; its two labels are `Role::Label` children whose
@@ -59,22 +74,47 @@ pub struct StatusBar {
 /// sample format — never from literals.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StatusInfo {
-    /// The canvas view's zoom factor (`1.0` is 100%: one document pixel
-    /// per logical screen pixel, [`crate::canvas_view::DEFAULT_ZOOM`]).
+    /// The canvas view's own, *logical* zoom factor (`1.0`,
+    /// [`crate::canvas_view::DEFAULT_ZOOM`], is one document pixel per
+    /// logical screen pixel). Not what the bar shows: see
+    /// [`Self::scale_factor`].
     pub zoom: f32,
+    /// The window's DPI scale factor (`Window::scale_factor`: `2.0` on a
+    /// Retina display). The bar shows [`physical_zoom`]`(zoom,
+    /// scale_factor)`, so 100% is one document pixel per physical pixel.
+    pub scale_factor: f32,
     /// The document's size in pixels, `(width, height)`.
     pub document_size: (u32, u32),
     /// The document's per-channel sample format.
     pub sample: SampleFormat,
 }
 
-/// `zoom` as a percentage: a whole number when it is one (`100%`,
-/// `25%`), otherwise two decimals (`33.33%`), the way Photoshop's own
-/// status bar reads. A non-finite zoom (structurally unreachable —
-/// [`crate::CanvasView`] clamps) reads as `–%` rather than `NaN%`.
+/// The physical zoom the status bar shows: the logical `zoom` times the
+/// window's `scale_factor`, so `1.0` is one document pixel per
+/// *physical* screen pixel — Photoshop's 100% (this module's doc
+/// comment). Computed in `f64`. A non-finite, zero or negative
+/// `scale_factor` (which `winit` should never report) counts as `1.0`,
+/// the same fold `aurora-app`'s own `guarded_scale_factor` applies.
 #[must_use]
-pub fn zoom_text(zoom: f32) -> String {
-    let percent = f64::from(zoom) * 100.0;
+pub fn physical_zoom(zoom: f32, scale_factor: f32) -> f64 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        f64::from(scale_factor)
+    } else {
+        1.0
+    };
+    f64::from(zoom) * scale
+}
+
+/// The logical `zoom` at `scale_factor` as a physical percentage
+/// ([`physical_zoom`]): a whole number when it is one (`100%`, `25%`,
+/// `125%`) — within `0.005`, so `f32` noise such as `0.8 × 1.25` still
+/// reads `100%` — otherwise two decimals (`33.33%`), the way Photoshop's
+/// own status bar reads. One rule at every scale factor. A non-finite
+/// zoom (structurally unreachable — [`crate::CanvasView`] clamps) reads
+/// as `–%` rather than `NaN%`.
+#[must_use]
+pub fn zoom_text(zoom: f32, scale_factor: f32) -> String {
+    let percent = physical_zoom(zoom, scale_factor) * 100.0;
     if !percent.is_finite() {
         return "–%".to_owned();
     }
@@ -203,7 +243,8 @@ pub fn insert_status_bar(
         WidgetKind::Container,
     )?;
     let built = (|| {
-        let zoom = widgets::insert_label(tree, root, scales, zoom_text(info.zoom))?;
+        let zoom =
+            widgets::insert_label(tree, root, scales, zoom_text(info.zoom, info.scale_factor))?;
         let document = widgets::insert_label(
             tree,
             root,
@@ -237,7 +278,7 @@ pub fn sync_status_bar(
     bar: StatusBar,
     info: &StatusInfo,
 ) -> Result<bool, WidgetError> {
-    let zoom = widgets::set_label_text(tree, bar.zoom, &zoom_text(info.zoom))?;
+    let zoom = widgets::set_label_text(tree, bar.zoom, &zoom_text(info.zoom, info.scale_factor))?;
     let document = widgets::set_label_text(
         tree,
         bar.document,
@@ -260,8 +301,8 @@ pub fn status_bar_text(tree: &WidgetTree<WidgetKind>, bar: StatusBar) -> Option<
 #[cfg(test)]
 mod tests {
     use super::{
-        STATUS_BAR_LABEL, StatusInfo, document_text, insert_status_bar, sample_format_text,
-        status_bar_text, sync_status_bar, zoom_text,
+        STATUS_BAR_LABEL, StatusInfo, document_text, insert_status_bar, physical_zoom,
+        sample_format_text, status_bar_text, sync_status_bar, zoom_text,
     };
     use accesskit::{Live, Role};
     use aurora_core::SampleFormat;
@@ -276,12 +317,41 @@ mod tests {
 
     #[test]
     fn zoom_reads_as_a_percentage() {
-        assert_eq!(zoom_text(1.0), "100%");
-        assert_eq!(zoom_text(0.25), "25%");
-        assert_eq!(zoom_text(64.0), "6400%");
-        assert_eq!(zoom_text(0.01), "1%");
-        assert_eq!(zoom_text(1.0 / 3.0), "33.33%");
-        assert_eq!(zoom_text(f32::NAN), "–%");
+        assert_eq!(zoom_text(1.0, 1.0), "100%");
+        assert_eq!(zoom_text(0.25, 1.0), "25%");
+        assert_eq!(zoom_text(64.0, 1.0), "6400%");
+        assert_eq!(zoom_text(0.01, 1.0), "1%");
+        assert_eq!(zoom_text(1.0 / 3.0, 1.0), "33.33%");
+        assert_eq!(zoom_text(f32::NAN, 1.0), "–%");
+    }
+
+    /// 0.163.0 (design-owner decision): the readout is physical, as in
+    /// Photoshop — logical zoom times the scale factor, one rounding rule
+    /// at whole and fractional scales.
+    #[test]
+    fn zoom_reads_physical_pixels_at_whole_and_fractional_scale_factors() {
+        // 2x Retina: the startup view is Photoshop's 200%, and one image
+        // pixel per physical pixel is logical 0.5.
+        assert_eq!(zoom_text(1.0, 2.0), "200%");
+        assert_eq!(zoom_text(0.5, 2.0), "100%");
+        assert_eq!(zoom_text(64.0, 2.0), "12800%", "MAX_ZOOM on Retina");
+        assert_eq!(zoom_text(0.01, 2.0), "2%", "MIN_ZOOM on Retina");
+        assert_eq!(zoom_text(1.0 / 3.0, 2.0), "66.67%");
+        // 1.25x and 1.5x: whole where the product is whole, `f32` noise
+        // (0.8 and 1/1.5 are inexact) rounded away, two decimals otherwise.
+        assert_eq!(zoom_text(1.0, 1.25), "125%");
+        assert_eq!(zoom_text(0.8, 1.25), "100%");
+        assert_eq!(zoom_text(1.0 / 3.0, 1.25), "41.67%");
+        assert_eq!(zoom_text(0.01, 1.25), "1.25%");
+        assert_eq!(zoom_text(1.0, 1.5), "150%");
+        assert_eq!(zoom_text(1.0 / 1.5, 1.5), "100%");
+        assert_eq!(zoom_text(1.0 / 3.0, 1.5), "50%");
+        assert_eq!(zoom_text(0.01, 1.5), "1.50%");
+        // A degenerate scale factor counts as 1x, never NaN or 0%.
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(zoom_text(1.0, bad), "100%", "scale {bad}");
+        }
+        assert!((physical_zoom(0.5, 2.0) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -300,6 +370,7 @@ mod tests {
         let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
         let info = StatusInfo {
             zoom: 1.0,
+            scale_factor: 1.0,
             document_size: (4000, 3000),
             sample: SampleFormat::F16,
         };
@@ -347,5 +418,22 @@ mod tests {
             unreachable!("inserted");
         };
         assert_eq!(node.label(), Some("200%"), "the AT text follows the zoom");
+        // 0.163.0: the same logical zoom on a 2x display is 400% physical,
+        // and the AT text reads the physical figure; back on a 1x display
+        // it reads 200% again.
+        let retina = StatusInfo {
+            scale_factor: 2.0,
+            ..zoomed
+        };
+        assert!(matches!(sync_status_bar(&mut tree, bar, &retina), Ok(true)));
+        let Some(node) = tree.accessibility(bar.zoom) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(node.label(), Some("400%"), "the AT text is physical");
+        assert!(matches!(sync_status_bar(&mut tree, bar, &zoomed), Ok(true)));
+        assert_eq!(
+            status_bar_text(&tree, bar).map(|text| text.0),
+            Some("200%".to_owned())
+        );
     }
 }

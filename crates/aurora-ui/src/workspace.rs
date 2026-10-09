@@ -231,6 +231,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     let (canvas_column, options_bar, canvas_area) = insert_canvas_column(&mut tree, root, scales);
     let initial = StatusInfo {
         zoom: crate::canvas_view::DEFAULT_ZOOM,
+        scale_factor: 1.0,
         document_size: (0, 0),
         sample: aurora_tile::SAMPLE_FORMAT,
     };

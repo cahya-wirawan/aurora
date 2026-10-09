@@ -73,8 +73,8 @@ pub use panel::{
 };
 pub use properties_panel::populate_properties_panel;
 pub use status_bar::{
-    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, sample_format_text,
-    status_bar_text, sync_status_bar, zoom_text,
+    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
+    sample_format_text, status_bar_text, sync_status_bar, zoom_text,
 };
 pub use tool::Tool;
 pub use tool_controls::{

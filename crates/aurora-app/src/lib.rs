@@ -5661,16 +5661,25 @@ fn sync_tool_controls(
 }
 
 /// What the status bar shows (0.162.0), read from the app's live state:
-/// the canvas view's zoom, the document's own canvas size
+/// the canvas view's (logical) zoom with the window's DPI `scale_factor`
+/// — the bar shows their product, Photoshop's physical zoom (0.163.0,
+/// design-owner decision: 100% is one document pixel per *physical*
+/// pixel; folded through [`guarded_scale_factor`], the same number the
+/// atlas renders at), the document's own canvas size
 /// ([`App::canvas_size`], the size a save writes), and the sample format
 /// every document's pixels are stored in ([`aurora_tile::SAMPLE_FORMAT`]
 /// — the tile store is the one place pixels live, invariant §7.3.1). No
 /// colour space: the document model records none yet (an opened file's
 /// ICC profile is not kept past decode), so the bar shows none rather
 /// than a guess.
-fn status_info(view: &aurora_ui::CanvasView, canvas_size: (u32, u32)) -> aurora_ui::StatusInfo {
+fn status_info(
+    view: &aurora_ui::CanvasView,
+    canvas_size: (u32, u32),
+    scale_factor: f64,
+) -> aurora_ui::StatusInfo {
     aurora_ui::StatusInfo {
         zoom: view.zoom(),
+        scale_factor: guarded_scale_factor(scale_factor),
         document_size: canvas_size,
         sample: aurora_tile::SAMPLE_FORMAT,
     }
@@ -5682,9 +5691,11 @@ fn sync_status_bar(
     workspace: &mut aurora_ui::Workspace,
     view: &aurora_ui::CanvasView,
     canvas_size: (u32, u32),
+    scale_factor: f64,
 ) -> bool {
     let bar = workspace.status_bar;
-    match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &status_info(view, canvas_size)) {
+    let info = status_info(view, canvas_size, scale_factor);
+    match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the status bar");
@@ -19918,7 +19929,9 @@ impl App {
         }
         // 0.162.0: the status bar shows the startup document from the
         // first frame and the first accessibility tree on.
-        let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size);
+        // No window yet, so the scale factor is `winit`'s own 1.0 default
+        // (the `scale_factor` field below); `resumed` re-syncs it.
+        let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size, 1.0);
 
         Self {
             window: None,
@@ -22616,11 +22629,18 @@ impl App {
     }
 
     /// [`sync_status_bar`] once per event-loop iteration (0.162.0):
-    /// whatever ran above — a wheel zoom, a keyboard zoom, an open that
-    /// changed `canvas_size` — the status bar follows, a frame is asked
-    /// for and the accessibility tree is pushed when its text changed.
+    /// whatever ran above — a wheel zoom, a Zoom-tool click, an open that
+    /// changed `canvas_size`, a DPI scale-factor change (0.163.0: the
+    /// readout is physical zoom) — the status bar follows, a frame is
+    /// asked for and the accessibility tree is pushed when its text
+    /// changed.
     fn sync_status_bar_now(&mut self) {
-        if sync_status_bar(&mut self.workspace, &self.canvas_view, self.canvas_size) {
+        if sync_status_bar(
+            &mut self.workspace,
+            &self.canvas_view,
+            self.canvas_size,
+            self.scale_factor,
+        ) {
             self.push_accessibility();
             self.needs_redraw = true;
         }
@@ -22924,7 +22944,12 @@ impl App {
         // 0.162.0: after the zoom floor above (which can move the zoom),
         // so the status bar this frame paints shows the zoom it draws at.
         // Its text is fixed-width items, so no relayout is needed.
-        if sync_status_bar(&mut self.workspace, &self.canvas_view, self.canvas_size) {
+        if sync_status_bar(
+            &mut self.workspace,
+            &self.canvas_view,
+            self.canvas_size,
+            self.scale_factor,
+        ) {
             self.push_accessibility();
         }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
@@ -23381,6 +23406,9 @@ impl ApplicationHandler<AppEvent> for App {
         self.menu.init_for_nsapp();
 
         self.scale_factor = window.scale_factor();
+        // 0.163.0: the status bar's physical zoom reads the real factor
+        // from the first frame, not `App::new`'s 1.0.
+        self.sync_status_bar_now();
         // Before the first layout (0.140.0): layout measures checkbox
         // labels with this engine, and one created after it would leave
         // the first frame's checkboxes unlabelled bare boxes until the
@@ -23507,6 +23535,10 @@ impl ApplicationHandler<AppEvent> for App {
                     let size = window.inner_size();
                     self.apply_resize((size.width, size.height));
                 }
+                // 0.163.0: the status bar's zoom is physical (logical zoom
+                // times this factor), so moving between a Retina and a
+                // non-Retina monitor changes its text with no zoom change.
+                self.sync_status_bar_now();
             }
             WindowEvent::DroppedFile(path) => self.handle_dropped_file(&path),
             // No drop-target visual affordance exists yet (nothing
@@ -55839,7 +55871,7 @@ mod tests {
     fn the_status_bar_reads_the_document_and_follows_zoom_and_size() {
         let mut workspace = laid_out_workspace();
         let mut view = CanvasView::new();
-        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000)));
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), 1.0));
         assert_eq!(
             aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar),
             Some((
@@ -55848,12 +55880,12 @@ mod tests {
             ))
         );
         assert_eq!(
-            status_info(&view, (4000, 3000)).sample,
+            status_info(&view, (4000, 3000), 1.0).sample,
             aurora_tile::SAMPLE_FORMAT,
             "the bit depth is the tile store's own format"
         );
         assert!(
-            !sync_status_bar(&mut workspace, &view, (4000, 3000)),
+            !sync_status_bar(&mut workspace, &view, (4000, 3000), 1.0),
             "an unchanged state changes nothing"
         );
         let bounds = pan_bounds(
@@ -55869,14 +55901,14 @@ mod tests {
             bounds,
         );
         assert!(view.zoom() < 1.0, "zoomed out: {}", view.zoom());
-        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000)));
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), 1.0));
         let Some((zoom, _)) = aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar)
         else {
             unreachable!("built");
         };
-        assert_eq!(zoom, aurora_ui::zoom_text(view.zoom()));
+        assert_eq!(zoom, aurora_ui::zoom_text(view.zoom(), 1.0));
         assert_ne!(zoom, "100%");
-        assert!(sync_status_bar(&mut workspace, &view, (640, 480)));
+        assert!(sync_status_bar(&mut workspace, &view, (640, 480), 1.0));
         assert_eq!(
             aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar).map(|t| t.1),
             Some("Document: 640 × 480 px · 16-bit float".to_owned())
@@ -55888,6 +55920,58 @@ mod tests {
             node.label(),
             Some("Document: 640 × 480 px · 16-bit float"),
             "a screen reader reads the current document info"
+        );
+    }
+
+    /// 0.163.0 (design-owner decision, Cahya, 2026-10-09): the status
+    /// bar reads Photoshop's *physical* zoom — logical zoom times the
+    /// window's scale factor — and a scale-factor change alone (the
+    /// window moving between a Retina and a non-Retina monitor) changes
+    /// its text and its accessible label.
+    #[test]
+    fn the_status_bar_reads_physical_zoom_and_follows_a_scale_factor_change() {
+        let mut workspace = laid_out_workspace();
+        let mut view = CanvasView::new();
+        let zoom_label = |workspace: &aurora_ui::Workspace| {
+            let text = aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar)
+                .map(|text| text.0);
+            let label = workspace
+                .tree
+                .accessibility(workspace.status_bar.zoom)
+                .and_then(|node| node.label().map(str::to_owned));
+            assert_eq!(text, label, "a screen reader reads the shown text");
+            text
+        };
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), 1.0));
+        assert_eq!(zoom_label(&workspace).as_deref(), Some("100%"));
+        // The window moves onto a 2x display: same logical view, 200%.
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), 2.0));
+        assert_eq!(zoom_label(&workspace).as_deref(), Some("200%"));
+        assert!(
+            !sync_status_bar(&mut workspace, &view, (4000, 3000), 2.0),
+            "an unchanged scale changes nothing"
+        );
+        // One image pixel per physical pixel on Retina is logical 0.5.
+        view.zoom_at((0.0, 0.0), 0.5);
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), 2.0));
+        assert_eq!(zoom_label(&workspace).as_deref(), Some("100%"));
+        // Fractional scale factors, and back to 1x.
+        for (scale, text) in [(1.25, "62.50%"), (1.5, "75%"), (1.0, "50%")] {
+            assert!(sync_status_bar(&mut workspace, &view, (4000, 3000), scale));
+            assert_eq!(
+                zoom_label(&workspace).as_deref(),
+                Some(text),
+                "scale {scale}"
+            );
+        }
+        // The factor the bar multiplies by is the guarded one the atlas
+        // renders at, so a degenerate one reads as 1x.
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert!((status_info(&view, (1, 1), bad).scale_factor - 1.0).abs() < f32::EPSILON);
+        }
+        assert!(
+            (status_info(&view, (1, 1), 2.0).scale_factor - guarded_scale_factor(2.0)).abs()
+                < f32::EPSILON
         );
     }
 
