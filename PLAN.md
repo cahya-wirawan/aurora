@@ -26,7 +26,42 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.153.0): an open's tile writes are prepared off
+**Latest (2026-10-09, 0.154.0): PSD opens stream, one layer at a
+time.** Until 0.153.0 a PSD open read the whole file into memory, decoded
+every layer into an in-memory `Image`, then encoded every tile — peak
+roughly file + decoded document + encoded tiles. Now
+`aurora_io::read_psd_streaming` parses the file from a seekable reader
+(`BufReader<File>`): header, resources, each layer record and each
+tagged-block header are read as reached, every declared length and
+offset is checked against the file length before anything is read or
+allocated, and channel data is only *located* during the parse. Each
+layer's channels are read, decoded and handed to a `PsdPixelSink` before
+the next layer's are read; `decode(&[u8])` and `read(&[u8])` are the
+same parser over a `Cursor`. The app's sink (`PreparedPsd::stream`)
+encodes each layer and writes its tiles into a **staging directory
+inside the tile store's own scratch dir** (new
+`crates/aurora-tile/src/staging.rs`: `StagingRoot` handed to the
+decode thread, `StagingArea::stage`, `StagedTile`), dropping the image;
+the UI-thread install, after the unchanged sweep, adopts each tile with
+the new `TileStore::insert_staged` — a paged-out entry pointing at the
+staged file, no I/O, no bytes in memory. Unadopted staging files and
+directories delete themselves (failed, superseded or panicked opens);
+an adopted file is deleted when its tile is paged in or forgotten.
+**Measured** (RTX 3090 box, same run, release; `VmHWM` above start):
+4096² four-layer noisy 8-bit (256 MiB file) peak +260 MiB against
++800 MiB on the 0.153.0 path, open 1.51 s vs 1.30 s, UI-thread install
+0.34 ms; 16-bit (512 MiB) +288 vs +1,024 MiB; **8192² four-layer 16-bit
+(2 GiB file) +1,277 MiB vs +4,352 MiB, open 7.3 s vs 7.2 s, install
+1.33 ms**. The PRD's "2 GB PSD in under 5 s" is **not** met (7.3 s, warm
+page cache). Opened documents are bit-identical to 0.153.0 for all 284
+corpus and fixture files (digest of tree, report, every pixel and mask
+sample, refusals included, compared across both builds). The candidate's
+full gate (`AURORA_REQUIRE_GPU=1`) passed 2,902, 0 failed, 0 skipped; the
+review revision (judge REVISE 0.899) added 3 tests: test count 2,905. **Needs a human: open a very large PSD on macOS; watch memory in
+Activity Monitor and the open time.** Details: "Next action", addendum
+0.154.0.
+
+**Previously (2026-10-09, 0.153.0): an open's tile writes are prepared off
 the UI thread.** After 0.152.0 the install's remaining ~0.72 s (dev) was
 writing every opened layer's and mask's pixels into the live
 `TileStore`, texel by texel — mostly the `codec::encode` of each tile
@@ -9229,6 +9264,19 @@ structural design work.
   An open that finishes under a modal dialog waits for it to close (review
   E1). The §7.3.1 half (the whole file in memory, not streamed through the
   tile store) is still open. "Next action", addendum 0.151.0.
+
+  **Update 0.154.0 — streamed, one layer at a time.** Closes most of the
+  §7.3.1 half: the file is parsed from a `BufReader<File>`
+  (`aurora_io::read_psd_streaming`), never read whole; each layer is
+  read, decoded, handed to a `PsdPixelSink`, encoded and staged to the
+  tile store's scratch disk (`aurora_tile::StagingArea`) before the next
+  is read, and the install adopts the staged files
+  (`TileStore::insert_staged`). Still not per-tile: one layer is an
+  in-memory `Image`, every user mask's coverage is held until its layer
+  is handed on, the image-resources section is read whole, and a flat
+  file's merged image reads the rest of the file at once. Measured: a
+  2 GiB PSD peaks at +1,277 MiB (was +4,352 MiB) and opens in 7.3 s —
+  over the PRD's 5 s. "Next action", addendum 0.154.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30628,6 +30676,160 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-10-09 (0.154.0) — PSD opens stream, one layer at a
+time.** Done as 0.154.0. Files: `crates/aurora-io/src/psd.rs`
+(`ByteSource`/`StreamSource`/`Window`, `read_layer_info`,
+`read_record_bytes`, `read_block_windows`, `check_channel`,
+`plan_layer_image`/`decode_pending`, `decode_source`, `materialize`,
+`build_streamed`, the public `PsdPixelSink`, `PsdStreamedDocument`,
+`read_streaming`; `Record` no longer borrows the file), `psd/tests.rs`
+(6 new tests, `records_of` on the streaming functions), `aurora-io`'s
+`lib.rs` (exports `read_psd_streaming`, `PsdPixelSink`,
+`PsdStreamedDocument`), `crates/aurora-tile/src/staging.rs` (new, 3
+tests), `aurora-tile`'s `store.rs` (`staging_root`, `insert_staged`,
+the `staged` set; paged-in staged files deleted), `error.rs`
+(`Staging`, `ForeignStagedTile`), `lib.rs`;
+`crates/aurora-app/src/prepared_pixels.rs` (`PreparedTile`,
+`PreparedPsd::stream`, `StreamSink`, `insert_one`), `aurora-app`'s
+`lib.rs` (`decode_chosen_file_with`, `App::open_file` passes the
+store's `StagingRoot`; 2 new tests and the `#[ignore]`d
+`measure_streaming_a_large_noisy_psd_open`).
+
+*Choice of hand-off: (i), staging files the store adopts.* The decode
+thread writes each encoded tile into a per-open directory the store's
+`StagingRoot` creates inside its own scratch dir; the install stays
+one step after the whole decode (so a failed, superseded or deferred
+(E1) open never touches the current document), and adopting a tile is
+a `HashMap` insert — measured 0.34 ms for 4096² and 1.33 ms for 8192²
+four layers. (ii) was rejected because a progressive install replaces
+the old document before the decode can fail. The file name is the
+staging one, not the store's `tile_path`: surface ids of the incoming
+tree collide with the outgoing document's until the sweep, and a
+rename per tile on the UI thread would cost milliseconds.
+
+*Measured* (release unless noted; peak = `VmHWM` above the start, after
+`clear_refs`; same process, file in a tempdir, warm page cache):
+
+| File | 0.153.0 path peak / time | 0.154.0 peak / time | UI install |
+|---|---|---|---|
+| 4096² ×4 noisy 8-bit, 256 MiB (dev) | +800 MiB / 2.71 s | +260 MiB / 2.72 s | 0.37 ms |
+| 4096² ×4 noisy 8-bit, 256 MiB | +800 MiB / 1.30 s | +260 MiB / 1.51 s | 0.34 ms |
+| 4096² ×4 noisy 16-bit, 512 MiB | +1,024 MiB / 1.41 s | +288 MiB / 1.51 s | 0.34 ms |
+| 8192² ×4 noisy 16-bit, 2 GiB | +4,352 MiB / 7.22 s | +1,277 MiB / 7.34 s | 1.33 ms |
+
+One decoded 8192² layer is 512 MiB, so the streamed peak is about 2.5
+layers (the decoded image, its encoded tiles, one channel's bytes) —
+"about one layer" in kind, not in constant. The open is slightly
+slower (the decode thread now also writes the tiles the store's writer
+used to write after the install). **2 GB in under 5 s is not met:
+7.3 s**, on a warm page cache, single-threaded decode.
+
+*Parity:* a digest of every corpus and fixture file's opened document
+(tree, canvas, report, every pixel and mask sample's bits; the error's
+`Debug` for a refusal) — 284 files — is identical between a build of
+0.153.0's `aurora-io` and this one. All psd-tools differentials
+(pixels, masks, density, vector masks) and hostile/truncation sweeps
+pass on the streaming parser, since `decode`/`read` now run it.
+
+*Mutations* (each file backed up, mutated, the three crates' tests
+run, restored, `touch`ed, sha256 checked):
+
+| # | Mutation | Result |
+|---|---|---|
+| 1 | read the whole file at the start of `decode_source` | killed: `the_streaming_read_hands_each_layer_on_before_reading_the_next`, `a_length_past_the_file_is_refused_before_anything_is_read` |
+| 2 | decode every layer before building (hold the whole document) | killed: `the_streaming_read_hands_each_layer_on_before_reading_the_next` |
+| 3a | `Window::fits` always true (no length check) | killed: `a_length_past_the_file_...`, `seeded_single_byte_mutations_never_panic` |
+| 3b | `StreamSource::read_at` skips its file-length check | killed (after the test was tightened to assert the reader is never asked): `a_length_past_the_file_...` |
+| 4 | trust a stale reader position (unchecked seek) | killed: dozens of psd tests |
+| 5 | EOF mid-layer zero-filled | killed: `a_reader_failing_or_ending_mid_layer_is_a_typed_error` |
+| 6 | I/O error panics | killed: same |
+| 7 | `decode_source` ignores a remembered read failure | survived in the candidate; **killed after review I1**: `a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask` |
+| 7b | both failure checks removed | survived in the candidate; moot after I1 removed the second check (7 is now the only one) |
+| 17 | `make_room` keeps the tombstone (J4 clear removed) | **survived** 0/40 idle runs of the two tests that target it; killed once by J4's own test under full-suite load — timing-dependent, there is no writer stall hook |
+| 18 | `insert_staged` clears the tombstone | survived: equivalent for correctness (the old write's result is then dropped as superseded, leaving its own file as an orphan until the key is evicted again) |
+| 8 | unadopted `StagedTile` keeps its file | killed: `staged_files_never_outlive_their_owner` |
+| 9 | unadopted staging dir kept / adopted one removed | killed: 2 staging tests, 2 app tests |
+| 10 | paged-in staged file not deleted | killed: `an_adopted_staged_tile_...`, `a_staged_streaming_open_installs_the_same_tiles_and_cleans_up_after_itself` |
+| 11 | adoption does not mark the area adopted (files deleted under the store) | killed: 2 staging tests, 1 app test |
+| 12 | adopted tile recorded at the store's own path (snapshot cannot read it) | killed: 3 staging tests, 1 app test |
+| 13 | adopted tile not recorded dirty | killed: `an_adopted_staged_tile_...` |
+| 14 | foreign staged tile accepted | killed: `staged_files_never_outlive_their_owner` |
+| 15 | insert before the sweep (non-atomic install) | killed: 7 app tests |
+| 16 | per-layer channel-length pre-check skipped | killed: `an_rle_channel_too_short_for_its_rectangle_is_refused_before_allocating` |
+
+*Disclosures.* Not bounded by one layer: every user mask's coverage is
+decoded while the tree is built (a mask's readability decides the
+document's structure) and held until its layer is handed on; the image
+resources are read whole (after a file-length check); a flat file's
+merged image reads the rest of the file at once. A failed staging write
+falls back to keeping that tile in memory (0.153.0's J1 rules then
+apply), so on a full disk memory is 0.153.0's. A dropped (superseded)
+result's staging files are deleted on a short-lived thread (review I4).
+Adopted staging directories are left empty in the scratch dir until its
+end-of-session sweep. `App::open_file`'s own use of the
+staging root is not exercised by a test (`App` cannot be built
+headlessly); `decode_chosen_file_with` is. The 5 s budget is missed.
+Only Linux/RTX 3090 measured; macOS file I/O and memory not.
+
+*Review revision* (after the candidate's full gate: `AURORA_REQUIRE_GPU=1`,
+2,902 passed, 0 failed, 0 skipped; clippy, strict rustdoc, deny clean;
+judge REVISE 0.899, no correctness or safety defect):
+
+- **I1 (fixed).** A read error on a mask channel is swallowed by the tree
+  build (reported as `MaskUnreadable`); only `decode_source`'s
+  `take_failure` turns it back into a failed open. New test
+  `a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask`: a
+  `Read + Seek` probe that fails exactly once, only on the mask's byte
+  range, and succeeds after; both the streaming read and `decode`'s
+  parser return the reader's `IoError::Io`. Mutation 7 is now killed by
+  it. The second check in `build_streamed` was **removed**, with a
+  comment: every read there propagates its own error.
+- **I2 (checked, test added, no fix needed).** `insert_staged` keeps
+  `forget_tile`'s tombstone; if the key is then paged in and evicted
+  again, `make_room`'s J4 clear drops the tombstone as write 2 is
+  submitted, so write 1's late result is discarded as superseded and
+  cannot delete write 2's file. New tests
+  `an_adopted_tile_over_an_in_flight_write_keeps_its_re_evicted_file`
+  (store) and `an_adopted_key_with_an_older_write_in_flight_survives_a_re_eviction`
+  (64 rounds, staging) read the tile back after the re-eviction — both
+  green. Honest limit: neither catches the J4 clear's removal
+  deterministically (mutation 17), because whether write 1 is still in
+  flight is a race this crate has no hook to stall.
+- **I3 (fixed).** The streaming sink checks `SESSION_ENDING` (0.151.0
+  C1) before creating a staging area and before staging each layer; once
+  set, tiles stay in memory (the result is never installed). Residual: a
+  write already under way as the flag flips can race the cleanup — then
+  `create_new` fails in the removed directory, or one stray file is left
+  for the next session's orphaned-scratch sweep.
+- **I4 (fixed).** `OpenWorker::take_finished` drops a superseded result
+  on a short-lived `aurora-open-drop` thread (inline only if that thread
+  cannot start), so its thousands of staged-file deletions stay off the
+  UI thread. Drop threads are not tracked or joined (D1 caps superseded
+  *decodes*, not these): one still running at exit is killed with the
+  process, and its remaining staged files are left to the next session's
+  orphaned-scratch sweep.
+- **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+  clippy `-D warnings`, **2,905 passed, 0 failed, 50 ignored, 0
+  skipped**, strict rustdoc, `cargo deny`. Judge round 2: **PASS 0.906**,
+  no blocking issue.
+- **Tracked follow-up (judge round 2, N1): a deterministic J4 test.**
+  Nothing deterministically tests `make_room`'s tombstone clear — the
+  safety property that stops a late, superseded write result deleting a
+  newer write's scratch file (reachable through `forget_tile` and, since
+  this round, `insert_staged`). Add a `#[cfg(test)]` hold/release hook on
+  the store's writer so a test can keep write 1 in flight, submit write
+  2, then reconcile — which would make 0.153.0's R2 and this round's M17
+  reliable kills. Recorded here, not done this round.
+
+**Needs a human: open a very large PSD on macOS; watch memory in
+Activity Monitor and the open time.**
+
+**Suggested next: Curves** — an adjustment in `aurora-filters`, a
+histogram behind the curve editor drawn in `text.secondary`, and a
+channel selector: the design owner's decided next step after the
+performance rounds.
+
 **Addendum 2026-10-09 (0.153.0) — an open's tile writes are prepared
 off the UI thread.** Done as 0.153.0 (`crates/aurora-app/src/prepared_pixels.rs`
 (new: `PreparedImage`, `PreparedPsd`, `PreparedLayer`, `PreparedMask`,
@@ -30853,7 +31055,7 @@ PSD decode already does not honour; see "Suggested next").
 | # | mutation | result |
 |---|---|---|
 | R1 | J1 exemption removed (inserted tiles' failed writes capped) | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
-| R2 | J4 tombstone clear removed from `make_room` | killed: `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file` |
+| R2 | J4 tombstone clear removed from `make_room` | killed: `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file` — **correction (0.154.0): that kill is timing-dependent, not deterministic** (0 of 40 idle runs failed; caught once under full-suite load); see 0.154.0's mutation 17 |
 | R3 | `forget_pending` no longer shrinks `inserted_unconfirmed` | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
 
 Test count **2,891**, measured: the full gate re-run on the revised

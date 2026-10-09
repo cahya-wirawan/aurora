@@ -50,9 +50,25 @@
 //! only recursion ([`build_document`], `subtree_has_blend`) runs over a
 //! tree already proven no deeper than that constant.
 //!
-//! What is *not* bounded here, stated rather than implied: the whole
-//! file is one in-memory slice, and the decode runs synchronously on the
-//! caller's thread (the app's UI thread today — invariant §7.3.4).
+//! **Streaming (0.154.0).** The parser reads through a seekable reader
+//! ([`read_streaming`]), never a slice of the whole file: the header, the
+//! image resources, each layer record and each tagged-block header are
+//! read as they are reached, every declared length and offset is checked
+//! against the file's own length *before* anything is read or allocated,
+//! and a layer's channel data is only located (offset and length) while
+//! the records are parsed. Its bytes are read when that one layer is
+//! decoded, which [`read_streaming`] does one layer at a time, handing
+//! each decoded image to a [`PsdPixelSink`] before the next is read. The
+//! in-memory entry points ([`decode`], [`read`]) run the same parser over
+//! a `Cursor`. A reader that fails mid-file is [`IoError::Io`]; one that
+//! ends early is [`IoError::PsdTruncated`].
+//!
+//! What is *not* bounded by one layer, stated rather than implied: every
+//! user mask's coverage is still decoded while the tree is built (a mask's
+//! readability decides the document's structure) and held until its layer
+//! is handed to the sink; the image-resources section is read whole (it is
+//! checked against the file length first); and the merged image, decoded
+//! only for a file with no layers, reads the rest of the file at once.
 //!
 //! # Scope, stated rather than implied
 //!
@@ -60,11 +76,13 @@
 //!   expanded to R = G = B), 8 or 16 bits per channel; every other mode
 //!   and depth is a typed error ([`IoError::UnsupportedPsdColorMode`],
 //!   [`IoError::UnsupportedPsdDepth`]).
-//! - The whole file is decoded in memory — this does **not** honour
-//!   invariant §7.3.1 (nothing assumes a document fits in memory), and
-//!   does nothing toward the "2 GB PSD in under 5 s" budget. The
-//!   [`PIXEL_BUDGET`] is what keeps that from being an unbounded
-//!   allocation.
+//! - Decoded one layer at a time (0.154.0, [`read_streaming`]): peak
+//!   memory is about one layer's channel data and decoded image plus the
+//!   masks above, not the whole file or document. The decoded layer is
+//!   still an in-memory [`Image`] — the tile store is reached only by the
+//!   caller's sink — so a single layer must fit in memory (invariant
+//!   §7.3.1 is honoured per layer, not per tile). The [`PIXEL_BUDGET`]
+//!   still bounds the whole file.
 //! - An embedded ICC profile is ignored and the pixels are tagged sRGB.
 //! - User layer masks are applied (0.147.0: [`PsdMask`] →
 //!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); user-mask
@@ -84,6 +102,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
+use std::io::{Seek, SeekFrom};
 
 use aurora_color::{IccProfile, promote_u8, promote_u16};
 use aurora_core::Rect;
@@ -221,6 +240,10 @@ pub struct PsdLayer {
     /// The layer's user mask (channel `-2`), applied by
     /// [`build_document`] (0.147.0).
     pub mask: Option<PsdMask>,
+    /// Where the layer's channels are in the file, while its pixels are
+    /// not decoded yet (0.154.0): [`decode`] decodes every one before it
+    /// returns, [`read_streaming`] one at a time as each is handed on.
+    pending: Option<PendingPixels>,
 }
 
 /// A layer's or group's own properties.
@@ -637,6 +660,217 @@ impl<'a> Reader<'a> {
 }
 
 // ---------------------------------------------------------------------
+// Streaming source (0.154.0)
+// ---------------------------------------------------------------------
+
+/// One byte range of the file — a channel's data — located while the
+/// records are parsed and read only when it is decoded. Always inside the
+/// file: [`read_layer_info`] checks every channel against what is left
+/// before it locates any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Chan {
+    offset: u64,
+    len: usize,
+}
+
+/// Where the parser's bytes come from (0.154.0): random access by offset,
+/// bounded by a length known up front.
+trait ByteSource {
+    /// The file's length in bytes.
+    fn len(&self) -> u64;
+
+    /// Exactly `len` bytes at `offset`. A range past [`Self::len`] is
+    /// refused ([`IoError::PsdTruncated`]) **before** anything is
+    /// allocated or read; a reader that then ends early is
+    /// [`IoError::PsdTruncated`] too, and one that fails is
+    /// [`IoError::Io`]. Either failure is also remembered
+    /// ([`Self::take_failure`]).
+    fn read_at(&mut self, offset: u64, len: usize, what: &'static str) -> Result<Vec<u8>, IoError>;
+
+    /// The first read failure since the last call, if any — so a failure
+    /// inside a mask, which the tree build reports and opens unmasked,
+    /// still fails the open: an unreadable *file* is not a damaged mask.
+    fn take_failure(&mut self) -> Option<IoError>;
+}
+
+/// [`ByteSource`] over any seekable reader: a `BufReader<File>` for the
+/// app's open, a `Cursor` for [`decode`]/[`read`]. Seeks only when a read
+/// does not start where the last one ended, so the parser's sequential
+/// metadata reads stay inside the reader's own buffer.
+#[derive(Debug)]
+struct StreamSource<R> {
+    inner: R,
+    len: u64,
+    /// Where `inner` is now, or `None` when unknown (before the first
+    /// read, and after a failed one).
+    pos: Option<u64>,
+    failure: Option<IoError>,
+    /// The largest single read and the total read so far — what the
+    /// bounded-memory tests assert on.
+    largest_read: usize,
+    total_read: u64,
+}
+
+impl<R: std::io::Read + Seek> StreamSource<R> {
+    fn new(mut inner: R) -> Result<Self, IoError> {
+        let len = inner.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            inner,
+            len,
+            pos: None,
+            failure: None,
+            largest_read: 0,
+            total_read: 0,
+        })
+    }
+
+    fn fail(&mut self, err: IoError) -> IoError {
+        self.pos = None;
+        let copy = match &err {
+            IoError::PsdTruncated { what } => IoError::PsdTruncated { what },
+            IoError::Io(io) => IoError::Io(std::io::Error::new(io.kind(), io.to_string())),
+            _ => malformed("read failure"),
+        };
+        self.failure.get_or_insert(copy);
+        err
+    }
+}
+
+impl<R: std::io::Read + Seek> ByteSource for StreamSource<R> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, offset: u64, len: usize, what: &'static str) -> Result<Vec<u8>, IoError> {
+        let end = u64::try_from(len)
+            .ok()
+            .and_then(|n| offset.checked_add(n))
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| truncated(what))?;
+        let mut buf: Vec<u8> = try_alloc(len)?;
+        buf.resize(len, 0);
+        if self.pos != Some(offset)
+            && let Err(err) = self.inner.seek(SeekFrom::Start(offset))
+        {
+            return Err(self.fail(IoError::Io(err)));
+        }
+        self.pos = None;
+        match self.inner.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(self.fail(truncated(what)));
+            }
+            Err(err) => return Err(self.fail(IoError::Io(err))),
+        }
+        self.pos = Some(end);
+        self.largest_read = self.largest_read.max(len);
+        self.total_read = self.total_read.saturating_add(len as u64);
+        Ok(buf)
+    }
+
+    fn take_failure(&mut self) -> Option<IoError> {
+        self.failure.take()
+    }
+}
+
+/// A bounded region of a [`ByteSource`] read front to back — the
+/// streaming counterpart of [`Reader`], with the same checks: anything
+/// past [`Self::remaining`] is [`IoError::PsdTruncated`] naming what was
+/// being read, decided from the region's bounds alone, before any read.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    pos: u64,
+    end: u64,
+}
+
+impl Window {
+    fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.pos)
+    }
+
+    fn fits(&self, n: usize) -> bool {
+        u64::try_from(n).is_ok_and(|n| n <= self.remaining())
+    }
+
+    fn advance(&mut self, n: usize, what: &'static str) -> Result<(), IoError> {
+        if !self.fits(n) {
+            return Err(truncated(what));
+        }
+        self.pos += n as u64;
+        Ok(())
+    }
+
+    fn take(
+        &mut self,
+        src: &mut dyn ByteSource,
+        n: usize,
+        what: &'static str,
+    ) -> Result<Vec<u8>, IoError> {
+        if !self.fits(n) {
+            return Err(truncated(what));
+        }
+        let bytes = src.read_at(self.pos, n, what)?;
+        self.pos += n as u64;
+        Ok(bytes)
+    }
+
+    /// At most `n` bytes: fewer when the region ends first.
+    fn take_upto(
+        &mut self,
+        src: &mut dyn ByteSource,
+        n: usize,
+        what: &'static str,
+    ) -> Result<Vec<u8>, IoError> {
+        let n = usize::try_from(self.remaining()).map_or(n, |left| n.min(left));
+        self.take(src, n, what)
+    }
+
+    fn peek(
+        &self,
+        src: &mut dyn ByteSource,
+        n: usize,
+        what: &'static str,
+    ) -> Result<Vec<u8>, IoError> {
+        if !self.fits(n) {
+            return Err(truncated(what));
+        }
+        src.read_at(self.pos, n, what)
+    }
+
+    fn take_array<const N: usize>(
+        &mut self,
+        src: &mut dyn ByteSource,
+        what: &'static str,
+    ) -> Result<[u8; N], IoError> {
+        let bytes = self.take(src, N, what)?;
+        <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| truncated(what))
+    }
+
+    fn sub(&mut self, n: usize, what: &'static str) -> Result<Window, IoError> {
+        if !self.fits(n) {
+            return Err(truncated(what));
+        }
+        let sub = Window {
+            pos: self.pos,
+            end: self.pos + n as u64,
+        };
+        self.pos = sub.end;
+        Ok(sub)
+    }
+
+    /// [`Reader::length`], read from `src`.
+    fn length(
+        &mut self,
+        src: &mut dyn ByteSource,
+        wide: bool,
+        what: &'static str,
+    ) -> Result<usize, IoError> {
+        let bytes = self.take(src, if wide { 8 } else { 4 }, what)?;
+        Reader::new(&bytes).length(wide, what)
+    }
+}
+
+// ---------------------------------------------------------------------
 // Header
 // ---------------------------------------------------------------------
 
@@ -902,10 +1136,12 @@ struct Features {
 }
 
 #[derive(Debug)]
-struct Record<'a> {
+struct Record {
     bounds: Rect,
     channels: Vec<(i16, usize)>,
-    data: Vec<(i16, &'a [u8])>,
+    /// Where each channel's data is in the file (0.154.0): located while
+    /// the records are parsed, read only when it is decoded.
+    data: Vec<(i16, Chan)>,
     blend: [u8; 4],
     opacity: u8,
     clipping: u8,
@@ -919,11 +1155,12 @@ struct Record<'a> {
     section: Option<Section>,
     fill_opacity: Option<u8>,
     features: Features,
-    /// The first `vmsk`/`vsms` block's data (0.150.0).
-    vector: Option<&'a [u8]>,
+    /// The first `vmsk`/`vsms` block's data (0.150.0), copied out of the
+    /// record's extra data (0.154.0) so the record owns it.
+    vector: Option<Vec<u8>>,
 }
 
-impl Record<'_> {
+impl Record {
     fn area(&self) -> u64 {
         u64::from(self.bounds.width) * u64::from(self.bounds.height)
     }
@@ -990,7 +1227,7 @@ fn rect_from_edges(top: i32, left: i32, bottom: i32, right: i32) -> Result<Rect,
     })
 }
 
-fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoError> {
+fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let top = r.i32("layer rectangle")?;
     let left = r.i32("layer rectangle")?;
     let bottom = r.i32("layer rectangle")?;
@@ -1063,7 +1300,9 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
             b"lfx2" | b"lrFX" | b"lmfx" => features.effects = true,
             b"vmsk" | b"vsms" => {
                 features.vector_mask = true;
-                vector = vector.or(Some(data));
+                if vector.is_none() {
+                    vector = Some(data.to_vec());
+                }
             }
             b"knko" => features.knockout = data.first().is_some_and(|v| *v != 0),
             k if FILL_KEYS.contains(&k) => features.fill = true,
@@ -1234,30 +1473,44 @@ fn decode_luni(data: &[u8]) -> Option<String> {
 }
 
 #[derive(Debug)]
-struct LayerInfo<'a> {
-    records: Vec<Record<'a>>,
+struct LayerInfo {
+    records: Vec<Record>,
     merged_alpha: bool,
 }
 
 /// A layer-info body (the count, the records, then every record's
 /// channel data) — the layout of both the layer-info section and an
-/// `Lr16`/`Layr` tagged block.
-fn read_layer_info<'a>(r: &mut Reader<'a>, header: Header) -> Result<LayerInfo<'a>, IoError> {
+/// `Lr16`/`Layr` tagged block — read from `src` within `r` (0.154.0).
+/// Each record's bytes are read and parsed by [`read_record`] exactly as
+/// the in-memory parser did; the channel data is only *located*: every
+/// declared length, summed, must fit in what is left of `r` (and so of
+/// the file) before any of it is read, and it is then skipped.
+fn read_layer_info(
+    src: &mut dyn ByteSource,
+    r: &mut Window,
+    header: Header,
+) -> Result<LayerInfo, IoError> {
     if r.remaining() == 0 {
         return Ok(LayerInfo {
             records: Vec::new(),
             merged_alpha: false,
         });
     }
-    let count = r.i16("layer count")?;
+    let count = i16::from_be_bytes(r.take_array::<2>(src, "layer count")?);
     let merged_alpha = count < 0;
     let count = count.unsigned_abs();
     let mut records = Vec::new();
     for _ in 0..count {
-        records.push(read_record(r, header)?);
+        let bytes = read_record_bytes(src, r, header)?;
+        let mut rr = Reader::new(&bytes);
+        let record = read_record(&mut rr, header)?;
+        if rr.remaining() != 0 {
+            return Err(malformed("layer record"));
+        }
+        records.push(record);
     }
     // Every channel's declared length, summed, must fit in what is left
-    // *before* any of it is sliced or decoded.
+    // *before* any of it is located or read.
     let mut total: usize = 0;
     for record in &records {
         for (_, len) in &record.channels {
@@ -1266,20 +1519,119 @@ fn read_layer_info<'a>(r: &mut Reader<'a>, header: Header) -> Result<LayerInfo<'
                 .ok_or_else(|| truncated("channel image data"))?;
         }
     }
-    if total > r.remaining() {
+    if !r.fits(total) {
         return Err(truncated("channel image data"));
     }
+    let mut at = r.pos;
     for record in &mut records {
         let mut data = Vec::with_capacity(record.channels.len());
         for (id, len) in &record.channels {
-            data.push((*id, r.take(*len, "channel image data")?));
+            data.push((
+                *id,
+                Chan {
+                    offset: at,
+                    len: *len,
+                },
+            ));
+            at = at.saturating_add(*len as u64);
         }
         record.data = data;
     }
+    r.advance(total, "channel image data")?;
     Ok(LayerInfo {
         records,
         merged_alpha,
     })
+}
+
+/// The bytes of one layer record (0.154.0), read field by field so that
+/// exactly the record is read: the rectangle and channel count, then the
+/// channel table, blend fields and extra-data length, then the extra
+/// data. Whatever is missing is simply not there — [`read_record`] then
+/// fails on the same field, with the same error, as it did over the whole
+/// file. The extra data is read only once its declared length fits in
+/// what is left of `r`, and only after the blend-mode signature has
+/// checked out, so a bad record never reads (or allocates) its claimed
+/// extra data.
+fn read_record_bytes(
+    src: &mut dyn ByteSource,
+    r: &mut Window,
+    header: Header,
+) -> Result<Vec<u8>, IoError> {
+    // Rectangle (16) and channel count (2).
+    const PREFIX: usize = 18;
+    // Blend signature and key (8), opacity, clipping, flags, filler (4),
+    // then the extra-data length (4).
+    const BLEND_AND_LENGTH: usize = 16;
+    let mut bytes = r.take_upto(src, PREFIX, "layer record")?;
+    let Some(&[hi, lo]) = bytes.get(16..PREFIX) else {
+        return Ok(bytes);
+    };
+    let count = u16::from_be_bytes([hi, lo]);
+    if count > MAX_CHANNELS {
+        return Ok(bytes);
+    }
+    let entry = if header.psb() { 10 } else { 6 };
+    let table = usize::from(count) * entry;
+    let fixed = table + BLEND_AND_LENGTH;
+    let more = r.take_upto(src, fixed, "layer record")?;
+    let short = more.len() < fixed;
+    bytes.extend_from_slice(&more);
+    if short {
+        return Ok(bytes);
+    }
+    let signature = bytes.get(PREFIX + table..PREFIX + table + 4);
+    if signature != Some(b"8BIM".as_slice()) && signature != Some(b"8B64".as_slice()) {
+        return Ok(bytes);
+    }
+    let Some(&[b0, b1, b2, b3]) = bytes.get(bytes.len().saturating_sub(4)..) else {
+        return Ok(bytes);
+    };
+    let Ok(extra_len) = usize::try_from(u32::from_be_bytes([b0, b1, b2, b3])) else {
+        return Ok(bytes);
+    };
+    if !r.fits(extra_len) {
+        return Ok(bytes);
+    }
+    let extra = r.take(src, extra_len, "layer extra data")?;
+    bytes
+        .try_reserve_exact(extra.len())
+        .map_err(|_| IoError::PsdOutOfMemory {
+            bytes: extra.len() as u64,
+        })?;
+    bytes.extend_from_slice(&extra);
+    Ok(bytes)
+}
+
+/// [`read_blocks`] over `src` (0.154.0): the same loop, but each block's
+/// data is a [`Window`] — located, not read. Every block is located before
+/// any is used, as the in-memory parser sliced them all first.
+fn read_block_windows(
+    src: &mut dyn ByteSource,
+    r: &mut Window,
+    psb: bool,
+    align: usize,
+) -> Result<Vec<([u8; 4], Window)>, IoError> {
+    let mut blocks = Vec::new();
+    while r.remaining() >= 12 {
+        let signature = r.peek(src, 4, "tagged block signature")?;
+        if signature.as_slice() != b"8BIM" && signature.as_slice() != b"8B64" {
+            break;
+        }
+        r.advance(4, "tagged block signature")?;
+        let key = r.take_array::<4>(src, "tagged block key")?;
+        let wide = psb && PSB_WIDE_KEYS.iter().any(|k| **k == key);
+        let len = r.length(src, wide, "tagged block length")?;
+        let data = r.sub(len, "tagged block")?;
+        blocks.push((key, data));
+        if align > 1 {
+            let pad = (align - len % align) % align;
+            if pad > 0 && r.fits(pad) {
+                r.advance(pad, "tagged block padding")?;
+            }
+        }
+    }
+    Ok(blocks)
 }
 
 // ---------------------------------------------------------------------
@@ -1354,6 +1706,27 @@ fn channel_body(
         return Err(malformed("a channel too short for its layer's size"));
     }
     Ok((compression, body))
+}
+
+/// [`channel_body`]'s check for a channel still in the file (0.154.0):
+/// reads only its 2-byte compression field (or less, for a channel
+/// shorter than that, which then fails exactly as [`channel_body`] does)
+/// and checks the *declared* length, so no channel's data is read before
+/// every channel of the layer is known to be big enough.
+fn check_channel(
+    src: &mut dyn ByteSource,
+    chan: Chan,
+    row_bytes: usize,
+    height: usize,
+    psb: bool,
+) -> Result<(), IoError> {
+    let head = src.read_at(chan.offset, chan.len.min(2), "channel compression")?;
+    let mut r = Reader::new(&head);
+    let compression = r.u16("channel compression")?;
+    if chan.len - 2 < min_channel_len(compression, row_bytes, height, psb)? {
+        return Err(malformed("a channel too short for its layer's size"));
+    }
+    Ok(())
 }
 
 /// Decodes one channel's bytes (its 2-byte compression field first) into
@@ -1575,12 +1948,8 @@ fn opaque_buffer(width: usize, height: usize) -> Result<Vec<f16>, IoError> {
 /// never decompressed (a 56-channel record of one id would otherwise
 /// cost 56 decodes) — and an id this reader does not know is counted as
 /// unknown. User masks (`-2`, `-3`) are `decode_mask`'s.
-fn pixel_channels<'a>(
-    record: &Record<'a>,
-    color_planes: usize,
-    notes: &mut Notes,
-) -> [Option<&'a [u8]>; 4] {
-    let mut slots: [Option<&'a [u8]>; 4] = [None; 4];
+fn pixel_channels(record: &Record, color_planes: usize, notes: &mut Notes) -> [Option<Chan>; 4] {
+    let mut slots: [Option<Chan>; 4] = [None; 4];
     let mut seen_ids: Vec<i16> = Vec::with_capacity(record.data.len());
     for (id, data) in &record.data {
         if seen_ids.contains(id) {
@@ -1608,61 +1977,85 @@ fn pixel_channels<'a>(
     slots
 }
 
-fn decode_layer_image(
-    record: &Record<'_>,
+/// A pixel layer whose channels are located but not yet read (0.154.0).
+#[derive(Clone, Copy, Debug)]
+struct PendingPixels {
     header: Header,
-    notes: &mut Notes,
-    profile: &SharedProfile,
-) -> Result<Option<Image>, IoError> {
-    let width = record.bounds.width as usize;
-    let height = record.bounds.height as usize;
-    if width == 0 || height == 0 {
-        return Ok(None);
+    width: u32,
+    height: u32,
+    /// The channel decoded into each RGBA slot ([`pixel_channels`]).
+    slots: [Option<Chan>; 4],
+}
+
+/// What [`decode_pending`] will decode for `record`, or `None` for a
+/// layer with no pixels: an empty rectangle, or one with nothing to fill
+/// it (opened empty and reported — no buffer is ever sized from the
+/// rectangle alone). The channel notes are made here, once per layer.
+fn plan_layer_image(record: &Record, header: Header, notes: &mut Notes) -> Option<PendingPixels> {
+    if record.bounds.width == 0 || record.bounds.height == 0 {
+        return None;
     }
-    let bps = header.bytes_per_sample();
     let planes = header.color_planes();
     let slots = pixel_channels(record, planes, notes);
     if slots.iter().all(Option::is_none) {
-        // A rectangle with nothing to fill it: opened empty, and no
-        // buffer is ever sized from the rectangle alone.
         notes.add(Note::LayerWithoutChannels);
-        return Ok(None);
-    }
-    // Every channel that will be decoded must be big enough for the
-    // rectangle *before* the RGBA buffer the rectangle implies exists.
-    let row_bytes = width
-        .checked_mul(bps)
-        .ok_or_else(|| malformed("channel size"))?;
-    for data in slots.iter().flatten() {
-        channel_body(data, row_bytes, height, header.psb())?;
-    }
-    let mut samples = opaque_buffer(width, height)?;
-    for (channel, data) in slots.iter().enumerate() {
-        if let Some(data) = data {
-            let plane = decode_channel(data, width, height, bps, header.psb())?;
-            write_plane(&mut samples, &plane, channel, bps);
-        }
+        return None;
     }
     if slots.iter().take(planes).any(Option::is_none) {
         notes.add(Note::MissingColorChannel);
     }
+    Some(PendingPixels {
+        header,
+        width: record.bounds.width,
+        height: record.bounds.height,
+        slots,
+    })
+}
+
+/// Reads and decodes one layer's pixels from `src` (0.154.0). Every
+/// channel that will be decoded must be big enough for the rectangle
+/// ([`check_channel`], from its declared length) *before* the RGBA buffer
+/// the rectangle implies exists; then the channels are read and decoded
+/// one at a time, each one's bytes dropped once its plane is written.
+fn decode_pending(
+    pending: &PendingPixels,
+    src: &mut dyn ByteSource,
+    profile: &SharedProfile,
+) -> Result<Image, IoError> {
+    let header = pending.header;
+    let width = pending.width as usize;
+    let height = pending.height as usize;
+    let bps = header.bytes_per_sample();
+    let row_bytes = width
+        .checked_mul(bps)
+        .ok_or_else(|| malformed("channel size"))?;
+    for chan in pending.slots.iter().flatten() {
+        check_channel(src, *chan, row_bytes, height, header.psb())?;
+    }
+    let mut samples = opaque_buffer(width, height)?;
+    for (channel, chan) in pending.slots.iter().enumerate() {
+        if let Some(chan) = chan {
+            let data = src.read_at(chan.offset, chan.len, "channel image data")?;
+            let plane = decode_channel(&data, width, height, bps, header.psb())?;
+            drop(data);
+            write_plane(&mut samples, &plane, channel, bps);
+        }
+    }
     if header.gray() {
         replicate_gray(&mut samples);
     }
-    Image::new(
-        record.bounds.width,
-        record.bounds.height,
-        profile.get(),
-        samples,
-    )
-    .map(Some)
+    Image::new(pending.width, pending.height, profile.get(), samples)
 }
 
 /// The record's user mask, or `None` when it has none: no mask data, or
 /// mask data but no `-2` channel (the mask data then describes only a
 /// vector mask). A `-2` channel too short for the mask rectangle is an
 /// error — the caller reports it and opens the layer unmasked.
-fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, IoError> {
+fn decode_mask(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+) -> Result<Option<PsdMask>, IoError> {
     let Some(info) = record.mask else {
         return Ok(None);
     };
@@ -1670,6 +2063,7 @@ fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, I
         return Ok(None);
     }
     decode_mask_channel(
+        src,
         record,
         header,
         -2,
@@ -1686,7 +2080,8 @@ fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, I
 /// One mask channel (`-2`, or the real user mask `-3`) decoded over
 /// `frame`'s rectangle, with `frame`'s default colour and flags.
 fn decode_mask_channel(
-    record: &Record<'_>,
+    src: &mut dyn ByteSource,
+    record: &Record,
     header: Header,
     channel: i16,
     frame: RealMask,
@@ -1700,10 +2095,12 @@ fn decode_mask_channel(
     // (`pixel_channels`).
     if width > 0
         && height > 0
-        && let Some((_, data)) = record.data.iter().find(|(id, _)| *id == channel)
+        && let Some((_, chan)) = record.data.iter().find(|(id, _)| *id == channel)
     {
         let bps = header.bytes_per_sample();
-        let plane = decode_channel(data, width, height, bps, header.psb())?;
+        let data = src.read_at(chan.offset, chan.len, "mask channel data")?;
+        let plane = decode_channel(&data, width, height, bps, header.psb())?;
+        drop(data);
         let mut values: Vec<f16> = try_alloc(width.saturating_mul(height))?;
         if bps == 2 {
             values.extend(plane.chunks_exact(2).map(|pair| match pair {
@@ -1797,7 +2194,7 @@ fn blend_for_key(key: [u8; 4]) -> PsdBlend {
     PsdBlend::Mode(mode)
 }
 
-fn props_for(record: &Record<'_>, notes: &mut Notes) -> PsdProps {
+fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
     // A group's own blend mode lives in its section divider; it wins over
     // the record's.
     let key = record.section.and_then(|s| s.blend).unwrap_or(record.blend);
@@ -1822,7 +2219,7 @@ fn props_for(record: &Record<'_>, notes: &mut Notes) -> PsdProps {
 }
 
 /// Notes for the features a record uses that Aurora does not apply.
-fn note_unsupported(record: &Record<'_>, outcome: &MaskOutcome, notes: &mut Notes) {
+fn note_unsupported(record: &Record, outcome: &MaskOutcome, notes: &mut Notes) {
     if record.features.effects {
         notes.add(Note::EffectsNotShown);
     }
@@ -1899,10 +2296,10 @@ fn subtree_has_blend(nodes: &[PsdNode]) -> bool {
 /// properties, *above* its children) closes it. Walked with an explicit
 /// stack, never recursion.
 fn build_tree(
-    records: &[Record<'_>],
+    src: &mut dyn ByteSource,
+    records: &[Record],
     header: Header,
     notes: &mut Notes,
-    profile: &SharedProfile,
     vector_budget: &mut vector::Budget,
 ) -> Result<Vec<PsdNode>, IoError> {
     let mut stack: Vec<Vec<PsdNode>> = vec![Vec::new()];
@@ -1930,7 +2327,8 @@ fn build_tree(
                     notes.add(Note::PassThroughGroup);
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
-                let outcome = masks_for(record, header, canvas_of(header), notes, vector_budget);
+                let outcome =
+                    masks_for(src, record, header, canvas_of(header), notes, vector_budget);
                 note_unsupported(record, &outcome, notes);
                 let mask = outcome.mask;
                 if let Some(parent) = stack.last_mut() {
@@ -1942,7 +2340,7 @@ fn build_tree(
                 }
             }
             _ => {
-                if let Some(node) = layer_node(record, header, notes, profile, vector_budget)?
+                if let Some(node) = layer_node(src, record, header, notes, vector_budget)
                     && let Some(parent) = stack.last_mut()
                 {
                     parent.push(node);
@@ -1965,19 +2363,19 @@ fn build_tree(
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 fn layer_node(
-    record: &Record<'_>,
+    src: &mut dyn ByteSource,
+    record: &Record,
     header: Header,
     notes: &mut Notes,
-    profile: &SharedProfile,
     vector_budget: &mut vector::Budget,
-) -> Result<Option<PsdNode>, IoError> {
+) -> Option<PsdNode> {
     if record.features.adjustment {
         notes.add(Note::AdjustmentSkipped);
-        return Ok(None);
+        return None;
     }
     if record.features.fill && record.area() == 0 {
         notes.add(Note::FillSkipped);
-        return Ok(None);
+        return None;
     }
     if record.features.text {
         notes.add(Note::TextRasterised);
@@ -1991,24 +2389,27 @@ fn layer_node(
         notes.add(Note::FillRasterised);
     }
     let props = props_for(record, notes);
-    let image = decode_layer_image(record, header, notes, profile)?;
+    // Located, not decoded (0.154.0): `decode` or `read_streaming`
+    // decodes it later, one layer at a time.
+    let pending = plan_layer_image(record, header, notes);
     // The region `Builder::add_nodes` gives the layer: its own rectangle
     // and the canvas when it has pixels, else the canvas.
     let canvas = canvas_of(header);
-    let region = if image.is_some() {
+    let region = if pending.is_some() {
         record.bounds.union(&canvas)
     } else {
         canvas
     };
-    let outcome = masks_for(record, header, region, notes, vector_budget);
+    let outcome = masks_for(src, record, header, region, notes, vector_budget);
     note_unsupported(record, &outcome, notes);
     let mask = outcome.mask;
-    Ok(Some(PsdNode::Layer(PsdLayer {
+    Some(PsdNode::Layer(PsdLayer {
         props,
         bounds: record.bounds,
-        image,
+        image: None,
         mask,
-    })))
+        pending,
+    }))
 }
 
 fn canvas_of(header: Header) -> Rect {
@@ -2033,14 +2434,14 @@ enum VectorSkip {
 /// the rendered shape, so psd-tools does not apply it either and the
 /// layer is reported as a shape); otherwise why it is not applied.
 fn vector_for(
-    record: &Record<'_>,
+    record: &Record,
     header: Header,
     budget: &mut vector::Budget,
 ) -> Result<Option<vector::Raster>, VectorSkip> {
     if record.features.fill {
         return Ok(None);
     }
-    let Some(data) = record.vector else {
+    let Some(data) = record.vector.as_deref() else {
         return Ok(None);
     };
     // Parsing costs a work unit per 26-byte record (plus one), charged
@@ -2095,7 +2496,8 @@ struct MaskOutcome {
 /// Every pixel charge made on the way is refunded when the layer falls
 /// back; spent work is not (it was spent).
 fn masks_for(
-    record: &Record<'_>,
+    src: &mut dyn ByteSource,
+    record: &Record,
     header: Header,
     region: Rect,
     notes: &mut Notes,
@@ -2104,7 +2506,10 @@ fn masks_for(
     let start = budget.pixels;
     let rendered =
         record.mask.is_some_and(|m| m.flags & MASK_FROM_RENDER != 0) && record.has_channel(-2);
-    let fallback = |notes: &mut Notes, budget: &mut vector::Budget, why: VectorSkip| {
+    let fallback = |src: &mut dyn ByteSource,
+                    notes: &mut Notes,
+                    budget: &mut vector::Budget,
+                    why: VectorSkip| {
         budget.pixels = start;
         notes.add(match why {
             VectorSkip::Disabled => Note::VectorMaskDisabledDropped,
@@ -2112,7 +2517,7 @@ fn masks_for(
             VectorSkip::Unreadable => Note::VectorMaskUnreadable,
             VectorSkip::TooLarge => Note::VectorMaskTooLarge,
         });
-        let mask = mask_or_report(record, header, notes);
+        let mask = mask_or_report(src, record, header, notes);
         MaskOutcome {
             pixel_used: mask.is_some(),
             mask,
@@ -2122,25 +2527,25 @@ fn masks_for(
     let raster = match vector_for(record, header, budget) {
         Ok(Some(raster)) => raster,
         Ok(None) => {
-            let mask = mask_or_report(record, header, notes);
+            let mask = mask_or_report(src, record, header, notes);
             return MaskOutcome {
                 pixel_used: mask.is_some(),
                 mask,
                 vector_applied: false,
             };
         }
-        Err(why) => return fallback(notes, budget, why),
+        Err(why) => return fallback(src, notes, budget, why),
     };
     let params = record.mask.map(|m| m.parameters).unwrap_or_default();
     let user_density = params.user_density.unwrap_or(u8::MAX);
     let vector_density = params.vector_density.unwrap_or(u8::MAX);
-    let pixel = match pixel_part(record, header, user_density, budget) {
+    let pixel = match pixel_part(src, record, header, user_density, budget) {
         Ok(pixel) => pixel,
         Err(PixelPart::Unreadable) => {
             notes.add(Note::MaskUnreadable);
             None
         }
-        Err(PixelPart::TooLarge) => return fallback(notes, budget, VectorSkip::TooLarge),
+        Err(PixelPart::TooLarge) => return fallback(src, notes, budget, VectorSkip::TooLarge),
     };
     let pixel = pixel.filter(|m| m.flags & MASK_DISABLED == 0 && !is_identity(m));
     let vector = PsdMask {
@@ -2166,7 +2571,7 @@ fn masks_for(
             pixel_used: true,
         }
     } else {
-        fallback(notes, budget, VectorSkip::TooLarge)
+        fallback(src, notes, budget, VectorSkip::TooLarge)
     }
 }
 
@@ -2178,7 +2583,8 @@ enum PixelPart {
 /// The user (pixel) mask that goes with an applied vector mask — see
 /// [`masks_for`].
 fn pixel_part(
-    record: &Record<'_>,
+    src: &mut dyn ByteSource,
+    record: &Record,
     header: Header,
     density: u8,
     budget: &mut vector::Budget,
@@ -2211,7 +2617,7 @@ fn pixel_part(
         }
         budget.pixels -= area;
     }
-    decode_mask_channel(record, header, channel, frame, density)
+    decode_mask_channel(src, record, header, channel, frame, density)
         .map(Some)
         .map_err(|_| PixelPart::Unreadable)
 }
@@ -2318,8 +2724,13 @@ fn combine_masks(
 
 /// [`decode_mask`], with a damaged mask reported and dropped (the layer
 /// opens unmasked) rather than failing the whole file.
-fn mask_or_report(record: &Record<'_>, header: Header, notes: &mut Notes) -> Option<PsdMask> {
-    decode_mask(record, header).unwrap_or_else(|_| {
+fn mask_or_report(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    notes: &mut Notes,
+) -> Option<PsdMask> {
+    decode_mask(src, record, header).unwrap_or_else(|_| {
         notes.add(Note::MaskUnreadable);
         None
     })
@@ -2478,37 +2889,93 @@ pub fn decode(bytes: &[u8]) -> Result<PsdFile, IoError> {
 }
 
 /// [`decode`] with `vector_work` as the file's vector-mask work budget
-/// (tests use a small one to exhaust it cheaply).
+/// (tests use a small one to exhaust it cheaply). The streaming parser
+/// over a `Cursor` (0.154.0), every layer's pixels then decoded before it
+/// returns.
 fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, IoError> {
-    let mut r = Reader::new(bytes);
-    let header = read_header(&mut r)?;
+    let mut src = StreamSource::new(std::io::Cursor::new(bytes))?;
+    let mut file = decode_source(&mut src, vector_work)?;
+    let profile = SharedProfile::new();
+    materialize(&mut file.layers, &mut src, &profile, 0)?;
+    Ok(file)
+}
+
+/// Decodes every pending layer image in `nodes`, in file order.
+fn materialize(
+    nodes: &mut [PsdNode],
+    src: &mut dyn ByteSource,
+    profile: &SharedProfile,
+    depth: usize,
+) -> Result<(), IoError> {
+    if depth > MAX_GROUP_DEPTH {
+        return Err(IoError::PsdGroupsTooDeep {
+            max: MAX_GROUP_DEPTH,
+        });
+    }
+    for node in nodes {
+        match node {
+            PsdNode::Layer(layer) => {
+                if let Some(pending) = layer.pending.take() {
+                    layer.image = Some(decode_pending(&pending, src, profile)?);
+                }
+            }
+            PsdNode::Group { children, .. } => materialize(children, src, profile, depth + 1)?,
+        }
+    }
+    Ok(())
+}
+
+/// The streaming parser (0.154.0): everything [`decode`] reads, with
+/// every layer's pixels located but not decoded ([`PsdLayer::pending`]).
+// One linear walk of the file's sections, kept in one piece so it reads in
+// the file's own order (the pre-0.154.0 slice parser was the same length).
+#[allow(clippy::too_many_lines)]
+fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, IoError> {
+    // More than the fixed 26-byte header, read once and parsed by
+    // `read_header` exactly as before; the window advances only past what
+    // it consumed.
+    const HEADER_PEEK: usize = 64;
+    let mut r = Window {
+        pos: 0,
+        end: src.len(),
+    };
+    let head = {
+        let mut probe = r;
+        probe.take_upto(src, HEADER_PEEK, "header")?
+    };
+    let mut head_reader = Reader::new(&head);
+    let header = read_header(&mut head_reader)?;
+    r.advance(head_reader.pos, "header")?;
+    drop(head);
     let psb = header.psb();
     let mut notes = Notes::default();
 
-    let color_data_len = r.length(false, "colour mode data length")?;
-    r.skip(color_data_len, "colour mode data")?;
-    let resources_len = r.length(false, "image resources length")?;
-    scan_resources(r.take(resources_len, "image resources")?, &mut notes);
+    let color_data_len = r.length(src, false, "colour mode data length")?;
+    r.advance(color_data_len, "colour mode data")?;
+    let resources_len = r.length(src, false, "image resources length")?;
+    let resources = r.take(src, resources_len, "image resources")?;
+    scan_resources(&resources, &mut notes);
+    drop(resources);
 
-    let section_len = r.length(psb, "layer and mask section length")?;
+    let section_len = r.length(src, psb, "layer and mask section length")?;
     let mut section = r.sub(section_len, "layer and mask section")?;
     let mut info = LayerInfo {
         records: Vec::new(),
         merged_alpha: false,
     };
     if section.remaining() > 0 {
-        let info_len = section.length(psb, "layer info length")?;
+        let info_len = section.length(src, psb, "layer info length")?;
         let mut body = section.sub(info_len, "layer info")?;
-        info = read_layer_info(&mut body, header)?;
+        info = read_layer_info(src, &mut body, header)?;
         if section.remaining() >= 4 {
-            let mask_len = section.length(false, "global layer mask length")?;
-            section.skip(mask_len, "global layer mask")?;
+            let mask_len = section.length(src, false, "global layer mask length")?;
+            section.advance(mask_len, "global layer mask")?;
         }
-        for (key, data) in read_blocks(&mut section, psb, 4)? {
+        for (key, mut data) in read_block_windows(src, &mut section, psb, 4)? {
             match &key {
                 b"Lr16" | b"Layr" if info.records.is_empty() => {
                     let tagged_alpha = info.merged_alpha;
-                    info = read_layer_info(&mut Reader::new(data), header)?;
+                    info = read_layer_info(src, &mut data, header)?;
                     info.merged_alpha |= tagged_alpha;
                 }
                 b"Lr32" => return Err(IoError::UnsupportedPsdDepth(32)),
@@ -2534,7 +3001,6 @@ fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, Io
         });
     }
 
-    let profile = SharedProfile::new();
     // Vector masks (0.150.0) and the real user masks that go with them
     // are converted only while what the declared rectangles leave of the
     // budget lasts; one that does not fit is reported, not refused.
@@ -2542,13 +3008,14 @@ fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, Io
         pixels: PIXEL_BUDGET.saturating_sub(total),
         work: vector_work,
     };
-    let layers = build_tree(
-        &info.records,
-        header,
-        &mut notes,
-        &profile,
-        &mut vector_budget,
-    )?;
+    let layers = build_tree(src, &info.records, header, &mut notes, &mut vector_budget)?;
+    // A read that failed inside a mask was reported as a damaged mask by
+    // the tree build; the file itself is what failed, so the open does.
+    // The only place a swallowed read failure is turned back into one
+    // (pinned by `a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask`).
+    if let Some(err) = src.take_failure() {
+        return Err(err);
+    }
     let color_planes = if header.gray() { 1 } else { 3 };
     let merged_alpha = info.merged_alpha && header.channels > color_planes;
     let extra = u64::from(header.channels)
@@ -2572,7 +3039,15 @@ fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, Io
         if !info.records.is_empty() {
             notes.add(Note::FlattenedFallback);
         }
-        Some(decode_merged(&mut r, header, merged_alpha)?)
+        drop(info);
+        // The merged image is the rest of the file, read at once — about
+        // one layer's worth, and only for a file with no layers at all.
+        let rest = r.take_upto(src, usize::MAX, "merged image")?;
+        Some(decode_merged(
+            &mut Reader::new(&rest),
+            header,
+            merged_alpha,
+        )?)
     } else {
         None
     };
@@ -2615,26 +3090,115 @@ fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, Io
 /// file [`decode`] accepted — origins and nesting are checked there — but
 /// that is reported, not assumed).
 pub fn build_document(file: PsdFile) -> Result<PsdDocument, IoError> {
-    let report = file.report();
+    let mut collect = Collect::default();
+    let document = build_streamed(file, None, &mut collect)?;
+    Ok(collect.into_document(document))
+}
+
+/// Where [`read_streaming`] hands an opened file's pixels (0.154.0), one
+/// layer at a time: each call gets one decoded layer image (or one mask's
+/// coverage) and owns it, and the next layer's channels are not read
+/// until the call returns — so a sink that encodes and drops each image
+/// keeps the decode's peak memory at about one layer.
+///
+/// Calls come in [`build_document`]'s order: each layer's mask (if any)
+/// before its pixels, layers in file order. An `Err` from either method
+/// stops the read and is returned by [`read_streaming`].
+pub trait PsdPixelSink {
+    /// One pixel layer's decoded image and its place in the layer's
+    /// surface — exactly a [`PsdDocument::pixels`] entry.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink cannot do with it; the read stops.
+    fn layer(&mut self, pixels: PsdPixels) -> Result<(), IoError>;
+
+    /// One attached mask's coverage — exactly a [`PsdDocument::masks`]
+    /// entry.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink cannot do with it; the read stops.
+    fn mask(&mut self, mask: PsdMaskPixels) -> Result<(), IoError>;
+}
+
+/// [`read_streaming`]'s result: a [`PsdDocument`] without its pixels and
+/// masks, which went to the [`PsdPixelSink`] instead. The report is final:
+/// it is made after every layer has been decoded.
+#[derive(Debug)]
+pub struct PsdStreamedDocument {
+    pub layers: LayerTree,
+    pub history: History,
+    pub canvas_size: (u32, u32),
+    pub report: PsdImportReport,
+}
+
+/// The sink [`build_document`] and [`read`] collect into.
+#[derive(Debug, Default)]
+struct Collect {
+    pixels: Vec<PsdPixels>,
+    masks: Vec<PsdMaskPixels>,
+}
+
+impl Collect {
+    fn into_document(self, document: PsdStreamedDocument) -> PsdDocument {
+        PsdDocument {
+            layers: document.layers,
+            history: document.history,
+            canvas_size: document.canvas_size,
+            pixels: self.pixels,
+            masks: self.masks,
+            report: document.report,
+        }
+    }
+}
+
+impl PsdPixelSink for Collect {
+    fn layer(&mut self, pixels: PsdPixels) -> Result<(), IoError> {
+        self.pixels.push(pixels);
+        Ok(())
+    }
+
+    fn mask(&mut self, mask: PsdMaskPixels) -> Result<(), IoError> {
+        self.masks.push(mask);
+        Ok(())
+    }
+}
+
+/// [`build_document`]'s body (0.154.0), handing pixels to `sink` and
+/// decoding each pending layer from `src` as it is reached.
+fn build_streamed(
+    file: PsdFile,
+    src: Option<&mut dyn ByteSource>,
+    sink: &mut dyn PsdPixelSink,
+) -> Result<PsdStreamedDocument, IoError> {
+    let PsdFile {
+        width,
+        height,
+        layers: nodes,
+        composite,
+        notes,
+        ..
+    } = file;
     let canvas = Rect {
         x: 0,
         y: 0,
-        width: file.width,
-        height: file.height,
+        width,
+        height,
     };
     let mut layers = LayerTree::new();
     let mut history = History::new();
-    let mut pixels: Vec<PsdPixels> = Vec::new();
-    let mut masks: Vec<PsdMaskPixels> = Vec::new();
+    let profile = SharedProfile::new();
     let mut builder = Builder {
         layers: &mut layers,
         history: &mut history,
-        pixels: &mut pixels,
-        masks: &mut masks,
+        sink,
+        src,
+        profile: &profile,
         canvas,
     };
-    if file.layers.is_empty() {
-        if let Some(image) = file.composite {
+    if nodes.is_empty() {
+        if let Some(image) = composite {
             let bounds = Rect {
                 width: image.width(),
                 height: image.height(),
@@ -2643,36 +3207,40 @@ pub fn build_document(file: PsdFile) -> Result<PsdDocument, IoError> {
             let id = builder
                 .history
                 .add_pixel_layer(builder.layers, "Background", bounds, None)?;
-            builder.pixels.push(PsdPixels {
+            builder.sink.layer(PsdPixels {
                 layer: id,
                 image,
                 offset: (0, 0),
-            });
+            })?;
         }
     } else {
-        builder.add_nodes(file.layers, None, 0)?;
+        builder.add_nodes(nodes, None, 0)?;
     }
+    // No second `take_failure` check here (0.154.0 review I1): every read
+    // this build makes (`decode_pending`) propagates its own error with
+    // `?`; only the tree build's mask decode swallows one, and
+    // `decode_source` checks for that before it returns.
     history.clear_undo();
-    Ok(PsdDocument {
+    Ok(PsdStreamedDocument {
         layers,
         history,
-        canvas_size: (file.width, file.height),
-        pixels,
-        masks,
-        report,
+        canvas_size: (width, height),
+        report: notes.report(),
     })
 }
 
-#[derive(Debug)]
-struct Builder<'b> {
+/// `'k` and `'s` are the sink's and the source's own lifetimes, kept apart
+/// from `'b` because a `&mut dyn` trait object's lifetime is invariant.
+struct Builder<'b, 'k, 's> {
     layers: &'b mut LayerTree,
     history: &'b mut History,
-    pixels: &'b mut Vec<PsdPixels>,
-    masks: &'b mut Vec<PsdMaskPixels>,
+    sink: &'b mut (dyn PsdPixelSink + 'k),
+    src: Option<&'b mut (dyn ByteSource + 's)>,
+    profile: &'b SharedProfile,
     canvas: Rect,
 }
 
-impl Builder<'_> {
+impl Builder<'_, '_, '_> {
     /// Recursion depth is bounded by [`MAX_GROUP_DEPTH`] ([`decode`]
     /// refuses deeper files, and this re-checks rather than trusting a
     /// hand-built [`PsdFile`]).
@@ -2691,7 +3259,7 @@ impl Builder<'_> {
             match node {
                 PsdNode::Layer(layer) => {
                     // Canvas-anchored bounds, see `PsdPixels`.
-                    let bounds = if layer.image.is_some() {
+                    let bounds = if layer.image.is_some() || layer.pending.is_some() {
                         layer.bounds.union(&self.canvas)
                     } else {
                         self.canvas
@@ -2720,12 +3288,25 @@ impl Builder<'_> {
                     if let Some(mask) = layer.mask {
                         self.attach_mask(id, mask, bounds)?;
                     }
-                    if let Some(image) = layer.image {
-                        self.pixels.push(PsdPixels {
+                    // Decoded here, after the layer exists and its mask is
+                    // attached, and handed on before the next layer's
+                    // channels are read (0.154.0).
+                    let image = match (layer.image, layer.pending) {
+                        (Some(image), _) => Some(image),
+                        (None, Some(pending)) => {
+                            let Some(src) = self.src.as_deref_mut() else {
+                                return Err(malformed("layer pixels without a source"));
+                            };
+                            Some(decode_pending(&pending, src, self.profile)?)
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some(image) = image {
+                        self.sink.layer(PsdPixels {
                             layer: id,
                             image,
                             offset,
-                        });
+                        })?;
                     }
                 }
                 PsdNode::Group {
@@ -2835,14 +3416,13 @@ impl Builder<'_> {
             }
             out
         };
-        self.masks.push(PsdMaskPixels {
+        self.sink.mask(PsdMaskPixels {
             layer: id,
             offset,
             width: target.width,
             height: target.height,
             coverage,
-        });
-        Ok(())
+        })
     }
 
     fn apply(&mut self, id: LayerId, props: &PsdProps) -> Result<(), IoError> {
@@ -2945,5 +3525,30 @@ fn mask_coverage_at(mask: &PsdMaskPixels, width: usize, column: u32, row: u32) -
 ///
 /// Either step's.
 pub fn read(bytes: &[u8]) -> Result<PsdDocument, IoError> {
-    build_document(decode(bytes)?)
+    let mut collect = Collect::default();
+    let document = read_streaming(std::io::Cursor::new(bytes), &mut collect)?;
+    Ok(collect.into_document(document))
+}
+
+/// Opens a PSD/PSB from a seekable reader, one layer at a time (0.154.0):
+/// the file is parsed as it is read — never read whole — and each layer's
+/// pixels are read, decoded and handed to `sink` before the next layer's
+/// are read. Everything else [`read`] returns comes back here; the pixels
+/// and masks went to `sink`. [`read`] is this over a `Cursor`, collecting.
+///
+/// Give it a buffered reader (`BufReader<File>`): the metadata is read in
+/// small pieces.
+///
+/// # Errors
+///
+/// [`decode`]'s and [`build_document`]'s, plus [`IoError::Io`] when the
+/// reader fails and [`IoError::PsdTruncated`] when it ends before a range
+/// its own length promised; and whatever `sink` returns.
+pub fn read_streaming<R: std::io::Read + Seek>(
+    reader: R,
+    sink: &mut dyn PsdPixelSink,
+) -> Result<PsdStreamedDocument, IoError> {
+    let mut src = StreamSource::new(reader)?;
+    let file = decode_source(&mut src, vector::MAX_FILE_VECTOR_WORK)?;
+    build_streamed(file, Some(&mut src), sink)
 }

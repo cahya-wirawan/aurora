@@ -2510,7 +2510,13 @@ fn a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha() {
 
 /// The header and layer records of `bytes`, read the way [`decode`]
 /// reads them (layer-info section, else an `Lr16`/`Layr` block).
-fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record<'_>>) {
+/// The streaming source [`decode`] runs over, for `bytes` (0.154.0).
+fn source(bytes: &[u8]) -> super::StreamSource<std::io::Cursor<&[u8]>> {
+    ok(super::StreamSource::new(std::io::Cursor::new(bytes)))
+}
+
+fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record>) {
+    let mut src = ok(super::StreamSource::new(std::io::Cursor::new(bytes)));
     let mut r = super::Reader::new(bytes);
     let header = ok(super::read_header(&mut r));
     let psb = header.psb();
@@ -2519,20 +2525,19 @@ fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record<'_>>) {
     let len = ok(r.length(false, "resources"));
     ok(r.skip(len, "resources"));
     let len = ok(r.length(psb, "layer and mask section"));
-    let mut section = ok(r.sub(len, "layer and mask section"));
-    let info_len = ok(section.length(psb, "layer info"));
+    let mut section = super::Window {
+        pos: r.pos as u64,
+        end: (r.pos + len) as u64,
+    };
+    let info_len = ok(section.length(&mut src, psb, "layer info"));
     let mut body = ok(section.sub(info_len, "layer info"));
-    let mut records = ok(super::read_layer_info(&mut body, header)).records;
+    let mut records = ok(super::read_layer_info(&mut src, &mut body, header)).records;
     if records.is_empty() && section.remaining() >= 4 {
-        let mask_len = ok(section.length(false, "global mask"));
-        ok(section.skip(mask_len, "global mask"));
-        for (key, data) in ok(super::read_blocks(&mut section, psb, 4)) {
+        let mask_len = ok(section.length(&mut src, false, "global mask"));
+        ok(section.advance(mask_len, "global mask"));
+        for (key, mut data) in ok(super::read_block_windows(&mut src, &mut section, psb, 4)) {
             if (&key == b"Lr16" || &key == b"Layr") && records.is_empty() {
-                records = ok(super::read_layer_info(
-                    &mut super::Reader::new(data),
-                    header,
-                ))
-                .records;
+                records = ok(super::read_layer_info(&mut src, &mut data, header)).records;
             }
         }
     }
@@ -2545,7 +2550,7 @@ fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record<'_>>) {
 fn vector_plane(bytes: &[u8], name: &str) -> Option<(u32, u32, Vec<f32>)> {
     let (header, records) = records_of(bytes);
     let record = records.iter().find(|r| r.name == name)?;
-    let path = super::vector::parse(record.vector?).ok()?;
+    let path = super::vector::parse(record.vector.as_deref()?).ok()?;
     let mut budget = unlimited();
     let raster = super::vector::rasterize(&path, header.width, header.height, &mut budget).ok()?;
     let (w, h) = (header.width, header.height);
@@ -3496,7 +3501,8 @@ fn corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering() {
             let Some(record) = records.iter().find(|r| r.name == layer) else {
                 unreachable!()
             };
-            let Ok(Some(mut render)) = super::decode_mask(record, header) else {
+            let Ok(Some(mut render)) = super::decode_mask(&mut source(&bytes), record, header)
+            else {
                 unreachable!("{file} {layer}: no rendered -2");
             };
             render.density = u8::MAX;
@@ -3531,7 +3537,8 @@ fn corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering() {
             let Some(record) = records.iter().find(|r| r.name == layer) else {
                 unreachable!()
             };
-            let Ok(Some(mut render)) = super::decode_mask(record, header) else {
+            let Ok(Some(mut render)) = super::decode_mask(&mut source(&bytes), record, header)
+            else {
                 unreachable!("{file} {layer}: no rendered -2");
             };
             render.density = u8::MAX;
@@ -3664,7 +3671,14 @@ fn a_layer_that_falls_back_gets_its_pixel_charges_back() {
     };
     let mut notes = super::Notes::default();
     let canvas = super::canvas_of(header);
-    let outcome = super::masks_for(record, header, canvas, &mut notes, &mut budget);
+    let outcome = super::masks_for(
+        &mut source(&bytes),
+        record,
+        header,
+        canvas,
+        &mut notes,
+        &mut budget,
+    );
     assert!(!outcome.vector_applied);
     assert_eq!(budget.pixels, start, "refunded");
     assert!(outcome.mask.is_some(), "the pixel mask alone, as 0.149.0");
@@ -3715,7 +3729,9 @@ fn corpus_masks_with_both_densities_are_the_product_of_each_part() {
         let Some(real) = info.real else {
             unreachable!()
         };
-        let Ok(u) = super::decode_mask_channel(record, header, -3, real, u8::MAX) else {
+        let Ok(u) =
+            super::decode_mask_channel(&mut source(&bytes), record, header, -3, real, u8::MAX)
+        else {
             unreachable!()
         };
         let Some((w, _, v)) = vector_plane(&bytes, layer) else {
@@ -3877,4 +3893,492 @@ fn an_off_canvas_mask_is_charged_exactly_its_parse_and_flattening() {
         Err(super::VectorSkip::TooLarge)
     );
     assert_eq!(budget.work, flatten - 1, "only the parse charge is kept");
+}
+
+// ---------------------------------------------------------------------
+// Streaming (0.154.0)
+// ---------------------------------------------------------------------
+
+/// A seekable reader over `data` that records how far into the file it
+/// has ever read (shared, so a sink can look mid-read), and can fail with
+/// an I/O error past a byte or claim to be longer than it is.
+struct Probe {
+    inner: std::io::Cursor<Vec<u8>>,
+    /// Every read, as `(offset, length)`.
+    log: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+    fail_at: Option<u64>,
+    /// Fails the first read that touches this byte range, once; every
+    /// read after it succeeds.
+    fail_once: Option<(u64, u64)>,
+    claimed_len: Option<u64>,
+}
+
+impl Probe {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            inner: std::io::Cursor::new(data),
+            log: std::rc::Rc::default(),
+            fail_at: None,
+            fail_once: None,
+            claimed_len: None,
+        }
+    }
+}
+
+impl std::io::Read for Probe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let pos = self.inner.position();
+        if let Some(fail_at) = self.fail_at
+            && pos + buf.len() as u64 > fail_at
+        {
+            return Err(std::io::Error::other("probe: the disk went away"));
+        }
+        if let Some((from, to)) = self.fail_once
+            && pos < to
+            && pos + buf.len() as u64 > from
+        {
+            self.fail_once = None;
+            return Err(std::io::Error::other("probe: one transient read error"));
+        }
+        let n = self.inner.read(buf)?;
+        self.log.borrow_mut().push((pos, n as u64));
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Probe {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        match (to, self.claimed_len) {
+            (std::io::SeekFrom::End(0), Some(len)) => {
+                self.inner.set_position(len);
+                Ok(len)
+            }
+            _ => self.inner.seek(to),
+        }
+    }
+}
+
+/// Records what a streaming read hands over, and how far into the file
+/// the reader had got at each hand-over.
+#[derive(Default)]
+struct Recording {
+    log: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+    /// How many reads had happened at each layer's hand-over.
+    reached: Vec<usize>,
+    pixels: Vec<super::PsdPixels>,
+    masks: Vec<super::PsdMaskPixels>,
+    fail_on_layer: Option<usize>,
+}
+
+impl super::PsdPixelSink for Recording {
+    fn layer(&mut self, pixels: super::PsdPixels) -> Result<(), IoError> {
+        if self.fail_on_layer == Some(self.pixels.len()) {
+            return Err(IoError::PsdMalformed {
+                what: "sink refused",
+            });
+        }
+        self.reached.push(self.log.borrow().len());
+        self.pixels.push(pixels);
+        Ok(())
+    }
+
+    fn mask(&mut self, mask: super::PsdMaskPixels) -> Result<(), IoError> {
+        self.masks.push(mask);
+        Ok(())
+    }
+}
+
+/// Four noisy 64×64 layers, `PackBits` or raw.
+fn four_noisy_layers(compression: u16) -> Vec<u8> {
+    let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+    TestPsd::new(1, 64, 64, 8)
+        .with(|f| {
+            for k in 0..4 {
+                let rgba: Vec<[u16; 4]> = (0..64 * 64)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let v = seed.to_le_bytes();
+                        [v[0], v[1], v[2], v[3] | 1].map(u16::from)
+                    })
+                    .collect();
+                let name = format!("noise {k}");
+                let layer = TestLayer::pixels(&name, 0, 0, 64, 64, 8, &rgba).with(|l| {
+                    l.compression = compression;
+                });
+                f.layers.push(layer);
+            }
+        })
+        .write()
+}
+
+/// A [`PsdDocument`] reduced to comparable data: tree, canvas, report,
+/// and every pixel and mask sample's bits.
+fn summary(document: &PsdDocument) -> (String, u64) {
+    use std::fmt::Write as _;
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut out = format!(
+        "{:?}\n{:?}\n{:?}\n",
+        document.layers, document.canvas_size, document.report
+    );
+    for p in &document.pixels {
+        let _ = writeln!(
+            out,
+            "{:?} {:?} {}x{}",
+            p.layer,
+            p.offset,
+            p.image.width(),
+            p.image.height()
+        );
+        for sample in p.image.samples() {
+            sample.to_bits().hash(&mut hasher);
+        }
+    }
+    for m in &document.masks {
+        let _ = writeln!(out, "{:?} {:?} {}x{}", m.layer, m.offset, m.width, m.height);
+        for sample in &m.coverage {
+            sample.to_bits().hash(&mut hasher);
+        }
+    }
+    (out, hasher.finish())
+}
+
+fn streamed(reader: impl std::io::Read + std::io::Seek) -> Result<PsdDocument, IoError> {
+    let mut collect = super::Collect::default();
+    super::read_streaming(reader, &mut collect).map(|document| collect.into_document(document))
+}
+
+/// AC-2: the streaming read of a real file on disk (`BufReader<File>`) is
+/// the in-memory read, sample for sample, for every fixture and — when
+/// present — every corpus file, refusals included.
+#[test]
+fn streaming_a_file_from_disk_matches_the_in_memory_read_for_every_fixture_and_corpus_file() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![
+        root.join("tests/fixtures/psd"),
+        root.join("../../corpora/psd"),
+    ];
+    let mut files = Vec::new();
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    assert!(files.len() >= 10, "the checked-in fixtures are there");
+    for path in &files {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let from_disk = streamed(std::io::BufReader::new(file));
+        let in_memory = read(&bytes);
+        match (from_disk, in_memory) {
+            (Ok(a), Ok(b)) => assert_eq!(summary(&a), summary(&b), "{}", path.display()),
+            (Err(a), Err(b)) => {
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "{}", path.display());
+            }
+            (a, b) => unreachable!("{}: {a:?} vs {b:?}", path.display()),
+        }
+        // And the eager `decode` + `build_document` path agrees too.
+        if let Ok(a) = read(&bytes) {
+            let b = ok(super::build_document(ok(decode(&bytes))));
+            assert_eq!(summary(&a), summary(&b), "{}", path.display());
+        }
+    }
+}
+
+/// AC-1/AC-5: each layer is handed to the sink before the next layer's
+/// channel data is read, no single read is bigger than the largest
+/// channel, and the whole file is read about once — never whole.
+#[test]
+fn the_streaming_read_hands_each_layer_on_before_reading_the_next() {
+    for compression in [0, 1] {
+        let bytes = four_noisy_layers(compression);
+        let (_, records) = records_of(&bytes);
+        // Each layer's channel data, as one byte range (they are laid out
+        // layer after layer).
+        let ranges: Vec<(u64, u64)> = records
+            .iter()
+            .map(|r| {
+                let start = r.data.iter().map(|(_, c)| c.offset).min().unwrap_or(0);
+                let end = r
+                    .data
+                    .iter()
+                    .map(|(_, c)| c.offset + c.len as u64)
+                    .max()
+                    .unwrap_or(0);
+                (start, end)
+            })
+            .collect();
+        let largest_channel = records
+            .iter()
+            .flat_map(|r| r.data.iter().map(|(_, c)| c.len))
+            .max()
+            .unwrap_or(0);
+        let len = bytes.len() as u64;
+        let probe = Probe::new(bytes);
+        let probe_log = std::rc::Rc::clone(&probe.log);
+        let mut sink = Recording {
+            log: std::rc::Rc::clone(&probe.log),
+            ..Recording::default()
+        };
+        let mut src = ok(super::StreamSource::new(probe));
+        let file = ok(super::decode_source(
+            &mut src,
+            super::vector::MAX_FILE_VECTOR_WORK,
+        ));
+        ok(super::build_streamed(file, Some(&mut src), &mut sink));
+        assert_eq!(sink.pixels.len(), 4);
+        let log = probe_log.borrow();
+        for (k, reached) in sink.reached.iter().enumerate() {
+            for (start, len) in log.iter().take(*reached) {
+                for (later, (from, to)) in ranges.iter().enumerate().skip(k + 1) {
+                    assert!(
+                        start + len <= *from || start >= to,
+                        "layer {k} was handed on after a read of layer {later}'s channel data"
+                    );
+                }
+            }
+        }
+        assert_eq!(sink.reached.len(), 4);
+        assert!(
+            src.largest_read <= largest_channel,
+            "largest single read {} > largest channel {largest_channel}",
+            src.largest_read
+        );
+        // Each channel's 2-byte compression field is read twice (checked,
+        // then decoded), and the header probe re-reads up to 64 bytes.
+        let slack = 64 + 2 * 16;
+        assert!(
+            src.total_read <= len + slack,
+            "read {} bytes of a {len}-byte file",
+            src.total_read
+        );
+        let channels: u64 = records
+            .iter()
+            .flat_map(|r| r.data.iter().map(|(_, c)| c.len as u64))
+            .sum();
+        assert!(src.total_read >= channels, "every channel is read once");
+    }
+}
+
+/// AC-3: an I/O error mid-layer is `IoError::Io`, and a reader that ends
+/// before the length it reported is `PsdTruncated` — never a panic, never
+/// a silently zero-filled layer.
+#[test]
+fn a_reader_failing_or_ending_mid_layer_is_a_typed_error() {
+    let bytes = four_noisy_layers(0);
+    let (_, records) = records_of(&bytes);
+    let Some(third) = records.get(2).and_then(|r| r.data.first()) else {
+        unreachable!("four layers");
+    };
+    let mid = third.1.offset + 100;
+    let mut failing = Probe::new(bytes.clone());
+    failing.fail_at = Some(mid);
+    assert!(matches!(streamed(failing), Err(IoError::Io(_))));
+
+    let mut short = Probe::new(bytes.get(..mid as usize).unwrap_or(&[]).to_vec());
+    short.claimed_len = Some(bytes.len() as u64);
+    assert!(matches!(streamed(short), Err(IoError::PsdTruncated { .. })));
+
+    // A failure inside a mask channel fails the open too — it is the file
+    // that failed, not the mask (the tree build would report a damaged
+    // mask and open the layer unmasked).
+    let masked = TestPsd::new(1, 8, 8, 8)
+        .with(|f| {
+            let rgba = vec![[200, 100, 50, 255]; 64];
+            let layer = TestLayer::pixels("masked", 0, 0, 8, 8, 8, &rgba).with(|l| {
+                l.mask = Some((0, 0, 8, 8, 0, 0));
+                l.channels.push((-2, vec![128; 64]));
+            });
+            f.layers.push(layer);
+        })
+        .write();
+    assert_eq!(doc(&masked).masks.len(), 1, "the fixture's mask decodes");
+    let (_, records) = records_of(&masked);
+    let Some(mask) = records
+        .first()
+        .and_then(|r| r.data.iter().find(|(id, _)| *id == -2))
+    else {
+        unreachable!("a -2 channel");
+    };
+    let mut failing = Probe::new(masked);
+    failing.fail_at = Some(mask.1.offset + 1);
+    assert!(matches!(streamed(failing), Err(IoError::Io(_))));
+}
+
+/// AC-3/AC-5: every truncation of a multi-layer file read through a real
+/// `File` gives exactly what the in-memory read of the same prefix gives.
+#[test]
+fn every_truncation_read_from_a_real_file_matches_the_in_memory_result() {
+    let bytes = four_noisy_layers(1);
+    let dir = ok(tempfile::tempdir().map_err(IoError::Io));
+    let path = dir.path().join("cut.psd");
+    for len in (0..bytes.len()).step_by(37) {
+        let prefix = bytes.get(..len).unwrap_or(&[]);
+        ok(std::fs::write(&path, prefix).map_err(IoError::Io));
+        let file = ok(std::fs::File::open(&path).map_err(IoError::Io));
+        let a = streamed(std::io::BufReader::new(file)).map(|d| summary(&d));
+        let b = read(prefix).map(|d| summary(&d));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"), "prefix {len}");
+    }
+}
+
+/// AC-3: a declared length or offset past the end of the file is refused
+/// from the declaration alone — nothing that size is read or allocated.
+#[test]
+fn a_length_past_the_file_is_refused_before_anything_is_read() {
+    let bytes = four_noisy_layers(0);
+    let at = |offset: usize, value: u32| {
+        let mut out = bytes.clone();
+        if let Some(slot) = out.get_mut(offset..offset + 4) {
+            slot.copy_from_slice(&value.to_be_bytes());
+        }
+        out
+    };
+    // Header (26), colour data length (4) at 26, resources length at 30,
+    // section length at 34, layer-info length at 38.
+    for (offset, what) in [
+        (30, "image resources"),
+        (34, "layer and mask section"),
+        (38, "layer info"),
+    ] {
+        let mut src = ok(super::StreamSource::new(std::io::Cursor::new(at(
+            offset,
+            u32::MAX - 7,
+        ))));
+        let result = super::decode_source(&mut src, super::vector::MAX_FILE_VECTOR_WORK);
+        assert!(
+            matches!(result, Err(IoError::PsdTruncated { what: w }) if w == what),
+            "{what}: {result:?}"
+        );
+        assert!(src.largest_read <= 64, "{what}: read {}", src.largest_read);
+    }
+    // The first record's first channel length, past the file.
+    let (_, records) = records_of(&bytes);
+    assert!(!records.is_empty());
+    // Rectangle (16) + count (2) + id (2): the length is at 38 + 4 + 2 + 20.
+    let mut src = ok(super::StreamSource::new(std::io::Cursor::new(at(
+        38 + 4 + 2 + 20,
+        u32::MAX - 7,
+    ))));
+    let result = super::decode_source(&mut src, super::vector::MAX_FILE_VECTOR_WORK);
+    assert!(
+        matches!(
+            result,
+            Err(IoError::PsdTruncated {
+                what: "channel image data"
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(src.largest_read <= 4096, "read {}", src.largest_read);
+    // And a read past the file is refused by the source itself, from the
+    // range alone: the reader is never asked for a byte.
+    let probe = Probe::new(vec![0_u8; 16]);
+    let log = std::rc::Rc::clone(&probe.log);
+    let mut src = ok(super::StreamSource::new(probe));
+    assert!(matches!(
+        super::ByteSource::read_at(&mut src, 10, 7, "probe"),
+        Err(IoError::PsdTruncated { what: "probe" })
+    ));
+    assert!(matches!(
+        super::ByteSource::read_at(&mut src, u64::MAX, 1, "probe"),
+        Err(IoError::PsdTruncated { what: "probe" })
+    ));
+    assert_eq!(src.total_read, 0);
+    assert!(
+        log.borrow().is_empty(),
+        "nothing was read: {:?}",
+        log.borrow()
+    );
+}
+
+/// A sink's error stops the read and is what comes back.
+#[test]
+fn a_sink_error_stops_the_streaming_read() {
+    let probe = Probe::new(four_noisy_layers(0));
+    let mut sink = Recording {
+        fail_on_layer: Some(1),
+        ..Recording::default()
+    };
+    let result = super::read_streaming(probe, &mut sink);
+    assert!(matches!(
+        result,
+        Err(IoError::PsdMalformed {
+            what: "sink refused"
+        })
+    ));
+    assert_eq!(sink.pixels.len(), 1);
+}
+
+/// 0.154.0 review I1: a read that fails **once**, only on a mask
+/// channel's bytes, and would succeed if retried, fails the open with the
+/// reader's own `IoError::Io` — through the streaming read and through
+/// `decode`'s parser — and is never opened with the mask dropped and
+/// reported as damaged (`MaskUnreadable`).
+#[test]
+fn a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask() {
+    let masked = TestPsd::new(1, 8, 8, 8)
+        .with(|f| {
+            let rgba = vec![[200, 100, 50, 255]; 64];
+            let layer = TestLayer::pixels("masked", 0, 0, 8, 8, 8, &rgba).with(|l| {
+                l.mask = Some((0, 0, 8, 8, 0, 0));
+                l.channels.push((-2, vec![128; 64]));
+            });
+            f.layers.push(layer);
+        })
+        .write();
+    let opened = doc(&masked);
+    assert_eq!(opened.masks.len(), 1, "the fixture's mask decodes");
+    assert!(opened.report.is_empty(), "{:?}", opened.report);
+    let (_, records) = records_of(&masked);
+    let Some((_, mask)) = records
+        .first()
+        .and_then(|r| r.data.iter().find(|(id, _)| *id == -2))
+        .copied()
+    else {
+        unreachable!("a -2 channel");
+    };
+    let range = (mask.offset, mask.offset + mask.len as u64);
+    // Pixel channels come before the mask's, so only the mask read fails.
+    assert!(records.first().is_some_and(|r| {
+        r.data
+            .iter()
+            .all(|(id, c)| *id == -2 || c.offset + c.len as u64 <= range.0)
+    }));
+
+    let mut probe = Probe::new(masked.clone());
+    probe.fail_once = Some(range);
+    let result = streamed(probe);
+    assert!(
+        matches!(&result, Err(IoError::Io(err)) if err.to_string().contains("transient")),
+        "{:?}",
+        result.map(|d| d.report)
+    );
+
+    let mut probe = Probe::new(masked);
+    probe.fail_once = Some(range);
+    let mut src = ok(super::StreamSource::new(probe));
+    let result = super::decode_source(&mut src, super::vector::MAX_FILE_VECTOR_WORK);
+    assert!(
+        matches!(&result, Err(IoError::Io(err)) if err.to_string().contains("transient")),
+        "{:?}",
+        result.map(|f| f.report())
+    );
 }

@@ -53,7 +53,8 @@ pub use import::{
     write_into_store, write_into_store_at,
 };
 pub use psd::{
-    PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixels, build_document as build_psd_document,
-    decode as decode_psd, encode_mask_pixels as encode_psd_mask, read as read_psd,
+    PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,
+    build_document as build_psd_document, decode as decode_psd,
+    encode_mask_pixels as encode_psd_mask, read as read_psd, read_streaming as read_psd_streaming,
     write_mask_pixels as write_psd_mask,
 };

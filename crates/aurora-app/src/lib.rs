@@ -956,6 +956,7 @@ fn unwritten_layers_item(unwritten: usize) -> Option<String> {
 /// (`aurora_io::read_psd`) — [`App::open_psd_file`]'s testable half. A
 /// refusal is an [`OpenFailure::Decode`] carrying the reader's own typed
 /// error, which [`open_failure_message`] turns into plain language.
+#[cfg(test)]
 fn open_psd_document(bytes: &[u8]) -> Result<aurora_io::PsdDocument, OpenFailure> {
     aurora_io::read_psd(bytes).map_err(OpenFailure::Decode)
 }
@@ -968,7 +969,18 @@ fn open_psd_document(bytes: &[u8]) -> Result<aurora_io::PsdDocument, OpenFailure
 /// and a `.aur` file is read and **pre-checked in a throwaway store**
 /// ([`precheck_aur`]) — its live read waits for the UI thread, so 0.143.1's
 /// rule that damaged bytes never reach the live store still holds.
+#[cfg(test)]
 fn decode_chosen_file(path: &Path) -> Result<DecodedFile, OpenFailure> {
+    decode_chosen_file_with(path, None)
+}
+
+/// `decode_chosen_file`, a PSD/PSB's tiles staged on the scratch disk
+/// through `staging` (0.154.0, [`PreparedPsd::stream`]) — what
+/// [`App::open_file`] runs.
+fn decode_chosen_file_with(
+    path: &Path,
+    staging: Option<&aurora_tile::StagingRoot>,
+) -> Result<DecodedFile, OpenFailure> {
     let read = |path: &Path| {
         std::fs::read(path).map_err(|err| {
             tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
@@ -982,14 +994,9 @@ fn decode_chosen_file(path: &Path) -> Result<DecodedFile, OpenFailure> {
         OpenRoute::Image => {
             open_image(path).map(|image| DecodedFile::Image(PreparedImage::new(image)))
         }
-        OpenRoute::Psd => {
-            let bytes = read(path)?;
-            let document = open_psd_document(&bytes)?;
-            // The file's bytes are not needed past the decode; dropped
-            // before the encode so the two never coexist (review J2).
-            drop(bytes);
-            Ok(DecodedFile::Psd(PreparedPsd::new(document)))
-        }
+        // Streamed (0.154.0): parsed from the file, never read whole, and
+        // decoded, encoded and staged one layer at a time.
+        OpenRoute::Psd => PreparedPsd::stream(path, staging).map(DecodedFile::Psd),
         OpenRoute::Aur => {
             let bytes = read(path)?;
             precheck_aur(&bytes)?;
@@ -1389,7 +1396,7 @@ fn aur_scratch_store() -> Option<(tempfile::TempDir, aurora_tile::TileStore)> {
 ///
 /// Since 0.151.0 the app runs the two halves on different threads —
 /// [`precheck_aur`] on the background decode thread
-/// ([`decode_chosen_file`]), [`read_prechecked_aur`] on the UI thread at
+/// ([`decode_chosen_file_with`]), [`read_prechecked_aur`] on the UI thread at
 /// install — so this composition is what the tests pin; the app performs
 /// the same two steps in the same order, on the same bytes.
 #[cfg_attr(
@@ -19086,7 +19093,7 @@ impl App {
 
     /// **Since 0.151.0 this only starts the open** (invariant §7.3.4):
     /// the read and decode run on a background thread
-    /// ([`OpenWorker::start`] with [`decode_chosen_file`]), the window
+    /// ([`OpenWorker::start`] with [`decode_chosen_file_with`]), the window
     /// shows and announces "Opening `<file>`…" ([`Self::show_open_state`]),
     /// and the loop installs the result when the thread wakes it
     /// ([`AppEvent::OpenFinished`], [`Self::poll_background_open`]). A
@@ -19134,10 +19141,14 @@ impl App {
             // nothing left to wake.
             let _ = proxy.send_event(AppEvent::OpenFinished);
         };
-        match self
-            .open_worker
-            .start(path.to_path_buf(), decode_chosen_file, wake)
-        {
+        // The decode thread stages the opened tiles straight into the
+        // store's scratch directory (0.154.0); the install adopts them.
+        let staging = self
+            .tile_store
+            .as_ref()
+            .map(aurora_tile::TileStore::staging_root);
+        let decode = move |path: &Path| decode_chosen_file_with(path, staging.as_ref());
+        match self.open_worker.start(path.to_path_buf(), decode, wake) {
             Ok(generation) => {
                 tracing::info!(path = %path.display(), generation, "opening a file in the background");
             }
@@ -19250,7 +19261,7 @@ impl App {
     }
 
     /// Opens a Photoshop file (0.144.0): reads and decodes it whole
-    /// ([`open_psd_document`], `aurora_io::read_psd`) into a real,
+    /// ([`PreparedPsd::stream`], `aurora_io::read_psd_streaming`) into a real,
     /// multi-layer document with its groups, names, opacity, fill
     /// opacity, blend modes and visibility, then installs it exactly the
     /// way a flat image is installed ([`Self::install_opened_document`]:
@@ -19267,7 +19278,7 @@ impl App {
     /// one shown faithfully opens with no dialog.
     ///
     /// Since 0.151.0 the read and decode happen on the background thread
-    /// ([`decode_chosen_file`]); this is handed the decoded `document`
+    /// ([`decode_chosen_file_with`]); this is handed the decoded `document`
     /// and does only the install, on the UI thread.
     ///
     /// Since 0.153.0 its tiles arrive already encoded ([`PreparedPsd`]).
@@ -19519,7 +19530,7 @@ impl App {
     /// change rather than a patch here.
     ///
     /// Since 0.151.0 the file is read and pre-checked on the background
-    /// thread ([`decode_chosen_file`], [`precheck_aur`]); this is handed
+    /// thread ([`decode_chosen_file_with`], [`precheck_aur`]); this is handed
     /// the checked `bytes`, and its live read ([`read_prechecked_aur`])
     /// still runs here, on the UI thread, because the live store is the
     /// UI thread's.
@@ -61448,7 +61459,7 @@ mod tests {
     use crate::background_open;
     use crate::{
         DecodedFile, OPENING_STATUS_NODE, OpenWorker, ToolSettings, decode_chosen_file,
-        read_prechecked_aur, window_title, with_opening_status,
+        decode_chosen_file_with, read_prechecked_aur, window_title, with_opening_status,
     };
     use crate::{OpenStep, PSD_REPORT_TITLE, aur_verify_scratch_dir_unless, background_open_step};
 
@@ -61573,7 +61584,7 @@ mod tests {
             let expected = aurora_io::encode_image_tiles_at(&b.image, b.offset.0, b.offset.1);
             assert_eq!(
                 encoded_summary(a.tiles.as_ref().ok()),
-                encoded_summary(expected.as_ref().ok())
+                raw_summary(expected.as_ref().ok())
             );
         }
         let expected_masks = crate::prepared_pixels::prepare_masks(&synchronous.masks);
@@ -61617,13 +61628,244 @@ mod tests {
         let expected = aurora_io::encode_image_tiles_at(&synchronous, 0, 0);
         assert_eq!(
             encoded_summary(background.tiles.as_ref().ok()),
-            encoded_summary(expected.as_ref().ok())
+            raw_summary(expected.as_ref().ok())
         );
-        assert!(encoded_summary(expected.as_ref().ok()).is_some_and(|tiles| !tiles.is_empty()));
+        assert!(raw_summary(expected.as_ref().ok()).is_some_and(|tiles| !tiles.is_empty()));
+    }
+
+    /// Staging files (0.154.0) anywhere under `dir`: files inside a
+    /// `staging-*` directory, and how many such directories there are.
+    fn staging_under(dir: &std::path::Path) -> (usize, usize) {
+        let (mut files, mut dirs) = (0, 0);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return (0, 0);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name().to_string_lossy().starts_with("staging-") {
+                    dirs += 1;
+                    files += std::fs::read_dir(&path).map_or(0, Iterator::count);
+                } else {
+                    let (f, d) = staging_under(&path);
+                    files += f;
+                    dirs += d;
+                }
+            }
+        }
+        (files, dirs)
+    }
+
+    /// Every `(surface, tile)` a prepared document will insert.
+    fn prepared_keys(
+        document: &crate::PreparedPsd,
+    ) -> Vec<(aurora_tile::SurfaceId, aurora_tile::TileId)> {
+        let mut keys = Vec::new();
+        for layer in &document.pixels {
+            let Some(surface) = document.layers.surface_id(layer.layer) else {
+                unreachable!("a pixel layer has a surface");
+            };
+            for (id, _) in layer.tiles.as_ref().into_iter().flatten() {
+                keys.push((surface, *id));
+            }
+        }
+        for mask in &document.masks {
+            let Some(surface) = document.layers.mask_surface_id(mask.layer) else {
+                unreachable!("an attached mask has a surface");
+            };
+            for (id, _) in &mask.tiles {
+                keys.push((surface, *id));
+            }
+        }
+        keys
+    }
+
+    /// AC-1/AC-2/AC-4 (0.154.0): the open `App::open_file` runs — the PSD
+    /// streamed from disk, each layer's tiles staged into the store's own
+    /// scratch directory by the decode thread — installs exactly the tiles
+    /// the in-memory path installs, the autosave snapshot reads them from
+    /// their staging files, and every staging file is gone once its tile
+    /// has been read.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one open, checked end to end
+    fn a_staged_streaming_open_installs_the_same_tiles_and_cleans_up_after_itself() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = write_temp_file(&dir, "layers.psd", &two_layer_masked_psd_with_effects());
+        let (staged_dir, mut staged_store) = real_tile_store();
+        let (_memory_dir, mut memory_store) = real_tile_store();
+        let staged = match decode_chosen_file_with(&path, Some(&staged_store.staging_root())) {
+            Ok(DecodedFile::Psd(document)) => document,
+            other => unreachable!("{other:?}"),
+        };
+        let memory = match decode_chosen_file(&path) {
+            Ok(DecodedFile::Psd(document)) => document,
+            other => unreachable!("{other:?}"),
+        };
+        let all_staged = staged
+            .pixels
+            .iter()
+            .flat_map(|layer| layer.tiles.as_ref().into_iter().flatten())
+            .chain(staged.masks.iter().flat_map(|mask| mask.tiles.iter()))
+            .all(|(_, tile)| matches!(tile, crate::prepared_pixels::PreparedTile::Staged(_)));
+        assert!(all_staged, "every tile went to the staging area");
+        assert_eq!(staged.report, memory.report);
+        assert_eq!(staged.pixels.len(), memory.pixels.len());
+        for (a, b) in staged.pixels.iter().zip(&memory.pixels) {
+            assert_eq!(a.layer, b.layer);
+            assert_eq!(
+                encoded_summary(a.tiles.as_ref().ok()),
+                encoded_summary(b.tiles.as_ref().ok())
+            );
+        }
+        for (a, b) in staged.masks.iter().zip(&memory.masks) {
+            assert_eq!(
+                encoded_summary(Some(&a.tiles)),
+                encoded_summary(Some(&b.tiles))
+            );
+        }
+        let keys = prepared_keys(&memory);
+        assert!(keys.len() >= 3, "pixels and a mask: {}", keys.len());
+        assert_eq!(staging_under(staged_dir.path()).0, keys.len());
+
+        let install = |store: &mut aurora_tile::TileStore, document: crate::PreparedPsd| {
+            let crate::PreparedPsd {
+                layers,
+                pixels,
+                masks,
+                ..
+            } = document;
+            let (_freed, failed) = crate::replace_document_pixels_prepared(
+                store,
+                aurora_doc::LayerTree::new(),
+                aurora_doc::History::new(),
+                &layers,
+                pixels,
+                masks,
+            );
+            assert_eq!(failed, 0);
+            layers
+        };
+        let started = std::time::Instant::now();
+        let layers = install(&mut staged_store, staged);
+        let install_time = started.elapsed();
+        let _ = install(&mut memory_store, memory);
+        assert!(
+            install_time < std::time::Duration::from_millis(50),
+            "adopting staged tiles is bookkeeping: {install_time:?}"
+        );
+        for (surface, id) in &keys {
+            let a = match staged_store.snapshot_tile(*surface, *id) {
+                Ok(Some(aurora_tile::TileSnapshot::Encoded(bytes))) => bytes,
+                other => unreachable!("a staged tile snapshots from its file: {other:?}"),
+            };
+            let b = match memory_store.snapshot_tile(*surface, *id) {
+                Ok(Some(aurora_tile::TileSnapshot::Encoded(bytes))) => bytes,
+                other => unreachable!("{other:?}"),
+            };
+            assert_eq!(a, b);
+        }
+        let mut skipped = aurora_io::SkippedTiles::new();
+        assert!(matches!(
+            crate::snapshot_autosave(
+                &dir.path().join("autosave.aur"),
+                &layers,
+                &aurora_doc::History::new(),
+                (8, 6),
+                &mut skipped,
+                crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
+                &mut staged_store,
+            ),
+            crate::SnapshotOutcome::Taken(_)
+        ));
+        for (surface, id) in &keys {
+            let a = match staged_store.get(*surface, *id) {
+                Ok(tile) => tile.texels().to_vec(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let b = match memory_store.get(*surface, *id) {
+                Ok(tile) => tile.texels().to_vec(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(a, b);
+        }
+        assert_eq!(
+            staging_under(staged_dir.path()).0,
+            0,
+            "every staged file is deleted once its tile is read"
+        );
+    }
+
+    /// AC-5 (0.154.0): a streaming open that fails mid-file — or succeeds
+    /// and is then thrown away (superseded) — leaves nothing on the scratch
+    /// disk and never touches the current document's tiles: the install
+    /// is still one step, after the whole decode.
+    #[test]
+    fn a_failed_or_discarded_streaming_open_leaves_the_store_and_scratch_untouched() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = two_layer_masked_psd_with_effects();
+        let good = write_temp_file(&dir, "good.psd", &bytes);
+        let (store_dir, mut store) = real_tile_store();
+        // The current document.
+        let current = match decode_chosen_file(&good) {
+            Ok(DecodedFile::Psd(document)) => document,
+            other => unreachable!("{other:?}"),
+        };
+        let keys = prepared_keys(&current);
+        let crate::PreparedPsd {
+            layers,
+            pixels,
+            masks,
+            ..
+        } = current;
+        let _ = crate::replace_document_pixels_prepared(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &layers,
+            pixels,
+            masks,
+        );
+        let before: Vec<Vec<half::f16>> = keys
+            .iter()
+            .map(|(surface, id)| match store.get(*surface, *id) {
+                Ok(tile) => tile.texels().to_vec(),
+                Err(err) => unreachable!("{err:?}"),
+            })
+            .collect();
+        let mut failures = 0;
+        for cut in (bytes.len() / 2..bytes.len()).step_by(7) {
+            let path = write_temp_file(&dir, "cut.psd", bytes.get(..cut).unwrap_or(&[]));
+            if decode_chosen_file_with(&path, Some(&store.staging_root())).is_err() {
+                failures += 1;
+            }
+            assert_eq!(staging_under(store_dir.path()), (0, 0), "cut at {cut}");
+        }
+        assert!(failures > 0, "some cuts land inside layer data");
+        let discarded = decode_chosen_file_with(&good, Some(&store.staging_root()));
+        assert!(matches!(discarded, Ok(DecodedFile::Psd(_))));
+        assert!(staging_under(store_dir.path()).0 > 0);
+        drop(discarded);
+        assert_eq!(
+            staging_under(store_dir.path()),
+            (0, 0),
+            "a dropped open is removed whole"
+        );
+        for ((surface, id), expected) in keys.iter().zip(&before) {
+            match store.get(*surface, *id) {
+                Ok(tile) => assert_eq!(tile.texels(), expected.as_slice()),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
     }
 
     /// Encoded tiles as comparable `(tile, bytes)` pairs (0.153.0).
-    fn encoded_summary(
+    fn raw_summary(
         tiles: Option<&aurora_io::EncodedTiles>,
     ) -> Option<Vec<(aurora_tile::TileId, Vec<u8>)>> {
         tiles.map(|tiles| {
@@ -61632,6 +61874,14 @@ mod tests {
                 .map(|(id, tile)| (*id, tile.bytes().to_vec()))
                 .collect()
         })
+    }
+
+    /// [`raw_summary`] of prepared tiles: a staged tile's bytes are read
+    /// back from its staging file (0.154.0).
+    fn encoded_summary(
+        tiles: Option<&crate::prepared_pixels::PreparedTiles>,
+    ) -> Option<Vec<(aurora_tile::TileId, Vec<u8>)>> {
+        tiles.map(|tiles| tiles.iter().map(|(id, tile)| (*id, tile.bytes())).collect())
     }
 
     /// AC-3: 0.143.1's pre-check survives the move off the UI thread. A
@@ -62042,6 +62292,200 @@ mod tests {
             sync_time.as_secs_f64() * 1e3,
         );
         let _shutdown = worker.shutdown(crate::background_autosave::SHUTDOWN_WAIT_BOUND);
+    }
+
+    /// Writes a `side`² PSD of four noisy layers at `depth` bits straight
+    /// to `path` (0.154.0's measurement), raw-compressed, without ever
+    /// holding it in memory. The merged image is left out: a reader of a
+    /// layered file never needs it.
+    fn write_noisy_psd(path: &std::path::Path, side: u32, depth: u16) -> std::io::Result<u64> {
+        use std::io::Write as _;
+        const LAYERS: u32 = 4;
+        let bps = u64::from(depth / 8);
+        let plane = u64::from(side) * u64::from(side) * bps;
+        let channel_len = 2 + plane;
+        let record_len = 70_u64;
+        let info_len = 2 + u64::from(LAYERS) * (record_len + 4 * channel_len);
+        let section_len = 4 + info_len + 4;
+        let u32_of = |v: u64| u32::try_from(v).map_err(std::io::Error::other);
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+        out.write_all(b"8BPS")?;
+        out.write_all(&1_u16.to_be_bytes())?;
+        out.write_all(&[0; 6])?;
+        out.write_all(&3_u16.to_be_bytes())?;
+        out.write_all(&side.to_be_bytes())?;
+        out.write_all(&side.to_be_bytes())?;
+        out.write_all(&depth.to_be_bytes())?;
+        out.write_all(&3_u16.to_be_bytes())?;
+        out.write_all(&0_u32.to_be_bytes())?; // colour mode data
+        out.write_all(&0_u32.to_be_bytes())?; // image resources
+        out.write_all(&u32_of(section_len)?.to_be_bytes())?;
+        out.write_all(&u32_of(info_len)?.to_be_bytes())?;
+        out.write_all(&4_i16.to_be_bytes())?;
+        for k in 0..LAYERS {
+            for edge in [0, 0, side, side] {
+                out.write_all(&edge.to_be_bytes())?;
+            }
+            out.write_all(&4_u16.to_be_bytes())?;
+            for id in [-1_i16, 0, 1, 2] {
+                out.write_all(&id.to_be_bytes())?;
+                out.write_all(&u32_of(channel_len)?.to_be_bytes())?;
+            }
+            out.write_all(b"8BIMnorm")?;
+            out.write_all(&[255, 0, 0, 0])?;
+            out.write_all(&12_u32.to_be_bytes())?; // extra data
+            out.write_all(&0_u32.to_be_bytes())?; // mask data
+            out.write_all(&0_u32.to_be_bytes())?; // blending ranges
+            let digit = u8::try_from(k).map_err(std::io::Error::other)? + b'0';
+            out.write_all(&[2, b'n', digit, 0])?;
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut row = vec![0_u8; usize::try_from(u64::from(side) * bps).unwrap_or(0)];
+        for _ in 0..LAYERS {
+            for _channel in 0..4 {
+                out.write_all(&0_u16.to_be_bytes())?;
+                for _ in 0..side {
+                    for chunk in row.chunks_mut(8) {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let bytes = seed.to_le_bytes();
+                        let n = chunk.len();
+                        chunk.copy_from_slice(bytes.get(..n).unwrap_or(&[]));
+                    }
+                    out.write_all(&row)?;
+                }
+            }
+        }
+        out.write_all(&0_u32.to_be_bytes())?; // global layer mask
+        out.flush()?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// 0.154.0's measurement (AC-1): peak RSS (`VmHWM` above the start)
+    /// and time of opening a large noisy PSD the streaming way —
+    /// `PreparedPsd::stream`, tiles staged — against the whole-file path
+    /// 0.153.0 took (read the file, decode every layer, encode every
+    /// tile: `open_psd_document` then `PreparedPsd::new`), plus the
+    /// UI-thread install of the streamed result. `#[ignore]`d: the default
+    /// 4096² four-layer 8-bit file is 256 MiB; set `AURORA_MEASURE_SIDE` and
+    /// `AURORA_MEASURE_DEPTH` (8 or 16) for larger — 8192 and 16 make a
+    /// 2 GiB file. The file goes in a tempdir and is deleted. Run with
+    /// `cargo test -p aurora-app --release -- --ignored --nocapture measure_streaming`.
+    #[test]
+    #[ignore = "measurement, writes and opens a large PSD"]
+    #[allow(clippy::print_stderr, clippy::too_many_lines)]
+    fn measure_streaming_a_large_noisy_psd_open() {
+        let env = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let side = env("AURORA_MEASURE_SIDE", 4096);
+        let depth = u16::try_from(env("AURORA_MEASURE_DEPTH", 8)).unwrap_or(8);
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("noisy.psd");
+        let file_len = match write_noisy_psd(&path, side, depth) {
+            Ok(len) => len,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let file_mib = file_len as f64 / f64::from(1 << 20);
+        let store = || {
+            let dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(budget) = std::num::NonZeroUsize::new(crate::TILE_BUDGET) else {
+                unreachable!("non-zero");
+            };
+            match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+                Ok(store) => (dir, store),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+
+        // After (0.154.0): streamed and staged on this (the decode)
+        // thread, then installed.
+        let (_new_dir, mut new_store) = store();
+        let base = peak_reset();
+        let started = std::time::Instant::now();
+        let streamed = match crate::PreparedPsd::stream(&path, Some(&new_store.staging_root())) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let stream_time = started.elapsed();
+        let stream_peak = peak_since(base);
+        let crate::PreparedPsd {
+            layers,
+            pixels,
+            masks,
+            ..
+        } = streamed;
+        let base = peak_reset();
+        let started = std::time::Instant::now();
+        let (_freed, failed) = crate::replace_document_pixels_prepared(
+            &mut new_store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &layers,
+            pixels,
+            masks,
+        );
+        let install_time = started.elapsed();
+        let install_peak = peak_since(base);
+        assert_eq!(failed, 0);
+        drop(new_store);
+
+        // Before (the 0.153.0 path): the whole file, the whole decoded
+        // document, then every encoded tile.
+        let (_old_dir, mut old_store) = store();
+        let base = peak_reset();
+        let started = std::time::Instant::now();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match open_psd_document(&bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        drop(bytes);
+        let prepared = crate::PreparedPsd::new(document);
+        let old_time = started.elapsed();
+        let old_peak = peak_since(base);
+        let crate::PreparedPsd {
+            layers,
+            pixels,
+            masks,
+            ..
+        } = prepared;
+        let started = std::time::Instant::now();
+        let (_freed, failed) = crate::replace_document_pixels_prepared(
+            &mut old_store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &layers,
+            pixels,
+            masks,
+        );
+        let old_install = started.elapsed();
+        assert_eq!(failed, 0);
+        eprintln!(
+            "noisy PSD {side}x{side}, 4 layers, {depth}-bit, {file_mib:.0} MiB file \
+             (one layer decoded = {:.0} MiB):\n  0.153.0 path (read whole, decode all, \
+             encode all): {:.0} ms, peak RSS +{old_peak}; its UI-thread insert {:.2} ms\n  \
+             0.154.0 streaming + staging: {:.0} ms, peak RSS +{stream_peak}; UI-thread \
+             install {:.2} ms (peak +{install_peak})",
+            f64::from(side) * f64::from(side) * 8.0 / f64::from(1 << 20),
+            old_time.as_secs_f64() * 1e3,
+            old_install.as_secs_f64() * 1e3,
+            stream_time.as_secs_f64() * 1e3,
+            install_time.as_secs_f64() * 1e3,
+        );
     }
 
     /// `/proc/self/status` field `name` in KiB (Linux only).

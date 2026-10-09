@@ -26,15 +26,68 @@
 //!   nothing read from a file reaches the store unvalidated. `.aur` opens
 //!   keep the old path (`crate::read_prechecked_aur`): their tile entries
 //!   are untrusted and go through `codec::decode`.
-//! - **Memory.** Each layer's decoded image is dropped on the decode thread
-//!   once its tiles are encoded, so the peak is — reasoned from this code,
-//!   not measured — the decoded document plus one layer's encoded tiles
-//!   (plus the decoded mask buffers until [`PreparedPsd::new`] returns); the inserted tiles sit in the store's
-//!   `pending` only until its writer has put them on the scratch disk, and
-//!   none become resident until read.
+//! - **Memory (0.154.0).** A PSD is streamed ([`PreparedPsd::stream`]):
+//!   parsed from the file without reading it whole, each layer decoded,
+//!   encoded, written into a staging area in the store's scratch
+//!   directory ([`aurora_tile::StagingArea`]) and dropped before the next
+//!   layer is read. The UI thread adopts the staged files
+//!   ([`aurora_tile::TileStore::insert_staged`]) — no bytes in memory.
+//!   Measured: a 2 GiB four-layer 16-bit PSD peaks at +1,277 MiB, against
+//!   +4,352 MiB for the 0.153.0 path. Every user mask's coverage is still
+//!   held until its layer is handed on, and a tile whose staging write
+//!   fails stays in memory ([`PreparedTile::Memory`]).
+
+use std::path::Path;
 
 use aurora_doc::LayerId;
 use aurora_io::{EncodedTiles, Image, IoError, PsdMaskPixels};
+use aurora_tile::{EncodedTile, StagedTile, StagingArea, StagingRoot, TileId};
+
+/// One prepared tile (0.154.0): already on the scratch disk in a staging
+/// area the store adopts ([`aurora_tile::TileStore::insert_staged`]), or —
+/// when no staging area could be made or a staging write failed — still
+/// in memory, inserted as 0.153.0 did
+/// ([`aurora_tile::TileStore::insert_encoded`], whose failed-write rule J1
+/// then applies).
+#[derive(Debug)]
+pub(crate) enum PreparedTile {
+    Memory(EncodedTile),
+    Staged(StagedTile),
+}
+
+impl PreparedTile {
+    /// The encoded length in bytes.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Memory(tile) => tile.len(),
+            Self::Staged(tile) => tile.len(),
+        }
+    }
+
+    /// The encoded bytes; a staged tile's read back from its file.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Memory(tile) => tile.bytes().to_vec(),
+            Self::Staged(tile) => tile
+                .path()
+                .and_then(|path| std::fs::read(path).ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// A layer's or mask's prepared tiles.
+pub(crate) type PreparedTiles = Vec<(TileId, PreparedTile)>;
+
+/// `tiles`, kept in memory.
+fn in_memory(tiles: EncodedTiles) -> PreparedTiles {
+    tiles
+        .into_iter()
+        .map(|(id, tile)| (id, PreparedTile::Memory(tile)))
+        .collect()
+}
 
 /// One pixel layer's encoded tiles, or why its placement was refused
 /// (`aurora_io::IoError::ImagePlacementOutOfRange`, the one error the
@@ -42,14 +95,14 @@ use aurora_io::{EncodedTiles, Image, IoError, PsdMaskPixels};
 #[derive(Debug)]
 pub(crate) struct PreparedLayer {
     pub(crate) layer: LayerId,
-    pub(crate) tiles: Result<EncodedTiles, IoError>,
+    pub(crate) tiles: Result<PreparedTiles, IoError>,
 }
 
 /// One layer mask's encoded coverage tiles.
 #[derive(Debug)]
 pub(crate) struct PreparedMask {
     pub(crate) layer: LayerId,
-    pub(crate) tiles: EncodedTiles,
+    pub(crate) tiles: PreparedTiles,
 }
 
 /// A decoded flat image (PNG/JPEG/TIFF), already encoded. The image
@@ -57,7 +110,7 @@ pub(crate) struct PreparedMask {
 #[derive(Debug)]
 pub(crate) struct PreparedImage {
     pub(crate) size: (u32, u32),
-    pub(crate) tiles: Result<EncodedTiles, IoError>,
+    pub(crate) tiles: Result<PreparedTiles, IoError>,
 }
 
 impl PreparedImage {
@@ -65,7 +118,7 @@ impl PreparedImage {
     /// image's one layer, and drops it.
     pub(crate) fn new(image: Image) -> Self {
         let size = (image.width(), image.height());
-        let tiles = aurora_io::encode_image_tiles_at(&image, 0, 0);
+        let tiles = aurora_io::encode_image_tiles_at(&image, 0, 0).map(in_memory);
         drop(image);
         Self { size, tiles }
     }
@@ -85,7 +138,9 @@ pub(crate) struct PreparedPsd {
 
 impl PreparedPsd {
     /// Encodes every layer's and mask's tiles, dropping each layer's image
-    /// as soon as its tiles exist.
+    /// as soon as its tiles exist — the 0.153.0 in-memory path, kept for
+    /// the tests that compare against it ([`Self::stream`] is the open).
+    #[cfg(test)]
     pub(crate) fn new(document: aurora_io::PsdDocument) -> Self {
         let aurora_io::PsdDocument {
             layers,
@@ -99,7 +154,7 @@ impl PreparedPsd {
             .into_iter()
             .map(|placed| {
                 let (x, y) = placed.offset;
-                let tiles = aurora_io::encode_image_tiles_at(&placed.image, x, y);
+                let tiles = aurora_io::encode_image_tiles_at(&placed.image, x, y).map(in_memory);
                 PreparedLayer {
                     layer: placed.layer,
                     tiles,
@@ -125,20 +180,167 @@ pub(crate) fn prepare_pixels(pixels: &[(LayerId, &Image, (u32, u32))]) -> Vec<Pr
         .iter()
         .map(|(layer, image, (x, y))| PreparedLayer {
             layer: *layer,
-            tiles: aurora_io::encode_image_tiles_at(image, *x, *y),
+            tiles: aurora_io::encode_image_tiles_at(image, *x, *y).map(in_memory),
         })
         .collect()
 }
 
 /// Encodes each mask's coverage tiles.
+#[cfg(test)]
 pub(crate) fn prepare_masks(masks: &[PsdMaskPixels]) -> Vec<PreparedMask> {
     masks
         .iter()
         .map(|mask| PreparedMask {
             layer: mask.layer,
-            tiles: aurora_io::encode_psd_mask(mask),
+            tiles: in_memory(aurora_io::encode_psd_mask(mask)),
         })
         .collect()
+}
+
+impl PreparedPsd {
+    /// Opens the PSD/PSB at `path` **streaming** (0.154.0): the file is
+    /// parsed from a `BufReader` (never read whole,
+    /// `aurora_io::read_psd_streaming`), and each layer's image, as the
+    /// reader hands it over, is encoded, written into a staging area made
+    /// from `staging` and dropped before the next layer is read — so the
+    /// decode thread holds about one layer, never the file, the decoded
+    /// document or its encoded tiles. Without `staging` (or when a staging
+    /// area or write fails) the encoded tiles stay in memory, as in 0.153.0.
+    ///
+    /// Nothing reaches the live store here: on any failure every staged
+    /// file is deleted as the prepared tiles drop, and the install stays
+    /// one atomic step on the UI thread.
+    pub(crate) fn stream(
+        path: &Path,
+        staging: Option<&StagingRoot>,
+    ) -> Result<Self, crate::OpenFailure> {
+        let file = std::fs::File::open(path).map_err(|err| {
+            tracing::warn!(path = %path.display(), %err, "failed to open the chosen file");
+            crate::OpenFailure::Read(err)
+        })?;
+        // Not once the session is ending (0.151.0 review C1's flag): the
+        // shutdown cleanup is about to remove the scratch directory, and a
+        // detached decode must not put a staging directory back into it.
+        let staging = staging.filter(|_| !session_ending());
+        let area = staging.and_then(|root| match root.area() {
+            Ok(area) => Some(area),
+            Err(err) => {
+                tracing::warn!(%err, "no tile staging area; the opened tiles stay in memory");
+                None
+            }
+        });
+        let mut sink = StreamSink {
+            area,
+            pixels: Vec::new(),
+            masks: Vec::new(),
+        };
+        let reader = std::io::BufReader::with_capacity(STREAM_BUFFER, file);
+        let document =
+            aurora_io::read_psd_streaming(reader, &mut sink).map_err(crate::OpenFailure::Decode)?;
+        let StreamSink { pixels, masks, .. } = sink;
+        Ok(Self {
+            layers: document.layers,
+            history: document.history,
+            canvas_size: document.canvas_size,
+            pixels,
+            masks,
+            report: document.report,
+        })
+    }
+}
+
+/// Whether the session is ending (`crate::SESSION_ENDING`, 0.151.0).
+fn session_ending() -> bool {
+    crate::SESSION_ENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The streaming open's read buffer: the metadata is read in small pieces.
+const STREAM_BUFFER: usize = 1 << 16;
+
+/// [`PreparedPsd::stream`]'s sink: encodes and stages one layer at a time.
+struct StreamSink {
+    area: Option<StagingArea>,
+    pixels: Vec<PreparedLayer>,
+    masks: Vec<PreparedMask>,
+}
+
+impl StreamSink {
+    /// Stages `tiles` one by one, keeping in memory any the area cannot
+    /// take (and every one without an area).
+    fn stage(&mut self, tiles: EncodedTiles) -> PreparedTiles {
+        // A detached decode still running at quit (0.154.0 review I3)
+        // stops staging: its result is never installed, and the shutdown
+        // cleanup is removing the scratch directory. A write already under
+        // way as the flag flips can still race that cleanup — then
+        // `create_new` fails inside the removed directory and the tile
+        // stays in memory, or, if it wins, one stray file is left for the
+        // next session's orphaned-scratch sweep.
+        if session_ending() {
+            self.area = None;
+            return in_memory(tiles);
+        }
+        let Some(area) = self.area.as_mut() else {
+            return in_memory(tiles);
+        };
+        tiles
+            .into_iter()
+            .map(|(id, tile)| match area.stage(&tile) {
+                Ok(staged) => (id, PreparedTile::Staged(staged)),
+                Err(err) => {
+                    tracing::warn!(%err, "a staging write failed; the tile stays in memory");
+                    (id, PreparedTile::Memory(tile))
+                }
+            })
+            .collect()
+    }
+}
+
+impl aurora_io::PsdPixelSink for StreamSink {
+    fn layer(&mut self, placed: aurora_io::PsdPixels) -> Result<(), IoError> {
+        let (x, y) = placed.offset;
+        let encoded = aurora_io::encode_image_tiles_at(&placed.image, x, y);
+        // The layer's image is not needed past its tiles (the point).
+        drop(placed.image);
+        let tiles = encoded.map(|tiles| self.stage(tiles));
+        self.pixels.push(PreparedLayer {
+            layer: placed.layer,
+            tiles,
+        });
+        Ok(())
+    }
+
+    fn mask(&mut self, mask: PsdMaskPixels) -> Result<(), IoError> {
+        let encoded = aurora_io::encode_psd_mask(&mask);
+        drop(mask.coverage);
+        let tiles = self.stage(encoded);
+        self.masks.push(PreparedMask {
+            layer: mask.layer,
+            tiles,
+        });
+        Ok(())
+    }
+}
+
+/// Inserts one prepared tile; `false` if the store refused it.
+fn insert_one(
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    id: TileId,
+    tile: PreparedTile,
+) -> bool {
+    match tile {
+        PreparedTile::Memory(tile) => {
+            store.insert_encoded(surface, id, tile);
+            true
+        }
+        PreparedTile::Staged(tile) => match store.insert_staged(surface, id, tile) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(%err, "a staged tile was refused by the tile store");
+                false
+            }
+        },
+    }
 }
 
 /// Inserts every prepared tile into `store` on its layer's surface (or
@@ -171,8 +373,12 @@ pub(crate) fn insert_prepared(
         };
         match tiles {
             Ok(tiles) => {
+                let mut refused = false;
                 for (id, tile) in tiles {
-                    store.insert_encoded(surface, id, tile);
+                    refused |= !insert_one(store, surface, id, tile);
+                }
+                if refused {
+                    failed += 1;
                 }
             }
             Err(err) => {
@@ -198,8 +404,12 @@ pub(crate) fn insert_prepared(
             failed += 1;
             continue;
         };
+        let mut refused = false;
         for (id, tile) in tiles {
-            store.insert_encoded(surface, id, tile);
+            refused |= !insert_one(store, surface, id, tile);
+        }
+        if refused {
+            failed += 1;
         }
     }
     failed

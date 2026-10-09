@@ -57,6 +57,20 @@ use crate::OpenFailure;
 /// [`OpenWorker`]; the first open is generation `1`.
 pub(crate) type Generation = u64;
 
+/// Drops a superseded open's result on a short-lived thread (0.154.0
+/// review I4): a streamed PSD's result owns its staged tile files, and
+/// dropping it deletes each one — thousands of `remove_file` calls for a
+/// large file, which must not run on the UI thread. If the thread cannot
+/// be started the result is dropped here instead (correct, only slower).
+fn drop_off_thread(finished: FinishedOpen) {
+    let spawned = std::thread::Builder::new()
+        .name("aurora-open-drop".to_owned())
+        .spawn(move || drop(finished));
+    if let Err(err) = spawned {
+        tracing::warn!(%err, "dropping a superseded open's result on the UI thread");
+    }
+}
+
 /// How long quitting waits for a decode still running before detaching
 /// it. Short on purpose: the decode's result is going to be thrown away,
 /// so waiting buys nothing but a tidy join.
@@ -286,6 +300,7 @@ impl OpenWorker {
                     path = %finished.path.display(),
                     "dropped a superseded open's result"
                 );
+                drop_off_thread(finished);
             }
         }
         self.reap_superseded();

@@ -19,6 +19,7 @@ use lru::LruCache;
 
 use crate::codec;
 use crate::error::TileError;
+use crate::staging::{StagedTile, StagingRoot};
 use crate::tile::{SurfaceId, TILE, Tile, TileId};
 use crate::writer::{BackgroundWriter, WriteJob, WriteResult};
 
@@ -295,6 +296,13 @@ pub struct TileStore {
     /// it only ever shrinks: a key leaves on a confirmed write, a read
     /// that makes it resident, a forget, or any other `forget_pending`.
     inserted_unconfirmed: HashSet<(SurfaceId, TileId)>,
+    /// Keys whose `paged_out` file is an adopted staging file
+    /// ([`Self::insert_staged`], 0.154.0) rather than this store's own
+    /// [`Self::tile_path`]. Such a file is deleted once the tile is paged
+    /// in — a later eviction writes the store's own file, so nothing else
+    /// would ever delete it — and, like any paged-out file, when the tile
+    /// is forgotten.
+    staged: HashSet<(SurfaceId, TileId)>,
     /// Keys that were **dirty when `make_room` took them out of
     /// `resident`** — the one piece of a `Tile`'s state `codec::encode`
     /// does not carry to the scratch disk, and which `Tile::from_texels`
@@ -660,6 +668,7 @@ impl TileStore {
             failed_writes: VecDeque::new(),
             forgotten_while_pending: HashSet::new(),
             inserted_unconfirmed: HashSet::new(),
+            staged: HashSet::new(),
             evicted_dirty: HashSet::new(),
             write_generation: 0,
             budget,
@@ -990,6 +999,69 @@ impl TileStore {
         });
     }
 
+    /// Where a background thread can make a [`crate::StagingArea`] for
+    /// this store (0.154.0) — see [`Self::insert_staged`].
+    #[must_use]
+    pub fn staging_root(&self) -> StagingRoot {
+        StagingRoot {
+            scratch_dir: self.scratch_dir.clone(),
+            owner: self.instance.clone(),
+        }
+    }
+
+    /// Adopts a tile a background thread already wrote to the scratch
+    /// disk ([`crate::StagingArea::stage`], 0.154.0) as `(surface, id)`'s
+    /// **paged-out** copy: the file becomes the tile's, exactly as if this
+    /// store had evicted it there, and nothing is read, written, copied or
+    /// made resident — O(1) bookkeeping on the caller's thread, and no
+    /// bytes in memory at all, which is what keeps an opened document's
+    /// encoded tiles out of memory (invariant §7.3.1).
+    ///
+    /// - **Bit identity.** The file holds the bytes
+    ///   [`crate::EncodedTile::of`] encoded, which is what the store's own
+    ///   writer would have put there; a page-in decodes it the same way.
+    /// - **Snapshot.** [`Self::snapshot_tile`] reads it like any other
+    ///   paged-out tile.
+    /// - **Dirty.** Recorded whole-tile, as [`Self::insert_encoded`] does,
+    ///   so the next GPU sync uploads it.
+    /// - **Lifetime.** Deleted when the tile is paged in or forgotten (see
+    ///   the store's `staged` set).
+    /// - **A key already held** is forgotten first, as in
+    ///   [`Self::insert_encoded`]. A `forget_tile` tombstone is kept: no
+    ///   new write is queued for the key, so the older in-flight write's
+    ///   result still deletes the file *it* wrote (the store's own path,
+    ///   never the staged one).
+    ///
+    /// # Errors
+    ///
+    /// [`TileError::ForeignStagedTile`] if `tile` was staged for another
+    /// store; it is then dropped, which deletes its file.
+    pub fn insert_staged(
+        &mut self,
+        surface: SurfaceId,
+        id: TileId,
+        mut tile: StagedTile,
+    ) -> Result<(), TileError> {
+        if tile.dir.owner != self.instance || !tile.dir.path.starts_with(&self.scratch_dir) {
+            return Err(TileError::ForeignStagedTile);
+        }
+        let Some(path) = tile.path.take() else {
+            return Err(TileError::ForeignStagedTile);
+        };
+        tile.dir
+            .adopted
+            .store(true, std::sync::atomic::Ordering::Release);
+        let key = (surface, id);
+        if self.contains_tile(surface, id) {
+            self.forget_tile(surface, id);
+        }
+        self.stats.bytes_written += tile.len as u64;
+        self.paged_out.insert(key, path);
+        self.staged.insert(key);
+        self.evicted_dirty.insert(key);
+        Ok(())
+    }
+
     /// Drops everything this store holds for `(surface, id)` — resident,
     /// pending, or paged out — and deletes its scratch file, so a
     /// subsequent [`Self::contains_tile`] is `false` and a subsequent
@@ -1034,6 +1106,7 @@ impl TileStore {
         // of `paged_out`, so the other order would leak the file.
         self.discard_stale_scratch_file(key);
         self.paged_out.remove(&key);
+        self.staged.remove(&key);
         // Tombstone *before* `forget_pending` clears the entry this
         // check reads -- the other order would always see it already
         // gone. Only a key genuinely still in `pending` has a write left
@@ -1364,6 +1437,21 @@ impl TileStore {
         if let Some(path) = self.paged_out.get(&(surface, id)).cloned() {
             self.page_in(surface, id, &path)?;
             self.paged_out.remove(&(surface, id));
+            // An adopted staging file (0.154.0) is the tile's only file
+            // until now; resident from here on, the tile's next eviction
+            // writes the store's own `tile_path`, so this one would never
+            // be deleted otherwise.
+            if self.staged.remove(&(surface, id)) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        %err,
+                        "could not delete a paged-in staged tile's file"
+                    ),
+                }
+            }
             Ok(())
         } else {
             self.make_resident((surface, id), Tile::blank());
@@ -4833,6 +4921,51 @@ mod insert_encoded_tests {
             unreachable!("evicted");
         };
         assert!(path.exists(), "the second write's scratch file survives");
+        assert_eq!(texels(&mut store, surface, a), patterned(3).texels());
+    }
+
+    /// 0.154.0 review I2: J4's sequence with an *adopted staged* tile in
+    /// place of the re-created one. `insert_staged` keeps the tombstone
+    /// `forget_tile` leaves for the in-flight write; the adopted tile is
+    /// paged in and evicted again (write 2, to `tile_path`) before the
+    /// drain, and `make_room`'s J4 clear is what stops write 1's result
+    /// from deleting write 2's file.
+    #[test]
+    fn an_adopted_tile_over_an_in_flight_write_keeps_its_re_evicted_file() {
+        let (_dir, mut store) = store(1);
+        let surface = SurfaceId::from_raw(0);
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        let _ = texels(&mut store, surface, a);
+        let _ = texels(&mut store, surface, b); // evicts `a`: write 1 in flight
+        let in_flight = store.pending.contains_key(&(surface, a));
+        let mut area = match store.staging_root().area() {
+            Ok(area) => area,
+            Err(err) => unreachable!("{err}"),
+        };
+        let staged = match area.stage(&EncodedTile::of(&patterned(3))) {
+            Ok(staged) => staged,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) = store.insert_staged(surface, a, staged) {
+            unreachable!("{err}");
+        }
+        drop(area);
+        assert_eq!(
+            store.forgotten_while_pending.contains(&(surface, a)),
+            in_flight,
+            "the tombstone is kept exactly when write 1 was still in flight"
+        );
+        assert_eq!(texels(&mut store, surface, a), patterned(3).texels());
+        let _ = texels(&mut store, surface, b); // evicts `a` again: write 2
+        flush(&mut store);
+        let Some(path) = store.paged_out.get(&(surface, a)).cloned() else {
+            unreachable!("evicted");
+        };
+        assert!(
+            path.exists(),
+            "write 2's scratch file survives write 1's result"
+        );
         assert_eq!(texels(&mut store, surface, a), patterned(3).texels());
     }
 

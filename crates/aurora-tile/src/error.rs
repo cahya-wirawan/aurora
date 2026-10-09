@@ -31,6 +31,18 @@ pub enum TileError {
         #[source]
         source: std::io::Error,
     },
+    /// A tile could not be written into a staging area (0.154.0,
+    /// [`crate::StagingArea::stage`]).
+    #[error("staging file {path:?} could not be written: {source}")]
+    Staging {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// [`crate::TileStore::insert_staged`] was handed a tile staged for a
+    /// different store (0.154.0); it was not adopted.
+    #[error("a staged tile belongs to a different tile store")]
+    ForeignStagedTile,
     /// A tile file on disk didn't parse as a valid tile (bad magic,
     /// unsupported version, truncated payload, or a decoded length that
     /// isn't exactly one whole tile (`aurora_tile::SAMPLES` samples)).
