@@ -3022,6 +3022,14 @@ enum AccessibilityReaction {
     /// A `Click` on a Layers-panel row: select that layer through
     /// [`press_layer_row`], exactly as a pointer press on the row does.
     PressLayer(aurora_doc::LayerId),
+    /// A `Click` on a History-panel step or origin row (0.148.0): jump
+    /// there through [`perform_history_jump`], the function a pointer
+    /// press on the row reaches too (`App::run_history_jump`). As there,
+    /// a live opacity drag only loses its slider capture first;
+    /// `perform_history_jump` commits it. The modal gates differ from the
+    /// pointer's only in form: a dialog or the palette blocks both. The
+    /// payload is the row's applied-step target.
+    JumpHistory(usize),
     /// An action on one of the Layers panel's controls (0.135.0) — handed
     /// to [`apply_layer_control_outcome`], which edits the document.
     LayerControl(aurora_widgets::ActionOutcome),
@@ -3061,6 +3069,22 @@ fn route_accessibility_action(
         && !workspace.tree.is_within(handle.root, request.target_node)
     {
         return AccessibilityReaction::BlockedByModal(request.target_node);
+    }
+    // A History row's `Click` (0.148.0) is the app's alone: the widget
+    // layer would treat a `ListRow` as a menu item and refuse an undone
+    // (dimmed, payload-`disabled`) one, though redo can reach it. The
+    // declared-action gate still holds — only a node that declares
+    // `Click` jumps; anything else falls through to `handle_action`,
+    // which refuses it.
+    if request.action == accesskit::Action::Click
+        && request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
+        && let Some(&target) = workspace.history_rows.get(&request.target_node)
+        && workspace
+            .tree
+            .accessibility(request.target_node)
+            .is_some_and(|node| node.supports_action(accesskit::Action::Click))
+    {
+        return AccessibilityReaction::JumpHistory(target);
     }
     match aurora_widgets::handle_action(&mut workspace.tree, focus, request) {
         Ok(aurora_widgets::ActionOutcome::Activated(id)) => {
@@ -3173,6 +3197,9 @@ struct AccessibilityContext<'a> {
     view: &'a mut aurora_ui::CanvasView,
     history: &'a mut aurora_doc::History,
     pixel_history: &'a mut aurora_brush::PixelHistory,
+    /// The live tile store (0.148.0): a History-row `Click` jumps through
+    /// pixel steps too, which need it. `None` before a document exists.
+    store: Option<&'a mut aurora_tile::TileStore>,
     undo_order: &'a mut UndoOrder,
     composite_cache: &'a mut CompositeCache,
     drag: &'a mut Option<Drag>,
@@ -3409,6 +3436,37 @@ fn apply_accessibility_action(
                 cx.composite_cache,
                 cx.drag,
                 layer_id,
+            );
+        }
+        AccessibilityReaction::JumpHistory(target) => {
+            // Only the slider's capture is dropped here, as
+            // `App::run_history_jump` does for a pointer press — never
+            // `end_pointer_opacity_drag`, whose `finish_opacity` would
+            // record the drag *before* `perform_history_jump` reads the
+            // current step, turning a Click on the current row into an
+            // Undo of the drag just committed (0.148.0 review I-1).
+            // `perform_history_jump` commits the drag itself, first.
+            if cx.layer_controls.pending.is_some() {
+                cx.click.release_capture();
+            }
+            let _ = perform_history_jump(
+                &mut HistoryJumpContext {
+                    workspace: cx.workspace,
+                    focus: cx.focus,
+                    scales: cx.scales,
+                    layers: cx.layers,
+                    history: cx.history,
+                    pixel_history: cx.pixel_history,
+                    store: cx.store.as_deref_mut(),
+                    undo_order: cx.undo_order,
+                    composite_cache: cx.composite_cache,
+                    view: cx.view,
+                    layer_rows: cx.layer_rows,
+                    active_layer: cx.active_layer,
+                    drag: cx.drag,
+                    layer_controls: cx.layer_controls,
+                },
+                target,
             );
         }
         AccessibilityReaction::LayerRowExpanded { row, expanded } => {
@@ -6023,7 +6081,48 @@ fn run_command(
             refresh_properties_panel(workspace, selected, tool_settings);
             CompositeInvalidation::None
         }
-        AppCommand::Undo => match undo_order.undo.last().copied() {
+        AppCommand::Undo | AppCommand::Redo => {
+            let direction = if command == AppCommand::Undo {
+                UndoDirection::Undo
+            } else {
+                UndoDirection::Redo
+            };
+            match step_undo_order(layers, history, pixel_history, store, undo_order, direction) {
+                Some(invalidation) => {
+                    refresh_history_panel(workspace, undo_order);
+                    invalidation
+                }
+                None => CompositeInvalidation::None,
+            }
+        }
+        // Never run here (`handle_key` hands both back; `perform_layer_command`
+        // runs them). `Everything`, never `None`, per the trap named above.
+        AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
+    }
+}
+
+/// One undo or redo step of the unified order, whole and alone — the
+/// document half of `Ctrl+Z`/`Ctrl+Shift+Z` ([`run_command`]) and of one
+/// step of a History-panel jump ([`perform_history_jump`], 0.148.0). It
+/// reverses (or replays) the step at the top of `undo_order`'s undo (or
+/// redo) side in its own backing store, then moves the step across
+/// ([`UndoOrder::step_back`]/[`UndoOrder::step_forward`]).
+///
+/// Returns what the step invalidated, or `None` when nothing happened —
+/// nothing to undo or redo, or the step failed and was not applied (both
+/// logged), in which case `undo_order` is untouched. **It refreshes no
+/// panel**: each caller refreshes once, so a jump across many steps
+/// rebuilds the History panel once rather than once per step.
+fn step_undo_order(
+    layers: &mut aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
+    undo_order: &mut UndoOrder,
+    direction: UndoDirection,
+) -> Option<CompositeInvalidation> {
+    match direction {
+        UndoDirection::Undo => match undo_order.undo.last().copied() {
             // The rect `History::undo` reports is deliberately thrown
             // away here -- see [`structural_invalidation`] for the whole
             // reason, which is not a small one.
@@ -6047,12 +6146,11 @@ fn run_command(
                     match history.undo(layers) {
                         Ok(dirty) => {
                             undo_order.step_back();
-                            refresh_history_panel(workspace, undo_order);
-                            structural_invalidation(dirty)
+                            Some(structural_invalidation(dirty))
                         }
                         Err(err) => {
                             tracing::warn!(?err, "undo failed");
-                            CompositeInvalidation::None
+                            None
                         }
                     }
                 } else {
@@ -6060,27 +6158,21 @@ fn run_command(
                         "the undo order names a structural step the document history does not \
                          have; leaving both untouched"
                     );
-                    CompositeInvalidation::None
+                    None
                 }
             }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo) {
-                        Some(invalidation) => {
-                            undo_order.step_back();
-                            refresh_history_panel(workspace, undo_order);
-                            invalidation
-                        }
-                        None => CompositeInvalidation::None,
-                    }
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo)
+                        .inspect(|_| undo_order.step_back())
                 } else {
                     tracing::warn!("no live tile store; cannot undo a pixel edit");
-                    CompositeInvalidation::None
+                    None
                 }
             }
-            None => CompositeInvalidation::None,
+            None => None,
         },
-        AppCommand::Redo => match undo_order.redo.last().copied() {
+        UndoDirection::Redo => match undo_order.redo.last().copied() {
             // Same deliberate discard, and the same `can_redo`
             // precondition, as the `Undo` arm above -- `History::redo`
             // conflates its own `Ok(None)` exactly the same way.
@@ -6089,12 +6181,11 @@ fn run_command(
                     match history.redo(layers) {
                         Ok(dirty) => {
                             undo_order.step_forward();
-                            refresh_history_panel(workspace, undo_order);
-                            structural_invalidation(dirty)
+                            Some(structural_invalidation(dirty))
                         }
                         Err(err) => {
                             tracing::warn!(?err, "redo failed");
-                            CompositeInvalidation::None
+                            None
                         }
                     }
                 } else {
@@ -6102,29 +6193,20 @@ fn run_command(
                         "the undo order names a structural step the document history cannot \
                          redo; leaving both untouched"
                     );
-                    CompositeInvalidation::None
+                    None
                 }
             }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo) {
-                        Some(invalidation) => {
-                            undo_order.step_forward();
-                            refresh_history_panel(workspace, undo_order);
-                            invalidation
-                        }
-                        None => CompositeInvalidation::None,
-                    }
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo)
+                        .inspect(|_| undo_order.step_forward())
                 } else {
                     tracing::warn!("no live tile store; cannot redo a pixel edit");
-                    CompositeInvalidation::None
+                    None
                 }
             }
-            None => CompositeInvalidation::None,
+            None => None,
         },
-        // Never run here (`handle_key` hands both back; `perform_layer_command`
-        // runs them). `Everything`, never `None`, per the trap named above.
-        AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
     }
 }
 
@@ -6193,16 +6275,28 @@ fn populate_history_rows(
     scales: &Scales,
     undo_order: &UndoOrder,
 ) -> Result<(), aurora_widgets::WidgetError> {
+    #[cfg(test)]
+    HISTORY_REFRESHES.with(|count| count.set(count.get().saturating_add(1)));
     let steps = undo_order.history_steps();
-    let current = aurora_ui::populate_history_panel(
+    let rows = aurora_ui::populate_history_panel_rows(
         &mut workspace.tree,
         workspace.history,
         scales,
         undo_order.origin,
         &steps,
     )?;
-    workspace.history_current = Some(current);
+    workspace.history_current = Some(rows.current);
+    workspace.history_rows = rows.targets;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread rebuilt the History panel
+    /// ([`populate_history_rows`]) — test-only, so a test can pin "a
+    /// History jump refreshes the panel once, not once per step"
+    /// (0.148.0). Per thread, so parallel tests do not see each other.
+    static HISTORY_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The real, non-hardcoded label/value pairs [`aurora_ui::
@@ -8380,6 +8474,233 @@ fn perform_undo_redo(
     // controls' own edits, or removed the active layer outright.
     let _ = sync_layer_controls(workspace, layer_controls, layers, active_layer, None);
     invalidation
+}
+
+/// The union of two invalidations (0.148.0): what a History jump across
+/// several steps invalidates is every step's own, together. `Everything`
+/// absorbs anything; two region lists concatenate.
+fn merge_invalidation(
+    acc: CompositeInvalidation,
+    next: CompositeInvalidation,
+) -> CompositeInvalidation {
+    match (acc, next) {
+        (CompositeInvalidation::Everything, _) | (_, CompositeInvalidation::Everything) => {
+            CompositeInvalidation::Everything
+        }
+        (CompositeInvalidation::None, other) | (other, CompositeInvalidation::None) => other,
+        (CompositeInvalidation::Regions(mut rects), CompositeInvalidation::Regions(more)) => {
+            rects.extend(more);
+            CompositeInvalidation::Regions(rects)
+        }
+    }
+}
+
+/// Every piece of `App` state a History-panel jump ([`perform_history_jump`],
+/// 0.148.0) touches — the same state [`App::run_undo_redo`] hands
+/// [`perform_undo_redo`] and [`sync_layer_rows_after_undo_redo`], minus
+/// what only other commands need (the palette, the tool).
+struct HistoryJumpContext<'a> {
+    workspace: &'a mut aurora_ui::Workspace,
+    focus: &'a mut FocusManager,
+    scales: &'a Scales,
+    layers: &'a mut aurora_doc::LayerTree,
+    history: &'a mut aurora_doc::History,
+    pixel_history: &'a mut aurora_brush::PixelHistory,
+    store: Option<&'a mut aurora_tile::TileStore>,
+    undo_order: &'a mut UndoOrder,
+    composite_cache: &'a mut CompositeCache,
+    view: &'a mut aurora_ui::CanvasView,
+    layer_rows: &'a mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &'a mut Option<aurora_doc::LayerId>,
+    drag: &'a mut Option<Drag>,
+    layer_controls: &'a mut LayerControlsState,
+}
+
+/// What one [`perform_history_jump`] did.
+#[derive(Debug, PartialEq)]
+struct HistoryJump {
+    /// How many undo/redo steps it really applied (`0`: nothing moved).
+    steps: usize,
+    /// Whether the jump stopped short of its target because a step failed
+    /// (logged).
+    stopped_early: bool,
+    /// The Layers panel's rows were rebuilt (the layer set changed), so
+    /// the caller must lay out again.
+    rebuilt: bool,
+    /// What the composite cache was invalidated by — the union of every
+    /// step's own, widened to `Everything` by the same two guards
+    /// [`perform_undo_redo`] applies.
+    invalidation: CompositeInvalidation,
+}
+
+/// The History-panel row under `position`, as the number of steps that
+/// are applied once it is the current one (0.148.0) — `None` for a press
+/// anywhere else, on a notice row, or while a modal is open
+/// (`modal_open`: a dialog or the command palette, the same rule
+/// [`App::route_gallery`] applies to the widgets it routes). Hit-testing
+/// goes through `WidgetTree::hit_test`, which descends only through
+/// ancestors containing the point, so a row scrolled out of the History
+/// body's clip is never hit.
+fn history_row_target_at(
+    workspace: &aurora_ui::Workspace,
+    modal_open: bool,
+    position: (f32, f32),
+) -> Option<usize> {
+    if modal_open {
+        return None;
+    }
+    let hit = workspace.tree.hit_test(position)?;
+    workspace.history_rows.get(&hit).copied()
+}
+
+/// Makes the History panel's row `target` the current step (0.148.0):
+/// undoes or redoes **one step at a time** through [`step_undo_order`] —
+/// the same document half `Ctrl+Z`/`Ctrl+Shift+Z` run ([`run_command`]),
+/// pixel and structural steps interleaved in `undo_order`'s own order —
+/// until exactly `target` steps are applied (`0`: everything undone, the
+/// origin row). Redo steps are kept: a jump back is undo, not a new edit,
+/// and only a later recorded edit discards them, as it always has.
+///
+/// **One user action, in [`App::run_undo_redo`]'s order:**
+/// 1. A live opacity-slider drag and a live stroke or drag are committed
+///    first ([`finish_opacity`], [`commit_drag_into_history`] — never a
+///    bare [`commit_ending_drag`], the 0.147.1 bug class). If that
+///    recorded a step it discarded the redo side, so a `target` that
+///    named an undone row — or the current row — no longer names a step
+///    to go to, and the jump ends there; an older row is still reached
+///    (the just-committed stroke is then one of the steps undone).
+/// 2. The steps, with the composite invalidation of each merged
+///    ([`merge_invalidation`]) and widened to `Everything` by
+///    [`perform_undo_redo`]'s two guards (grid anchor, compositing path).
+/// 3. Once, at the end: [`after_undo_redo`], [`sync_layer_controls`], one
+///    History refresh, then [`sync_layer_rows_after_undo_redo`] (which
+///    rebuilds the Layers panel and repairs the active layer when the
+///    layer set changed) and [`refresh_layer_row_descriptions`].
+///
+/// A step that fails stops the jump where it is: every step before it is
+/// whole (a step moves in `undo_order` only once its store applied it),
+/// so the state is consistent; it is logged and step 3 still runs.
+///
+/// Clicking the current row (`target` equal to the applied count) does
+/// nothing at all, and so does a `target` past the last step.
+#[allow(clippy::too_many_lines)]
+fn perform_history_jump(cx: &mut HistoryJumpContext<'_>, target: usize) -> HistoryJump {
+    let applied_before = cx.undo_order.undo.len();
+    let total = applied_before.saturating_add(cx.undo_order.redo.len());
+    let mut jump = HistoryJump {
+        steps: 0,
+        stopped_early: false,
+        rebuilt: false,
+        invalidation: CompositeInvalidation::None,
+    };
+    let live = cx.drag.is_some() || cx.layer_controls.pending.is_some();
+    if target > total || (target == applied_before && !live) {
+        return jump;
+    }
+    let canvas_size = canvas_area_logical_size(cx.workspace);
+    let _ = finish_opacity(&mut LayerControlEdit {
+        workspace: cx.workspace,
+        layers: cx.layers,
+        history: cx.history,
+        pixel_history: cx.pixel_history,
+        undo_order: cx.undo_order,
+        layer_rows: cx.layer_rows,
+        active_layer: *cx.active_layer,
+        state: cx.layer_controls,
+    });
+    commit_drag_into_history(
+        cx.workspace,
+        cx.drag.take(),
+        cx.layers,
+        cx.history,
+        cx.pixel_history,
+        cx.undo_order,
+        cx.view,
+        *cx.active_layer,
+        canvas_size,
+    );
+    if cx.undo_order.undo.len() != applied_before && target >= applied_before {
+        // The commit recorded a step and with it discarded every redo
+        // step: the clicked row was the current one or an undone one,
+        // and neither is a step to go to any more.
+        return jump;
+    }
+    let layers_before = LayerSetSnapshot::capture(cx.layers, *cx.active_layer);
+    let anchor_before = composite_reference_origin(cx.layers, *cx.active_layer);
+    let gpu_path_before = document_qualifies_for_gpu_compositing(cx.layers);
+    let mut merged = CompositeInvalidation::None;
+    while cx.undo_order.undo.len() != target {
+        let applied = cx.undo_order.undo.len();
+        let direction = if applied > target {
+            UndoDirection::Undo
+        } else {
+            UndoDirection::Redo
+        };
+        let stepped = step_undo_order(
+            cx.layers,
+            cx.history,
+            cx.pixel_history,
+            cx.store.as_deref_mut(),
+            cx.undo_order,
+            direction,
+        );
+        match stepped {
+            Some(invalidation) if cx.undo_order.undo.len() != applied => {
+                merged = merge_invalidation(merged, invalidation);
+                jump.steps = jump.steps.saturating_add(1);
+            }
+            _ => {
+                tracing::warn!(
+                    ?direction,
+                    applied,
+                    target,
+                    "a History jump stopped partway: a step could not be applied"
+                );
+                jump.stopped_early = true;
+                break;
+            }
+        }
+    }
+    if jump.steps == 0 && !jump.stopped_early {
+        return jump;
+    }
+    let anchor_held = composite_reference_origin(cx.layers, *cx.active_layer) == anchor_before;
+    let gpu_path_held = document_qualifies_for_gpu_compositing(cx.layers) == gpu_path_before;
+    jump.invalidation = if anchor_held && gpu_path_held {
+        merged
+    } else {
+        CompositeInvalidation::Everything
+    };
+    after_undo_redo(
+        cx.view,
+        cx.layers,
+        *cx.active_layer,
+        cx.composite_cache,
+        canvas_size,
+        &jump.invalidation,
+    );
+    let _ = sync_layer_controls(
+        cx.workspace,
+        cx.layer_controls,
+        cx.layers,
+        *cx.active_layer,
+        None,
+    );
+    refresh_history_panel(cx.workspace, cx.undo_order);
+    jump.rebuilt = sync_layer_rows_after_undo_redo(
+        cx.workspace,
+        cx.focus,
+        cx.scales,
+        cx.layers,
+        cx.layer_rows,
+        cx.active_layer,
+        cx.view,
+        cx.composite_cache,
+        cx.layer_controls,
+        &layers_before,
+    );
+    refresh_layer_row_descriptions(cx.workspace, cx.layer_rows, cx.layers);
+    jump
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
@@ -17855,6 +18176,7 @@ impl App {
                 view: &mut self.canvas_view,
                 history: &mut self.history,
                 pixel_history: &mut self.pixel_history,
+                store: self.tile_store.as_mut(),
                 undo_order: &mut self.undo_order,
                 composite_cache: &mut self.composite_cache,
                 drag: &mut self.drag,
@@ -18084,6 +18406,65 @@ impl App {
         // undo/redo produced, which is the only way to pin the
         // anchor-moved guard down directly rather than by inferring it
         // from pixels that might agree by coincidence.
+    }
+
+    /// A primary press at `position`: when it lands on a History-panel
+    /// step or origin row ([`history_row_target_at`]), jumps there and
+    /// returns `true`. The command palette is modal for this press as it
+    /// is for the widgets [`Self::route_gallery`] routes (an open dialog
+    /// has already taken the press in [`Self::handle_pointer_pressed`]).
+    fn press_history_row(&mut self, position: (f32, f32)) -> bool {
+        let modal_open = self.dialog.is_some() || self.command_palette.is_some();
+        let Some(target) = history_row_target_at(&self.workspace, modal_open, position) else {
+            return false;
+        };
+        self.run_history_jump(target);
+        true
+    }
+
+    /// Jumps to the History panel's row `target` ([`perform_history_jump`],
+    /// 0.148.0) against `App`'s own fields — the pointer half; an
+    /// assistive technology's `Click` reaches the same function through
+    /// [`apply_accessibility_action`]. Drops a live opacity-slider capture
+    /// first, as [`Self::run_undo_redo`] does, then relays out (the
+    /// History rows, and maybe the Layers rows, were rebuilt), pushes
+    /// accessibility and redraws.
+    fn run_history_jump(&mut self, target: usize) {
+        if self
+            .layer_controls
+            .controls
+            .map(|controls| controls.opacity)
+            == self.gallery_click.captured()
+            && self.gallery_click.captured().is_some()
+        {
+            self.gallery_click.release_capture();
+        }
+        let jump = perform_history_jump(
+            &mut HistoryJumpContext {
+                workspace: &mut self.workspace,
+                focus: &mut self.focus,
+                scales: &self.scales,
+                layers: &mut self.layers,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                store: self.tile_store.as_mut(),
+                undo_order: &mut self.undo_order,
+                composite_cache: &mut self.composite_cache,
+                view: &mut self.canvas_view,
+                layer_rows: &mut self.layer_rows,
+                active_layer: &mut self.active_layer,
+                drag: &mut self.drag,
+                layer_controls: &mut self.layer_controls,
+            },
+            target,
+        );
+        tracing::debug!(?jump, target, "History jump");
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
     }
 
     /// Runs New Layer / Delete Layer ([`perform_layer_command`]) against
@@ -19256,6 +19637,12 @@ impl App {
                 layer_id,
             );
             self.push_accessibility();
+            return;
+        }
+
+        // A History-panel row (0.148.0) jumps to that step, whatever the
+        // tool.
+        if button == PointerButton::Primary && self.press_history_row(position) {
             return;
         }
 
@@ -22023,6 +22410,826 @@ mod tests {
     /// `App::handle_accessibility_action` wraps — against the same state
     /// shape `App` holds (review revision of 0.128.0: red-team RT-2 found
     /// the wrapper executed by no test).
+    /// 0.148.0: clicking a History row jumps to that step, through the
+    /// same one-step undo/redo `Ctrl+Z`/`Ctrl+Shift+Z` run.
+    mod history_jump {
+        use super::super::{
+            AccessibilityContext, AccessibilityReaction, AppCommand, CompositeCache, Drag,
+            HISTORY_REFRESHES, HistoryJump, HistoryJumpContext, LayerControlsState,
+            LayerSetSnapshot, UndoKind, apply_accessibility_action, history_row_target_at,
+            layer_ids_in_order, load_scales, perform_history_jump, perform_undo_redo,
+            route_accessibility_action, sync_layer_rows_after_undo_redo,
+        };
+        use super::{
+            HistoryRig, a_brush_drag_that_painted, a11y_request, commit_test_surface, hrow,
+        };
+        use aurora_doc::LayerId;
+        use aurora_theme::Scales;
+        use aurora_widgets::{ClickTracker, WidgetId};
+        use std::collections::HashMap;
+
+        const W: f32 = 1600.0;
+        const H: f32 = 900.0;
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const SMALL: aurora_core::Rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        /// The History rig plus the rest of the state `App::run_history_jump`
+        /// hands [`perform_history_jump`].
+        struct JumpRig {
+            rig: HistoryRig,
+            scales: Scales,
+            cache: CompositeCache,
+            view: aurora_ui::CanvasView,
+            layer_rows: HashMap<WidgetId, LayerId>,
+            active: Option<LayerId>,
+            state: LayerControlsState,
+            drag: Option<Drag>,
+        }
+
+        /// What a jump must make identical to the same number of undos.
+        #[derive(Debug, PartialEq)]
+        struct Snapshot {
+            pixels: Option<Vec<half::f16>>,
+            layers: Vec<(String, Option<f32>)>,
+            undo: Vec<UndoKind>,
+            redo: Vec<UndoKind>,
+            rows: Vec<(String, bool, bool)>,
+        }
+
+        impl JumpRig {
+            fn new() -> Self {
+                let scales = match load_scales() {
+                    Ok(scales) => scales,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let mut this = Self {
+                    rig: HistoryRig::new(),
+                    scales,
+                    cache: CompositeCache::default(),
+                    view: aurora_ui::CanvasView::new(),
+                    layer_rows: HashMap::new(),
+                    active: None,
+                    state: LayerControlsState::default(),
+                    drag: None,
+                };
+                this.layout();
+                this
+            }
+
+            fn layout(&mut self) {
+                self.rig.workspace.tree.compute_layout(W, H);
+            }
+
+            /// Brush, add "Ink", eraser, set Ink's opacity, brush: pixel
+            /// and structural steps interleaved. Rows: Open + 5 steps.
+            fn interleaved() -> Self {
+                let mut this = Self::new();
+                this.rig.stroke(false);
+                let mut ink = None;
+                this.rig.structural(|history, layers| {
+                    ink = history.add_pixel_layer(layers, "Ink", SMALL, None).ok();
+                });
+                let Some(ink) = ink else {
+                    unreachable!("setup: the layer was added");
+                };
+                this.rig.stroke(true);
+                this.rig.structural(|history, layers| {
+                    assert!(history.set_opacity(layers, ink, 0.5).is_ok(), "setup");
+                });
+                this.rig.stroke(false);
+                this.layout();
+                this
+            }
+
+            fn context(&mut self) -> HistoryJumpContext<'_> {
+                HistoryJumpContext {
+                    workspace: &mut self.rig.workspace,
+                    focus: &mut self.rig.focus,
+                    scales: &self.scales,
+                    layers: &mut self.rig.layers,
+                    history: &mut self.rig.history,
+                    pixel_history: &mut self.rig.pixel_history,
+                    store: Some(&mut self.rig.store),
+                    undo_order: &mut self.rig.undo_order,
+                    composite_cache: &mut self.cache,
+                    view: &mut self.view,
+                    layer_rows: &mut self.layer_rows,
+                    active_layer: &mut self.active,
+                    drag: &mut self.drag,
+                    layer_controls: &mut self.state,
+                }
+            }
+
+            fn row(&self, position: usize) -> WidgetId {
+                match self
+                    .rig
+                    .workspace
+                    .tree
+                    .children(self.rig.workspace.history.body)
+                    .and_then(|rows| rows.get(position))
+                {
+                    Some(&row) => row,
+                    None => unreachable!("no History row {position}"),
+                }
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            fn centre(&self, row: WidgetId) -> (f32, f32) {
+                let Some(b) = self.rig.workspace.tree.bounds(row) else {
+                    unreachable!("a laid-out row");
+                };
+                (
+                    b.x as f32 + b.width as f32 / 2.0,
+                    b.y as f32 + b.height as f32 / 2.0,
+                )
+            }
+
+            /// A primary press on History row `position`, routed the way
+            /// `App::handle_pointer_pressed` routes it: hit-test, then jump.
+            fn click(&mut self, position: usize, modal_open: bool) -> Option<HistoryJump> {
+                self.layout();
+                let at = self.centre(self.row(position));
+                let target = history_row_target_at(&self.rig.workspace, modal_open, at)?;
+                let jump = perform_history_jump(&mut self.context(), target);
+                self.layout();
+                Some(jump)
+            }
+
+            /// `App::run_undo_redo`, once.
+            fn undo_redo(&mut self, command: AppCommand) {
+                let before = LayerSetSnapshot::capture(&self.rig.layers, self.active);
+                let _ = perform_undo_redo(
+                    &mut self.rig.workspace,
+                    &mut self.rig.focus,
+                    &mut self.rig.palette,
+                    &mut self.rig.tool,
+                    &crate::ToolSettings::default(),
+                    &mut self.rig.layers,
+                    &mut self.rig.history,
+                    &mut self.rig.pixel_history,
+                    Some(&mut self.rig.store),
+                    &mut self.rig.undo_order,
+                    &mut self.cache,
+                    &mut self.view,
+                    self.active,
+                    &mut self.drag,
+                    &mut self.state,
+                    command,
+                );
+                let _ = sync_layer_rows_after_undo_redo(
+                    &mut self.rig.workspace,
+                    &mut self.rig.focus,
+                    &self.scales,
+                    &self.rig.layers,
+                    &mut self.layer_rows,
+                    &mut self.active,
+                    &mut self.view,
+                    &mut self.cache,
+                    &self.state,
+                    &before,
+                );
+                self.layout();
+            }
+
+            fn snapshot(&mut self) -> Snapshot {
+                let pixels = self
+                    .rig
+                    .store
+                    .get(commit_test_surface(), TILE)
+                    .ok()
+                    .map(|tile| tile.texels().to_vec());
+                let layers = layer_ids_in_order(&self.rig.layers)
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            self.rig.layers.name(id).unwrap_or_default().to_owned(),
+                            self.rig.layers.opacity(id),
+                        )
+                    })
+                    .collect();
+                Snapshot {
+                    pixels,
+                    layers,
+                    undo: self.rig.undo_order.undo.clone(),
+                    redo: self.rig.undo_order.redo.clone(),
+                    rows: self.rig.rows(),
+                }
+            }
+        }
+
+        fn refreshes() -> usize {
+            HISTORY_REFRESHES.with(std::cell::Cell::get)
+        }
+
+        /// AC-1/AC-5: clicking an older step leaves the document exactly
+        /// as that many `Ctrl+Z`s would — pixels, layer tree, the order
+        /// and the panel — across interleaved pixel and structural steps.
+        #[test]
+        fn clicking_an_older_step_matches_the_same_number_of_undos() {
+            for (position, undos) in [(1, 4), (2, 3), (3, 2), (4, 1)] {
+                let mut jumped = JumpRig::interleaved();
+                let mut undone = JumpRig::interleaved();
+                let jump = jumped.click(position, false);
+                assert_eq!(jump.map(|jump| jump.steps), Some(undos), "row {position}");
+                for _ in 0..undos {
+                    undone.undo_redo(AppCommand::Undo);
+                }
+                assert_eq!(jumped.snapshot(), undone.snapshot(), "row {position}");
+                assert_eq!(jumped.rig.undo_order.undo.len(), position);
+            }
+        }
+
+        /// The marker lands on the clicked row, and redo steps are kept.
+        #[test]
+        fn a_jump_back_marks_the_clicked_row_and_keeps_the_redo_steps() {
+            let mut rig = JumpRig::interleaved();
+            let _ = rig.click(2, false);
+            let marks: Vec<(bool, bool)> = rig
+                .rig
+                .rows()
+                .into_iter()
+                .map(|(_, selected, disabled)| (selected, disabled))
+                .collect();
+            assert_eq!(
+                marks,
+                [
+                    (false, false),
+                    (false, false),
+                    (true, false),
+                    (false, true),
+                    (false, true),
+                    (false, true),
+                ],
+                "row 2 is current, the three after it are undone"
+            );
+            assert_eq!(rig.rig.undo_order.redo.len(), 3, "redo steps are kept");
+            assert_eq!(rig.rig.workspace.history_current, Some(rig.row(2)));
+        }
+
+        /// AC-1: clicking a later, undone row redoes up to it.
+        #[test]
+        fn clicking_an_undone_row_redoes_up_to_it() {
+            let mut jumped = JumpRig::interleaved();
+            let full = jumped.snapshot();
+            let _ = jumped.click(0, false);
+            let jump = jumped.click(4, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(4));
+            let mut redone = JumpRig::interleaved();
+            for _ in 0..5 {
+                redone.undo_redo(AppCommand::Undo);
+            }
+            for _ in 0..4 {
+                redone.undo_redo(AppCommand::Redo);
+            }
+            assert_eq!(jumped.snapshot(), redone.snapshot());
+            let _ = jumped.click(5, false);
+            assert_eq!(
+                jumped.snapshot(),
+                full,
+                "redoing everything restores it all"
+            );
+        }
+
+        /// AC-1: the origin row undoes everything.
+        #[test]
+        fn clicking_the_origin_row_undoes_everything() {
+            let mut jumped = JumpRig::interleaved();
+            let fresh = JumpRig::new().snapshot();
+            let jump = jumped.click(0, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(5));
+            let snapshot = jumped.snapshot();
+            assert!(snapshot.undo.is_empty());
+            assert_eq!(snapshot.redo.len(), 5);
+            assert_eq!(snapshot.layers, fresh.layers, "no layer is left");
+            let mut undone = JumpRig::interleaved();
+            for _ in 0..5 {
+                undone.undo_redo(AppCommand::Undo);
+            }
+            assert_eq!(snapshot, undone.snapshot());
+            assert_eq!(jumped.rig.rows().first(), Some(&hrow("Open", true, false)));
+        }
+
+        /// AC-1/AC-2: the current row does nothing — no step, no refresh.
+        #[test]
+        fn clicking_the_current_row_does_nothing() {
+            let mut rig = JumpRig::interleaved();
+            let before = rig.snapshot();
+            let current = rig.row(5);
+            assert_eq!(rig.rig.workspace.history_current, Some(current));
+            rig.cache.mark_current(TILE);
+            let refreshed = refreshes();
+            let jump = rig.click(5, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(0));
+            assert_eq!(refreshes(), refreshed, "no refresh");
+            assert_eq!(rig.row(5), current, "the rows were not rebuilt");
+            assert!(rig.cache.is_current(TILE), "nothing invalidated");
+            assert_eq!(rig.snapshot(), before);
+        }
+
+        /// AC-2: one refresh for the whole jump, not one per step, and the
+        /// composite is invalidated.
+        #[test]
+        fn a_jump_refreshes_the_panel_once_and_invalidates_the_composite() {
+            let mut rig = JumpRig::interleaved();
+            rig.cache.mark_current(TILE);
+            let refreshed = refreshes();
+            let jump = rig.click(1, false);
+            assert_eq!(jump.as_ref().map(|jump| jump.steps), Some(4));
+            assert_eq!(refreshes(), refreshed + 1, "exactly one refresh");
+            assert!(
+                !rig.cache.is_current(TILE),
+                "the jump invalidated the composite"
+            );
+            assert_eq!(
+                jump.map(|jump| jump.invalidation),
+                Some(super::super::CompositeInvalidation::Everything),
+                "structural steps were crossed"
+            );
+            assert_eq!(rig.rig.workspace.history_current, Some(rig.row(1)));
+        }
+
+        /// The union a jump invalidates: two region lists concatenate,
+        /// `None` is the identity and `Everything` absorbs. (This rig's
+        /// strokes paint a surface no layer owns, so their own
+        /// invalidation is `Everything`; this pins the `Regions` arm.)
+        #[test]
+        fn merge_invalidation_is_the_union_of_every_step() {
+            use super::super::{CompositeInvalidation as I, merge_invalidation};
+            let a = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            };
+            let b = aurora_core::Rect { x: 8, ..a };
+            assert_eq!(
+                merge_invalidation(I::Regions(vec![a]), I::Regions(vec![b])),
+                I::Regions(vec![a, b])
+            );
+            assert_eq!(
+                merge_invalidation(I::None, I::Regions(vec![a])),
+                I::Regions(vec![a])
+            );
+            assert_eq!(
+                merge_invalidation(I::Regions(vec![a]), I::None),
+                I::Regions(vec![a])
+            );
+            assert_eq!(merge_invalidation(I::None, I::None), I::None);
+            assert_eq!(
+                merge_invalidation(I::Regions(vec![a]), I::Everything),
+                I::Everything
+            );
+            assert_eq!(merge_invalidation(I::Everything, I::None), I::Everything);
+        }
+
+        /// A pixel-only jump invalidates too (the union of each stroke's own).
+        #[test]
+        fn a_pixel_only_jump_invalidates_the_composite() {
+            let mut rig = JumpRig::new();
+            rig.rig.stroke(false);
+            rig.rig.stroke(true);
+            rig.cache.mark_current(TILE);
+            let jump = rig.click(0, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(2));
+            assert!(!rig.cache.is_current(TILE));
+        }
+
+        /// AC-3: a stroke still live when a row is clicked is committed
+        /// first — through `commit_drag_into_history` — and then the jump
+        /// undoes it with the rest; it stays redoable.
+        #[test]
+        fn a_jump_while_a_stroke_is_live_commits_the_stroke_first() {
+            let mut rig = JumpRig::new();
+            rig.rig.stroke(false);
+            rig.layout();
+            rig.drag = Some(a_brush_drag_that_painted(&mut rig.rig.store, (200.5, 40.5)));
+            let jump = rig.click(0, false);
+            assert_eq!(
+                jump.map(|jump| jump.steps),
+                Some(2),
+                "the stroke, then the older one"
+            );
+            assert!(rig.drag.is_none(), "the drag ended");
+            assert!(rig.rig.undo_order.undo.is_empty());
+            assert_eq!(
+                rig.rig.undo_order.redo,
+                vec![UndoKind::Pixel, UndoKind::Pixel]
+            );
+            assert_eq!(
+                rig.rig.rows(),
+                [
+                    hrow("Open", true, false),
+                    hrow("Brush Stroke", false, true),
+                    hrow("Brush Stroke", false, true),
+                ]
+            );
+            let _ = rig.click(2, false);
+            assert_eq!(rig.rig.undo_order.undo.len(), 2, "the live stroke redoes");
+        }
+
+        /// AC-3: with a stroke live, a click on an undone row only commits
+        /// the stroke: recording it discarded that row's step.
+        #[test]
+        fn a_live_stroke_and_a_click_on_an_undone_row_only_commits_the_stroke() {
+            let mut rig = JumpRig::new();
+            rig.rig.stroke(false);
+            rig.rig.stroke(false);
+            let _ = rig.click(1, false);
+            rig.drag = Some(a_brush_drag_that_painted(&mut rig.rig.store, (200.5, 40.5)));
+            let jump = rig.click(2, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(0));
+            assert!(rig.drag.is_none());
+            assert_eq!(
+                rig.rig.undo_order.undo.len(),
+                2,
+                "old stroke + the live one"
+            );
+            assert!(rig.rig.undo_order.redo.is_empty());
+        }
+
+        /// AC-3: with a stroke live, a click on the current row only
+        /// commits the stroke — it undoes nothing, the committed stroke
+        /// included.
+        #[test]
+        fn a_live_stroke_and_a_click_on_the_current_row_only_commits_the_stroke() {
+            let mut rig = JumpRig::new();
+            rig.rig.stroke(false);
+            rig.drag = Some(a_brush_drag_that_painted(&mut rig.rig.store, (200.5, 40.5)));
+            let jump = rig.click(1, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(0));
+            assert!(rig.drag.is_none(), "the drag ended");
+            assert_eq!(rig.rig.undo_order.undo.len(), 2, "nothing was undone");
+            assert_eq!(
+                rig.rig.rows().last(),
+                Some(&hrow("Brush Stroke", true, false)),
+                "the committed stroke is the current step"
+            );
+        }
+
+        /// AC-2: a step that fails stops the jump where it is — every
+        /// step before it applied, the order consistent, one refresh, the
+        /// marker on the step reached. Here the pixel step cannot undo:
+        /// there is no tile store.
+        #[test]
+        fn a_step_that_fails_stops_the_jump_partway() {
+            let mut rig = JumpRig::new();
+            rig.rig.stroke(false);
+            let mut ink = None;
+            rig.rig.structural(|history, layers| {
+                ink = history.add_pixel_layer(layers, "Ink", SMALL, None).ok();
+            });
+            let Some(ink) = ink else {
+                unreachable!("setup");
+            };
+            rig.rig.structural(|history, layers| {
+                assert!(history.set_opacity(layers, ink, 0.5).is_ok(), "setup");
+            });
+            rig.layout();
+            rig.cache.mark_current(TILE);
+            let at = rig.centre(rig.row(0));
+            let Some(target) = history_row_target_at(&rig.rig.workspace, false, at) else {
+                unreachable!("the origin row is clickable");
+            };
+            let refreshed = refreshes();
+            let mut cx = rig.context();
+            cx.store = None;
+            let jump = perform_history_jump(&mut cx, target);
+            assert_eq!(jump.steps, 2, "both structural steps undid");
+            assert!(jump.stopped_early);
+            assert_eq!(refreshes(), refreshed + 1, "one refresh");
+            assert_eq!(rig.rig.undo_order.undo, vec![UndoKind::Pixel]);
+            assert_eq!(rig.rig.undo_order.redo.len(), 2);
+            assert!(!rig.rig.layers.contains(ink));
+            assert!(!rig.cache.is_current(TILE));
+            rig.layout();
+            assert_eq!(rig.rig.workspace.history_current, Some(rig.row(1)));
+        }
+
+        /// AC-3: a press while a modal (a dialog or the palette) is open
+        /// never jumps.
+        #[test]
+        fn a_click_while_a_modal_is_open_does_nothing() {
+            let mut rig = JumpRig::interleaved();
+            let before = rig.snapshot();
+            assert!(rig.click(1, true).is_none());
+            assert_eq!(rig.snapshot(), before);
+        }
+
+        /// Layers panel repair: jumping past structural steps that add
+        /// layers rebuilds the rows and repairs the active layer.
+        #[test]
+        fn a_jump_across_structural_steps_repairs_the_layers_panel() {
+            let mut rig = JumpRig::new();
+            let mut ids = Vec::new();
+            for name in ["Ink", "Ink 2"] {
+                rig.rig.structural(|history, layers| {
+                    ids.extend(history.add_pixel_layer(layers, name, SMALL, None).ok());
+                });
+            }
+            rig.layer_rows = match aurora_ui::populate_layers_panel(
+                &mut rig.rig.workspace.tree,
+                rig.rig.workspace.layers,
+                &rig.scales,
+                &rig.rig.layers,
+            ) {
+                Ok(rows) => rows,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            rig.active = ids.last().copied();
+            let _ = rig.click(0, false);
+            assert!(rig.layer_rows.is_empty(), "no layer, no row");
+            assert_eq!(rig.active, None, "the active layer is gone");
+            let jump = rig.click(2, false);
+            assert!(jump.is_some_and(|jump| jump.rebuilt));
+            assert_eq!(rig.layer_rows.len(), 2);
+            assert!(
+                rig.active
+                    .is_some_and(|active| rig.rig.layers.contains(active))
+            );
+        }
+
+        /// AC-1/AC-4: past the 1000-row cap the notice rows do nothing, and
+        /// a click on the first shown step jumps across 999 steps; the last
+        /// row jumps back.
+        #[test]
+        fn a_jump_across_the_capped_window_and_the_notice_rows_do_nothing() {
+            let mut rig = JumpRig::new();
+            let id = match rig
+                .rig
+                .history
+                .add_pixel_layer(&mut rig.rig.layers, "Ink", SMALL, None)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            rig.rig.undo_order.record(
+                UndoKind::Structural,
+                &mut rig.rig.history,
+                &mut rig.rig.pixel_history,
+            );
+            for i in 0..1002 {
+                let opacity = if i % 2 == 0 { 0.25 } else { 0.75 };
+                assert!(
+                    rig.rig
+                        .history
+                        .set_opacity(&mut rig.rig.layers, id, opacity)
+                        .is_ok()
+                );
+                rig.rig.undo_order.record(
+                    UndoKind::Structural,
+                    &mut rig.rig.history,
+                    &mut rig.rig.pixel_history,
+                );
+            }
+            super::super::refresh_history_panel(&mut rig.rig.workspace, &rig.rig.undo_order);
+            rig.layout();
+            let rows = rig.rig.rows();
+            assert_eq!(rows.len(), 1001, "notice + 1000 steps");
+            // The notice row is scrolled to the top first so it is hit.
+            rig.rig.workspace.tree.scroll_into_view(rig.row(0));
+            let before = rig.snapshot();
+            assert!(rig.click(0, false).is_none(), "a notice row is not a step");
+            assert_eq!(rig.snapshot(), before);
+
+            // Row 1 shows step index 3: four applied once it is current.
+            let jump = rig.click(1, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(999));
+            assert_eq!(rig.rig.undo_order.undo.len(), 4);
+            assert_eq!(
+                rig.rig.layers.opacity(id),
+                Some(0.25),
+                "step 3, the third opacity edit, set 0.25"
+            );
+            assert_eq!(rig.rig.workspace.history_current, Some(rig.row(1)));
+
+            rig.rig.workspace.tree.scroll_into_view(rig.row(1000));
+            let jump = rig.click(1000, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(999));
+            assert_eq!(rig.rig.undo_order.undo.len(), 1003);
+            assert_eq!(
+                rig.rig.layers.opacity(id),
+                Some(0.75),
+                "the last step set 0.75"
+            );
+        }
+
+        /// One assistive-technology request through the real
+        /// [`apply_accessibility_action`], no dialog, palette or gallery.
+        fn act(rig: &mut JumpRig, request: &accesskit::ActionRequest) {
+            let _ = apply_accessibility_action(
+                &mut AccessibilityContext {
+                    workspace: &mut rig.rig.workspace,
+                    focus: &mut rig.rig.focus,
+                    dialog: &mut None,
+                    palette: None,
+                    scales: &rig.scales,
+                    layers: &mut rig.rig.layers,
+                    layer_rows: &mut rig.layer_rows,
+                    active_layer: &mut rig.active,
+                    view: &mut rig.view,
+                    history: &mut rig.rig.history,
+                    pixel_history: &mut rig.rig.pixel_history,
+                    store: Some(&mut rig.rig.store),
+                    undo_order: &mut rig.rig.undo_order,
+                    composite_cache: &mut rig.cache,
+                    drag: &mut rig.drag,
+                    layer_controls: &mut rig.state,
+                    click: &mut ClickTracker::default(),
+                    gallery: &mut None,
+                    tool: aurora_ui::Tool::default(),
+                    tool_settings: &mut crate::ToolSettings::default(),
+                    tool_controls: None,
+                    scroll_follow: &mut crate::ScrollFollow::default(),
+                },
+                request,
+            );
+            rig.layout();
+        }
+
+        /// "Ink" added (one structural step), then a live opacity drag on
+        /// it from 1.0 to 0.3 that has not been committed yet.
+        fn a_rig_with_a_live_opacity_drag() -> (JumpRig, LayerId) {
+            let mut rig = JumpRig::new();
+            let mut ink = None;
+            rig.rig.structural(|history, layers| {
+                ink = history.add_pixel_layer(layers, "Ink", SMALL, None).ok();
+            });
+            let Some(ink) = ink else {
+                unreachable!("setup: the layer was added");
+            };
+            rig.active = Some(ink);
+            rig.layout();
+            (rig, ink)
+        }
+
+        fn start_live_opacity_drag(rig: &mut JumpRig, ink: LayerId) {
+            rig.state.pending = Some(super::super::PendingOpacity {
+                layer: ink,
+                start: 1.0,
+            });
+            if let Err(err) = rig.rig.layers.set_opacity(ink, 0.3) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        /// Review I-1: an AT `Click` on the current row while a pointer
+        /// opacity drag is live commits the drag as its own step and undoes
+        /// nothing — the drag the user just made stays applied.
+        #[test]
+        fn an_at_click_on_the_current_row_during_an_opacity_drag_only_commits_it() {
+            let (mut rig, ink) = a_rig_with_a_live_opacity_drag();
+            start_live_opacity_drag(&mut rig, ink);
+            let current = rig.row(1);
+            assert_eq!(rig.rig.workspace.history_current, Some(current), "setup");
+            act(&mut rig, &a11y_request(current, accesskit::Action::Click));
+            assert!(rig.state.pending.is_none(), "the drag was committed");
+            assert_eq!(rig.rig.layers.opacity(ink), Some(0.3), "and not undone");
+            assert_eq!(
+                rig.rig.undo_order.undo,
+                vec![UndoKind::Structural, UndoKind::Structural],
+                "Add Ink, then the opacity drag"
+            );
+            assert!(rig.rig.undo_order.redo.is_empty(), "no undo ran");
+            assert_eq!(rig.rig.rows().len(), 3);
+        }
+
+        /// Review I-1, the undone-row half: committing the drag discards
+        /// the redo side, so the click only commits.
+        #[test]
+        fn an_at_click_on_an_undone_row_during_an_opacity_drag_only_commits_it() {
+            let (mut rig, ink) = a_rig_with_a_live_opacity_drag();
+            rig.rig.structural(|history, layers| {
+                assert!(history.set_opacity(layers, ink, 0.5).is_ok(), "setup");
+            });
+            let _ = rig.click(1, false);
+            assert_eq!(rig.rig.layers.opacity(ink), Some(1.0), "setup: undone");
+            start_live_opacity_drag(&mut rig, ink);
+            let undone = rig.row(2);
+            act(&mut rig, &a11y_request(undone, accesskit::Action::Click));
+            assert!(rig.state.pending.is_none(), "the drag was committed");
+            assert_eq!(
+                rig.rig.layers.opacity(ink),
+                Some(0.3),
+                "nothing redone or undone"
+            );
+            assert_eq!(rig.rig.undo_order.undo.len(), 2, "Add Ink + the drag");
+            assert!(
+                rig.rig.undo_order.redo.is_empty(),
+                "the redo side was discarded"
+            );
+        }
+
+        /// The pointer path, for symmetry: a press on the current row
+        /// during an opacity drag also only commits it.
+        #[test]
+        fn a_press_on_the_current_row_during_an_opacity_drag_only_commits_it() {
+            let (mut rig, ink) = a_rig_with_a_live_opacity_drag();
+            start_live_opacity_drag(&mut rig, ink);
+            let jump = rig.click(1, false);
+            assert_eq!(jump.map(|jump| jump.steps), Some(0));
+            assert_eq!(rig.rig.layers.opacity(ink), Some(0.3));
+            assert_eq!(rig.rig.undo_order.undo.len(), 2);
+        }
+
+        /// AC-4: an assistive technology's `Click` on a row — an undone,
+        /// payload-disabled one too — jumps through the real
+        /// `apply_accessibility_action`; `Focus` on a row is refused, and
+        /// with the palette open the `Click` is blocked.
+        #[test]
+        fn an_assistive_technology_click_jumps() {
+            let mut rig = JumpRig::interleaved();
+            let mut dialog = None;
+            let mut click = ClickTracker::default();
+            let mut gallery = None;
+            let mut tool_settings = crate::ToolSettings::default();
+            let mut follow = crate::ScrollFollow::default();
+            let row = rig.row(1);
+            let mut act = |rig: &mut JumpRig, palette: Option<WidgetId>, request| {
+                apply_accessibility_action(
+                    &mut AccessibilityContext {
+                        workspace: &mut rig.rig.workspace,
+                        focus: &mut rig.rig.focus,
+                        dialog: &mut dialog,
+                        palette,
+                        scales: &rig.scales,
+                        layers: &mut rig.rig.layers,
+                        layer_rows: &mut rig.layer_rows,
+                        active_layer: &mut rig.active,
+                        view: &mut rig.view,
+                        history: &mut rig.rig.history,
+                        pixel_history: &mut rig.rig.pixel_history,
+                        store: Some(&mut rig.rig.store),
+                        undo_order: &mut rig.rig.undo_order,
+                        composite_cache: &mut rig.cache,
+                        drag: &mut rig.drag,
+                        layer_controls: &mut rig.state,
+                        click: &mut click,
+                        gallery: &mut gallery,
+                        tool: aurora_ui::Tool::default(),
+                        tool_settings: &mut tool_settings,
+                        tool_controls: None,
+                        scroll_follow: &mut follow,
+                    },
+                    &request,
+                )
+            };
+            // The palette is modal to an assistive technology too.
+            let palette = rig.row(0);
+            let effects = act(
+                &mut rig,
+                Some(palette),
+                a11y_request(row, accesskit::Action::Click),
+            );
+            assert_eq!(effects, super::super::AccessibilityEffects::default());
+            assert_eq!(rig.rig.undo_order.undo.len(), 5, "blocked by the palette");
+
+            let effects = act(&mut rig, None, a11y_request(row, accesskit::Action::Click));
+            assert!(effects.relayout && effects.redraw);
+            assert_eq!(rig.rig.undo_order.undo.len(), 1);
+            rig.layout();
+
+            // Now row 4 is undone (payload-disabled) and still reachable.
+            let undone = rig.row(4);
+            assert!(matches!(
+                route_accessibility_action(
+                    &mut rig.rig.workspace,
+                    &mut rig.rig.focus,
+                    None,
+                    &rig.layer_rows,
+                    None,
+                    None,
+                    &a11y_request(undone, accesskit::Action::Click),
+                ),
+                AccessibilityReaction::JumpHistory(4)
+            ));
+            let _ = act(
+                &mut rig,
+                None,
+                a11y_request(undone, accesskit::Action::Click),
+            );
+            assert_eq!(rig.rig.undo_order.undo.len(), 4);
+            rig.layout();
+            let focus_request = a11y_request(rig.row(2), accesskit::Action::Focus);
+            assert!(matches!(
+                route_accessibility_action(
+                    &mut rig.rig.workspace,
+                    &mut rig.rig.focus,
+                    None,
+                    &rig.layer_rows,
+                    None,
+                    None,
+                    &focus_request,
+                ),
+                AccessibilityReaction::Rejected(_)
+            ));
+        }
+    }
+
     mod accessibility_reactions {
         use super::super::*;
         use super::{a11y_request, layer_bounds, row_of, two_layers_one_moved};
@@ -22155,6 +23362,7 @@ mod tests {
                         view: &mut self.view,
                         history: &mut self.history,
                         pixel_history: &mut self.pixel_history,
+                        store: None,
                         undo_order: &mut self.undo_order,
                         composite_cache: &mut self.composite_cache,
                         drag: &mut self.drag,
@@ -58080,6 +59288,7 @@ mod tests {
                     view: &mut rig.view,
                     history: &mut rig.history,
                     pixel_history: &mut rig.pixel_history,
+                    store: None,
                     undo_order: &mut rig.undo_order,
                     composite_cache: &mut rig.cache,
                     drag: &mut rig.drag,
@@ -58327,6 +59536,7 @@ mod tests {
                     view: &mut rig.view,
                     history: &mut rig.history,
                     pixel_history: &mut rig.pixel_history,
+                    store: None,
                     undo_order: &mut rig.undo_order,
                     composite_cache: &mut rig.cache,
                     drag: &mut rig.drag,
@@ -58388,6 +59598,7 @@ mod tests {
                     view: &mut rig.view,
                     history: &mut rig.history,
                     pixel_history: &mut rig.pixel_history,
+                    store: None,
                     undo_order: &mut rig.undo_order,
                     composite_cache: &mut rig.cache,
                     drag: &mut rig.drag,

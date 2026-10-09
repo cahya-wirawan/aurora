@@ -26,7 +26,39 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.147.1): the History panel shows the user's
+**Latest (2026-10-08, 0.148.0): click a History row to jump to that
+step.** Photoshop-style: a press on a step row (or the "Open"/"New
+Document" origin row) makes that step the current one. `aurora-app`'s
+new `perform_history_jump` commits a live opacity drag and a live
+stroke first (`finish_opacity`, `commit_drag_into_history` — no bare
+`commit_ending_drag`), then undoes or redoes **one step at a time**
+through `step_undo_order`, the one-step document half Ctrl+Z and
+Ctrl+Shift+Z run (extracted from `run_command`, which now calls it
+too), pixel and structural steps interleaved in `UndoOrder` order,
+until exactly the clicked row's step count is applied. Redo steps are
+kept; a new edit still discards them. At the end, once: the merged
+composite invalidation (`merge_invalidation`, widened to `Everything`
+by `perform_undo_redo`'s two guards), `after_undo_redo`, one History
+refresh, `sync_layer_rows_after_undo_redo` (Layers rows and the active
+layer repaired) and the row descriptions. A step that fails stops the
+jump where it is, logged. The current row and the "… N steps omitted"
+notice rows do nothing; a dialog or the command palette blocks the
+press. Rows declare accesskit `Click` (not `Focus` — no Tab stops, so
+**no keyboard way to jump**), and an assistive-technology `Click`
+takes the same path (`AccessibilityReaction::JumpHistory`, routed
+before `handle_action`, which would refuse a dimmed row). Still
+`Role::List`/`ListItem`, not a `ListBox` (reason in the addendum).
+18 mutations: 15 killed (one only after a test was
+added), 3 survived — two equivalent halves of the current-row no-op
+check, and the two `Everything` guards, which cannot fire in the rigs
+(accepted). Gate on the candidate: 2,791 passed, 0 failed, 0 skipped
+(`AURORA_REQUIRE_GPU=1`, RTX 3090); the review revision adds 3 tests,
+re-measured after it: **2,794 passed, 0 failed, 0 skipped**, every gate
+step green; judge round 2 **PASS 0.92**. Tested headlessly only — **not verified on real macOS or
+with a screen reader. Needs a human: click History rows on macOS.**
+Details: "Next action", addendum 0.148.0.
+
+**Previously (2026-10-08, 0.147.1): the History panel shows the user's
 steps.** A real-macOS report ("I don't see the changes in history
 panel"): the panel listed `History::journal_descriptions()`, the
 structural crash-recovery journal, so brush and eraser strokes (which
@@ -52,8 +84,8 @@ before the review revision: 2,770 passed, 0 failed, 0 skipped on the
 RTX 3090; after it, re-measured: **2,774 passed, 0 failed, 0 skipped**
 (`AURORA_REQUIRE_GPU=1`), judge round 2 **PASS 0.92**. Tested headlessly only — **not verified on real macOS or
 with a screen reader. Needs a human:** paint, undo and redo on macOS and
-watch History. Clicking a row does nothing yet. Details: "Next action",
-addendum 0.147.1.
+watch History. Clicking a row did nothing yet (0.148.0 adds it).
+Details: "Next action", addendum 0.147.1.
 
 **Previously (2026-10-08, 0.147.0): PSD layer masks are applied, and
 Grayscale PSDs open.** A PSD layer's or group's user mask (channel `-2`)
@@ -7957,6 +7989,11 @@ structural design work.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
   `cargo test --workspace --doc`, and `cargo doc --workspace --no-deps
   --all-features` all clean.
+
+  **Update 0.148.0 — click a History row to jump to that step.** One
+  undo/redo step at a time through the Ctrl+Z path, redo steps kept,
+  one refresh; pointer and accesskit `Click`, no keyboard yet. Not yet
+  verified on real macOS. See "Next action", addendum 0.148.0.
 
   **Update 0.147.1 — History lists the user's undoable steps.** Strokes
   and structural steps in `UndoOrder` (Ctrl+Z) order after an origin
@@ -30334,6 +30371,126 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-08 (0.148.0) — click a History row to jump to that
+step.** Done as 0.147.1 suggested. **Rows:** `aurora_ui::
+populate_history_panel_rows` (new; `populate_history_panel` is now a
+wrapper returning `.current`) returns `HistoryRows { current, targets }`:
+the origin row maps to `0` and the step at index `i` of `steps` to
+`i + 1`, the number of applied steps once it is current, so row index
+and step index never get confused under the 1000-row cap. Only those
+rows declare accesskit `Action::Click`; the "… N omitted" notice rows
+declare nothing and are not in the map. `aurora_ui::Workspace` gains
+`history_rows` (the last map); `aurora-app`'s `populate_history_rows`
+stores it next to `history_current`. **Jump:** `perform_history_jump`
+(free, with a `HistoryJumpContext`) follows `App::run_undo_redo`'s
+order: commit a live opacity drag (`finish_opacity`) and a live stroke
+(`commit_drag_into_history`); if that recorded a step it discarded the
+redo side, so a click on the current or an undone row ends there (an
+older row is still reached, the just-committed stroke among the steps
+undone); snapshot the layer set and the two `perform_undo_redo` guards;
+then loop `step_undo_order` (the one-step document half of
+`run_command`'s Undo/Redo arms, extracted so Ctrl+Z, Ctrl+Shift+Z and the
+jump share it; it refreshes nothing) until `undo.len() == target`,
+merging each step's invalidation (`merge_invalidation`). A step that
+returns `None` (failed, or no tile store for a pixel step) stops the
+loop, logged at `warn`, `HistoryJump::stopped_early`. Then once:
+`after_undo_redo`, `sync_layer_controls`, `refresh_history_panel`,
+`sync_layer_rows_after_undo_redo`, `refresh_layer_row_descriptions`.
+**Routing:** `App::handle_pointer_pressed` → `press_history_row` →
+`history_row_target_at` (refuses while a dialog or the palette is open;
+`WidgetTree::hit_test` descends only through ancestors containing the
+point, so a row scrolled out of the body's clip is never hit) →
+`run_history_jump` (drops a live slider capture, relayout, accesskit
+push, redraw), after the Layers-row branch. An AT `Click` on a mapped row
+that declares `Click` becomes `AccessibilityReaction::JumpHistory`
+**before** `aurora_widgets::handle_action` (which treats a `ListRow` as a
+menu item and refuses an undone, payload-`disabled` row); the
+dialog/palette modal gates still apply first. `AccessibilityContext`
+gains `store` (a pixel step needs it). **Role kept `List`/`ListItem`**,
+not `ListBox`/`ListBoxOption`: a listbox is one focusable widget the
+arrow keys move through, and these rows take neither focus nor keys —
+the Layers `Tree` rows are focusable, which is the difference.
+
+Tests (headless, `aurora-app` `tests::history_jump`, 16 — 19 after the
+review revision's three opacity-drag tests — plus one in `aurora-ui`): older row == N undos (pixels of the stroke tile, layer
+names/opacity, order, rows) at four depths; marker and kept redo steps;
+undone row redoes; origin undoes all; current row: no step, no refresh,
+no invalidation, rows not rebuilt; one refresh per jump (a test-only
+thread-local counter in `populate_history_rows`); pixel-only jump
+invalidates; live stroke committed then undone; live stroke + undone row
+or current row only commits; modal; Layers rows/active layer repaired;
+partial failure (no store) stops after two structural steps with one
+refresh; 1003-step capped window (notice row inert, 999-step jumps both
+ways); AT `Click` (palette blocks it, undone row reachable, `Focus`
+refused); `merge_invalidation` union; `aurora-ui` row actions/targets on
+a capped window.
+
+| # | Mutation | Result |
+|---|---|---|
+| M01 | loop stops one step short | killed (12 app) |
+| M02 | undo/redo direction inverted | killed (12 app) |
+| M03 | History refresh per step | killed (2 app: `a_jump_refreshes_the_panel_once…`, `a_step_that_fails…`) |
+| M04 | live drag dropped, not committed | killed (3 app, the live-stroke tests) |
+| M05 | modal ignored in `history_row_target_at` | killed (1 app: `a_click_while_a_modal_is_open_does_nothing`) |
+| M06 | the "earlier omitted" notice row maps to a target | killed (1 ui + 1 app capped-window) |
+| M07b | current-row early return removed (first check only) | **survived** — equivalent: the later `steps == 0` return catches it |
+| M07c | `steps == 0` early return removed (second check only) | **survived** — equivalent: the first check catches a current-row click |
+| M07d | both removed (current row re-applies: refresh + invalidate) | killed (1 app: `clicking_the_current_row_does_nothing`) |
+| M08 | AT `Click` not routed to the jump | killed (1 app: `an_assistive_technology_click_jumps`) |
+| M09 | invalidation not applied (`after_undo_redo` gets `None`) | killed (1 app: `a_pixel_only_jump_invalidates_the_composite`) |
+| M10 | the two `Everything` guards skipped | **survived, accepted** — structural steps already report `Everything`, and pixel steps (the only `Regions` producers) cannot move the grid anchor or flip the GPU predicate, so no merge of `Regions` can meet a guard that fires; the rig's strokes also paint a surface no layer owns, which itself reports `Everything`. The same dead-in-effect state `perform_undo_redo` documents for its own copy; kept so it re-arms if structural narrowing returns |
+| M11 | Layers rows not repaired | killed (1 app: `a_jump_across_structural_steps_repairs_the_layers_panel`) |
+| M12 | discarded-redo check removed | killed (1 app: `a_live_stroke_and_a_click_on_the_current_row_only_commits_the_stroke`) |
+| M13 | a failed step not reported (`stopped_early` unset) | killed (1 app: `a_step_that_fails_stops_the_jump_partway`) |
+| M14 | merge drops every invalidation | **survived** at first (every jump in the rigs merges `Everything`), then killed after `merge_invalidation_is_the_union_of_every_step` was added |
+| M15 | step rows declare no `Click` | killed (1 ui + 1 app) |
+| M16 | AT `JumpHistory` arm commits the opacity drag itself (`end_pointer_opacity_drag`) before the jump — the review's I-1 | killed (1 app: `an_at_click_on_the_current_row_during_an_opacity_drag_only_commits_it`) |
+
+Every mutated file was backed up, restored and checked by sha256.
+
+**Disclosed:** no keyboard way to jump (rows are not `Tab` stops; adding
+`Focus` to up to 1002 rows is the open focus-model question);
+no end-to-end test makes a jump whose steps report `Regions` (the rigs'
+strokes paint a layerless surface), so the region union is pinned only
+by the unit test, and M10's guards are unexercised; a jump with a live
+stroke refreshes History twice (once in `commit_drag_into_history`, once
+at the end), every other jump once; a jump of N steps is N real undo/redo
+applications on the UI thread (a 999-step structural jump is fast in the
+test, but a jump over many large pixel strokes is not measured, and
+invariant §7.3.4 still applies); the pointer press is routed after the
+Layers-row branch and before the rail divider, with no pressed or hover
+look; accesskit `Click` on a `ListItem` has not been tried with a real
+screen reader; 0.147.1's per-refresh costs (linear `history_steps`,
+whole-panel rebuild) are unchanged; a pointer press on a History row is
+refused while the command palette is open, but a press on a Layers row
+is not (that branch predates this round and ignores the palette — an
+asymmetry disclosed, not changed). **Needs a human: click History rows
+on macOS** (older, undone, origin, after a stroke) and check the canvas
+and the Layers panel follow. **Suggested next:** PSD mask density
+(psd-tools' `d·m + (1 − d)`), then vector masks (needs a path
+rasteriser — `aurora-vector`).
+
+**Review revision (0.148.0).** The candidate passed the full gate
+(fmt, layering, style, `check --locked`, clippy,
+`AURORA_REQUIRE_GPU=1 cargo test --workspace` **2,791 passed, 0 failed,
+0 skipped**, strict rustdoc, `cargo deny`); the judge returned REVISE
+(0.87). After the revision the full gate was re-run: all green,
+**2,794 passed, 0 failed, 0 skipped**; judge round 2 **PASS 0.92**.
+**I-1 (fixed):** the AT `JumpHistory` arm called
+`end_pointer_opacity_drag`, whose `finish_opacity` recorded a live
+opacity drag *before* `perform_history_jump` read the applied count, so
+the commit-discarded-redo check never fired and an AT `Click` on the
+current row during a pointer opacity drag ran one Undo — reverting the
+drag just committed. The arm now only releases the slider capture (as
+`App::run_history_jump` does) and `perform_history_jump` commits the
+drag itself; three tests added (AT `Click` on the current row and on an
+undone row during a drag, and the pointer press on the current row),
+and M16 (the old call restored) is killed. **I-2 (accepted):** M10
+recorded as an accepted survivor with its reason; a `Regions`-reporting
+rig was not cheap (the stroke helpers paint a fixed surface no layer
+owns). **I-3 (disclosed):** the palette asymmetry between History and
+Layers row presses, behaviour unchanged. Still tested headlessly only.
 
 **Addendum 2026-10-08 (0.147.1) — the History panel showed no strokes
 and never marked the current step.** Reported on real macOS: "I don't
