@@ -26,7 +26,60 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.161.1): a CI test race fixed.** GitHub Actions'
+**Latest (2026-10-09, 0.163.0): the status bar's zoom is physical, as in
+Photoshop.** Three design-owner decisions (Cahya, 2026-10-09) on 0.162.0's
+status bar: **placement** stays under the canvas only (no change);
+**look** stays plain `Label` text with no background (no change); and
+**zoom on Retina matches Photoshop** — 100% is one image pixel per
+*physical* screen pixel. `aurora_ui::status_bar::zoom_text(zoom,
+scale_factor)` now shows `physical_zoom` = logical `CanvasView::zoom` ×
+the window's DPI scale factor (new `StatusInfo::scale_factor`; the app
+passes `guarded_scale_factor`, the same factor the atlas renders at), so
+on a 2x display the startup view reads 200% and logical 0.5 reads 100%.
+One rounding rule at every scale factor, unchanged from 0.162.0: whole
+when within 0.005 of a whole percent (`125%` at 1.25x, and `f32` noise
+such as 0.8 × 1.25 still reads `100%`), else two decimals (`41.67%`).
+The text and its accessible label follow a scale-factor change: the app
+re-syncs in the `ScaleFactorChanged` arm and in `resumed`, besides every
+event-loop iteration and frame. Internal zoom, `MIN_ZOOM`/`MAX_ZOOM` and
+pointer mapping stay logical (on Retina `MIN_ZOOM`/`MAX_ZOOM` read 2% and
+12800%). No "Actual Pixels"/"100%" command or fixed zoom preset exists —
+zoom comes only from the wheel/trackpad, the Zoom tool's click and the
+min-zoom floor; there is no keyboard zoom — so none was added or
+changed. 3,045 tests (3,043 + 2). **Needs a human** on a Retina Mac.
+Details: "Next action", addendum 0.163.0.
+
+**Previously (2026-10-09, 0.162.0): a status bar, and the Layers row cap is a
+token.** The second workspace round (Photoshop's layout convention,
+Aurora's own tokens). A one-row status bar (`aurora_ui::status_bar`,
+`Workspace::status_bar`) runs along the bottom of the canvas column, under
+the canvas area and between the tools panel and the rail, and reads
+"100%" and "Document: 4000 × 3000 px · 16-bit float" as in the approved
+mockup: the zoom is the live `CanvasView::zoom` (one document pixel per
+*logical* pixel is 100%), the size is `App::canvas_size`, and the sample
+format is `aurora_tile::SAMPLE_FORMAT` (new: the `f16` tag of what every
+tile stores, pinned against the real texel type by a test) — no colour
+space, because the document model records none. It is two plain `Label`s
+(no new widget, no gallery entry, no new colour pair) in a container one
+`row_height` tall, padded `spacing.sm`, items `spacing.md` apart, the zoom
+item `spacing.xxxl` wide. The app syncs it every event-loop iteration and
+again before each frame (after the zoom floor), so wheel and keyboard
+zoom, opens and canvas-size changes all reach it. Accessibility: a
+`Role::Status` node labelled "Status", explicitly `Live::Off` so zooming
+does not announce every tick; its two `Role::Label` children carry the
+text. The canvas area shrinks by the bar's row, so pointer mapping,
+viewport, scissor and wheel zoom follow from the canvas area's own bounds
+unchanged (tested at scale 1, 2, 1.25 and 1.5). The canvas column now has
+a zero `flex_basis` so the bar's own padding and fixed item cannot widen
+it in a crowded window. **Design-owner decision (Cahya, 2026-10-09):** the
+0.161.0 engineering constant `CONTENT_PANEL_MAX_ROWS` is now the design
+token `size.content_panel_max_rows` (10, a count of `row_height` rows, the
+design owner's to tune; `aurora_theme::SizeScale`,
+`aurora_ui::panel::content_panel_max_rows`, `design/README.md`,
+`design/tokens.css` — emitted unitless). 3,043 tests (3,033 + 10).
+**Needs a human** on macOS. Details: "Next action", addendum 0.162.0.
+
+**Previously (2026-10-09, 0.161.1): a CI test race fixed.** GitHub Actions'
 Ubuntu (and Windows) runs failed in
 `prepared_pixels::tests::a_background_autosave_right_after_the_install_recovers_the_document`
 with `NotFound` on `first.aur`. Cause: the test submitted two autosave
@@ -55,7 +108,7 @@ here, and are left to CI); a scan of those for the same
 for future rounds: the local gate is Linux-only, so a cfg-gated
 mutation needs a cross-target `cargo check` before it ships.
 
-**Latest (2026-10-09, 0.161.0): the Curves editor is reliably visible.**
+**Previously (2026-10-09, 0.161.0): the Curves editor is reliably visible.**
 The design owner's real-macOS report (2548 x 1344 physical, Widget Gallery
 open, a new Curves layer active) showed the Properties panel as its title
 row alone, so the only curve editor on screen was the gallery's static
@@ -30951,6 +31004,153 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.163.0) — the status bar's zoom is physical.**
+Design-owner decisions (Cahya, 2026-10-09) on 0.162.0's open items:
+placement under the canvas only — kept; plain `Label` text, no
+background — kept; Retina zoom — match Photoshop (100% = one image pixel
+per physical pixel) — done here. Files: `aurora-ui` `status_bar.rs`
+(`StatusInfo::scale_factor`, new `physical_zoom`, `zoom_text(zoom,
+scale_factor)`, module doc; one new test, two adapted), `workspace.rs`
+(initial `scale_factor: 1.0`), `canvas_view.rs` (`DEFAULT_ZOOM` doc),
+`lib.rs` (re-export); `aurora-app` `lib.rs` (`status_info`/
+`sync_status_bar` take the scale factor; `App::sync_status_bar_now` and
+`redraw` pass `self.scale_factor`; explicit syncs in the
+`ScaleFactorChanged` arm and in `resumed`; one new test, one adapted).
+Zoom commands: none targets "100%", "actual pixels" or a fixed level —
+the wheel (`apply_scroll_zoom`), the Zoom tool's click
+(`handle_zoom_tool_click`) and the `canvas_min_zoom` floor are all
+relative or logical — so no command was added or changed.
+
+Mutations (files backed up to the scratchpad, mutated, `aurora-ui
+status_bar` and `aurora-app --lib status_bar` run with
+`AURORA_REQUIRE_GPU=1`, restored, `touch`ed, sha256 checked):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `zoom_text` ignores the scale factor | killed: ui `zoom_reads_physical_pixels_at_whole_and_fractional_scale_factors`, `the_bar_is_a_labelled_status_region_…`; app `the_status_bar_reads_physical_zoom_and_follows_a_scale_factor_change` |
+| M2 | scale factor applied twice in `physical_zoom` | killed: same three |
+| M3 | app `status_info` passes `1.0` | killed: app `the_status_bar_reads_physical_zoom_…` |
+| M4 | app `status_info` skips `guarded_scale_factor` | killed: app `the_status_bar_reads_physical_zoom_…` |
+| M5 | whole-percent threshold `0.005` → `1e-9` | killed: ui `zoom_reads_as_a_percentage`, `zoom_reads_physical_pixels_…` |
+| M6 | `physical_zoom`'s degenerate-scale guard dropped | killed: ui `zoom_reads_physical_pixels_…` |
+| M7 | the `ScaleFactorChanged` arm's explicit sync removed | **survived** — redundant with the per-iteration sync, and no test drives a real `App` |
+| M8 | `App::sync_status_bar_now` passes `1.0`, not `self.scale_factor` | **survived** — no headless `App` (0.162.0's M11 class) |
+| M9 | two decimals → one | killed: ui ×2, app `the_status_bar_reads_physical_zoom_…` |
+
+Disclosures: (1) M7/M8: the `App` wiring of the scale factor is untested
+at `App` level; only the free functions are. (2) The zoom item is still
+`spacing.xxxl` (64 px) wide and labels are not text-measured: whole
+readings up to `12800%` fit by estimate, but a two-decimal reading above
+1000% (e.g. `1543.20%`, reachable on Retina) may end in "…"; not seen on
+hardware. (3) Two decimals everywhere is kept from 0.162.0, so 1.5x at
+`MIN_ZOOM` reads `1.50%` rather than Photoshop's possible `1.5%`. (4) The
+3,045 count is 3,043 + 2 new tests, not re-measured workspace-wide; only
+`aurora-ui` and `aurora-app` were run in full. (5) Nothing in the
+canvas, its clamps or its rendering changed — a Retina user simply sees a
+number twice 0.162.0's.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **3,045 passed, 0 failed, 61 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast exit 0. Independent judge:
+**PASS 0.928**, no blocking issue — it traced the scale factor end to
+end (`effective_residency_zoom` and `TileResidency::write_uniform`'s
+`uv_scale = (viewport_px / zoom) / tex` give `zoom × scale` physical px
+per document px, so logical 0.5 at 2x really is Photoshop's 100%) and
+confirmed `resumed` re-syncs with the real scale factor before the
+first frame. Recorded, not changed: `canvas_area_physical_rect` still
+uses an unguarded `scale_factor as f32` (pre-existing; degenerate
+factors only).
+
+**Needs a human:** on a Retina Mac, 100% in the status bar shows one image
+pixel per screen pixel (compare with Photoshop); moving the window to a
+non-Retina display halves the figure.
+
+**Suggested next:** panel tab groups and collapsing the rail to icons
+(workspace round 3).
+
+**Addendum 2026-10-09 (0.162.0) — a status bar, and the Layers row cap is
+a token.** Files: `aurora-ui` `status_bar.rs` (new: `StatusBar`,
+`StatusInfo`, `insert_status_bar`, `sync_status_bar`, `status_bar_text`,
+`zoom_text`, `document_text`, `sample_format_text`, `STATUS_BAR_LABEL`;
+three tests), `workspace.rs` (`Workspace::status_bar`, the canvas column's
+zero `flex_basis`, one adapted and two new tests), `panel.rs`
+(`content_panel_max_rows(&Scales)` replaces `CONTENT_PANEL_MAX_ROWS`),
+`layers_panel.rs`/`properties_panel.rs` (tests read the token), `lib.rs`;
+`aurora-app` `lib.rs` (`status_info`, `sync_status_bar`,
+`App::sync_status_bar_now`, called in `about_to_wait`, in `redraw` after the
+zoom floor and once in `App::new`; two new tests, three adapted);
+`aurora-theme` `scales.rs` (`SizeScale::content_panel_max_rows`, one test);
+`aurora-tile` `tile.rs` (`SAMPLE_FORMAT`, one test); `aurora-core`
+`color.rs` (`SampleFormat::bits`/`is_float`, one test);
+`design/tokens/scales.toml`, `design/README.md`, `design/tokens.css`,
+`design/build_tokens_css.py` (a `*_rows` size is emitted without `px`).
+
+Mutations (each file backed up, mutated, the targeted suites run with
+`AURORA_REQUIRE_GPU=1`, restored, `touch`ed and its sha256 checked):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `sync_status_bar` stops updating the zoom label | killed: `status_bar::tests::the_bar_is_a_labelled_status_region_that_is_not_live_and_syncs_its_text`, app `the_status_bar_reads_the_document_and_follows_zoom_and_size` |
+| M2 | document size from the wrong source (width/height swapped) | killed: app `the_status_bar_reads_the_document_and_follows_zoom_and_size` |
+| M3 | `sample_format_text` hardcoded to "16-bit float" | killed: `the_document_readout_names_size_and_sample_format` |
+| M4 | app passes a literal `F32`, not the tile tag | killed: app `the_status_bar_reads_…` |
+| M5 | status bar `Position::Absolute` (canvas bottom offset ignored) | killed: 5 tests (ui layout ×2, app `canvas_area_physical_rect_scales_by_the_dpi_factor`, `canvas_area_physical_size_rounds_to_whole_pixels`, `the_canvas_ends_above_the_status_bar_at_whole_and_fractional_scales`) |
+| M6 | row cap a literal `10.0` again | killed: `the_layers_cap_follows_the_content_panel_max_rows_token` |
+| M7 | `Role::Status` → `GenericContainer` | killed: `the_bar_is_a_labelled_status_region_…` |
+| M8 | `Live::Off` → `Live::Polite` | killed: `the_bar_is_a_labelled_status_region_…` |
+| M9 | bar height `row_height + 4` | killed: `the_status_bar_is_one_token_row_under_the_canvas_and_overlaps_nothing` |
+| M10 | canvas column's zero `flex_basis` dropped | killed: `at_640_by_480_the_gallery_stays_inside_the_window_and_the_canvas_is_a_sliver` |
+| M11 | the per-iteration `sync_status_bar_now` removed | **survived** — no test drives a real `App` event loop |
+| M12 | `aurora_tile::SAMPLE_FORMAT` = `F32` | killed: `the_sample_format_tag_matches_the_real_texel_type`, app `the_status_bar_reads_…` |
+
+Disclosures: (1) **Placement departs from the mockup**, which draws the
+status bar across the whole window (under the rail too); it is in the
+canvas column, Photoshop's per-document convention, because the workspace
+root is a `Row` the gallery and floating chrome are inserted into — a
+full-width bar needs that row wrapped in a new column, raised for the
+design owner rather than done. (2) No colour space is shown: the document
+model records none (an opened file's ICC profile is dropped after decode).
+(3) "100%" is one document pixel per *logical* pixel, so on Retina it is
+Photoshop's 200%. (4) The bar draws no background or top border (plain
+containers paint nothing yet), and its text uses the `Label` widget's own
+size and colour, not the mockup's `type.size.xs`/`text.secondary` — no
+new pair was introduced; a status-text style is a design decision to
+raise. (5) The status-bar *wiring* in `App` (M11) is untested at App level;
+only the free functions are. (6) In a window shorter than both bars (about
+50 px) the canvas is squeezed to zero and the status bar overhangs the
+bottom edge; in one narrower than the bar's padding it overhangs its
+column, as the options bar already did. (7) The 3,043 test count is
+3,033 + 10 new tests counted, not re-measured workspace-wide; aurora-ui
+(167), aurora-app lib (715 + 5 ignored), aurora-theme, aurora-tile and
+aurora-core were run.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **3,043 passed, 0 failed, 61 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast exit 0 — on a tree that also
+carried 0.161.1's two fixes (the autosave test race, the Windows
+`unused_mut`). Independent judge: 0.898, REVISE on one doc defect only —
+the Curves catch-all doc comment had landed on `sync_status_bar_now`,
+leaving `sync_curves_controls_now` undocumented — fixed before commit.
+Recorded, not changed: M11 (the per-iteration `App` sync, untestable
+without a headless `App`); at fractional scales the canvas scissor's
+`ceil` can share one physical row with the bar (harmless: the widget
+pass draws after the canvas); `size.content_panel_max_rows` is not
+validated (`0` would leave Layers/Properties without a body); the CSS
+generator writes any `size.*_rows` token unitless by name suffix. The
+builder's one unidentified aurora-app failure in 1 of 5 combined runs
+did not recur in the full gate; the known candidate (the autosave race)
+is fixed by 0.161.1. (The three items this entry left open for the
+design owner — placement, status text style, Retina "100%" — were
+decided on 2026-10-09; see addendum 0.163.0.)
+
+**Needs a human:** on macOS check the status bar text and that zooming
+updates it; VoiceOver reads it.
+
+**Suggested next:** panel tab groups and collapsing the rail to icons
+(workspace round 3).
 
 **Addendum 2026-10-09 (0.161.0) — the Curves editor is reliably
 visible.** Files: `aurora-ui` `panel.rs` (`PanelSizing`,

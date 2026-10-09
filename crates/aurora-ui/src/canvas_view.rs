@@ -10,7 +10,11 @@
 //! transform to know what to draw.
 
 /// Zoom at which one document pixel occupies exactly one logical screen
-/// pixel ("100%") — [`CanvasView::new`]'s own starting zoom.
+/// pixel — [`CanvasView::new`]'s own starting zoom. Every zoom in this
+/// module is logical; the status bar shows it *physically* (times the
+/// window's scale factor, [`crate::status_bar::physical_zoom`]), so this
+/// reads "100%" at 1x and "200%" on a 2x Retina display, as Photoshop
+/// counts (0.163.0).
 pub const DEFAULT_ZOOM: f32 = 1.0;
 
 /// Practical zoom bounds — not the literal "infinite" this bullet is

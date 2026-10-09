@@ -68,6 +68,22 @@ impl SampleFormat {
             Self::F32 => 4,
         }
     }
+
+    /// Bits per sample (`8 * bytes()`).
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.bytes() * 8
+    }
+
+    /// Whether the sample is a floating-point value (`F16`, `F32`) rather
+    /// than an integer (`U8`).
+    #[must_use]
+    pub const fn is_float(self) -> bool {
+        match self {
+            Self::F16 | Self::F32 => true,
+            Self::U8 => false,
+        }
+    }
 }
 
 /// A complete pixel format descriptor: layout, sample type, and colour
@@ -106,6 +122,16 @@ mod tests {
         assert_eq!(SampleFormat::U8.bytes(), 1);
         assert_eq!(SampleFormat::F16.bytes(), 2);
         assert_eq!(SampleFormat::F32.bytes(), 4);
+    }
+
+    #[test]
+    fn sample_bits_and_kind() {
+        assert_eq!(SampleFormat::U8.bits(), 8);
+        assert_eq!(SampleFormat::F16.bits(), 16);
+        assert_eq!(SampleFormat::F32.bits(), 32);
+        assert!(!SampleFormat::U8.is_float());
+        assert!(SampleFormat::F16.is_float());
+        assert!(SampleFormat::F32.is_float());
     }
 
     #[test]

@@ -59,6 +59,7 @@
   --spacing-xxxl: 64px;
 
   --size-options-control-width: 224px;
+  --size-content-panel-max-rows: 10;
 
   --radius-none: 0px;
   --radius-sm: 2px;
