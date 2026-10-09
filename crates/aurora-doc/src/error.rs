@@ -36,6 +36,10 @@ pub enum DocError {
     /// the valid `0.0..=1.0` range.
     #[error("opacity {0} is out of range: must be within 0.0..=1.0")]
     OpacityOutOfRange(f32),
+    /// A mask density passed to [`crate::LayerTree::set_mask_density`]
+    /// was outside `0.0..=1.0` (or `NaN`), 0.149.0.
+    #[error("mask density {0} is out of range: must be within 0.0..=1.0")]
+    MaskDensityOutOfRange(f32),
     /// [`crate::LayerTree::add_mask`] was called on a layer that already
     /// has one — matching Photoshop's own UI, which replaces "Add Layer
     /// Mask" with "Delete Layer Mask" once one exists rather than letting

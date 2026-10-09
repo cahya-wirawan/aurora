@@ -2054,6 +2054,7 @@ impl LayerTree {
             bounds,
             enabled: true,
             inverted: false,
+            density: crate::FULL_MASK_DENSITY,
         });
         Ok(())
     }
@@ -2124,6 +2125,23 @@ impl LayerTree {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         let mask = entry.mask.as_mut().ok_or(DocError::NoMask(id))?;
         mask.inverted = inverted;
+        Ok(())
+    }
+
+    /// Sets the mask's [`LayerMask::density`] (0.149.0).
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::MaskDensityOutOfRange`] if `density` is not within
+    /// `0.0..=1.0` (a `NaN` is not), checked first; otherwise the same as
+    /// [`Self::set_mask_enabled`]. Nothing is changed when this happens.
+    pub fn set_mask_density(&mut self, id: LayerId, density: f32) -> Result<(), DocError> {
+        if !(0.0..=1.0).contains(&density) {
+            return Err(DocError::MaskDensityOutOfRange(density));
+        }
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        let mask = entry.mask.as_mut().ok_or(DocError::NoMask(id))?;
+        mask.density = density;
         Ok(())
     }
 
@@ -2320,6 +2338,7 @@ mod tests {
                 bounds: bounds(),
                 enabled: true,
                 inverted: false,
+                density: crate::FULL_MASK_DENSITY,
             })
         );
 
@@ -3912,6 +3931,7 @@ mod tests {
                 bounds: mask_bounds,
                 enabled: true,
                 inverted: false,
+                density: crate::FULL_MASK_DENSITY,
             })
         );
 
@@ -5504,6 +5524,7 @@ mod tests {
             bounds,
             enabled: true,
             inverted: false,
+            density: crate::FULL_MASK_DENSITY,
         }
     }
 

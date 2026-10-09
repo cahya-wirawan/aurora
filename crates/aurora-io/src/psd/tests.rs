@@ -1788,24 +1788,375 @@ fn a_relative_position_flag_does_not_move_the_mask_and_is_reported_where_it_matt
     assert!(report_text(&doc(&at_origin)).is_empty());
 }
 
+// -- 0.149.0: mask density ---------------------------------------------
+
+/// The opened `masked_file` with `tail` as its mask's parameter block
+/// (flags carry bit 4, plus `extra_flags`).
+fn with_parameters(extra_flags: u8, tail: Vec<u8>) -> PsdDocument {
+    let spec = (1, 1, 3, 3, 0, 0x10 | extra_flags);
+    let mut file = masked_file(8, spec, vec![0, 64, 128, 255], 0);
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask_tail = Some(tail);
+    }
+    doc(&file.write())
+}
+
+/// The density the opened document attached to its only layer's mask.
+fn only_density(document: &PsdDocument) -> Option<f32> {
+    document
+        .layers
+        .mask(root(&document.layers, 0))
+        .map(|m| m.density)
+}
+
+/// psd-tools' effective coverage: `d * c + (1 - d)`, `c` after invert.
+fn with_density(coverage: f32, density: f32) -> f32 {
+    density * coverage + (1.0 - density)
+}
+
 #[test]
-fn mask_density_or_feather_is_reported_and_the_default_parameters_are_not() {
-    let with_tail = |tail: Vec<u8>| {
-        let spec = (1, 1, 3, 3, 0, 0x10);
-        let mut file = masked_file(8, spec, vec![255; 4], 0);
-        if let Some(layer) = file.layers.first_mut() {
-            layer.mask_tail = Some(tail);
+fn user_mask_density_is_attached_as_the_masks_density_and_not_baked_or_reported() {
+    let samples = [0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+    for density in [0_u8, 1, 128, 254, 255] {
+        let document = with_parameters(0, vec![0x01, density]);
+        assert_eq!(
+            only_density(&document),
+            Some(f32::from(density) / 255.0),
+            "{density}"
+        );
+        // The coverage itself is the file's, untouched: density stays
+        // editable rather than baked in.
+        assert_mask_matches_photoshop(&document, (1, 1, 3, 3, 0, 0x10), &samples);
+        assert!(
+            report_text(&document).is_empty(),
+            "{density}: {}",
+            report_text(&document)
+        );
+    }
+}
+
+#[test]
+fn mask_density_applies_to_the_coverage_after_the_files_invert_flag() {
+    // Inverted (bit 2) at density 128: psd-tools inverts the sample and
+    // then applies `d * c + (1 - d)`. The import bakes the inversion into
+    // the coverage, so the attached density over the attached coverage
+    // must give the same number.
+    let spec = (1, 1, 3, 3, 0, 0x14);
+    let mut file = masked_file(8, spec, vec![0, 64, 128, 255], 0);
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask_tail = Some(vec![0x01, 128]);
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let density = 128.0 / 255.0;
+    assert_eq!(only_density(&document), Some(density));
+    let samples = [0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0];
+    for y in 1..4 {
+        for x in 1..4 {
+            let want = with_density(photoshop_mask(spec, &samples, x, y), density);
+            let got = with_density(
+                effective_mask(&document, id, x, y).unwrap_or(f32::NAN),
+                density,
+            );
+            assert!(
+                (got - want).abs() <= 1.0 / 1024.0,
+                "({x}, {y}): {got} vs {want}"
+            );
         }
-        report_text(&doc(&file.write()))
+    }
+}
+
+#[test]
+fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() {
+    let feather = |flag: u8, lead: &[u8], value: f64| {
+        let mut tail = vec![flag];
+        tail.extend_from_slice(lead);
+        tail.extend_from_slice(&value.to_be_bytes());
+        tail
     };
-    assert!(with_tail(vec![0x01, 128]).contains("density or feather"));
-    let mut feather = vec![0x02];
-    feather.extend_from_slice(&2.5_f64.to_be_bytes());
-    assert!(with_tail(feather).contains("density or feather"));
-    assert!(with_tail(vec![0x01, 255]).is_empty());
-    assert!(with_tail(vec![0x00]).is_empty());
-    // Truncated parameter block: lenient, nothing to report.
-    assert!(with_tail(Vec::new()).is_empty());
+    let full = Some(1.0);
+    for (what, tail, density, reported) in [
+        ("user feather", feather(0x02, &[], 2.5), full, true),
+        (
+            "density + zero feather",
+            feather(0x03, &[128], 0.0),
+            Some(128.0 / 255.0),
+            false,
+        ),
+        // psd-tools' fallback: a vector density with no user density is
+        // applied to the user mask.
+        (
+            "vector density only",
+            vec![0x04, 64],
+            Some(64.0 / 255.0),
+            false,
+        ),
+        (
+            "user + vector density",
+            vec![0x05, 128, 64],
+            Some(128.0 / 255.0),
+            true,
+        ),
+        (
+            "user + full vector density",
+            vec![0x05, 128, 255],
+            Some(128.0 / 255.0),
+            false,
+        ),
+        ("vector feather", feather(0x08, &[], 1.0), full, true),
+        ("vector zero feather", feather(0x08, &[], 0.0), full, false),
+        ("full density", vec![0x01, 255], full, false),
+        ("nothing present", vec![0x00], full, false),
+    ] {
+        let document = with_parameters(0, tail);
+        assert_eq!(only_density(&document), density, "{what}");
+        let text = report_text(&document);
+        assert_eq!(
+            text.contains("feather or a vector-mask density"),
+            reported,
+            "{what}: {text}"
+        );
+        assert!(!text.contains("full density"), "{what}: {text}");
+    }
+}
+
+#[test]
+fn a_truncated_or_odd_parameter_block_keeps_what_was_read_and_never_panics() {
+    for (what, tail, density) in [
+        ("empty", Vec::new(), 1.0),
+        ("density byte missing", vec![0x01], 1.0),
+        (
+            "feather truncated after density",
+            vec![0x03, 9, 0, 0],
+            9.0 / 255.0,
+        ),
+        ("every bit, one byte", vec![0xFF, 7], 7.0 / 255.0),
+        ("unknown bits only", vec![0xF0], 1.0),
+    ] {
+        let document = with_parameters(0, tail);
+        assert_eq!(only_density(&document), Some(density), "{what}");
+        assert!(
+            report_text(&document).is_empty(),
+            "{what}: {}",
+            report_text(&document)
+        );
+    }
+    // Every prefix of a full block, and every single-byte mutation of it,
+    // opens without a panic and with a density in range.
+    let mut full = vec![0x0F, 128];
+    full.extend_from_slice(&2.0_f64.to_be_bytes());
+    full.push(64);
+    full.extend_from_slice(&f64::NAN.to_be_bytes());
+    for len in 0..=full.len() {
+        let prefix = full.get(..len).map(<[u8]>::to_vec).unwrap_or_default();
+        let d = only_density(&with_parameters(0, prefix)).unwrap_or(f32::NAN);
+        assert!((0.0..=1.0).contains(&d), "prefix {len}: {d}");
+    }
+    for index in 0..full.len() {
+        for byte in [0x00, 0x7F, 0xFF] {
+            let mut mutated = full.clone();
+            if let Some(slot) = mutated.get_mut(index) {
+                *slot = byte;
+            }
+            let d = only_density(&with_parameters(0, mutated)).unwrap_or(f32::NAN);
+            assert!((0.0..=1.0).contains(&d), "byte {index} = {byte}: {d}");
+        }
+    }
+}
+
+#[test]
+fn a_group_mask_density_is_attached_to_the_group() {
+    let bytes = TestPsd::new(1, 4, 4, 8)
+        .with(|p| {
+            p.layers = vec![
+                TestLayer::divider(),
+                TestLayer::pixels("in", 0, 0, 2, 2, 8, &two_by_two(8)),
+                TestLayer::group("G", *b"norm").with(|l| {
+                    l.mask = Some((0, 0, 1, 2, 255, 0x10));
+                    l.mask_tail = Some(vec![0x01, 0]);
+                    l.channels.push((-2, vec![0, 128]));
+                }),
+            ];
+        })
+        .write();
+    let document = doc(&bytes);
+    let group = root(&document.layers, 0);
+    assert_eq!(document.layers.mask(group).map(|m| m.density), Some(0.0));
+    // Coverage still the file's own; at density 0 it has no effect.
+    assert_eq!(effective_mask(&document, group, 0, 0), Some(0.0));
+    assert_eq!(with_density(0.0, 0.0), 1.0);
+    assert!(
+        report_text(&document).is_empty(),
+        "{}",
+        report_text(&document)
+    );
+}
+
+/// Every layer named `name` in `tree`, depth first.
+fn find_named(tree: &LayerTree, name: &str) -> Option<LayerId> {
+    let mut stack: Vec<LayerId> = tree.roots().to_vec();
+    while let Some(id) = stack.pop() {
+        if tree.name(id) == Some(name) {
+            return Some(id);
+        }
+        if let Some(children) = tree.children(id) {
+            stack.extend_from_slice(children);
+        }
+    }
+    None
+}
+
+/// The real psd-tools fixtures that carry a mask parameter block, checked
+/// against psd-tools' own reading (`psd_tools` 1.x, `composite.py`
+/// `_get_mask`: density = user, else vector, else 255; effective coverage
+/// `d * m + (1 - d)` over the user mask). The expected numbers were
+/// computed by psd-tools itself over each rectangle (the mask's bbox ∩
+/// the layer's record rectangle ∩ the canvas), not by hand.
+#[test]
+#[allow(clippy::type_complexity, clippy::too_many_lines)] // a data table
+fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures");
+    if !dir.is_dir() {
+        println!("SKIPPED: corpus not present at {}", dir.display());
+        return;
+    }
+    // (file, layer, density byte, (x0, y0, x1, y1), psd-tools' sum)
+    let cases: &[(&str, &str, u8, (i64, i64, i64, i64), f64)] = &[
+        (
+            "mask-density-layermask.psd",
+            "Rectangle 2 copy",
+            64,
+            (1, 25, 24, 32),
+            145.591_773,
+        ),
+        (
+            "mask-density-layermask.psd",
+            "Rectangle 2",
+            128,
+            (0, 16, 24, 25),
+            168.784_191,
+        ),
+        (
+            "mask-density-layermask.psd",
+            "Rectangle 2 copy 3",
+            191,
+            (1, 8, 24, 16),
+            130.431_881,
+        ),
+        (
+            "mask-density-layermask.psd",
+            "Rectangle 2 copy 2",
+            255,
+            (0, 0, 24, 8),
+            110.505_883,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1",
+            64,
+            (15, 0, 32, 8),
+            123.166_536,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy",
+            128,
+            (15, 8, 32, 16),
+            110.478_739,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy 2",
+            191,
+            (15, 16, 32, 24),
+            97.914_557,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy 3",
+            255,
+            (15, 24, 32, 32),
+            88.337_256,
+        ),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1",
+            64,
+            (15, 0, 32, 8),
+            133.992_157,
+        ),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1 copy",
+            128,
+            (15, 8, 32, 16),
+            131.984_314,
+        ),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1 copy 2",
+            191,
+            (15, 16, 32, 24),
+            130.007_843,
+        ),
+        (
+            "mask_parameters.psd",
+            "Rectangle 1",
+            204,
+            (23, 19, 185, 181),
+            25_728.8,
+        ),
+        (
+            "layer_mask_data.psd",
+            "1",
+            204,
+            (12, 17, 68, 179),
+            7_104.141_179,
+        ),
+        (
+            "layer_mask_data.psd",
+            "2",
+            230,
+            (22, 11, 179, 59),
+            6_064.795_85,
+        ),
+        (
+            "layer_mask_data.psd",
+            "4",
+            191,
+            (12, 141, 188, 191),
+            6_541.570_782,
+        ),
+    ];
+    for &(file, layer, byte, (x0, y0, x1, y1), want) in cases {
+        let bytes = match std::fs::read(dir.join(file)) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{file}: {err}"),
+        };
+        let document = doc(&bytes);
+        let Some(id) = find_named(&document.layers, layer) else {
+            unreachable!("{file}: no layer {layer:?}");
+        };
+        let density = document.layers.mask(id).map(|m| m.density);
+        assert_eq!(density, Some(f32::from(byte) / 255.0), "{file} {layer}");
+        let density = density.unwrap_or(f32::NAN);
+        let mut sum = 0.0_f64;
+        let mut n = 0_u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+                sum += f64::from(with_density(c, density));
+                n += 1;
+            }
+        }
+        let tolerance = 1e-3 * f64::from(n);
+        assert!(
+            (sum - want).abs() <= tolerance,
+            "{file} {layer}: Aurora {sum} vs psd-tools {want} over {n} px"
+        );
+        println!("{file} {layer}: Aurora {sum:.4} psd-tools {want:.4} ({n} px)");
+    }
 }
 
 #[test]

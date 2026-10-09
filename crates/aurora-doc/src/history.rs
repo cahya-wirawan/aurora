@@ -114,6 +114,46 @@ enum LayerOp {
         id: LayerId,
         value: Rect,
     },
+    /// A mask's [`LayerMask::density`] (0.149.0). Appended last for the
+    /// same postcard-ordinal reason as [`Self::SetBounds`].
+    ///
+    /// Also the carrier for a density that a *journaled* `RestoreMask` or
+    /// `Restore` holds in memory but cannot put on the wire
+    /// ([`LayerMask::density`] is `#[serde(skip)]`, see its doc comment):
+    /// [`History::save_journal`] writes one of these straight after each
+    /// such op, so a loaded journal replays to the same density.
+    ///
+    /// "Appending is always safe" holds for *new readers of old data*
+    /// only: a build older than 0.149.0 cannot decode this variant, so
+    /// it refuses any journal (and so any `.aur` or autosave) that
+    /// carries one rather than replaying it without the density.
+    SetMaskDensity {
+        id: LayerId,
+        value: f32,
+    },
+}
+
+/// Every `(layer, density)` pair a journaled `op` carries in a mask whose
+/// [`LayerMask::density`] would be lost on the wire — the masks below
+/// full density inside a `RestoreMask` or a `Restore`d subtree.
+/// [`History::save_journal`]'s helper.
+fn reduced_mask_densities(op: &LayerOp) -> Vec<(LayerId, f32)> {
+    let reduced = |mask: &LayerMask| mask.density < crate::FULL_MASK_DENSITY;
+    match op {
+        LayerOp::RestoreMask(id, mask) if reduced(mask) => vec![(*id, mask.density)],
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .mask
+                    .as_ref()
+                    .filter(|mask| reduced(mask))
+                    .map(|mask| (*id, mask.density))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The document-space region a step touched, when it's knowable from
@@ -263,6 +303,14 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
                 layer_dirty_rect(tree, id),
             ))
         }
+        LayerOp::SetMaskDensity { id, value } => {
+            let old = tree.mask(id).ok_or(DocError::NoMask(id))?.density;
+            tree.set_mask_density(id, value)?;
+            Ok((
+                LayerOp::SetMaskDensity { id, value: old },
+                layer_dirty_rect(tree, id),
+            ))
+        }
         LayerOp::SetBounds { id, value } => {
             let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
             tree.set_bounds(id, value)?;
@@ -381,6 +429,13 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetMaskInverted { id, value } => {
             let verb = if *value { "Inverted" } else { "Un-inverted" };
             format!("{verb} mask on layer #{}", id.to_raw())
+        }
+        LayerOp::SetMaskDensity { id, value } => {
+            format!(
+                "Set mask density on layer #{} to {:.0}%",
+                id.to_raw(),
+                value * 100.0
+            )
         }
         // "Repositioned," not "Moved" -- `Reparent` already claims that
         // verb for changing a layer's place in the tree/z-order, a
@@ -644,8 +699,27 @@ impl History {
     /// fails — not expected for this crate's own, entirely
     /// serializable `LayerOp` shape, but a real, checked possibility
     /// rather than an assumption.
+    ///
+    /// **Mask density is carried separately** (0.149.0): a journaled
+    /// `RestoreMask`/`Restore` holding a mask whose
+    /// [`LayerMask::density`] is below `1.0` is followed, on the wire
+    /// only, by a `SetMaskDensity` op for it — the field itself is
+    /// `#[serde(skip)]` (see its doc comment for why). The in-memory
+    /// journal is not changed; a journal loaded back and saved again
+    /// writes the same ops, since the loaded `RestoreMask` decodes at
+    /// `1.0` and the following `SetMaskDensity` is kept as it is.
     pub fn save_journal(&self) -> Result<Vec<u8>, DocError> {
-        postcard::to_allocvec(&self.journal)
+        let mut wire: Vec<std::borrow::Cow<'_, LayerOp>> = Vec::with_capacity(self.journal.len());
+        for op in &self.journal {
+            wire.push(std::borrow::Cow::Borrowed(op));
+            for (id, value) in reduced_mask_densities(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetMaskDensity {
+                    id,
+                    value,
+                }));
+            }
+        }
+        postcard::to_allocvec(&wire)
             .map_err(|source| DocError::JournalSerialization(source.to_string()))
     }
 
@@ -1133,6 +1207,7 @@ impl History {
                 bounds,
                 enabled: true,
                 inverted: false,
+                density: crate::FULL_MASK_DENSITY,
             },
         ));
         self.push(LayerOp::RemoveMask(id));
@@ -1199,6 +1274,25 @@ impl History {
         tree.set_mask_inverted(id, value)?;
         self.journal.push(LayerOp::SetMaskInverted { id, value });
         self.push(LayerOp::SetMaskInverted { id, value: old });
+        Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// Same as [`LayerTree::set_mask_density`], recorded for undo
+    /// (0.149.0).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_mask_density`].
+    pub fn set_mask_density(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: f32,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.mask(id).ok_or(DocError::NoMask(id))?.density;
+        tree.set_mask_density(id, value)?;
+        self.journal.push(LayerOp::SetMaskDensity { id, value });
+        self.push(LayerOp::SetMaskDensity { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
 
@@ -2884,6 +2978,7 @@ mod tests {
             bounds: other_bounds(),
             enabled: false,
             inverted: false,
+            density: crate::FULL_MASK_DENSITY,
         });
         assert_eq!(tree.mask(id).cloned(), expected);
         let replayed = match history.replay() {
@@ -3007,6 +3102,174 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(tree.mask(id).map(|m| m.inverted), Some(false));
+    }
+
+    // -- 0.149.0: mask density ------------------------------------------
+
+    /// Saves, loads and replays `history`'s journal: the crash-recovery /
+    /// `.aur` `history` entry path, through real `postcard` bytes.
+    fn replayed_through_postcard(history: &History) -> LayerTree {
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match recovered.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn set_mask_density_undo_redo_and_range_check() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(matches!(
+            history.set_mask_density(&mut tree, id, 0.5),
+            Err(DocError::NoMask(_))
+        ));
+        if let Err(err) = history.add_mask(&mut tree, &mut store, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.density), Some(1.0), "default");
+        if let Err(err) = history.set_mask_density(&mut tree, id, 0.25) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.density), Some(0.25));
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.density), Some(1.0));
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.density), Some(0.25));
+        for bad in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            assert!(
+                matches!(
+                    history.set_mask_density(&mut tree, id, bad),
+                    Err(DocError::MaskDensityOutOfRange(_))
+                ),
+                "{bad}"
+            );
+            assert_eq!(tree.mask(id).map(|m| m.density), Some(0.25), "unchanged");
+        }
+        for edge in [0.0, 1.0] {
+            if let Err(err) = tree.set_mask_density(id, edge) {
+                unreachable!("{edge}: {err:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn mask_density_survives_a_postcard_journal_round_trip_through_every_carrier() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let a = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match history.add_pixel_layer(&mut tree, "b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (id, density) in [(a, 0.25), (b, 0.75)] {
+            if let Err(err) = history.add_mask(&mut tree, &mut store, id, bounds()) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = history.set_mask_density(&mut tree, id, density) {
+                unreachable!("{err:?}");
+            }
+        }
+        // 1. A plain SetMaskDensity.
+        let replayed = replayed_through_postcard(&history);
+        assert_eq!(replayed.mask(a).map(|m| m.density), Some(0.25));
+        assert_eq!(replayed.mask(b).map(|m| m.density), Some(0.75));
+
+        // 2. Remove `a`'s mask, then undo: the journal now ends in a
+        //    `RestoreMask` carrying density 0.25 that postcard cannot
+        //    encode by itself.
+        if let Err(err) = history.remove_mask(&mut tree, a) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(replayed_through_postcard(&history).mask(a), None);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        let replayed = replayed_through_postcard(&history);
+        assert_eq!(replayed.mask(a).map(|m| m.density), Some(0.25));
+
+        // 3. Delete layer `b`, then undo: a `Restore` subtree carrying a
+        //    0.75 mask.
+        if let Err(err) = history.remove(&mut tree, b) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        let replayed = replayed_through_postcard(&history);
+        assert_eq!(replayed.mask(b).map(|m| m.density), Some(0.75));
+        assert_eq!(replayed.mask(a).map(|m| m.density), Some(0.25));
+
+        // Loading and saving again writes the same bytes: the expansion
+        // is idempotent.
+        let first = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let reloaded = match History::load_journal(&first) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let second = match reloaded.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_full_density_journal_is_byte_identical_to_the_pre_density_encoding() {
+        // No density below 1.0 anywhere: `save_journal` must add nothing,
+        // so every journal an older build could have written still reads
+        // and every journal this build writes for such a document is
+        // what an older build wrote.
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.add_mask(&mut tree, &mut store, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove_mask(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        let saved = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = match postcard::to_allocvec(&history.journal) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(saved, plain);
     }
 
     #[test]
@@ -3431,6 +3694,7 @@ mod tests {
                     bounds: out_of_range_origin(),
                     enabled: true,
                     inverted: false,
+                    density: crate::FULL_MASK_DENSITY,
                 },
             ),
         ];

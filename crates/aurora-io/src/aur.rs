@@ -263,6 +263,100 @@ const HISTORY_ENTRY: &str = "history";
 /// of its own rather than a manifest field.
 const SKIPPED_TILES_ENTRY: &str = "skipped-tiles";
 
+/// The optional entry carrying every mask's [`aurora_doc::LayerMask::density`]
+/// below `1.0` (0.149.0), `postcard`-encoded as a [`MaskDensityWire`].
+///
+/// An entry of its own for exactly the reason [`SKIPPED_TILES_ENTRY`] is
+/// (this module's doc comment): the manifest's `LayerTree` is positional
+/// `postcard`, so `LayerMask` keeps its density `#[serde(skip)]` and the
+/// manifest bytes are unchanged. Written only when some mask is below
+/// full density, so every save of a document without one stays
+/// byte-identical to what 0.148.0 wrote; absent means "every mask at
+/// full density", which is also what every older file means.
+///
+/// **Not forward compatible, and older builds refuse rather than
+/// degrade.** A build older than 0.149.0 never looks this entry up, but
+/// it never gets that far: every file Aurora itself writes with this
+/// entry also has a
+/// `history` journal containing `LayerOp::SetMaskDensity`, which
+/// [`aurora_doc::History::save_journal`] writes after every reduced
+/// mask and an older build's `History::load_journal` cannot decode (an
+/// unknown postcard variant ordinal), so [`read`] there refuses the
+/// whole file ("Couldn't Open File"). That stays true after the density
+/// is set back to 1.0, since the journal keeps the op. ADR 0009's rule —
+/// every new build reads every old file — still holds; only the
+/// downgrade direction is refused, loudly, which is safer than silently
+/// showing every mask at full density. A reader that finds an
+/// unrecognised `version` in this entry refuses the file for the same
+/// reason.
+const MASK_DENSITY_ENTRY: &str = "mask-density";
+
+/// [`MASK_DENSITY_ENTRY`]'s own schema version.
+const MASK_DENSITY_VERSION: u32 = 1;
+
+/// [`MASK_DENSITY_ENTRY`]'s payload: version first (frozen), then one
+/// `(raw layer id, density)` pair per reduced-density mask.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MaskDensityWire {
+    version: u32,
+    densities: Vec<(u64, f32)>,
+}
+
+/// The frozen prefix of [`MaskDensityWire`].
+#[derive(serde::Deserialize)]
+struct MaskDensityPrefix {
+    version: u32,
+}
+
+/// Every mask in `layers` below full density, as [`MaskDensityWire`]
+/// pairs, in [`layer_ids`] order.
+fn reduced_mask_densities(layers: &LayerTree) -> Vec<(u64, f32)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let density = layers.mask(id)?.density;
+            (density < aurora_doc::FULL_MASK_DENSITY).then_some((id.to_raw(), density))
+        })
+        .collect()
+}
+
+/// Reads [`MASK_DENSITY_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unrecognised version, bytes
+/// that do not decode, or a pair naming a layer without a mask or a
+/// density outside `0.0..=1.0` (`LayerTree::set_mask_density`'s own
+/// check) — a hostile or damaged file is refused, never half-applied
+/// silently; [`IoError::Zip`]-family errors as [`read_capped`] gives them.
+fn read_mask_densities<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(MASK_DENSITY_ENTRY) {
+        Ok(file) => read_capped(file, MASK_DENSITY_ENTRY, MAX_METADATA_ENTRY_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != MASK_DENSITY_VERSION {
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported mask-density version {} (this build understands version \
+             {MASK_DENSITY_VERSION})",
+            prefix.version
+        )));
+    }
+    let wire: MaskDensityWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, density) in wire.densities {
+        layers
+            .set_mask_density(aurora_doc::LayerId::from_raw(raw), density)
+            .map_err(|err| IoError::ManifestDeserialization(format!("mask density: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The most [`SkippedTileRecord`]s either side of this format will put
 /// in, or take out of, the [`SKIPPED_TILES_ENTRY`] entry.
 ///
@@ -1082,6 +1176,20 @@ fn write_with_policy<W: Write + Seek>(
     zip.start_file(HISTORY_ENTRY, deflated)?;
     zip.write_all(&history_bytes)?;
 
+    // Only when some mask is below full density, so an ordinary save
+    // stays byte-identical to 0.148.0's (see `MASK_DENSITY_ENTRY`).
+    let densities = reduced_mask_densities(layers);
+    if !densities.is_empty() {
+        let wire = MaskDensityWire {
+            version: MASK_DENSITY_VERSION,
+            densities,
+        };
+        let bytes = postcard::to_allocvec(&wire)
+            .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+        zip.start_file(MASK_DENSITY_ENTRY, deflated)?;
+        zip.write_all(&bytes)?;
+    }
+
     for (surface, bounds) in persisted_surfaces(layers) {
         let (tiles_x, tiles_y) = tile_grid(bounds)?;
         for ty in 0..tiles_y {
@@ -1294,6 +1402,8 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     // oversized extent must be refused before the loop it would
     // otherwise make unfinishable starts, not part-way through it.
     validate_persisted_rects(&manifest.layers)?;
+    let mut layers = manifest.layers;
+    read_mask_densities(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
@@ -1308,13 +1418,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     // clears nothing it merely elided (0.82.2).
     let mut committed: Vec<(SurfaceId, TileId)> = Vec::new();
     let mut elided: Vec<(SurfaceId, TileId)> = Vec::new();
-    if let Err(err) = read_persisted_tiles(
-        &mut zip,
-        &manifest.layers,
-        store,
-        &mut committed,
-        &mut elided,
-    ) {
+    if let Err(err) = read_persisted_tiles(&mut zip, &layers, store, &mut committed, &mut elided) {
         roll_back_committed_tiles(store, &committed, &err);
         return Err(err);
     }
@@ -1323,7 +1427,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     }
 
     Ok(AurDocument {
-        layers: manifest.layers,
+        layers,
         history,
         canvas_size: (manifest.canvas_width, manifest.canvas_height),
         profile,
@@ -3435,6 +3539,231 @@ mod tests {
             exactly(coverage_at(&mut fresh_store, mask_surface, tile, 7, 8), 0.0),
             "a group's own mask coverage must round trip"
         );
+    }
+
+    // -- 0.149.0: mask density ------------------------------------------
+
+    /// A two-mask document (a pixel layer at density 0.5, a group at 0.0)
+    /// plus one full-density mask, saved through the real [`write`].
+    fn reduced_density_document(
+        store: &mut TileStore,
+    ) -> (
+        Vec<u8>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let full = match history.add_pixel_layer(&mut layers, "f", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [pixel, full, group] {
+            if let Err(err) = history.add_mask(&mut layers, store, id, mask_bounds()) {
+                unreachable!("{err:?}");
+            }
+        }
+        for (id, density) in [(pixel, 0.5), (group, 0.0)] {
+            if let Err(err) = history.set_mask_density(&mut layers, id, density) {
+                unreachable!("{err:?}");
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), pixel, full, group)
+    }
+
+    /// `container` with its `mask-density` entry replaced by `payload`
+    /// (or dropped, for `None`), every other entry copied raw.
+    fn with_mask_density_entry(container: &[u8], payload: Option<&[u8]>) -> Vec<u8> {
+        let mut archive = match zip::ZipArchive::new(Cursor::new(container)) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let file = match archive.by_index_raw(index) {
+                Ok(file) => file,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if file.name() == super::MASK_DENSITY_ENTRY {
+                continue;
+            }
+            if let Err(err) = out.raw_copy_file(file) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Some(payload) = payload {
+            if let Err(err) = out.start_file(
+                super::MASK_DENSITY_ENTRY,
+                zip::write::SimpleFileOptions::default(),
+            ) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = std::io::Write::write_all(&mut out, payload) {
+                unreachable!("{err:?}");
+            }
+        }
+        match out.finish() {
+            Ok(cursor) => cursor.into_inner(),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn round_trips_mask_density_and_its_history_replays_to_it() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, full, group) = reduced_density_document(&mut store);
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.as_slice())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            archive.file_names().any(|n| n == super::MASK_DENSITY_ENTRY),
+            "{:?}",
+            archive.file_names().collect::<Vec<_>>()
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (id, want) in [(pixel, 0.5), (full, 1.0), (group, 0.0)] {
+            assert_eq!(document.layers.mask(id).map(|m| m.density), Some(want));
+        }
+        let replayed = match document.history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (id, want) in [(pixel, 0.5), (full, 1.0), (group, 0.0)] {
+            assert_eq!(replayed.mask(id).map(|m| m.density), Some(want), "replay");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_container_without_a_mask_density_entry_opens_every_mask_at_full_density() {
+        // What every file before 0.149.0 is: the same document, entry
+        // removed.
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, full, group) = reduced_density_document(&mut store);
+        let old = with_mask_density_entry(&bytes, None);
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(old), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [pixel, full, group] {
+            assert_eq!(document.layers.mask(id).map(|m| m.density), Some(1.0));
+        }
+    }
+
+    #[test]
+    fn a_full_density_save_writes_no_mask_density_entry() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.add_mask(&mut layers, &mut store, id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let archive = match zip::ZipArchive::new(bytes) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            archive.file_names().all(|n| n != super::MASK_DENSITY_ENTRY),
+            "{:?}",
+            archive.file_names().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_hostile_mask_density_entry_is_refused_not_applied() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, _full, _group) = reduced_density_document(&mut store);
+        let encode = |wire: &super::MaskDensityWire| match postcard::to_allocvec(wire) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "out of range",
+                encode(&super::MaskDensityWire {
+                    version: super::MASK_DENSITY_VERSION,
+                    densities: vec![(pixel.to_raw(), 2.0)],
+                }),
+            ),
+            (
+                "NaN",
+                encode(&super::MaskDensityWire {
+                    version: super::MASK_DENSITY_VERSION,
+                    densities: vec![(pixel.to_raw(), f32::NAN)],
+                }),
+            ),
+            (
+                "unknown layer",
+                encode(&super::MaskDensityWire {
+                    version: super::MASK_DENSITY_VERSION,
+                    densities: vec![(9_999, 0.5)],
+                }),
+            ),
+            (
+                "newer version",
+                encode(&super::MaskDensityWire {
+                    version: super::MASK_DENSITY_VERSION + 1,
+                    densities: Vec::new(),
+                }),
+            ),
+            ("empty", Vec::new()),
+            ("truncated", vec![1, 1, 0]),
+        ];
+        for (what, payload) in cases {
+            let tampered = with_mask_density_entry(&bytes, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            assert!(
+                matches!(
+                    read(Cursor::new(tampered), &mut fresh),
+                    Err(crate::IoError::ManifestDeserialization(_))
+                ),
+                "{what}"
+            );
+        }
     }
 
     #[test]

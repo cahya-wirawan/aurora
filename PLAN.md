@@ -26,7 +26,41 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-08, 0.148.0): click a History row to jump to that
+**Latest (2026-10-09, 0.149.0): PSD mask density is applied, and
+editable.** `aurora_doc::LayerMask` gains `density: f32` (default
+`FULL_MASK_DENSITY` = `1.0`); `aurora-app`'s `apply_mask` (the one
+mask path — the GPU path reaches it too, through `resolve_tile` per
+root) applies it to the **post-invert** coverage as
+`density * c + (1 - density)`, psd-tools' own formula and order, and
+only below full density, so a full-density mask takes the old
+arithmetic bit for bit. It is a stored property, not baked into the
+coverage (invariant §7.3.2): `LayerTree::set_mask_density` (range
+checked, `MaskDensityOutOfRange`) and the journaled, undoable
+`History::set_mask_density` (a new `LayerOp::SetMaskDensity`, appended
+last). Because `postcard` is positional, the field is
+`#[serde(skip)]` — the manifest and journal bytes are unchanged and old
+files load at `1.0` — and travels separately: a new optional `.aur`
+entry `mask-density` (versioned, written only when some mask is below
+full density, so an ordinary save stays byte-identical; a hostile entry
+is refused), and `History::save_journal` writes a `SetMaskDensity`
+after any journaled `RestoreMask`/`Restore` carrying a reduced mask.
+The PSD import reads the whole parameter block (user and vector
+density and feather) and sets the user mask's density (user, else
+vector — psd-tools' fallback — else 255); "Opened With Changes" now
+lists only feather and an unused vector-mask density. Feather is
+**not** applied (baking a blur would be destructive; no cheap honest
+non-destructive path exists yet). Corpus: the 15 layers in 5 psd-tools
+fixtures with a parameter block match psd-tools' density exactly and
+its effective-coverage sums within f16 rounding. Mutations: see the
+addendum. Tested headlessly and on a real GPU only — **not compared
+against Photoshop. Needs a human: compare a PSD with a reduced-density
+mask against Photoshop.** Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`): 2,810 passed, 0 failed, 0 skipped; judge
+REVISE 0.886 on one wrong forward-compatibility disclosure, corrected
+(older builds *refuse* a reduced-density file rather than open it at
+full density); judge round 2 PASS 0.92. Details: "Next action", addendum 0.149.0.
+
+**Previously (2026-10-08, 0.148.0): click a History row to jump to that
 step.** Photoshop-style: a press on a step row (or the "Open"/"New
 Document" origin row) makes that step the current one. `aurora-app`'s
 new `perform_history_jump` commits a live opacity drag and a live
@@ -8973,6 +9007,20 @@ structural design work.
   `open_psd_document` → `replace_document_pixels` → `composite_document`.
   New committed fixture `4x4_16bit_grayscale.psd` (psd-tools, sha256 in
   `PROVENANCE.md`). Corpus and mutations: see addendum 0.147.0.
+
+  **Update 0.149.0 — mask density applied.** `MaskInfo::parameters` is
+  now a `MaskParameters` (user density/feather, vector density/feather,
+  each `Option`, read in psd-tools' order and leniently: a truncated
+  block keeps what was read). `PsdMask::density` is
+  `MaskParameters::applied_density` (user, else vector, else 255 — the
+  vector fallback is psd-tools' convention, unverified against
+  Photoshop), and `Builder::attach_mask` sets it with
+  `History::set_mask_density` when below 255 — not baked, so it stays
+  editable. `MaskParametersNotApplied` now fires only for a non-zero
+  user or vector feather, or a vector density below 255 that the
+  fallback did not use; its text names "a feather or a vector-mask
+  density". The model side (`LayerMask::density`, `.aur`
+  `mask-density`, the journal carrier) is in addendum 0.149.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30371,6 +30419,122 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.149.0) — PSD mask density applied, and
+editable.** Done as the 0.147.0 disclosures asked. **Choice: a stored
+field, not baked.** `aurora_doc::LayerMask::density: f32` (`0.0..=1.0`,
+default `FULL_MASK_DENSITY`). The cost that made it non-trivial, and how
+it was paid: `LayerMask` is `postcard`-encoded inside both the `.aur`
+manifest's `LayerTree` and the history journal, and `postcard` is
+positional (pinned by `aur.rs`'s
+`postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`),
+so a plain new field would have made every existing `.aur` and autosave
+unopenable. The field is therefore `#[serde(skip, default)]` — the wire
+shape is unchanged (`layer_mask_density_is_off_the_wire_so_old_bytes_decode_at_full_density`)
+— and carried twice over, separately: (1) a new optional `.aur` entry
+`mask-density` (`MaskDensityWire { version, densities: Vec<(raw id,
+f32)> }`, the `skipped-tiles` pattern), written only when a mask is
+below full density and applied after the manifest is validated through
+`LayerTree::set_mask_density`, so an out-of-range/NaN value, an unknown
+layer, a newer version, or undecodable bytes refuse the file
+(`ManifestDeserialization`) rather than being half-applied;
+(2) `History::save_journal` emits, on the wire only, a
+`LayerOp::SetMaskDensity` after each journaled `RestoreMask` or
+`Restore` subtree carrying a reduced mask (idempotent across
+load/save). `LayerMask` lost `Eq` (an `f32`); nothing needed it.
+**Semantics:** `c' = d * c + (1 - d)` over the post-invert coverage
+`c`, including outside `mask.bounds` (`c = 0` there, so a reduced mask
+shows the layer at `1 - d`, as psd-tools' default-colour paste does);
+the fail-open "coverage unreadable" case stays `1.0`; the formula runs
+only when `d < 1`, so full density is the old code path. Group masks go
+through the same `apply_mask`. **GPU:** masks never had GPU code — the
+GPU path calls `resolve_tile` per root, which applies masks on the CPU
+before the GPU blends — so density reaches it with no GPU change;
+proven by `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_reduced_density_mask`
+(RTX 3090, `AURORA_REQUIRE_GPU=1`, submit counter checked). **Feather:
+not applied, still reported.** A feather is a Gaussian blur of the
+coverage; baking it is destructive, and a non-destructive version needs
+a blur at composite time (a filter-graph node, or a blurred derived
+coverage cache with invalidation) — neither is cheap. **Corpus**
+(psd-tools fixtures): 21 layers carry a parameter block; the 15 Aurora
+attaches a mask to with a density below 255 or a fallback
+(`mask-density-layermask`, `-layervectormask`, `-vectormask`,
+`mask_parameters`, `layer_mask_data`) are checked by
+`corpus_mask_densities_and_effective_coverage_match_psd_tools`: density
+bytes equal, and Σ(d·m + 1 − d) over each mask ∩ layer ∩ canvas within
+1e-3/px of psd-tools' (largest gap 0.053 over 8,800 px, f16 sample
+rounding). That test checks the import's density and coverage against
+psd-tools' formula applied in the test, not `apply_mask` itself — the
+composite formula is pinned by the `aurora-app` tests. **Tests:**
+`aurora-doc` 4 (density undo/redo/range, postcard journal round trip
+through all three carriers + idempotence, full-density journal
+byte-identical, old `LayerMask` bytes decode at 1.0); `aurora-io` aur
+4 (round trip + history replay, entry-less file at 1.0, full-density
+save writes no entry, 6 hostile entries refused), psd 6 (density ×5
+values attached and not baked, density after invert, feather/vector
+reporting matrix, truncated and mutated parameter blocks never panic
+and stay in range, group-mask density, corpus); `aurora-app` 3
+(composite at density 0/0.25/0.5/1 × invert × layer/group at 4 sample
+pixels, full density bit-identical to a never-set mask, GPU = CPU =
+expected). Every pre-existing test unchanged and green.
+
+**Mutation matrix** (each file backed up, mutated, tested, restored, and
+its sha256 checked; `aurora-doc`/`aurora-io` `--lib` plus `aurora-app
+--lib mask` under `AURORA_REQUIRE_GPU=1`, RTX 3090). 15 of 16 killed:
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | density ignored in `apply_mask` | killed | app density composite, GPU=CPU density |
+| M2 | formula reversed to `d * c` | killed | same two |
+| M3 | invert dropped before density | killed | 6 app mask tests incl. both new ones |
+| M3b | density applied *before* invert (order swapped) | killed | app density composite, GPU=CPU density |
+| M4 | deserialize default `0.0` instead of `1.0` | killed | layer old-bytes, journal round trip, tree postcard round trip, app `.aur` mask round trip |
+| M5 | density on the wire (no `skip`) | killed | layer old-bytes, journal round trip |
+| M6 | import ignores the parameter block | killed | 6 psd tests incl. corpus |
+| M7 | no vector-density fallback | killed | psd reporting matrix, corpus |
+| M8 | `save_journal` expansion removed | killed | journal round trip |
+| M9 | `Restore`-subtree expansion removed | killed | journal round trip (case 3) |
+| M10 | `.aur` write omits `mask-density` | killed | aur round trip |
+| M11 | `.aur` read ignores `mask-density` | killed | aur round trip, aur hostile |
+| M12 | unused vector density not reported | killed | psd reporting matrix |
+| M13 | `set_mask_density` range check removed | killed | history range check, aur hostile |
+| M14 | full-density fast path removed (formula always) | **survived** | equivalent: `1.0 * c + 0.0 == c` exactly in IEEE-754 for every finite `c` (the fast path is kept anyway so the bit-identity does not rest on that) |
+| M15 | import skips `set_mask_density` | killed | 6 psd tests incl. corpus |
+
+No GPU-specific mutation exists to run: there is no GPU mask code (the
+GPU path reuses `apply_mask` via `resolve_tile`), and M1/M2/M3b are each
+caught by the GPU differential as well as the CPU test.
+
+**Disclosures.** (1) The vector-density fallback follows psd-tools, not
+a Photoshop comparison. (2) A build older than 0.149.0 **refuses** a 0.149.0
+`.aur` (or autosave) that carries a reduced density — "Couldn't Open
+File" — because the file's `history` journal then contains
+`LayerOp::SetMaskDensity`, a variant the older `load_journal` cannot
+decode; it stays refused after the density is set back to 1.0, since the
+journal keeps the op. (The first draft of this disclosure said such a
+build would open it at full density and drop the densities on re-save;
+review I1 found that wrong — the refusal comes first.) Files without a
+reduced density are byte-identical to 0.148.0's and open everywhere. (3) No UI edits density yet — `History::set_mask_density` is
+reached only by the PSD import and the `.aur` read restoring a saved
+density. (4) Vector masks themselves are
+still not applied, so a vector density used by the fallback is applied
+to the stored pixel mask only. (5) **Measured after the review:** full gate
+green — fmt, layering, style lint, `check --locked`, clippy `-D
+warnings`, `AURORA_REQUIRE_GPU=1 cargo test --workspace` 2,810 passed,
+0 failed, 0 skipped, strict rustdoc, `cargo deny`. Judge: REVISE
+(0.886), blocking only on disclosure (2), which was wrong (review I1:
+older builds refuse such a file because the journal carries
+`SetMaskDensity`; corrected here, in `aur.rs`'s `MASK_DENSITY_ENTRY`
+doc and on the `SetMaskDensity` variant), plus the README calling
+density "editable" with no control for it (I2, reworded). Not changed:
+the corpus check applies psd-tools' formula inside the test rather than
+comparing psd-tools' own composited output (I3, disclosed). The fix
+being comment- and prose-only, the gate was not re-run after it beyond
+fmt and strict rustdoc. Judge round 2 on the corrected text: **PASS 0.92**. (6) Headless and GPU tests only; not
+compared side by side with Photoshop. **Needs a human: compare a PSD
+with a reduced-density mask against Photoshop.** **Suggested next:**
+vector masks (a path rasteriser via `aurora-vector`), or decoding PSDs
+off the UI thread.
 
 **Addendum 2026-10-08 (0.148.0) — click a History row to jump to that
 step.** Done as 0.147.1 suggested. **Rows:** `aurora_ui::
