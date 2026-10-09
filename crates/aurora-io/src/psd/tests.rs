@@ -2022,6 +2022,18 @@ fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
         return;
     }
     // (file, layer, density byte, (x0, y0, x1, y1), psd-tools' sum)
+    //
+    // 0.150.0: `mask-density-layervectormask.psd`'s four layers left this
+    // table — they carry both a user mask and a vector mask, whose two
+    // densities are now baked into one combined coverage (density 1);
+    // `corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering`
+    // covers them. The vector-only layers below now open as Aurora's own
+    // raster of the vector mask, which matches Photoshop's rendering
+    // these numbers were taken from exactly. `mask_parameters.psd`'s
+    // "Rectangle 1" left too: its user density (204) now applies only to
+    // its (empty, shown) real user mask, and the vector density (250) to
+    // the vector raster — psd-tools instead applies 204 to the rendered
+    // `-2` channel.
     let cases: &[(&str, &str, u8, (i64, i64, i64, i64), f64)] = &[
         (
             "mask-density-layermask.psd",
@@ -2052,34 +2064,6 @@ fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
             110.505_883,
         ),
         (
-            "mask-density-layervectormask.psd",
-            "Layer 1",
-            64,
-            (15, 0, 32, 8),
-            123.166_536,
-        ),
-        (
-            "mask-density-layervectormask.psd",
-            "Layer 1 copy",
-            128,
-            (15, 8, 32, 16),
-            110.478_739,
-        ),
-        (
-            "mask-density-layervectormask.psd",
-            "Layer 1 copy 2",
-            191,
-            (15, 16, 32, 24),
-            97.914_557,
-        ),
-        (
-            "mask-density-layervectormask.psd",
-            "Layer 1 copy 3",
-            255,
-            (15, 24, 32, 32),
-            88.337_256,
-        ),
-        (
             "mask-density-vectormask.psd",
             "Layer 1",
             64,
@@ -2099,13 +2083,6 @@ fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
             191,
             (15, 16, 32, 24),
             130.007_843,
-        ),
-        (
-            "mask_parameters.psd",
-            "Rectangle 1",
-            204,
-            (23, 19, 185, 181),
-            25_728.8,
         ),
         (
             "layer_mask_data.psd",
@@ -2525,4 +2502,1379 @@ fn a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha() {
     assert_eq!(px(image, 0, 0), u8px(60, 60, 60, 255));
     assert_eq!(px(image, 1, 0)[3], 0.0);
     assert!(!report_text(&document).contains("saved channel"));
+}
+
+// ---------------------------------------------------------------------
+// Vector masks (0.150.0)
+// ---------------------------------------------------------------------
+
+/// The header and layer records of `bytes`, read the way [`decode`]
+/// reads them (layer-info section, else an `Lr16`/`Layr` block).
+fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record<'_>>) {
+    let mut r = super::Reader::new(bytes);
+    let header = ok(super::read_header(&mut r));
+    let psb = header.psb();
+    let len = ok(r.length(false, "colour mode data"));
+    ok(r.skip(len, "colour mode data"));
+    let len = ok(r.length(false, "resources"));
+    ok(r.skip(len, "resources"));
+    let len = ok(r.length(psb, "layer and mask section"));
+    let mut section = ok(r.sub(len, "layer and mask section"));
+    let info_len = ok(section.length(psb, "layer info"));
+    let mut body = ok(section.sub(info_len, "layer info"));
+    let mut records = ok(super::read_layer_info(&mut body, header)).records;
+    if records.is_empty() && section.remaining() >= 4 {
+        let mask_len = ok(section.length(false, "global mask"));
+        ok(section.skip(mask_len, "global mask"));
+        for (key, data) in ok(super::read_blocks(&mut section, psb, 4)) {
+            if (&key == b"Lr16" || &key == b"Layr") && records.is_empty() {
+                records = ok(super::read_layer_info(
+                    &mut super::Reader::new(data),
+                    header,
+                ))
+                .records;
+            }
+        }
+    }
+    (header, records)
+}
+
+/// Aurora's raster of the named layer's vector mask over the whole
+/// canvas (outside the raster rectangle: its constant), row-major.
+#[allow(clippy::many_single_char_names, clippy::cast_sign_loss)] // pixel loops
+fn vector_plane(bytes: &[u8], name: &str) -> Option<(u32, u32, Vec<f32>)> {
+    let (header, records) = records_of(bytes);
+    let record = records.iter().find(|r| r.name == name)?;
+    let path = super::vector::parse(record.vector?).ok()?;
+    let mut budget = unlimited();
+    let raster = super::vector::rasterize(&path, header.width, header.height, &mut budget).ok()?;
+    let (w, h) = (header.width, header.height);
+    let outside = if raster.outside { 1.0 } else { 0.0 };
+    let mut plane = vec![outside; (w as usize) * (h as usize)];
+    let b = raster.bounds;
+    for (i, v) in raster.coverage.iter().enumerate() {
+        let x = b.x as usize + i % b.width as usize;
+        let y = b.y as usize + i / b.width as usize;
+        if let Some(slot) = plane.get_mut(y * w as usize + x) {
+            *slot = v.to_f32();
+        }
+    }
+    Some((w, h, plane))
+}
+
+// -- Synthetic vector masks ---------------------------------------------
+
+/// A `vmsk` block: version 3, `flags`, then the records.
+fn vmsk(flags: u32, records: &[[u8; 26]]) -> Vec<u8> {
+    let mut out = 3_u32.to_be_bytes().to_vec();
+    out.extend_from_slice(&flags.to_be_bytes());
+    for record in records {
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+fn record(selector: u16, body: &[u8]) -> [u8; 26] {
+    let mut out = [0_u8; 26];
+    let bytes = selector.to_be_bytes();
+    for (slot, v) in out.iter_mut().zip(bytes.iter().chain(body)) {
+        *slot = *v;
+    }
+    out
+}
+
+/// A subpath-length record: closed (`0`) or open (`3`), `knots`, `op`.
+fn subpath(closed: bool, knots: u16, op: i16) -> [u8; 26] {
+    let mut body = knots.to_be_bytes().to_vec();
+    body.extend_from_slice(&op.to_be_bytes());
+    record(if closed { 0 } else { 3 }, &body)
+}
+
+fn fixed(v: f64) -> [u8; 4] {
+    ((v * f64::from(1_u32 << 24)).round() as i32).to_be_bytes()
+}
+
+/// A knot from `(x, y)` points, normalised; written vertical first.
+fn knot(closed: bool, pre: (f64, f64), anchor: (f64, f64), leave: (f64, f64)) -> [u8; 26] {
+    let mut body = Vec::new();
+    for (x, y) in [pre, anchor, leave] {
+        body.extend_from_slice(&fixed(y));
+        body.extend_from_slice(&fixed(x));
+    }
+    record(if closed { 1 } else { 4 }, &body)
+}
+
+fn corner(x: f64, y: f64) -> [u8; 26] {
+    knot(true, (x, y), (x, y), (x, y))
+}
+
+/// A closed axis-aligned rectangle subpath, normalised.
+fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64, op: i16) -> Vec<[u8; 26]> {
+    vec![
+        subpath(true, 4, op),
+        corner(x0, y0),
+        corner(x1, y0),
+        corner(x1, y1),
+        corner(x0, y1),
+    ]
+}
+
+/// A closed four-knot Bézier ellipse (the usual `0.5523` handles).
+fn ellipse_path(cx: f64, cy: f64, rx: f64, ry: f64, op: i16) -> Vec<[u8; 26]> {
+    let k = 0.552_284_749_8;
+    vec![
+        subpath(true, 4, op),
+        knot(
+            true,
+            (cx - k * rx, cy - ry),
+            (cx, cy - ry),
+            (cx + k * rx, cy - ry),
+        ),
+        knot(
+            true,
+            (cx + rx, cy - k * ry),
+            (cx + rx, cy),
+            (cx + rx, cy + k * ry),
+        ),
+        knot(
+            true,
+            (cx + k * rx, cy + ry),
+            (cx, cy + ry),
+            (cx - k * rx, cy + ry),
+        ),
+        knot(
+            true,
+            (cx - rx, cy + k * ry),
+            (cx - rx, cy),
+            (cx - rx, cy - k * ry),
+        ),
+    ]
+}
+
+fn initial_fill(value: u16) -> [u8; 26] {
+    record(8, &value.to_be_bytes())
+}
+
+/// One opaque full-canvas pixel layer carrying `block` as its `vmsk`.
+#[allow(clippy::cast_possible_wrap)] // tiny test canvases
+fn vector_file(width: u32, height: u32, block: Vec<u8>) -> TestPsd {
+    let (w, h) = (width as i32, height as i32);
+    let n = (width * height) as usize;
+    TestPsd::new(1, width, height, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("v", 0, 0, w, h, 8, &vec![[200, 100, 50, 255]; n])
+                .with(|l| l.blocks.push((*b"vmsk", block))),
+        );
+    })
+}
+
+fn vector_doc(width: u32, height: u32, records: &[[u8; 26]]) -> PsdDocument {
+    doc(&vector_file(width, height, vmsk(0, records)).write())
+}
+
+/// The only layer's effective mask (`None` when it has no mask), with
+/// its density applied.
+fn vmask(document: &PsdDocument, x: i64, y: i64) -> Option<f32> {
+    let id = root(&document.layers, 0);
+    let density = document.layers.mask(id)?.density;
+    effective_mask(document, id, x, y).map(|c| with_density(c, density))
+}
+
+fn mask_sum(document: &PsdDocument, width: i64, height: i64) -> f64 {
+    let mut sum = 0.0;
+    for y in 0..height {
+        for x in 0..width {
+            sum += f64::from(vmask(document, x, y).unwrap_or(f32::NAN));
+        }
+    }
+    sum
+}
+
+#[test]
+fn a_rectangle_vector_mask_becomes_the_layers_mask_and_is_reported_as_converted() {
+    // x 2.5..6, y 2..6 on 8×8: a half-covered left column.
+    let document = vector_doc(8, 8, &rect_path(0.3125, 0.25, 0.75, 0.75, 1));
+    for (x, y, want) in [
+        (0, 0, 0.0),
+        (1, 3, 0.0),
+        (2, 3, 0.5),
+        (3, 2, 1.0),
+        (5, 5, 1.0),
+        (6, 5, 0.0),
+        (4, 6, 0.0),
+        (7, 7, 0.0),
+    ] {
+        assert_eq!(vmask(&document, x, y), Some(want), "({x}, {y})");
+    }
+    let text = report_text(&document);
+    assert!(
+        text.contains("1 vector mask was converted to a pixel mask"),
+        "{text}"
+    );
+    assert!(!text.contains("not applied"), "{text}");
+}
+
+#[test]
+fn x_is_scaled_by_the_width_and_y_by_the_height() {
+    // A 16×8 canvas, rectangle x 0..0.25 (4 px), y 0..0.75 (6 px).
+    let document = vector_doc(16, 8, &rect_path(0.0, 0.0, 0.25, 0.75, 1));
+    assert_eq!(vmask(&document, 3, 5), Some(1.0));
+    assert_eq!(vmask(&document, 4, 5), Some(0.0));
+    assert_eq!(vmask(&document, 3, 6), Some(0.0));
+    assert_eq!(mask_sum(&document, 16, 8), 24.0);
+}
+
+#[test]
+fn a_bezier_ellipse_is_filled_as_a_curve_not_as_its_knot_polygon() {
+    // r = 16 px on 64×64: area π r² ≈ 804.25 (the four-knot Bézier is
+    // within 0.03% of the circle); the knot diamond would be 2 r² = 512.
+    let document = vector_doc(64, 64, &ellipse_path(0.5, 0.5, 0.25, 0.25, 1));
+    // Chords lie inside the curve: at most `(2/3) × FLATTEN_TOLERANCE ×
+    // perimeter` ≈ 3.4 px² is lost to flattening.
+    let sum = mask_sum(&document, 64, 64);
+    let area = std::f64::consts::PI * 256.0;
+    assert!((sum - area).abs() < 4.0, "{sum} vs {area}");
+    assert_eq!(vmask(&document, 32, 32), Some(1.0));
+    // On the 45° diagonal, just inside the circle but outside the
+    // diamond: (32 + 10.5, 32 + 10.5) is 14.85 px from the centre.
+    assert_eq!(vmask(&document, 42, 42), Some(1.0));
+    assert_eq!(vmask(&document, 0, 0), Some(0.0));
+    // Anti-aliased: some edge pixel is partial.
+    let partial = (0..64).any(|x| vmask(&document, x, 20).is_some_and(|v| v > 0.0 && v < 1.0));
+    assert!(partial);
+}
+
+#[test]
+fn an_inverted_vector_mask_shows_outside_and_hides_inside() {
+    let file = vector_file(8, 8, vmsk(1, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    let document = doc(&file.write());
+    assert_eq!(vmask(&document, 3, 3), Some(0.0));
+    assert_eq!(vmask(&document, 0, 0), Some(1.0));
+    assert_eq!(vmask(&document, 7, 7), Some(1.0));
+    let id = root(&document.layers, 0);
+    assert_eq!(
+        document.layers.mask(id).map(|m| m.bounds),
+        Some(rect(0, 0, 8, 8))
+    );
+}
+
+#[test]
+fn a_disabled_vector_mask_is_ignored_and_reported_as_left_out() {
+    let file = vector_file(8, 8, vmsk(4, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    assert!(document.layers.mask(id).is_none());
+    let text = report_text(&document);
+    assert!(
+        text.contains("1 turned-off vector mask was left out"),
+        "{text}"
+    );
+    assert!(!text.contains("converted"), "{text}");
+}
+
+#[test]
+fn subpath_operations_combine_as_psd_tools_combines_them() {
+    // A = x 0..6 (op 1); B = x 2..8 with `op`; probes at x = 1 (A only),
+    // 3 (both) and 7 (B only) on 8×8.
+    for (op, want) in [
+        (0_i16, [1.0, 0.0, 1.0]),
+        (1, [1.0, 1.0, 1.0]),
+        (2, [1.0, 0.0, 0.0]),
+        (3, [0.0, 1.0, 0.0]),
+        (-1, [1.0, 1.0, 1.0]),
+        (7, [1.0, 1.0, 0.0]),
+    ] {
+        let mut records = rect_path(0.0, 0.0, 0.75, 1.0, 1);
+        records.extend(rect_path(0.25, 0.0, 1.0, 1.0, op));
+        let document = vector_doc(8, 8, &records);
+        let got = [1, 3, 7].map(|x| vmask(&document, x, 4).unwrap_or(f32::NAN));
+        assert_eq!(got, want, "op {op}");
+    }
+}
+
+#[test]
+fn a_first_subtract_or_intersect_starts_from_everything() {
+    // Subtract first: everything minus the shape. Intersect first:
+    // everything ∩ the shape = the shape.
+    for (op, inside, outside) in [(2_i16, 0.0, 1.0), (3, 1.0, 0.0), (0, 1.0, 0.0)] {
+        let document = vector_doc(8, 8, &rect_path(0.25, 0.25, 0.75, 0.75, op));
+        assert_eq!(vmask(&document, 3, 3), Some(inside), "op {op}");
+        assert_eq!(vmask(&document, 0, 0), Some(outside), "op {op}");
+        assert_eq!(vmask(&document, 7, 7), Some(outside), "op {op}");
+    }
+}
+
+#[test]
+fn the_initial_fill_shows_everything_only_without_subpaths() {
+    let all = vector_doc(4, 4, &[initial_fill(1)]);
+    assert_eq!(mask_sum(&all, 4, 4), 16.0);
+    let none = vector_doc(4, 4, &[initial_fill(0)]);
+    assert_eq!(mask_sum(&none, 4, 4), 0.0);
+    // psd-tools' rule: with a subpath the initial fill is not used.
+    let mut records = vec![initial_fill(1)];
+    records.extend(rect_path(0.0, 0.0, 0.5, 0.5, 1));
+    let shape = vector_doc(4, 4, &records);
+    assert_eq!(mask_sum(&shape, 4, 4), 4.0);
+}
+
+#[test]
+fn a_self_overlapping_subpath_is_filled_with_the_nonzero_rule() {
+    // The same rectangle traced twice in one subpath: winding 2 inside,
+    // which the non-zero rule fills and even-odd would leave empty.
+    let mut records = vec![subpath(true, 8, 1)];
+    for _ in 0..2 {
+        records.extend([
+            corner(0.25, 0.25),
+            corner(0.75, 0.25),
+            corner(0.75, 0.75),
+            corner(0.25, 0.75),
+        ]);
+    }
+    let document = vector_doc(8, 8, &records);
+    assert_eq!(vmask(&document, 3, 3), Some(1.0));
+    assert_eq!(mask_sum(&document, 8, 8), 16.0);
+}
+
+#[test]
+fn an_open_subpath_is_filled_as_if_closed_by_a_straight_line() {
+    // Three corners of the 8×8 square, open: the triangle below the
+    // diagonal (0,0)-(8,8) — area 32.
+    let records = vec![
+        subpath(false, 3, 1),
+        knot(false, (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)),
+        knot(false, (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)),
+        knot(false, (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)),
+    ];
+    let document = vector_doc(8, 8, &records);
+    assert!((mask_sum(&document, 8, 8) - 32.0).abs() < 0.1);
+    assert_eq!(vmask(&document, 1, 6), Some(1.0));
+    assert_eq!(vmask(&document, 6, 1), Some(0.0));
+}
+
+#[test]
+fn a_vector_density_is_the_masks_density_when_there_is_no_pixel_mask() {
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        // Mask data with no `-2` channel: flags bit 4, a parameter block
+        // naming only a vector density of 128.
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        layer.mask_tail = Some(vec![0x04, 128]);
+    }
+    let document = doc(&file.write());
+    assert_eq!(only_density(&document), Some(128.0 / 255.0));
+    assert_eq!(vmask(&document, 3, 3), Some(1.0));
+    assert_eq!(
+        vmask(&document, 0, 0),
+        Some(with_density(0.0, 128.0 / 255.0))
+    );
+}
+
+#[test]
+fn a_pixel_mask_and_a_vector_mask_intersect() {
+    // Pixel mask: the left half (x 0..4) shown, hidden elsewhere;
+    // vector: x 2..6, y 2..6.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 4, 0, 0));
+        layer.channels.push((-2, vec![255; 32]));
+    }
+    let document = doc(&file.write());
+    for (x, y, want) in [
+        (3, 3, 1.0),
+        (5, 3, 0.0),
+        (1, 1, 0.0),
+        (2, 5, 1.0),
+        (6, 6, 0.0),
+    ] {
+        assert_eq!(vmask(&document, x, y), Some(want), "({x}, {y})");
+    }
+    let text = report_text(&document);
+    assert!(!text.contains("combined version"), "{text}");
+}
+
+#[test]
+fn a_rendered_user_mask_is_replaced_by_the_real_mask_times_the_vector() {
+    // Flags bit 3: `-2` is Photoshop's rendering (here, a deliberately
+    // wrong all-shown plane), the real user mask `-3` (x 0..4, real
+    // default hidden) is the pixel part, with densities 128 (user) and
+    // 64 (vector) each baked into its own part.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x18));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 8, 4] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.extend_from_slice(&[0x05, 128, 64]);
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 64]));
+        layer.channels.push((-3, vec![255; 32]));
+    }
+    let document = doc(&file.write());
+    let (du, dv) = (128.0 / 255.0, 64.0 / 255.0);
+    let both = |u: f32, v: f32| f16::from_f32(with_density(u, du) * with_density(v, dv)).to_f32();
+    assert_eq!(only_density(&document), Some(1.0));
+    for (x, y, u, v) in [
+        (3, 3, 1.0, 1.0),
+        (5, 3, 0.0, 1.0),
+        (1, 1, 1.0, 0.0),
+        (7, 7, 0.0, 0.0),
+    ] {
+        assert_eq!(vmask(&document, x, y), Some(both(u, v)), "({x}, {y})");
+    }
+    let text = report_text(&document);
+    assert!(!text.contains("combined version"), "{text}");
+    assert!(text.contains("converted"), "{text}");
+}
+
+#[test]
+fn a_group_vector_mask_is_applied_to_the_group() {
+    let bytes = TestPsd::new(1, 8, 8, 8)
+        .with(|p| {
+            p.layers = vec![
+                TestLayer::divider(),
+                TestLayer::pixels("in", 0, 0, 2, 2, 8, &two_by_two(8)),
+                TestLayer::group("G", *b"norm").with(|l| {
+                    l.blocks
+                        .push((*b"vsms", vmsk(0, &rect_path(0.0, 0.0, 0.5, 1.0, 1))));
+                }),
+            ];
+        })
+        .write();
+    let document = doc(&bytes);
+    let group = root(&document.layers, 0);
+    assert_eq!(effective_mask(&document, group, 3, 7), Some(1.0));
+    assert_eq!(effective_mask(&document, group, 4, 0), Some(0.0));
+}
+
+#[test]
+fn a_shape_layers_vector_mask_is_not_applied_again() {
+    // A fill + vector mask is a shape layer: its pixels are the rendered
+    // shape, so the vector mask is neither applied nor reported.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.blocks.push((*b"SoCo", vec![0; 4]));
+    }
+    let document = doc(&file.write());
+    assert!(document.layers.mask(root(&document.layers, 0)).is_none());
+    let text = report_text(&document);
+    assert!(text.contains("shape layer opened as pixels"), "{text}");
+    assert!(!text.contains("vector mask"), "{text}");
+}
+
+#[test]
+fn a_malformed_vector_mask_is_reported_and_the_file_still_opens_unmasked() {
+    let rect = rect_path(0.25, 0.25, 0.75, 0.75, 1);
+    let mut bad_version = vmsk(0, &rect);
+    if let Some(v) = bad_version.get_mut(3) {
+        *v = 2;
+    }
+    let mut short_subpath = vec![subpath(true, 5, 1)];
+    short_subpath.extend(rect.iter().skip(1).copied());
+    let mut unknown = rect.clone();
+    unknown.push(record(9, &[]));
+    let mut cases = vec![
+        ("version", bad_version),
+        ("short subpath", vmsk(0, &short_subpath)),
+        ("unknown record", vmsk(0, &unknown)),
+        ("no flags", vec![0, 0, 0, 3]),
+        ("empty", Vec::new()),
+    ];
+    // Truncated mid-record: whole records only, so this one *parses*
+    // (the last knot is gone, so the subpath is short: unreadable).
+    let mut cut = vmsk(0, &rect);
+    cut.truncate(cut.len() - 10);
+    cases.push(("truncated", cut));
+    for (what, block) in cases {
+        let document = doc(&vector_file(8, 8, block).write());
+        assert!(
+            document.layers.mask(root(&document.layers, 0)).is_none(),
+            "{what}"
+        );
+        let text = report_text(&document);
+        assert!(
+            text.contains("vector mask could not be read"),
+            "{what}: {text}"
+        );
+    }
+}
+
+#[test]
+fn too_many_records_or_segments_are_bounded_and_reported() {
+    // One record past the cap.
+    let over = vec![record(6, &[]); super::vector::MAX_VECTOR_RECORDS + 1];
+    let document = doc(&vector_file(4, 4, vmsk(0, &over)).write());
+    assert!(report_text(&document).contains("could not be read"));
+    // 65,535 knots whose control points fling far off the canvas: each
+    // cubic would want the full step cap, so the total passes
+    // `MAX_FLATTENED_SEGMENTS` and the mask is refused before any
+    // flattening allocation of that size.
+    let mut records = vec![subpath(true, u16::MAX, 1)];
+    for i in 0..u16::MAX {
+        let x = f64::from(i % 2);
+        records.push(knot(true, (x, 100.0), (x, 0.5), (x, -100.0)));
+    }
+    let started = std::time::Instant::now();
+    let document = doc(&vector_file(64, 64, vmsk(0, &records)).write());
+    assert!(started.elapsed().as_secs() < 20);
+    let text = report_text(&document);
+    assert!(text.contains("too large or complex"), "{text}");
+    assert!(document.layers.mask(root(&document.layers, 0)).is_none());
+    // The segment cap on its own: 8,000 knots wholly above the canvas
+    // (so the raster is empty and no work bound applies), each cubic
+    // wanting the full 256 steps — 2 Mi segments, past the cap.
+    let mut records = vec![subpath(true, 8000, 1)];
+    for i in 0..8000_u32 {
+        let x = f64::from(i % 2);
+        records.push(knot(true, (x, -10.0), (x, -50.0), (1.0 - x, -90.0)));
+    }
+    let path = ok_vector(&vmsk(0, &records));
+    assert_eq!(
+        super::vector::rasterize(&path, 64, 64, &mut unlimited()),
+        Err(super::vector::VectorFailure::TooLarge)
+    );
+}
+
+fn unlimited() -> super::vector::Budget {
+    super::vector::Budget {
+        pixels: u64::MAX,
+        work: u64::MAX,
+    }
+}
+
+#[test]
+fn the_raster_is_charged_against_the_budget_and_refused_past_it() {
+    use super::vector::{Budget, RASTER_PIXEL_CHARGE, VectorFailure, rasterize};
+    let path = ok_vector(&vmsk(0, &rect_path(0.0, 0.0, 1.0, 1.0, 1)));
+    // The bounding box grown by a pixel, clipped to 100×100, at two
+    // budget pixels per raster pixel.
+    let charge = 10_000 * RASTER_PIXEL_CHARGE;
+    let mut budget = Budget {
+        pixels: charge,
+        work: u64::MAX,
+    };
+    let raster = rasterize(&path, 100, 100, &mut budget);
+    assert_eq!(raster.map(|r| r.charged), Ok(charge));
+    assert_eq!(budget.pixels, 0);
+    let spent = u64::MAX - budget.work;
+    assert!(spent > 0);
+    for short in [
+        Budget {
+            pixels: charge - 1,
+            work: u64::MAX,
+        },
+        Budget {
+            pixels: u64::MAX,
+            work: spent - 1,
+        },
+    ] {
+        let mut budget = short;
+        assert_eq!(
+            rasterize(&path, 100, 100, &mut budget),
+            Err(VectorFailure::TooLarge)
+        );
+        // Only the flattening charge (1 + 4 corner-to-corner segments)
+        // is kept: flattening was done.
+        assert_eq!(budget.pixels, short.pixels, "pixels untouched");
+        assert_eq!(
+            short.work - budget.work,
+            5 * super::vector::SEGMENT_CHARGE,
+            "flattening only"
+        );
+    }
+    // Scanline work past `MAX_RASTER_WORK` (a full-canvas box on a
+    // 20,000 × 20,000 canvas) is refused before any raster exists.
+    let mut budget = unlimited();
+    assert_eq!(
+        rasterize(&path, 20_000, 20_000, &mut budget),
+        Err(VectorFailure::TooLarge)
+    );
+}
+
+#[test]
+fn one_files_vector_masks_share_one_work_budget() {
+    use super::vector::{Budget, VectorFailure, rasterize};
+    let path = ok_vector(&vmsk(0, &ellipse_path(0.5, 0.5, 0.4, 0.3, 1)));
+    let mut probe = unlimited();
+    assert!(rasterize(&path, 64, 64, &mut probe).is_ok());
+    let one = u64::MAX - probe.work;
+    // Enough for one mask and not two: the second is refused.
+    let mut budget = Budget {
+        pixels: u64::MAX,
+        work: one * 2 - 1,
+    };
+    assert!(rasterize(&path, 64, 64, &mut budget).is_ok());
+    assert_eq!(budget.work, one - 1);
+    assert_eq!(
+        rasterize(&path, 64, 64, &mut budget),
+        Err(VectorFailure::TooLarge)
+    );
+    assert!(budget.work < one - 1, "the flattening charge is kept");
+}
+
+/// `work_for`'s count, by hand: the square x, y 2..6 on 8×8 (exact in
+/// 8.24 fixed point), one group.
+#[test]
+fn the_work_estimate_counts_every_pass_the_fill_makes() {
+    let path = ok_vector(&vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    let mut budget = unlimited();
+    assert!(super::vector::rasterize(&path, 8, 8, &mut budget).is_ok());
+    // Raster: the box grown by a pixel, 1..7 → 6×6. Corner-to-corner
+    // edges are one segment each; the two vertical ones cross local rows
+    // 1..5: 4 × 16 + 1 sub-scanlines each.
+    let len = 36;
+    let crossings = 2 * (4 * 16 + 1);
+    let log = 2; // 64 - leading_zeros(2 edges)
+    let (box_w, box_h) = (4 + 2, 4 + 1);
+    let segments = (1 + 4) * super::vector::SEGMENT_CHARGE;
+    let want =
+        segments + 3 * len + 3 * len + crossings * (1 + log) + box_h * 16 + 2 * box_w * box_h;
+    assert_eq!(u64::MAX - budget.work, want);
+}
+
+#[test]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn a_flood_of_empty_subpaths_costs_no_per_pixel_pass() {
+    // The review's attack: one canvas rectangle, then 65,530 zero-knot
+    // subpath records — each its own group — on a 2,048² canvas. Each
+    // group is folded into a constant instead of a whole-raster pass
+    // (which would be ~2.7e11 operations).
+    let mut records = rect_path(0.25, 0.25, 0.75, 0.75, 1);
+    for i in 0..65_530_u32 {
+        records.push(subpath(true, 0, (i % 3) as i16));
+    }
+    let started = std::time::Instant::now();
+    let path = ok_vector(&vmsk(0, &records));
+    let mut budget = unlimited();
+    let raster = super::vector::rasterize(&path, 2048, 2048, &mut budget);
+    let elapsed = started.elapsed();
+    let Ok(raster) = raster else {
+        unreachable!("{raster:?}")
+    };
+    assert!(elapsed.as_secs_f64() < 5.0, "{elapsed:?}");
+    // Exclude, combine and a later subtract with an empty plane are all
+    // the identity: still just the rectangle.
+    let at = |x: usize, y: usize| {
+        let b = raster.bounds;
+        let i = (y - b.y as usize) * b.width as usize + (x - b.x as usize);
+        raster.coverage.get(i).map(|v| v.to_f32())
+    };
+    assert_eq!(at(1024, 1024), Some(1.0));
+    assert_eq!(at(511, 1024), Some(0.0));
+    // An empty intersect after a drawn group clears everything.
+    let mut records = rect_path(0.25, 0.25, 0.75, 0.75, 1);
+    records.push(subpath(true, 0, 3));
+    let document = vector_doc(8, 8, &records);
+    assert_eq!(mask_sum(&document, 8, 8), 0.0);
+    // And an empty first subtract starts from everything.
+    let mut records = vec![subpath(true, 0, 2)];
+    records.extend(rect_path(0.25, 0.25, 0.75, 0.75, 2));
+    let document = vector_doc(8, 8, &records);
+    assert_eq!(vmask(&document, 3, 3), Some(0.0));
+    assert_eq!(vmask(&document, 0, 0), Some(1.0));
+}
+
+#[test]
+fn many_drawn_groups_are_refused_by_their_whole_raster_passes() {
+    // 200 one-pixel squares, each its own group, two of them at opposite
+    // corners so the raster is the whole 1,024² canvas: 200 groups × 3
+    // passes × 1 Mi px is past `MAX_RASTER_WORK`.
+    let mut records = Vec::new();
+    for i in 0..200_u32 {
+        let x = f64::from(i % 2) * 0.999;
+        let y = f64::from(i) / 200.0;
+        records.extend(rect_path(x, y, x + 0.001, y + 0.001, 1));
+    }
+    let path = ok_vector(&vmsk(0, &records));
+    let mut budget = unlimited();
+    assert_eq!(
+        super::vector::rasterize(&path, 1024, 1024, &mut budget),
+        Err(super::vector::VectorFailure::TooLarge)
+    );
+}
+
+/// The worst case at the caps (G2, 0.150.0 review): a 4,096-knot zigzag
+/// whose every edge spans the full height of a 4,096 × 256 canvas — one
+/// sub-scanline sorts 4,096 crossings, 4,096 sub-scanlines — just under
+/// `MAX_RASTER_WORK`. Its time is printed; the assertion is generous
+/// (debug builds are ~20× slower than release).
+#[test]
+fn the_worst_case_at_the_work_cap_finishes_in_bounded_time() {
+    // In order (a zigzag), and shuffled — knots at a multiplicative
+    // permutation of the columns, so every sub-scanline's crossings
+    // arrive out of order and every sort does real work.
+    let n = 4096_u16;
+    for shuffled in [false, true] {
+        let mut records = vec![subpath(true, n, 1)];
+        for i in 0..n {
+            let column = if shuffled {
+                (u64::from(i) * 2_654_435_761 % u64::from(n)) as u16
+            } else {
+                i
+            };
+            let x = f64::from(column) / f64::from(n);
+            let y = f64::from(i % 2);
+            records.push(corner(x, y));
+        }
+        let path = ok_vector(&vmsk(0, &records));
+        let mut budget = unlimited();
+        let started = std::time::Instant::now();
+        let raster = super::vector::rasterize(&path, 4096, 256, &mut budget);
+        let elapsed = started.elapsed();
+        let work = u64::MAX - budget.work;
+        assert!(raster.is_ok(), "shuffled {shuffled}");
+        assert!(work <= super::vector::MAX_RASTER_WORK);
+        assert!(work * 5 > super::vector::MAX_RASTER_WORK * 4, "{work}");
+        println!("worst case at the cap (shuffled {shuffled}): work {work}, {elapsed:?}");
+        assert!(elapsed.as_secs_f64() < 120.0, "{elapsed:?}");
+    }
+}
+
+/// The per-file aggregate (G2): five layers each carrying the shuffled
+/// worst case — only four fit `MAX_FILE_VECTOR_WORK`; the fifth is
+/// reported, and the whole open is timed.
+#[test]
+fn a_files_vector_masks_stop_at_the_per_file_work_budget() {
+    let n = 4096_u16;
+    let mut records = vec![subpath(true, n, 1)];
+    for i in 0..n {
+        let column = (u64::from(i) * 2_654_435_761 % u64::from(n)) as u16;
+        records.push(corner(f64::from(column) / f64::from(n), f64::from(i % 2)));
+    }
+    let block = vmsk(0, &records);
+    let bytes = TestPsd::new(1, 4096, 256, 8)
+        .with(|p| {
+            for i in 0..5 {
+                p.layers.push(
+                    TestLayer::pixels(&format!("v{i}"), 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"vmsk", block.clone()))),
+                );
+            }
+        })
+        .write();
+    let started = std::time::Instant::now();
+    let document = doc(&bytes);
+    let elapsed = started.elapsed();
+    let text = report_text(&document);
+    assert!(text.contains("4 vector masks were converted"), "{text}");
+    assert!(
+        text.contains("1 vector mask was too large or complex"),
+        "{text}"
+    );
+    println!("five worst-case vector masks: {elapsed:?}");
+    assert!(elapsed.as_secs_f64() < 120.0, "{elapsed:?}");
+}
+
+fn ok_vector(block: &[u8]) -> super::vector::VectorPath {
+    match super::vector::parse(block) {
+        Ok(path) => path,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+#[test]
+fn the_parser_reads_flags_knots_and_fixed_point_vertical_first() {
+    let mut records = vec![initial_fill(1)];
+    records.push(knot(true, (0.5, 0.5), (0.5, 0.5), (0.5, 0.5))); // stray: ignored
+    records.extend(rect_path(0.125, 0.25, 0.5, 0.75, -1));
+    records.push(record(7, &[]));
+    let path = ok_vector(&vmsk(7, &records));
+    assert!(path.invert && path.not_link && path.disable && path.initial_fill);
+    assert_eq!(path.subpaths.len(), 1);
+    let Some(first) = path.subpaths.first() else {
+        unreachable!()
+    };
+    assert!(first.closed);
+    assert_eq!(first.operation, -1);
+    assert_eq!(first.knots.len(), 4);
+    assert_eq!(
+        first.knots.first().map(|k| k.anchor),
+        Some(super::vector::Point { x: 0.125, y: 0.25 })
+    );
+    // psd-tools reads records inside a subpath's count as its items: an
+    // initial-fill record there counts toward the knots and is not the
+    // path's initial fill.
+    let mut records = vec![subpath(true, 5, 1), initial_fill(1)];
+    records.extend(rect_path(0.0, 0.0, 0.5, 0.5, 1).into_iter().skip(1));
+    let path = ok_vector(&vmsk(0, &records));
+    assert!(!path.initial_fill);
+    assert_eq!(path.subpaths.first().map(|p| p.knots.len()), Some(4));
+}
+
+/// The vector-mask files' own truncation and mutation sweeps.
+fn vector_sweep_fixtures() -> Vec<Vec<u8>> {
+    let mut records = ellipse_path(0.5, 0.5, 0.3, 0.2, 1);
+    records.extend(rect_path(0.1, 0.1, 0.6, 0.6, 0));
+    records.extend(rect_path(0.2, 0.2, 0.4, 0.9, -1));
+    records.push(initial_fill(0));
+    let mut both = vector_file(6, 5, vmsk(1, &records));
+    if let Some(layer) = both.layers.first_mut() {
+        layer.mask = Some((0, 0, 3, 3, 0, 0x18));
+        let mut tail = vec![0x00, 255];
+        for v in [1_i32, 1, 3, 4] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.extend_from_slice(&[
+            0x0F, 100, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 9]));
+        layer.channels.push((-3, vec![7, 8, 9, 10, 11, 12]));
+    }
+    vec![vector_file(5, 4, vmsk(0, &records)).write(), both.write()]
+}
+
+#[test]
+fn every_truncation_and_seeded_mutation_of_a_vector_masked_file_never_panics() {
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    for file in vector_sweep_fixtures() {
+        let document = ok(read(&file));
+        assert!(report_text(&document).contains("converted"));
+        for len in 0..file.len() {
+            let _ = read(file.get(..len).unwrap_or(&[]));
+        }
+        for _ in 0..3_000 {
+            let mut mutated = file.clone();
+            let at = (next() as usize) % mutated.len().max(1);
+            let value = next() as u8;
+            if let Some(byte) = mutated.get_mut(at) {
+                *byte = value;
+            }
+            let _ = read(&mutated);
+        }
+    }
+}
+
+/// The corpus differential (0.150.0): every vector-masked layer Aurora
+/// opens from psd-tools' fixtures, Aurora's raster against
+///
+/// - **psd-tools' own** `draw_vector_mask` (psd-tools 1.17.4 with
+///   `aggdraw` 1.4.1), by sum: the committed numbers are psd-tools' sum
+///   and its count of partial (edge) pixels. `aggdraw` paints a
+///   systematic 63/255 outward band on every edge pixel (measured: the
+///   per-pixel maximum |Aurora − psd-tools| is 0.2471 = 63/255 on every
+///   layer with a non-trivial edge, and Aurora's sum is lower by about a
+///   quarter per edge pixel), so the tolerance is `63/255` per psd-tools
+///   edge pixel plus half a pixel;
+/// - **Photoshop's own rendering**, pixel by pixel, wherever the file
+///   carries one: on a vector-only layer the `-2` channel flagged
+///   "from rendering" *is* Photoshop's raster of the same path. The
+///   tolerance is `1/16` per pixel: 16 sub-scanlines put a single edge
+///   within `1/32` of its exact area, and two edges can share a pixel.
+///
+/// Expected values were computed by psd-tools itself, not by hand.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::format_push_string,
+    clippy::nonminimal_bool
+)] // a data table and a measurement log
+fn corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures");
+    if !dir.is_dir() {
+        println!("SKIPPED: corpus not present at {}", dir.display());
+        return;
+    }
+    // (file, layer, psd-tools sum, psd-tools edge pixels, `-2` is a
+    // rendering of the vector mask alone)
+    let cases: &[(&str, &str, f64, u32, bool)] = &[
+        (
+            "clipping-mask2.psd",
+            "Rounded Rectangle 1",
+            190_429.020,
+            1748,
+            true,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1",
+            133.988,
+            25,
+            false,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy",
+            138.000,
+            42,
+            false,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy 2",
+            138.000,
+            42,
+            false,
+        ),
+        (
+            "mask-density-layervectormask.psd",
+            "Layer 1 copy 3",
+            133.988,
+            25,
+            false,
+        ),
+        ("mask-density-vectormask.psd", "Layer 1", 133.988, 25, true),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1 copy",
+            138.000,
+            42,
+            true,
+        ),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1 copy 2",
+            138.000,
+            42,
+            true,
+        ),
+        (
+            "mask-density-vectormask.psd",
+            "Layer 1 copy 3",
+            133.988,
+            25,
+            true,
+        ),
+        ("mask-vector-density.psd", "Layer 1", 133.988, 25, true),
+        ("mask-vector-density.psd", "Layer 1 copy", 138.000, 42, true),
+        (
+            "mask-vector-density.psd",
+            "Layer 1 copy 2",
+            138.000,
+            42,
+            true,
+        ),
+        (
+            "mask-vector-density.psd",
+            "Layer 1 copy 3",
+            133.988,
+            25,
+            true,
+        ),
+        ("mask_parameters.psd", "Rectangle 1", 25_757.725, 661, true),
+        ("passthrough_vector_mask.psd", "Group 1", 263.965, 33, true),
+        ("vector-mask2.psd", "Masked Rectangle 1", 90.129, 40, false),
+        ("vector-mask2.psd", "Color Fill 1", 13.241, 20, true),
+        ("vector-mask3.psd", "Group 1", 65_536.000, 0, false),
+    ];
+    let band = 63.0 / 255.0;
+    for &(file, layer, want, edge, rendered) in cases {
+        let bytes = match std::fs::read(dir.join(file)) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{file}: {err}"),
+        };
+        let Some((w, h, plane)) = vector_plane(&bytes, layer) else {
+            unreachable!("{file}: no vector mask on {layer:?}");
+        };
+        let sum: f64 = plane.iter().map(|v| f64::from(*v)).sum();
+        let tolerance = band * f64::from(edge) + 0.5;
+        assert!(
+            (sum - want).abs() <= tolerance,
+            "{file} {layer}: Aurora {sum} vs psd-tools {want} (±{tolerance})"
+        );
+        // The document really applies it, and says so.
+        let document = doc(&bytes);
+        let Some(id) = find_named(&document.layers, layer) else {
+            unreachable!("{file}: no layer {layer:?}");
+        };
+        assert!(document.layers.mask(id).is_some(), "{file} {layer}");
+        assert!(report_text(&document).contains("converted"), "{file}");
+        let mut line = format!(
+            "{file} {layer}: Aurora {sum:.3}, psd-tools {want:.3} (Δ {:.3}, {edge} edge px)",
+            sum - want
+        );
+        if rendered {
+            let (header, records) = records_of(&bytes);
+            let Some(record) = records.iter().find(|r| r.name == layer) else {
+                unreachable!()
+            };
+            let Ok(Some(mut render)) = super::decode_mask(record, header) else {
+                unreachable!("{file} {layer}: no rendered -2");
+            };
+            render.density = u8::MAX;
+            let mut worst = 0.0_f32;
+            let mut ps_sum = 0.0_f64;
+            for y in 0..i64::from(h) {
+                for x in 0..i64::from(w) {
+                    let ps = super::effective_at(&render, x, y);
+                    let a = plane
+                        .get((y * i64::from(w) + x) as usize)
+                        .copied()
+                        .unwrap_or(f32::NAN);
+                    let d = (a - ps).abs();
+                    worst = if d.is_nan() {
+                        f32::INFINITY
+                    } else {
+                        worst.max(d)
+                    };
+                    ps_sum += f64::from(ps);
+                }
+            }
+            assert!(
+                worst <= 1.0 / 16.0,
+                "{file} {layer}: max |Aurora - Photoshop| {worst}"
+            );
+            line += &format!("; Photoshop's own render {ps_sum:.3}, max per-pixel |Δ| {worst:.4}");
+        } else {
+            // Both a user mask and a vector mask: the `-2` channel is
+            // Photoshop's rendering of the two together (density not
+            // applied), against Aurora's `real user mask × vector`.
+            let (header, records) = records_of(&bytes);
+            let Some(record) = records.iter().find(|r| r.name == layer) else {
+                unreachable!()
+            };
+            let Ok(Some(mut render)) = super::decode_mask(record, header) else {
+                unreachable!("{file} {layer}: no rendered -2");
+            };
+            render.density = u8::MAX;
+            let density = document.layers.mask(id).map_or(f32::NAN, |m| m.density);
+            let (mut worst, mut ps_sum, mut a_sum) = (0.0_f32, 0.0_f64, 0.0_f64);
+            for y in 0..i64::from(h) {
+                for x in 0..i64::from(w) {
+                    let ps = super::effective_at(&render, x, y);
+                    let a = with_density(
+                        effective_mask(&document, id, x, y).unwrap_or(f32::NAN),
+                        density,
+                    );
+                    let d = (a - ps).abs();
+                    worst = if d.is_nan() {
+                        f32::INFINITY
+                    } else {
+                        worst.max(d)
+                    };
+                    ps_sum += f64::from(ps);
+                    a_sum += f64::from(a);
+                }
+            }
+            line += &format!(
+                "; combined: Aurora {a_sum:.3} vs Photoshop's render {ps_sum:.3}, max |Δ| {worst:.4}"
+            );
+            // Photoshop's rendering carries no density, so it is the
+            // reference only where both densities are full.
+            if density == 1.0
+                && !record
+                    .mask
+                    .is_some_and(|m| m.parameters.vector_density.is_some_and(|d| d != u8::MAX))
+            {
+                assert!(
+                    worst <= 1.0 / 16.0,
+                    "{file} {layer}: combined max |Δ| {worst}"
+                );
+                line += " (asserted)";
+            }
+        }
+        println!("{line}");
+    }
+}
+
+#[test]
+fn applied_densities_are_not_reported_and_a_vector_feather_is() {
+    // Both masks, both densities baked (the rendered-mask fixture): no
+    // parameter line at all.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x18));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 8, 4] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.extend_from_slice(&[0x05, 128, 64]);
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 64]));
+        layer.channels.push((-3, vec![255; 32]));
+    }
+    let text = report_text(&doc(&file.write()));
+    assert!(!text.contains("feather"), "{text}");
+    assert!(!text.contains("density"), "{text}");
+    // A vector-only layer (mask data, no `-2`) with a vector feather.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        let mut tail = vec![0x08];
+        tail.extend_from_slice(&1.5_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+    }
+    let text = report_text(&doc(&file.write()));
+    assert!(
+        text.contains("1 layer mask uses a feather, which"),
+        "{text}"
+    );
+    assert!(!text.contains("density"), "{text}");
+}
+
+#[test]
+fn an_unconvertible_vector_mask_falls_back_to_photoshops_rendering_and_says_so() {
+    // Flags bit 3, `-2` the rendering (left half), `-3` a real user mask,
+    // and a vector mask that does not parse: `-2` is applied, and the
+    // report says it is Photoshop's combination, not "areas are visible".
+    let mut file = vector_file(8, 8, vec![0, 0, 0, 2, 0, 0, 0, 0]);
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 4, 0, 0x08));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 8, 8] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 32]));
+        layer.channels.push((-3, vec![255; 64]));
+    }
+    let document = doc(&file.write());
+    assert_eq!(vmask(&document, 1, 1), Some(1.0));
+    assert_eq!(vmask(&document, 5, 1), Some(0.0));
+    let text = report_text(&document);
+    assert!(
+        text.contains("the mask Photoshop saved already rendered"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Photoshop's own saved rendering of it was applied"),
+        "{text}"
+    );
+    assert!(!text.contains("areas the mask hides are visible"), "{text}");
+    assert!(!text.contains("isn't used"), "{text}");
+}
+
+#[test]
+fn a_layer_that_falls_back_gets_its_pixel_charges_back() {
+    // Pixel mask (no rendering flag) + vector mask; a budget that fits
+    // the raster but not the combined rectangle.
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 4, 0, 0));
+        layer.channels.push((-2, vec![255; 32]));
+    }
+    let bytes = file.write();
+    let (header, records) = records_of(&bytes);
+    let Some(record) = records.first() else {
+        unreachable!()
+    };
+    // The raster is 6×6 (the box grown by a pixel), charged twice.
+    let start = 36 * super::vector::RASTER_PIXEL_CHARGE;
+    let mut budget = super::vector::Budget {
+        pixels: start,
+        work: u64::MAX,
+    };
+    let mut notes = super::Notes::default();
+    let canvas = super::canvas_of(header);
+    let outcome = super::masks_for(record, header, canvas, &mut notes, &mut budget);
+    assert!(!outcome.vector_applied);
+    assert_eq!(budget.pixels, start, "refunded");
+    assert!(outcome.mask.is_some(), "the pixel mask alone, as 0.149.0");
+    assert!(
+        notes
+            .report()
+            .items
+            .join("\n")
+            .contains("too large or complex")
+    );
+}
+
+/// G5 (0.150.0 review): the partial-density layers with both masks,
+/// against `(d_u·U + 1 − d_u)(d_v·V + 1 − d_v)` computed here from the
+/// decoded real user mask `U` (`-3`) and Aurora's vector plane `V`.
+/// The oracle reuses Aurora's own raster (`vector_plane`), so this is a
+/// self-consistency check of `combine_masks`' density arithmetic and
+/// rectangle choice — not an independent check of the raster, which
+/// the psd-tools/Photoshop differential above is. A `NaN` anywhere
+/// fails it.
+#[test]
+#[allow(clippy::cast_sign_loss, clippy::many_single_char_names)]
+fn corpus_masks_with_both_densities_are_the_product_of_each_part() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures");
+    if !dir.is_dir() {
+        println!("SKIPPED: corpus not present at {}", dir.display());
+        return;
+    }
+    let Ok(bytes) = std::fs::read(dir.join("mask-density-layervectormask.psd")) else {
+        unreachable!()
+    };
+    let document = doc(&bytes);
+    let (header, records) = records_of(&bytes);
+    for (layer, density) in [
+        ("Layer 1", 64_u8),
+        ("Layer 1 copy", 128),
+        ("Layer 1 copy 2", 191),
+    ] {
+        let Some(record) = records.iter().find(|r| r.name == layer) else {
+            unreachable!()
+        };
+        let Some(info) = record.mask else {
+            unreachable!()
+        };
+        assert_eq!(info.parameters.user_density, Some(density));
+        assert_eq!(info.parameters.vector_density, Some(density));
+        let Some(real) = info.real else {
+            unreachable!()
+        };
+        let Ok(u) = super::decode_mask_channel(record, header, -3, real, u8::MAX) else {
+            unreachable!()
+        };
+        let Some((w, _, v)) = vector_plane(&bytes, layer) else {
+            unreachable!()
+        };
+        let Some(id) = find_named(&document.layers, layer) else {
+            unreachable!()
+        };
+        let d = f32::from(density) / 255.0;
+        let (mut worst, mut sum) = (0.0_f32, 0.0_f64);
+        for y in 0..i64::from(header.height) {
+            for x in 0..i64::from(header.width) {
+                let b = u.bounds;
+                let inside = x >= b.x && y >= b.y && x < b.right() && y < b.bottom();
+                let mut uv = if inside {
+                    let i = ((y - b.y) * i64::from(b.width) + (x - b.x)) as usize;
+                    u.coverage
+                        .as_ref()
+                        .and_then(|c| c.get(i))
+                        .map_or(f32::NAN, |c| c.to_f32())
+                } else if u.default_color != 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                if u.flags & 0x04 != 0 {
+                    uv = 1.0 - uv;
+                }
+                let vv = v
+                    .get((y * i64::from(w) + x) as usize)
+                    .copied()
+                    .unwrap_or(f32::NAN);
+                let want = (d * uv + 1.0 - d) * (d * vv + 1.0 - d);
+                let got = effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+                let d = (got - want).abs();
+                worst = if d.is_nan() {
+                    f32::INFINITY
+                } else {
+                    worst.max(d)
+                };
+                sum += f64::from(got);
+            }
+        }
+        assert_eq!(document.layers.mask(id).map(|m| m.density), Some(1.0));
+        assert!(worst <= 1e-3, "{layer}: {worst}");
+        println!(
+            "{layer}: density {density}, Aurora sum {sum:.3}, max |Δ| vs the product {worst:.5}"
+        );
+    }
+}
+
+/// One full-size vector-masked layer per block, 1×1 pixels each.
+fn many_vector_layers(width: u32, height: u32, block: &[u8], layers: usize) -> Vec<u8> {
+    TestPsd::new(1, width, height, 8)
+        .with(|p| {
+            for i in 0..layers {
+                p.layers.push(
+                    TestLayer::pixels(&format!("v{i}"), 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"vmsk", block.to_vec()))),
+                );
+            }
+        })
+        .write()
+}
+
+/// Round 2 of the review: parsing and flattening are charged to the
+/// file's work budget too, and an off-canvas path (an empty raster) is
+/// not free. 50 layers each carrying a 4,000-knot path wholly above
+/// the canvas; a budget for exactly three: three convert, the other 47
+/// are refused before they are even parsed.
+#[test]
+fn parsing_and_flattening_draw_on_the_files_work_budget() {
+    let knots = 4000_u16;
+    let mut records = vec![subpath(true, knots, 1)];
+    for i in 0..knots {
+        records.push(corner(f64::from(i % 2), -0.5));
+    }
+    let block = vmsk(0, &records);
+    // Parse: one per record plus one; flatten: `SEGMENT_CHARGE` per segment.
+    let parse = (block.len() / 26) as u64 + 1;
+    let flatten = (1 + u64::from(knots)) * super::vector::SEGMENT_CHARGE;
+    let one = parse + flatten;
+    let bytes = many_vector_layers(8, 8, &block, 50);
+    let started = std::time::Instant::now();
+    let file = ok(super::decode_with_vector_work(&bytes, 3 * one + 10));
+    let elapsed = started.elapsed();
+    let text = file.report().items.join("\n");
+    assert!(text.contains("3 vector masks were converted"), "{text}");
+    assert!(
+        text.contains("47 vector masks were too large or complex"),
+        "{text}"
+    );
+    assert!(elapsed.as_secs_f64() < 5.0, "{elapsed:?}");
+}
+
+/// The hostile ceiling of parsing and flattening, at the real per-file
+/// budget: 1,100 layers, each a 4,095-knot path whose handles fling far
+/// off the canvas (≈ 2^20 segments, just under the per-mask cap) and
+/// whose every point lies above it. Heavy (a ~117 MB file), so it is
+/// `#[ignore]`d rather than printing `SKIPPED` — that word is the
+/// workspace's "a real-GPU test did not run" signal under
+/// `AURORA_REQUIRE_GPU`, and an always-printed one would dilute it. Run it
+/// with `cargo test -p aurora-io --release -- --ignored
+/// the_worst_case_of_parsing`; measured in release and recorded in PLAN.md.
+#[test]
+#[ignore = "heavy (~117 MB file); run with --ignored, ideally in release"]
+fn the_worst_case_of_parsing_and_flattening_at_the_file_budget() {
+    let knots = 4095_u16;
+    let mut records = vec![subpath(true, knots, 1)];
+    for i in 0..knots {
+        let x = f64::from(i % 2);
+        records.push(knot(true, (x, -10.0), (x, -50.0), (1.0 - x, -90.0)));
+    }
+    let block = vmsk(0, &records);
+    let bytes = many_vector_layers(64, 64, &block, 1100);
+    let started = std::time::Instant::now();
+    let file = ok(decode(&bytes));
+    let elapsed = started.elapsed();
+    let text = file.report().items.join("\n");
+    println!("1,100 flatten-heavy vector masks: {elapsed:?}\n{text}");
+    assert!(text.contains("too large or complex"), "{text}");
+}
+
+/// The exact parse and flattening charges of one off-canvas mask (its
+/// raster is empty, so nothing else is charged), and a budget one unit
+/// short of the flattening refusing it with only the parse charge kept.
+#[test]
+fn an_off_canvas_mask_is_charged_exactly_its_parse_and_flattening() {
+    let knots = 100_u16;
+    let mut records = vec![subpath(true, knots, 1)];
+    for i in 0..knots {
+        records.push(corner(f64::from(i % 2), -0.5));
+    }
+    let block = vmsk(0, &records);
+    let parse = (block.len() / 26) as u64 + 1;
+    let flatten = (1 + u64::from(knots)) * super::vector::SEGMENT_CHARGE;
+    let bytes = many_vector_layers(8, 8, &block, 1);
+    let (header, layers) = records_of(&bytes);
+    let Some(record) = layers.first() else {
+        unreachable!()
+    };
+    let start = parse + flatten;
+    let mut budget = super::vector::Budget {
+        pixels: u64::MAX,
+        work: start,
+    };
+    let raster = super::vector_for(record, header, &mut budget);
+    assert!(
+        matches!(raster, Ok(Some(ref r)) if r.coverage.is_empty()),
+        "{raster:?}"
+    );
+    assert_eq!(budget.work, 0, "parse + flatten, nothing else");
+    let mut budget = super::vector::Budget {
+        pixels: u64::MAX,
+        work: start - 1,
+    };
+    assert_eq!(
+        super::vector_for(record, header, &mut budget).map(|r| r.is_some()),
+        Err(super::VectorSkip::TooLarge)
+    );
+    assert_eq!(budget.work, flatten - 1, "only the parse charge is kept");
 }

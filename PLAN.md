@@ -26,7 +26,111 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.149.0): PSD mask density is applied, and
+**Latest (2026-10-09, 0.151.0): opening a file decodes it off the UI
+thread.** `App::open_file` now only *starts* an open (invariant
+§7.3.4): a new `crates/aurora-app/src/background_open.rs` `OpenWorker`
+runs `decode_chosen_file` on its own `std::thread` (`aurora-app` has no
+async runtime and none was added) — the read and decode of a
+PNG/JPEG/TIFF, the whole PSD/PSB decode, and a `.aur` file's read plus
+0.143.1's throwaway-store pre-check (`precheck_aur`, split out of
+`read_aur_for_open`) — and hands back plain `Send` data
+(`DecodedFile`). The thread sends its result, *then* wakes the loop
+through an `EventLoopProxy` user event: the loop's user event type is
+now `AppEvent` (`Accessibility(accesskit_winit::Event)` |
+`OpenFinished`; `accesskit_winit` takes any `T: From<Event>`), and
+`about_to_wait` installs the result (`poll_background_open`). The
+install stays on the UI thread — the live `aurora_tile::TileStore` is
+`App`'s, not shared — and is the unchanged synchronous code: panels,
+sweep, pixel and mask writes, autosave, and for `.aur` the live read
+(`read_prechecked_aur`), which only ever sees bytes that passed the
+pre-check. **Measured install cost, and it is not small:** a 4096²,
+four-layer, uncompressed 8-bit PSD (304 MiB), dev test profile,
+RTX 3090 box, two runs — background decode 1.69 s; UI-thread install
+2.55–2.57 s (panels < 0.1 ms, tile writes 0.68 s, autosave
+1.88–1.89 s). So for a large file the UI thread still freezes for
+longer at install than the decode this round moved off it; not
+chunked, disclosed. While an open is pending the window title reads
+"Opening <file>… — Aurora" and the accessibility tree carries a
+`Role::Status`, polite-live node with the same text as the root's last
+child (`with_opening_status`); both clear on every outcome. A second
+open while one is pending **supersedes** it (newest wins): the old
+thread cannot be interrupted, runs to completion detached, and its
+result is dropped by generation id (`OpenWorker::take_finished`). The
+current document stays editable meanwhile; those edits are discarded
+when the new document replaces it, as an open always did. Quitting
+joins a decode thread that finishes within 100 ms
+(`SHUTDOWN_JOIN_BOUND`) and detaches the rest. A failed decode raises
+the same "Couldn't Open File" messages; a decode panic is caught and
+shown as a new `OpenFailure::Background` — **except in release
+builds, whose profile is `panic = "abort"`, where a decode panic still
+ends the process** (there the protection is `aurora-io`'s own
+`panic`/`unwrap`/`expect`/`indexing_slicing` denials; running out of
+memory aborts in every profile). After review (judge REVISE 0.80): an
+open that finishes while a modal dialog is up waits in the worker and
+installs — report or failure shown — once the dialog closes
+(`background_open_step`), at most one superseded decode may still run
+beside the pending one (a third open is refused, shown as "Couldn't
+Open File"), and a decode detached at quit can no longer recreate the
+session scratch directory (`SESSION_ENDING`). 19 new tests (10 worker,
+9 app-level) plus one `#[ignore]`d measurement; 17 of 18 mutations killed (the survivor is the one `about_to_wait` call line, which no headless test can reach). Test count
+2,863 (2,844 + 19; the pre-revision candidate's full gate measured
+2,858 passed, 0 failed, 47 ignored, 0 skipped with
+`AURORA_REQUIRE_GPU=1`; the revision's 5 new tests were measured in
+`aurora-app`'s own run). **Needs a human: open a large PSD on macOS and check the window
+stays responsive.** Details: "Next action", addendum 0.151.0.
+
+**Previously (2026-10-09, 0.150.0): PSD vector masks are applied.**
+`aurora-io` parses the `vmsk`/`vsms` block (version 3; invert, not-link
+and disable flags; subpath length records, linked/unlinked closed/open
+knots in signed 8.24 fixed point, vertical first, normalised to the
+document; fill-rule, clipboard and initial-fill records) in a new
+`psd/vector.rs`, and rasterises it with its own scanline filler
+(`scripts/layering.json` does not let `aurora-io` depend on
+`aurora-vector`; that edge was not added): cubic Béziers flattened by
+Wang's bound at 0.05 px, each subpath filled non-zero with exact
+horizontal and 16-sub-scanline vertical coverage, subpaths grouped and
+combined with psd-tools' own operation rules (exclude/combine/subtract/
+intersect, the first subtract/intersect starting from everything,
+`-1` joining the previous group), psd-tools' initial-fill rule, and
+the invert flag (which psd-tools ignores). The mask flags' bit 3 ("came
+from rendering other data") turned out to matter: on every vector-masked
+corpus layer the `-2` channel is Photoshop's *own rendering* of the
+vector mask (with the real user mask, `-3`, when there is one), so it is
+not applied again; the pixel part is the real user mask, and Aurora's
+coverage is `real user mask × vector`, each density baked into its own
+part when both exist (one `LayerMask::density` cannot hold two), the
+vector density kept editable when the vector mask stands alone.
+Corpus: 18 layers in 8 fixtures — against Photoshop's own rendering
+the per-pixel maximum difference is 0.0298 (curved), 0.0444 (two
+intersected subpaths) and 0.0000 on the other 13 compared layers;
+against psd-tools' `draw_vector_mask` Aurora is lower by ~63/255 per
+edge pixel, which is `aggdraw`'s own outward band. All 16 mutations
+killed (34 of 34 after the two review revisions). "Opened With Changes" now says
+a vector mask was *converted to a pixel mask* (no longer editable or
+resolution-independent), and lists unreadable, too-large and turned-off
+ones — or, when one can't be converted but the file carries Photoshop's
+own rendering of it, that the rendering was applied instead. Review
+revisions (judge REVISE 0.77, then 0.85, both on unbounded work):
+parsing, flattening and every scanline pass are now charged to one
+per-file work budget before they run, empty subpath groups are folded
+into a constant, and once the budget is spent no further vector mask
+is even parsed. Measured worst case, release, **on the UI thread**:
+~0.5 s for one mask at the per-mask cap, ~2.1 s for a whole file of
+scanline-heavy masks, ~1.2 s for a ~117 MB file of 1,100
+flattening-heavy, off-canvas masks. The work caps also limit real
+files: one mask converts at most ~38 Mpx of raster (about 6,000²), one
+file ~150 Mpx in all; past that a mask is reported "too large or
+complex". Not bounded by the work budget, only by the pixel budget:
+`combine_masks` over its rectangle and the `-3` decode. Gate before the
+revisions: 2,832, then 2,842 (round 2), passed, 0 failed, 0 skipped
+(`AURORA_REQUIRE_GPU=1`); round 3 measured 2,845 passed, then 2,844
+passed / 46 ignored once the heavy worst-case test became `#[ignore]`d;
+judge round 3 PASS 0.91. Tested headlessly and on a
+real GPU only — **not compared against Photoshop directly. Needs a
+human: compare a vector-masked PSD against Photoshop.** Details: "Next
+action", addendum 0.150.0.
+
+**Previously (2026-10-09, 0.149.0): PSD mask density is applied, and
 editable.** `aurora_doc::LayerMask` gains `density: f32` (default
 `FULL_MASK_DENSITY` = `1.0`); `aurora-app`'s `apply_mask` (the one
 mask path — the GPU path reaches it too, through `resolve_tile` per
@@ -9021,6 +9125,34 @@ structural design work.
   fallback did not use; its text names "a feather or a vector-mask
   density". The model side (`LayerMask::density`, `.aur`
   `mask-density`, the journal carrier) is in addendum 0.149.0.
+
+  **Update 0.150.0 — vector masks applied.** `Record::vector` keeps the
+  first `vmsk`/`vsms` block; `MaskInfo::real` reads the 18 real-mask
+  bytes (real flags, real default colour, real rectangle — psd-tools'
+  order, before the parameter block). `masks_for` replaces
+  `mask_or_report` for layers and groups: without an applicable vector
+  mask it *is* 0.149.0's path; with one, `vector::parse` +
+  `vector::rasterize` produce coverage over the paths' bounding box
+  (clipped to the canvas, charged against what the declared rectangles
+  leave of `PIXEL_BUDGET`), `pixel_part` picks `-3` (with the real
+  frame) when flags bit 3 marks `-2` as a rendering, else `-2`, and
+  `combine_masks` multiplies them with each density baked in. A shape
+  layer's (fill + vector) mask is still not applied — its pixels are the
+  rendered shape, and psd-tools does not apply it either. New notes:
+  `VectorMaskRasterised`, `VectorMaskUnreadable`, `VectorMaskTooLarge`,
+  `VectorMaskDisabledDropped`; `VectorMaskNotApplied` is gone and
+  `RealMaskNotUsed` fires only when the vector mask was not applied.
+  **Update 0.151.0 — the decode runs off the UI thread.** Closes the
+  §7.3.4 half of 0.144.0's "decode runs synchronously on the UI thread"
+  disclosure, for the decode only: `App::open_file` starts an
+  `OpenWorker` thread (`background_open.rs`) running
+  `decode_chosen_file`, and the loop installs the result when woken
+  (`AppEvent::OpenFinished`). The install — tile writes, mask writes,
+  autosave, and a `.aur`'s live read — is still on the UI thread and was
+  measured at ~2.6 s for a 4096² four-layer PSD, more than its decode.
+  An open that finishes under a modal dialog waits for it to close (review
+  E1). The §7.3.1 half (the whole file in memory, not streamed through the
+  tile store) is still open. "Next action", addendum 0.151.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30419,6 +30551,555 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.151.0) — opening a file decodes it off the UI
+thread.** Done as 0.151.0 (`crates/aurora-app/src/background_open.rs`,
+new; `crates/aurora-app/src/lib.rs`).
+
+*Shape.* `App::open_file` calls `OpenWorker::start(path,
+decode_chosen_file, wake)` and returns. `decode_chosen_file` is the
+whole background half: `open_image` for PNG/JPEG/TIFF,
+`std::fs::read` + `open_psd_document` for PSD/PSB, `std::fs::read` +
+`precheck_aur` for `.aur` (the 0.143.1 throwaway-store read, now on the
+decode thread; the throwaway store is created and dropped there). Its
+result is `DecodedFile` (`Image` | `Psd(PsdDocument)` | `Aur(Vec<u8>)`),
+plain `Send` data. The thread runs the decode under `catch_unwind`,
+sends `FinishedOpen { generation, path, result, decode_time }` on an
+`mpsc` channel, and only then calls `wake`, which in the app is
+`proxy.send_event(AppEvent::OpenFinished)`. The event loop's user event
+type changed from `accesskit_winit::Event` to `AppEvent`
+(`Accessibility(..)` | `OpenFinished`), with `From<accesskit_winit::Event>`
+so `Adapter::with_event_loop_proxy` is unchanged; `user_event` sets
+`needs_redraw` for `OpenFinished`, and `about_to_wait` calls
+`poll_background_open` first, which takes the result, clears the
+"Opening" state, installs (`install_finished_open` → `open_image_file`
+/ `open_psd_file` / `open_aur_file`, the old install bodies, now handed
+decoded data) and relays out. No tokio runtime exists in `aurora-app`
+and none was added.
+
+*Why the install stays on the UI thread.* The live `aurora_tile::TileStore`
+is owned by `App` and every writer of it runs on the UI thread; this
+round did not make it shared. A `.aur`'s live read
+(`read_prechecked_aur`) is therefore still a UI-thread decode of every
+tile — the pre-check moved off, the second read did not.
+
+*Measured install cost* (`measure_installing_a_large_psd_on_the_ui_thread`,
+`#[ignore]`d; `cargo test -p aurora-app --lib -- --ignored --nocapture
+measure_installing`; dev test profile — workspace crates at
+`opt-level = 1` — on the RTX 3090 box, two runs): a 4096², four-layer,
+uncompressed 8-bit PSD of 304 MiB decodes in 1.69 s on the background
+thread; the UI thread then spends 2.55–2.57 s installing it — panels
+< 0.1 ms, sweep + tile writes 0.68 s, autosave (`write_autosave`, a whole
+`.aur` written from the live store) 1.88–1.89 s. **The install is
+longer than the decode this round moved off the UI thread**, and the
+autosave is most of it. Not chunked this round; release numbers not
+measured.
+
+*Rules, and where each is pinned.*
+- Newest wins: a second open supersedes the pending one; the old thread
+  runs to completion detached and its result is dropped because its
+  generation is no longer the pending one
+  (`a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`,
+  `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one`).
+- A failure clears the pending state and comes back as its own
+  `OpenFailure` (`a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`),
+  with byte-identical messages to the synchronous path
+  (`a_failed_background_open_raises_the_same_couldnt_open_file_message`).
+- A panic becomes `OpenFailure::Background(BackgroundFailure::Panicked)`
+  and is shown in the real "Couldn't Open File" dialog
+  (`a_panicking_decode_is_reported_as_a_failed_open_and_does_not_take_the_caller_down`,
+  `a_caught_decode_panic_is_shown_as_couldnt_open_file`).
+- The decode really runs on another thread and wakes the caller
+  (`a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready`).
+- Quit is bounded: `OpenWorker::shutdown(SHUTDOWN_JOIN_BOUND = 100 ms)`
+  from `App::finish_shutdown` joins finished threads and detaches running
+  ones (`shutting_down_with_a_decode_still_running_returns_within_its_bound`,
+  `shutting_down_after_a_decode_finished_joins_its_thread`).
+- Same document as the synchronous path: layers (paint order, parents,
+  names, kinds, opacity, fill, blend, bounds, visibility, masks,
+  surfaces), `History::save_journal` bytes (the History panel's "Open"
+  origin), every layer's samples and offset, mask coverage, the import
+  report (the fixture carries an `lfx2` block, so "Opened With Changes"
+  has an item), and the composite after the install's own
+  `replace_document_pixels`
+  (`a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path`,
+  `a_background_image_open_decodes_the_same_pixels_as_the_synchronous_path`).
+- The `.aur` pre-check runs on the decode thread and refuses a damaged
+  file there; a sound file's checked bytes read into a live store as
+  before
+  (`a_background_aur_open_prechecks_in_a_throwaway_store_and_refuses_a_damaged_file`).
+- Loading state: title "Opening <file>… — Aurora" (`window_title`, file
+  name sanitised by `display_file_name`) and a `Role::Status`,
+  `Live::Polite` node labelled "Opening <file>…" appended as the root's
+  last child (`with_opening_status`, `OPENING_STATUS_NODE =
+  NodeId(u64::MAX)`), both gone once the result — here a failure — is
+  taken
+  (`the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure`).
+- Edits while pending are allowed and discarded at install, exactly as
+  an open always replaced the document; documented on `App::open_file`,
+  not tested (no headless `App`).
+
+*Mutations* — each file backed up to the session scratchpad
+(`mut151/`), mutated, `AURORA_REQUIRE_GPU=1 cargo test -q -p aurora-app
+--lib` run (631 tests, 1 ignored), restored, and checked against its
+recorded sha256 (all restores matched):
+
+| # | Mutation | Result | Killed by (among others) |
+|---|---|---|---|
+| M1 | decode run on the calling (UI) thread before spawning | killed, 4 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready`, `shutting_down_with_a_decode_still_running_returns_within_its_bound` |
+| M2 | generation check removed (every result taken as current) | killed, 3 | `a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`, `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one` |
+| M3 | `catch_unwind` removed | killed, 2 | `a_panicking_decode_is_reported_as_a_failed_open_and_does_not_take_the_caller_down`, `a_caught_decode_panic_is_shown_as_couldnt_open_file` |
+| M4 | a failed result is never returned (error not reported) | killed, 6 | `a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`, `a_failed_background_open_raises_the_same_couldnt_open_file_message` |
+| M5 | pending ("Opening") state not cleared on a failure | killed, 5 | `a_failed_decode_comes_back_as_its_failure_and_clears_the_pending_state`, `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M6 | second-open rule inverted (oldest kept, newest dropped) | killed, 2 | `a_second_open_supersedes_the_first_and_only_the_newest_result_is_returned`, `a_stale_generation_is_ignored_even_when_it_arrives_before_the_pending_one` |
+| M7 | the thread's `wake` call removed | killed, 13 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready` and every app-level background test |
+| M8 | shutdown waits unbounded for running threads | killed, 1 | `shutting_down_with_a_decode_still_running_returns_within_its_bound` |
+| M9 | `.aur` pre-check removed from `decode_chosen_file` | killed, 1 | `a_background_aur_open_prechecks_in_a_throwaway_store_and_refuses_a_damaged_file` |
+| M10 | status node never added to the accessibility update | killed, 1 | `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M11 | window title ignores the pending open | killed, 1 | `the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure` |
+| M12 | PSD routed to the flat-image decoder | killed, 2 | `a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path`, `a_failed_background_open_raises_the_same_couldnt_open_file_message` |
+| M13 | wake sent *before* the result (20 ms gap) | killed, 11 | `a_started_open_decodes_off_the_calling_thread_and_wakes_once_its_result_is_ready` and every app-level background test |
+| M14 | `poll_background_open` removed from `about_to_wait` | **survived** | none — the `App` wiring has no headless test (disclosed) |
+
+13 of 14 killed. M1's first run hung rather than failed (two test
+decodes waited unboundedly on a gate that only the test thread, now
+blocked inside the decode, could open); both gates were bounded at 10 s
+and the whole table above was re-run against the final tests.
+
+*Disclosures.*
+- **Install still blocks the UI thread** for as long as tile writes,
+  mask writes, autosave and (for `.aur`) the live read take — ~2.6 s for
+  the measured 4096² four-layer PSD, more than its decode.
+- **§7.3.1 still open:** the whole file is read into memory and the
+  whole document decoded before anything is installed; streaming it
+  layer by layer through the tile store is not done.
+- **Release builds abort on a decode panic** (`[profile.release] panic =
+  "abort"`): `catch_unwind` only works in unwinding (dev/test) builds.
+  In release the protection is the decoders' own lints — `aurora-io`,
+  like every workspace crate, denies `panic`, `unwrap`, `expect` and
+  `indexing_slicing` — so a panic there takes an arithmetic overflow or
+  a dependency's panic, not an ordinary bug. Allocation failure (out of
+  memory) aborts the process in **every** profile.
+- **The `App` wiring is inspection-only**: `poll_background_open` in
+  `about_to_wait`, the proxy wake closure, `user_event`'s
+  `OpenFinished` arm, the title updates and `finish_shutdown`'s
+  `shutdown` call — `App` needs a live `EventLoopProxy`, so no test
+  constructs it (M14 survives).
+- A superseded decode cannot be cancelled. Since the review (D1) at
+  most one may still run beside the pending one (`MAX_SUPERSEDED`), so
+  at most two whole files and documents are in memory at once; a third
+  open is refused as `BackgroundFailure::Busy`. A just-installed open's
+  thread counts as running until its `wake` call returns, so a third
+  open in that microsecond window is refused spuriously.
+- An open that finishes while a modal dialog is up waits (review E1),
+  and the "Opening …" title and status stay up until the dialog closes.
+  A live brush or eraser drag is dropped at install, as before.
+- On quit, a detached `.aur` pre-check may still be writing into the
+  session scratch directory that shutdown cleanup removes; its writes
+  then fail and the process exits. Since the review (C1) it can no
+  longer *recreate* that directory: `SESSION_ENDING` is set before the
+  cleanup and `aur_verify_scratch_dir` refuses once it is. A pre-check
+  that read the flag just before it was set can still recreate it (a
+  check-then-act window, not closed by a lock). Reasoned, not observed.
+- The status node is an accessibility node outside the widget tree, and
+  the visible state is the OS title bar only (nothing drawn in-app);
+  neither the title nor the announcement has been seen or heard on real
+  hardware or with a screen reader. The thread-spawn failure path
+  (`BackgroundFailure::Spawn`) is untested.
+- Measured in the dev test profile only.
+
+*Verified:* `cargo fmt --all --check`; `cargo clippy -p aurora-app
+--all-targets --all-features -- -D warnings`; `cargo check --workspace`;
+`AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --lib` (630 passed, 1
+ignored; 635 after the review revision); `cargo doc -p aurora-app --no-deps --all-features --document-private-items` (no warnings); `python3 scripts/check_layering.py`; `python3 scripts/check_no_hardcoded_style.py`. The coordinator's full gate on the
+pre-revision candidate: 2,858 passed, 0 failed, 47 ignored, 0 skipped.
+Test count after the revision 2,863 (2,844 + 19 new).
+
+*Review revision (0.151.0, same version).* The candidate's full gate
+passed (`AURORA_REQUIRE_GPU=1`: 2,858 passed, 0 failed, 47 ignored, 0
+skipped; clippy, strict rustdoc, `cargo deny` clean); judge REVISE 0.80.
+- **E1 (blocking) — fixed.** An install landing under a modal lost its
+  report: `open_psd_report_dialog` and `report_open_failure` only log
+  when the slot is taken, and async open made that reachable. Now
+  `background_open_step` (`background_open.rs`, behind an
+  `OpenInstaller` trait `App` implements) leaves a finished open in the
+  worker while `App::dialog` is set and installs it on the first
+  `about_to_wait` after the dialog closes — every close path (key,
+  click, accessibility action, menu) is an event the loop follows with
+  `about_to_wait`, so none needs its own hook. Install-later rather than
+  queue-the-message, so the document is never swapped beneath an alert
+  about the old one. Tests:
+  `the_open_step_defers_a_finished_open_while_a_modal_is_up_and_installs_it_after`,
+  `a_finished_open_waits_for_an_open_dialog_to_close_then_installs_and_shows_its_report`,
+  `a_failed_open_waits_for_an_open_dialog_to_close_then_shows_couldnt_open_file`
+  (the last two over a real workspace and dialog slot; their installer
+  calls the same report functions `App` does, but builds no document —
+  `App` is not constructible headlessly).
+- **D1 — fixed, refuse.** `MAX_SUPERSEDED = 1`: an open while one is
+  pending and a superseded decode still runs is refused with
+  `BackgroundFailure::Busy`, shown as "Couldn't Open File" ("Aurora is
+  still reading files you opened earlier…"). Test:
+  `a_third_open_while_two_decodes_still_run_is_refused_as_busy`.
+- **C1 — fixed.** `SESSION_ENDING` (an `AtomicBool`) is set in
+  `App::finish_shutdown` before the cleanup; `aur_verify_scratch_dir`
+  delegates to `aur_verify_scratch_dir_unless`, which returns `None` and
+  creates nothing once it is set. Test:
+  `no_aur_scratch_store_is_created_once_the_session_is_ending`. The
+  check-then-act window remains (disclosed above).
+- **W1 — done, partly.** The per-iteration step is now the free
+  `background_open_step` and is tested (M14b killed); deleting its one
+  call in `about_to_wait` (M14) still survives — that line is in `App`.
+- **B1, R1, A1 — done** (disclosures above; README now gives the
+  measured ~2.6 s; the autosave follow-on is named above).
+- **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+  clippy `-D warnings`, **2,863 passed, 0 failed, 0 skipped** (47
+  ignored), strict rustdoc, `cargo deny`. Judge round 2: **PASS 0.903**,
+  no blocking issue. Its notes, recorded: (J1) `aur_verify_scratch_dir`'s
+  doc now states the `SESSION_ENDING` exception, which also skips the
+  independent-temp fallback; (J2) the E1 tests' `DialogRig` re-implements
+  the dialog half of `App::install_finished_open` with the same helper
+  functions rather than calling it — a regression inside that method's
+  report path would not be caught (inherent while `App` cannot be built
+  headlessly); (J3) M14 survives, as above; (J4) a deferred result can
+  still be superseded when a dialog-closing event and a new open arrive
+  in the same event batch (every open route is blocked while a dialog is
+  up, so only then) — the older result is dropped by generation and its
+  report is never shown, acceptable because that document was never
+  installed and the user asked for a newer one.
+- **S1 — verified by inspection, no test.** All in-progress brush and
+  eraser state lives in `Drag::Brush`/`Drag::Eraser` (`stroke`,
+  `carry`, `last_doc`, `warned`) — `App` has no separate brush scratch
+  layer — and the install sets `self.drag = None` and replaces
+  `pixel_history`; the stroke's dabs are in the outgoing document's
+  tiles, which the install sweeps first. `handle_pointer_moved` only
+  advances an existing drag, so a still-held button paints nothing more
+  until the next press, and its release commits nothing.
+
+Mutations after the revision (all 18 re-run against the revised tests,
+same procedure):
+
+| # | Mutation | Result (failing tests) |
+|---|---|---|
+| M1–M13 | as in the table above | all killed again (M1: 5, M2: 3, M3: 2, M4: 7, M5: 5, M6: 3, M7: 17, M8: 1, M9: 1, M10: 1, M11: 1, M12: 3, M13: 14) |
+| M14 | `poll_background_open` call removed from `about_to_wait` | **survived** (the one line in `App`) |
+| M14b | `background_open_step` drops the result instead of installing it | killed, 3: `the_open_step_defers_…`, both `…_waits_for_an_open_dialog_to_close_…` |
+| M15 | E1 deferral removed (`modal_open` ignored) | killed, 3: the same three |
+| M16 | D1 cap removed | killed, 1: `a_third_open_while_two_decodes_still_run_is_refused_as_busy` |
+| M17 | C1 `session_ending` refusal removed | killed, 1: `no_aur_scratch_store_is_created_once_the_session_is_ending` |
+
+17 of 18 killed; `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --lib`
+on the revised code: 635 passed, 0 failed, 1 ignored.
+
+**Needs a human: open a large PSD on macOS and check the window stays
+responsive** (repaints, the canvas pans, panels scroll, the title reads
+"Opening …", VoiceOver announces it), and note how long the end-of-open
+pause is.
+
+*Named follow-on: the post-open autosave (review A1).*
+`install_opened_document` writes a whole `.aur` autosave from the live
+store right after an open — ~1.9 s of the measured ~2.6 s install. That
+write exists so a crash right after opening recovers the opened
+document. Candidate designs, each a crash-recovery semantics change and
+therefore not done here: (a) on open, delete the stale autosave and
+record the source path, recovering by re-opening the source file (the
+source must still exist and be unchanged; a hash or mtime check); or
+(b) an incremental or chunked autosave that writes the container a few
+tiles per frame, or from a compressed-tile snapshot on a worker thread.
+
+*Suggested next:* A1 above, then chunk the tile and mask writes across
+frames; after that, stream a PSD's layers through the tile store
+(§7.3.1) instead of decoding the whole file in memory.
+
+**Addendum 2026-10-09 (0.150.0) — PSD vector masks applied.** Done as
+0.150.0 (`crates/aurora-io/src/psd/vector.rs`, `psd.rs`, `psd/tests.rs`,
+`aurora-app`'s `an_opened_psds_vector_mask_is_composited`).
+
+*Semantics (psd-tools 1.17.4, `composite/vector.py`).* Knots are
+`preceding, anchor, leaving`, each `(y, x)` in 8.24 fixed point times
+the document's height and width; the edge between knots `a`, `b` is
+the cubic `a.anchor, a.leaving, b.preceding, b.anchor`; closed subpaths
+also join last to first, open ones are closed by a straight line; a
+subpath with fewer than two knots draws nothing. Each subpath is filled
+non-zero (AGG's default, which `aggdraw` uses) and the subpaths of one
+group are composited with "over". Groups combine in order: `0` exclude,
+`1` combine, `2` subtract, `3` intersect; the first subtract/intersect
+inverts the starting value; any other operation is skipped. The
+starting value is `1` only for a non-zero initial-fill record *and no
+subpaths at all*. The invert flag is applied as `1 − m` (psd-tools does
+not apply it). A disabled vector mask is left out (and reported, since
+it cannot be turned back on). Vector feather stays reported, not
+applied.
+
+*The `-2` channel is a rendering.* Measured on the corpus: every
+vector-masked layer with a `-2` channel has mask flags bit 3 set, and
+there `-2` is Photoshop's own rendering — of the vector mask alone, or
+of the real user mask (`-3`) times the vector mask. Applying `-2` and
+then the vector mask (what psd-tools does) squares the edges and the
+density. So with an applied vector mask Aurora uses `-3` (real frame)
+as the pixel part when bit 3 is set, `-2` only when it is not.
+Measured: at full density `real user mask × Aurora's vector raster`
+equals Photoshop's `-2` rendering with max per-pixel |Δ| **0.0000** on
+`mask-density-layervectormask.psd` "Layer 1 copy 3",
+`vector-mask2.psd` "Masked Rectangle 1" and `vector-mask3.psd`
+"Group 1".
+
+*Density.* Vector only: coverage = the raster, `LayerMask::density` =
+the vector density (exact and editable). Both: `(d_u·U + 1 − d_u) ×
+(d_v·V + 1 − d_v)` baked into the coverage, density 1 — one density
+cannot express two, so the densities stop being editable on such
+layers. psd-tools instead applies "user, else vector" density to the
+rendered `-2`, multiplies by the vector mask and applies the vector
+density again; Aurora does not follow that. As a result four layers
+left 0.149.0's density table (`mask-density-layervectormask.psd`, now
+baked) and `mask_parameters.psd` "Rectangle 1" (its user density 204
+now applies only to an empty, shown real user mask).
+
+*Corpus differential* (`corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering`;
+expected values computed by psd-tools 1.17.4 with `aggdraw` 1.4.1 and
+committed as data — 18 layers, 8 files; the three `vector-mask*.ps[db]`
+32-bit files are refused by Aurora and so are not compared):
+
+| Layer | Aurora sum | psd-tools sum | Δ (edge px) | vs Photoshop's own `-2`, max \|Δ\| |
+|---|---|---|---|---|
+| clipping-mask2 "Rounded Rectangle 1" | 190,008.666 | 190,429.020 | −420.354 (1748) | 0.0298 |
+| mask-density-vectormask ×4, mask-vector-density ×4 | 128.000 | 133.988 / 138.000 | −5.988 / −10.000 (25 / 42) | 0.0000 |
+| mask_parameters "Rectangle 1" | 25,600.001 | 25,757.725 | −157.724 (661) | 0.0000 |
+| passthrough_vector_mask "Group 1" | 256.000 | 263.965 | −7.965 (33) | 0.0000 |
+| vector-mask2 "Color Fill 1" (two intersects) | 11.605 | 13.241 | −1.636 (20) | 0.0444 |
+| mask-density-layervectormask ×4 | 128.000 | 133.988 / 138.000 | −5.988 / −10.000 | combined: 0.0000 at full density |
+| vector-mask2 "Masked Rectangle 1" | 81.000 | 90.129 | −9.129 (40) | combined: 0.0000 |
+| vector-mask3 "Group 1" (initial fill) | 65,536.000 | 65,536.000 | 0.000 | combined: 0.0000 |
+
+Against psd-tools the per-pixel maximum is 0.2471 (= 63/255) on every
+layer with an edge, measured offline from dumped planes: `aggdraw`
+paints a 63/255 band outside every edge (Photoshop does not), so the
+committed tolerance is 63/255 per psd-tools edge pixel plus 0.5 on the
+sum, and the per-pixel check (≤ 1/16: 16 sub-scanlines put one edge
+within 1/32, two edges can share a pixel) is against Photoshop's own
+rendering instead.
+
+*Bounds.* ≤ 65,536 records; ≤ 256 segments per cubic and ≤ 2^20 per
+mask; scanline work (edge crossings + each subpath's box area) ≤ 2^28;
+the raster rectangle and any `-3` or combined rectangle are charged
+against `PIXEL_BUDGET` minus the declared rectangles; every buffer is
+`try_reserve`d. Exceeding any of them is a "too large or complex"
+report line and the 0.149.0 behaviour for that layer — never a refused
+file. Truncation and 3,000-mutation sweeps over two vector-masked
+files (one with `-2`, `-3`, real fields and a full parameter block):
+no panics.
+
+*Mutations* (each file backed up to the session scratchpad, restored,
+sha256 checked; `cargo test -p aurora-io --lib psd::`):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | invert flag ignored | killed | `an_inverted_vector_mask_shows_outside_and_hides_inside` |
+| 2 | subpath operation ignored (all combine) | killed | `subpath_operations_combine_…`, `a_first_subtract_or_intersect_…`, corpus vector |
+| 3 | even-odd instead of non-zero | killed | `a_self_overlapping_subpath_is_filled_with_the_nonzero_rule` |
+| 4 | knot x/y swapped | killed | 8 tests incl. the parser test and both corpus tests |
+| 5 | width/height swapped | killed | `x_is_scaled_by_the_width_and_y_by_the_height` |
+| 6 | Bézier as straight lines | killed | ellipse test, corpus vector, segment-cap test |
+| 7 | no pixel × vector intersection | killed | `a_rendered_user_mask_is_replaced_…`, corpus vector |
+| 8 | disabled flag ignored | killed | `a_disabled_vector_mask_is_ignored_…` |
+| 9 | record cap removed | killed | `too_many_records_or_segments_are_bounded_and_reported` |
+| 10 | flatten tolerance 50 px | killed | ellipse test, corpus vector |
+| 11 | first-group inversion ignored | killed | `a_first_subtract_or_intersect_starts_from_everything` |
+| 12 | render flag ignored (`-2` reused) | killed | `a_rendered_user_mask_is_replaced_…`, corpus density |
+| 13 | segment cap removed | killed | `too_many_records_or_segments_are_bounded_and_reported` |
+| 14 | vector density dropped | killed | 3 tests |
+| 15 | initial fill used with subpaths | killed | `the_initial_fill_shows_…`, corpus vector |
+| 16 | raster not charged to budget | killed | `the_raster_is_charged_against_the_budget_…` |
+
+*Disclosures.* The path is not kept: "converted to a pixel mask" is a
+report line, not a footnote, because enlarging or re-editing the shape
+is a real loss a user would not otherwise see. Vector-mask coverage
+outside the canvas is the mask's outside constant (the raster is
+clipped to the canvas). With both masks, the densities are baked and
+no longer editable; a turned-off pixel mask next to an applied vector
+mask is dropped. When the vector mask is disabled Aurora keeps 0.149.0's
+behaviour (it applies `-2`), which assumes Photoshop does not render a
+disabled vector mask into `-2` — no corpus file shows either way. The
+non-zero rule is AGG's default as `aggdraw` uses it, read from the
+code, not confirmed by a self-intersecting corpus path; the fill-rule
+record is ignored, as psd-tools ignores it. A leading `-1` operation is
+read as combine (psd-tools raises there). A raster pixel peaks at 10
+bytes (two `f32` planes plus the `f16` result) and is charged 2 budget
+pixels (16 bytes) of `PIXEL_BUDGET` (review revision, G7). The decode still runs on the UI
+thread (invariant §7.3.4). Flattening loses up to ~(2/3)·0.05 px of area
+per unit perimeter (chords lie inside curves). Test count left at
+2,810 for the coordinator to measure.
+
+*Review revision (judge REVISE 0.77; gate before revision 2,832
+passed, 0 failed, 0 skipped, `AURORA_REQUIRE_GPU=1`; 2,842 after it — 10
+new `aurora-io` tests, counted, not yet re-measured as a full gate).*
+
+- **G1 (unbounded work).** The whole-raster passes were not charged and
+  zero-knot subpaths formed groups that cost a full pass each (~2.2e12
+  operations for 65,530 of them on 4,096²). Now `vector::work_for`
+  charges, before any raster exists: every edge crossing times
+  `1 + log2(edges)`, a step per sub-scanline and two passes over each
+  subpath's box (the per-row resets now touch only that box's columns),
+  three whole-raster passes per group that draws anything, and two for
+  the result. A group that draws nothing is folded into a constant (on a
+  uniform mask its operation is applied to the constant; on a
+  materialised one it is the identity, or a reset to `0` for
+  intersect), so it costs no per-pixel pass — matching psd-tools, whose
+  plane for such a group is all zero. Regression:
+  `a_flood_of_empty_subpaths_costs_no_per_pixel_pass` (65,530 empty
+  subpaths on 2,048², < 5 s asserted, ~ms measured) and
+  `many_drawn_groups_are_refused_by_their_whole_raster_passes`.
+  Corner-to-corner cubics (handles on their anchors) are now one exact
+  segment instead of a Wang-bound split of a straight line.
+- **G2 (per-file work, sort cost).** A `vector::Budget { pixels, work }`
+  is threaded through the whole layer tree; `MAX_FILE_VECTOR_WORK` =
+  2^30 (four masks at the 2^28 per-mask cap). Measured on this machine
+  (release; debug in parentheses): the worst case at the per-mask cap —
+  a 4,096-edge zigzag spanning a 4,096 × 256 canvas, work 242,291,218 —
+  **0.21 s in order and 0.51 s with the crossings shuffled** (0.22 s /
+  0.82 s); a file of five such masks converts four and reports one, the
+  whole open taking **2.03 s** (3.37 s). (Round 2 found parsing and
+  flattening were still outside this budget — see below; the bounded
+  ceilings are restated there.) A legitimate cost: a full-canvas mask costs
+  ~7 work per pixel, so a single mask is refused past ~38 Mpx (about
+  6,000²) and one file converts only ~150 Mpx of vector-mask raster in
+  all; past that, the mask is reported "too large or complex".
+- **G3.** With the vector mask applied, densities are no longer reported;
+  a feather is, as a new "uses a feather" line — also on a vector-only
+  layer with no `-2` channel (previously missed: G8's second question).
+- **G4.** When a vector mask cannot be converted and `-2` is flagged as
+  Photoshop's rendering, the report now says that rendering (pixel and
+  vector mask combined) was applied, and that the pixel mask on its own
+  (`-3`) isn't kept — instead of "areas the mask hides are visible" and
+  "the combined version isn't used".
+- **G5.** `corpus_masks_with_both_densities_are_the_product_of_each_part`:
+  for `mask-density-layervectormask.psd`'s density 64/128/191 layers,
+  Aurora's coverage against `(d_u·U + 1 − d_u)(d_v·V + 1 − d_v)` from the
+  decoded `-3` plane and the vector plane — max |Δ| 0.00024 (f16).
+- **G6.** Every pixel charge (raster, `-3`, combined rectangle) is
+  refunded when a layer falls back; spent work is not.
+- **G7.** A raster pixel is charged 2 budget pixels (16 bytes) against a
+  10-byte peak; the docs now say which allocations are fallible (input-
+  sized lists, polygons, edges, planes, result) and which grow normally
+  (per-group index lists, a fill's active and crossing lists — bounded by
+  the record cap and one polygon's edges).
+- **G8.** psd-tools' `Subpath.read` reads its `length` following
+  records as items, whatever their selector, so fill-rule, clipboard and
+  initial-fill records inside a subpath count toward its knots (as
+  Aurora already did); an initial-fill record there is a subpath item
+  that `VectorMask` never reads, so Aurora no longer takes it as the
+  path's initial fill. A length record inside a subpath (which
+  psd-tools would read as a nested subpath) is still unreadable here.
+
+Mutations, revision round: 28 run, 28 killed (one, "segment cap
+removed", first survived because the new work cap made it redundant on
+the existing test; a raster-less 2 Mi-segment path now kills it):
+
+| # | Mutation | Killed by |
+|---|---|---|
+| 16 | raster not charged | `the_raster_is_charged_…`, `a_layer_that_falls_back_…` |
+| 17 | group passes uncharged | `many_drawn_groups_…`, `the_work_estimate_…` |
+| 18 | sort uncharged | `the_work_estimate_…`, worst case, per-file |
+| 19 | per-file budget ignored | `one_files_vector_masks_share_…`, per-file, budget test |
+| 20 | empty-group folding disabled | `a_flood_of_empty_subpaths_…` |
+| 21 | box passes uncharged | `the_work_estimate_counts_every_pass_the_fill_makes` |
+| 22 | fallback refund removed | `a_layer_that_falls_back_gets_its_pixel_charges_back` |
+| 23 | applied densities reported | `applied_densities_are_not_reported_…` |
+| 24 | rendered-combination wording dropped | `an_unconvertible_vector_mask_falls_back_…` |
+| 25 | initial fill read inside a subpath | parser test |
+| 26 | vector feather unreported | `applied_densities_are_not_reported_…` |
+| 27 | straight-edge exact flattening removed | work estimate, worst case, per-file |
+| 28 | fallback note ignores the rendering | `an_unconvertible_vector_mask_falls_back_…` |
+| 13 | segment cap removed (re-run) | `too_many_records_or_segments_…` (new case) |
+
+The original 1–15 were re-run and are all still killed; none was run
+against the app test.
+
+*Review revision, round 2 (judge REVISE 0.85; gate before it 2,842
+passed, 0 failed, 0 skipped; 2,845 after it — 3 new `aurora-io` tests,
+counted, not re-measured as a full gate).*
+
+- **Parsing and flattening are charged to the file's work budget**
+  (blocking). `vector_for` charges one unit per 26-byte record (plus
+  one) *before* parsing and refuses when that does not fit, so once the
+  file's 2^30 is spent no further vector mask is parsed at all.
+  `rasterize` counts the segments the path will flatten into
+  (`segment_total`, the same Wang bounds as `flatten`, no allocation),
+  refuses past `MAX_FLATTENED_SEGMENTS` or the file's remaining work,
+  and charges `SEGMENT_CHARGE` = 8 units per segment *before*
+  flattening — kept even when a later bound refuses, since the work is
+  done, and taken on the off-canvas `area == 0` path too, which had
+  cost nothing. The weight is measured, not guessed: at 1 unit per
+  segment a file of flattening-heavy masks took 8.3 s; one segment costs
+  ~8 ns (release), about eight scanline units. Regressions:
+  `parsing_and_flattening_draw_on_the_files_work_budget` (50 off-canvas
+  layers, a budget for three: 3 converted, 47 refused unparsed, < 5 s),
+  `an_off_canvas_mask_is_charged_exactly_its_parse_and_flattening`
+  (exact charge; a budget one short refuses with only the parse kept),
+  and the env-gated `the_worst_case_of_parsing_and_flattening_at_the_file_budget`
+  (`AURORA_PSD_WORST_CASE=1`).
+- **Measured hostile ceilings** (release, this machine, UI thread):
+  one mask at the scanline cap 0.50 s (shuffled crossings; 0.20 s in
+  order); a file of scanline-heavy masks (four convert, the fifth is
+  refused) 2.07 s; a ~117 MB file of 1,100 off-canvas masks of ≈2^20
+  segments each (127 convert, 973 refused) 1.15 s for the whole open.
+  Those are what the work budget bounds. **Bounded only by the pixel
+  budget, not the work budget:** `combine_masks`, one multiply per pixel
+  of its rectangle (at most the region, charged to the pixels), and the
+  decode of a `-3` real user mask (charged to the pixels; ZIP may cost
+  ~2,000× its bytes, as for any channel). Neither was measured at the
+  2^28-pixel extreme.
+- **Charge accuracy.** The result passes are now charged as three (two
+  planes and the result), not two; box sides round up by a pixel or two,
+  so a box is charged its area plus about its perimeter, never less.
+  `MAX_RASTER_WORK`'s doc now lists everything `work_for` counts; an
+  orphaned doc fragment that opened `Budget`'s doc is gone.
+- **G5 honesty.** The both-densities corpus test now fails on a `NaN`
+  (as does the Photoshop differential) and is described as what it is:
+  a self-consistency check of `combine_masks`' arithmetic, since its
+  oracle reuses Aurora's own vector raster.
+- **Wording.** The fallback line for a layer with both masks no longer
+  claims the saved mask is "the combination of the two" (unverified for
+  a disabled vector mask): it says the mask Photoshop saved already
+  rendered is applied as one pixel mask.
+
+Mutations, round 3 (backed up, restored, sha256 checked): parse charge
+removed — killed (`an_off_canvas_mask_is_charged_exactly_…`); early
+refusal before parsing removed — killed
+(`parsing_and_flattening_draw_on_the_files_work_budget`); flattening
+charge removed — killed (4 tests); flattening pre-check against the file
+budget removed — killed (`an_off_canvas_mask_…`, after a first run where
+it survived because no test reached it); off-canvas path refunded its
+charge — killed (`parsing_and_flattening_…`); three result passes
+charged as two — killed (`the_work_estimate_…`). The earlier 28 were
+re-run against this tree: 27 killed; "segment cap removed" survived
+because `flatten` re-checked the same cap the new pre-flatten count
+already enforces. The redundant inner check was removed, and the
+mutation re-run against the one remaining check is killed
+(`too_many_records_or_segments_are_bounded_and_reported`). 34 of 34
+killed.
+
+*Review revision, round 3 — measured.* Full gate on the round-3 tree,
+RTX 3090, `AURORA_REQUIRE_GPU=1`: fmt, layering, style lint,
+`check --locked`, clippy `-D warnings`, 2,845 passed, 0 failed, strict
+rustdoc and `cargo deny` all green. Judge round 3: **PASS 0.91**, no
+blocking issue (the round-2 blocker — parsing and flattening outside the
+file budget — confirmed closed; `segment_total` was read to agree
+exactly with `flatten`'s real count). Its follow-ups, applied before the
+commit: the heavy worst-case test is now `#[ignore]`d instead of
+printing `SKIPPED` (that word is this workspace's "a real-GPU test did
+not run" signal), which moves it from the passed to the ignored count —
+**2,844 passed, 46 ignored** from here; a stale "one per segment"
+comment and the "Latest" mutation count corrected. Disclosed, not
+changed: a mask refused at the pre-flatten check keeps only its parse
+charge (one unit per record), which under-weights parsing plus
+`segment_total` by a constant factor — bounded by input size (at most
+2^30 records per file, ≈ 28 GB of `vmsk` data), not measured.
+
+**Needs a human: compare a vector-masked PSD against Photoshop.**
+
+**Suggested next (0.151.0): decode PSDs off the UI thread and stream
+through the tile store.**
 
 **Addendum 2026-10-09 (0.149.0) — PSD mask density applied, and
 editable.** Done as the 0.147.0 disclosures asked. **Choice: a stored

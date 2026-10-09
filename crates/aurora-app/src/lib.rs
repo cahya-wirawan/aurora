@@ -537,6 +537,12 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+mod background_open;
+use background_open::{
+    BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
+    background_open_step,
+};
+
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
 const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
 const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
@@ -935,6 +941,101 @@ fn open_psd_document(bytes: &[u8]) -> Result<aurora_io::PsdDocument, OpenFailure
     aurora_io::read_psd(bytes).map_err(OpenFailure::Decode)
 }
 
+/// The background half of every open (0.151.0): reads the chosen file
+/// and decodes it by its route ([`open_route`]) into plain `Send` data
+/// for the UI thread to install. Runs on an [`OpenWorker`] thread, never
+/// on the UI thread, and touches no live state: a flat image is decoded
+/// ([`open_image`]), a PSD/PSB is decoded whole ([`open_psd_document`]),
+/// and a `.aur` file is read and **pre-checked in a throwaway store**
+/// ([`precheck_aur`]) — its live read waits for the UI thread, so 0.143.1's
+/// rule that damaged bytes never reach the live store still holds.
+fn decode_chosen_file(path: &Path) -> Result<DecodedFile, OpenFailure> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|err| {
+            tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
+            OpenFailure::Read(err)
+        })
+    };
+    match open_route(path) {
+        OpenRoute::Image => open_image(path).map(DecodedFile::Image),
+        OpenRoute::Psd => {
+            let bytes = read(path)?;
+            open_psd_document(&bytes).map(DecodedFile::Psd)
+        }
+        OpenRoute::Aur => {
+            let bytes = read(path)?;
+            precheck_aur(&bytes)?;
+            Ok(DecodedFile::Aur(bytes))
+        }
+    }
+}
+
+/// The window's own title when no open is pending.
+const WINDOW_TITLE: &str = "Aurora";
+
+/// The "Opening `<file>`…" sentence an open still decoding shows (0.151.0)
+/// — the window title's prefix and the accessibility status node's label.
+fn opening_status_text(path: &Path) -> String {
+    format!("Opening {}\u{2026}", display_file_name(path))
+}
+
+/// The window title for `opening`, the file still decoding if any
+/// (0.151.0): `"Opening photo.psd… — Aurora"`, else plain `"Aurora"`.
+fn window_title(opening: Option<&Path>) -> String {
+    opening.map_or_else(
+        || WINDOW_TITLE.to_owned(),
+        |path| format!("{} \u{2014} {WINDOW_TITLE}", opening_status_text(path)),
+    )
+}
+
+/// The accessibility node id of the "Opening …" status (0.151.0). Not a
+/// widget: widget ids count up from zero, so the top of the range is
+/// never one of theirs.
+const OPENING_STATUS_NODE: accesskit::NodeId = accesskit::NodeId(u64::MAX);
+
+/// Adds the "Opening `<file>`…" status to `update` while `opening` is
+/// pending (0.151.0): a `Role::Status` node with a polite live region,
+/// appended as the last child of `root`, so a screen reader announces
+/// the open without taking focus. With nothing pending `update` is
+/// returned unchanged, and the node — no longer anyone's child — leaves
+/// the tree, which is how the state is cleared for assistive technology.
+fn with_opening_status(
+    mut update: accesskit::TreeUpdate,
+    root: WidgetId,
+    opening: Option<&Path>,
+) -> accesskit::TreeUpdate {
+    let Some(path) = opening else {
+        return update;
+    };
+    let Some((_, root_node)) = update.nodes.iter_mut().find(|(id, _)| *id == root) else {
+        return update;
+    };
+    root_node.push_child(OPENING_STATUS_NODE);
+    let mut status = accesskit::Node::new(accesskit::Role::Status);
+    status.set_label(opening_status_text(path));
+    status.set_live(accesskit::Live::Polite);
+    update.nodes.push((OPENING_STATUS_NODE, status));
+    update
+}
+
+/// The event loop's own user event (0.151.0). `accesskit_winit` needs
+/// its events delivered through the loop's proxy (`From` below), and a
+/// background open wakes the loop the same way when its decode is done.
+#[derive(Debug)]
+enum AppEvent {
+    /// An accessibility event from `accesskit_winit`.
+    Accessibility(accesskit_winit::Event),
+    /// A background open finished; [`App::poll_background_open`]
+    /// installs it on the next `about_to_wait`.
+    OpenFinished,
+}
+
+impl From<accesskit_winit::Event> for AppEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Accessibility(event)
+    }
+}
+
 /// The "Opened With Changes" dialog's title (0.144.0).
 const PSD_REPORT_TITLE: &str = "Opened With Changes";
 
@@ -1019,7 +1120,34 @@ fn document_canvas_size(layers: &aurora_doc::LayerTree) -> (u32, u32) {
 /// did not verify", which *deletes the export*. Silently discarding a
 /// professional's save is the worst thing this project can do, so the
 /// degraded case gives up the nesting, not the save.
+///
+/// **One exception (0.151.0): once the session is ending**
+/// (`SESSION_ENDING`, set by `App::finish_shutdown` before its cleanup)
+/// this returns `None` without recreating anything *and without the
+/// independent-temp fallback*, so a detached `.aur` pre-check cannot
+/// re-create and leak the session directory. No save runs after
+/// `finish_shutdown`, so the "deletes the export" path above is not
+/// reachable through it.
 fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
+    aur_verify_scratch_dir_unless(SESSION_ENDING.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Set once by `App::finish_shutdown`, before its cleanup removes this
+/// session's scratch directory (0.151.0 review C1). A decode thread
+/// detached at quit may still reach [`aur_verify_scratch_dir`] for a
+/// `.aur` pre-check; that function recreates a missing session
+/// directory on purpose, which after the cleanup would leak a directory
+/// of paged-out tiles. With this set it refuses instead.
+static SESSION_ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`aur_verify_scratch_dir`] with the [`SESSION_ENDING`] flag passed in,
+/// so a test can drive both sides without touching the process-wide
+/// flag. `None`, creating nothing at all, once the session is ending.
+fn aur_verify_scratch_dir_unless(session_ending: bool) -> Option<tempfile::TempDir> {
+    if session_ending {
+        tracing::info!("the session is ending; not creating a .aur scratch store");
+        return None;
+    }
     let mut builder = tempfile::Builder::new();
     builder.prefix("aur-verify-");
     // Same reasoning as `create_tile_store_scratch_dir`'s own call:
@@ -1230,18 +1358,45 @@ fn aur_scratch_store() -> Option<(tempfile::TempDir, aurora_tile::TileStore)> {
 /// The cost is decoding every tile twice (the pre-check pages them to
 /// its own scratch directory, under a 16-tile memory budget) and holding
 /// the whole file in memory, as the flat-image path already does.
+///
+/// Since 0.151.0 the app runs the two halves on different threads —
+/// [`precheck_aur`] on the background decode thread
+/// ([`decode_chosen_file`]), [`read_prechecked_aur`] on the UI thread at
+/// install — so this composition is what the tests pin; the app performs
+/// the same two steps in the same order, on the same bytes.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the app composes its two halves across threads")
+)]
 fn read_aur_for_open(
     bytes: &[u8],
     store: &mut aurora_tile::TileStore,
 ) -> Result<aurora_io::AurDocument, OpenFailure> {
-    {
-        let Some((_scratch_dir, mut scratch)) = aur_scratch_store() else {
-            return Err(OpenFailure::NoTileStorage);
-        };
-        aurora_io::read_aur(std::io::Cursor::new(bytes), &mut scratch).map_err(OpenFailure::Aur)?;
-        // `scratch` and its directory drop here, before the live read
-        // starts, so the two never hold the file's tiles at once.
-    }
+    precheck_aur(bytes)?;
+    read_prechecked_aur(bytes, store)
+}
+
+/// [`read_aur_for_open`]'s first half: reads `bytes` into a throwaway
+/// store ([`aur_scratch_store`]) and throws the result away. Touches no
+/// live store, so it is safe on the background decode thread (0.151.0);
+/// the throwaway store is created, used and dropped on that thread.
+fn precheck_aur(bytes: &[u8]) -> Result<(), OpenFailure> {
+    let Some((_scratch_dir, mut scratch)) = aur_scratch_store() else {
+        return Err(OpenFailure::NoTileStorage);
+    };
+    aurora_io::read_aur(std::io::Cursor::new(bytes), &mut scratch).map_err(OpenFailure::Aur)?;
+    // `scratch` and its directory drop here, before any live read
+    // starts, so the two never hold the file's tiles at once.
+    Ok(())
+}
+
+/// [`read_aur_for_open`]'s second half: reads bytes that already passed
+/// [`precheck_aur`] into the **live** `store`. Only ever called with
+/// bytes that came back from that check ([`DecodedFile::Aur`]).
+fn read_prechecked_aur(
+    bytes: &[u8],
+    store: &mut aurora_tile::TileStore,
+) -> Result<aurora_io::AurDocument, OpenFailure> {
     aurora_io::read_aur(std::io::Cursor::new(bytes), store).map_err(OpenFailure::AurAfterCheck)
 }
 
@@ -2497,6 +2652,10 @@ enum OpenFailure {
     /// There is nowhere to read a `.aur` document's tiles into: no live
     /// tile store this session, or no scratch store for the pre-check.
     NoTileStorage,
+    /// The background decode itself failed rather than the file
+    /// (0.151.0): its thread could not be started, or the decode
+    /// panicked and the panic was caught ([`background_open`]).
+    Background(BackgroundFailure),
 }
 
 /// The sentence every refused open ends with — except
@@ -2675,6 +2834,19 @@ fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure)
         OpenFailure::NoTileStorage => format!(
             "Aurora couldn't open \"{file_name}\" because this session has no storage for image \
              data available."
+        ),
+        OpenFailure::Background(BackgroundFailure::Spawn(err)) => format!(
+            "Aurora couldn't start reading \"{file_name}\". Details: {}.",
+            display_error_detail(err)
+        ),
+        OpenFailure::Background(BackgroundFailure::Busy) => format!(
+            "Aurora is still reading files you opened earlier, so it can't start opening \
+             \"{file_name}\" yet. Try again once the current open has finished."
+        ),
+        OpenFailure::Background(BackgroundFailure::Panicked(detail)) => format!(
+            "Aurora ran into an internal error while reading \"{file_name}\" and stopped. \
+             Details: {}.",
+            display_error_detail(detail)
         ),
     };
     format!("{body} {OPEN_FAILED_UNCHANGED}")
@@ -17509,7 +17681,10 @@ struct App {
     gpu: Option<GpuContext>,
     surface: Option<GpuSurface<'static>>,
     adapter: Option<accesskit_winit::Adapter>,
-    proxy: EventLoopProxy<accesskit_winit::Event>,
+    proxy: EventLoopProxy<AppEvent>,
+    /// The open still decoding on a background thread, if any, and the
+    /// channel its result comes back on (0.151.0).
+    open_worker: OpenWorker,
     /// The real workspace layout (`aurora_ui::build_workspace` — canvas
     /// area + the Layers/Properties/History dock, matching the
     /// owner-approved workspace mockup) — a static structure for now,
@@ -17975,6 +18150,30 @@ impl ShutdownState for App {
     }
 }
 
+impl OpenInstaller for App {
+    fn open_worker(&mut self) -> &mut OpenWorker {
+        &mut self.open_worker
+    }
+
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    fn show_open_state(&mut self) {
+        Self::show_open_state(self);
+    }
+
+    fn install(&mut self, finished: FinishedOpen) {
+        self.install_finished_open(finished);
+        // The install rebuilt the panels and may have opened a dialog;
+        // nothing else relays out on this path (it is not a key event).
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+    }
+}
+
 impl App {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -17986,7 +18185,7 @@ impl App {
     // trade `aurora_doc::history` and the GPU test modules already make.
     #[allow(clippy::too_many_lines)]
     fn new(
-        proxy: EventLoopProxy<accesskit_winit::Event>,
+        proxy: EventLoopProxy<AppEvent>,
         theme: Theme,
         background: wgpu::Color,
         scales: Scales,
@@ -18085,6 +18284,7 @@ impl App {
             surface: None,
             adapter: None,
             proxy,
+            open_worker: OpenWorker::default(),
             workspace,
             focus,
             shortcuts: default_shortcuts(),
@@ -18164,7 +18364,10 @@ impl App {
         };
         let tree = &self.workspace.tree;
         let focused = self.focus.focused().unwrap_or(self.workspace.root);
-        adapter.update_if_active(|| tree.accessibility_update(focused));
+        let opening = self.open_worker.pending_path();
+        adapter.update_if_active(|| {
+            with_opening_status(tree.accessibility_update(focused), tree.root(), opening)
+        });
     }
 
     /// An assistive technology's `accesskit::ActionRequest`: a thin
@@ -18545,6 +18748,17 @@ impl App {
         self.open_file(path);
     }
 
+    /// **Since 0.151.0 this only starts the open** (invariant §7.3.4):
+    /// the read and decode run on a background thread
+    /// ([`OpenWorker::start`] with [`decode_chosen_file`]), the window
+    /// shows and announces "Opening `<file>`…" ([`Self::show_open_state`]),
+    /// and the loop installs the result when the thread wakes it
+    /// ([`AppEvent::OpenFinished`], [`Self::poll_background_open`]). A
+    /// second open while one is pending supersedes it (newest wins); the
+    /// current document stays editable meanwhile, and those edits are
+    /// discarded when the new document replaces it. Everything below
+    /// describes the install, which is unchanged.
+    ///
     /// Opens `path` as a real document — a real, multi-layer `.aur` file
     /// ([`Self::open_aur_file`]) if the extension names one, otherwise a
     /// flat image ([`open_image`]) replacing the current document with a
@@ -18578,31 +18792,98 @@ impl App {
     /// the previous document's pixels to be composited onto a smaller
     /// new one and persisted into this very call's own autosave.
     fn open_file(&mut self, path: &Path) {
-        // A live opacity drag belongs to the document being replaced.
-        self.commit_layer_controls_drag();
-        match open_route(path) {
-            OpenRoute::Aur => {
-                self.open_aur_file(path);
-                return;
+        let proxy = self.proxy.clone();
+        let wake = move || {
+            // `Err` only once the loop has exited (quitting): there is
+            // nothing left to wake.
+            let _ = proxy.send_event(AppEvent::OpenFinished);
+        };
+        match self
+            .open_worker
+            .start(path.to_path_buf(), decode_chosen_file, wake)
+        {
+            Ok(generation) => {
+                tracing::info!(path = %path.display(), generation, "opening a file in the background");
             }
-            OpenRoute::Psd => {
-                self.open_psd_file(path);
-                return;
-            }
-            OpenRoute::Image => {}
+            Err(failure) => self.report_open_failure(path, &failure),
         }
-        let image = match open_image(path) {
-            Ok(image) => image,
+        self.show_open_state();
+    }
+
+    /// Mirrors the worker's pending open (0.151.0) into the window title
+    /// ([`window_title`]) and the accessibility tree
+    /// ([`with_opening_status`], through [`Self::push_accessibility`]),
+    /// and asks for a frame. Called when an open starts and again when
+    /// one finishes, before its install, so the state is cleared on
+    /// every outcome — success, failure, or a caught panic.
+    fn show_open_state(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&window_title(self.open_worker.pending_path()));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
+    /// Installs a background open whose result has arrived, if any
+    /// (0.151.0) — `about_to_wait`'s step, woken by
+    /// [`AppEvent::OpenFinished`], through [`background_open_step`]: a
+    /// superseded open's result never gets here
+    /// ([`OpenWorker::take_finished`] drops it by generation), and while a
+    /// modal dialog is open nothing is installed — the finished open waits
+    /// in the worker until the first iteration after the dialog closes.
+    fn poll_background_open(&mut self) {
+        if background_open_step(self) == OpenStep::Installed {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// The UI-thread half of an open (0.151.0): reports a failure
+    /// ([`Self::report_open_failure`], the same messages as before), or
+    /// installs the decoded file the way the synchronous path did —
+    /// [`Self::open_image_file`], [`Self::open_psd_file`] or
+    /// [`Self::open_aur_file`]. Edits made to the current document while
+    /// the decode ran are discarded with it, exactly as an open always
+    /// replaced the document.
+    fn install_finished_open(&mut self, finished: FinishedOpen) {
+        let FinishedOpen {
+            generation,
+            path,
+            result,
+            decode_time,
+        } = finished;
+        let decoded = match result {
+            Ok(decoded) => decoded,
             Err(failure) => {
-                self.report_open_failure(path, &failure);
+                self.report_open_failure(&path, &failure);
                 return;
             }
         };
+        let started = std::time::Instant::now();
+        // A live opacity drag belongs to the document being replaced.
+        self.commit_layer_controls_drag();
+        match decoded {
+            DecodedFile::Image(image) => self.open_image_file(&path, &image),
+            DecodedFile::Psd(document) => self.open_psd_file(&path, document),
+            DecodedFile::Aur(bytes) => self.open_aur_file(&path, &bytes),
+        }
+        tracing::info!(
+            path = %path.display(),
+            generation,
+            decode_ms = decode_time.as_secs_f64() * 1e3,
+            install_ms = started.elapsed().as_secs_f64() * 1e3,
+            "installed a background open"
+        );
+    }
+
+    /// Installs a decoded flat image (0.151.0: the second half of what
+    /// [`Self::open_file`] did synchronously until then) as a fresh,
+    /// single-layer document sized to it.
+    fn open_image_file(&mut self, path: &Path, image: &aurora_io::Image) {
         let name = path
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image");
-        let (layers, history, layer_id) = document_from_image(name, &image);
+        let (layers, history, layer_id) = document_from_image(name, image);
         // The image's own real, decoded dimensions -- known exactly
         // here, rather than derived back out of the one layer just
         // built from it (`document_canvas_size`'s own fallback role).
@@ -18610,7 +18891,7 @@ impl App {
         let Some(unwritten) = self.install_opened_document(
             layers,
             history,
-            &[(layer_id, &image, (0, 0))],
+            &[(layer_id, image, (0, 0))],
             &[],
             canvas_size,
         ) else {
@@ -18642,24 +18923,11 @@ impl App {
     /// (adjustment layers, masks, clipping, effects, ...) gets the
     /// itemised [`PSD_REPORT_TITLE`] dialog ([`psd_report_message`]);
     /// one shown faithfully opens with no dialog.
-    fn open_psd_file(&mut self, path: &Path) {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
-                self.report_open_failure(path, &OpenFailure::Read(err));
-                return;
-            }
-        };
-        let document = match open_psd_document(&bytes) {
-            Ok(document) => document,
-            Err(failure) => {
-                tracing::warn!(path = %path.display(), ?failure, "failed to decode the chosen PSD");
-                self.report_open_failure(path, &failure);
-                return;
-            }
-        };
-        drop(bytes);
+    ///
+    /// Since 0.151.0 the read and decode happen on the background thread
+    /// ([`decode_chosen_file`]); this is handed the decoded `document`
+    /// and does only the install, on the UI thread.
+    fn open_psd_file(&mut self, path: &Path, document: aurora_io::PsdDocument) {
         let aurora_io::PsdDocument {
             layers,
             history,
@@ -18908,8 +19176,13 @@ impl App {
     /// elided as blank (0.82.1). PLAN.md's 0.82.1 addendum has the full
     /// account, including why closing the rest needs an architectural
     /// change rather than a patch here.
-    fn open_aur_file(&mut self, path: &Path) {
-        self.commit_layer_controls_drag();
+    ///
+    /// Since 0.151.0 the file is read and pre-checked on the background
+    /// thread ([`decode_chosen_file`], [`precheck_aur`]); this is handed
+    /// the checked `bytes`, and its live read ([`read_prechecked_aur`])
+    /// still runs here, on the UI thread, because the live store is the
+    /// UI thread's.
+    fn open_aur_file(&mut self, path: &Path, bytes: &[u8]) {
         // Before the read, not after it as until 0.143.1: once the live
         // read has succeeded the current document's aliased tiles are
         // already overwritten, so every refusal that can still happen
@@ -18921,7 +19194,7 @@ impl App {
                 return;
             }
         };
-        let Some(document) = self.read_chosen_aur(path) else {
+        let Some(document) = self.read_chosen_aur(path, bytes) else {
             return;
         };
         // The profile (`_profile`) is a real, checked value now
@@ -19052,11 +19325,10 @@ impl App {
     /// pre-check. `None` once every refusal on the way — no live store,
     /// an unreadable file, a damaged or unsupported container — has been
     /// logged and shown ([`Self::report_open_failure`]).
-    fn read_chosen_aur(&mut self, path: &Path) -> Option<aurora_io::AurDocument> {
-        let read = match (self.tile_store.as_mut(), std::fs::read(path)) {
-            (None, _) => Err(OpenFailure::NoTileStorage),
-            (Some(_), Err(err)) => Err(OpenFailure::Read(err)),
-            (Some(store), Ok(bytes)) => read_aur_for_open(&bytes, store),
+    fn read_chosen_aur(&mut self, path: &Path, bytes: &[u8]) -> Option<aurora_io::AurDocument> {
+        let read = match self.tile_store.as_mut() {
+            None => Err(OpenFailure::NoTileStorage),
+            Some(store) => read_prechecked_aur(bytes, store),
         };
         match read {
             Ok(document) => Some(document),
@@ -20280,6 +20552,23 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // A decode still running is abandoned, never waited on for long
+        // (0.151.0): joined if it finishes within the bound, detached
+        // otherwise. A second call (both exit paths run this) finds
+        // nothing and returns at once.
+        // Before the cleanup below removes the scratch directory, so a
+        // detached `.aur` pre-check cannot recreate it (review C1).
+        SESSION_ENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = self
+            .open_worker
+            .shutdown(background_open::SHUTDOWN_JOIN_BOUND);
+        if report.detached > 0 {
+            tracing::info!(
+                detached = report.detached,
+                joined = report.joined,
+                "quit with a file still decoding; its thread was detached"
+            );
+        }
         run_shutdown_cleanup(self);
     }
 
@@ -21181,7 +21470,7 @@ const MUDA_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 const MIN_WINDOW_WIDTH: f64 = 640.0;
 const MIN_WINDOW_HEIGHT: f64 = 480.0;
 
-impl ApplicationHandler<accesskit_winit::Event> for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -21192,7 +21481,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // (`spike/a11y-ime/FINDINGS.md` finding #1) — this is that
         // ordering, as real production code, not a spike anymore.
         let attrs = Window::default_attributes()
-            .with_title("Aurora")
+            .with_title(window_title(self.open_worker.pending_path()))
             .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(
@@ -21283,7 +21572,17 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         self.push_accessibility();
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, event: accesskit_winit::Event) {
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
+        let event = match event {
+            AppEvent::Accessibility(event) => event,
+            AppEvent::OpenFinished => {
+                // Installed by `about_to_wait`, which runs after this on
+                // the same iteration: the wake's whole job is to end the
+                // loop's `Wait` so that it does.
+                self.needs_redraw = true;
+                return;
+            }
+        };
         match event.window_event {
             accesskit_winit::WindowEvent::InitialTreeRequested => {
                 // `Adapter::with_event_loop_proxy` can't synchronously
@@ -21436,6 +21735,11 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 self.apply_resize((size.width, size.height));
             }
         }
+
+        // A background open whose decode finished (0.151.0) is installed
+        // here, on the UI thread, before everything below mirrors the
+        // document -- so the controls follow the new one this iteration.
+        self.poll_background_open();
 
         // The gallery tooltip's timer: tick first, then read the next
         // deadline, so a deadline that just passed is consumed.
@@ -21590,7 +21894,7 @@ pub fn run() -> anyhow::Result<()> {
     let autosave_path = autosave_path();
     let layout_path = layout_path();
 
-    let event_loop = EventLoop::<accesskit_winit::Event>::with_user_event()
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .map_err(|err| anyhow::anyhow!("event loop creation failed: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -25276,6 +25580,8 @@ mod tests {
         rect: (i32, i32, i32, i32),
         channels: Vec<(i16, Vec<u8>)>,
         mask: Option<(i32, i32, i32, i32, u8, u8)>,
+        /// Tagged blocks after the name (0.150.0: a `vmsk`).
+        blocks: Vec<([u8; 4], Vec<u8>)>,
     }
 
     /// A minimal, uncompressed 8-bit PSD (0.147.0) — just enough of the
@@ -25333,6 +25639,12 @@ mod tests {
             }
             be32(&mut extra, 0);
             extra.extend_from_slice(&[1, b'L', 0, 0]);
+            for (key, data) in &layer.blocks {
+                extra.extend_from_slice(b"8BIM");
+                extra.extend_from_slice(key);
+                be32(&mut extra, data.len());
+                extra.extend_from_slice(data);
+            }
             be32(&mut info, extra.len());
             info.extend_from_slice(&extra);
         }
@@ -25366,6 +25678,7 @@ mod tests {
                 (2, vec![rgb[2]; n]),
             ],
             mask: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -25456,6 +25769,59 @@ mod tests {
         }
     }
 
+    /// 0.150.0: a PSD vector mask is rasterised and composited — a blue
+    /// layer masked by the rectangle x 2.5..6, y 2..6 (normalised in the
+    /// file's 8.24 fixed point, vertical first) over a red one on 8×8:
+    /// blue inside, red outside, an even mix in the half-covered column.
+    #[test]
+    fn an_opened_psds_vector_mask_is_composited() {
+        let fixed = |v: f64| ((v * f64::from(1_u32 << 24)).round() as i32).to_be_bytes();
+        let mut block = 3_u32.to_be_bytes().to_vec();
+        block.extend_from_slice(&0_u32.to_be_bytes());
+        let mut subpath = vec![0_u8, 0, 0, 4, 0, 1];
+        subpath.resize(26, 0);
+        block.extend_from_slice(&subpath);
+        for (x, y) in [(0.3125, 0.25), (0.75, 0.25), (0.75, 0.75), (0.3125, 0.75)] {
+            block.extend_from_slice(&1_u16.to_be_bytes());
+            for _ in 0..3 {
+                block.extend_from_slice(&fixed(y));
+                block.extend_from_slice(&fixed(x));
+            }
+        }
+        let (_scratch, mut store) = real_tile_store();
+        let mut top = tiny_solid((0, 0, 8, 8), [0, 0, 255]);
+        top.blocks.push((*b"vmsk", block));
+        let bytes = tiny_psd(8, 8, 3, &[tiny_solid((0, 0, 8, 8), [255, 0, 0]), top]);
+        let (document, image) = open_and_composite_psd(
+            &bytes,
+            &mut store,
+            (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+        );
+        assert!(
+            document
+                .report
+                .items
+                .iter()
+                .any(|item| item.contains("converted to a pixel mask")),
+            "{:?}",
+            document.report
+        );
+        for (x, y, m) in [
+            (0, 0, 0.0),
+            (1, 4, 0.0),
+            (2, 4, 0.5),
+            (3, 2, 1.0),
+            (5, 5, 1.0),
+            (6, 5, 0.0),
+            (4, 6, 0.0),
+            (7, 7, 0.0),
+        ] {
+            let want = [1.0 - m, 0.0, m, 1.0];
+            let got = image_pixel(&image, x, y);
+            assert!(near(got, want), "({x}, {y}): {got:?}");
+        }
+    }
+
     /// 0.147.0, the aliasing trap: the outgoing document's layer 0 had a
     /// mask painted fully hidden on the same derived mask surface the
     /// incoming PSD's layer 0 gets. The sweep must run first (no stale
@@ -25535,6 +25901,7 @@ mod tests {
                 (-2, vec![0]),
             ],
             mask: Some((1, 1, 2, 2, 255, 0)),
+            blocks: Vec::new(),
         };
         let (_document, image) = open_and_composite_psd(
             &tiny_psd(2, 2, 1, &[layer]),
@@ -60644,6 +61011,682 @@ mod tests {
             assert_eq!(rig.tool, Tool::Eraser, "the shortcut fired");
             assert_eq!(rig.slider(), (24.0, false));
         }
+    }
+    // ---- 0.151.0: opening a file off the UI thread ----
+
+    use crate::background_open;
+    use crate::{
+        DecodedFile, OPENING_STATUS_NODE, OpenWorker, ToolSettings, decode_chosen_file,
+        read_prechecked_aur, window_title, with_opening_status,
+    };
+    use crate::{OpenStep, PSD_REPORT_TITLE, aur_verify_scratch_dir_unless, background_open_step};
+
+    /// Runs the app's own background half ([`decode_chosen_file`]) for
+    /// `path` on a real [`OpenWorker`] thread and waits for its wake —
+    /// the test stand-in for the event loop's `AppEvent::OpenFinished`.
+    fn open_in_background(path: &std::path::Path) -> background_open::FinishedOpen {
+        let mut worker = OpenWorker::default();
+        let (woken_tx, woken) = std::sync::mpsc::channel();
+        if let Err(failure) = worker.start(path.to_path_buf(), decode_chosen_file, move || {
+            let _ = woken_tx.send(());
+        }) {
+            unreachable!("{failure:?}");
+        }
+        assert_eq!(worker.pending_path(), Some(path), "the open is pending");
+        assert!(
+            woken
+                .recv_timeout(std::time::Duration::from_mins(2))
+                .is_ok(),
+            "the background open never woke the loop"
+        );
+        let Some(finished) = worker.take_finished() else {
+            unreachable!("a woken open has a result");
+        };
+        assert_eq!(worker.pending_path(), None, "taken: nothing is pending");
+        finished
+    }
+
+    fn write_temp_file(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        if let Err(err) = std::fs::write(&path, bytes) {
+            unreachable!("{err:?}");
+        }
+        path
+    }
+
+    /// Every layer's structure, in paint order, as comparable text.
+    fn layer_summary(layers: &aurora_doc::LayerTree) -> Vec<String> {
+        layers
+            .paint_order()
+            .into_iter()
+            .map(|id| {
+                format!(
+                    "{id:?} parent={:?} name={:?} kind={:?} opacity={:?} fill={:?} blend={:?} \
+                     bounds={:?} visible={:?} mask={:?} surface={:?}",
+                    layers.parent(id),
+                    layers.name(id),
+                    layers.kind(id),
+                    layers.opacity(id),
+                    layers.fill_opacity(id),
+                    layers.blend_mode(id),
+                    layers.bounds(id),
+                    layers.visible(id),
+                    layers.mask(id),
+                    layers.surface_id(id),
+                )
+            })
+            .collect()
+    }
+
+    /// A two-layer PSD with a layer mask and a layer-effects block, so
+    /// the open has pixels, mask coverage and an "Opened With Changes"
+    /// report item to compare.
+    fn two_layer_masked_psd_with_effects() -> Vec<u8> {
+        let bottom = tiny_solid((0, 0, 8, 6), [255, 0, 0]);
+        let mut top = TinyLayer {
+            mask: Some((1, 2, 5, 6, 0, 0)),
+            blocks: vec![(*b"lfx2", vec![0; 8])],
+            ..tiny_solid((1, 1, 6, 4), [0, 0, 255])
+        };
+        // A 4×4 mask plane, a ramp so its coverage is not uniform.
+        top.channels
+            .push((-2, (0..16).map(|i: u8| i.saturating_mul(17)).collect()));
+        tiny_psd(8, 6, 3, &[bottom, top])
+    }
+
+    /// AC-4: the document a background open hands the UI thread is the
+    /// one the synchronous path built — same layers, history journal
+    /// (the History panel's "Open" origin), pixels, masks, report — and,
+    /// written into a store the way the install writes it, composites to
+    /// the same image.
+    #[test]
+    fn a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = two_layer_masked_psd_with_effects();
+        let path = write_temp_file(&dir, "layers.psd", &bytes);
+
+        let finished = open_in_background(&path);
+        assert_eq!(finished.path, path);
+        let background = match finished.result {
+            Ok(DecodedFile::Psd(document)) => document,
+            other => unreachable!("a PSD decodes to a PSD document: {other:?}"),
+        };
+        let synchronous = match open_psd_document(&bytes) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+
+        assert_eq!(background.canvas_size, synchronous.canvas_size);
+        assert_eq!(
+            layer_summary(&background.layers),
+            layer_summary(&synchronous.layers)
+        );
+        assert_eq!(background.layers.len(), 2);
+        assert!(matches!(
+            (background.history.save_journal(), synchronous.history.save_journal()),
+            (Ok(a), Ok(b)) if a == b
+        ));
+        assert_eq!(background.report, synchronous.report);
+        assert!(
+            psd_report_message("layers.psd", &background.report).is_some(),
+            "the Opened With Changes report still reaches the install"
+        );
+        assert_eq!(background.pixels.len(), synchronous.pixels.len());
+        for (a, b) in background.pixels.iter().zip(&synchronous.pixels) {
+            assert_eq!((a.layer, a.offset), (b.layer, b.offset));
+            assert_eq!(a.image.samples(), b.image.samples());
+        }
+        assert_eq!(
+            format!("{:?}", background.masks),
+            format!("{:?}", synchronous.masks)
+        );
+        assert_eq!(background.masks.len(), 1, "the fixture's mask was decoded");
+
+        let empty = || (aurora_doc::LayerTree::new(), aurora_doc::History::new());
+        let (_a_dir, mut a_store) = real_tile_store();
+        let (_b_dir, mut b_store) = real_tile_store();
+        let (_, from_background) = open_and_composite_psd(&bytes, &mut a_store, empty());
+        let (_, from_synchronous) = open_and_composite_psd(&bytes, &mut b_store, empty());
+        assert_eq!(from_background.samples(), from_synchronous.samples());
+    }
+
+    #[test]
+    fn a_background_image_open_decodes_the_same_pixels_as_the_synchronous_path() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = match aurora_io::png::encode(&fake_image(5, 3)) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = write_temp_file(&dir, "photo.png", &bytes);
+        let background = match open_in_background(&path).result {
+            Ok(DecodedFile::Image(image)) => image,
+            other => unreachable!("a PNG decodes to an image: {other:?}"),
+        };
+        let Ok(synchronous) = open_image(&path) else {
+            unreachable!("a real PNG decodes");
+        };
+        assert_eq!(
+            (background.width(), background.height()),
+            (synchronous.width(), synchronous.height())
+        );
+        assert_eq!(background.samples(), synchronous.samples());
+    }
+
+    /// AC-3: 0.143.1's pre-check survives the move off the UI thread. A
+    /// damaged `.aur` is refused *by the background thread*, which never
+    /// holds the live store; a sound one comes back as checked bytes
+    /// that then read into the live store exactly as before.
+    #[test]
+    fn a_background_aur_open_prechecks_in_a_throwaway_store_and_refuses_a_damaged_file() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (damaged, surface) = damaged_aur_sharing_the_first_surface();
+        let damaged_path = write_temp_file(&dir, "damaged.aur", &damaged);
+        match open_in_background(&damaged_path).result {
+            Err(OpenFailure::Aur(aurora_io::IoError::Tile(_))) => {}
+            other => unreachable!("expected the pre-check's refusal, got {other:?}"),
+        }
+
+        // A sound file: a one-layer document written from a red image.
+        let (_source_dir, mut source) = real_tile_store();
+        let red: Vec<half::f16> = (0..16)
+            .flat_map(|_| [1.0, 0.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        let image = match aurora_io::Image::new(4, 4, aurora_color::IccProfile::srgb(), red) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (layers, history, id) = document_from_image("sound", &image);
+        if let Err(err) = aurora_io::write_into_store(&image, &mut source, surface) {
+            unreachable!("{err:?}");
+        }
+        let mut written = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut written,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut source,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let sound_path = write_temp_file(&dir, "sound.aur", written.get_ref());
+        let checked = match open_in_background(&sound_path).result {
+            Ok(DecodedFile::Aur(bytes)) => bytes,
+            other => unreachable!("a sound .aur passes the pre-check: {other:?}"),
+        };
+        assert_eq!(&checked, written.get_ref());
+        let (_live_dir, mut live) = live_store_with_the_current_document(surface);
+        let document = match read_prechecked_aur(&checked, &mut live) {
+            Ok(document) => document,
+            Err(failure) => unreachable!("{failure:?}"),
+        };
+        assert_eq!(document.layers.name(id), Some("sound"));
+        assert_eq!(
+            first_texel(&mut live, surface),
+            texel_bits([1.0, 0.0, 0.0, 1.0])
+        );
+    }
+
+    /// AC-3: a failed background open is the same "Couldn't Open File"
+    /// as before — the same `OpenFailure`, so the same message.
+    #[test]
+    fn a_failed_background_open_raises_the_same_couldnt_open_file_message() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let missing = dir.path().join("gone.png");
+        let background = match open_in_background(&missing).result {
+            Err(failure) => failure,
+            Ok(decoded) => unreachable!("a missing file cannot open: {decoded:?}"),
+        };
+        let Err(synchronous) = open_image(&missing) else {
+            unreachable!("a missing file cannot open")
+        };
+        assert_eq!(
+            open_failure_message("gone.png", "png", &background),
+            open_failure_message("gone.png", "png", &synchronous)
+        );
+        assert!(open_failure_message("gone.png", "png", &background).contains("couldn't find"));
+
+        let garbage = write_temp_file(&dir, "broken.psd", b"8BPS not really a photoshop file");
+        let background = match open_in_background(&garbage).result {
+            Err(failure) => failure,
+            Ok(decoded) => unreachable!("garbage cannot open: {decoded:?}"),
+        };
+        let Err(synchronous) = open_psd_document(b"8BPS not really a photoshop file") else {
+            unreachable!("garbage cannot open")
+        };
+        assert_eq!(
+            open_failure_message("broken.psd", "psd", &background),
+            open_failure_message("broken.psd", "psd", &synchronous)
+        );
+    }
+
+    /// AC-3: a decode panic caught on the background thread reaches the
+    /// user as an ordinary refused open, in the real dialog.
+    #[test]
+    #[allow(clippy::panic)] // the panic under test
+    fn a_caught_decode_panic_is_shown_as_couldnt_open_file() {
+        let mut worker = OpenWorker::default();
+        let (woken_tx, woken) = std::sync::mpsc::channel();
+        if let Err(failure) = worker.start(
+            std::path::PathBuf::from("/x/hostile.psd"),
+            |_| panic!("index out of range"),
+            move || {
+                let _ = woken_tx.send(());
+            },
+        ) {
+            unreachable!("{failure:?}");
+        }
+        assert!(
+            woken
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok()
+        );
+        let Some(finished) = worker.take_finished() else {
+            unreachable!("a caught panic is a result");
+        };
+        let failure = match finished.result {
+            Err(failure) => failure,
+            Ok(decoded) => unreachable!("{decoded:?}"),
+        };
+        let message = open_failure_message("hostile.psd", "psd", &failure);
+        assert_eq!(
+            message,
+            "Aurora ran into an internal error while reading \"hostile.psd\" and stopped. \
+             Details: index out of range. Your current document has not changed."
+        );
+        let scales = crate::test_workspace_scales();
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        assert!(open_open_failed_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            &message
+        ));
+        assert!(dialog.is_some());
+    }
+
+    /// The status node [`with_opening_status`] adds, if present: its
+    /// role, label and live setting, and whether the root lists it.
+    fn opening_status(
+        update: &accesskit::TreeUpdate,
+        root: WidgetId,
+    ) -> Option<(
+        accesskit::Role,
+        Option<String>,
+        Option<accesskit::Live>,
+        bool,
+    )> {
+        let listed = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == root)
+            .is_some_and(|(_, node)| node.children().contains(&OPENING_STATUS_NODE));
+        update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == OPENING_STATUS_NODE)
+            .map(|(_, node)| {
+                (
+                    node.role(),
+                    node.label().map(str::to_owned),
+                    node.live(),
+                    listed,
+                )
+            })
+    }
+
+    /// AC-2: while an open is pending the window title says "Opening
+    /// `<file>`…" and the accessibility tree carries a polite status node
+    /// saying the same; once the result is taken — here a *failure* —
+    /// both are gone, driven through a real worker rather than asserted
+    /// on the pure functions alone.
+    #[test]
+    fn the_opening_state_is_shown_and_announced_while_pending_and_cleared_after_a_failure() {
+        let workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let tree = &workspace.tree;
+        let root = tree.root();
+        let path = std::path::Path::new("/pictures/big\u{202e} photo.psd");
+        assert_eq!(window_title(None), "Aurora");
+        assert_eq!(
+            window_title(Some(path)),
+            "Opening big photo.psd\u{2026} \u{2014} Aurora",
+            "the file name is sanitised as every dialog's is"
+        );
+
+        let mut worker = OpenWorker::default();
+        let (release_tx, release) = std::sync::mpsc::channel::<()>();
+        let (woken_tx, woken) = std::sync::mpsc::channel();
+        if let Err(failure) = worker.start(
+            path.to_path_buf(),
+            move |_| {
+                // Bounded, so a decode wrongly run on the calling thread
+                // fails this test instead of hanging it.
+                let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+                Err(OpenFailure::Read(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )))
+            },
+            move || {
+                let _ = woken_tx.send(());
+            },
+        ) {
+            unreachable!("{failure:?}");
+        }
+        let pending =
+            with_opening_status(tree.accessibility_update(root), root, worker.pending_path());
+        assert_eq!(
+            opening_status(&pending, root),
+            Some((
+                accesskit::Role::Status,
+                Some("Opening big photo.psd\u{2026}".to_owned()),
+                Some(accesskit::Live::Polite),
+                true
+            ))
+        );
+        assert_eq!(
+            window_title(worker.pending_path()),
+            "Opening big photo.psd\u{2026} \u{2014} Aurora"
+        );
+
+        let _ = release_tx.send(());
+        assert!(
+            woken
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok()
+        );
+        let Some(finished) = worker.take_finished() else {
+            unreachable!("the failure is a result");
+        };
+        assert!(finished.result.is_err());
+        let cleared =
+            with_opening_status(tree.accessibility_update(root), root, worker.pending_path());
+        assert_eq!(opening_status(&cleared, root), None);
+        assert_eq!(window_title(worker.pending_path()), "Aurora");
+        assert_eq!(
+            cleared.nodes.len(),
+            tree.accessibility_update(root).nodes.len(),
+            "cleared means exactly the widget tree again"
+        );
+    }
+
+    /// The installation-time measurement AC-1 asks for: a 4096² four-layer
+    /// PSD decoded on a background thread, then each step the UI thread
+    /// still runs at install timed separately. `#[ignore]`d: it allocates
+    /// well over a gigabyte. Run with
+    /// `cargo test -p aurora-app --release -- --ignored --nocapture measure_installing`.
+    #[test]
+    #[ignore = "measurement, allocates over a gigabyte"]
+    #[allow(clippy::print_stderr)]
+    fn measure_installing_a_large_psd_on_the_ui_thread() {
+        let side = 4096_i32;
+        let layers: Vec<TinyLayer> = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]]
+            .into_iter()
+            .map(|rgb| tiny_solid((0, 0, side, side), rgb))
+            .collect();
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = tiny_psd(side.unsigned_abs(), side.unsigned_abs(), 3, &layers);
+        drop(layers);
+        let path = write_temp_file(&dir, "large.psd", &bytes);
+        let file_mb = bytes.len() / (1024 * 1024);
+        drop(bytes);
+
+        let finished = open_in_background(&path);
+        let decode = finished.decode_time;
+        let document = match finished.result {
+            Ok(DecodedFile::Psd(document)) => document,
+            other => unreachable!("{other:?}"),
+        };
+        let scales = crate::test_workspace_scales();
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let started = std::time::Instant::now();
+        if let Err(err) = replace_document(
+            &mut workspace,
+            &scales,
+            &document.layers,
+            &UndoOrder::default(),
+            aurora_ui::Tool::default(),
+            &ToolSettings::default(),
+        ) {
+            unreachable!("{err:?}");
+        }
+        let panels = started.elapsed();
+        let (_store_dir, mut store) = real_tile_store();
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let started = std::time::Instant::now();
+        let (_freed, failed) = replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+            &document.masks,
+        );
+        let pixels = started.elapsed();
+        assert_eq!(failed, 0);
+        let autosave = dir.path().join("autosave.aur");
+        let mut skipped = aurora_io::SkippedTiles::new();
+        let started = std::time::Instant::now();
+        write_autosave(
+            &autosave,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            &mut skipped,
+            &mut store,
+        );
+        let autosave_time = started.elapsed();
+        eprintln!(
+            "large PSD ({side}x{side}, 4 layers, {file_mb} MiB file): background decode {:.1} ms; \
+             UI-thread install: panels {:.1} ms, tile writes {:.1} ms, autosave {:.1} ms, total {:.1} ms",
+            decode.as_secs_f64() * 1e3,
+            panels.as_secs_f64() * 1e3,
+            pixels.as_secs_f64() * 1e3,
+            autosave_time.as_secs_f64() * 1e3,
+            (panels + pixels + autosave_time).as_secs_f64() * 1e3,
+        );
+    }
+    /// An [`OpenInstaller`] over a real workspace and dialog slot (0.151.0
+    /// review E1). Its install shows what `App::install_finished_open`
+    /// shows for these two outcomes, through the same functions: "Couldn't
+    /// Open File" for a failure ([`open_failure_message`],
+    /// [`open_open_failed_dialog`]), "Opened With Changes" for a PSD with
+    /// a report ([`psd_report_message`], [`open_dialog`]). It does not
+    /// build the document — `App` cannot be constructed headlessly.
+    struct DialogRig {
+        workspace: aurora_ui::Workspace,
+        focus: FocusManager,
+        dialog: Option<crate::DialogHandle>,
+        scales: Scales,
+        worker: OpenWorker,
+        installed: Vec<std::path::PathBuf>,
+    }
+
+    impl DialogRig {
+        fn new() -> Self {
+            let scales = crate::test_workspace_scales();
+            Self {
+                workspace: aurora_ui::build_workspace(&scales),
+                focus: FocusManager::default(),
+                dialog: None,
+                scales,
+                worker: OpenWorker::default(),
+                installed: Vec::new(),
+            }
+        }
+
+        fn dialog_title(&self) -> Option<String> {
+            let handle = self.dialog.as_ref()?;
+            self.workspace
+                .tree
+                .accessibility(handle.root)
+                .and_then(accesskit::Node::label)
+                .map(str::to_owned)
+        }
+
+        fn start(&mut self, path: &std::path::Path) {
+            let (woken_tx, woken) = std::sync::mpsc::channel();
+            if let Err(failure) =
+                self.worker
+                    .start(path.to_path_buf(), decode_chosen_file, move || {
+                        let _ = woken_tx.send(());
+                    })
+            {
+                unreachable!("{failure:?}");
+            }
+            assert!(
+                woken
+                    .recv_timeout(std::time::Duration::from_mins(1))
+                    .is_ok()
+            );
+        }
+    }
+
+    impl background_open::OpenInstaller for DialogRig {
+        fn open_worker(&mut self) -> &mut OpenWorker {
+            &mut self.worker
+        }
+        fn modal_open(&self) -> bool {
+            self.dialog.is_some()
+        }
+        fn show_open_state(&mut self) {}
+        fn install(&mut self, finished: background_open::FinishedOpen) {
+            let name = display_file_name(&finished.path);
+            self.installed.push(finished.path);
+            let (title, message, actions) = match finished.result {
+                Err(failure) => {
+                    let message = open_failure_message(&name, "psd", &failure);
+                    assert!(open_open_failed_dialog(
+                        &mut self.workspace,
+                        &mut self.focus,
+                        &mut self.dialog,
+                        &self.scales,
+                        &message
+                    ));
+                    return;
+                }
+                Ok(DecodedFile::Psd(document)) => match psd_report_message(&name, &document.report)
+                {
+                    Some(message) => (PSD_REPORT_TITLE, message, psd_report_dialog_actions()),
+                    None => return,
+                },
+                Ok(_) => return,
+            };
+            assert!(open_dialog(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.dialog,
+                &self.scales,
+                title,
+                &message,
+                actions,
+            ));
+        }
+    }
+
+    /// Opens an unrelated alert — the kind a user can raise while an open
+    /// decodes (here the export-refused one) — and returns its root.
+    fn raise_an_unrelated_alert(rig: &mut DialogRig) -> WidgetId {
+        assert!(open_dialog(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &mut rig.dialog,
+            &rig.scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        ));
+        let Some(handle) = rig.dialog.as_ref() else {
+            unreachable!("it just opened");
+        };
+        handle.root
+    }
+
+    /// Review E1: a PSD that finishes decoding under an open alert is not
+    /// installed under it — its "Opened With Changes" report would find
+    /// the modal slot taken and be lost — and is installed, report shown,
+    /// once the alert closes.
+    #[test]
+    fn a_finished_open_waits_for_an_open_dialog_to_close_then_installs_and_shows_its_report() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = write_temp_file(&dir, "effects.psd", &two_layer_masked_psd_with_effects());
+        let mut rig = DialogRig::new();
+        let alert = raise_an_unrelated_alert(&mut rig);
+        rig.start(&path);
+
+        assert_eq!(background_open_step(&mut rig), OpenStep::Deferred);
+        assert!(rig.installed.is_empty(), "nothing installs under a modal");
+        assert_eq!(rig.dialog.as_ref().map(|handle| handle.root), Some(alert));
+        assert_eq!(rig.worker.pending_path(), Some(path.as_path()));
+
+        close_dialog(&mut rig.workspace, &mut rig.focus, &mut rig.dialog);
+        assert_eq!(background_open_step(&mut rig), OpenStep::Installed);
+        assert_eq!(rig.installed, vec![path]);
+        assert_eq!(rig.dialog_title().as_deref(), Some(PSD_REPORT_TITLE));
+    }
+
+    /// Review E1, the failure half: "Couldn't Open File" is not lost to an
+    /// alert that was already open.
+    #[test]
+    fn a_failed_open_waits_for_an_open_dialog_to_close_then_shows_couldnt_open_file() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let missing = dir.path().join("gone.psd");
+        let mut rig = DialogRig::new();
+        let alert = raise_an_unrelated_alert(&mut rig);
+        rig.start(&missing);
+
+        assert_eq!(background_open_step(&mut rig), OpenStep::Deferred);
+        assert_eq!(rig.dialog.as_ref().map(|handle| handle.root), Some(alert));
+        close_dialog(&mut rig.workspace, &mut rig.focus, &mut rig.dialog);
+        assert_eq!(background_open_step(&mut rig), OpenStep::Installed);
+        assert_eq!(rig.dialog_title().as_deref(), Some(OPEN_FAILED_TITLE));
+    }
+
+    /// Review C1: once the session is ending, a late `.aur` pre-check gets
+    /// no scratch store — the function returns before it would recreate
+    /// the session directory shutdown just removed.
+    #[test]
+    fn no_aur_scratch_store_is_created_once_the_session_is_ending() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(aur_verify_scratch_dir_unless(true).is_none());
+        assert!(
+            aur_verify_scratch_dir_unless(false).is_some(),
+            "a live session still gets one"
+        );
     }
 }
 

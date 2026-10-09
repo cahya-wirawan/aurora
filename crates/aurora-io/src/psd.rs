@@ -69,9 +69,14 @@
 //! - User layer masks are applied (0.147.0: [`PsdMask`] →
 //!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); user-mask
 //!   density is applied as `aurora_doc::LayerMask::density` (0.149.0,
-//!   [`PsdMask::density`]); feather (user or vector) and vector-mask
-//!   density are reported, not applied; vector masks,
-//!   clipping, layer effects, blending ranges ("Blend If") and knockout are not applied either.
+//!   [`PsdMask::density`]); vector masks (`vmsk`/`vsms`, 0.150.0) are
+//!   parsed and rasterised by Aurora's own scanline filler (`vector`
+//!   module — `aurora-io` may not depend on `aurora-vector`) and applied
+//!   as pixel coverage — alone, or multiplied with the real user mask —
+//!   with the vector-mask density; the conversion itself is reported,
+//!   since the path is not kept. Feather (user or vector) is reported,
+//!   not applied; clipping, layer effects, blending ranges ("Blend If")
+//!   and knockout are not applied either.
 //!   Adjustment and fill layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
 //!   one of those that a file actually uses is named in the report.
@@ -92,6 +97,7 @@ use crate::image::Image;
 mod test_writer;
 #[cfg(test)]
 mod tests;
+mod vector;
 
 /// The largest canvas side a version-1 PSD file may declare.
 pub const PSD_MAX_EXTENT: u32 = 30_000;
@@ -129,6 +135,11 @@ const MASK_DISABLED: u8 = 0x02;
 /// Mask flags bit 2: "invert layer mask when blending" (obsolete in
 /// the spec, still honoured: the coverage is inverted on import).
 const MASK_INVERT: u8 = 0x04;
+/// Mask flags bit 3: "the user mask actually came from rendering other
+/// data" — on a layer with a vector mask, the `-2` channel is
+/// Photoshop's own rendering of that vector mask (combined with the real
+/// user mask, which is then channel `-3`), not a separate pixel mask.
+const MASK_FROM_RENDER: u8 = 0x08;
 /// Mask flags bit 4: a mask-parameter block (density, feather) follows.
 const MASK_PARAMETERS: u8 = 0x10;
 
@@ -339,9 +350,15 @@ enum Note {
     FillRasterised,
     MaskUnreadable,
     MaskParametersNotApplied,
+    FeatherNotApplied,
     RealMaskNotUsed,
+    RenderedMaskUsed,
     MaskRelativePosition,
-    VectorMaskNotApplied,
+    VectorMaskUnreadable,
+    VectorMaskTooLarge,
+    VectorMaskFromRendering,
+    VectorMaskRasterised,
+    VectorMaskDisabledDropped,
     ClippingDropped,
     EffectsNotShown,
     BlendIfNotApplied,
@@ -418,6 +435,23 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "s" } else { "" },
             if one { "it is" } else { "they are" },
         ),
+        Note::FeatherNotApplied => format!(
+            "{n} layer mask{s} use{} a feather, which Aurora doesn't apply yet; {} applied \
+             with hard edges.",
+            if one { "s" } else { "" },
+            if one { "it is" } else { "they are" },
+        ),
+        Note::RenderedMaskUsed => format!(
+            "{n} layer{s} with both a pixel mask and a vector mask: the mask Photoshop \
+             saved already rendered is applied as one pixel mask, so the pixel mask on its \
+             own isn't kept."
+        ),
+        Note::VectorMaskFromRendering => format!(
+            "{n} vector mask{s} couldn't be converted (unreadable or too complex); \
+             Photoshop's own saved rendering of {} was applied instead, as a pixel mask at \
+             the document's resolution.",
+            if one { "it" } else { "them" },
+        ),
         Note::RealMaskNotUsed => format!(
             "{n} layer{s} with both a pixel mask and a vector mask: the pixel mask is applied, \
              but Photoshop's combined version of the two isn't used."
@@ -433,9 +467,27 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} layer mask{s} could not be read and {was} ignored, so areas the mask hides are \
              visible."
         ),
-        Note::VectorMaskNotApplied => {
-            format!("{n} vector mask{s} {is} not applied, so areas the mask hides are visible.")
-        }
+        Note::VectorMaskUnreadable => format!(
+            "{n} vector mask{s} could not be read and {was} not applied, so areas the mask \
+             hides are visible."
+        ),
+        Note::VectorMaskTooLarge => format!(
+            "{n} vector mask{s} {was} too large or complex to convert and {was} not applied, so \
+             areas the mask hides are visible."
+        ),
+        Note::VectorMaskRasterised => format!(
+            "{n} vector mask{s} {was} converted to {}pixel mask{s} at the document's \
+             resolution: {} look{} the same, but the path can't be edited and won't stay \
+             sharp if the image is enlarged.",
+            if one { "a " } else { "" },
+            if one { "it" } else { "they" },
+            if one { "s" } else { "" },
+        ),
+        Note::VectorMaskDisabledDropped => format!(
+            "{n} turned-off vector mask{s} {was} left out; {} had no effect on the image, but \
+             can't be turned back on.",
+            if one { "it" } else { "they" },
+        ),
         Note::ClippingDropped => format!(
             "{n} clipped layer{s} {is} shown unclipped — Aurora doesn't have clipping masks \
              yet."
@@ -785,6 +837,18 @@ struct MaskInfo {
     flags: u8,
     /// Flags bit 4's parameter block, as far as it could be read.
     parameters: MaskParameters,
+    /// The "real" user mask fields (mask data of 36 bytes or more): the
+    /// genuine user mask, channel `-3`, when a layer has both a user
+    /// mask and a vector mask (0.150.0).
+    real: Option<RealMask>,
+}
+
+/// The real user mask's own rectangle, default colour and flags.
+#[derive(Clone, Copy, Debug)]
+struct RealMask {
+    bounds: Rect,
+    default_color: u8,
+    flags: u8,
 }
 
 /// A mask's parameter block (flags bit 4), each field present only when
@@ -813,11 +877,15 @@ impl MaskParameters {
     /// [`Self::applied_density`] did not already use (a user density is
     /// there too) and that is below full.
     fn has_unapplied(self) -> bool {
-        let feathered = |f: Option<f64>| f.is_some_and(|f| f != 0.0);
         feathered(self.user_feather)
             || feathered(self.vector_feather)
             || (self.user_density.is_some() && self.vector_density.is_some_and(|d| d != u8::MAX))
     }
+}
+
+/// Whether a feather value asks for anything (present and non-zero).
+fn feathered(feather: Option<f64>) -> bool {
+    feather.is_some_and(|f| f != 0.0)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -851,6 +919,8 @@ struct Record<'a> {
     section: Option<Section>,
     fill_opacity: Option<u8>,
     features: Features,
+    /// The first `vmsk`/`vsms` block's data (0.150.0).
+    vector: Option<&'a [u8]>,
 }
 
 impl Record<'_> {
@@ -973,6 +1043,7 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
     let mut section = None;
     let mut nested_section = None;
     let mut fill_opacity = None;
+    let mut vector = None;
     let mut features = Features {
         blend_if: blend_if_in_use(ranges),
         ..Features::default()
@@ -990,7 +1061,10 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
             b"TySh" | b"tySh" => features.text = true,
             b"SoLd" | b"PlLd" | b"SoLE" => features.smart = true,
             b"lfx2" | b"lrFX" | b"lmfx" => features.effects = true,
-            b"vmsk" | b"vsms" => features.vector_mask = true,
+            b"vmsk" | b"vsms" => {
+                features.vector_mask = true;
+                vector = vector.or(Some(data));
+            }
             b"knko" => features.knockout = data.first().is_some_and(|v| *v != 0),
             k if FILL_KEYS.contains(&k) => features.fill = true,
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
@@ -1012,6 +1086,7 @@ fn read_record<'a>(r: &mut Reader<'a>, header: Header) -> Result<Record<'a>, IoE
         section: section.or(nested_section),
         fill_opacity,
         features,
+        vector,
     })
 }
 
@@ -1039,15 +1114,42 @@ fn read_mask_info(r: &mut Reader<'_>) -> Option<MaskInfo> {
     let default_color = r.u8("mask default colour").ok()?;
     let flags = r.u8("mask flags").ok()?;
     let bounds = rect_from_edges(top, left, bottom, right).ok()?;
+    // psd-tools' order: the 18 real-mask bytes (real flags, real
+    // default colour, real rectangle) come before the parameter block.
+    // A truncated real block keeps the mask and drops both, as before.
+    let mut real = None;
+    let mut real_ok = true;
+    if total >= 36 {
+        real_ok = false;
+        if let (Ok(real_flags), Ok(real_default)) =
+            (r.u8("real mask flags"), r.u8("real mask colour"))
+        {
+            let edges = (
+                r.i32("real mask rectangle"),
+                r.i32("real mask rectangle"),
+                r.i32("real mask rectangle"),
+                r.i32("real mask rectangle"),
+            );
+            if let (Ok(t), Ok(l), Ok(b), Ok(rt)) = edges {
+                real_ok = true;
+                real = rect_from_edges(t, l, b, rt).ok().map(|bounds| RealMask {
+                    bounds,
+                    default_color: real_default,
+                    flags: real_flags,
+                });
+            }
+        }
+    }
     Some(MaskInfo {
         bounds,
         default_color,
         flags,
-        parameters: if flags & MASK_PARAMETERS != 0 {
-            read_mask_parameters(r, total)
+        parameters: if flags & MASK_PARAMETERS != 0 && real_ok {
+            read_mask_parameters(r)
         } else {
             MaskParameters::default()
         },
+        real,
     })
 }
 
@@ -1058,11 +1160,8 @@ fn read_mask_info(r: &mut Reader<'_>) -> Option<MaskInfo> {
 /// (`u8`) and vector feather (`f64`), in that order — and leniently: a
 /// truncated block keeps whatever was read before the bytes ran out and
 /// stops there, since a short block is damage, not a request.
-fn read_mask_parameters(r: &mut Reader<'_>, total: usize) -> MaskParameters {
+fn read_mask_parameters(r: &mut Reader<'_>) -> MaskParameters {
     let mut params = MaskParameters::default();
-    if total >= 36 && r.skip(18, "real user mask").is_err() {
-        return params;
-    }
     let Ok(present) = r.u8("mask parameters") else {
         return params;
     };
@@ -1570,14 +1669,38 @@ fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, I
     if !record.has_channel(-2) {
         return Ok(None);
     }
+    decode_mask_channel(
+        record,
+        header,
+        -2,
+        RealMask {
+            bounds: info.bounds,
+            default_color: info.default_color,
+            flags: info.flags,
+        },
+        info.parameters.applied_density(),
+    )
+    .map(Some)
+}
+
+/// One mask channel (`-2`, or the real user mask `-3`) decoded over
+/// `frame`'s rectangle, with `frame`'s default colour and flags.
+fn decode_mask_channel(
+    record: &Record<'_>,
+    header: Header,
+    channel: i16,
+    frame: RealMask,
+    density: u8,
+) -> Result<PsdMask, IoError> {
+    let info = frame;
     let mut coverage = None;
     let width = info.bounds.width as usize;
     let height = info.bounds.height as usize;
-    // The first `-2` channel only, like every other id
+    // The first channel of the id only, like every other id
     // (`pixel_channels`).
     if width > 0
         && height > 0
-        && let Some((_, data)) = record.data.iter().find(|(id, _)| *id == -2)
+        && let Some((_, data)) = record.data.iter().find(|(id, _)| *id == channel)
     {
         let bps = header.bytes_per_sample();
         let plane = decode_channel(data, width, height, bps, header.psb())?;
@@ -1592,13 +1715,13 @@ fn decode_mask(record: &Record<'_>, header: Header) -> Result<Option<PsdMask>, I
         }
         coverage = Some(values);
     }
-    Ok(Some(PsdMask {
+    Ok(PsdMask {
         bounds: info.bounds,
         default_color: info.default_color,
         flags: info.flags,
         coverage,
-        density: info.parameters.applied_density(),
-    }))
+        density,
+    })
 }
 
 /// One `sRGB` profile for every image one [`decode`] produces (0.144.0
@@ -1699,7 +1822,7 @@ fn props_for(record: &Record<'_>, notes: &mut Notes) -> PsdProps {
 }
 
 /// Notes for the features a record uses that Aurora does not apply.
-fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
+fn note_unsupported(record: &Record<'_>, outcome: &MaskOutcome, notes: &mut Notes) {
     if record.features.effects {
         notes.add(Note::EffectsNotShown);
     }
@@ -1709,14 +1832,33 @@ fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
     if record.mask_unreadable && record.has_channel(-2) {
         notes.add(Note::MaskUnreadable);
     }
+    // With the vector mask applied (0.150.0) both densities are applied
+    // (`masks_for`), so only a feather of a part actually used is left —
+    // also when there is no `-2` channel at all.
+    if let Some(mask) = record.mask
+        && outcome.vector_applied
+    {
+        let p = mask.parameters;
+        if feathered(p.vector_feather) || (outcome.pixel_used && feathered(p.user_feather)) {
+            notes.add(Note::FeatherNotApplied);
+        }
+    }
     if let Some(mask) = record.mask
         && record.has_channel(-2)
     {
-        if mask.parameters.has_unapplied() {
+        if !outcome.vector_applied && mask.parameters.has_unapplied() {
             notes.add(Note::MaskParametersNotApplied);
         }
-        if record.has_channel(-3) {
-            notes.add(Note::RealMaskNotUsed);
+        // With the vector mask applied, the real user mask (`-3`) *is*
+        // what is used. Without it, a `-2` flagged as a rendering is
+        // Photoshop's combination of both masks, applied as one, and the
+        // user mask alone (`-3`) is what goes unused.
+        if record.has_channel(-3) && !outcome.vector_applied {
+            notes.add(if mask.flags & MASK_FROM_RENDER != 0 {
+                Note::RenderedMaskUsed
+            } else {
+                Note::RealMaskNotUsed
+            });
         }
         // Only where the two readings differ: on a layer whose own
         // rectangle starts at the document origin (every group's does)
@@ -1725,9 +1867,6 @@ fn note_unsupported(record: &Record<'_>, notes: &mut Notes) {
         if mask.flags & MASK_RELATIVE != 0 && (record.bounds.x != 0 || record.bounds.y != 0) {
             notes.add(Note::MaskRelativePosition);
         }
-    }
-    if record.features.vector_mask && !record.features.fill {
-        notes.add(Note::VectorMaskNotApplied);
     }
     if record.features.blend_if {
         notes.add(Note::BlendIfNotApplied);
@@ -1764,6 +1903,7 @@ fn build_tree(
     header: Header,
     notes: &mut Notes,
     profile: &SharedProfile,
+    vector_budget: &mut vector::Budget,
 ) -> Result<Vec<PsdNode>, IoError> {
     let mut stack: Vec<Vec<PsdNode>> = vec![Vec::new()];
     for record in records {
@@ -1786,11 +1926,13 @@ fn build_tree(
                     Vec::new()
                 };
                 let props = props_for(record, notes);
-                note_unsupported(record, notes);
                 if props.pass_through && subtree_has_blend(&children) {
                     notes.add(Note::PassThroughGroup);
                 }
-                let mask = mask_or_report(record, header, notes);
+                // A group's mask region is the canvas (`Builder::add_nodes`).
+                let outcome = masks_for(record, header, canvas_of(header), notes, vector_budget);
+                note_unsupported(record, &outcome, notes);
+                let mask = outcome.mask;
                 if let Some(parent) = stack.last_mut() {
                     parent.push(PsdNode::Group {
                         props,
@@ -1800,7 +1942,7 @@ fn build_tree(
                 }
             }
             _ => {
-                if let Some(node) = layer_node(record, header, notes, profile)?
+                if let Some(node) = layer_node(record, header, notes, profile, vector_budget)?
                     && let Some(parent) = stack.last_mut()
                 {
                     parent.push(node);
@@ -1827,6 +1969,7 @@ fn layer_node(
     header: Header,
     notes: &mut Notes,
     profile: &SharedProfile,
+    vector_budget: &mut vector::Budget,
 ) -> Result<Option<PsdNode>, IoError> {
     if record.features.adjustment {
         notes.add(Note::AdjustmentSkipped);
@@ -1847,16 +1990,330 @@ fn layer_node(
     } else if record.features.fill {
         notes.add(Note::FillRasterised);
     }
-    note_unsupported(record, notes);
     let props = props_for(record, notes);
     let image = decode_layer_image(record, header, notes, profile)?;
-    let mask = mask_or_report(record, header, notes);
+    // The region `Builder::add_nodes` gives the layer: its own rectangle
+    // and the canvas when it has pixels, else the canvas.
+    let canvas = canvas_of(header);
+    let region = if image.is_some() {
+        record.bounds.union(&canvas)
+    } else {
+        canvas
+    };
+    let outcome = masks_for(record, header, region, notes, vector_budget);
+    note_unsupported(record, &outcome, notes);
+    let mask = outcome.mask;
     Ok(Some(PsdNode::Layer(PsdLayer {
         props,
         bounds: record.bounds,
         image,
         mask,
     })))
+}
+
+fn canvas_of(header: Header) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: header.width,
+        height: header.height,
+    }
+}
+
+/// Why a record's vector mask was not applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorSkip {
+    Unreadable,
+    TooLarge,
+    Disabled,
+}
+
+/// The record's vector mask, rasterised (0.150.0); `Ok(None)` when it
+/// has none or it is a shape layer's (whose stored pixels are already
+/// the rendered shape, so psd-tools does not apply it either and the
+/// layer is reported as a shape); otherwise why it is not applied.
+fn vector_for(
+    record: &Record<'_>,
+    header: Header,
+    budget: &mut vector::Budget,
+) -> Result<Option<vector::Raster>, VectorSkip> {
+    if record.features.fill {
+        return Ok(None);
+    }
+    let Some(data) = record.vector else {
+        return Ok(None);
+    };
+    // Parsing costs a work unit per 26-byte record (plus one), charged
+    // before parsing; once the file's work is spent, no further vector
+    // mask is even parsed.
+    let records = (data.len() / 26) as u64 + 1;
+    if records > budget.work {
+        return Err(VectorSkip::TooLarge);
+    }
+    budget.work -= records;
+    let skip = |failure| match failure {
+        vector::VectorFailure::Unreadable => VectorSkip::Unreadable,
+        vector::VectorFailure::TooLarge => VectorSkip::TooLarge,
+    };
+    let path = vector::parse(data).map_err(skip)?;
+    if path.disable {
+        return Err(VectorSkip::Disabled);
+    }
+    vector::rasterize(&path, header.width, header.height, budget)
+        .map(Some)
+        .map_err(skip)
+}
+
+/// What [`masks_for`] decided for one record.
+#[derive(Debug)]
+struct MaskOutcome {
+    mask: Option<PsdMask>,
+    /// The vector mask was converted and is part of `mask`.
+    vector_applied: bool,
+    /// A pixel (user) mask is part of `mask`.
+    pixel_used: bool,
+}
+
+/// The record's one Aurora mask (0.150.0). Without an applicable vector
+/// mask this is exactly 0.149.0's [`mask_or_report`]; the report then
+/// says why, and — when the `-2` channel is flagged as Photoshop's own
+/// rendering ([`MASK_FROM_RENDER`]) — that it is that rendering, which
+/// already includes the vector mask, that is applied. With one:
+///
+/// - **The pixel part.** When `-2` is flagged as a rendering it is not
+///   used again; the genuine user mask is then the real user mask
+///   (`-3`, with the real rectangle, default colour and flags), when
+///   the record has one. Without that flag `-2` is the user mask. A
+///   pixel part that is shown everywhere (an empty rectangle shown
+///   outside), or is turned off, is dropped.
+/// - **Vector only:** the raster becomes the mask, its density the
+///   vector-mask density — exact, and editable as `LayerMask::density`.
+/// - **Both:** coverage is `user × vector` (Photoshop intersects them),
+///   each with its *own* density baked in first, since one
+///   `LayerMask::density` cannot express two (`combine_masks`).
+///
+/// Every pixel charge made on the way is refunded when the layer falls
+/// back; spent work is not (it was spent).
+fn masks_for(
+    record: &Record<'_>,
+    header: Header,
+    region: Rect,
+    notes: &mut Notes,
+    budget: &mut vector::Budget,
+) -> MaskOutcome {
+    let start = budget.pixels;
+    let rendered =
+        record.mask.is_some_and(|m| m.flags & MASK_FROM_RENDER != 0) && record.has_channel(-2);
+    let fallback = |notes: &mut Notes, budget: &mut vector::Budget, why: VectorSkip| {
+        budget.pixels = start;
+        notes.add(match why {
+            VectorSkip::Disabled => Note::VectorMaskDisabledDropped,
+            _ if rendered => Note::VectorMaskFromRendering,
+            VectorSkip::Unreadable => Note::VectorMaskUnreadable,
+            VectorSkip::TooLarge => Note::VectorMaskTooLarge,
+        });
+        let mask = mask_or_report(record, header, notes);
+        MaskOutcome {
+            pixel_used: mask.is_some(),
+            mask,
+            vector_applied: false,
+        }
+    };
+    let raster = match vector_for(record, header, budget) {
+        Ok(Some(raster)) => raster,
+        Ok(None) => {
+            let mask = mask_or_report(record, header, notes);
+            return MaskOutcome {
+                pixel_used: mask.is_some(),
+                mask,
+                vector_applied: false,
+            };
+        }
+        Err(why) => return fallback(notes, budget, why),
+    };
+    let params = record.mask.map(|m| m.parameters).unwrap_or_default();
+    let user_density = params.user_density.unwrap_or(u8::MAX);
+    let vector_density = params.vector_density.unwrap_or(u8::MAX);
+    let pixel = match pixel_part(record, header, user_density, budget) {
+        Ok(pixel) => pixel,
+        Err(PixelPart::Unreadable) => {
+            notes.add(Note::MaskUnreadable);
+            None
+        }
+        Err(PixelPart::TooLarge) => return fallback(notes, budget, VectorSkip::TooLarge),
+    };
+    let pixel = pixel.filter(|m| m.flags & MASK_DISABLED == 0 && !is_identity(m));
+    let vector = PsdMask {
+        bounds: raster.bounds,
+        default_color: if raster.outside { u8::MAX } else { 0 },
+        flags: 0,
+        coverage: (!raster.coverage.is_empty()).then_some(raster.coverage),
+        density: vector_density,
+    };
+    let Some(pixel) = pixel else {
+        notes.add(Note::VectorMaskRasterised);
+        return MaskOutcome {
+            mask: Some(vector),
+            vector_applied: true,
+            pixel_used: false,
+        };
+    };
+    if let Some(mask) = combine_masks(&pixel, &vector, region, &mut budget.pixels) {
+        notes.add(Note::VectorMaskRasterised);
+        MaskOutcome {
+            mask: Some(mask),
+            vector_applied: true,
+            pixel_used: true,
+        }
+    } else {
+        fallback(notes, budget, VectorSkip::TooLarge)
+    }
+}
+
+enum PixelPart {
+    Unreadable,
+    TooLarge,
+}
+
+/// The user (pixel) mask that goes with an applied vector mask — see
+/// [`masks_for`].
+fn pixel_part(
+    record: &Record<'_>,
+    header: Header,
+    density: u8,
+    budget: &mut vector::Budget,
+) -> Result<Option<PsdMask>, PixelPart> {
+    let Some(info) = record.mask else {
+        return Ok(None);
+    };
+    let (channel, frame) = if info.flags & MASK_FROM_RENDER != 0 {
+        match info.real {
+            Some(real) if record.has_channel(-3) => (-3, real),
+            _ => return Ok(None),
+        }
+    } else if record.has_channel(-2) {
+        (
+            -2,
+            RealMask {
+                bounds: info.bounds,
+                default_color: info.default_color,
+                flags: info.flags,
+            },
+        )
+    } else {
+        return Ok(None);
+    };
+    // `-2` is already in the decode's own budget; `-3` is not.
+    if channel == -3 {
+        let area = u64::from(frame.bounds.width) * u64::from(frame.bounds.height);
+        if area > budget.pixels {
+            return Err(PixelPart::TooLarge);
+        }
+        budget.pixels -= area;
+    }
+    decode_mask_channel(record, header, channel, frame, density)
+        .map(Some)
+        .map_err(|_| PixelPart::Unreadable)
+}
+
+/// Whether `mask` shows everything: no samples, shown outside.
+fn is_identity(mask: &PsdMask) -> bool {
+    let invert = mask.flags & MASK_INVERT != 0;
+    let samples = mask.coverage.is_some() && mask.bounds.width > 0 && mask.bounds.height > 0;
+    !samples && ((mask.default_color != 0) != invert)
+}
+
+/// A mask's effective coverage at a document pixel: its sample (or
+/// default colour outside its rectangle), inverted per its flags, with
+/// its density applied.
+fn effective_at(mask: &PsdMask, x: i64, y: i64) -> f32 {
+    let b = mask.bounds;
+    let inside = x >= b.x && y >= b.y && x < b.right() && y < b.bottom();
+    let raw = match (&mask.coverage, inside) {
+        (Some(values), true) => {
+            let row = usize::try_from(y - b.y).unwrap_or(usize::MAX);
+            let col = usize::try_from(x - b.x).unwrap_or(usize::MAX);
+            let index = row.saturating_mul(b.width as usize).saturating_add(col);
+            values.get(index).map_or(1.0, |v| v.to_f32())
+        }
+        _ => {
+            if mask.default_color != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    };
+    let raw = if mask.flags & MASK_INVERT != 0 {
+        1.0 - raw
+    } else {
+        raw
+    };
+    let d = f32::from(mask.density) / 255.0;
+    d * raw + (1.0 - d)
+}
+
+/// `user × vector`, each with its own density, as one mask of density
+/// `255` (0.150.0). Its rectangle keeps the constant outside it exact:
+/// hidden outside when either part is hidden there (the intersection of
+/// those parts' rectangles), shown when both are shown (the bounding box
+/// of both), and otherwise — a partial density outside a hidden
+/// rectangle — the whole `region`, written out. The written area is
+/// charged against `budget`; `None` when it does not fit.
+fn combine_masks(
+    user: &PsdMask,
+    vector: &PsdMask,
+    region: Rect,
+    budget: &mut u64,
+) -> Option<PsdMask> {
+    let shown = |m: &PsdMask| (m.default_color != 0) != (m.flags & MASK_INVERT != 0);
+    let one = |m: &PsdMask| shown(m) || m.density == 0;
+    let zero = |m: &PsdMask| !shown(m) && m.density == u8::MAX;
+    let empty = Rect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+    let nonempty = |r: Rect| r.width > 0 && r.height > 0;
+    let (target, default_color) = match (zero(user), zero(vector)) {
+        (true, true) => (intersect(user.bounds, vector.bounds).unwrap_or(empty), 0),
+        (true, false) => (user.bounds, 0),
+        (false, true) => (vector.bounds, 0),
+        (false, false) if one(user) && one(vector) => {
+            let target = match (nonempty(user.bounds), nonempty(vector.bounds)) {
+                (true, true) => user.bounds.union(&vector.bounds),
+                (true, false) => user.bounds,
+                (false, true) => vector.bounds,
+                (false, false) => empty,
+            };
+            (target, u8::MAX)
+        }
+        (false, false) => (region, 0),
+    };
+    let area = u64::from(target.width) * u64::from(target.height);
+    if area > *budget {
+        return None;
+    }
+    *budget -= area;
+    let mut coverage = None;
+    if area > 0 {
+        let mut values: Vec<f16> = try_alloc(usize::try_from(area).ok()?).ok()?;
+        for y in target.y..target.bottom() {
+            for x in target.x..target.right() {
+                let c = effective_at(user, x, y) * effective_at(vector, x, y);
+                values.push(f16::from_f32(c));
+            }
+        }
+        coverage = Some(values);
+    }
+    Some(PsdMask {
+        bounds: target,
+        default_color,
+        flags: 0,
+        coverage,
+        density: u8::MAX,
+    })
 }
 
 /// [`decode_mask`], with a damaged mask reported and dropped (the layer
@@ -2017,6 +2474,12 @@ fn remove_white_matte(samples: &mut [f16]) {
 /// past its limits; [`IoError::PsdTruncated`]/[`IoError::PsdMalformed`]
 /// for a damaged one.
 pub fn decode(bytes: &[u8]) -> Result<PsdFile, IoError> {
+    decode_with_vector_work(bytes, vector::MAX_FILE_VECTOR_WORK)
+}
+
+/// [`decode`] with `vector_work` as the file's vector-mask work budget
+/// (tests use a small one to exhaust it cheaply).
+fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, IoError> {
     let mut r = Reader::new(bytes);
     let header = read_header(&mut r)?;
     let psb = header.psb();
@@ -2072,7 +2535,20 @@ pub fn decode(bytes: &[u8]) -> Result<PsdFile, IoError> {
     }
 
     let profile = SharedProfile::new();
-    let layers = build_tree(&info.records, header, &mut notes, &profile)?;
+    // Vector masks (0.150.0) and the real user masks that go with them
+    // are converted only while what the declared rectangles leave of the
+    // budget lasts; one that does not fit is reported, not refused.
+    let mut vector_budget = vector::Budget {
+        pixels: PIXEL_BUDGET.saturating_sub(total),
+        work: vector_work,
+    };
+    let layers = build_tree(
+        &info.records,
+        header,
+        &mut notes,
+        &profile,
+        &mut vector_budget,
+    )?;
     let color_planes = if header.gray() { 1 } else { 3 };
     let merged_alpha = info.merged_alpha && header.channels > color_planes;
     let extra = u64::from(header.channels)
