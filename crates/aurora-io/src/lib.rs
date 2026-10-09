@@ -42,16 +42,19 @@ pub mod psd;
 pub mod tiff;
 
 pub use aur::{
-    AurDocument, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
-    write as write_aur, write_best_effort as write_aur_best_effort,
+    AurDocument, AurSnapshot, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
+    snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,
+    write_best_effort as write_aur_best_effort, write_snapshot as write_aur_snapshot,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
 pub use import::{
-    decode_by_extension, encode_by_extension, read_from_store, write_into_store,
-    write_into_store_at,
+    EncodedTiles, decode_by_extension, encode_by_extension, encode_image_tiles_at, read_from_store,
+    write_into_store, write_into_store_at,
 };
 pub use psd::{
-    PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixels, build_document as build_psd_document,
-    decode as decode_psd, read as read_psd, write_mask_pixels as write_psd_mask,
+    PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,
+    build_document as build_psd_document, decode as decode_psd,
+    encode_mask_pixels as encode_psd_mask, read as read_psd, read_streaming as read_psd_streaming,
+    write_mask_pixels as write_psd_mask,
 };

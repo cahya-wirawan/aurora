@@ -26,7 +26,118 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.151.0): opening a file decodes it off the UI
+**Latest (2026-10-09, 0.154.0): PSD opens stream, one layer at a
+time.** Until 0.153.0 a PSD open read the whole file into memory, decoded
+every layer into an in-memory `Image`, then encoded every tile — peak
+roughly file + decoded document + encoded tiles. Now
+`aurora_io::read_psd_streaming` parses the file from a seekable reader
+(`BufReader<File>`): header, resources, each layer record and each
+tagged-block header are read as reached, every declared length and
+offset is checked against the file length before anything is read or
+allocated, and channel data is only *located* during the parse. Each
+layer's channels are read, decoded and handed to a `PsdPixelSink` before
+the next layer's are read; `decode(&[u8])` and `read(&[u8])` are the
+same parser over a `Cursor`. The app's sink (`PreparedPsd::stream`)
+encodes each layer and writes its tiles into a **staging directory
+inside the tile store's own scratch dir** (new
+`crates/aurora-tile/src/staging.rs`: `StagingRoot` handed to the
+decode thread, `StagingArea::stage`, `StagedTile`), dropping the image;
+the UI-thread install, after the unchanged sweep, adopts each tile with
+the new `TileStore::insert_staged` — a paged-out entry pointing at the
+staged file, no I/O, no bytes in memory. Unadopted staging files and
+directories delete themselves (failed, superseded or panicked opens);
+an adopted file is deleted when its tile is paged in or forgotten.
+**Measured** (RTX 3090 box, same run, release; `VmHWM` above start):
+4096² four-layer noisy 8-bit (256 MiB file) peak +260 MiB against
++800 MiB on the 0.153.0 path, open 1.51 s vs 1.30 s, UI-thread install
+0.34 ms; 16-bit (512 MiB) +288 vs +1,024 MiB; **8192² four-layer 16-bit
+(2 GiB file) +1,277 MiB vs +4,352 MiB, open 7.3 s vs 7.2 s, install
+1.33 ms**. The PRD's "2 GB PSD in under 5 s" is **not** met (7.3 s, warm
+page cache). Opened documents are bit-identical to 0.153.0 for all 284
+corpus and fixture files (digest of tree, report, every pixel and mask
+sample, refusals included, compared across both builds). The candidate's
+full gate (`AURORA_REQUIRE_GPU=1`) passed 2,902, 0 failed, 0 skipped; the
+review revision (judge REVISE 0.899) added 3 tests: test count 2,905. **Needs a human: open a very large PSD on macOS; watch memory in
+Activity Monitor and the open time.** Details: "Next action", addendum
+0.154.0.
+
+**Previously (2026-10-09, 0.153.0): an open's tile writes are prepared off
+the UI thread.** After 0.152.0 the install's remaining ~0.72 s (dev) was
+writing every opened layer's and mask's pixels into the live
+`TileStore`, texel by texel — mostly the `codec::encode` of each tile
+the store evicted as the write overran its budget. Now the decode
+thread also builds and encodes those tiles (new
+`crates/aurora-app/src/prepared_pixels.rs`; `aurora_io::encode_image_tiles_at`
+and `aurora_io::encode_psd_mask`, which share their per-tile fill with
+`write_into_store_at` and `aurora_doc::write_mask_coverage_region`, so
+the tiles are bit-identical, fully transparent overlapped ones
+included) into `aurora_tile::EncodedTile`s — a type only the store's own
+encoder can construct — and the UI thread, after the unchanged sweep,
+only calls the new `TileStore::insert_encoded` per tile: O(1)
+bookkeeping that records the tile exactly as an eviction would
+(pending + scratch path + owed upload, handed to the existing writer
+thread), so nothing becomes resident and the resident budget is never
+touched. `.aur` opens keep the old live read (untrusted tile entries
+go through `codec::decode`). **Measured** (RTX 3090 box, same run
+compares old and new): flat-colour 4096² four-layer PSD, UI-thread
+install 1.3–1.5 ms dev / 1.2 ms release, against tile writes of
+662–693 ms dev / 320 ms release; the decode thread pays 658–689 ms dev
+/ 307 ms release more. Noisy (incompressible) layers: inserts
+0.7–0.9 ms dev / 0.6–1.3 ms release against 561–700 ms dev /
+280–349 ms release of writes. Design (A) of the two the task named;
+(B) (chunking across frames) was not built. The candidate's full gate
+(`AURORA_REQUIRE_GPU=1`) passed 2,889, 0 failed, 0 skipped; the review
+revision (judge REVISE 0.899) kept inserted tiles' failed scratch writes
+out of the failed-write cap, fixed a pre-existing `make_room` tombstone
+leak, and added 2 tests: test count 2,891. **Needs a human:
+open a large PSD on macOS; the end-of-open pause should be near zero.**
+Details: "Next action", addendum 0.153.0.
+
+**Previously (2026-10-09, 0.152.0): the autosave is written off the UI
+thread.** 0.151.0's install spent ~1.9 s of its ~2.6 s writing the
+crash-recovery autosave from the live tile store. Now every autosave
+trigger — a fresh session's startup document (`startup_document`
+snapshots, `App::new` submits), the PNG/JPEG/TIFF/PSD install and the
+`.aur` open (`request_autosave`) — takes an `aurora_io::AurSnapshot` on
+the UI thread and hands it to a new
+`crates/aurora-app/src/background_autosave.rs` `AutosaveWorker`, one
+`std::thread` that encodes, writes to a unique `0o600` temp file,
+`sync_all`s and renames — the same file, format and recovery code
+(design (b); no ADR). One timing difference: the startup autosave is
+now written by the worker after `App::new`, so a crash in the first
+moments of a fresh session can find no autosave yet. The
+snapshot is cheap because of how the store holds tiles: a resident
+tile is decoded `f16` and is `memcpy`d (`peek`, the LRU does not
+move); an evicted tile is already `codec::encode` bytes — the exact
+`.aur` tile entry — and is shared from its pending write or read from
+its scratch file, **never paged in, decoded or evicted** (new
+`aurora_tile::TileStore::snapshot_tile`). Walking the store with
+`get` instead (the first attempt) measured 1.37 s, about as slow as
+the write itself. **Measured** (same 4096², four-layer PSD, dev test
+profile, RTX 3090 box, two runs): snapshot 7.3–7.6 ms (10 MiB),
+submit 0.04 ms; UI-thread install 0.73 s (was 2.55–2.57 s; the
+remaining ~0.72 s is the tile writes); worker write 0.63–0.64 s off the
+UI thread; the old synchronous autosave measured 1.79–1.82 s in the
+same runs. One writer and one queue slot: a newer request replaces a
+waiting one, worker writes land in request order, and the rename
+happens under the worker's lock only for a generation newer than the
+last landed; the over-budget synchronous fallback first supersedes the
+worker (review R1), so the file always ends up holding the newest
+request. On noisy (incompressible) layers the snapshot measured
+98–202 ms (512 MiB copied or read, warm page cache); see the addendum.
+Quit abandons the autosave (a clean quit deletes it anyway): a waiting
+job is dropped, the write in flight is cancelled at its next write
+call, the thread is joined within 500 ms or detached, and no rename can
+happen afterwards (nor once `SESSION_ENDING` is set). A snapshot past
+2 GiB — decided from an I/O-free bound before anything is copied
+(review R2) — falls back to the old streaming write on the UI thread
+(§7.3.1). 17 new tests (16 in `aurora-app`, 1 in `aurora-tile`); test
+count 2,880 (2,863 + 14, gate-measured 2,877, + 3 in the review
+revision). **Needs a human: open a large PSD on macOS; the
+end-of-open pause should be gone or much shorter.** Details: "Next
+action", addendum 0.152.0.
+
+**Previously (2026-10-09, 0.151.0): opening a file decodes it off the UI
 thread.** `App::open_file` now only *starts* an open (invariant
 §7.3.4): a new `crates/aurora-app/src/background_open.rs` `OpenWorker`
 runs `decode_chosen_file` on its own `std::thread` (`aurora-app` has no
@@ -9153,6 +9264,19 @@ structural design work.
   An open that finishes under a modal dialog waits for it to close (review
   E1). The §7.3.1 half (the whole file in memory, not streamed through the
   tile store) is still open. "Next action", addendum 0.151.0.
+
+  **Update 0.154.0 — streamed, one layer at a time.** Closes most of the
+  §7.3.1 half: the file is parsed from a `BufReader<File>`
+  (`aurora_io::read_psd_streaming`), never read whole; each layer is
+  read, decoded, handed to a `PsdPixelSink`, encoded and staged to the
+  tile store's scratch disk (`aurora_tile::StagingArea`) before the next
+  is read, and the install adopts the staged files
+  (`TileStore::insert_staged`). Still not per-tile: one layer is an
+  in-memory `Image`, every user mask's coverage is held until its layer
+  is handed on, the image-resources section is read whole, and a flat
+  file's merged image reads the rest of the file at once. Measured: a
+  2 GiB PSD peaks at +1,277 MiB (was +4,352 MiB) and opens in 7.3 s —
+  over the PRD's 5 s. "Next action", addendum 0.154.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30551,6 +30675,624 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.154.0) — PSD opens stream, one layer at a
+time.** Done as 0.154.0. Files: `crates/aurora-io/src/psd.rs`
+(`ByteSource`/`StreamSource`/`Window`, `read_layer_info`,
+`read_record_bytes`, `read_block_windows`, `check_channel`,
+`plan_layer_image`/`decode_pending`, `decode_source`, `materialize`,
+`build_streamed`, the public `PsdPixelSink`, `PsdStreamedDocument`,
+`read_streaming`; `Record` no longer borrows the file), `psd/tests.rs`
+(6 new tests, `records_of` on the streaming functions), `aurora-io`'s
+`lib.rs` (exports `read_psd_streaming`, `PsdPixelSink`,
+`PsdStreamedDocument`), `crates/aurora-tile/src/staging.rs` (new, 3
+tests), `aurora-tile`'s `store.rs` (`staging_root`, `insert_staged`,
+the `staged` set; paged-in staged files deleted), `error.rs`
+(`Staging`, `ForeignStagedTile`), `lib.rs`;
+`crates/aurora-app/src/prepared_pixels.rs` (`PreparedTile`,
+`PreparedPsd::stream`, `StreamSink`, `insert_one`), `aurora-app`'s
+`lib.rs` (`decode_chosen_file_with`, `App::open_file` passes the
+store's `StagingRoot`; 2 new tests and the `#[ignore]`d
+`measure_streaming_a_large_noisy_psd_open`).
+
+*Choice of hand-off: (i), staging files the store adopts.* The decode
+thread writes each encoded tile into a per-open directory the store's
+`StagingRoot` creates inside its own scratch dir; the install stays
+one step after the whole decode (so a failed, superseded or deferred
+(E1) open never touches the current document), and adopting a tile is
+a `HashMap` insert — measured 0.34 ms for 4096² and 1.33 ms for 8192²
+four layers. (ii) was rejected because a progressive install replaces
+the old document before the decode can fail. The file name is the
+staging one, not the store's `tile_path`: surface ids of the incoming
+tree collide with the outgoing document's until the sweep, and a
+rename per tile on the UI thread would cost milliseconds.
+
+*Measured* (release unless noted; peak = `VmHWM` above the start, after
+`clear_refs`; same process, file in a tempdir, warm page cache):
+
+| File | 0.153.0 path peak / time | 0.154.0 peak / time | UI install |
+|---|---|---|---|
+| 4096² ×4 noisy 8-bit, 256 MiB (dev) | +800 MiB / 2.71 s | +260 MiB / 2.72 s | 0.37 ms |
+| 4096² ×4 noisy 8-bit, 256 MiB | +800 MiB / 1.30 s | +260 MiB / 1.51 s | 0.34 ms |
+| 4096² ×4 noisy 16-bit, 512 MiB | +1,024 MiB / 1.41 s | +288 MiB / 1.51 s | 0.34 ms |
+| 8192² ×4 noisy 16-bit, 2 GiB | +4,352 MiB / 7.22 s | +1,277 MiB / 7.34 s | 1.33 ms |
+
+One decoded 8192² layer is 512 MiB, so the streamed peak is about 2.5
+layers (the decoded image, its encoded tiles, one channel's bytes) —
+"about one layer" in kind, not in constant. The open is slightly
+slower (the decode thread now also writes the tiles the store's writer
+used to write after the install). **2 GB in under 5 s is not met:
+7.3 s**, on a warm page cache, single-threaded decode.
+
+*Parity:* a digest of every corpus and fixture file's opened document
+(tree, canvas, report, every pixel and mask sample's bits; the error's
+`Debug` for a refusal) — 284 files — is identical between a build of
+0.153.0's `aurora-io` and this one. All psd-tools differentials
+(pixels, masks, density, vector masks) and hostile/truncation sweeps
+pass on the streaming parser, since `decode`/`read` now run it.
+
+*Mutations* (each file backed up, mutated, the three crates' tests
+run, restored, `touch`ed, sha256 checked):
+
+| # | Mutation | Result |
+|---|---|---|
+| 1 | read the whole file at the start of `decode_source` | killed: `the_streaming_read_hands_each_layer_on_before_reading_the_next`, `a_length_past_the_file_is_refused_before_anything_is_read` |
+| 2 | decode every layer before building (hold the whole document) | killed: `the_streaming_read_hands_each_layer_on_before_reading_the_next` |
+| 3a | `Window::fits` always true (no length check) | killed: `a_length_past_the_file_...`, `seeded_single_byte_mutations_never_panic` |
+| 3b | `StreamSource::read_at` skips its file-length check | killed (after the test was tightened to assert the reader is never asked): `a_length_past_the_file_...` |
+| 4 | trust a stale reader position (unchecked seek) | killed: dozens of psd tests |
+| 5 | EOF mid-layer zero-filled | killed: `a_reader_failing_or_ending_mid_layer_is_a_typed_error` |
+| 6 | I/O error panics | killed: same |
+| 7 | `decode_source` ignores a remembered read failure | survived in the candidate; **killed after review I1**: `a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask` |
+| 7b | both failure checks removed | survived in the candidate; moot after I1 removed the second check (7 is now the only one) |
+| 17 | `make_room` keeps the tombstone (J4 clear removed) | **survived** 0/40 idle runs of the two tests that target it; killed once by J4's own test under full-suite load — timing-dependent, there is no writer stall hook |
+| 18 | `insert_staged` clears the tombstone | survived: equivalent for correctness (the old write's result is then dropped as superseded, leaving its own file as an orphan until the key is evicted again) |
+| 8 | unadopted `StagedTile` keeps its file | killed: `staged_files_never_outlive_their_owner` |
+| 9 | unadopted staging dir kept / adopted one removed | killed: 2 staging tests, 2 app tests |
+| 10 | paged-in staged file not deleted | killed: `an_adopted_staged_tile_...`, `a_staged_streaming_open_installs_the_same_tiles_and_cleans_up_after_itself` |
+| 11 | adoption does not mark the area adopted (files deleted under the store) | killed: 2 staging tests, 1 app test |
+| 12 | adopted tile recorded at the store's own path (snapshot cannot read it) | killed: 3 staging tests, 1 app test |
+| 13 | adopted tile not recorded dirty | killed: `an_adopted_staged_tile_...` |
+| 14 | foreign staged tile accepted | killed: `staged_files_never_outlive_their_owner` |
+| 15 | insert before the sweep (non-atomic install) | killed: 7 app tests |
+| 16 | per-layer channel-length pre-check skipped | killed: `an_rle_channel_too_short_for_its_rectangle_is_refused_before_allocating` |
+
+*Disclosures.* Not bounded by one layer: every user mask's coverage is
+decoded while the tree is built (a mask's readability decides the
+document's structure) and held until its layer is handed on; the image
+resources are read whole (after a file-length check); a flat file's
+merged image reads the rest of the file at once. A failed staging write
+falls back to keeping that tile in memory (0.153.0's J1 rules then
+apply), so on a full disk memory is 0.153.0's. A dropped (superseded)
+result's staging files are deleted on a short-lived thread (review I4).
+Adopted staging directories are left empty in the scratch dir until its
+end-of-session sweep. `App::open_file`'s own use of the
+staging root is not exercised by a test (`App` cannot be built
+headlessly); `decode_chosen_file_with` is. The 5 s budget is missed.
+Only Linux/RTX 3090 measured; macOS file I/O and memory not.
+
+*Review revision* (after the candidate's full gate: `AURORA_REQUIRE_GPU=1`,
+2,902 passed, 0 failed, 0 skipped; clippy, strict rustdoc, deny clean;
+judge REVISE 0.899, no correctness or safety defect):
+
+- **I1 (fixed).** A read error on a mask channel is swallowed by the tree
+  build (reported as `MaskUnreadable`); only `decode_source`'s
+  `take_failure` turns it back into a failed open. New test
+  `a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask`: a
+  `Read + Seek` probe that fails exactly once, only on the mask's byte
+  range, and succeeds after; both the streaming read and `decode`'s
+  parser return the reader's `IoError::Io`. Mutation 7 is now killed by
+  it. The second check in `build_streamed` was **removed**, with a
+  comment: every read there propagates its own error.
+- **I2 (checked, test added, no fix needed).** `insert_staged` keeps
+  `forget_tile`'s tombstone; if the key is then paged in and evicted
+  again, `make_room`'s J4 clear drops the tombstone as write 2 is
+  submitted, so write 1's late result is discarded as superseded and
+  cannot delete write 2's file. New tests
+  `an_adopted_tile_over_an_in_flight_write_keeps_its_re_evicted_file`
+  (store) and `an_adopted_key_with_an_older_write_in_flight_survives_a_re_eviction`
+  (64 rounds, staging) read the tile back after the re-eviction — both
+  green. Honest limit: neither catches the J4 clear's removal
+  deterministically (mutation 17), because whether write 1 is still in
+  flight is a race this crate has no hook to stall.
+- **I3 (fixed).** The streaming sink checks `SESSION_ENDING` (0.151.0
+  C1) before creating a staging area and before staging each layer; once
+  set, tiles stay in memory (the result is never installed). Residual: a
+  write already under way as the flag flips can race the cleanup — then
+  `create_new` fails in the removed directory, or one stray file is left
+  for the next session's orphaned-scratch sweep.
+- **I4 (fixed).** `OpenWorker::take_finished` drops a superseded result
+  on a short-lived `aurora-open-drop` thread (inline only if that thread
+  cannot start), so its thousands of staged-file deletions stay off the
+  UI thread. Drop threads are not tracked or joined (D1 caps superseded
+  *decodes*, not these): one still running at exit is killed with the
+  process, and its remaining staged files are left to the next session's
+  orphaned-scratch sweep.
+- **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+  clippy `-D warnings`, **2,905 passed, 0 failed, 50 ignored, 0
+  skipped**, strict rustdoc, `cargo deny`. Judge round 2: **PASS 0.906**,
+  no blocking issue.
+- **Tracked follow-up (judge round 2, N1): a deterministic J4 test.**
+  Nothing deterministically tests `make_room`'s tombstone clear — the
+  safety property that stops a late, superseded write result deleting a
+  newer write's scratch file (reachable through `forget_tile` and, since
+  this round, `insert_staged`). Add a `#[cfg(test)]` hold/release hook on
+  the store's writer so a test can keep write 1 in flight, submit write
+  2, then reconcile — which would make 0.153.0's R2 and this round's M17
+  reliable kills. Recorded here, not done this round.
+
+**Needs a human: open a very large PSD on macOS; watch memory in
+Activity Monitor and the open time.**
+
+**Suggested next: Curves** — an adjustment in `aurora-filters`, a
+histogram behind the curve editor drawn in `text.secondary`, and a
+channel selector: the design owner's decided next step after the
+performance rounds.
+
+**Addendum 2026-10-09 (0.153.0) — an open's tile writes are prepared
+off the UI thread.** Done as 0.153.0 (`crates/aurora-app/src/prepared_pixels.rs`
+(new: `PreparedImage`, `PreparedPsd`, `PreparedLayer`, `PreparedMask`,
+`insert_prepared`), `aurora-app`'s `lib.rs` (`decode_chosen_file`,
+`replace_document_pixels_prepared`, `install_opened_document`,
+`open_image_file`, `open_psd_file`, `document_from_size`; the old
+`replace_document_pixels` is now a test-only wrapper over the new path,
+and `replace_document_pixels_synchronously` is the test-only verbatim
+old path the measurements compare against), `background_open.rs`
+(`DecodedFile::Image`/`Psd` carry the prepared forms), `aurora-io`'s
+`import.rs` (`encode_image_tiles_at`, `EncodedTiles`, shared
+`fill_placed_tile`/`placed_overlap`) and `psd.rs` (`encode_mask_pixels`
+re-exported as `encode_psd_mask`), `aurora-doc`'s `mask.rs`
+(`encode_mask_coverage_region`, shared `fill_mask_tile`), `aurora-tile`'s
+`store.rs` (`EncodedTile`, `TileStore::insert_encoded`)). This closes
+0.152.0's "chunk the tile and mask writes across frames" follow-on, but
+with **design (A), pre-encoded insertion**, not chunking.
+
+*Why (A), measured.* Of the two designs, (A) moves all per-texel work
+(the fill and the `codec::encode` that the old write paid on every
+eviction) to the decode thread and leaves the UI thread O(1) per tile;
+(B) would still have paid the same ~0.7 s on the UI thread, only spread
+over frames, while needing a half-installed document state that edits,
+saves, autosave, undo and a second open would each have to respect.
+(A) measured at ~0.1–0.2 % of the old cost (below), so (B) was not
+built. The bookkeeping `insert_encoded` does is exactly what `make_room`
+does for an evicted tile — a `paged_out` path, a `pending` entry with a
+fresh write generation, an `evicted_dirty` mark (the GPU upload is
+owed) and a job for the existing background writer — so page-in,
+eviction, `snapshot_tile`, `snapshot_len_bound`, `forget_tile` and
+`forget_surfaces` all treat an inserted tile as an evicted one with no
+new code. Invariant §7.3.1: an inserted tile is never resident, so the
+resident budget is untouched; the encoded bytes sit in `pending` only
+until the writer lands them (measured 187–225 ms for 512 MiB of noisy
+tiles), and each layer's decoded image is dropped on the decode thread
+as soon as its tiles exist. Peak memory is **higher**, not lower (review
+J2, measured below): the decode thread peaks at about one layer's
+encoded size above the decoded document, and after the install the
+whole encoded document sits in `pending` until the writer lands it
+(~0.2 s per 512 MiB on this box's disk; indefinitely on a stalled one,
+see disclosure 10). Every PNG/JPEG/TIFF/PSD open now also writes the
+whole document to the scratch disk, even one that would fit in the
+resident budget (review J6); before, the last `budget` tiles of an open
+stayed resident and were never written unless evicted.
+
+*Measured* (RTX 3090 box; `measure_installing_a_large_psd_on_the_ui_thread`
+now also runs the old write path into a second store in the same run;
+new `measure_installing_noisy_layers_on_the_ui_thread`, 0.152.0's noisy
+approach: four 4096² layers of random `f16` in [0, 1), 512 MiB encoded;
+both `#[ignore]`d):
+
+| | dev before (old path, same run) | dev after | release before | release after |
+|---|---|---|---|---|
+| flat PSD: tile writes → inserts (UI) | 662–693 ms | 0.8–0.9 ms | 320 ms | 0.7 ms |
+| flat PSD: UI-thread install total | (0.73 s in 0.152.0) | 1.3–1.5 ms | (0.35 s in 0.152.0) | 1.2 ms |
+| flat PSD: extra on the decode thread | — | 658–689 ms | — | 307 ms |
+| noisy, 16-tile store: writes → inserts (UI) | 693–700 ms | 0.74–0.85 ms | 349 ms | 1.26 ms |
+| noisy, 256-tile store: writes → inserts (UI) | 561–641 ms | 0.68–0.72 ms | 280 ms | 0.61 ms |
+| noisy: encode on the decode thread | — | 726–805 ms | — | 307–513 ms |
+| noisy: first read of every tile (first-composite proxy) | 1,003–1,058 ms | 855–1,058 ms | 525–551 ms | 461–522 ms |
+
+The flat-PSD autosave snapshot fell from 7.3–7.6 ms to 0.4–0.5 ms: right
+after the install every tile is still a shared `pending` buffer, so the
+snapshot copies nothing. Two runs dev, one release.
+
+*Rules* (module docs of `prepared_pixels`, `TileStore::insert_encoded`).
+Tiles are bit-identical to the old writers' on an empty surface, which
+is what the install always writes onto (the sweep comes first and is
+unchanged): the encoders share their per-tile body with
+`write_into_store_at` / `write_mask_coverage_region`, start from a blank
+tile, and produce exactly the tiles the writers touched — every tile a
+placed image or mask region overlaps, fully transparent ones included,
+as before (no blank-tile elision; the autosave still leaves blank tiles
+out, unchanged). The 0.144.0 C-01 placement check and origin semantics
+come from the same code (`ImagePlacementOutOfRange` is computed before
+anything is encoded and counts as an unwritten layer, as before). Masks
+are inserted after every layer's pixels and after the sweep (0.147.0
+M9). Alpha/premultiplication: samples are copied verbatim, as before.
+`.aur` keeps the old path (`read_prechecked_aur` → `read_aur`, which
+decodes every untrusted tile entry). AC-4 is enforced by type:
+`EncodedTile` has one constructor, `EncodedTile::of(&Tile)`, and no way
+to wrap foreign bytes. An insert over a key a `forget_tile` tombstoned
+while its write was in flight clears the tombstone (the new generation
+already supersedes the old result); otherwise this write's own result
+would consume it and delete the scratch file it just wrote.
+
+*Tests* (9 new). `aurora-tile`'s `store::insert_encoded_tests` (5):
+inserted tiles are never resident, are written to scratch (files hold
+the inserted bytes), page back in exactly from both `pending` and the
+scratch disk, and the budget holds while reading; an inserted tile
+reads from `pending` before its write lands, its snapshot shares the
+inserted bytes, its budget estimate counts them, and it owes a
+whole-tile upload; `forget_surface` frees inserted tiles and deletes
+their files; inserting over a tile forgotten mid-write keeps the new
+file; an insert replaces a resident tile whole. `aurora-app`'s
+`prepared_pixels::tests` (4): the prepared install is bit-identical to
+the old writers (3 layers — full-canvas noise with per-texel alpha and
+fully transparent texels, a 300×200 layer cropped at (130, 270) across
+tile seams, a fully transparent layer — and 2 masks with a `NaN`, an
+out-of-range and a short-buffer coverage; outgoing document with
+aliased ids, masks and pending writes; same tile set, same texels,
+before and after the writer drains; nothing resident after the
+install); refused placements are counted as before; a background
+autosave right after the install (tiles still pending) and after the
+store's flush both recover the document; an install while the previous
+autosave is writing (first file recovers the first document, final file
+the second, live store equal to the old path). Existing open/install
+tests now exercise the new path (`replace_document_pixels` wraps it);
+`a_background_{psd,image}_open_…` compare the encoded tiles with the
+synchronous decode's. Test count after the candidate: **2,889** (2,880 + 9; 3 ignored in
+`aurora-app` incl. the new measurement). Runs:
+`cargo test -p aurora-tile -p aurora-doc -p aurora-io` (80 + 260 + 203
+passed, 1 ignored) and `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app`
+(655 passed, 3 ignored); clippy `-D warnings` on the four crates with
+`--all-targets --all-features` and `cargo fmt --all --check` clean.
+Then the candidate's full gate (`AURORA_REQUIRE_GPU=1`): **2,889 passed,
+0 failed, 49 ignored, 0 skipped**; clippy, strict rustdoc and deny
+clean.
+
+*Mutations* (each file backed up to the session scratchpad, mutated,
+the four crates' tests run with `AURORA_REQUIRE_GPU=1`, restored with
+`copyfile` + `os.utime`, sha256 checked — 15 of 15 restored):
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `insert_encoded` never submits the write (never on scratch) | killed: `inserted_tiles_go_to_scratch_never_resident_and_page_back_in_exactly`, `inserting_over_a_tile_forgotten_…` |
+| M2 | wrong tile key (x/y swapped) in `encode_image_tiles_at` | killed: all 4 `prepared_pixels` tests |
+| M3 | wrong origin (encoder fills as if placed at (0, 0)) | killed: `the_prepared_install_is_bit_identical_…`, both autosave tests |
+| M4 | blank-tile rule broken (fully transparent tiles skipped) | killed: `the_prepared_install_is_bit_identical_…`, `a_refused_placement_…`, `an_install_while_…` |
+| M5 | `insert_encoded` bypasses the budget (decodes into `resident` with `LruCache::put`) | killed: 4 `prepared_pixels` + 5 `insert_encoded_tests` |
+| M6 | masks inserted before the sweep | killed: 4 `prepared_pixels` + `an_opened_psds_mask_is_written_after_the_outgoing_masks_are_swept` |
+| M7 | pixels inserted before the sweep | killed: 4 `prepared_pixels` + 3 existing sweep-order tests |
+| M8 | `snapshot_tile` ignores pending (inserted) bytes | killed: both autosave tests, `an_inserted_tile_reads_from_pending_…`, `snapshot_tile_copies_without_paging_in_or_evicting` |
+| M9 | `insert_encoded` records no `pending` entry | killed: 9 tests incl. both autosave tests and 4 existing open tests |
+| M10 | `.aur` tile bytes inserted without decoding (an added unchecked constructor) | killed: 5 damaged-`.aur` tests, e.g. `read_aur_for_open_refuses_a_damaged_file_before_touching_the_live_store` |
+| M11 | the `forget_tile` tombstone is not cleared | killed: `inserting_over_a_tile_forgotten_while_its_write_was_pending_keeps_the_new_file` |
+| M12 | no owed upload (`evicted_dirty`) recorded | killed: `the_prepared_install_is_bit_identical_…`, `an_inserted_tile_reads_from_pending_…` |
+| M13 | a held key is not forgotten first | killed: `an_insert_replaces_a_resident_tile_whole` |
+| M14 | the decode thread drops the PSD's masks | killed: `a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path` |
+| M15 | shared mask fill: `NaN` fails closed | killed: `write_mask_coverage_region_clamps_fails_open_and_skips_an_empty_region` (the bit-identity test cannot see it: both paths share the body) |
+
+15 of 15 killed.
+
+*Disclosures.* (1) Bit-identity holds against an *empty* target
+surface; on a surface still holding a tile (impossible after the sweep)
+the old writer kept that tile's texels outside the image and an insert
+replaces the tile whole. (2) Dirty state differs: an incoming tile is
+now whole-tile dirty where the old resident survivors carried the exact
+written rectangle; every tile is uploaded either way, and the
+`composite_cache.bump` after the install already invalidates
+everything. (3) The decode thread is correspondingly slower (+0.66–0.69
+s dev, +0.31 s release for the flat PSD), so "Opening …" shows longer;
+the window stays responsive throughout. (4) The pause moves partly to
+the first composite: with the app's 256-tile budget the old install
+left the last 256 tiles resident, now every tile is paged in from
+`pending` by the first frames (the read-every-tile proxy above shows no
+regression at 16 or 256 tiles, but it is a proxy, not a frame). (5)
+`pending` grows to every inserted tile until the writer drains it
+(measured ~0.2 s for 512 MiB), past the "bounded by evictions since the
+last touch" argument `ensure_resident` documents; the memory was
+already held as the decoded document. (6) Found, not fixed: `make_room`
+has the same tombstone hazard `insert_encoded` now avoids — a key
+`forget_tile`d while its write is in flight, re-created and evicted
+again before the old result is drained, has its new scratch file
+deleted by the new result and its bytes kept in `pending` for good (a
+leak, not data loss: reads come from `pending`). Under 0.152.0's install
+this is plausibly reachable at an open whose sweep hits writes still in flight. **Fixed in the review revision (J4)**, with a test reproducing the sequence. (7)
+The flat-image path now drops the decoded `Image` on the decode thread
+(the install needs only its size); `document_from_image` is test-only,
+`document_from_size` is production. (8) `.aur` opens are unchanged and
+still read on the UI thread. (9) Not run on real macOS hardware; one
+release run of the timings. (10) No backpressure (review J3): the
+store's writer queue (`writer.rs`) is unbounded, so on a slow or stalled
+scratch disk `pending` holds the whole encoded document — up to ~8 B/px
+for incompressible content — for as long as the disk takes, outside the
+resident budget. That is the decode thread's memory handed over, not
+new memory, but it is the one place this path holds document-sized
+memory after the install, against invariant §7.3.1 (which the in-memory
+PSD decode already does not honour; see "Suggested next").
+
+*Review revision (judge REVISE 0.899).*
+
+- **J1 (fixed): inserted tiles could be lost to the failed-write cap.**
+  The cap (`failed_write_capacity() == budget`) assumed about `budget`
+  more tiles survived resident; no inserted tile is resident, so a
+  failing scratch disk during an open would have dropped all but
+  `budget` of them, permanently. `TileStore` now tracks
+  `inserted_unconfirmed` (keys inserted and neither written nor ever
+  resident); `retain_failed_write` keeps those outside the cap. Bounded
+  by the encoded document the decode thread already held, and only
+  shrinking (`forget_pending` removes a key on a confirmed write, a
+  read, a forget). Documented on `insert_encoded`. Test
+  `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap`
+  (budget 2, 7 inserted tiles, every write failing: all 7 kept and
+  readable, 0 dropped).
+- **J2 (fixed and measured).** `decode_chosen_file` drops the PSD file's
+  bytes before encoding (the image route already dropped them inside
+  `open_image`). Peak memory, measured in
+  `measure_installing_noisy_layers_on_the_ui_thread` as `VmHWM` after
+  `clear_refs` 5, above the RSS at the start of each install, store
+  flush included: 16-tile store, release, old path **11 MiB**, 0.153.0
+  **504 MiB**; dev 12 MiB against 503 MiB. That test holds all four
+  decoded images and encodes all layers before inserting, so 504 MiB is
+  the whole encoded document at once; in the app the decode thread drops
+  each image once encoded, so its peak is — reasoned, not measured — the
+  decoded document plus one layer's encoded tiles (plus the decoded mask
+  buffers until `PreparedPsd::new` returns), and then the encoded document sits in
+  `pending` until written. The 256-tile iteration reported 0–7 MiB and
+  is not reliable: it runs second, and the allocator keeps the first
+  iteration's freed memory resident, inflating its baseline. The
+  "lower than before" claim is withdrawn above.
+- **J3 (disclosed):** disclosure 10 and the `insert_encoded` docs.
+- **J4 (fixed):** `make_room` clears a stale `forget_tile` tombstone
+  when it records a new pending write for that key. Test
+  `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file`.
+- **J5 (done):** the gate figures above replace the earlier "no gate"
+  wording, here, in CLAUDE.md and in README.
+- **J6 (disclosed):** in "Why (A)" above.
+
+*Revision mutations* (same procedure; restored with `copyfile` +
+`os.utime`, sha256 checked):
+
+| # | mutation | result |
+|---|---|---|
+| R1 | J1 exemption removed (inserted tiles' failed writes capped) | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
+| R2 | J4 tombstone clear removed from `make_room` | killed: `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file` — **correction (0.154.0): that kill is timing-dependent, not deterministic** (0 of 40 idle runs failed; caught once under full-suite load); see 0.154.0's mutation 17 |
+| R3 | `forget_pending` no longer shrinks `inserted_unconfirmed` | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
+
+Test count **2,891**, measured: the full gate re-run on the revised
+tree passed every step (`AURORA_REQUIRE_GPU=1`: 2,891 passed, 0 failed,
+49 ignored, 0 skipped; clippy, strict rustdoc, `cargo deny` clean).
+Judge round 2: **PASS 0.906**, no blocking issue. Its notes, applied:
+the app-side peak ("the decoded document plus one layer's encoded tiles")
+is *reasoned from the code, not measured* — only the test fixture's
+504 MiB is measured — and it also includes the decoded mask buffers,
+held until `PreparedPsd::new` returns; `cap_failed_writes` now documents
+why it may bypass `forget_pending` (keys in `inserted_unconfirmed` never
+enter `failed_writes`).
+
+*Needs a human:* open a large PSD on macOS; the end-of-open pause
+should be near zero.
+
+*Suggested next:* stream PSD layers through the tile store (§7.3.1), so
+the whole file is no longer decoded in memory.
+
+**Addendum 2026-10-09 (0.152.0) — the autosave is written off the UI
+thread.** Done as 0.152.0 (`crates/aurora-app/src/background_autosave.rs`
+(new), `aurora-app`'s `lib.rs` (`request_autosave`, `snapshot_autosave`,
+`write_autosave_temp`, `land_autosave_temp`, `startup_document`,
+`App::new`, both open installs, `finish_shutdown`), `aurora-io`'s
+`aur.rs` (`AurSnapshot`, `snapshot_best_effort`, `write_snapshot`; the
+header/skipped-tile entries now shared with `write_with_policy`),
+`aurora-tile`'s `store.rs` (`TileSnapshot`, `TileStore::snapshot_tile`)).
+This closes 0.151.0's named follow-on A1 with **design (b)**.
+
+*Why (b), measured rather than assumed.* The first snapshot walked the
+store with `get`, like the writer, copying decoded texels: 1.37 s for
+the 4096² four-layer PSD, about as slow as the 1.8 s write — because
+with 1024 tiles against a 16-tile (test) or 256-tile (app) budget the
+cost is paging (read + `codec::decode` per tile, plus a
+`codec::encode` per eviction), not the ZIP write. The store already
+holds an evicted tile as its `codec::encode` bytes, which are the
+`.aur` tile entry verbatim, so `snapshot_tile` copies those (shared
+`Arc` from a pending write, or a scratch-file read) and `memcpy`s only
+resident tiles, peeking so the LRU does not move: 7.3–7.6 ms. Design
+(a) (re-open the source on recovery) was therefore not needed, and
+the file, its format, the partial-file rule and the recovery code are
+all unchanged. No ADR. (Timing differs in one place: see disclosure
+8.)
+
+*Measured* (`measure_installing_a_large_psd_on_the_ui_thread`, now
+reporting the snapshot, the submit, the UI-thread total, the worker
+write and the old synchronous write in the same run; dev test profile,
+RTX 3090 box, two runs; the test store's budget is 16 tiles):
+
+| | before (0.151.0) | after (0.152.0) |
+|---|---|---|
+| tile writes (UI) | 0.68 s | 0.72 s |
+| autosave on the UI thread | 1.88–1.89 s | snapshot 7.3–7.6 ms (10 MiB) + submit 0.04 ms |
+| UI-thread install total | 2.55–2.57 s | 0.73 s |
+| autosave write, worker | — | 0.63–0.64 s |
+| old synchronous autosave, same run | — | 1.79–1.82 s |
+
+*Rules* (module docs of `background_autosave`): one worker thread, one
+queue slot — a newer request replaces a waiting one, which is never
+written; worker writes land in request order; the rename runs under the
+worker's lock and only for a generation newer than the last landed
+(`land`). (After review R1 the over-budget synchronous write first
+calls `AutosaveWorker::supersede`, so the rule is: the file ends up
+holding the newest request, worker or synchronous.) A job owns its snapshot, so an edit, a second open or the
+store being dropped after it cannot reach the file. Quit (clean)
+abandons the autosave, because the cleanup deletes it anyway: the
+waiting job is dropped, the write in flight fails at its next write
+call (`CancellableWriter`, `ErrorKind::Other` — `write_all` retries
+`Interrupted` forever), the thread is joined within 500 ms
+(`SHUTDOWN_WAIT_BOUND`) or detached, and from then on `land` refuses,
+as it does once `SESSION_ENDING` is set — so `remove_autosave` after it
+is final. The worker writes only the temp dir, never the scratch
+directory. A write panic is caught (`catch_unwind`) in unwinding
+builds and logged; in release (`panic = "abort"`) it ends the process.
+A failed autosave is logged and leaves the previous one in place —
+unchanged from before, and still not shown to the user. A snapshot past
+`AUTOSAVE_SNAPSHOT_BUDGET_BYTES` (2 GiB) falls back to the old
+streaming write on the UI thread. An evicted tile whose bytes do not
+decode is left out by the worker and the file routed to the partial
+path.
+
+*Tests* (14 new): 13 in `background_autosave::tests` — recovers to the
+snapshotted document; evicted tiles snapshot without a single fault and
+the file is entry-for-entry identical to the streaming write (blank
+tile included); coalescing (1 and 3 land, 2 is never written); a stale
+generation is refused; an edit (and dropping the store) after the
+snapshot is not in the file; opening another document while the first
+autosave writes (first file is the first document, final file the
+second); `request_autosave` returns before the file exists; quit while
+writing (cancelled, joined, no file, no temp, no submit afterwards);
+a write that finishes after quit does not land; nothing lands once the
+session is ending; a failed write keeps the previous autosave and the
+worker goes on; a panicking write is caught; the snapshot budget. Plus
+`aurora-tile`'s `snapshot_tile_copies_without_paging_in_or_evicting`.
+`startup_document_writes_a_fresh_documents_autosave` now submits the
+returned job and checks it recovers. Test count 2,877 (2,863 + 14).
+
+*Mutations* (each file backed up, mutated, the targeted tests run with
+`AURORA_REQUIRE_GPU=1`, restored, sha256 checked):
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `request_autosave` writes synchronously on the UI thread | killed: `request_autosave_returns_before_the_file_is_written` |
+| M2 | generation check removed from `land` | killed: `a_stale_generation_never_lands_over_a_newer_one` |
+| M3 | coalescing inverted (waiting job kept, newer dropped) | killed: `a_newer_request_replaces_a_waiting_one_and_lands_last` |
+| M4 | temp + rename removed (written straight over the destination) | killed: `a_failed_write_leaves_the_previous_autosave_in_place`, `a_stale_generation_…` |
+| M5 | `shutdown` does not mark the worker cancelled | killed: `a_write_that_finishes_after_quit_does_not_land`, `quitting_while_a_write_is_in_progress_cancels_it` |
+| M6 | `shutdown` does not cancel the write in flight | killed: `quitting_while_a_write_is_in_progress_cancels_it` |
+| M7 | `SESSION_ENDING` guard ignored in `land` | killed: `nothing_lands_once_the_session_is_ending` |
+| M8 | `catch_unwind` removed | killed: `a_panicking_write_is_caught_and_the_worker_goes_on` |
+| M9 | `snapshot_tile` pages in through `get` (the slow walk) | killed: `snapshot_tile_copies_without_paging_in_or_evicting`, `a_background_autosave_of_evicted_tiles_matches_the_streaming_write` |
+| M10 | `CancellableWriter` never cancels | killed: `a_failed_write_leaves_…`, `quitting_while_…` |
+| M11 | `finish_shutdown` does not stop the autosave worker | **survived** — `App` cannot be built headlessly |
+| M12 | `sync_all` before the rename removed | **survived** — only a power loss shows it |
+| M13 | `write_snapshot` stores blank resident tiles | killed: `a_background_autosave_of_evicted_tiles_matches_…` |
+| M14 | `snapshot_tile` ignores pending bytes | killed: `a_background_autosave_of_evicted_tiles_matches_…` |
+
+12 of 14 killed.
+
+*Disclosures.* (1) A "lazy snapshot that reads the live store on the
+worker" cannot be written as a mutation: the worker has no store
+handle (the `TileStore` is `App`'s), so it does not compile; the
+isolation tests pin the behaviour instead. (2) Measured on flat-colour
+layers, whose encoded tiles are tiny; for noisy content each evicted
+tile's scratch read is up to ~512 KiB on the UI thread, and with the
+app's 256-tile budget the resident `memcpy` is up to 128 MiB (measured
+in the review revision below: 98–202 ms for 512 MiB, warm cache). (3) A snapshot holds a second copy of the resident tiles and
+of the evicted tiles' encoded bytes until written (bounded at 2 GiB by
+an I/O-free estimate since review R2, then the old stall). (4) M11: nothing headless calls `finish_shutdown`;
+the shutdown order was reviewed, not tested (review R6 moved it into
+`run_shutdown_cleanup`, where it is tested). (5) An undecodable evicted tile found by the
+worker is recorded in the file and routed to the partial path, but not
+folded back into `App::skipped_tiles`; no test produces one. (6) A
+worker detached at quit can leave its `.tmp` beside the autosave in
+the temp directory if the process exits mid-write; it never lands. (7)
+When a write is cancelled, the `zip` crate prints "ZipWriter drop
+failed: … autosave cancelled" to stderr from its `Drop`; harmless. (8)
+Startup snapshots the demo document before `App` exists and `App::new`
+submits it, so a crash in the first moments of a fresh session may find
+no autosave yet (before 0.152.0 it was written before the window). (9)
+Not run on real macOS hardware; no full-workspace gate this round.
+
+*Review revision.* The candidate's full gate passed
+(`AURORA_REQUIRE_GPU=1`: 2,877 passed, 0 failed, 47 ignored, 0 skipped;
+clippy, strict rustdoc and deny clean); judge REVISE 0.85. After the
+revision the full gate was re-run on the revised tree: all green,
+**2,880 passed, 0 failed, 48 ignored, 0 skipped**; judge round 2
+**PASS 0.906**, no blocking issue. Its non-blocking notes, recorded and
+not done: `snapshot_tile`'s scratch read is an unbounded `fs::read` — the
+budget bound holds only for well-formed scratch files, so a corrupted or
+replaced oversize file (owner-only directory) is read in full before the
+worker's decode refuses it; the UI-thread snapshot scales to roughly
+0.4–0.8 s near the 2 GiB budget from a warm cache, and the ~1 s+
+cold-disk figure is an estimate, so "the autosave no longer blocks the
+UI thread" is partial for large or noisy documents; an over-budget or
+tile-skipping autosave can land a `.partial` while the canonical file
+keeps the previous document's complete autosave (the pre-existing
+partial-autosave rule); `supersede` refuses but does not cancel the
+in-flight write (wasted worker I/O); R6b still survives. Outcomes:
+
+- **R1 (fixed): the wrong document could be recovered.** The
+  over-budget fallback wrote synchronously while an older worker write
+  (for the previous document) was still in flight or waiting; that write
+  then renamed itself over the new one. `request_autosave_within` now
+  calls `AutosaveWorker::supersede` first: under the lock it drops the
+  waiting job and records a new generation as landed, so the in-flight
+  write is refused at its rename (`Landing::Stale`); taking the lock also
+  waits out a rename already under way. The write in flight is not
+  interrupted, only refused. Other synchronous writers and deleters
+  checked: startup's fallback runs before the worker exists; recovery
+  reads before it exists; shutdown deletes only after the worker is
+  shut down. Test
+  `an_older_write_never_lands_over_a_synchronous_over_budget_autosave`.
+- **R2 (fixed): the over-budget path paid twice.** The budget is now
+  decided before any copy or read, from
+  `TileStore::snapshot_len_bound` (I/O-free: resident texel bytes,
+  pending length, or `codec::MAX_ENCODED_LEN` = 8 + 512 KiB for a
+  scratch-disk tile, the codec's own worst case). Test
+  `an_over_budget_document_copies_nothing_before_falling_back` (no
+  scratch bytes read). **Noisy measurement**
+  (`measure_autosave_snapshot_on_noisy_layers`, new, `#[ignore]`: four
+  4096² layers of random `f16` in [0, 1), store flushed so every evicted
+  tile is on the scratch disk, page cache warm), UI-thread snapshot /
+  worker write / old synchronous autosave:
+  dev, 16-tile store 195.5 / 786 / 2,125 ms; dev, 256-tile (app) store
+  105.5 / 848 / 1,776 ms; release, 16-tile 201.7 / 653 / 1,257 ms;
+  release, 256-tile 98.1 / 608 / 1,071 ms; 512 MiB copied or read each
+  time. Release, flat-colour PSD install (the existing measurement):
+  UI-thread total 0.35 s (tile writes 0.34 s, snapshot 7.4 ms) against a
+  1.14 s synchronous autosave. **Worst case**, stated rather than
+  measured: the snapshot reads every evicted tile, up to ~512 KiB each,
+  on the UI thread — 1,024 tiles is 512 MiB, about 0.1–0.2 s from page
+  cache as measured, and roughly 1 s or more from a cold disk at
+  ~500 MB/s; the 2 GiB budget caps it at ~4,000 such tiles.
+- **R3 (done):** "crash-recovery semantics are unchanged" and "writes
+  land in request order" are qualified above and in "Where we are"
+  (same file, format and recovery code; the startup window; the ordering
+  rule after R1).
+- **R4 (not done, disclosed):** feeding worker-found undecodable tiles
+  back to `App::skipped_tiles` needs to know which document they belong
+  to (a later open resets the record), which is more than a cheap
+  change; disclosure 5 stands.
+- **R5 (done):** the temp name is now
+  `<name>.<pid>.<n>.<random>.tmp`, the random part from
+  `std::collections::hash_map::RandomState` (OS-seeded; no new
+  dependency). It was already `create_new` and `0o600`, so this only
+  removes the pre-create denial of service.
+- **R6 (done):** the worker shutdown moved from `finish_shutdown` into
+  `run_shutdown_cleanup`, before the clean and the aborted cleanups,
+  through a new `ShutdownState::autosave_worker`; test
+  `shutdown_cleanup_stops_the_autosave_worker_before_deleting_the_autosave`.
+  What still cannot be tested headlessly is `App`'s own
+  `autosave_worker()` returning the real worker (R6b below).
+
+*Revision mutations* (same procedure; note: restoring a backup with
+`shutil.copy2` keeps its old mtime, which can leave a stale build of a
+*dependency* crate, so these were re-run after touching every file):
+
+| # | mutation | result |
+|---|---|---|
+| R1a | `supersede` call removed from the fallback | killed: `an_older_write_never_lands_over_a_synchronous_over_budget_autosave` |
+| R1b | `supersede` does not mark its generation landed | killed: same |
+| R1c | `supersede` keeps the waiting job | killed: same |
+| R2a | budget pre-check removed | killed: `an_over_budget_document_copies_nothing_before_falling_back`, `a_document_past_the_snapshot_budget_is_not_snapshotted`, the R1 test |
+| R2b | bound counts scratch-disk tiles as 0 bytes | killed: `an_over_budget_document_copies_nothing_before_falling_back` |
+| R6a | `run_shutdown_cleanup` does not stop the worker | killed: `shutdown_cleanup_stops_the_autosave_worker_before_deleting_the_autosave` |
+| R6b | `App::autosave_worker` returns `None` | **survived** — `App` cannot be built headlessly |
+
+Test count 2,880 (2,877 + 3). M11 of the first table is now R6a
+(killed); its remaining headless gap is R6b.
+
+*Needs a human:* open a large PSD on macOS; the end-of-open pause should
+be gone or much shorter.
+
+*Suggested next:* chunk the tile and mask writes of an install across
+frames (the remaining ~0.7 s), then stream PSD layers through the tile
+store (§7.3.1).
 
 **Addendum 2026-10-09 (0.151.0) — opening a file decodes it off the UI
 thread.** Done as 0.151.0 (`crates/aurora-app/src/background_open.rs`,

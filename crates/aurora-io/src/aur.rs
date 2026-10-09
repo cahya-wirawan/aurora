@@ -1153,42 +1153,8 @@ fn write_with_policy<W: Write + Seek>(
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    zip.start_file(MIME_ENTRY, stored)?;
-    zip.write_all(MIME_TYPE.as_bytes())?;
-
-    let color_space = match profile {
-        None => ColorSpaceTag::Srgb,
-        Some(profile) => ColorSpaceTag::Icc(profile.to_bytes()?),
-    };
-    let manifest = ManifestWrite {
-        version: MANIFEST_VERSION,
-        canvas_width: canvas_size.0,
-        canvas_height: canvas_size.1,
-        color_space,
-        layers,
-    };
-    let manifest_bytes = postcard::to_allocvec(&manifest)
-        .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
-    zip.start_file(MANIFEST_ENTRY, deflated)?;
-    zip.write_all(&manifest_bytes)?;
-
-    let history_bytes = history.save_journal()?;
-    zip.start_file(HISTORY_ENTRY, deflated)?;
-    zip.write_all(&history_bytes)?;
-
-    // Only when some mask is below full density, so an ordinary save
-    // stays byte-identical to 0.148.0's (see `MASK_DENSITY_ENTRY`).
-    let densities = reduced_mask_densities(layers);
-    if !densities.is_empty() {
-        let wire = MaskDensityWire {
-            version: MASK_DENSITY_VERSION,
-            densities,
-        };
-        let bytes = postcard::to_allocvec(&wire)
-            .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
-        zip.start_file(MASK_DENSITY_ENTRY, deflated)?;
-        zip.write_all(&bytes)?;
-    }
+    let header = DocumentEntries::build(layers, history, canvas_size, profile)?;
+    header.write_to(&mut zip, stored, deflated)?;
 
     for (surface, bounds) in persisted_surfaces(layers) {
         let (tiles_x, tiles_y) = tile_grid(bounds)?;
@@ -1232,7 +1198,7 @@ fn write_with_policy<W: Write + Seek>(
                         }
                     },
                 };
-                if tile.texels().iter().all(|sample| sample.to_f32() == 0.0) {
+                if is_blank(tile.texels()) {
                     continue;
                 }
                 let bytes = aurora_tile::codec::encode(tile.texels());
@@ -1258,22 +1224,338 @@ fn write_with_policy<W: Write + Seek>(
     // ordinary user-facing save -- byte-identical to what it produced
     // before this entry existed, since an ordinary save of a document
     // that never lost anything unions an empty list with an empty list.
-    let mut recorded = known_missing.clone();
-    recorded.record(&skipped);
-    if !recorded.is_empty() {
-        let wire = SkippedTilesWire {
-            version: SKIPPED_TILES_VERSION,
-            total: recorded.total(),
-            records: recorded.records().to_vec(),
-        };
-        let bytes = postcard::to_allocvec(&wire)
-            .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+    if let Some(bytes) = skipped_tiles_entry(known_missing, &skipped)? {
         zip.start_file(SKIPPED_TILES_ENTRY, deflated)?;
         zip.write_all(&bytes)?;
     }
 
     zip.finish()?;
     Ok(skipped)
+}
+
+/// Whether a tile is all zeros, the one shape [`write()`] never stores (an
+/// absent entry reads back as a blank tile). Compares bit patterns, so
+/// `-0.0` counts as zero exactly as the `to_f32() == 0.0` test it
+/// replaced did, and a `NaN` never does.
+fn is_blank(texels: &[half::f16]) -> bool {
+    texels
+        .iter()
+        .all(|sample| matches!(sample.to_bits(), 0x0000 | 0x8000))
+}
+
+/// The `skipped-tiles` entry's bytes, or `None` when nothing was ever
+/// lost (the `is_empty` guard [`write_with_policy`] documents).
+fn skipped_tiles_entry(
+    known_missing: &SkippedTiles,
+    skipped: &[SkippedTile],
+) -> Result<Option<Vec<u8>>, IoError> {
+    let mut recorded = known_missing.clone();
+    recorded.record(skipped);
+    if recorded.is_empty() {
+        return Ok(None);
+    }
+    let wire = SkippedTilesWire {
+        version: SKIPPED_TILES_VERSION,
+        total: recorded.total(),
+        records: recorded.records().to_vec(),
+    };
+    postcard::to_allocvec(&wire)
+        .map(Some)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))
+}
+
+/// Every entry of a container that precedes the tiles: the manifest, the
+/// history journal and (only when some mask is below full density, so an
+/// ordinary save stays byte-identical to 0.148.0's, see
+/// `MASK_DENSITY_ENTRY`) the mask densities. Built once, then written by
+/// [`write_with_policy`] and by [`write_snapshot`] in the same order.
+#[derive(Debug, Clone)]
+struct DocumentEntries {
+    manifest: Vec<u8>,
+    history: Vec<u8>,
+    mask_densities: Option<Vec<u8>>,
+}
+
+impl DocumentEntries {
+    fn build(
+        layers: &LayerTree,
+        history: &History,
+        canvas_size: (u32, u32),
+        profile: Option<&aurora_color::IccProfile>,
+    ) -> Result<Self, IoError> {
+        let color_space = match profile {
+            None => ColorSpaceTag::Srgb,
+            Some(profile) => ColorSpaceTag::Icc(profile.to_bytes()?),
+        };
+        let manifest = ManifestWrite {
+            version: MANIFEST_VERSION,
+            canvas_width: canvas_size.0,
+            canvas_height: canvas_size.1,
+            color_space,
+            layers,
+        };
+        let manifest = postcard::to_allocvec(&manifest)
+            .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+        let history = history.save_journal()?;
+        let densities = reduced_mask_densities(layers);
+        let mask_densities = if densities.is_empty() {
+            None
+        } else {
+            let wire = MaskDensityWire {
+                version: MASK_DENSITY_VERSION,
+                densities,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
+        Ok(Self {
+            manifest,
+            history,
+            mask_densities,
+        })
+    }
+
+    /// Writes the `mimetype` sentinel and then these entries.
+    fn write_to<W: Write + Seek>(
+        &self,
+        zip: &mut ZipWriter<W>,
+        stored: SimpleFileOptions,
+        deflated: SimpleFileOptions,
+    ) -> Result<(), IoError> {
+        zip.start_file(MIME_ENTRY, stored)?;
+        zip.write_all(MIME_TYPE.as_bytes())?;
+        zip.start_file(MANIFEST_ENTRY, deflated)?;
+        zip.write_all(&self.manifest)?;
+        zip.start_file(HISTORY_ENTRY, deflated)?;
+        zip.write_all(&self.history)?;
+        if let Some(bytes) = &self.mask_densities {
+            zip.start_file(MASK_DENSITY_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        Ok(())
+    }
+}
+
+/// One tile, copied out of the store by [`snapshot_best_effort`].
+#[derive(Debug, Clone)]
+struct SnapshotTile {
+    surface: SurfaceId,
+    tile: TileId,
+    content: aurora_tile::TileSnapshot,
+}
+
+impl SnapshotTile {
+    fn bytes(&self) -> usize {
+        match &self.content {
+            aurora_tile::TileSnapshot::Texels(texels) => {
+                texels.len() * std::mem::size_of::<half::f16>()
+            }
+            aurora_tile::TileSnapshot::Encoded(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// A whole `.aur` container's content captured at one instant
+/// (0.152.0): everything [`write_best_effort`] would write, but owned,
+/// `Send` and independent of the [`TileStore`] it was taken from, so
+/// [`write_snapshot`] can serialize it on another thread while the
+/// store goes on changing. Built by [`snapshot_best_effort`].
+///
+/// Each tile is taken by [`TileStore::snapshot_tile`]: a `memcpy` of a
+/// resident tile's texels, or the encoded bytes of an evicted one
+/// (shared with its pending write, or read from its scratch file) —
+/// never a page-in, a decode or an eviction. The blank check, every
+/// `codec::encode`/`codec::decode` and the ZIP write all happen in
+/// [`write_snapshot`]. The price is memory: a snapshot holds a second
+/// copy of every resident tile (8 bytes per pixel) and of every evicted
+/// tile's encoded bytes until it has been written, bounded only by the
+/// caller's `max_texel_bytes`.
+#[derive(Debug, Clone)]
+pub struct AurSnapshot {
+    entries: DocumentEntries,
+    tiles: Vec<SnapshotTile>,
+    skipped: Vec<SkippedTile>,
+    known_missing: SkippedTiles,
+}
+
+impl AurSnapshot {
+    /// The tiles [`snapshot_best_effort`] had to leave out because the
+    /// store could not read them; empty for a complete snapshot.
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedTile] {
+        &self.skipped
+    }
+
+    /// How many tiles were copied (blank ones included; the writer drops
+    /// those).
+    #[must_use]
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    /// The tile bytes this snapshot holds (decoded texels and encoded
+    /// bytes together).
+    #[must_use]
+    pub fn texel_bytes(&self) -> usize {
+        self.tiles.iter().map(SnapshotTile::bytes).sum()
+    }
+}
+
+/// Captures what [`write_best_effort`] would write, without writing it:
+/// the manifest, the history journal, the mask densities, a copy of
+/// every tile `store` holds for a persisted surface, and the
+/// `skipped-tiles` record (`known_missing` plus every tile this could
+/// not read, which is left out exactly as [`write_best_effort`] leaves
+/// it out). Same validation and same refusals as that function.
+///
+/// **`Ok(None)`, before copying or reading a single tile, when the
+/// snapshot could exceed `max_texel_bytes`** (0.152.0 review R2): a
+/// snapshot is a second in-memory copy of the document's tiles, which at
+/// the 300,000 px ceiling cannot fit (§7.3.1), so a caller past its
+/// budget falls back to [`write_best_effort`]'s streaming write instead.
+/// The decision uses [`TileStore::snapshot_len_bound`], an I/O-free
+/// upper bound, so an over-budget document pays nothing for the attempt.
+/// (Until the review it was checked tile by tile *after* each copy, so a
+/// refused snapshot had already copied and read up to the whole budget.)
+///
+/// # Errors
+///
+/// Whatever [`write_best_effort`] refuses before writing a tile: an
+/// out-of-range or over-budget layer extent, or a manifest/history
+/// encoding failure. An unreadable tile is not an error; it is recorded.
+pub fn snapshot_best_effort(
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
+    max_texel_bytes: usize,
+    store: &mut TileStore,
+) -> Result<Option<AurSnapshot>, IoError> {
+    let mut bound = 0_usize;
+    for (surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                if let Some(len) = store.snapshot_len_bound(surface, TileId { x: tx, y: ty }) {
+                    bound = bound.saturating_add(len);
+                }
+            }
+        }
+    }
+    if bound > max_texel_bytes {
+        return Ok(None);
+    }
+    validate_persisted_rects(layers)?;
+    let entries = DocumentEntries::build(layers, history, canvas_size, profile)?;
+    let mut tiles = Vec::new();
+    let mut skipped = Vec::new();
+    for (surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let tile_id = TileId { x: tx, y: ty };
+                if !store.contains_tile(surface, tile_id) {
+                    continue;
+                }
+                match store.snapshot_tile(surface, tile_id) {
+                    Ok(None) => {}
+                    Ok(Some(content)) => tiles.push(SnapshotTile {
+                        surface,
+                        tile: tile_id,
+                        content,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(
+                            ?surface,
+                            ?tile_id,
+                            %err,
+                            "leaving an unreadable tile out of a .aur snapshot"
+                        );
+                        skipped.push(SkippedTile {
+                            surface,
+                            tile: tile_id,
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(AurSnapshot {
+        entries,
+        tiles,
+        skipped,
+        known_missing: known_missing.clone(),
+    }))
+}
+
+/// Writes `snapshot` as a complete `.aur` container: the same entries,
+/// in the same order, as the [`write_best_effort`] call it stands in
+/// for would have written at the moment the snapshot was taken. Touches
+/// no tile store, so it may run on any thread.
+///
+/// An evicted tile's encoded bytes are decoded here, which is both the
+/// blank check and the validation a page-in would have done; bytes that
+/// do not decode are left out and recorded exactly as an unreadable
+/// tile is in [`write_best_effort`], and returned, so a caller can
+/// route the result to a partial file. Bytes that do decode are
+/// written verbatim (they are `codec::encode`'s own output already).
+///
+/// # Errors
+///
+/// Any I/O or ZIP error from `writer`.
+pub fn write_snapshot<W: Write + Seek>(
+    writer: W,
+    snapshot: &AurSnapshot,
+) -> Result<Vec<SkippedTile>, IoError> {
+    let mut zip = ZipWriter::new(writer);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    snapshot.entries.write_to(&mut zip, stored, deflated)?;
+    let mut fresh = Vec::new();
+    for tile in &snapshot.tiles {
+        let encoded;
+        let bytes: &[u8] = match &tile.content {
+            aurora_tile::TileSnapshot::Texels(texels) => {
+                if is_blank(texels) {
+                    continue;
+                }
+                encoded = aurora_tile::codec::encode(texels);
+                &encoded
+            }
+            aurora_tile::TileSnapshot::Encoded(bytes) => match aurora_tile::codec::decode(bytes) {
+                Ok(texels) if is_blank(&texels) => continue,
+                Ok(_) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        surface = ?tile.surface,
+                        tile_id = ?tile.tile,
+                        %err,
+                        "leaving an undecodable evicted tile out of a .aur snapshot write"
+                    );
+                    fresh.push(SkippedTile {
+                        surface: tile.surface,
+                        tile: tile.tile,
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            },
+        };
+        zip.start_file(tile_entry_name(tile.surface, tile.tile), stored)?;
+        zip.write_all(bytes)?;
+    }
+    let mut all_skipped = snapshot.skipped.clone();
+    all_skipped.extend(fresh.iter().cloned());
+    if let Some(bytes) = skipped_tiles_entry(&snapshot.known_missing, &all_skipped)? {
+        zip.start_file(SKIPPED_TILES_ENTRY, deflated)?;
+        zip.write_all(&bytes)?;
+    }
+    zip.finish()?;
+    Ok(fresh)
 }
 
 /// [`read`]'s own return shape: the reconstructed `LayerTree`/`History`,

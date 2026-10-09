@@ -57,6 +57,20 @@ use crate::OpenFailure;
 /// [`OpenWorker`]; the first open is generation `1`.
 pub(crate) type Generation = u64;
 
+/// Drops a superseded open's result on a short-lived thread (0.154.0
+/// review I4): a streamed PSD's result owns its staged tile files, and
+/// dropping it deletes each one — thousands of `remove_file` calls for a
+/// large file, which must not run on the UI thread. If the thread cannot
+/// be started the result is dropped here instead (correct, only slower).
+fn drop_off_thread(finished: FinishedOpen) {
+    let spawned = std::thread::Builder::new()
+        .name("aurora-open-drop".to_owned())
+        .spawn(move || drop(finished));
+    if let Err(err) = spawned {
+        tracing::warn!(%err, "dropping a superseded open's result on the UI thread");
+    }
+}
+
 /// How long quitting waits for a decode still running before detaching
 /// it. Short on purpose: the decode's result is going to be thrown away,
 /// so waiting buys nothing but a tidy join.
@@ -70,10 +84,12 @@ pub(crate) const MAX_SUPERSEDED: usize = 1;
 /// data: no tile-store handle, nothing that needs the UI thread.
 #[derive(Debug)]
 pub(crate) enum DecodedFile {
-    /// A flat PNG/JPEG/TIFF image.
-    Image(aurora_io::Image),
-    /// A whole PSD/PSB document with its import report.
-    Psd(aurora_io::PsdDocument),
+    /// A flat PNG/JPEG/TIFF image, its tiles already encoded on the
+    /// decode thread (0.153.0).
+    Image(crate::PreparedImage),
+    /// A whole PSD/PSB document with its import report, its layers' and
+    /// masks' tiles already encoded on the decode thread (0.153.0).
+    Psd(crate::PreparedPsd),
     /// A `.aur` document's bytes, **already read once into a throwaway
     /// store** on the decode thread (`crate::precheck_aur`, 0.143.1's
     /// safety rule). The UI thread reads them into the live store; the
@@ -284,6 +300,7 @@ impl OpenWorker {
                     path = %finished.path.display(),
                     "dropped a superseded open's result"
                 );
+                drop_off_thread(finished);
             }
         }
         self.reap_superseded();
@@ -416,7 +433,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         (tx, move |_: &Path| {
             let _ = rx.recv_timeout(PATIENCE);
-            Ok(DecodedFile::Image(tiny_image()))
+            Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image())))
         })
     }
 
@@ -440,7 +457,7 @@ mod tests {
                 if let Ok(mut slot) = seen.lock() {
                     *slot = Some((std::thread::current().id(), path.to_path_buf()));
                 }
-                Ok(DecodedFile::Image(tiny_image()))
+                Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image())))
             },
             wake,
         ) {
@@ -537,7 +554,7 @@ mod tests {
         }
         let second = match worker.start(
             PathBuf::from("second.png"),
-            |_| Ok(DecodedFile::Image(tiny_image())),
+            |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
             second_wake,
         ) {
             Ok(generation) => generation,
@@ -649,7 +666,7 @@ mod tests {
         let (woken, wake) = waker();
         if let Err(failure) = worker.start(
             PathBuf::from("small.png"),
-            |_| Ok(DecodedFile::Image(tiny_image())),
+            |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
             wake,
         ) {
             unreachable!("{failure:?}");
@@ -686,7 +703,7 @@ mod tests {
         let (third_woken, third_wake) = waker();
         match worker.start(
             PathBuf::from("c.psd"),
-            |_| Ok(DecodedFile::Image(tiny_image())),
+            |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
             third_wake,
         ) {
             Err(OpenFailure::Background(BackgroundFailure::Busy)) => {}
@@ -713,7 +730,7 @@ mod tests {
         let (fourth_woken, fourth_wake) = waker();
         if let Err(failure) = worker.start(
             PathBuf::from("d.psd"),
-            |_| Ok(DecodedFile::Image(tiny_image())),
+            |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
             fourth_wake,
         ) {
             unreachable!("nothing is running any more: {failure:?}");
@@ -752,7 +769,7 @@ mod tests {
         let (woken, wake) = waker();
         if let Err(failure) = app.worker.start(
             PathBuf::from("x.psd"),
-            |_| Ok(DecodedFile::Image(tiny_image())),
+            |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
             wake,
         ) {
             unreachable!("{failure:?}");
@@ -787,7 +804,7 @@ mod tests {
             let wakes = Arc::clone(&wakes);
             match worker.start(
                 PathBuf::from("x.png"),
-                |_| Ok(DecodedFile::Image(tiny_image())),
+                |_| Ok(DecodedFile::Image(crate::PreparedImage::new(tiny_image()))),
                 move || {
                     wakes.fetch_add(1, Ordering::SeqCst);
                 },
