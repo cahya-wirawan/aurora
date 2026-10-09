@@ -47,6 +47,13 @@ PAIRS = [
     # ring colours against each other so the ring delineates itself.
     ("text.on_accent on border.focus", "text.on_accent", "border.focus", 3.0, "UI boundary"),
     ("accent.primary on surface.panel", "accent.primary", "surface.panel", 3.0, "UI boundary"),
+    # 0.160.0, design owner's decision (2026-10-09): an unselected tool
+    # button is drawn with a border.strong outline in every theme. The
+    # tools strip paints no background of its own, so the outline sits on
+    # the window clear colour, surface.app (the same colours as the
+    # "border.strong on surface.app" gate above, listed again so the tool
+    # button's own dependency is explicit).
+    ("border.strong on surface.app (unselected tool button outline)", "border.strong", "surface.app", 3.0, "UI boundary (tool button)"),
     # 0.156.0: the curve editor's histogram fills text.secondary (the design
     # owner's "muted foreground" decision) inside the surface.sunken well.
     ("text.secondary on surface.sunken", "text.secondary", "surface.sunken", 3.0, "UI graphic (histogram)"),

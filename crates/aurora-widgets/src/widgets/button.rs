@@ -1,7 +1,20 @@
 //! A push button: a discrete trigger, the simplest of the three
 //! interaction shapes this first widget slice covers.
+//!
+//! **Toggle buttons (0.160.0).** A button built with
+//! [`insert_toggle_button`] also carries an on/off state
+//! ([`ButtonState::toggled`]), exposed to assistive technology as
+//! accesskit's `toggled` property on a `Role::Button` — the accesskit
+//! spelling of a toggle button, which a screen reader announces as
+//! "selected"/"pressed". Clicking one does **not** flip it: the caller
+//! decides what a click means (the tools panel treats its buttons as a
+//! radio group) and sets the state with [`set_button_toggled`]. An "on"
+//! toggle is painted like a push button (`accent.primary`, label in
+//! `text.on_accent`); an "off" one has no fill, only the control outline,
+//! with its label in `text.primary` — both pairs already gated by
+//! `design/check_contrast.py`. No hover state exists for any button yet.
 
-use accesskit::{Action, Node, Role};
+use accesskit::{Action, Node, Role, Toggled};
 use aurora_theme::Scales;
 use taffy::style_helpers::length;
 use taffy::{Rect as LayoutRect, Style};
@@ -15,11 +28,27 @@ pub struct ButtonState {
     pub label: String,
     pub pressed: bool,
     pub disabled: bool,
+    /// `None` for a push button; `Some(on)` for a toggle button
+    /// ([`insert_toggle_button`]).
+    pub toggled: Option<bool>,
+}
+
+impl ButtonState {
+    /// Whether the button is painted with the accent fill (and so its
+    /// label in `text.on_accent`): a push button always, a toggle button
+    /// when on or while held down.
+    #[must_use]
+    pub const fn fills_accent(&self) -> bool {
+        self.pressed || !matches!(self.toggled, Some(false))
+    }
 }
 
 fn node(state: &ButtonState) -> Node {
     let mut node = Node::new(Role::Button);
     node.set_label(state.label.clone());
+    if let Some(on) = state.toggled {
+        node.set_toggled(if on { Toggled::True } else { Toggled::False });
+    }
     if state.disabled {
         node.set_disabled();
     } else {
@@ -56,6 +85,7 @@ pub fn insert_button(
         label: label.into(),
         pressed: false,
         disabled: false,
+        toggled: None,
     };
     tree.insert(
         parent,
@@ -63,6 +93,67 @@ pub fn insert_button(
         node(&state),
         WidgetKind::Button(state),
     )
+}
+
+/// Adds a new **toggle** button, initially `on` or off, as the last child
+/// of `parent` — see this module's own doc comment.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_toggle_button(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    label: impl Into<String>,
+    on: bool,
+) -> Result<WidgetId, WidgetError> {
+    let state = ButtonState {
+        label: label.into(),
+        pressed: false,
+        disabled: false,
+        toggled: Some(on),
+    };
+    // One control row plus its vertical padding, text-blind or measured
+    // alike (`measure::measure_widget` gives the same height), so a
+    // headless layout and the app's text-aware one agree on height.
+    let mut toggle_style = style(scales);
+    toggle_style.size.height = length(super::row_height(scales) + 2.0 * spacing(scales.spacing.sm));
+    tree.insert(
+        parent,
+        toggle_style,
+        node(&state),
+        WidgetKind::Button(state),
+    )
+}
+
+/// Sets toggle button `id` on or off, returning whether anything changed.
+/// Works on a disabled toggle too (its state can still follow the app).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it is not a button or is a plain
+/// push button (one with no toggle state to set).
+pub fn set_button_toggled(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    on: bool,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::Button(state)) => match state.toggled {
+            Some(current) if current == on => return Ok(false),
+            Some(_) => {}
+            None => return Err(WidgetError::WrongWidgetKind(id)),
+        },
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_button_mut(tree, id, |state| {
+        state.toggled = Some(on);
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// Sets whether `id` (a button) is currently pressed — e.g. while the
@@ -136,7 +227,10 @@ fn with_button_mut(
 
 #[cfg(test)]
 mod tests {
-    use super::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
+    use super::{
+        ButtonState, insert_button, insert_toggle_button, set_button_disabled, set_button_pressed,
+        set_button_toggled,
+    };
     use crate::WidgetError;
     use crate::tree::WidgetTree;
     use crate::widgets::{WidgetKind, new_tree, test_scales};
@@ -157,6 +251,7 @@ mod tests {
                 label: "OK".to_owned(),
                 pressed: false,
                 disabled: false,
+                toggled: None,
             }))
         );
         let Some(accessibility) = tree.accessibility(id) else {
@@ -266,5 +361,58 @@ mod tests {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+    }
+
+    /// 0.160.0: a toggle button reports its state through accesskit's
+    /// `toggled` property (a screen reader's "selected"), keeps `Click`,
+    /// and follows `set_button_toggled` — which reports a real change only.
+    #[test]
+    fn a_toggle_button_exposes_and_follows_its_toggled_state() {
+        let scales = test_scales();
+        let (mut tree, root) = new_tree(Style::default());
+        let Ok(id) = insert_toggle_button(&mut tree, root, &scales, "Brush", false) else {
+            unreachable!("root exists");
+        };
+        let toggled = |tree: &WidgetTree<WidgetKind>| {
+            tree.accessibility(id).and_then(accesskit::Node::toggled)
+        };
+        assert_eq!(toggled(&tree), Some(accesskit::Toggled::False));
+        assert!(
+            tree.accessibility(id)
+                .is_some_and(|node| node.role() == accesskit::Role::Button
+                    && node.supports_action(Action::Click))
+        );
+        assert!(matches!(set_button_toggled(&mut tree, id, true), Ok(true)));
+        assert_eq!(toggled(&tree), Some(accesskit::Toggled::True));
+        assert!(matches!(set_button_toggled(&mut tree, id, true), Ok(false)));
+        match tree.payload(id) {
+            Some(WidgetKind::Button(state)) => {
+                assert_eq!(state.toggled, Some(true));
+                assert!(state.fills_accent());
+            }
+            other => unreachable!("{other:?}"),
+        }
+        assert!(matches!(set_button_toggled(&mut tree, id, false), Ok(true)));
+        match tree.payload(id) {
+            Some(WidgetKind::Button(state)) => assert!(!state.fills_accent()),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_push_button_has_no_toggle_state_to_set() {
+        let scales = test_scales();
+        let (mut tree, root) = new_tree(Style::default());
+        let Ok(id) = insert_button(&mut tree, root, &scales, "OK") else {
+            unreachable!("root exists");
+        };
+        assert_eq!(
+            tree.accessibility(id).and_then(accesskit::Node::toggled),
+            None
+        );
+        assert!(matches!(
+            set_button_toggled(&mut tree, id, true),
+            Err(WidgetError::WrongWidgetKind(wrong)) if wrong == id
+        ));
     }
 }

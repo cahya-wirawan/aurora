@@ -3524,6 +3524,9 @@ enum AccessibilityReaction {
     /// handed to [`apply_tool_control_outcome`], which edits the live
     /// tool settings (never the document, no history).
     ToolControl(aurora_widgets::ActionOutcome),
+    /// A `Click` on a tools-panel button (0.160.0): the app runs
+    /// [`AppCommand::SelectTool`] for it ([`AccessibilityEffects::select_tool`]).
+    SelectTool(aurora_ui::Tool),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -3579,6 +3582,8 @@ fn route_accessibility_action(
                 AccessibilityReaction::DialogAction(Some(action.to_owned()))
             } else if let Some(&layer_id) = layer_rows.get(&id) {
                 AccessibilityReaction::PressLayer(layer_id)
+            } else if let Some(tool) = tool_button_target(workspace, id) {
+                AccessibilityReaction::SelectTool(tool)
             } else {
                 AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
             }
@@ -3734,6 +3739,10 @@ struct AccessibilityEffects {
     /// Something visible may have changed: request a redraw. `user_event`
     /// sets no `needs_redraw` of its own.
     redraw: bool,
+    /// A tool an assistive technology's `Click` on a tools-panel button
+    /// selected (0.160.0). The context holds the tool by value, so the app
+    /// applies it, through [`AppCommand::SelectTool`].
+    select_tool: Option<aurora_ui::Tool>,
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -4005,6 +4014,13 @@ fn apply_accessibility_action(
         AccessibilityReaction::ToolControl(outcome) => {
             apply_tool_control_accessibility(cx, outcome);
         }
+        AccessibilityReaction::SelectTool(tool) => {
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                select_tool: Some(tool),
+            };
+        }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
             tracing::debug!(?outcome, "accessibility action on the widget gallery");
             if let Some(gallery) = cx.gallery.as_mut()
@@ -4048,6 +4064,7 @@ fn apply_accessibility_action(
     AccessibilityEffects {
         relayout: true,
         redraw: true,
+        select_tool: None,
     }
 }
 
@@ -4535,7 +4552,7 @@ enum WidgetOwner {
     /// The Layers panel's opacity/blend/visibility controls
     /// ([`aurora_ui::LayerControls`]): they edit the live document.
     LayerControls,
-    /// The Properties panel's radius readout and slider
+    /// The options-bar radius readout and slider (0.160.0; Properties panel until then)
     /// ([`aurora_ui::ToolControls`], 0.136.0): they edit the live tool
     /// settings, never the document.
     ToolControls,
@@ -4544,6 +4561,9 @@ enum WidgetOwner {
     /// its panel body; the app only closes open popovers
     /// ([`close_open_popovers`]) and lays out again.
     PanelScrollbar,
+    /// The left tools panel's buttons (0.160.0): a click selects a tool
+    /// through [`AppCommand::SelectTool`].
+    ToolsPanel,
 }
 
 /// Closes every open popover a panel scroll could leave stranded
@@ -4675,7 +4695,24 @@ fn widget_owner(
     if tool_controls.is_some_and(|controls| aurora_ui::tool_controls_contains(tree, controls, id)) {
         return Some(WidgetOwner::ToolControls);
     }
+    if is_tool_button(tree, id) {
+        return Some(WidgetOwner::ToolsPanel);
+    }
     None
+}
+
+/// Whether `id` is a tools-panel button: a toggle button whose parent is a
+/// `Role::Toolbar` labelled [`aurora_ui::TOOLS_PANEL_LABEL`]. Read off the
+/// tree because [`widget_owner`] is handed the tree alone.
+fn is_tool_button(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+    matches!(tree.payload(id), Some(WidgetKind::Button(state)) if state.toggled.is_some())
+        && tree
+            .parent(id)
+            .and_then(|parent| tree.accessibility(parent))
+            .is_some_and(|node| {
+                node.role() == accesskit::Role::Toolbar
+                    && node.label() == Some(aurora_ui::TOOLS_PANEL_LABEL)
+            })
 }
 
 /// Closes the Layers panel's blend-mode list when a `Down` lands outside
@@ -5252,14 +5289,18 @@ fn install_startup_panels(
         Err(err) => tracing::warn!(?err, "failed to build the Layers-panel controls"),
     }
     let _ = sync_layer_controls(workspace, &layer_controls, layers, active_layer, None);
-    let tool_controls =
-        match aurora_ui::insert_tool_controls(&mut workspace.tree, workspace.properties, scales) {
-            Ok(controls) => Some(controls),
-            Err(err) => {
-                tracing::warn!(?err, "failed to build the Properties-panel tool controls");
-                None
-            }
-        };
+    let tool_controls = match aurora_ui::insert_tool_controls(
+        &mut workspace.tree,
+        workspace.options_bar,
+        workspace.properties,
+        scales,
+    ) {
+        Ok(controls) => Some(controls),
+        Err(err) => {
+            tracing::warn!(?err, "failed to build the options-bar tool controls");
+            None
+        }
+    };
     let _ = sync_tool_controls(workspace, tool_controls, tool, tool_settings, None);
     StartupPanels {
         layer_rows,
@@ -5553,9 +5594,44 @@ fn sync_layer_controls(
     }
 }
 
-/// Mirrors the active `tool` and its live radius into the Properties
-/// panel's tool controls ([`aurora_ui::sync_tool_controls`]), leaving a
-/// captured slider's value alone. Returns whether anything changed.
+/// Mirrors `tool` into the left tools panel (0.160.0): its button on,
+/// every other off. Returns whether anything changed.
+fn sync_tools_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) -> bool {
+    let panel = workspace.tools;
+    match aurora_ui::sync_tools_panel(&mut workspace.tree, &panel, tool) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the tools panel");
+            false
+        }
+    }
+}
+
+/// The tool a press, key or assistive-technology `Click` on `id` selects,
+/// if `id` is one of the tools panel's buttons (0.160.0).
+fn tool_button_target(workspace: &aurora_ui::Workspace, id: WidgetId) -> Option<aurora_ui::Tool> {
+    workspace.tools.tool_for(id)
+}
+
+/// The tool a widget outcome clicked, if it is an activation of a
+/// tools-panel button (a pointer release over it, or `Space`/`Enter`).
+fn tool_button_click(
+    workspace: &aurora_ui::Workspace,
+    outcome: &PointerOutcome,
+) -> Option<aurora_ui::Tool> {
+    match outcome {
+        PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => {
+            tool_button_target(workspace, *id)
+        }
+        _ => None,
+    }
+}
+
+/// Mirrors the active `tool` and its live radius into the options bar's
+/// tool controls ([`aurora_ui::sync_tool_controls`], 0.160.0; the
+/// Properties panel's until then), leaving a captured slider's value
+/// alone, and the tools panel's highlight ([`sync_tools_panel`]). Returns
+/// whether anything changed.
 fn sync_tool_controls(
     workspace: &mut aurora_ui::Workspace,
     controls: Option<aurora_ui::ToolControls>,
@@ -5563,8 +5639,11 @@ fn sync_tool_controls(
     settings: &ToolSettings,
     captured: Option<WidgetId>,
 ) -> bool {
+    // The tools panel follows too, so startup and the once-per-iteration
+    // sync cover any path that changed `tool` without `SelectTool`.
+    let highlighted = sync_tools_panel(workspace, tool);
     let Some(controls) = controls else {
-        return false;
+        return highlighted;
     };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
@@ -5573,9 +5652,9 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed,
+        Ok(changed) => changed || highlighted,
         Err(err) => {
-            tracing::warn!(?err, "failed to sync the Properties-panel tool controls");
+            tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
         }
     }
@@ -7282,6 +7361,10 @@ fn run_command(
         AppCommand::SelectTool(selected) => {
             *tool = selected;
             refresh_properties_panel(workspace, selected, tool_settings);
+            // 0.160.0: the tools panel's highlight follows every switch
+            // that comes through here -- a shortcut, the palette, a click
+            // or an assistive technology's `Click` on a tool button.
+            sync_tools_panel(workspace, selected);
             CompositeInvalidation::None
         }
         AppCommand::Undo | AppCommand::Redo => {
@@ -18628,9 +18711,11 @@ fn stamp_tool_dab(
 /// the first `compute_layout`, not `None` (confirmed by this function's
 /// own tests — a real finding, not assumed from `bounds`'s own doc
 /// comment). Used both to size the atlas ([`canvas_area_physical_size`])
-/// and to restrict the canvas draw call to this rect via
-/// `RenderPass::set_viewport`, so it never draws over the
-/// Layers/Properties/History dock.
+/// and to place the canvas draw (`RenderPass::set_viewport`). Since
+/// 0.160.0 the canvas area starts after the tools panel and below the
+/// options bar, and what actually bounds the draw is the scissor from
+/// [`clamp_canvas_to_surface`] — so it never draws over the tools panel,
+/// the options bar or the Layers/Properties/History dock.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn canvas_area_physical_rect(
@@ -18645,6 +18730,38 @@ fn canvas_area_physical_rect(
         bounds.width as f32 * scale,
         bounds.height as f32 * scale,
     ))
+}
+
+/// The whole-pixel part of a physical canvas rect `(x, y, w, h)` that lies
+/// on a `surface` of `(width, height)` physical px, as a scissor rect
+/// `(x, y, w, h)` — or `None` when nothing of it does (an empty or
+/// off-surface canvas area, e.g. a window narrower than the tools panel
+/// and the rail). 0.160.0 review J3: since the tools panel and options bar
+/// the canvas starts at a non-zero origin, and a fractional scale factor
+/// can round its far edge past the surface's own. Outward-rounded, then
+/// clamped, so the scissor never exceeds the attachment (wgpu validates a
+/// scissor against it; a viewport, in wgpu 30, only against
+/// `max_texture_dimension_2d`).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_canvas_to_surface(
+    rect: (f32, f32, f32, f32),
+    surface: (u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let (x, y, w, h) = rect;
+    if ![x, y, w, h].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (sw, sh) = (surface.0 as f32, surface.1 as f32);
+    let x0 = x.floor().clamp(0.0, sw);
+    let y0 = y.floor().clamp(0.0, sh);
+    let x1 = (x + w).ceil().clamp(0.0, sw);
+    let y1 = (y + h).ceil().clamp(0.0, sh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
 /// [`canvas_area_physical_rect`]'s own width/height, rounded to whole
@@ -19440,7 +19557,7 @@ struct App {
     /// The live Brush/Eraser radius (0.136.0) — not document state, see
     /// [`ToolSettings`].
     tool_settings: ToolSettings,
-    /// The Properties panel's radius readout and slider (0.136.0; `None`
+    /// The options-bar radius readout and slider (0.160.0; Properties panel until then) (0.136.0; `None`
     /// only if building them failed, which is logged). The slider shares
     /// [`Self::gallery_click`] with every other app-owned widget.
     tool_controls: Option<aurora_ui::ToolControls>,
@@ -19835,6 +19952,9 @@ impl App {
             },
             request,
         );
+        if let Some(tool) = effects.select_tool {
+            self.select_tool_command(tool);
+        }
         if effects.relayout {
             let window_size = self.window.as_ref().map(|window| window.inner_size());
             if let Some(size) = window_size {
@@ -19902,6 +20022,11 @@ impl App {
             match owner {
                 WidgetOwner::LayerControls => self.apply_layer_control(&outcome),
                 WidgetOwner::ToolControls => self.apply_tool_control(&outcome),
+                WidgetOwner::ToolsPanel => {
+                    if let Some(tool) = tool_button_click(&self.workspace, &outcome) {
+                        self.select_tool_command(tool);
+                    }
+                }
                 // A linked panel bar is never focused, so no key reaches it.
                 WidgetOwner::Gallery | WidgetOwner::PanelScrollbar => {}
             }
@@ -22099,6 +22224,14 @@ impl App {
             {
                 self.apply_tool_control(outcome);
             }
+            if routed.owner == Some(WidgetOwner::ToolsPanel)
+                && let Some(tool) = routed
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| tool_button_click(&self.workspace, outcome))
+            {
+                self.select_tool_command(tool);
+            }
             // Any path that dropped the slider's capture -- a press
             // elsewhere resetting a stale one, a modal's cancel -- ends
             // the drag's pending undo step here (`settle_pending_opacity`).
@@ -22246,7 +22379,8 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Applies one routed Properties-panel tool-control outcome
+    /// Applies one routed options-bar tool-control outcome (0.160.0; the
+    /// Properties panel's until then)
     /// ([`apply_tool_control_outcome`]): a radius change re-announces and
     /// redraws. No history step — tool settings are not document state.
     fn apply_tool_control(&mut self, outcome: &PointerOutcome) {
@@ -22270,10 +22404,41 @@ impl App {
         }
     }
 
+    /// Selects `tool` exactly as the `SelectTool` command does — the one
+    /// path a tools-panel click, `Space`/`Enter` on a focused tool button
+    /// and an assistive technology's `Click` all take (0.160.0), so the
+    /// tool, the Properties body and the tools panel's highlight can never
+    /// disagree with a shortcut's result.
+    fn select_tool_command(&mut self, tool: aurora_ui::Tool) {
+        let tool_before = self.tool;
+        let _: CompositeInvalidation = run_command(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            &mut self.tool,
+            &self.tool_settings,
+            &mut self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            self.tile_store.as_mut(),
+            &mut self.undo_order,
+            AppCommand::SelectTool(tool),
+        );
+        let _ = end_radius_drag_on_tool_change(
+            &mut self.gallery_click,
+            self.tool_controls,
+            tool_before,
+            self.tool,
+        );
+        self.sync_tool_controls_now();
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
     /// The catch-all tool sync (0.136.0), run once per event-loop
     /// iteration beside [`Self::sync_layer_controls_now`]: every path that
     /// switches the active tool (a letter shortcut or the command palette;
-    /// the macOS menu cannot switch tools) is reflected in the radius controls without each
+    /// the macOS menu cannot switch tools) is reflected in the options bar's radius controls and the tools panel's highlight without each
     /// one having to remember. The Properties *body* is refreshed by those
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
@@ -22756,17 +22921,32 @@ impl App {
                     });
 
                     let viewport = canvas_area_physical_rect(&self.workspace, self.scale_factor);
-                    if let (Some(residency), Some(canvas_pipeline), Some((x, y, w, h))) = (
+                    let scissor =
+                        viewport.and_then(|rect| clamp_canvas_to_surface(rect, surface.size()));
+                    if let (
+                        Some(residency),
+                        Some(canvas_pipeline),
+                        Some((x, y, w, h)),
+                        Some(clip),
+                    ) = (
                         self.residency.as_ref(),
                         self.canvas_pipeline.as_mut(),
                         viewport,
+                        scissor,
                     ) {
                         let bind_group = canvas_pipeline.bind_group(gpu.device(), residency);
                         let pipeline = canvas_pipeline.pipeline(gpu.device(), surface.format());
+                        // The viewport keeps the canvas area's own rect, so
+                        // the image is never squeezed; the scissor, clamped
+                        // to the surface (0.160.0 review J3), is what bounds
+                        // the draw, and is reset for the widgets after it.
                         pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                        pass.set_scissor_rect(clip.0, clip.1, clip.2, clip.3);
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, &bind_group, &[]);
                         pass.draw(0..3, 0..1);
+                        let (sw, sh) = surface.size();
+                        pass.set_scissor_rect(0, 0, sw, sh);
                     }
 
                     if !widget_paints.is_empty()
@@ -23515,13 +23695,13 @@ mod tests {
         apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
         autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
         brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_roots_into_tile, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, display_file_name,
-        dissolve_gate, document_canvas_size, document_from_image,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_canvas_to_surface,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_roots_into_tile,
+        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, display_file_name, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
@@ -25188,6 +25368,7 @@ mod tests {
                 let tool_settings = crate::ToolSettings::default();
                 let tool_controls = match aurora_ui::insert_tool_controls(
                     &mut workspace.tree,
+                    workspace.options_bar,
                     workspace.properties,
                     &scales,
                 ) {
@@ -25322,6 +25503,93 @@ mod tests {
         /// panel's bar really scroll its body (the same `handle_action`
         /// path sliders use), and a scroll closes an open dropdown list.
         #[test]
+        fn an_at_click_on_a_tool_button_selects_that_tool_through_select_tool() {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            for tool in [
+                aurora_ui::Tool::Pan,
+                aurora_ui::Tool::Eraser,
+                aurora_ui::Tool::Move,
+            ] {
+                let Some(button) = state.workspace.tools.button_for(tool) else {
+                    unreachable!("every tool has a button");
+                };
+                let effects = state.act(&a11y_request(button, accesskit::Action::Click));
+                assert_eq!(
+                    effects,
+                    AccessibilityEffects {
+                        relayout: true,
+                        redraw: true,
+                        select_tool: Some(tool),
+                    },
+                    "{tool:?}"
+                );
+                // What `App` does with the effect: the `SelectTool` command.
+                let _ = run_command(
+                    &mut state.workspace,
+                    &mut state.focus,
+                    &mut state.palette,
+                    &mut state.tool,
+                    &state.tool_settings,
+                    &mut state.layers,
+                    &mut state.history,
+                    &mut state.pixel_history,
+                    None,
+                    &mut state.undo_order,
+                    AppCommand::SelectTool(tool),
+                );
+                assert_eq!(state.tool, tool);
+                for (other, id) in state.workspace.tools.buttons {
+                    let expected = if other == tool {
+                        accesskit::Toggled::True
+                    } else {
+                        accesskit::Toggled::False
+                    };
+                    assert_eq!(
+                        state
+                            .workspace
+                            .tree
+                            .accessibility(id)
+                            .and_then(accesskit::Node::toggled),
+                        Some(expected),
+                        "after a Click on {tool:?}, {other:?}'s node"
+                    );
+                }
+            }
+        }
+
+        /// Routing alone (no `App`): a `Click` on a tool button is the
+        /// `SelectTool` reaction, never a generic `Handled`.
+        #[test]
+        fn route_accessibility_action_maps_a_tool_button_click_to_select_tool() {
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+            workspace.tree.compute_layout(WIDTH, HEIGHT);
+            let mut focus = FocusManager::default();
+            let Some(button) = workspace.tools.button_for(aurora_ui::Tool::Zoom) else {
+                unreachable!("every tool has a button");
+            };
+            let reaction = route_accessibility_action(
+                &mut workspace,
+                &mut focus,
+                None,
+                &HashMap::new(),
+                None,
+                None,
+                &a11y_request(button, accesskit::Action::Click),
+            );
+            assert!(
+                matches!(
+                    reaction,
+                    AccessibilityReaction::SelectTool(aurora_ui::Tool::Zoom)
+                ),
+                "{reaction:?}"
+            );
+        }
+
+        #[test]
         fn an_at_set_value_on_the_layers_bar_scrolls_its_body_and_closes_the_blend_list() {
             let mut layers = aurora_doc::LayerTree::new();
             let mut active = None;
@@ -25447,6 +25715,7 @@ mod tests {
         const BOTH: AccessibilityEffects = AccessibilityEffects {
             relayout: true,
             redraw: true,
+            select_tool: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -29540,6 +29809,24 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
+        // 0.160.0: the tools panel's buttons come first in tab order, one
+        // stop each; the docked panels follow them.
+        for (_, button) in workspace.tools.buttons {
+            let _ = run_command(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut tool,
+                &crate::ToolSettings::default(),
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                None,
+                &mut undo_order,
+                AppCommand::FocusNext,
+            );
+            assert_eq!(focus.focused(), Some(button));
+        }
         let _ = run_command(
             &mut workspace,
             &mut focus,
@@ -30670,7 +30957,8 @@ mod tests {
             &mut FakeClipboard::default(),
             &mut FakeFileDialog::default(),
         );
-        assert_eq!(focus.focused(), Some(workspace.layers.root));
+        // 0.160.0: Tab reaches the tools panel's first button first.
+        assert_eq!(focus.focused(), Some(workspace.tools.buttons[0].1));
     }
 
     #[test]
@@ -55342,6 +55630,16 @@ mod tests {
         );
     }
 
+    /// The canvas area's own top-left, logical px (0.160.0: right of the
+    /// tools panel, under the options bar).
+    #[allow(clippy::cast_precision_loss)]
+    fn canvas_origin(workspace: &aurora_ui::Workspace) -> (f32, f32) {
+        match workspace.tree.bounds(workspace.canvas_area) {
+            Some(bounds) => (bounds.x as f32, bounds.y as f32),
+            None => unreachable!("laid out"),
+        }
+    }
+
     fn laid_out_workspace() -> aurora_ui::Workspace {
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         workspace.tree.compute_layout(1000.0, 800.0);
@@ -55351,13 +55649,292 @@ mod tests {
     #[test]
     fn pointer_in_canvas_reports_a_canvas_relative_point_when_inside() {
         let workspace = laid_out_workspace();
-        // A 1000x800 viewport, a 250px-wide rail -- canvas area is the
-        // 750x800 rect at the window's own origin (see
-        // `aurora_ui::workspace`'s own layout test).
+        // A 1000x800 viewport, a 250px-wide rail -- since 0.160.0 the
+        // canvas area starts right of the tools panel and below the
+        // options bar (see `aurora_ui::workspace`'s own layout test), so a
+        // window point maps to one offset by exactly that origin.
+        let (ox, oy) = canvas_origin(&workspace);
+        assert!(ox > 0.0 && oy > 0.0, "the canvas is offset: {ox}, {oy}");
         assert_eq!(
             pointer_in_canvas(&workspace, (100.0, 50.0)),
-            Some((100.0, 50.0))
+            Some((100.0 - ox, 50.0 - oy))
         );
+        assert_eq!(pointer_in_canvas(&workspace, (ox, oy)), Some((0.0, 0.0)));
+        assert_eq!(
+            pointer_in_canvas(&workspace, (ox - 1.0, oy + 10.0)),
+            None,
+            "a point over the tools panel is not on the canvas"
+        );
+        assert_eq!(
+            pointer_in_canvas(&workspace, (ox + 10.0, oy - 1.0)),
+            None,
+            "a point over the options bar is not on the canvas"
+        );
+    }
+
+    /// 0.160.0 AC-1/AC-5: pressing and releasing over each tools-panel
+    /// button is routed to the tools panel and activates that button, and
+    /// selecting through the `SelectTool` command then highlights it.
+    #[test]
+    fn clicking_each_tool_button_routes_to_the_tools_panel_and_selects_it() {
+        let scales = crate::test_workspace_scales();
+        let mut workspace = laid_out_workspace();
+        let mut focus = FocusManager::default();
+        let mut gallery = None;
+        let mut click = ClickTracker::default();
+        let mut tool = Tool::default();
+        let mut palette = None;
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        for (expected, button) in workspace.tools.buttons {
+            let Some(b) = workspace.tree.bounds(button) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (
+                b.x as f32 + b.width as f32 / 2.0,
+                b.y as f32 + b.height as f32 / 2.0,
+            );
+            assert_eq!(pointer_in_canvas(&workspace, centre), None);
+            let mut routed = None;
+            for phase in [PointerPhase::Down, PointerPhase::Up] {
+                routed = Some(crate::route_widget_pointer(
+                    &mut workspace,
+                    &mut focus,
+                    &mut gallery,
+                    None,
+                    None,
+                    &mut click,
+                    &scales,
+                    false,
+                    phase,
+                    centre,
+                    Modifiers::none(),
+                    &mut crate::NoTextHit,
+                ));
+                assert_eq!(
+                    routed.as_ref().and_then(|routed| routed.owner),
+                    Some(crate::WidgetOwner::ToolsPanel),
+                    "{expected:?} {phase:?}"
+                );
+            }
+            let Some(picked) = routed
+                .as_ref()
+                .and_then(|routed| routed.outcome.as_ref())
+                .and_then(|outcome| crate::tool_button_click(&workspace, outcome))
+            else {
+                unreachable!("the release over {expected:?} activates it: {routed:?}");
+            };
+            assert_eq!(picked, expected);
+            let _ = run_command(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut tool,
+                &crate::ToolSettings::default(),
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                None,
+                &mut undo_order,
+                AppCommand::SelectTool(picked),
+            );
+            assert_eq!(tool, expected);
+            assert_eq!(
+                aurora_ui::selected_tool(&workspace.tree, &workspace.tools),
+                Some(expected)
+            );
+        }
+    }
+
+    /// 0.160.0 AC-1: the shortcut path (a tool letter through `handle_key`)
+    /// moves the tools panel's highlight too, not just `tool`.
+    #[test]
+    fn a_tool_shortcut_moves_the_tools_panel_highlight() {
+        let mut workspace = laid_out_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let shortcuts = default_shortcuts();
+        for (letter, expected) in [('b', Tool::Brush), ('e', Tool::Eraser), ('v', Tool::Move)] {
+            let _ = handle_key(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                &mut palette,
+                &mut tool,
+                &crate::ToolSettings::default(),
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                None,
+                &mut undo_order,
+                &shortcuts,
+                Modifiers::none(),
+                Key::Character(letter),
+                Some(&letter.to_string()),
+                &mut FakeClipboard::default(),
+                &mut FakeFileDialog::default(),
+            );
+            assert_eq!(tool, expected, "{letter}");
+            assert_eq!(
+                aurora_ui::selected_tool(&workspace.tree, &workspace.tools),
+                Some(expected),
+                "{letter}"
+            );
+        }
+    }
+
+    /// 0.160.0 AC-3: the startup panels put the radius controls in the
+    /// options bar, show the slider for Brush/Eraser only, and a radius
+    /// edit there changes the one `ToolSettings`.
+    #[test]
+    fn the_options_bar_carries_the_radius_and_an_edit_there_changes_tool_settings() {
+        let scales = crate::test_workspace_scales();
+        let mut workspace = laid_out_workspace();
+        let layers = aurora_doc::LayerTree::new();
+        let mut settings = crate::ToolSettings::default();
+        let panels = install_startup_panels(
+            &mut workspace,
+            &scales,
+            &layers,
+            &UndoOrder::default(),
+            Tool::Brush,
+            &settings,
+        );
+        let Some(controls) = panels.tool_controls else {
+            unreachable!("built");
+        };
+        assert!(
+            workspace
+                .tree
+                .is_within(workspace.options_bar, controls.radius)
+        );
+        assert!(
+            !workspace
+                .tree
+                .is_within(workspace.properties.root, controls.radius)
+        );
+        assert_eq!(
+            crate::widget_owner(
+                &workspace.tree,
+                None,
+                None,
+                Some(&controls),
+                controls.radius
+            ),
+            Some(crate::WidgetOwner::ToolControls)
+        );
+        for tool in Tool::ALL {
+            let _ =
+                crate::sync_tool_controls(&mut workspace, Some(controls), tool, &settings, None);
+            assert_eq!(
+                aurora_ui::radius_slider_shown(&workspace.tree, &controls),
+                matches!(tool, Tool::Brush | Tool::Eraser),
+                "{tool:?}"
+            );
+            assert_eq!(
+                aurora_ui::selected_tool(&workspace.tree, &workspace.tools),
+                Some(tool),
+                "the catch-all sync moves the highlight too"
+            );
+        }
+        let _ =
+            crate::sync_tool_controls(&mut workspace, Some(controls), Tool::Brush, &settings, None);
+        let outcome = PointerOutcome::Action(aurora_widgets::ActionOutcome::ValueChanged {
+            id: controls.radius,
+            value: 40.0,
+        });
+        assert!(crate::apply_tool_control_outcome(
+            &mut workspace,
+            Some(controls),
+            Tool::Brush,
+            &mut settings,
+            &outcome,
+            None,
+        ));
+        assert_eq!(settings.radius(Tool::Brush), Some(40.0));
+        assert!(matches!(
+            workspace.tree.payload(controls.radius),
+            Some(aurora_widgets::widgets::WidgetKind::Slider(state)) if (state.value - 40.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            workspace.tree.payload(controls.readout),
+            Some(aurora_widgets::widgets::WidgetKind::Label(state)) if state.text == "Radius 40 px"
+        ));
+    }
+
+    /// 0.160.0 AC-1/AC-5, the Retina lesson: with the canvas now offset by
+    /// the tools panel and the options bar, a real dab stamped from a
+    /// *physical* pointer position lands under the pointer at scale
+    /// factors 1 and 2 -- and not where it would land if either the
+    /// offset or the scale factor were ignored.
+    #[test]
+    fn a_dab_lands_under_the_pointer_with_the_canvas_offset_at_scale_one_and_two() {
+        let workspace = laid_out_workspace();
+        let (ox, oy) = canvas_origin(&workspace);
+        let view = CanvasView::new();
+        let mut settings = crate::ToolSettings::default();
+        assert!(settings.set_radius(Tool::Brush, 4.0));
+        let target = (60.5_f32, 40.5_f32);
+        for scale in [1.0_f64, 2.0] {
+            let (_dir, mut store) = real_tile_store();
+            let surface = aurora_tile::SurfaceId::from_raw(0);
+            #[allow(clippy::cast_possible_truncation)]
+            let physical = (
+                f64::from(ox + target.0) * scale,
+                f64::from(oy + target.1) * scale,
+            );
+            let position = logical_point(physical, scale);
+            let Some(canvas_point) = pointer_in_canvas(&workspace, position) else {
+                unreachable!("{position:?} is over the canvas at scale {scale}");
+            };
+            let doc = view.to_document(canvas_point);
+            let local = layer_local_point(
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 256,
+                    height: 256,
+                },
+                doc,
+            );
+            let mut drag = None;
+            assert!(
+                crate::stamp_tool_dab(
+                    crate::DabTool::Brush,
+                    &mut store,
+                    surface,
+                    local,
+                    &settings,
+                    [1.0, 0.0, 0.0],
+                    &mut drag,
+                )
+                .is_complete()
+            );
+            let under = sample_pixel(&mut store, surface, target);
+            assert!(
+                under.is_some_and(|[r, _, _, a]| r > 0.9 && a > 0.9),
+                "scale {scale}: the dab must be under the pointer at {target:?}: {under:?}"
+            );
+            for missed in [
+                (target.0 + ox, target.1 + oy),
+                (target.0 - ox, target.1 - oy),
+            ] {
+                let there = sample_pixel(&mut store, surface, missed);
+                assert!(
+                    there.is_none_or(|[_, _, _, a]| a < 0.1),
+                    "scale {scale}: nothing at {missed:?}, where an ignored offset would land: {there:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -55432,12 +56009,14 @@ mod tests {
     #[test]
     fn canvas_area_physical_rect_scales_by_the_dpi_factor() {
         let workspace = laid_out_workspace();
-        // Logical canvas area is (0, 0, 750, 800) (see
-        // `pointer_in_canvas_reports_a_canvas_relative_point_when_inside`'s
-        // own comment); at a 2x scale factor, physical is double that.
+        // Logical canvas area is (ox, oy, 750 - ox, 800 - oy) since 0.160.0
+        // (see `pointer_in_canvas_reports_a_canvas_relative_point_when_inside`'s
+        // own comment); at a 2x scale factor, physical is double that --
+        // the origin included, which is what keeps Retina mapping right.
+        let (ox, oy) = canvas_origin(&workspace);
         assert_eq!(
             canvas_area_physical_rect(&workspace, 2.0),
-            Some((0.0, 0.0, 1500.0, 1600.0))
+            Some((2.0 * ox, 2.0 * oy, 2.0 * (750.0 - ox), 2.0 * (800.0 - oy)))
         );
     }
 
@@ -55458,7 +56037,76 @@ mod tests {
     #[test]
     fn canvas_area_physical_size_rounds_to_whole_pixels() {
         let workspace = laid_out_workspace();
-        assert_eq!(canvas_area_physical_size(&workspace, 1.0), Some((750, 800)));
+        let (ox, oy) = canvas_origin(&workspace);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let expected = ((750.0 - ox) as u32, (800.0 - oy) as u32);
+        assert_eq!(canvas_area_physical_size(&workspace, 1.0), Some(expected));
+    }
+
+    /// 0.160.0 review J3: whatever the window and scale factor, the
+    /// canvas's clamped scissor stays on the surface (x+w <= width,
+    /// y+h <= height), and a canvas squeezed to nothing draws nothing.
+    #[test]
+    fn the_canvas_scissor_never_leaves_the_surface_in_a_narrow_window_or_at_a_fractional_scale() {
+        for (window, scale) in [
+            ((1000.0_f32, 800.0_f32), 1.0_f64),
+            ((1000.0, 800.0), 1.25),
+            ((1000.0, 800.0), 1.5),
+            ((333.0, 257.0), 1.75),
+            ((240.0, 200.0), 2.0),
+            ((90.0, 60.0), 1.25),
+        ] {
+            let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+            workspace.tree.compute_layout(window.0, window.1);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let surface = (
+                (f64::from(window.0) * scale).round() as u32,
+                (f64::from(window.1) * scale).round() as u32,
+            );
+            let Some(rect) = canvas_area_physical_rect(&workspace, scale) else {
+                unreachable!("laid out");
+            };
+            match clamp_canvas_to_surface(rect, surface) {
+                Some((x, y, w, h)) => {
+                    assert!(w > 0 && h > 0, "{window:?} @ {scale}");
+                    assert!(
+                        x + w <= surface.0,
+                        "{window:?} @ {scale}: {x}+{w} > {}",
+                        surface.0
+                    );
+                    assert!(
+                        y + h <= surface.1,
+                        "{window:?} @ {scale}: {y}+{h} > {}",
+                        surface.1
+                    );
+                }
+                None => assert!(
+                    rect.2 < 1.0 || rect.0 >= surface.0 as f32,
+                    "{window:?} @ {scale}: only an empty or off-surface canvas is skipped: {rect:?}"
+                ),
+            }
+        }
+        // The clamp itself: past the far edge, before the origin, empty.
+        assert_eq!(
+            clamp_canvas_to_surface((96.0, 74.0, 1000.0, 1000.0), (800, 600)),
+            Some((96, 74, 704, 526))
+        );
+        assert_eq!(
+            clamp_canvas_to_surface((10.4, 10.6, 20.2, 5.0), (100, 100)),
+            Some((10, 10, 21, 6))
+        );
+        assert_eq!(
+            clamp_canvas_to_surface((900.0, 0.0, 50.0, 50.0), (800, 600)),
+            None
+        );
+        assert_eq!(
+            clamp_canvas_to_surface((96.0, 74.0, 0.0, 500.0), (800, 600)),
+            None
+        );
+        assert_eq!(
+            clamp_canvas_to_surface((f32::NAN, 0.0, 5.0, 5.0), (800, 600)),
+            None
+        );
     }
 
     #[test]
@@ -59639,8 +60287,8 @@ mod tests {
         let checkbox = rig.g().checkbox;
         assert_eq!(
             rig.workspace.tree.children(root).map(<[WidgetId]>::len),
-            Some(4),
-            "canvas, divider, rail, gallery"
+            Some(5),
+            "tools, canvas column, divider, rail, gallery"
         );
         if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, checkbox) {
             unreachable!("{err:?}");
@@ -59653,7 +60301,8 @@ mod tests {
             rig.workspace.tree.children(root),
             Some(
                 [
-                    rig.workspace.canvas_area,
+                    rig.workspace.tools.root,
+                    rig.workspace.canvas_column,
                     rig.workspace.divider,
                     rig.workspace.rail
                 ]
@@ -62817,6 +63466,7 @@ mod tests {
                 let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let controls = match aurora_ui::insert_tool_controls(
                     &mut workspace.tree,
+                    workspace.options_bar,
                     workspace.properties,
                     &scales,
                 ) {
@@ -64849,6 +65499,7 @@ mod tests {
                 let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                 let controls = match aurora_ui::insert_tool_controls(
                     &mut workspace.tree,
+                    workspace.options_bar,
                     workspace.properties,
                     &scales,
                 ) {

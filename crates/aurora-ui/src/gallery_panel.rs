@@ -113,6 +113,9 @@ pub struct GalleryPanel {
     pub tree_rows: [WidgetId; 3],
     pub picker: WidgetId,
     pub curve: WidgetId,
+    /// Toggle buttons (0.160.0, the tools panel's kind): off, on, and
+    /// disabled-on. A click flips an enabled one.
+    pub toggle_buttons: [WidgetId; 3],
     /// Owned by [`Self::button`]; shown on hover after
     /// [`GALLERY_TOOLTIP_DELAY`] ([`gallery_hover`]/[`gallery_tick`]).
     pub tooltip: Tooltip,
@@ -323,6 +326,13 @@ fn build(
     )?;
     // The histogram state (0.156.0): a sample bell behind the grid.
     widgets::set_curve_editor_histogram(tree, curve, Some(&gallery_sample_histogram()))?;
+    // One row of three, so the states sit side by side like the
+    // tools panel's buttons would in a horizontal toolbar.
+    let toggles = widgets::insert_container(tree, right, toggle_row_style(scales))?;
+    let toggle_off = widgets::insert_toggle_button(tree, toggles, scales, "Off", false)?;
+    let toggle_on = widgets::insert_toggle_button(tree, toggles, scales, "On", true)?;
+    let toggle_disabled = widgets::insert_toggle_button(tree, toggles, scales, "Disabled", true)?;
+    widgets::set_button_disabled(tree, toggle_disabled, true)?;
     let tooltip = Tooltip::new(tree, button, scales, "A tooltip", GALLERY_TOOLTIP_DELAY)?;
 
     Ok(GalleryPanel {
@@ -341,9 +351,24 @@ fn build(
         tree_rows: [parent_row, first_row, second_row],
         picker,
         curve,
+        toggle_buttons: [toggle_off, toggle_on, toggle_disabled],
         tooltip,
         open_menu: None,
     })
+}
+
+/// The toggle-button demo row (0.160.0): a row, `spacing.sm` apart.
+fn toggle_row_style(scales: &Scales) -> Style {
+    #[allow(clippy::cast_precision_loss)]
+    let gap = taffy::style_helpers::length(scales.spacing.sm as f32);
+    Style {
+        flex_direction: taffy::FlexDirection::Row,
+        gap: taffy::Size {
+            width: gap,
+            height: gap,
+        },
+        ..Default::default()
+    }
 }
 
 /// The demo tree's two child rows under `parent` — built at insert and
@@ -576,6 +601,14 @@ pub fn apply_gallery_outcome(
     {
         gallery.tooltip.owner_pressed(tree)?;
     }
+    if let PointerOutcome::Action(ActionOutcome::Activated(id)) = outcome
+        && gallery.toggle_buttons.contains(id)
+        && let Some(WidgetKind::Button(state)) = tree.payload(*id)
+        && let Some(on) = state.toggled
+    {
+        widgets::set_button_toggled(tree, *id, !on)?;
+        return Ok(());
+    }
     match outcome {
         PointerOutcome::Action(ActionOutcome::Activated(id)) if *id == gallery.menu_button => {
             if let Some(menu) = gallery.open_menu.take() {
@@ -734,6 +767,7 @@ mod tests {
             g.picker,
             g.curve,
         ];
+        ids.extend(g.toggle_buttons);
         ids.extend(g.tree_rows);
         ids
     }
@@ -763,9 +797,22 @@ mod tests {
             (g.tree_view, Role::Tree),
             (g.tree_rows[0], Role::TreeItem),
             (g.tree_rows[2], Role::TreeItem),
+            (g.toggle_buttons[0], Role::Button),
         ] {
             assert_eq!(role(&ws.tree, id), Some(want), "{id:?}");
         }
+        // 0.160.0: the toggle button in its off, on and disabled states.
+        let toggled = |id| ws.tree.accessibility(id).and_then(accesskit::Node::toggled);
+        assert_eq!(
+            toggled(g.toggle_buttons[0]),
+            Some(accesskit::Toggled::False)
+        );
+        assert_eq!(toggled(g.toggle_buttons[1]), Some(accesskit::Toggled::True));
+        assert!(
+            ws.tree
+                .accessibility(g.toggle_buttons[2])
+                .is_some_and(accesskit::Node::is_disabled)
+        );
         for id in ids(&g) {
             assert!(ws.tree.accessibility(id).is_some(), "{id:?} has a node");
         }
@@ -817,20 +864,27 @@ mod tests {
         // Pinned (red-team RT-4 / critic C12): a new widget or a token
         // change that moves this must update it knowingly. 443 since
         // 0.142.0: the 422 px it was plus the panel's 21 px title row.
-        assert!((min - 443.0).abs() < f32::EPSILON, "{min}");
+        // 500 since 0.160.0: plus the toggle-button row (one control row
+        // and its padding, 29 px) and its column gap, in the right column.
+        assert!((min - 500.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
             // slider and text field stretching, that is the right column's
             // curve editor, not the left column's last tree row.
-            let (Some(row), Some(curve), Some(body)) = (
+            // Since 0.160.0 the toggle-button row sits under it.
+            let (Some(row), Some(curve), Some(toggle), Some(body)) = (
                 ws.tree.bounds(g.tree_rows[2]),
                 ws.tree.bounds(g.curve),
+                ws.tree.bounds(g.toggle_buttons[0]),
                 ws.tree.bounds(g.panel.body),
             ) else {
                 unreachable!()
             };
-            (row.bottom().max(curve.bottom()), body.bottom())
+            (
+                row.bottom().max(curve.bottom()).max(toggle.bottom()),
+                body.bottom(),
+            )
         };
         let (row, bottom) = last_row_vs_body(min);
         assert!(row <= bottom, "{row} <= {bottom} at {min}");
@@ -842,7 +896,7 @@ mod tests {
     /// judge follow-up): a measured checkbox is a row tall, not a bare
     /// box, so the left column grows. The right column (the curve
     /// editor) must still be the taller one, or the 443 px minimum above
-    /// would describe a layout the app never uses.
+    /// would describe a layout the app never uses. (500 px since 0.160.0.)
     #[test]
     fn the_measured_layout_keeps_the_same_minimum_height() {
         let scales = test_scales();
@@ -883,7 +937,7 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 443.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!((min - 500.0).abs() < f32::EPSILON, "measured minimum {min}");
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the
@@ -949,7 +1003,7 @@ mod tests {
         assert!(!ws.tree.contains(panel_root));
         assert_eq!(
             ws.tree.children(ws.root),
-            Some([ws.canvas_area, ws.divider, ws.rail].as_slice())
+            Some([ws.tools.root, ws.canvas_column, ws.divider, ws.rail].as_slice())
         );
     }
 
@@ -1318,7 +1372,31 @@ mod tests {
         assert!(!ws.tree.contains(node));
         assert_eq!(
             ws.tree.children(ws.root),
-            Some([ws.canvas_area, ws.divider, ws.rail].as_slice())
+            Some([ws.tools.root, ws.canvas_column, ws.divider, ws.rail].as_slice())
         );
+    }
+
+    /// 0.160.0: clicking a gallery toggle button flips it.
+    #[test]
+    fn activating_a_gallery_toggle_button_flips_it() {
+        let (mut ws, mut g, _) = opened(TALL);
+        let scales = test_scales();
+        let mut focus = FocusManager::new();
+        let off = g.toggle_buttons[0];
+        for expected in [true, false] {
+            if let Err(err) = apply_gallery_outcome(
+                &mut ws.tree,
+                &mut focus,
+                &mut g,
+                &scales,
+                &PointerOutcome::Action(ActionOutcome::Activated(off)),
+            ) {
+                unreachable!("{err:?}");
+            }
+            assert!(matches!(
+                ws.tree.payload(off),
+                Some(WidgetKind::Button(state)) if state.toggled == Some(expected)
+            ));
+        }
     }
 }

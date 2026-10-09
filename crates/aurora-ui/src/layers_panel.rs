@@ -854,14 +854,16 @@ mod tests {
 
         let mut focus = aurora_widgets::FocusManager::new();
         let mut visited = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..6 + ws.tools.buttons.len() {
             match focus.focus_next(&mut ws.tree) {
                 Some(id) => visited.push(id),
                 None => unreachable!("the workspace has focusable widgets"),
             }
         }
 
-        let mut expected = vec![ws.layers.root];
+        // 0.160.0: the tools panel's buttons come first, one stop each.
+        let mut expected: Vec<_> = ws.tools.buttons.iter().map(|(_, id)| *id).collect();
+        expected.push(ws.layers.root);
         expected.extend_from_slice(&row_ids);
         expected.push(ws.properties.root);
         expected.push(ws.history.root);

@@ -440,7 +440,14 @@ pub fn text_runs(
     let runs = match kind {
         WidgetKind::Button(state) => vec![run(
             &state.label,
-            rgba(theme.text.on_accent, opacity(state.disabled, theme)),
+            rgba(
+                if state.fills_accent() {
+                    theme.text.on_accent
+                } else {
+                    theme.text.primary
+                },
+                opacity(state.disabled, theme),
+            ),
             full,
             HAlign::Center,
         )],

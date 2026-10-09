@@ -26,7 +26,36 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.159.0): Curves layers composite on the GPU.** A
+**Latest (2026-10-09, 0.160.0): a left tools panel and an options bar —
+workspace round 1.** Photoshop's layout convention in Aurora's own tokens:
+the workspace root row is now tools panel → canvas column (options bar
+over the canvas area) → divider → rail. The tools panel
+(`aurora_ui::tools_panel`) is a vertical, non-scrolling `Role::Toolbar`
+("Tools") holding one text-labelled toggle button per `Tool::ALL` entry
+(seven: Move, Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser — the
+design owner's text-labels decision; no icons, no new tokens); exactly one
+is on (accesskit `toggled`, so a screen reader says "selected"), and a
+click, `Space`/`Enter` on a focused button or an AT `Click` all run the
+same `AppCommand::SelectTool` a shortcut does, whose arm now also syncs the
+highlight. Each button is its own Tab stop (the arrow-key toolbar pattern
+needs roving focus the toolkit lacks). Its width is its widest label
+(`compute_text_layout` now measures a *toggle* button) plus `spacing.md`
+padding and `spacing.xs` strip padding. Unselected buttons are outlined in
+`border.strong` (design owner, review revision). The Brush/Eraser radius readout and
+slider **moved** into the options bar (one slider, one `ToolSettings`; the
+slider is `size.options_control_width` wide, a new provisional token); a
+tool with no radius hides the slider and keeps the readout; the Properties
+panel keeps the layer controls and the Curves editor. The canvas area is
+offset by both strips; `pointer_in_canvas`/`canvas_area_physical_rect`
+already subtracted its origin, and a new test stamps a real dab from a
+physical pointer position at scale 1 and 2. `aurora-widgets` gained
+`insert_toggle_button`/`set_button_toggled` (an off toggle has no fill,
+label in `text.primary`; on is `accent.primary` + `text.on_accent`: both
+pairs already gated, `check_contrast.py` passes), in the Widget Gallery
+and with 5 `#[ignore]`d unblessed goldens. **Needs a human** (macOS look,
+Retina coordinates, VoiceOver). Details: "Next action", addendum 0.160.0.
+
+**Previously (2026-10-09, 0.159.0): Curves layers composite on the GPU.** A
 root-level Curves adjustment layer is now its own GPU pass
 (`aurora_render::TileCompositor::composite_curves_with_opacity`,
 `shaders/curves.wgsl`, compiled appended to `composite.wgsl` as a second
@@ -7165,7 +7194,9 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03 (**update 0.145.0:** every panel body now scrolls, wheel
+  2026-08-03 (**update 0.160.0:** a left tools panel and an options bar
+  across the top of the canvas, the radius slider moved into it —
+  "Next action", addendum 0.160.0; **update 0.145.0:** every panel body now scrolls, wheel
   and trackpad — "Next action", addendum 0.145.0; **update 0.146.0:** a
   visible, draggable scrollbar beside each panel body, linked to it —
   addendum 0.146.0), `crates/aurora-ui/src/{panel,workspace}.rs` (`aurora-ui`'s
@@ -30863,6 +30894,133 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.160.0) — left tools panel and options bar
+(workspace round 1).** Files: `aurora-widgets` `widgets/button.rs`
+(`ButtonState::toggled`/`fills_accent`, `insert_toggle_button`,
+`set_button_toggled`; a toggle's height is one control row plus
+`spacing.sm` padding, text-blind or measured alike), `widgets/mod.rs`,
+`paint.rs` (an off toggle paints no fill), `text.rs` (its label in
+`text.primary`), `measure.rs` (a toggle button is measured: label +
+`2·spacing.md`; plain push buttons deliberately still are not),
+`tests/gallery.rs` (a 6-cell toggle gallery — off, on, held, disabled off,
+disabled on, focused; one GPU pixel test and 5 `#[ignore]`d goldens, one
+per built-in theme, **unblessed**); `aurora-ui` new `tools_panel.rs`
+(`ToolsPanel`, `insert_tools_panel`, `sync_tools_panel`, `selected_tool`,
+`tools_panel_contains`, `TOOLS_PANEL_LABEL`), `workspace.rs` (`tools`,
+`canvas_column`, `options_bar`, `OPTIONS_BAR_LABEL`, the new row layout),
+`tool_controls.rs` (`insert_tool_controls` now takes the options bar;
+`ToolControls::options`; `radius_slider_shown`; the slider hides for a
+radius-less tool), `gallery_panel.rs` (three toggle buttons, a click flips
+one; pinned minimum height 443 → 500 px, knowingly), `layers_panel.rs`
+(tab-order test adapted); `aurora-app` `lib.rs` (`WidgetOwner::ToolsPanel`,
+`is_tool_button`, `tool_button_click`, `sync_tools_panel`,
+`AccessibilityReaction::SelectTool`, `AccessibilityEffects::select_tool`,
+`App::select_tool_command` running `run_command(SelectTool)`, the
+`SelectTool` arm syncing the highlight, `sync_tool_controls` syncing it on
+every iteration). Tests: 18 new passing (+5 ignored goldens); adapted, not
+deleted: the workspace layout/rail tests, the gallery-removal and
+tab-order tests, `pointer_in_canvas`/physical-rect/size tests, two
+focus-order app tests, the tool-controls location/collapse tests. 3,000 →
+**3,018** passing (measured per touched crate: `aurora-widgets`,
+`aurora-ui`, `aurora-app` under `AURORA_REQUIRE_GPU=1` on the RTX 3090; the
+full workspace was not re-run this round).
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | `widget_owner` never returns `ToolsPanel` (click not routed) | killed | `clicking_each_tool_button_routes_to_the_tools_panel_and_selects_it` |
+| 2 | `SelectTool` arm stops syncing the highlight | killed | `a_tool_shortcut_moves_the_tools_panel_highlight`, the click test, the AT click test |
+| 3 | `pointer_in_canvas` ignores the canvas origin | killed | `a_dab_lands_under_the_pointer_with_the_canvas_offset_at_scale_one_and_two`, `pointer_in_canvas_reports_a_canvas_relative_point_when_inside` |
+| 4 | `logical_point` ignores the scale factor | killed | the dab test, `logical_point_divides_out_a_scale_factor` (plus one autosave test, which passes alone on clean code) |
+| 5 | toggle node loses `toggled` | killed | `an_at_click_on_a_tool_button_selects_that_tool_through_select_tool` |
+| 6 | options bar shows the slider for a radius-less tool | killed | `the_options_bar_shows_the_radius_slider_only_for_a_tool_with_a_radius` |
+| 7 | a second "Radius" slider left in Properties | killed | `the_properties_panel_holds_no_radius_slider_any_more` |
+| 8 | a literal width on the tools strip | killed | `the_tools_panel_and_options_bar_take_token_sized_space_and_never_overlap`, the rail-floor test (and the style lint) |
+| 9 | AT `Click` on a tool button not mapped to `SelectTool` | killed | `route_accessibility_action_maps_a_tool_button_click_to_select_tool`, the AT click test, `every_action_the_live_workspace_declares_is_mapped_or_widget_local` |
+| 10 | the `SelectTool` reaction drops the tool from its effects | killed | the AT click test |
+| 11 | `canvas_area_physical_rect` drops the origin | killed | `canvas_area_physical_rect_scales_by_the_dpi_factor` |
+| 12 | an off toggle painted with the accent | killed | `a_toggle_button_fills_with_the_accent_only_when_on_or_held`, `a_toggle_button_exposes_and_follows_its_toggled_state` |
+| 13 | a toggle button not text-measured | killed | `a_toggle_button_measures_its_label_and_a_push_button_does_not` |
+
+Disclosures. `App::route_gallery`/the key route/the effects consumer that
+call `select_tool_command` are not under test (no headless `App`); the
+tests drive the free functions they call. No button has a hover state
+yet. In a window too
+narrow for the options bar's own padding (≈ under tools + rail + 24 px)
+the bar overhangs its squeezed column — tested and disclosed. The tools strip is wide (its widest label, "Marquee
+Select") because labels are text for now. Tab now stops on seven tool
+buttons before the panels. Plain push buttons are still not text-measured.
+**Needs a human: on macOS check the tools panel and options bar look,
+Retina coordinates, VoiceOver announcing the selected tool.**
+**Suggested next: the status bar (workspace round 2).**
+
+**Review revision (0.160.0).** The judge returned REVISE at 0.896; this
+revision answers it and two design-owner decisions (Cahya, 2026-10-09).
+- **Decision 1, outlined off tool buttons:** an unselected toggle button
+  paints a `border.strong` stroke (the existing 1 px control-outline width,
+  `CONTROL_BORDER_WIDTH`; there is no border-width scale) in every theme,
+  dimmed by `disabled_opacity` when disabled; on and held are the accent
+  fill with no such outline. `border.control_opacity` is untouched.
+  `border.strong` was chosen as asked: it is the token already gated for
+  state-bearing boundaries. New gated pair "border.strong on surface.app
+  (unselected tool button outline)" (the strip paints no background, so
+  the outline sits on the window's `surface.app` clear): Dark 4.09:1,
+  Light 10.01:1, High Contrast Dark/Light 21.00:1, Colour-Critical
+  7.92:1 — all pass the 3.0 floor. The gallery's off cells pick it up;
+  goldens stay `#[ignore]`d and unblessed.
+- **Decision 2, a token:** `size.options_control_width = 224` logical px
+  (`design/tokens/scales.toml` `[size]`, `aurora_theme::SizeScale`,
+  `--size-options-control-width` in the regenerated `design/tokens.css`,
+  listed in `design/README.md`) — **a provisional default for the design
+  owner to tune**, 7 × `spacing.xl`, not density-scaled. The options-bar
+  slider is exactly that wide (shrinking only in a narrower bar); the
+  readout takes the rest. This replaces the 1:2 flex split.
+- **J1:** a hidden Radius slider is now `hidden` in the accesskit tree too
+  (the linked-scrollbar precedent), re-applied after the mutators that
+  rebuild its node; asserted per tool.
+- **J2:** the `sync_tool_controls` and `sync_tool_controls_now` doc
+  comments are back on their own functions; "Properties panel" →
+  "options bar" in `apply_tool_control`'s doc and two warn messages.
+- **J3:** wgpu 30 validates `set_viewport` only against
+  `max_texture_dimension_2d` (size) and ±2× that (position), **not** the
+  attachment (`wgpu-core-30.0.0` `command/render.rs`), so the reported
+  panic could not happen; a scissor *is* validated against the target.
+  The canvas draw now keeps its unclamped viewport (no squeeze) and adds
+  a scissor from `clamp_canvas_to_surface` (outward-rounded, clamped to
+  the surface), skipping the draw when it is empty, then resets the
+  scissor for the widgets. Tested over narrow windows and scale factors
+  1, 1.25, 1.5, 1.75 and 2. The draw site itself is not under test (no
+  headless `App`).
+- **Flake check:** `prepared_pixels::tests::a_background_autosave_right_after_the_install_recovers_the_document`
+  passed 20/20 alone (`--test-threads=1`) and 3/3 in the full `aurora-app`
+  suite on clean code. Its synchronisation is channel handshakes with 60 s
+  timeouts, so it is not timing-sensitive in a normal run; the one failure
+  (under mutation 4) coincided with the full gate running concurrently on
+  the same machine. Not reproduced, so not changed.
+- **Mutations:** R1 off-toggle outline removed — killed by
+  `a_toggle_button_fills_with_the_accent_only_when_on_or_held`; R2 slider
+  width back to a flex share — killed by
+  `the_options_bar_slider_width_follows_the_size_token`; R3 hidden slider
+  still announced — killed by
+  `the_options_bar_shows_the_radius_slider_only_for_a_tool_with_a_radius`;
+  R4 scissor not clamped — killed by
+  `the_canvas_scissor_never_leaves_the_surface_in_a_narrow_window_or_at_a_fractional_scale`.
+- 3 new tests (`the_options_control_width_token_parses`, the slider-width
+  test, the scissor test): **3,021** passing.
+- **Measured after the revision:** full gate green on the RTX 3090 with
+  `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+  clippy `-D warnings`, **3,021 passed, 0 failed, 61 ignored, 0
+  skipped**, strict rustdoc, `cargo deny`, contrast check exit 0 (the
+  candidate's gate before the revision: 3,018 passed). Judge round 2:
+  the wgpu claim verified at source (`set_viewport` checks only device
+  limits; `set_scissor` checks the attachment), both design-owner
+  decisions judged at PASS level; its one blocking note — the J2 defect
+  class back inside the J3 fix (`clamp_canvas_to_surface` had been
+  inserted between `canvas_area_physical_size`'s doc and its `fn`) — and
+  a stale `canvas_area_physical_rect` doc (still citing `set_viewport` as
+  the bound) were both fixed before commit, re-checked with strict
+  rustdoc and clippy on `aurora-app`. Judge trail: REVISE 0.896 → 0.906
+  with those two doc fixes required → applied.
 
 **Addendum 2026-10-09 (0.159.0) — Curves on the GPU path.** Files:
 `aurora-filters` `curves.rs`/`lib.rs` (`CurvesLut::packed_for_gpu`,
