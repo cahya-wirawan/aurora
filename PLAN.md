@@ -26,7 +26,34 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.156.0): the Curves UI — a channel selector,
+**Latest (2026-10-09, 0.157.0): curves interpolate like Photoshop's.**
+`aurora_core::ToneCurve` is now a natural cubic spline (second derivative
+`0` at both ends) with its output clamped to `[0, 1]`, replacing
+0.155.0's monotone Fritsch–Carlson spline, and holds up to **19** points
+(`MAX_POINTS`, was 16) — the design owner's decision that Aurora match
+Photoshop so imported PSD Curves layers look identical. Evidence, and
+how strong it is: psd-tools 1.17.4's Curves compositor uses
+`scipy.interpolate.CubicSpline(bc_type="natural")` clipped to `[0, 1]`;
+independently, Photoshop's **own merged composite** in the corpus
+fixture `adjustments/curves_rgb.psd` was compared against four models
+over that file's four Curves layers: the natural spline was within one
+8-bit level on all 674 cleanly exercised levels of three channel paths
+(672 exact), Fritsch–Carlson off by up to 10. That is a
+strong 8-bit match, not a proof of Photoshop's algorithm, and says
+nothing about 16-bit behaviour. `CurvesLut` now tabulates the spline
+*before* its clamp and clamps after interpolating (clamping first put
+the clamp's kink inside a table interval: measured `3.1e-3`); its
+re-derived bound is `1.83e-4`, measured `1.80e-4` on the worst legal
+curve. Existing Curves layers whose curve has interior points now
+composite differently (0.155.0/0.156.0 were never released); a `.aur`
+with a 17–19-point curve is refused by an older build. Photoshop's
+movable endpoints (a curve starting at input 26, flat beyond) are still
+not representable — the PSD `curv` import (0.158.0) must relax that.
+12 of 12 mutations killed. Full gate green on the RTX 3090 (`AURORA_REQUIRE_GPU=1`): 2,972 passed, 0 failed, 0 skipped; judge PASS 0.91.
+**Needs a human: compare a curve against Photoshop on the same
+points.** Details: "Next action", addendum 0.157.0.
+
+**Previously (2026-10-09, 0.156.0): the Curves UI — a channel selector,
 the curve editor bound to the layer, and a histogram behind it.** When
 the active layer is a Curves adjustment, the Properties panel shows an
 RGB / Red / Green / Blue tab bar above the curve editor
@@ -30770,6 +30797,167 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.157.0) — Photoshop-matching curve
+interpolation.** The design owner (Cahya, 2026-10-09, final) decided
+Aurora's curves match Photoshop: its interpolation and its 19-point
+limit. Files: `aurora-core` `tone_curve.rs` (natural cubic spline:
+`natural_second_derivatives`, a Thomas-algorithm solve in `f64`, and
+`ToneCurve::spline`, the one evaluation formula — the whole model sits
+behind those two functions so a later correction touches one place;
+`evaluate` clamps to `[0, 1]`; new `evaluate_unclamped`; `MAX_POINTS`
+16 → 19), `curves.rs` (decode tests), `aurora-filters` `curves.rs`
+(table of the unclamped spline, clamp after lookup, re-derived bound),
+`aurora-widgets` `widgets/curve_editor.rs` (docs only: the cap was
+already `aurora_core::MAX_POINTS`, never a literal, and the
+widest-segment fallback's bound is now "seventeen segments, at least
+`1/17` wide"). The curve editor's paint and the Properties Curves UI use
+`ToneCurve::evaluate` unchanged; `.aur` and the journal decode through
+`ToneCurve`'s own `Deserialize`, so they accept 19 points with no format
+change.
+
+*Research findings and confidence.* (1) psd-tools 1.17.4,
+`psd_tools/composite/adjustments.py::apply_curves`: per channel,
+`scipy.interpolate.CubicSpline(x, y, bc_type="natural")` over the
+stored points (`/ 255`), input clamped to the first/last point's `x`,
+output clipped to `[0, 1]`, a 256-entry LUT for 8-bit; per-channel
+curves before the composite (RGB) curve. (2) An independent oracle:
+Photoshop's own merged composite stored in
+`corpora/psd/reference/psd-tools-fixtures/adjustments/curves_rgb.psd`
+(four masked Curves layers over an image). For each layer, the pixels
+where its mask is fully on and every other Curves mask fully off were
+compared with the layers below (composited by psd-tools, Curves
+hidden) mapped through four candidate models. Mean absolute error per
+8-bit sample, 30,000 samples per layer: natural spline 0.012–0.016
+(322 of 119,985 samples off by more than one level, all in the
+fixture's palette strip at the bottom rows); Fritsch–Carlson 4.6–14.0;
+zero-end-slope cubic 12.8–23.9; linear 10.0–17.8. Per input level,
+three channel paths whose curves Aurora can represent (endpoints at 0
+and 255) — "Curves 3" red, "Curves 1" green-then-RGB and
+blue-then-RGB — the natural spline matched 672 of 674 levels exactly
+and the other two within one level; Fritsch–Carlson missed by up to 10.
+Those 674 pairs are embedded in
+`matches_photoshop_on_curves_from_its_own_merged_composite`. (3) The
+widely documented reconstruction (natural cubic spline, zero second
+derivative at the ends, evaluated per output level, clamped) agrees
+with both. **Confidence: high for 8-bit RGB** (two independent sources,
+one of them Photoshop's own pixels, and the competing models are
+decisively worse); **unverified** for 16-bit documents (Photoshop may
+evaluate a 256-entry table and interpolate it; Aurora evaluates the
+spline directly), for Grayscale (`curves_grayscale.psd` did **not**
+match any model under the naive channel mapping I used — Photoshop's
+grayscale curves likely use a different convention such as ink
+percentage; unresolved), and Photoshop's source is of course not
+available.
+
+*`CurvesLut` bound, re-derived.* The natural spline's `f''` is linear
+on each interval between its knot values `M_i`; diagonal dominance of
+the tridiagonal system gives `|M_i| <= 6 / (h_{i-1} h_i) <= 6 * 256^2`
+(points `>= 1/256` apart, outputs in `[0, 1]`), so linear interpolation
+at `h = 1/16384` errs by at most `6 * 256^2 / (8 * 16384^2) ~= 1.83e-4`
+— the same figure as 0.155.0's, by a different argument. That bound
+only holds for a smooth function, and the clamp is not one: a table of
+the *clamped* curve measured `3.1e-3` on the minimum-separation
+zigzag (most of an 8-bit level). So the table now stores the spline
+before its clamp and the lookup clamps after interpolating
+(`1`-Lipschitz). Measured: typical S-curve `6.0e-8`, one-step rise
+`7.2e-7`, 19-point minimum-separation zigzag `1.80e-4` (asserted
+`< 1.9e-4`).
+
+*Tests changed, and why.* Removed or replaced in `tone_curve.rs`
+because they asserted Fritsch–Carlson properties a natural spline does
+not have: `monotone_data_gives_a_monotone_curve` and
+`the_unclamped_spline_never_overshoots_its_knots` (replaced by
+`an_overshoot_leaves_the_unit_range_and_is_clamped`, which asserts the
+reverse and that the clamp is applied),
+`adversarial_curves_stay_within_each_intervals_own_knots` (replaced by
+`adversarial_curves_stay_finite_and_inside_the_unit_range`),
+`a_local_extremum_is_flat_and_not_overshot` (FC tangent `0` at an
+extremum; replaced by
+`the_spline_is_natural_at_the_ends_and_smooth_across_knots`),
+`a_plateau_is_exactly_flat` (replaced by
+`a_plateau_between_rises_rings_rather_than_staying_flat`),
+`a_seventeenth_point_is_refused` (replaced by
+`nineteen_points_are_accepted_and_a_twentieth_is_refused`), and
+`identity_is_the_identity_within_1e_6` (tightened to
+`identity_is_the_identity_bit_for_bit`). Added:
+`two_points_give_a_straight_line`,
+`a_three_point_curve_matches_the_hand_solved_natural_spline`,
+`matches_photoshop_on_curves_from_its_own_merged_composite`, and in
+`curves.rs` `nineteen_points_decode_and_sixteen_still_do`; the
+oversized-decode case moved from 17 to 20 points. `aurora-filters`'
+accuracy test gained the 19-point zigzag; its monotone-LUT test is kept
+(monotone *for that data*, now said so). Counts: `aurora-core` 52 → 55, every other crate unchanged, **2,969 → 2,972**.
+
+*Mutations* (each file backed up to the scratchpad, mutated, the named
+crates' tests run, restored, `touch`ed, sha256 checked equal):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | Fritsch–Carlson tangents + Hermite back in `spline` | killed | 5 `tone_curve` tests incl. the Photoshop oracle |
+| M2 | Parabolic-runout end condition instead of natural | killed | hand-solved, Photoshop oracle, natural-ends |
+| M3 | No output clamp in `evaluate` | killed | overshoot, adversarial, `CurvesLut` accuracy |
+| M4 | `MAX_POINTS = 16` | killed | `nineteen_points_are_accepted…`, `nineteen_points_decode…` |
+| M5 | Cap unbounded (`validate`, `add_point`, decode) | killed | construction, nineteen/twenty, oversized decode |
+| M6 | `CurvesLut` table from clamped `evaluate` | killed | `lut_accuracy…` (`3.1e-3`) |
+| M7 | `CurvesLut` lookup without the post-clamp | killed | `lut_accuracy…`, monotone LUT |
+| M8 | Thomas elimination sign slip | killed | Photoshop oracle, natural-ends |
+| M9 | Back substitution ignores the coupling | killed | Photoshop oracle, natural-ends |
+| M10 | Curvature term `h^2/3` for `h^2/6` | killed | hand-solved, Photoshop oracle, natural-ends |
+| M11 | `M_k`/`M_{k+1}` swapped in the formula | killed | Photoshop oracle, natural-ends |
+| M12 | Decode cap literal `16` | killed | `nineteen_points_decode_and_sixteen_still_do` |
+
+The editor has no cap literal of its own to mutate (it relies on
+`ToneCurve::add_point`); under M4 the editor's tests stayed green, which
+is correct — they are written against `MAX_POINTS`.
+
+*Disclosures.* (a) **Compositing changes** for every existing Curves
+layer with an interior point; 0.155.0/0.156.0 were never released, so
+accepted. (b) **Forward compatibility:** a `.aur` (or journal) holding a
+17–19-point curve is refused by a 0.155.0/0.156.0 build (its decoder
+stops at 16); files with 16 or fewer still decode both ways. (c) A
+natural spline **can invent tone reversals** the user did not place —
+Photoshop's behaviour, chosen deliberately; the clamp is now
+load-bearing. (d) **Endpoints still pinned** at `x == 0`/`x == 1`;
+Photoshop allows movable endpoints with flat extension, and adding flat
+points is not equivalent for a natural spline, so `curv` import needs
+the invariant relaxed. (e) 16-bit and Grayscale behaviour unverified
+(above). (f) The oracle's backdrop is psd-tools' own composite of the
+layers below, so a psd-tools compositing error there would show as
+noise (it shows as 0.3% of samples, all in one strip) — the per-level
+reference pairs keep only levels where at least 90% of pixels agree.
+(g) Checks run per crate (`aurora-core`, `-filters`, `-widgets`, `-ui`,
+`-io`, `-doc`, `-app`, the last four with `AURORA_REQUIRE_GPU=1`),
+`cargo clippy -D warnings` on the three edited crates, `cargo fmt
+--check`, rustdoc on the edited crates, `cargo check --workspace`.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,972 passed, 0 failed, 55 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast check exit 0. Independent judge:
+**PASS 0.91**, no critical or high issue (the Thomas solve's diagonal
+dominance, pivots, panic-freedom and the LUT bound were each re-derived).
+Its notes, applied: the `|M_i|` bound is now stated as the global
+`max_j 6/(h_{j-1}h_j)` rather than per knot; the oracle test's doc now
+says the 8-bit rounding between curves models Photoshop's 8-bit *file*
+only and that it checks `ToneCurve`, not `CurvesLut` end to end; a
+mis-worded "17 before" comment fixed; and the oracle extraction is now
+committed and reproducible as `scripts/oracles/psd_curves_oracle.py`
+(re-run: natural spline within one level on all 674 kept levels,
+Fritsch–Carlson up to 10). Recorded, not changed: the minimum separation
+is checked with a rounded `f32` subtraction while widths are computed in
+exact `f64`, so a true width can sit below `1/256` by up to half an ulp —
+about a `1e-5` relative effect on the bound, well inside the test's
+ceiling.
+
+**Needs a human: compare a curve against Photoshop on the same
+points** — e.g. `(0,0) (64,40) (128,160) (255,255)` on a gradient, in
+an 8-bit and a 16-bit document, reading values with the Info panel.
+
+**Suggested next (0.158.0): PSD `curv` import with an exact match**
+(relaxing the endpoint invariant for movable endpoints, checked against
+`curves_rgb.psd`'s merged image), **then the Curves GPU port, then the
+workspace rounds.**
 
 **Addendum 2026-10-09 (0.156.0) — the Curves UI.** Done as specified
 above ("Where we are"). Files: `aurora-widgets` `widgets/curve_editor.rs`

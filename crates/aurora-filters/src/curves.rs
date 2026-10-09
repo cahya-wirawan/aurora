@@ -23,13 +23,29 @@
 //! - **No 8-bit intermediate** (invariant §7.3.1b). Each curve is sampled
 //!   at [`CURVES_LUT_INTERVALS`]` + 1` evenly spaced `f32` positions and
 //!   read back with linear interpolation in `f32`. The sample positions
-//!   `i / 16384` are exact in `f32`. The worst-case interpolation error,
-//!   for the steepest curve [`aurora_core::ToneCurve`] can hold (a full
-//!   `0 -> 1` rise across one minimum-separation interval of `1/256`,
-//!   whose Hermite segment has `|f''| <= 6 * 256^2`), is bounded by
-//!   `h^2 / 8 * max|f''| = 6 * 256^2 / (8 * 16384^2) ~= 1.8e-4`, under one
-//!   12-bit code value; a typical curve measures below `1e-6` (see the
-//!   tests, which measure both against [`aurora_core::ToneCurve::evaluate`]).
+//!   `i / 16384` are exact in `f32`.
+//! - **The table holds the spline before its clamp, and the lookup
+//!   clamps** (0.157.0). [`aurora_core::ToneCurve`] is a natural cubic
+//!   spline clamped to `[0, 1]` (Photoshop's model), and the clamp is
+//!   load-bearing: a curve may cross `0` or `1` with a slope of several
+//!   hundred. Interpolating samples of the *clamped* curve would put that
+//!   kink inside one table interval, an error of up to `slope * h / 4` —
+//!   measured at `3.1e-3` (most of an 8-bit level) on the
+//!   minimum-separation zigzag in the tests. Clamping after
+//!   interpolation instead is `1`-Lipschitz, so the error is the smooth
+//!   spline's own: `h^2 / 8 * max|f''|` with `h = 1/16384`. The natural
+//!   spline's second derivative is linear on each interval between its
+//!   knot values `M_i`, and diagonal dominance of its tridiagonal system
+//!   bounds every `|M_i|` by `max_j 6 / (h_{j-1} h_j) <= 6 * 256^2` for points
+//!   at least `1/256` apart with outputs in `[0, 1]` (see
+//!   `aurora_core::tone_curve`'s `natural_second_derivatives`). So the
+//!   bound is `6 * 256^2 / (8 * 16384^2) ~= 1.83e-4` — numerically the
+//!   same figure 0.155.0 derived for Fritsch–Carlson's Hermite segments,
+//!   by a different argument — plus `f32` rounding of samples that may
+//!   lie far outside `[0, 1]` (an overshoot of up to a few hundred,
+//!   rounding at `~1e-5` of it at worst). Under one 12-bit code value; a
+//!   typical curve measures below `1e-6` (see the tests, which measure
+//!   both against [`aurora_core::ToneCurve::evaluate`]).
 //! - **Identity curves are skipped**, not tabulated, so an identity curve
 //!   (or an absent channel curve) is an *exact* passthrough, bit for bit,
 //!   rather than a passthrough up to interpolation rounding.
@@ -62,14 +78,16 @@ impl Table {
                 .map(|i| {
                     #[allow(clippy::cast_precision_loss)]
                     let x = i as f32 / last;
-                    curve.evaluate(x)
+                    curve.evaluate_unclamped(x)
                 })
                 .collect(),
         ))
     }
 
     /// Linear interpolation between the two samples around `x`, which is
-    /// clamped to `[0, 1]` first (`NaN` reads as `0.0`).
+    /// clamped to `[0, 1]` first (`NaN` reads as `0.0`), and the result
+    /// clamped to `[0, 1]` after — the curve's own output clamp, applied
+    /// once the interpolation is done (see the module docs).
     fn lookup(&self, x: f32) -> f32 {
         let x = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
         #[allow(clippy::cast_precision_loss)]
@@ -82,7 +100,7 @@ impl Table {
         #[allow(clippy::cast_precision_loss)]
         let frac = position - index as f32;
         match (self.0.get(index), self.0.get(index + 1)) {
-            (Some(&low), Some(&high)) => (high - low).mul_add(frac, low),
+            (Some(&low), Some(&high)) => (high - low).mul_add(frac, low).clamp(0.0, 1.0),
             // Unreachable: every table holds INTERVALS + 1 samples.
             _ => x,
         }
@@ -260,6 +278,9 @@ mod tests {
         assert!((g - 0.5).abs() < 1e-6, "composite alone on green: {g}");
     }
 
+    /// Monotone *for this data*: a natural spline is not monotone in
+    /// general (0.157.0), but this one is, and the table must not add a
+    /// reversal the curve does not have.
     #[test]
     fn a_monotone_curve_stays_monotone_through_the_lut() {
         let lut = CurvesLut::new(&composite_only(&[
@@ -299,18 +320,38 @@ mod tests {
     #[test]
     fn lut_accuracy_against_direct_evaluation_is_measured_and_bounded() {
         let typical = max_lut_error(&[(0.0, 0.0), (0.25, 0.18), (0.75, 0.84), (1.0, 1.0)]);
-        // The steepest legal curve: a full rise across one 1/256 interval.
+        // A full rise across one 1/256 interval: the natural spline
+        // overshoots both ways around it, so the clamp is crossed steeply.
         let step = 1.0 / 256.0;
         let steepest = max_lut_error(&[(0.0, 0.0), (0.5, 0.0), (0.5 + step, 1.0), (1.0, 1.0)]);
+        // The curve with the largest second derivatives the invariants
+        // allow: 19 points alternating 0 / 1 at minimum separation, every
+        // `|M_i|` near its `6 * 256^2` ceiling and the clamp crossed
+        // dozens of times.
+        #[allow(clippy::cast_precision_loss)]
+        let zigzag: Vec<(f32, f32)> = (0..aurora_core::MAX_POINTS)
+            .map(|i| {
+                let x = if i + 1 == aurora_core::MAX_POINTS {
+                    1.0
+                } else {
+                    i as f32 * step
+                };
+                (x, if i % 2 == 0 { 0.0 } else { 1.0 })
+            })
+            .collect();
+        let zigzag = max_lut_error(&zigzag);
         println!(
             "CurvesLut ({CURVES_LUT_INTERVALS} intervals) max |lut - evaluate|: typical \
-             S-curve {typical:e}, steepest legal curve {steepest:e}"
+             S-curve {typical:e}, one-step rise {steepest:e}, minimum-separation zigzag \
+             {zigzag:e}"
         );
         assert!(typical < 1e-6, "typical curve error {typical}");
-        assert!(
-            steepest < 1.9e-4,
-            "steepest curve error {steepest} exceeds the derived bound"
-        );
+        for (name, error) in [("one-step rise", steepest), ("zigzag", zigzag)] {
+            assert!(
+                error < 1.9e-4,
+                "{name} error {error} exceeds the derived 1.83e-4 bound"
+            );
+        }
     }
 
     #[test]

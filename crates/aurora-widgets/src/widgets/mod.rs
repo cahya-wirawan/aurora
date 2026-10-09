@@ -94,8 +94,8 @@
 //! (`color_picker.rs`'s own doc comment has the full list); a focused
 //! channel slider rings the square it covers (0.129.0).
 //! The curve editor ([`insert_curve_editor`]/[`handle_curve_editor_key`])
-//! edits an `aurora_core::ToneCurve` (a monotone cubic through 2 to 16
-//! control points, the model living in `aurora-core` so the future
+//! edits an `aurora_core::ToneCurve` (Photoshop's natural cubic spline,
+//! clamped to `[0, 1]`, through 2 to 19 control points, the model living in `aurora-core` so the future
 //! Curves adjustment shares it): one root that paints a well, a quarter
 //! grid, the identity diagonal, the curve and a marker per point, and one
 //! `Role::Slider` per point with roving focus (only the selected point is

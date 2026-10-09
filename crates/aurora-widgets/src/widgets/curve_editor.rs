@@ -9,7 +9,8 @@
 //! as `aurora-ui`'s Curves controls do with a tab bar, 0.156.0), **no**
 //! input/output numeric fields, **no** presets, and no glyphs of any kind
 //! (this crate draws none). The curve model itself — validation,
-//! Fritsch–Carlson interpolation, editing — is [`ToneCurve`] in
+//! Photoshop's natural-cubic interpolation clamped to `[0, 1]`, editing —
+//! is [`ToneCurve`] in
 //! `aurora-core`, so the adjustment that will one day *apply* a curve
 //! shares it without depending on this crate; this module owns only the
 //! interaction and the tree.
@@ -120,7 +121,7 @@
 //! | `Delete` | an endpoint selected | `Ignored` |
 //! | `Insert` | the segment after the selection has room | a point at that segment's midpoint input, **on** the curve, selected |
 //! | `Insert` | that segment is under `2/256` wide | the same, in the **widest** segment of the curve (lowest index on a tie) |
-//! | `Insert` | 16 points | `Ignored` |
+//! | `Insert` | [`aurora_core::MAX_POINTS`] (19) points | `Ignored` |
 //! | any | a key that changes nothing | `Ignored`, no damage |
 //!
 //! `Insert` with the **last** point selected uses the segment before it
@@ -496,9 +497,9 @@ fn has_room(a: CurvePoint, b: CurvePoint) -> bool {
 /// (the lowest-indexed one on a tie). Without the fallback, repeated
 /// `Insert` from the identity halves the same run of segments until the
 /// next one is `1/256` wide and stalls at 10 points; with it, `Insert`
-/// is refused only at [`aurora_core::MAX_POINTS`] — below the limit
-/// there are at most fourteen segments spanning `[0, 1]`, so the widest
-/// is at least `1/14` wide, far above `2/256`. `None`
+/// is refused only at [`aurora_core::MAX_POINTS`] (19) — below the limit
+/// there are at most seventeen segments spanning `[0, 1]`, so the widest
+/// is at least `1/17` wide, far above `2/256`. `None`
 /// when no segment has room (only reachable at the point limit).
 fn insert_segment(points: &[CurvePoint], selected: usize) -> Option<(CurvePoint, CurvePoint)> {
     let last = points.len().checked_sub(1)?;
@@ -848,7 +849,8 @@ pub fn curve_editor_point_at(
 
 /// A pointer press on empty plot: adds a point at the pointer's input
 /// level **and** output level (both clamped to `[0, 1]`) and selects it.
-/// `Ignored` if the curve refuses the point (16 points already, too close
+/// `Ignored` if the curve refuses the point ([`aurora_core::MAX_POINTS`]
+/// already, too close
 /// to a neighbour, at an endpoint's input), for a non-finite point, or
 /// for an editor with no plot.
 ///
@@ -1441,7 +1443,7 @@ mod tests {
         ]);
         let (next, sel) = keyed(&tight, 1, CurveEditorKey::Insert, false);
         assert_eq!((next.points().len(), sel), (5, 2));
-        // Sixteen points: full.
+        // `MAX_POINTS` (19) points: full.
         let full: Vec<CurvePoint> = (0..MAX_POINTS)
             .map(|i| p(i as f32 / (MAX_POINTS - 1) as f32, 0.5))
             .collect();

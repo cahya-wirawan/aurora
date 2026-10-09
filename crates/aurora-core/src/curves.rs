@@ -135,9 +135,11 @@ mod tests {
         };
         assert!(postcard::from_bytes::<ToneCurve>(&bytes).is_err());
 
-        // Seventeen points, each individually valid-looking.
+        // Twenty points, each individually valid-looking: one past
+        // Photoshop's 19 (`MAX_POINTS` since 0.157.0; the old test used 17,
+        // one past the old cap of 16).
         #[allow(clippy::cast_precision_loss)]
-        let many: Vec<(f32, f32)> = (0..17).map(|i| (i as f32 / 16.0, 0.5)).collect();
+        let many: Vec<(f32, f32)> = (0..20).map(|i| (i as f32 / 19.0, 0.5)).collect();
         let bytes = match postcard::to_allocvec(&many) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),
@@ -154,5 +156,26 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert!(postcard::from_bytes::<ToneCurve>(&bytes).is_err());
+    }
+
+    /// 0.157.0 raised the cap from 16 to 19 points: a 19-point curve now
+    /// decodes, and so does every curve a 0.155.0/0.156.0 build could
+    /// write (16 points or fewer) — the point-list encoding itself did not
+    /// change. (An older build refuses a 17-to-19-point curve.)
+    #[test]
+    fn nineteen_points_decode_and_sixteen_still_do() {
+        for n in [2_u16, 16, 17, 19] {
+            let points: Vec<(f32, f32)> = (0..n)
+                .map(|i| (f32::from(i) / f32::from(n - 1), 0.25))
+                .collect();
+            let bytes = match postcard::to_allocvec(&points) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            match postcard::from_bytes::<ToneCurve>(&bytes) {
+                Ok(curve) => assert_eq!(curve.points().len(), usize::from(n)),
+                Err(err) => unreachable!("{n} points must decode: {err:?}"),
+            }
+        }
     }
 }

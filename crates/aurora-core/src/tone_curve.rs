@@ -2,12 +2,14 @@
 //! and the curve-editor widget (`aurora_widgets`' `curve_editor`).
 //!
 //! A [`ToneCurve`] maps an input level `x` in `[0, 1]` to an output level
-//! `y` in `[0, 1]` through `2..=16` control points ([`MIN_POINTS`],
-//! [`MAX_POINTS`]), interpolated by a **monotone cubic Hermite spline**
-//! (Fritsch–Carlson). It lives here, in `aurora-core`, so the widget that
-//! edits it and the future adjustment that applies it (`aurora-filters`,
-//! `aurora-doc`, `aurora-io`) share one definition without either
-//! depending on the other (`scripts/layering.json`).
+//! `y` in `[0, 1]` through `2..=19` control points ([`MIN_POINTS`],
+//! [`MAX_POINTS`] — Photoshop's own Curves limit), interpolated by a
+//! **natural cubic spline** whose output is then **clamped to `[0, 1]`**,
+//! which is what Photoshop's Curves does (0.157.0). It lives here, in
+//! `aurora-core`, so the widget that edits it and the adjustment that
+//! applies it (`aurora-filters`, `aurora-doc`, `aurora-io`) share one
+//! definition without either depending on the other
+//! (`scripts/layering.json`).
 //!
 //! # Invariants
 //!
@@ -23,41 +25,51 @@
 //! - consecutive `x`s at least [`MIN_POINT_SEPARATION`] apart (so strictly
 //!   increasing — the constructor never sorts silently).
 //!
-//! # Interpolation
+//! # Interpolation: Photoshop's, as far as it has been verified
 //!
-//! Fritsch–Carlson, computed in `f64`: secants `d_k`; an interior
-//! tangent is the mean of its two neighbouring secants when both have
-//! the same strict sign and `0` otherwise (so a local extremum of the
-//! data is a flat extremum of the curve); each end tangent is its
-//! adjacent secant; then, per interval, a flat interval zeroes both its
-//! tangents and any interval whose `(m_k / d_k, m_{k+1} / d_k)` lies
-//! outside the radius-3 circle has both scaled back onto it. The result
-//! is **monotone within every interval**: each segment stays between its
-//! own two knots' `y`s and never overshoots, so no curve ever leaves
-//! `[0, 1]` by construction. [`ToneCurve::evaluate`] still clamps its
-//! result to `[0, 1]`, but only as a rounding safety net.
+//! **Decided by the design owner (Cahya, PRD FR-027 *Ownership*,
+//! 2026-10-09): Aurora matches Photoshop**, so an imported PSD Curves
+//! layer looks identical. The model, all of it behind
+//! `natural_second_derivatives` and `ToneCurve::spline`, so a later
+//! correction touches one place:
 //!
-//! **This deliberately differs from Photoshop**, whose Curves dialog
-//! interpolates with a natural cubic spline that overshoots between
-//! close points (and then clips), and allows 19 points to this type's
-//! [`MAX_POINTS`] of 16. A monotone spline was chosen because it cannot
-//! invent tone reversals the user did not place. **Decided by the design
-//! owner (Cahya, PRD FR-027 *Ownership*, 2026-10-09): Aurora will match
-//! Photoshop** — its natural-cubic-style interpolation with outputs
-//! clamped to `[0, 1]`, and its 19-point limit — so an imported PSD
-//! Curves layer looks identical. **Not implemented yet: scheduled for
-//! 0.157.0** (verified against psd-tools or Photoshop reference curves;
-//! it also moves the curve editor's point cap, the LUT accuracy bound and
-//! every test that assumes a monotone curve). Until then this type is
-//! the monotone interpolation described above.
+//! - a **natural cubic spline** through the points, computed in `f64`:
+//!   `C2`-continuous, second derivative exactly `0` at both ends, the
+//!   interior second derivatives `M_i` solved from the standard
+//!   tridiagonal system (strictly diagonally dominant, so the Thomas
+//!   algorithm needs no pivoting and no denominator can be zero);
+//! - evaluated per interval as `(1 - t) y_k + t y_{k+1} + h^2 / 6 *
+//!   (((1 - t)^3 - (1 - t)) M_k + (t^3 - t) M_{k+1})`, a form that is
+//!   exactly `y_k` at `t == 0` and exactly `y_{k+1}` at `t == 1`, and
+//!   exactly `x` for the identity curve;
+//! - the result **clamped to `[0, 1]`**. Unlike the monotone
+//!   Fritsch–Carlson spline this replaced (0.155.0–0.156.0), a natural
+//!   spline overshoots between close or uneven points — it can invent a
+//!   tone reversal the user did not place — and the clamp is then
+//!   load-bearing, not a rounding safety net. That is Photoshop's
+//!   behaviour, chosen deliberately.
 //!
-//! A second, smaller question inside that choice, still open: each
-//! interior tangent starts as the **unweighted** mean of its two
-//! neighbouring secants (Fritsch and Carlson's original 1980 form),
-//! not the interval-width-weighted three-point estimate (e.g. Fritsch
-//! and Butland's weighted harmonic mean) that bends less towards a much
-//! shorter neighbouring interval. Both keep the monotonicity guarantee;
-//! they differ only in shape between unevenly spaced points.
+//! **Evidence (0.157.0):** psd-tools 1.17.4's Curves compositor
+//! (`psd_tools/composite/adjustments.py`, `apply_curves`) uses
+//! `scipy.interpolate.CubicSpline(..., bc_type="natural")`, clipped to
+//! `[0, 1]`, with input clamped to the first/last point. Independently of
+//! psd-tools' own code, Photoshop's **own merged composite** stored in
+//! the corpus fixture `adjustments/curves_rgb.psd` was compared, region by
+//! region, against four candidate models applied to that file's four
+//! Curves layers: the natural spline was within one 8-bit level on every
+//! level the fixture exercises cleanly (the reference test below), where
+//! Fritsch–Carlson missed by up to 10 levels, a zero-end-slope cubic by
+//! up to 21 and linear interpolation by up to 17. What it does **not**
+//! establish: behaviour at 16 bits per channel (Photoshop may well
+//! evaluate a 256-entry table and interpolate it; Aurora evaluates the
+//! spline directly), and Photoshop's own source.
+//!
+//! **One Photoshop difference kept:** Photoshop lets the first and last
+//! points move horizontally (a curve may start at input 26) and holds the
+//! output flat beyond them. This type still pins them to `x == 0` and
+//! `x == 1`, so such a PSD curve is not yet representable — adding flat
+//! points at the ends is **not** equivalent for a natural spline. The PSD
+//! `curv` import must relax that invariant (0.158.0).
 //!
 //! [`ToneCurve::build_lut`] allocates exactly the length it is asked for,
 //! up to [`MAX_LUT_LEN`] samples (4 MiB of `f32`); a longer request is
@@ -73,8 +85,10 @@ pub const MIN_POINTS: usize = 2;
 /// and small enough that the allocation cannot plausibly fail.
 pub const MAX_LUT_LEN: usize = 1 << 20;
 
-/// The most points a curve may have (Photoshop's own Curves limit).
-pub const MAX_POINTS: usize = 16;
+/// The most points a curve may have: 19, Photoshop's own Curves limit
+/// (16 until 0.157.0 — a `.aur` file holding a 17-to-19-point curve is
+/// refused by an older build).
+pub const MAX_POINTS: usize = 19;
 
 /// The smallest horizontal gap between two consecutive points: `1/256`,
 /// exact in `f32`. Deliberately **smaller** than the `1/255` step an
@@ -140,10 +154,10 @@ pub enum ToneCurveError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToneCurve {
     points: Vec<CurvePoint>,
-    /// One Fritsch–Carlson tangent per point, recomputed after every
-    /// edit (a pure function of `points`, so derived `PartialEq` is
-    /// exactly "same points").
-    tangents: Vec<f64>,
+    /// One natural-spline second derivative per point (`0.0` at both
+    /// ends), recomputed after every edit (a pure function of `points`,
+    /// so derived `PartialEq` is exactly "same points").
+    second_derivatives: Vec<f64>,
 }
 
 impl Default for ToneCurve {
@@ -175,8 +189,11 @@ impl ToneCurve {
     }
 
     fn from_valid(points: Vec<CurvePoint>) -> Self {
-        let tangents = tangents(&points);
-        Self { points, tangents }
+        let second_derivatives = natural_second_derivatives(&points);
+        Self {
+            points,
+            second_derivatives,
+        }
     }
 
     /// The control points, in increasing `x`.
@@ -199,14 +216,30 @@ impl ToneCurve {
         )
     }
 
-    /// The curve's output at input `x`. `x` is clamped to `[0, 1]`, and a
-    /// NaN `x` is treated as `0.0`. Exact (`==`) at every control point.
-    /// The result is clamped to `[0, 1]` — a rounding safety net only;
-    /// the spline itself never leaves its own knots' range.
+    /// The curve's output at input `x`: the spline clamped to `[0, 1]`
+    /// (see this module's own doc comment). `x` is clamped to `[0, 1]`,
+    /// and a NaN `x` is treated as `0.0`. Exact (`==`) at every control
+    /// point, and exactly `x` for the identity curve.
     #[must_use]
-    // The Hermite formula's own names (`x`, `t`, `h`, `k`, `a`, `b`, `y`).
-    #[allow(clippy::many_single_char_names)]
     pub fn evaluate(&self, x: f32) -> f32 {
+        (self.spline(x) as f32).clamp(0.0, 1.0)
+    }
+
+    /// The spline itself, **before** the output clamp — it may leave
+    /// `[0, 1]` between points. For a lookup table that interpolates
+    /// between samples and clamps afterwards (`aurora_filters::curves`),
+    /// which keeps the table's error bound free of the clamp's kink.
+    /// Input handling as [`Self::evaluate`]; always finite.
+    #[must_use]
+    pub fn evaluate_unclamped(&self, x: f32) -> f32 {
+        self.spline(x) as f32
+    }
+
+    /// The natural cubic spline at `x`, in `f64` — the one place the
+    /// interpolation formula lives (with `natural_second_derivatives`).
+    // The spline formula's own names (`x`, `t`, `u`, `h`, `k`, `a`, `b`).
+    #[allow(clippy::many_single_char_names)]
+    fn spline(&self, x: f32) -> f64 {
         let x = if x.is_nan() {
             0.0
         } else {
@@ -220,8 +253,8 @@ impl ToneCurve {
         let (Some(a), Some(b), Some(&ma), Some(&mb)) = (
             self.points.get(k),
             self.points.get(k + 1),
-            self.tangents.get(k),
-            self.tangents.get(k + 1),
+            self.second_derivatives.get(k),
+            self.second_derivatives.get(k + 1),
         ) else {
             // Unreachable: every curve holds at least two points.
             return 0.0;
@@ -230,14 +263,8 @@ impl ToneCurve {
         let (x1, y1) = (f64::from(b.x), f64::from(b.y));
         let h = x1 - x0;
         let t = (x - x0) / h;
-        let t2 = t * t;
-        let t3 = t2 * t;
-        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-        let h10 = t3 - 2.0 * t2 + t;
-        let h01 = -2.0 * t3 + 3.0 * t2;
-        let h11 = t3 - t2;
-        let y = h00 * y0 + h10 * h * ma + h01 * y1 + h11 * h * mb;
-        (y as f32).clamp(0.0, 1.0)
+        let u = 1.0 - t;
+        u * y0 + t * y1 + h * h / 6.0 * ((u * u * u - u) * ma + (t * t * t - t) * mb)
     }
 
     /// `n` evenly spaced samples: sample `i` is [`Self::evaluate`] at
@@ -434,73 +461,82 @@ fn validate(points: &[CurvePoint]) -> Result<(), ToneCurveError> {
     Ok(())
 }
 
-/// Fritsch–Carlson tangents for already-validated `points` — see
-/// "Interpolation" in this module's own doc comment.
-// Fritsch–Carlson's own names (`n`, `m`, `d`, `a`, `b`, `s`).
-#[allow(clippy::many_single_char_names)]
-fn tangents(points: &[CurvePoint]) -> Vec<f64> {
-    let secants: Vec<f64> = points
+/// The natural cubic spline's second derivatives `M_i` at each of
+/// already-validated `points`: `M_0 = M_{n-1} = 0` (the natural end
+/// condition) and, for each interior point,
+/// `h_{i-1} M_{i-1} + 2 (h_{i-1} + h_i) M_i + h_i M_{i+1} = 6 (d_i - d_{i-1})`
+/// with `h` the interval widths and `d` the secants. Solved by the Thomas
+/// algorithm in `f64`: the system is strictly diagonally dominant (each
+/// diagonal exceeds its off-diagonals by `h_{i-1} + h_i >= 2/256`), so
+/// every elimination denominator is at least `h_{i-1} + 2 h_i > 0` and
+/// nothing divides by zero. Two points give all zeros — a straight line.
+///
+/// The same dominance bounds every `|M_i|` — not each `M_i` by its *own*
+/// neighbours' widths, since a large `M` can carry to a knot beside a wide
+/// interval, but all of them by the global maximum —
+/// `max_j |6 (d_j - d_{j-1})| / (h_{j-1} + h_j) <= max_j 6 / (h_{j-1} h_j)
+/// <= 6 * 256^2`, which is what `aurora_filters::curves`' table-accuracy
+/// bound rests on.
+fn natural_second_derivatives(points: &[CurvePoint]) -> Vec<f64> {
+    let n = points.len();
+    let mut m = vec![0.0_f64; n];
+    if n < 3 {
+        return m;
+    }
+    let widths: Vec<f64> = points
         .windows(2)
         .map(|w| match w {
-            [a, b] => (f64::from(b.y) - f64::from(a.y)) / (f64::from(b.x) - f64::from(a.x)),
+            [a, b] => f64::from(b.x) - f64::from(a.x),
+            _ => 1.0,
+        })
+        .collect();
+    let secants: Vec<f64> = points
+        .windows(2)
+        .zip(&widths)
+        .map(|(w, &h)| match w {
+            [a, b] => (f64::from(b.y) - f64::from(a.y)) / h,
             _ => 0.0,
         })
         .collect();
-    let n = points.len();
-    let mut m = vec![0.0_f64; n];
-    for (k, slot) in m.iter_mut().enumerate() {
-        let left = k.checked_sub(1).and_then(|i| secants.get(i)).copied();
-        let right = secants.get(k).copied();
-        *slot = match (left, right) {
-            (Some(l), Some(r)) => {
-                if (l > 0.0 && r > 0.0) || (l < 0.0 && r < 0.0) {
-                    f64::midpoint(l, r)
-                } else {
-                    0.0
-                }
-            }
-            (None, Some(r)) => r,
-            (Some(l), None) => l,
-            (None, None) => 0.0,
+    // Forward elimination over the interior rows `1..n - 1`; row 0 is the
+    // known `M_0 = 0`, so its eliminated coefficients are zero too.
+    let mut upper = vec![0.0_f64; n];
+    let mut rhs = vec![0.0_f64; n];
+    for i in 1..n - 1 {
+        let (Some(&hl), Some(&hr), Some(&dl), Some(&dr)) = (
+            widths.get(i - 1),
+            widths.get(i),
+            secants.get(i - 1),
+            secants.get(i),
+        ) else {
+            return vec![0.0; n];
         };
-    }
-    for (k, &d) in secants.iter().enumerate() {
-        // Redundant with the sign rule above — both tangents of a flat
-        // interval are already `0` (an interior one has a zero secant
-        // beside it; an end one *is* that secant) — and measured as such:
-        // deleting this branch survives every test, the skipped `0 / 0`
-        // below being `NaN`, which fails `> 9.0`. Kept so no `NaN` is
-        // ever computed and the step reads as the published algorithm.
-        if d == 0.0 {
-            if let Some(slot) = m.get_mut(k) {
-                *slot = 0.0;
-            }
-            if let Some(slot) = m.get_mut(k + 1) {
-                *slot = 0.0;
-            }
-            continue;
+        let (prev_upper, prev_rhs) = (
+            upper.get(i - 1).copied().unwrap_or(0.0),
+            rhs.get(i - 1).copied().unwrap_or(0.0),
+        );
+        let denom = 2.0 * (hl + hr) - hl * prev_upper;
+        if let Some(slot) = upper.get_mut(i) {
+            *slot = hr / denom;
         }
-        let (Some(&mk), Some(&mk1)) = (m.get(k), m.get(k + 1)) else {
-            continue;
-        };
-        let a = mk / d;
-        let b = mk1 / d;
-        let s = a * a + b * b;
-        if s > 9.0 {
-            let tau = 3.0 / s.sqrt();
-            if let Some(slot) = m.get_mut(k) {
-                *slot = tau * a * d;
-            }
-            if let Some(slot) = m.get_mut(k + 1) {
-                *slot = tau * b * d;
-            }
+        if let Some(slot) = rhs.get_mut(i) {
+            *slot = (6.0 * (dr - dl) - hl * prev_rhs) / denom;
+        }
+    }
+    // Back substitution; `M_{n-1} = 0` closes it.
+    for i in (1..n - 1).rev() {
+        let next = m.get(i + 1).copied().unwrap_or(0.0);
+        let value =
+            rhs.get(i).copied().unwrap_or(0.0) - upper.get(i).copied().unwrap_or(0.0) * next;
+        if let Some(slot) = m.get_mut(i) {
+            *slot = value;
         }
     }
     m
 }
 
 /// A curve is written as its point list, `(x, y)` pairs in order — the
-/// tangents are derived data and never stored (0.155.0, for the Curves
+/// second derivatives are derived data and never stored (0.155.0, for the Curves
 /// adjustment layer's `.aur`/journal encoding).
 impl serde::Serialize for ToneCurve {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -552,9 +588,9 @@ impl<'de> serde::Deserialize<'de> for ToneCurve {
 }
 
 #[cfg(test)]
-// Exact float equality is the claim under test (knots, LUT ends, clamps);
-// the formulas' own single-letter names; a pseudo-random fraction in
-// `[0, 1)` cast to an index.
+// Exact float equality is the claim under test (knots, LUT ends, clamps,
+// the identity); the formulas' own single-letter names; a pseudo-random
+// fraction in `[0, 1)` cast to an index.
 #[allow(
     clippy::float_cmp,
     clippy::many_single_char_names,
@@ -563,7 +599,7 @@ impl<'de> serde::Deserialize<'de> for ToneCurve {
 mod tests {
     use super::{
         CurvePoint, MAX_LUT_LEN, MAX_POINTS, MIN_POINT_SEPARATION, ToneCurve, ToneCurveError,
-        tangents,
+        natural_second_derivatives,
     };
 
     fn p(x: f32, y: f32) -> CurvePoint {
@@ -584,51 +620,6 @@ mod tests {
         }
     }
 
-    /// Asserts every sample in every interval stays within that
-    /// interval's own knot range (`±1e-6`) and inside `[0, 1]` — the
-    /// tighter, per-interval bound, not just the final clamp.
-    fn assert_bounded_per_interval(c: &ToneCurve, samples_per_interval: u32) {
-        for w in c.points().windows(2) {
-            let [a, b] = w else { unreachable!() };
-            let (lo, hi) = (a.y.min(b.y) - 1e-6, a.y.max(b.y) + 1e-6);
-            for s in 0..=samples_per_interval {
-                let t = f64::from(s) / f64::from(samples_per_interval);
-                let x = (f64::from(a.x) + t * (f64::from(b.x) - f64::from(a.x))) as f32;
-                let y = c.evaluate(x);
-                // A sample rounding onto the neighbouring interval's
-                // knot is still that knot's value — exact there.
-                assert!(
-                    (lo..=hi).contains(&y) && (0.0..=1.0).contains(&y),
-                    "{x} -> {y} outside [{lo}, {hi}] for {:?}",
-                    c.points()
-                );
-            }
-        }
-    }
-
-    /// The unclamped spline value inside interval `k`, for tests that
-    /// must see past `evaluate`'s safety-net clamp.
-    fn raw(c: &ToneCurve, x: f64) -> f64 {
-        let pts = c.points();
-        let k = pts
-            .partition_point(|q| f64::from(q.x) <= x)
-            .saturating_sub(1)
-            .min(pts.len() - 2);
-        let m = tangents(pts);
-        let (Some(a), Some(b), Some(&ma), Some(&mb)) =
-            (pts.get(k), pts.get(k + 1), m.get(k), m.get(k + 1))
-        else {
-            unreachable!()
-        };
-        let h = f64::from(b.x) - f64::from(a.x);
-        let t = (x - f64::from(a.x)) / h;
-        let (t2, t3) = (t * t, t * t * t);
-        (2.0 * t3 - 3.0 * t2 + 1.0) * f64::from(a.y)
-            + (t3 - 2.0 * t2 + t) * h * ma
-            + (-2.0 * t3 + 3.0 * t2) * f64::from(b.y)
-            + (t3 - t2) * h * mb
-    }
-
     fn zigzag(n: usize, step: f32) -> Vec<CurvePoint> {
         (0..n)
             .map(|i| {
@@ -638,17 +629,23 @@ mod tests {
             .collect()
     }
 
+    /// The identity is exactly the identity — bit for bit, not within a
+    /// tolerance — over a `2^16`-step sweep of `[0, 1]` plus a 1000-step
+    /// one: both its second derivatives are `0`, and the evaluation form
+    /// reduces to `0 * (1 - x) + 1 * x`.
     #[test]
-    fn identity_is_the_identity_within_1e_6() {
+    fn identity_is_the_identity_bit_for_bit() {
         let c = ToneCurve::identity();
-        for i in 0..=1000_u32 {
-            let x = i as f32 / 1000.0;
-            assert!((c.evaluate(x) - x).abs() <= 1e-6, "{x}");
+        assert_eq!(natural_second_derivatives(c.points()), vec![0.0, 0.0]);
+        let fine = (0..=(1_u32 << 16)).map(|i| i as f32 / (1_u32 << 16) as f32);
+        let sweep = (0..=1000_u32).map(|i| i as f32 / 1000.0);
+        for x in fine.chain(sweep) {
+            assert_eq!(c.evaluate(x).to_bits(), x.to_bits(), "{x}");
         }
         let lut = lut(&c, 256);
         assert_eq!(lut.len(), 256);
         for (i, y) in lut.iter().enumerate() {
-            assert!((y - i as f32 / 255.0).abs() <= 1e-6, "{i}");
+            assert_eq!(*y, (i as f64 / 255.0) as f32, "{i}");
         }
         assert_eq!(ToneCurve::default(), c);
         assert_eq!(c.points(), [p(0.0, 0.0), p(1.0, 1.0)]);
@@ -682,48 +679,274 @@ mod tests {
         }
     }
 
+    /// Two points are a straight line: no curvature to solve for.
     #[test]
-    fn monotone_data_gives_a_monotone_curve() {
-        let increasing = curve(&[
-            p(0.0, 0.0),
-            p(0.1, 0.5),
-            p(0.2, 0.55),
-            p(0.5, 0.6),
-            p(0.52, 0.95),
-            p(1.0, 1.0),
-        ]);
-        let decreasing = curve(&[p(0.0, 1.0), p(0.05, 0.2), p(0.6, 0.19), p(1.0, 0.0)]);
-        let samples = lut(&increasing, 4097);
+    fn two_points_give_a_straight_line() {
+        let c = curve(&[p(0.0, 0.25), p(1.0, 0.75)]);
+        assert_eq!(natural_second_derivatives(c.points()), vec![0.0, 0.0]);
+        for i in 0..=1024_u32 {
+            let x = i as f32 / 1024.0;
+            let want = 0.25 + 0.5 * f64::from(x);
+            assert!((f64::from(c.evaluate(x)) - want).abs() <= 1e-7, "{x}");
+        }
+        let falling = curve(&[p(0.0, 1.0), p(1.0, 0.0)]);
+        assert_eq!(falling.evaluate(0.25), 0.75);
+        assert_eq!(falling.evaluate(0.5), 0.5);
+    }
+
+    /// A hand-solved natural spline: through `(0, 0)`, `(0.5, 0.75)`,
+    /// `(1, 1)` the one interior second derivative is
+    /// `6 (0.5 - 1.5) / (2 * 1) = -3`, so the interval midpoints are
+    /// `0.375 + 0.25 / 6 * 0.375 * 3 = 0.421875` and
+    /// `0.875 + 0.046875 = 0.921875` — all exact in binary. A clamped
+    /// (zero-end-slope) or Fritsch–Carlson spline gives other values.
+    #[test]
+    fn a_three_point_curve_matches_the_hand_solved_natural_spline() {
+        let c = curve(&[p(0.0, 0.0), p(0.5, 0.75), p(1.0, 1.0)]);
+        assert_eq!(natural_second_derivatives(c.points()), vec![0.0, -3.0, 0.0]);
+        assert_eq!(c.evaluate(0.25), 0.421_875);
+        assert_eq!(c.evaluate(0.75), 0.921_875);
+    }
+
+    /// The natural end condition and `C2` continuity, measured on the
+    /// curve itself rather than read off the solver: the second
+    /// difference vanishes at both ends, and one-sided slopes agree across
+    /// every interior knot (a sign or index slip in the solver breaks
+    /// both).
+    #[test]
+    fn the_spline_is_natural_at_the_ends_and_smooth_across_knots() {
+        let pts = [
+            p(0.0, 0.1),
+            p(0.2, 0.3),
+            p(0.35, 0.32),
+            p(0.6, 0.7),
+            p(1.0, 0.8),
+        ];
+        let c = curve(&pts);
+        let f = |x: f64| f64::from(c.evaluate_unclamped(x as f32));
+        let e = 1.0 / 1024.0;
+        for (x0, dir) in [(0.0, 1.0), (1.0, -1.0)] {
+            let second = (f(x0) - 2.0 * f(x0 + dir * e) + f(x0 + dir * 2.0 * e)) / (e * e);
+            assert!(second.abs() < 0.05, "end {x0}: f'' ~= {second}");
+        }
+        for q in pts.iter().skip(1).take(pts.len() - 2) {
+            let x = f64::from(q.x);
+            let left = (f(x) - f(x - e)) / e;
+            let right = (f(x + e) - f(x)) / e;
+            assert!((left - right).abs() < 0.02, "knot {x}: {left} vs {right}");
+        }
+    }
+
+    /// Photoshop's output level for each input level, flattened
+    /// `(input, output)` pairs — see
+    /// `matches_photoshop_on_curves_from_its_own_merged_composite`.
+    const PS_CURVES3_RED: &[u8] = &[
+        0, 0, 2, 1, 3, 1, 4, 1, 6, 2, 7, 2, 8, 3, 9, 3, 11, 4, 12, 4, 13, 4, 14, 5, 15, 5, 16, 5,
+        17, 6, 18, 6, 19, 7, 20, 7, 22, 8, 23, 8, 24, 8, 25, 9, 27, 10, 28, 10, 32, 12, 35, 13, 39,
+        15, 44, 18, 45, 19, 50, 22, 51, 22, 52, 23, 53, 24, 55, 25, 56, 26, 57, 27, 58, 27, 59, 28,
+        60, 29, 62, 31, 63, 31, 64, 32, 65, 33, 66, 34, 67, 35, 68, 36, 69, 37, 70, 38, 71, 39, 72,
+        40, 73, 41, 74, 42, 75, 43, 76, 44, 77, 45, 78, 46, 79, 47, 80, 48, 81, 50, 82, 51, 83, 52,
+        84, 53, 85, 55, 86, 56, 87, 57, 88, 58, 89, 60, 90, 61, 91, 63, 92, 64, 93, 65, 94, 67, 95,
+        68, 96, 70, 97, 72, 98, 73, 99, 75, 100, 76, 101, 78, 102, 80, 103, 81, 104, 83, 105, 85,
+        106, 87, 107, 88, 108, 90, 109, 92, 110, 94, 111, 96, 112, 97, 113, 99, 114, 101, 115, 103,
+        116, 105, 117, 107, 118, 109, 119, 110, 120, 112, 121, 114, 122, 116, 123, 118, 124, 120,
+        125, 122, 126, 124, 127, 126, 128, 128, 129, 129, 130, 131, 131, 133, 132, 135, 133, 137,
+        134, 139, 135, 141, 136, 143, 137, 145, 138, 146, 139, 148, 140, 150, 141, 152, 142, 154,
+        143, 155, 144, 157, 145, 159, 146, 161, 147, 162, 148, 164, 149, 166, 150, 167, 151, 169,
+        152, 171, 153, 172, 154, 174, 155, 175, 156, 177, 157, 178, 158, 180, 159, 181, 160, 183,
+        161, 184, 162, 185, 163, 187, 164, 188, 165, 189, 166, 191, 167, 192, 168, 193, 169, 195,
+        170, 196, 171, 197, 172, 198, 173, 199, 174, 201, 175, 202, 176, 203, 177, 204, 178, 205,
+        179, 206, 180, 207, 181, 208, 182, 209, 183, 210, 184, 211, 185, 212, 186, 213, 187, 214,
+        188, 215, 189, 216, 190, 217, 191, 218, 192, 219, 193, 219, 194, 220, 195, 221, 196, 222,
+        197, 223, 198, 224, 199, 224, 200, 225, 201, 226, 202, 227, 203, 227, 204, 228, 205, 229,
+        206, 230, 207, 230, 208, 231, 209, 232, 210, 232, 211, 233, 212, 234, 213, 234, 214, 235,
+        215, 235, 216, 236, 217, 237, 218, 237, 219, 238, 220, 238, 221, 239, 222, 239, 223, 240,
+        224, 241, 225, 241, 226, 242, 227, 242, 228, 243, 229, 243, 230, 244, 231, 244, 232, 245,
+        233, 245, 234, 246, 235, 246, 236, 247, 237, 247, 238, 247, 239, 248, 240, 248, 241, 249,
+        242, 249, 243, 250, 244, 250, 245, 251, 246, 251, 247, 252, 248, 252, 250, 253, 252, 254,
+        254, 255, 255, 255,
+    ];
+
+    /// Photoshop's output level for each input level, flattened
+    /// `(input, output)` pairs — see
+    /// `matches_photoshop_on_curves_from_its_own_merged_composite`.
+    const PS_CURVES1_GREEN_THEN_RGB: &[u8] = &[
+        0, 0, 2, 1, 5, 3, 6, 3, 7, 4, 9, 5, 12, 7, 14, 8, 16, 9, 19, 12, 20, 12, 22, 14, 24, 15,
+        25, 16, 26, 17, 27, 18, 28, 19, 29, 20, 30, 21, 31, 21, 32, 22, 33, 23, 34, 25, 35, 26, 36,
+        27, 37, 28, 38, 30, 39, 31, 40, 32, 41, 33, 42, 34, 43, 37, 44, 38, 46, 41, 47, 43, 48, 44,
+        49, 46, 50, 47, 51, 49, 52, 50, 53, 52, 54, 54, 55, 57, 56, 59, 57, 60, 58, 62, 59, 64, 60,
+        66, 61, 68, 62, 69, 63, 71, 64, 73, 65, 75, 66, 77, 67, 79, 68, 80, 69, 82, 70, 84, 71, 86,
+        72, 88, 73, 90, 74, 92, 75, 94, 76, 96, 77, 98, 78, 99, 79, 101, 80, 103, 81, 105, 82, 107,
+        83, 109, 84, 111, 85, 113, 86, 114, 87, 116, 88, 118, 89, 120, 90, 122, 91, 123, 92, 125,
+        93, 127, 94, 128, 95, 130, 96, 132, 97, 134, 98, 134, 99, 135, 100, 137, 101, 138, 102,
+        140, 103, 142, 104, 143, 105, 145, 106, 146, 107, 148, 108, 149, 109, 151, 110, 152, 111,
+        154, 112, 155, 113, 155, 114, 157, 115, 158, 116, 160, 117, 161, 118, 162, 119, 164, 120,
+        165, 121, 166, 122, 168, 123, 169, 124, 169, 125, 170, 126, 172, 127, 173, 128, 174, 129,
+        176, 130, 177, 131, 178, 132, 179, 133, 180, 134, 182, 135, 182, 136, 183, 137, 184, 138,
+        185, 139, 186, 140, 187, 141, 189, 142, 190, 143, 191, 144, 192, 145, 192, 146, 193, 147,
+        194, 148, 195, 149, 196, 150, 197, 151, 198, 152, 199, 153, 200, 154, 201, 155, 201, 156,
+        202, 157, 203, 158, 204, 159, 205, 160, 206, 161, 207, 162, 208, 163, 208, 164, 209, 165,
+        209, 166, 210, 167, 211, 168, 212, 169, 213, 170, 213, 171, 214, 172, 215, 173, 216, 174,
+        217, 175, 217, 176, 218, 177, 218, 178, 219, 179, 220, 180, 220, 181, 221, 182, 222, 183,
+        223, 184, 223, 185, 224, 186, 225, 187, 225, 188, 226, 189, 227, 190, 227, 191, 228, 192,
+        228, 193, 228, 194, 229, 195, 230, 196, 230, 197, 231, 198, 231, 199, 232, 200, 233, 201,
+        233, 202, 234, 203, 234, 205, 235, 207, 236, 208, 237, 210, 238, 211, 238, 212, 239, 214,
+        240, 217, 241, 218, 241, 219, 242, 221, 243, 222, 243, 224, 244, 226, 245, 227, 245, 229,
+        246, 230, 246, 231, 247, 234, 248, 236, 249, 239, 250, 243, 251, 246, 252, 248, 253, 250,
+        253, 251, 254, 252, 254, 253, 254, 255, 255,
+    ];
+
+    /// Photoshop's output level for each input level, flattened
+    /// `(input, output)` pairs — see
+    /// `matches_photoshop_on_curves_from_its_own_merged_composite`.
+    const PS_CURVES1_BLUE_THEN_RGB: &[u8] = &[
+        0, 7, 1, 8, 3, 10, 7, 13, 8, 14, 9, 14, 10, 15, 12, 17, 16, 21, 18, 23, 19, 24, 20, 26, 21,
+        27, 22, 28, 26, 34, 27, 36, 29, 38, 30, 40, 31, 43, 32, 44, 33, 46, 34, 47, 35, 49, 36, 50,
+        37, 52, 38, 55, 39, 57, 40, 59, 41, 60, 42, 62, 43, 64, 44, 66, 46, 69, 47, 71, 48, 73, 49,
+        77, 50, 79, 51, 80, 52, 82, 53, 84, 54, 86, 55, 88, 56, 90, 57, 92, 58, 94, 59, 96, 60, 98,
+        61, 98, 62, 99, 63, 101, 64, 103, 65, 105, 66, 107, 67, 109, 68, 111, 69, 113, 70, 114, 71,
+        114, 72, 116, 73, 118, 74, 120, 75, 122, 76, 122, 77, 123, 78, 125, 79, 127, 80, 127, 81,
+        128, 82, 130, 83, 132, 84, 132, 85, 134, 86, 135, 87, 135, 88, 137, 89, 138, 90, 138, 91,
+        140, 92, 142, 93, 142, 94, 143, 95, 145, 96, 145, 97, 146, 98, 148, 99, 148, 100, 149, 101,
+        151, 102, 151, 103, 152, 104, 152, 105, 154, 106, 155, 107, 155, 108, 157, 109, 158, 110,
+        158, 111, 160, 112, 160, 113, 161, 114, 162, 115, 162, 116, 164, 117, 165, 118, 165, 119,
+        166, 120, 168, 121, 168, 122, 169, 123, 170, 124, 170, 125, 172, 126, 173, 127, 173, 128,
+        174, 129, 176, 130, 177, 131, 177, 132, 178, 133, 179, 134, 180, 135, 180, 136, 182, 137,
+        183, 138, 184, 139, 184, 140, 185, 141, 186, 142, 187, 143, 189, 144, 189, 145, 190, 146,
+        191, 147, 192, 148, 193, 149, 193, 150, 194, 151, 195, 152, 196, 153, 197, 154, 198, 155,
+        199, 156, 199, 157, 200, 158, 201, 159, 202, 160, 203, 161, 204, 162, 205, 163, 206, 164,
+        206, 165, 207, 166, 208, 167, 208, 168, 209, 169, 210, 170, 211, 171, 212, 172, 213, 173,
+        213, 174, 214, 175, 215, 176, 216, 177, 216, 178, 217, 179, 217, 180, 218, 181, 219, 182,
+        220, 183, 220, 184, 221, 185, 222, 186, 223, 187, 223, 188, 224, 189, 225, 190, 225, 191,
+        226, 192, 227, 193, 227, 194, 228, 195, 228, 196, 229, 197, 230, 198, 230, 199, 231, 200,
+        231, 201, 232, 202, 233, 203, 233, 204, 234, 205, 234, 206, 235, 207, 235, 208, 236, 209,
+        237, 210, 237, 211, 238, 212, 238, 213, 239, 215, 240, 216, 240, 218, 241, 220, 242, 221,
+        242, 222, 243, 226, 245, 227, 245, 228, 245, 229, 246, 233, 247, 235, 248, 237, 249, 238,
+        249, 239, 250, 240, 250, 242, 251, 243, 251, 246, 252, 247, 252, 248, 253, 249, 253, 252,
+        254, 255, 255,
+    ];
+
+    /// **Photoshop's own rendering as the oracle.** Each list is flattened
+    /// `(input level, Photoshop's output level)` pairs read from the
+    /// merged composite Photoshop stored in the corpus fixture
+    /// `corpora/psd/reference/psd-tools-fixtures/adjustments/curves_rgb.psd`
+    /// (read with psd-tools 1.17.4, 0.157.0): for one Curves layer, every
+    /// pixel where that layer's mask is fully on and every other Curves
+    /// layer's fully off, the layers below composited by psd-tools with
+    /// all Curves layers hidden, grouped by input level and kept only
+    /// where at least 90% of at least three pixels agree. The point lists
+    /// are the layer's own stored points. Red of "Curves 3" is a channel
+    /// curve alone; green and blue of "Curves 1" go through their channel
+    /// curve and then the RGB curve, rounded to an 8-bit value between the
+    /// two — that rounding models the 8-bit *file* only; Aurora's own
+    /// `aurora_filters::curves` path (same order) has no 8-bit step. This
+    /// checks `ToneCurve` alone, not `CurvesLut` end to end. Reproduce the
+    /// pairs with `scripts/oracles/psd_curves_oracle.py`. Every level
+    /// must be within one 8-bit level, and at least 98% exact;
+    /// Fritsch–Carlson misses these by up to 10 levels.
+    #[test]
+    fn matches_photoshop_on_curves_from_its_own_merged_composite() {
+        let pts = |raw: &[(u8, u8)]| -> ToneCurve {
+            let points: Vec<CurvePoint> = raw
+                .iter()
+                .map(|&(x, y)| p(f32::from(x) / 255.0, f32::from(y) / 255.0))
+                .collect();
+            curve(&points)
+        };
+        let level = |c: &ToneCurve, v: f32| (c.evaluate(v / 255.0) * 255.0).round();
+        let red3 = pts(&[(0, 0), (96, 70), (151, 169), (255, 255)]);
+        let rgb1 = pts(&[(0, 0), (49, 37), (95, 118), (197, 232), (255, 255)]);
+        let green1 = pts(&[(0, 0), (65, 72), (213, 211), (255, 255)]);
+        let blue1 = pts(&[(0, 15), (73, 95), (122, 128), (255, 255)]);
+        let cases: [(&str, &[u8], Option<&ToneCurve>, &ToneCurve); 3] = [
+            ("Curves 3 red", PS_CURVES3_RED, None, &red3),
+            (
+                "Curves 1 green, then RGB",
+                PS_CURVES1_GREEN_THEN_RGB,
+                Some(&rgb1),
+                &green1,
+            ),
+            (
+                "Curves 1 blue, then RGB",
+                PS_CURVES1_BLUE_THEN_RGB,
+                Some(&rgb1),
+                &blue1,
+            ),
+        ];
+        for (name, pairs, composite, channel) in cases {
+            let n = pairs.len() / 2;
+            assert!(n >= 200, "{name}: {n} levels");
+            let mut exact = 0_usize;
+            for pair in pairs.chunks_exact(2) {
+                let [input, want] = pair else { unreachable!() };
+                let mut out = level(channel, f32::from(*input));
+                if let Some(rgb) = composite {
+                    out = level(rgb, out);
+                }
+                let want = f32::from(*want);
+                assert!(
+                    (out - want).abs() <= 1.0,
+                    "{name}: {input} -> {out}, Photoshop {want}"
+                );
+                exact += usize::from(out == want);
+            }
+            assert!(exact * 100 >= n * 98, "{name}: only {exact} of {n} exact");
+        }
+    }
+
+    /// A natural spline overshoots monotone data between uneven points —
+    /// it is *not* monotone, by design (Photoshop's behaviour) — and
+    /// `evaluate` clamps what leaves `[0, 1]`. Replaces 0.155.0's
+    /// `monotone_data_gives_a_monotone_curve` and
+    /// `the_unclamped_spline_never_overshoots_its_knots`, whose claims
+    /// were properties of the Fritsch–Carlson spline this replaced.
+    #[test]
+    fn an_overshoot_leaves_the_unit_range_and_is_clamped() {
+        let c = curve(&[p(0.0, 0.0), p(0.45, 0.0), p(0.5, 1.0), p(1.0, 1.0)]);
+        let (mut below, mut above) = (false, false);
+        for i in 0..=4096_u32 {
+            let x = i as f32 / 4096.0;
+            let raw = c.evaluate_unclamped(x);
+            assert!(raw.is_finite(), "{x}");
+            below |= raw < -0.01;
+            above |= raw > 1.01;
+            assert_eq!(c.evaluate(x), raw.clamp(0.0, 1.0), "{x}");
+        }
+        assert!(below && above, "the spline must overshoot both ways here");
+        assert_eq!(c.evaluate(0.6), 1.0);
+        assert!(c.evaluate_unclamped(0.6) > 1.0);
+    }
+
+    /// A plateau between two rises is no longer exactly flat (it was under
+    /// Fritsch–Carlson, 0.155.0's `a_plateau_is_exactly_flat`): the
+    /// natural spline rings through it, as Photoshop's does.
+    #[test]
+    fn a_plateau_between_rises_rings_rather_than_staying_flat() {
+        let c = curve(&[p(0.0, 0.0), p(0.3, 0.4), p(0.7, 0.4), p(1.0, 1.0)]);
+        assert_eq!(c.evaluate(0.3), 0.4);
+        assert_eq!(c.evaluate(0.7), 0.4);
+        let dip = (1..400_u32)
+            .map(|i| c.evaluate(0.3 + 0.4 * i as f32 / 400.0))
+            .fold(f32::INFINITY, f32::min);
         assert!(
-            samples
-                .windows(2)
-                .all(|w| matches!(w, [a, b] if *b >= *a - 1e-7))
-        );
-        let samples = lut(&decreasing, 4097);
-        assert!(
-            samples
-                .windows(2)
-                .all(|w| matches!(w, [a, b] if *b <= *a + 1e-7))
+            dip < 0.39,
+            "expected the spline to dip below the plateau: {dip}"
         );
     }
 
+    /// The most adversarial curves the invariants allow — a full-range
+    /// zigzag at minimum separation, a one-step spike, steep-then-flat —
+    /// stay finite unclamped, inside `[0, 1]` clamped, and still exact at
+    /// their knots. Replaces 0.155.0's
+    /// `adversarial_curves_stay_within_each_intervals_own_knots`: a
+    /// natural spline does not stay within an interval's own knots.
     #[test]
-    fn adversarial_curves_stay_within_each_intervals_own_knots() {
+    fn adversarial_curves_stay_finite_and_inside_the_unit_range() {
         let sep = MIN_POINT_SEPARATION;
         let sets = vec![
             zigzag(MAX_POINTS, sep),
-            zigzag(MAX_POINTS, 1.0 / 16.0),
+            zigzag(MAX_POINTS, 1.0 / 19.0),
             zigzag(3, 0.5),
-            // Plateaus between steep rises.
-            vec![
-                p(0.0, 0.0),
-                p(0.2, 0.5),
-                p(0.4, 0.5),
-                p(0.41, 1.0),
-                p(0.8, 1.0),
-                p(1.0, 1.0),
-            ],
-            // A one-point spike at minimum separation either side.
             vec![
                 p(0.0, 0.0),
                 p(0.5 - sep, 0.0),
@@ -731,68 +954,18 @@ mod tests {
                 p(0.5 + sep, 0.0),
                 p(1.0, 0.0),
             ],
-            // Steep then shallow — the case the radius-3 rescale exists for.
             vec![p(0.0, 0.0), p(sep, 0.9), p(1.0 - sep, 0.95), p(1.0, 1.0)],
-            vec![p(0.0, 0.0), p(0.9, 0.01), p(0.9 + sep, 0.99), p(1.0, 1.0)],
-        ];
-        for set in &sets {
-            assert_bounded_per_interval(&curve(set), 256);
-        }
-    }
-
-    /// The per-interval bound must hold for the *unclamped* spline too,
-    /// or `evaluate`'s final clamp would be hiding an overshoot.
-    #[test]
-    fn the_unclamped_spline_never_overshoots_its_knots() {
-        let sets = [
-            vec![
-                p(0.0, 0.0),
-                p(0.9, 0.01),
-                p(0.9 + MIN_POINT_SEPARATION, 0.99),
-                p(1.0, 1.0),
-            ],
-            vec![
-                p(0.0, 0.2),
-                p(0.1, 0.3),
-                p(0.11, 0.9),
-                p(0.5, 0.95),
-                p(1.0, 0.96),
-            ],
-            zigzag(MAX_POINTS, MIN_POINT_SEPARATION),
         ];
         for set in &sets {
             let c = curve(set);
-            for w in set.windows(2) {
-                let [a, b] = w else { unreachable!() };
-                let (lo, hi) = (f64::from(a.y.min(b.y)), f64::from(a.y.max(b.y)));
-                for s in 0..=512_u32 {
-                    let x =
-                        f64::from(a.x) + f64::from(s) / 512.0 * (f64::from(b.x) - f64::from(a.x));
-                    let y = raw(&c, x);
-                    assert!(y >= lo - 1e-9 && y <= hi + 1e-9, "{x} -> {y}");
-                }
+            for i in 0..=8192_u32 {
+                let x = i as f32 / 8192.0;
+                assert!(c.evaluate_unclamped(x).is_finite(), "{x} for {set:?}");
+                assert!((0.0..=1.0).contains(&c.evaluate(x)), "{x} for {set:?}");
             }
-        }
-    }
-
-    #[test]
-    fn a_local_extremum_is_flat_and_not_overshot() {
-        // Signs differ either side of the middle point: its tangent is 0,
-        // so the curve peaks exactly at the knot.
-        let c = curve(&[p(0.0, 0.0), p(0.5, 0.8), p(1.0, 0.0)]);
-        for i in 0..=1000_u32 {
-            let x = i as f32 / 1000.0;
-            assert!(c.evaluate(x) <= 0.8, "{x}");
-        }
-        assert_eq!(tangents(c.points()).get(1), Some(&0.0));
-    }
-
-    #[test]
-    fn a_plateau_is_exactly_flat() {
-        let c = curve(&[p(0.0, 0.0), p(0.3, 0.4), p(0.7, 0.4), p(1.0, 1.0)]);
-        for i in 0..=400_u32 {
-            let x = 0.3 + 0.4 * i as f32 / 400.0;
-            assert!((c.evaluate(x) - 0.4).abs() <= 1e-7, "{x}");
+            for q in set {
+                assert_eq!(c.evaluate(q.x), q.y, "knot {q:?}");
+            }
         }
     }
 
@@ -872,16 +1045,25 @@ mod tests {
         assert_eq!(c.add_point(0.5 + MIN_POINT_SEPARATION).map(|_| ()), Ok(()));
     }
 
+    /// Photoshop's limit, literally: 19 points are a curve and 20 are
+    /// not, whether constructed or inserted (16 until 0.157.0; replaces
+    /// `a_seventeenth_point_is_refused`).
     #[test]
-    fn a_seventeenth_point_is_refused() {
+    fn nineteen_points_are_accepted_and_a_twentieth_is_refused() {
+        assert_eq!(MAX_POINTS, 19);
+        let even = |n: usize| -> Vec<CurvePoint> {
+            (0..n).map(|i| p(i as f32 / (n - 1) as f32, 0.5)).collect()
+        };
+        assert!(ToneCurve::new(&even(19)).is_ok());
+        assert_eq!(
+            ToneCurve::new(&even(20)),
+            Err(ToneCurveError::TooManyPoints)
+        );
         let mut c = ToneCurve::identity();
-        for i in 1..(MAX_POINTS - 1) {
-            assert!(
-                c.add_point(i as f32 / (MAX_POINTS - 1) as f32).is_ok(),
-                "{i}"
-            );
+        for i in 1..18_u16 {
+            assert!(c.add_point(f32::from(i) / 18.0).is_ok(), "{i}");
         }
-        assert_eq!(c.points().len(), MAX_POINTS);
+        assert_eq!(c.points().len(), 19);
         let snapshot = c.clone();
         assert_eq!(c.add_point(0.03), Err(ToneCurveError::TooManyPoints));
         assert_eq!(c, snapshot);
