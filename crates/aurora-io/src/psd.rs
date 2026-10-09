@@ -2907,17 +2907,36 @@ pub fn write_mask_pixels(
         mask.offset,
         mask.width,
         mask.height,
-        |column, row| {
-            mask.coverage
-                .get(
-                    (row as usize)
-                        .saturating_mul(width)
-                        .saturating_add(column as usize),
-                )
-                .map_or(1.0, |v| v.to_f32())
-        },
+        |column, row| mask_coverage_at(mask, width, column, row),
     )?;
     Ok(())
+}
+
+/// [`write_mask_pixels`]'s tiles, built and encoded without a store
+/// (0.153.0) for `aurora_tile::TileStore::insert_encoded` on the layer's
+/// mask surface — the caller resolves that surface
+/// (`LayerTree::mask_surface_id`) after its sweep, exactly where
+/// [`write_mask_pixels`] resolves it. Bit-identical to what
+/// [`write_mask_pixels`] leaves on an empty mask surface: both run
+/// `aurora_doc`'s one per-tile fill with the same coverage lookup.
+#[must_use]
+pub fn encode_mask_pixels(mask: &PsdMaskPixels) -> crate::EncodedTiles {
+    let width = mask.width as usize;
+    aurora_doc::encode_mask_coverage_region(mask.offset, mask.width, mask.height, |column, row| {
+        mask_coverage_at(mask, width, column, row)
+    })
+}
+
+/// `mask`'s coverage at region-local `(column, row)`; `1.0` (fail open)
+/// past the end of a short buffer.
+fn mask_coverage_at(mask: &PsdMaskPixels, width: usize, column: u32, row: u32) -> f32 {
+    mask.coverage
+        .get(
+            (row as usize)
+                .saturating_mul(width)
+                .saturating_add(column as usize),
+        )
+        .map_or(1.0, |v| v.to_f32())
 }
 
 /// [`decode`] then [`build_document`].

@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId, TileStore};
+use aurora_tile::{CHANNELS, EncodedTile, SurfaceId, TILE, Tile, TileId, TileStore};
 
 use crate::error::IoError;
 use crate::image::Image;
@@ -84,51 +84,136 @@ pub fn write_into_store_at(
     // Exclusive surface-local right/bottom edges.
     let right = dx.checked_add(width).ok_or_else(out_of_range)?;
     let bottom = dy.checked_add(height).ok_or_else(out_of_range)?;
-    let samples = image.samples();
-    let row_len = width as usize;
-
     for ty in (dy / TILE)..bottom.div_ceil(TILE) {
         for tx in (dx / TILE)..right.div_ceil(TILE) {
-            // The tile's own surface-local extent, clipped to the image.
-            let tile_x0 = tx * TILE;
-            let tile_y0 = ty * TILE;
-            let x0 = tile_x0.max(dx);
-            let y0 = tile_y0.max(dy);
-            let x1 = tile_x0.saturating_add(TILE).min(right);
-            let y1 = tile_y0.saturating_add(TILE).min(bottom);
-            if x0 >= x1 || y0 >= y1 {
+            if placed_overlap(tx, ty, dx, dy, right, bottom).is_none() {
                 continue;
             }
-            let w = (x1 - x0) as usize;
             let tile = store.get_mut(surface, TileId { x: tx, y: ty })?;
-            let texels = tile.texels_mut();
-
-            for sy in y0..y1 {
-                // Image-local source row/column, tile-local destination.
-                let src_row = (sy - dy) as usize;
-                let src_col = (x0 - dx) as usize;
-                let src_start = (src_row * row_len + src_col) * CHANNELS;
-                let src_end = src_start + w * CHANNELS;
-                let dst_start =
-                    ((sy - tile_y0) as usize * TILE as usize + (x0 - tile_x0) as usize) * CHANNELS;
-                let dst_end = dst_start + w * CHANNELS;
-                if let (Some(src), Some(dst)) = (
-                    samples.get(src_start..src_end),
-                    texels.get_mut(dst_start..dst_end),
-                ) {
-                    dst.copy_from_slice(src);
-                }
+            if let Some(dirty) = fill_placed_tile(image, dx, dy, tx, ty, tile.texels_mut()) {
+                tile.mark_dirty(dirty);
             }
-
-            tile.mark_dirty(aurora_core::Rect {
-                x: i64::from(x0 - tile_x0),
-                y: i64::from(y0 - tile_y0),
-                width: x1 - x0,
-                height: y1 - y0,
-            });
         }
     }
     Ok(())
+}
+
+/// One surface's tiles, each encoded on the calling thread and ready for
+/// `aurora_tile::TileStore::insert_encoded` — what
+/// [`encode_image_tiles_at`] and `aurora_doc::encode_mask_coverage_region`
+/// return (0.153.0).
+pub type EncodedTiles = Vec<(TileId, EncodedTile)>;
+
+/// [`write_into_store_at`]'s tiles, built and encoded **without a store**
+/// (0.153.0), so the per-texel work can run on a background thread and
+/// the UI thread only inserts them
+/// (`aurora_tile::TileStore::insert_encoded`).
+///
+/// Bit-identical to what [`write_into_store_at`] leaves in a store whose
+/// `surface` was empty beforehand — every opened document's case, since
+/// the open sweeps the outgoing document first: the same tiles (every one
+/// the placed image overlaps, a fully transparent one included — no
+/// blank-tile elision, exactly as `write_into_store_at` creates every
+/// overlapped tile), each starting from a blank tile and filled by the
+/// same row copy (`fill_placed_tile`, shared by both). Returned in
+/// row-major tile order.
+///
+/// # Errors
+///
+/// [`IoError::ImagePlacementOutOfRange`] exactly when
+/// [`write_into_store_at`] returns it; nothing is encoded then.
+pub fn encode_image_tiles_at(image: &Image, dx: u32, dy: u32) -> Result<EncodedTiles, IoError> {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    let out_of_range = || IoError::ImagePlacementOutOfRange {
+        x: dx,
+        y: dy,
+        width,
+        height,
+    };
+    let right = dx.checked_add(width).ok_or_else(out_of_range)?;
+    let bottom = dy.checked_add(height).ok_or_else(out_of_range)?;
+    let mut tiles = Vec::new();
+    for ty in (dy / TILE)..bottom.div_ceil(TILE) {
+        for tx in (dx / TILE)..right.div_ceil(TILE) {
+            if placed_overlap(tx, ty, dx, dy, right, bottom).is_none() {
+                continue;
+            }
+            let mut tile = Tile::blank();
+            let _dirty = fill_placed_tile(image, dx, dy, tx, ty, tile.texels_mut());
+            tiles.push((TileId { x: tx, y: ty }, EncodedTile::of(&tile)));
+        }
+    }
+    Ok(tiles)
+}
+
+/// Tile `(tx, ty)`'s overlap with an image placed at `(dx, dy)` whose
+/// exclusive far edges are `right`/`bottom`, as surface-local
+/// `(x0, y0, x1, y1)`; `None` when they do not overlap.
+fn placed_overlap(
+    tx: u32,
+    ty: u32,
+    dx: u32,
+    dy: u32,
+    right: u32,
+    bottom: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let tile_x0 = tx * TILE;
+    let tile_y0 = ty * TILE;
+    let x0 = tile_x0.max(dx);
+    let y0 = tile_y0.max(dy);
+    let x1 = tile_x0.saturating_add(TILE).min(right);
+    let y1 = tile_y0.saturating_add(TILE).min(bottom);
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+/// Copies the part of `image` (placed at surface-local `(dx, dy)`) that
+/// tile `(tx, ty)` overlaps into that tile's `texels`, row by row, and
+/// returns the tile-local rectangle written — the one body both
+/// [`write_into_store_at`] and [`encode_image_tiles_at`] run, so the two
+/// cannot drift apart. `None` (nothing written) when they do not overlap
+/// or the placement overflows.
+fn fill_placed_tile(
+    image: &Image,
+    dx: u32,
+    dy: u32,
+    tx: u32,
+    ty: u32,
+    texels: &mut [half::f16],
+) -> Option<aurora_core::Rect> {
+    let right = dx.checked_add(image.width())?;
+    let bottom = dy.checked_add(image.height())?;
+    let (x0, y0, x1, y1) = placed_overlap(tx, ty, dx, dy, right, bottom)?;
+    let tile_x0 = tx * TILE;
+    let tile_y0 = ty * TILE;
+    let samples = image.samples();
+    let row_len = image.width() as usize;
+    let w = (x1 - x0) as usize;
+    for sy in y0..y1 {
+        // Image-local source row/column, tile-local destination.
+        let src_row = (sy - dy) as usize;
+        let src_col = (x0 - dx) as usize;
+        let src_start = (src_row * row_len + src_col) * CHANNELS;
+        let src_end = src_start + w * CHANNELS;
+        let dst_start =
+            ((sy - tile_y0) as usize * TILE as usize + (x0 - tile_x0) as usize) * CHANNELS;
+        let dst_end = dst_start + w * CHANNELS;
+        if let (Some(src), Some(dst)) = (
+            samples.get(src_start..src_end),
+            texels.get_mut(dst_start..dst_end),
+        ) {
+            dst.copy_from_slice(src);
+        }
+    }
+    Some(aurora_core::Rect {
+        x: i64::from(x0 - tile_x0),
+        y: i64::from(y0 - tile_y0),
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 /// Decodes `bytes` using whichever format `path`'s own extension names

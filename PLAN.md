@@ -26,7 +26,39 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.152.0): the autosave is written off the UI
+**Latest (2026-10-09, 0.153.0): an open's tile writes are prepared off
+the UI thread.** After 0.152.0 the install's remaining ~0.72 s (dev) was
+writing every opened layer's and mask's pixels into the live
+`TileStore`, texel by texel — mostly the `codec::encode` of each tile
+the store evicted as the write overran its budget. Now the decode
+thread also builds and encodes those tiles (new
+`crates/aurora-app/src/prepared_pixels.rs`; `aurora_io::encode_image_tiles_at`
+and `aurora_io::encode_psd_mask`, which share their per-tile fill with
+`write_into_store_at` and `aurora_doc::write_mask_coverage_region`, so
+the tiles are bit-identical, fully transparent overlapped ones
+included) into `aurora_tile::EncodedTile`s — a type only the store's own
+encoder can construct — and the UI thread, after the unchanged sweep,
+only calls the new `TileStore::insert_encoded` per tile: O(1)
+bookkeeping that records the tile exactly as an eviction would
+(pending + scratch path + owed upload, handed to the existing writer
+thread), so nothing becomes resident and the resident budget is never
+touched. `.aur` opens keep the old live read (untrusted tile entries
+go through `codec::decode`). **Measured** (RTX 3090 box, same run
+compares old and new): flat-colour 4096² four-layer PSD, UI-thread
+install 1.3–1.5 ms dev / 1.2 ms release, against tile writes of
+662–693 ms dev / 320 ms release; the decode thread pays 658–689 ms dev
+/ 307 ms release more. Noisy (incompressible) layers: inserts
+0.7–0.9 ms dev / 0.6–1.3 ms release against 561–700 ms dev /
+280–349 ms release of writes. Design (A) of the two the task named;
+(B) (chunking across frames) was not built. The candidate's full gate
+(`AURORA_REQUIRE_GPU=1`) passed 2,889, 0 failed, 0 skipped; the review
+revision (judge REVISE 0.899) kept inserted tiles' failed scratch writes
+out of the failed-write cap, fixed a pre-existing `make_room` tombstone
+leak, and added 2 tests: test count 2,891. **Needs a human:
+open a large PSD on macOS; the end-of-open pause should be near zero.**
+Details: "Next action", addendum 0.153.0.
+
+**Previously (2026-10-09, 0.152.0): the autosave is written off the UI
 thread.** 0.151.0's install spent ~1.9 s of its ~2.6 s writing the
 crash-recovery autosave from the live tile store. Now every autosave
 trigger — a fresh session's startup document (`startup_document`
@@ -30595,6 +30627,251 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.153.0) — an open's tile writes are prepared
+off the UI thread.** Done as 0.153.0 (`crates/aurora-app/src/prepared_pixels.rs`
+(new: `PreparedImage`, `PreparedPsd`, `PreparedLayer`, `PreparedMask`,
+`insert_prepared`), `aurora-app`'s `lib.rs` (`decode_chosen_file`,
+`replace_document_pixels_prepared`, `install_opened_document`,
+`open_image_file`, `open_psd_file`, `document_from_size`; the old
+`replace_document_pixels` is now a test-only wrapper over the new path,
+and `replace_document_pixels_synchronously` is the test-only verbatim
+old path the measurements compare against), `background_open.rs`
+(`DecodedFile::Image`/`Psd` carry the prepared forms), `aurora-io`'s
+`import.rs` (`encode_image_tiles_at`, `EncodedTiles`, shared
+`fill_placed_tile`/`placed_overlap`) and `psd.rs` (`encode_mask_pixels`
+re-exported as `encode_psd_mask`), `aurora-doc`'s `mask.rs`
+(`encode_mask_coverage_region`, shared `fill_mask_tile`), `aurora-tile`'s
+`store.rs` (`EncodedTile`, `TileStore::insert_encoded`)). This closes
+0.152.0's "chunk the tile and mask writes across frames" follow-on, but
+with **design (A), pre-encoded insertion**, not chunking.
+
+*Why (A), measured.* Of the two designs, (A) moves all per-texel work
+(the fill and the `codec::encode` that the old write paid on every
+eviction) to the decode thread and leaves the UI thread O(1) per tile;
+(B) would still have paid the same ~0.7 s on the UI thread, only spread
+over frames, while needing a half-installed document state that edits,
+saves, autosave, undo and a second open would each have to respect.
+(A) measured at ~0.1–0.2 % of the old cost (below), so (B) was not
+built. The bookkeeping `insert_encoded` does is exactly what `make_room`
+does for an evicted tile — a `paged_out` path, a `pending` entry with a
+fresh write generation, an `evicted_dirty` mark (the GPU upload is
+owed) and a job for the existing background writer — so page-in,
+eviction, `snapshot_tile`, `snapshot_len_bound`, `forget_tile` and
+`forget_surfaces` all treat an inserted tile as an evicted one with no
+new code. Invariant §7.3.1: an inserted tile is never resident, so the
+resident budget is untouched; the encoded bytes sit in `pending` only
+until the writer lands them (measured 187–225 ms for 512 MiB of noisy
+tiles), and each layer's decoded image is dropped on the decode thread
+as soon as its tiles exist. Peak memory is **higher**, not lower (review
+J2, measured below): the decode thread peaks at about one layer's
+encoded size above the decoded document, and after the install the
+whole encoded document sits in `pending` until the writer lands it
+(~0.2 s per 512 MiB on this box's disk; indefinitely on a stalled one,
+see disclosure 10). Every PNG/JPEG/TIFF/PSD open now also writes the
+whole document to the scratch disk, even one that would fit in the
+resident budget (review J6); before, the last `budget` tiles of an open
+stayed resident and were never written unless evicted.
+
+*Measured* (RTX 3090 box; `measure_installing_a_large_psd_on_the_ui_thread`
+now also runs the old write path into a second store in the same run;
+new `measure_installing_noisy_layers_on_the_ui_thread`, 0.152.0's noisy
+approach: four 4096² layers of random `f16` in [0, 1), 512 MiB encoded;
+both `#[ignore]`d):
+
+| | dev before (old path, same run) | dev after | release before | release after |
+|---|---|---|---|---|
+| flat PSD: tile writes → inserts (UI) | 662–693 ms | 0.8–0.9 ms | 320 ms | 0.7 ms |
+| flat PSD: UI-thread install total | (0.73 s in 0.152.0) | 1.3–1.5 ms | (0.35 s in 0.152.0) | 1.2 ms |
+| flat PSD: extra on the decode thread | — | 658–689 ms | — | 307 ms |
+| noisy, 16-tile store: writes → inserts (UI) | 693–700 ms | 0.74–0.85 ms | 349 ms | 1.26 ms |
+| noisy, 256-tile store: writes → inserts (UI) | 561–641 ms | 0.68–0.72 ms | 280 ms | 0.61 ms |
+| noisy: encode on the decode thread | — | 726–805 ms | — | 307–513 ms |
+| noisy: first read of every tile (first-composite proxy) | 1,003–1,058 ms | 855–1,058 ms | 525–551 ms | 461–522 ms |
+
+The flat-PSD autosave snapshot fell from 7.3–7.6 ms to 0.4–0.5 ms: right
+after the install every tile is still a shared `pending` buffer, so the
+snapshot copies nothing. Two runs dev, one release.
+
+*Rules* (module docs of `prepared_pixels`, `TileStore::insert_encoded`).
+Tiles are bit-identical to the old writers' on an empty surface, which
+is what the install always writes onto (the sweep comes first and is
+unchanged): the encoders share their per-tile body with
+`write_into_store_at` / `write_mask_coverage_region`, start from a blank
+tile, and produce exactly the tiles the writers touched — every tile a
+placed image or mask region overlaps, fully transparent ones included,
+as before (no blank-tile elision; the autosave still leaves blank tiles
+out, unchanged). The 0.144.0 C-01 placement check and origin semantics
+come from the same code (`ImagePlacementOutOfRange` is computed before
+anything is encoded and counts as an unwritten layer, as before). Masks
+are inserted after every layer's pixels and after the sweep (0.147.0
+M9). Alpha/premultiplication: samples are copied verbatim, as before.
+`.aur` keeps the old path (`read_prechecked_aur` → `read_aur`, which
+decodes every untrusted tile entry). AC-4 is enforced by type:
+`EncodedTile` has one constructor, `EncodedTile::of(&Tile)`, and no way
+to wrap foreign bytes. An insert over a key a `forget_tile` tombstoned
+while its write was in flight clears the tombstone (the new generation
+already supersedes the old result); otherwise this write's own result
+would consume it and delete the scratch file it just wrote.
+
+*Tests* (9 new). `aurora-tile`'s `store::insert_encoded_tests` (5):
+inserted tiles are never resident, are written to scratch (files hold
+the inserted bytes), page back in exactly from both `pending` and the
+scratch disk, and the budget holds while reading; an inserted tile
+reads from `pending` before its write lands, its snapshot shares the
+inserted bytes, its budget estimate counts them, and it owes a
+whole-tile upload; `forget_surface` frees inserted tiles and deletes
+their files; inserting over a tile forgotten mid-write keeps the new
+file; an insert replaces a resident tile whole. `aurora-app`'s
+`prepared_pixels::tests` (4): the prepared install is bit-identical to
+the old writers (3 layers — full-canvas noise with per-texel alpha and
+fully transparent texels, a 300×200 layer cropped at (130, 270) across
+tile seams, a fully transparent layer — and 2 masks with a `NaN`, an
+out-of-range and a short-buffer coverage; outgoing document with
+aliased ids, masks and pending writes; same tile set, same texels,
+before and after the writer drains; nothing resident after the
+install); refused placements are counted as before; a background
+autosave right after the install (tiles still pending) and after the
+store's flush both recover the document; an install while the previous
+autosave is writing (first file recovers the first document, final file
+the second, live store equal to the old path). Existing open/install
+tests now exercise the new path (`replace_document_pixels` wraps it);
+`a_background_{psd,image}_open_…` compare the encoded tiles with the
+synchronous decode's. Test count after the candidate: **2,889** (2,880 + 9; 3 ignored in
+`aurora-app` incl. the new measurement). Runs:
+`cargo test -p aurora-tile -p aurora-doc -p aurora-io` (80 + 260 + 203
+passed, 1 ignored) and `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app`
+(655 passed, 3 ignored); clippy `-D warnings` on the four crates with
+`--all-targets --all-features` and `cargo fmt --all --check` clean.
+Then the candidate's full gate (`AURORA_REQUIRE_GPU=1`): **2,889 passed,
+0 failed, 49 ignored, 0 skipped**; clippy, strict rustdoc and deny
+clean.
+
+*Mutations* (each file backed up to the session scratchpad, mutated,
+the four crates' tests run with `AURORA_REQUIRE_GPU=1`, restored with
+`copyfile` + `os.utime`, sha256 checked — 15 of 15 restored):
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `insert_encoded` never submits the write (never on scratch) | killed: `inserted_tiles_go_to_scratch_never_resident_and_page_back_in_exactly`, `inserting_over_a_tile_forgotten_…` |
+| M2 | wrong tile key (x/y swapped) in `encode_image_tiles_at` | killed: all 4 `prepared_pixels` tests |
+| M3 | wrong origin (encoder fills as if placed at (0, 0)) | killed: `the_prepared_install_is_bit_identical_…`, both autosave tests |
+| M4 | blank-tile rule broken (fully transparent tiles skipped) | killed: `the_prepared_install_is_bit_identical_…`, `a_refused_placement_…`, `an_install_while_…` |
+| M5 | `insert_encoded` bypasses the budget (decodes into `resident` with `LruCache::put`) | killed: 4 `prepared_pixels` + 5 `insert_encoded_tests` |
+| M6 | masks inserted before the sweep | killed: 4 `prepared_pixels` + `an_opened_psds_mask_is_written_after_the_outgoing_masks_are_swept` |
+| M7 | pixels inserted before the sweep | killed: 4 `prepared_pixels` + 3 existing sweep-order tests |
+| M8 | `snapshot_tile` ignores pending (inserted) bytes | killed: both autosave tests, `an_inserted_tile_reads_from_pending_…`, `snapshot_tile_copies_without_paging_in_or_evicting` |
+| M9 | `insert_encoded` records no `pending` entry | killed: 9 tests incl. both autosave tests and 4 existing open tests |
+| M10 | `.aur` tile bytes inserted without decoding (an added unchecked constructor) | killed: 5 damaged-`.aur` tests, e.g. `read_aur_for_open_refuses_a_damaged_file_before_touching_the_live_store` |
+| M11 | the `forget_tile` tombstone is not cleared | killed: `inserting_over_a_tile_forgotten_while_its_write_was_pending_keeps_the_new_file` |
+| M12 | no owed upload (`evicted_dirty`) recorded | killed: `the_prepared_install_is_bit_identical_…`, `an_inserted_tile_reads_from_pending_…` |
+| M13 | a held key is not forgotten first | killed: `an_insert_replaces_a_resident_tile_whole` |
+| M14 | the decode thread drops the PSD's masks | killed: `a_background_psd_open_hands_over_the_same_document_as_the_synchronous_path` |
+| M15 | shared mask fill: `NaN` fails closed | killed: `write_mask_coverage_region_clamps_fails_open_and_skips_an_empty_region` (the bit-identity test cannot see it: both paths share the body) |
+
+15 of 15 killed.
+
+*Disclosures.* (1) Bit-identity holds against an *empty* target
+surface; on a surface still holding a tile (impossible after the sweep)
+the old writer kept that tile's texels outside the image and an insert
+replaces the tile whole. (2) Dirty state differs: an incoming tile is
+now whole-tile dirty where the old resident survivors carried the exact
+written rectangle; every tile is uploaded either way, and the
+`composite_cache.bump` after the install already invalidates
+everything. (3) The decode thread is correspondingly slower (+0.66–0.69
+s dev, +0.31 s release for the flat PSD), so "Opening …" shows longer;
+the window stays responsive throughout. (4) The pause moves partly to
+the first composite: with the app's 256-tile budget the old install
+left the last 256 tiles resident, now every tile is paged in from
+`pending` by the first frames (the read-every-tile proxy above shows no
+regression at 16 or 256 tiles, but it is a proxy, not a frame). (5)
+`pending` grows to every inserted tile until the writer drains it
+(measured ~0.2 s for 512 MiB), past the "bounded by evictions since the
+last touch" argument `ensure_resident` documents; the memory was
+already held as the decoded document. (6) Found, not fixed: `make_room`
+has the same tombstone hazard `insert_encoded` now avoids — a key
+`forget_tile`d while its write is in flight, re-created and evicted
+again before the old result is drained, has its new scratch file
+deleted by the new result and its bytes kept in `pending` for good (a
+leak, not data loss: reads come from `pending`). Under 0.152.0's install
+this is plausibly reachable at an open whose sweep hits writes still in flight. **Fixed in the review revision (J4)**, with a test reproducing the sequence. (7)
+The flat-image path now drops the decoded `Image` on the decode thread
+(the install needs only its size); `document_from_image` is test-only,
+`document_from_size` is production. (8) `.aur` opens are unchanged and
+still read on the UI thread. (9) Not run on real macOS hardware; one
+release run of the timings. (10) No backpressure (review J3): the
+store's writer queue (`writer.rs`) is unbounded, so on a slow or stalled
+scratch disk `pending` holds the whole encoded document — up to ~8 B/px
+for incompressible content — for as long as the disk takes, outside the
+resident budget. That is the decode thread's memory handed over, not
+new memory, but it is the one place this path holds document-sized
+memory after the install, against invariant §7.3.1 (which the in-memory
+PSD decode already does not honour; see "Suggested next").
+
+*Review revision (judge REVISE 0.899).*
+
+- **J1 (fixed): inserted tiles could be lost to the failed-write cap.**
+  The cap (`failed_write_capacity() == budget`) assumed about `budget`
+  more tiles survived resident; no inserted tile is resident, so a
+  failing scratch disk during an open would have dropped all but
+  `budget` of them, permanently. `TileStore` now tracks
+  `inserted_unconfirmed` (keys inserted and neither written nor ever
+  resident); `retain_failed_write` keeps those outside the cap. Bounded
+  by the encoded document the decode thread already held, and only
+  shrinking (`forget_pending` removes a key on a confirmed write, a
+  read, a forget). Documented on `insert_encoded`. Test
+  `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap`
+  (budget 2, 7 inserted tiles, every write failing: all 7 kept and
+  readable, 0 dropped).
+- **J2 (fixed and measured).** `decode_chosen_file` drops the PSD file's
+  bytes before encoding (the image route already dropped them inside
+  `open_image`). Peak memory, measured in
+  `measure_installing_noisy_layers_on_the_ui_thread` as `VmHWM` after
+  `clear_refs` 5, above the RSS at the start of each install, store
+  flush included: 16-tile store, release, old path **11 MiB**, 0.153.0
+  **504 MiB**; dev 12 MiB against 503 MiB. That test holds all four
+  decoded images and encodes all layers before inserting, so 504 MiB is
+  the whole encoded document at once; in the app the decode thread drops
+  each image once encoded, so its peak is — reasoned, not measured — the
+  decoded document plus one layer's encoded tiles (plus the decoded mask
+  buffers until `PreparedPsd::new` returns), and then the encoded document sits in
+  `pending` until written. The 256-tile iteration reported 0–7 MiB and
+  is not reliable: it runs second, and the allocator keeps the first
+  iteration's freed memory resident, inflating its baseline. The
+  "lower than before" claim is withdrawn above.
+- **J3 (disclosed):** disclosure 10 and the `insert_encoded` docs.
+- **J4 (fixed):** `make_room` clears a stale `forget_tile` tombstone
+  when it records a new pending write for that key. Test
+  `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file`.
+- **J5 (done):** the gate figures above replace the earlier "no gate"
+  wording, here, in CLAUDE.md and in README.
+- **J6 (disclosed):** in "Why (A)" above.
+
+*Revision mutations* (same procedure; restored with `copyfile` +
+`os.utime`, sha256 checked):
+
+| # | mutation | result |
+|---|---|---|
+| R1 | J1 exemption removed (inserted tiles' failed writes capped) | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
+| R2 | J4 tombstone clear removed from `make_room` | killed: `a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file` |
+| R3 | `forget_pending` no longer shrinks `inserted_unconfirmed` | killed: `failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap` |
+
+Test count **2,891**, measured: the full gate re-run on the revised
+tree passed every step (`AURORA_REQUIRE_GPU=1`: 2,891 passed, 0 failed,
+49 ignored, 0 skipped; clippy, strict rustdoc, `cargo deny` clean).
+Judge round 2: **PASS 0.906**, no blocking issue. Its notes, applied:
+the app-side peak ("the decoded document plus one layer's encoded tiles")
+is *reasoned from the code, not measured* — only the test fixture's
+504 MiB is measured — and it also includes the decoded mask buffers,
+held until `PreparedPsd::new` returns; `cap_failed_writes` now documents
+why it may bypass `forget_pending` (keys in `inserted_unconfirmed` never
+enter `failed_writes`).
+
+*Needs a human:* open a large PSD on macOS; the end-of-open pause
+should be near zero.
+
+*Suggested next:* stream PSD layers through the tile store (§7.3.1), so
+the whole file is no longer decoded in memory.
 
 **Addendum 2026-10-09 (0.152.0) — the autosave is written off the UI
 thread.** Done as 0.152.0 (`crates/aurora-app/src/background_autosave.rs`

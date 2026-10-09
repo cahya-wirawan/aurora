@@ -23,5 +23,5 @@ pub use error::TileError;
 pub use scratch::{
     LOCK_FILE_NAME, ScratchLock, SweepReport, lock_scratch_dir, sweep_orphaned_scratch_dirs,
 };
-pub use store::{Stats, TileSnapshot, TileStore};
+pub use store::{EncodedTile, Stats, TileSnapshot, TileStore};
 pub use tile::{CHANNELS, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};

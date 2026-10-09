@@ -93,6 +93,53 @@ const WHOLE_TILE: Rect = Rect {
     height: TILE,
 };
 
+/// One whole tile's [`codec::encode`] bytes, ready for
+/// [`TileStore::insert_encoded`] (0.153.0).
+///
+/// **Only this crate's own encoder can make one.** The one constructor,
+/// [`Self::of`], encodes a real [`Tile`] (always exactly one whole tile
+/// of samples), and there is deliberately no way to wrap bytes read from
+/// anywhere else: `insert_encoded` hands these bytes to the scratch disk
+/// and later to `codec::decode` without validating them first, which is
+/// sound only because they never came from a file. A `.aur` file's tile
+/// entries are untrusted input and must keep going through
+/// `codec::decode` and [`TileStore::get_mut`] (`aurora_io::read_aur`).
+///
+/// Cheap to move between threads (an `Arc` around the encoded buffer):
+/// `aurora-app` encodes on its background decode thread and inserts on
+/// the UI thread, so the per-texel work never lands on the latter.
+#[derive(Debug, Clone)]
+pub struct EncodedTile(Arc<Vec<u8>>);
+
+impl EncodedTile {
+    /// Encodes `tile`'s texels exactly as an eviction would
+    /// ([`codec::encode`]). Its dirty state is not carried — an inserted
+    /// tile is always reported whole-tile dirty instead.
+    #[must_use]
+    pub fn of(tile: &Tile) -> Self {
+        Self(Arc::new(codec::encode(tile.texels())))
+    }
+
+    /// The encoded length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false`: an encoded tile carries at least its header.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The encoded bytes, read-only (for comparisons; there is no way
+    /// back from bytes to an `EncodedTile`).
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// What [`TileStore::snapshot_tile`] copies out of the store.
 #[derive(Debug, Clone)]
 pub enum TileSnapshot {
@@ -236,6 +283,18 @@ pub struct TileStore {
     /// and `pending` is itself bounded the way [`Self::failed_writes`]'s
     /// own doc explains.
     forgotten_while_pending: HashSet<(SurfaceId, TileId)>,
+    /// Keys [`Self::insert_encoded`] put in `pending` whose bytes have not
+    /// yet been confirmed on the scratch disk and have never been resident
+    /// (0.153.0 review J1). A failed write for one of these is kept
+    /// **outside** [`Self::failed_write_capacity`]'s cap: such a tile was
+    /// never resident, so the old "about `budget` tiles also survive in
+    /// `resident`" half of that cap's reasoning does not hold for it, and
+    /// dropping its `pending` bytes would destroy the only copy an open
+    /// ever had. Bounded by what was inserted — the encoded size of the
+    /// document being opened, which the decode thread already held — and
+    /// it only ever shrinks: a key leaves on a confirmed write, a read
+    /// that makes it resident, a forget, or any other `forget_pending`.
+    inserted_unconfirmed: HashSet<(SurfaceId, TileId)>,
     /// Keys that were **dirty when `make_room` took them out of
     /// `resident`** — the one piece of a `Tile`'s state `codec::encode`
     /// does not carry to the scratch disk, and which `Tile::from_texels`
@@ -600,6 +659,7 @@ impl TileStore {
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
             forgotten_while_pending: HashSet::new(),
+            inserted_unconfirmed: HashSet::new(),
             evicted_dirty: HashSet::new(),
             write_generation: 0,
             budget,
@@ -857,6 +917,77 @@ impl TileStore {
                 source,
             }),
         }
+    }
+
+    /// Stores `tile` under `(surface, id)` as an **already-evicted** tile
+    /// (0.153.0): its bytes go straight into `pending` and to the
+    /// background writer, exactly as `make_room` hands over an evicted
+    /// tile, and nothing becomes resident. O(1) bookkeeping per tile and
+    /// no per-texel work, which is the point — an opened document's
+    /// thousand-odd tiles were encoded on the decode thread, and this is
+    /// all the UI thread has left to do for each.
+    ///
+    /// - **Resident budget.** Untouched: the tile is not resident until
+    ///   something reads it, and then it comes in through the ordinary
+    ///   page-in (`ensure_resident`'s pending branch, or the scratch file
+    ///   once the write has landed), which makes room first. So this can
+    ///   never push the store past its budget (invariant §7.3.1); the
+    ///   encoded bytes are held in `pending` only until the writer
+    ///   confirms them, as for any eviction.
+    /// - **Dirty.** Recorded whole-tile (`evicted_dirty`), as for a tile
+    ///   evicted while dirty, so the next GPU sync uploads it.
+    /// - **A key already held** (unusual: callers sweep first) is
+    ///   forgotten first, so the inserted bytes replace it whole. A
+    ///   `forget_tile` tombstone for the key is cleared: the fresh
+    ///   generation recorded here already makes the older in-flight
+    ///   write's result superseded, and a tombstone left behind would
+    ///   instead be consumed by *this* write's result, deleting the file
+    ///   it just wrote and leaving the bytes in `pending` for good.
+    ///
+    /// - **A failed scratch write** (0.153.0 review J1) keeps the bytes in
+    ///   `pending`, readable, **outside** the failed-write cap
+    ///   (`failed_write_capacity`): an inserted tile was never
+    ///   resident, so capping it would drop the only copy an open ever
+    ///   had. On a persistently failing scratch disk the whole inserted
+    ///   (encoded) document therefore stays in memory until each tile is
+    ///   read, forgotten or written — bounded by what the decode thread
+    ///   already held, never by more. Once read, a tile is an ordinary
+    ///   resident tile and later evictions are capped as before.
+    /// - **No backpressure** (0.153.0 review J3): the writer's queue is
+    ///   unbounded, so on a slow or stalled scratch disk `pending` holds
+    ///   every inserted tile's bytes — up to ~8 B/px for incompressible
+    ///   content — for as long as the disk takes. That is the decode
+    ///   thread's memory handed over, not new memory, but it is held
+    ///   outside the resident budget (§7.3.1).
+    ///
+    /// The bytes are not validated: [`EncodedTile`] can only be made by
+    /// this crate's encoder, so they are a whole tile by construction.
+    pub fn insert_encoded(&mut self, surface: SurfaceId, id: TileId, tile: EncodedTile) {
+        let key = (surface, id);
+        if self.contains_tile(surface, id) {
+            self.forget_tile(surface, id);
+        }
+        self.forgotten_while_pending.remove(&key);
+        let bytes = tile.0;
+        let path = self.tile_path(surface, id);
+        self.write_generation = self.write_generation.wrapping_add(1);
+        let generation = self.write_generation;
+        self.stats.bytes_written += bytes.len() as u64;
+        // The same three entries, in the same call, as `make_room`
+        // writes for an eviction: `ensure_resident`, `snapshot_tile`,
+        // `forget_tile` and `forget_surfaces` all handle the key from
+        // here on exactly as they handle an evicted one.
+        self.paged_out.insert(key, path.clone());
+        self.pending.insert(key, (generation, Arc::clone(&bytes)));
+        self.inserted_unconfirmed.insert(key);
+        self.evicted_dirty.insert(key);
+        self.writer.submit(WriteJob {
+            surface,
+            id,
+            generation,
+            path,
+            bytes,
+        });
     }
 
     /// Drops everything this store holds for `(surface, id)` — resident,
@@ -1320,6 +1451,7 @@ impl TileStore {
     /// costs a decode or a disk write.
     fn forget_pending(&mut self, key: (SurfaceId, TileId)) {
         self.pending.remove(&key);
+        self.inserted_unconfirmed.remove(&key);
         self.failed_writes.retain(|held| *held != key);
     }
 
@@ -1495,6 +1627,11 @@ impl TileStore {
             // is nothing being held for this key, so nothing to bound.
             return;
         }
+        if self.inserted_unconfirmed.contains(&key) {
+            // An inserted, never-resident tile (0.153.0 review J1): kept
+            // outside the cap — see `inserted_unconfirmed`.
+            return;
+        }
         if !self.failed_writes.contains(&key) {
             self.failed_writes.push_back(key);
         }
@@ -1504,6 +1641,11 @@ impl TileStore {
     /// Drops the oldest failed-write entries until at most
     /// [`Self::failed_write_capacity`] remain — see
     /// [`Self::retain_failed_write`] for why the cap exists.
+    ///
+    /// Removes from `pending` directly rather than through
+    /// `forget_pending`, which is safe only because a key in
+    /// `inserted_unconfirmed` never enters `failed_writes`
+    /// (`retain_failed_write` returns before queueing it). Keep it so.
     fn cap_failed_writes(&mut self) {
         while self.failed_writes.len() > self.failed_write_capacity() {
             let Some(oldest) = self.failed_writes.pop_front() else {
@@ -1710,6 +1852,16 @@ impl TileStore {
                 (victim_surface, victim_id),
                 (generation, Arc::clone(&bytes)),
             );
+            // A `forget_tile` tombstone left for this key by an *earlier*
+            // write still in flight is cleared (0.153.0 review J4): the new
+            // generation above already makes that write's result
+            // superseded, and a tombstone left behind would instead be
+            // consumed by *this* write's result — deleting the scratch
+            // file it just wrote and keeping its bytes in `pending` for
+            // good. The writer is FIFO, so this write lands after the
+            // stale one and overwrites its file.
+            self.forgotten_while_pending
+                .remove(&(victim_surface, victim_id));
             self.writer.submit(WriteJob {
                 surface: victim_surface,
                 id: victim_id,
@@ -4418,5 +4570,288 @@ mod tests {
     #[test]
     fn each_store_gets_its_own_filename_token() {
         assert_ne!(super::instance_token(), super::instance_token());
+    }
+}
+
+/// [`TileStore::insert_encoded`] (0.153.0). A child of this module so it
+/// can see the store's private maps: "never resident, pending until
+/// written, then only on the scratch disk" is a statement about them.
+#[cfg(test)]
+mod insert_encoded_tests {
+    use std::num::NonZeroUsize;
+
+    use super::{EncodedTile, TileSnapshot, TileStore, WHOLE_TILE};
+    use crate::tile::{SurfaceId, Tile, TileId};
+
+    fn store(budget: usize) -> (tempfile::TempDir, TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = NonZeroUsize::new(budget) else {
+            unreachable!("non-zero literal");
+        };
+        match TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => (dir, store),
+            Err(err) => unreachable!("{err}"),
+        }
+    }
+
+    /// A tile whose every sample depends on `seed` and its index.
+    fn patterned(seed: u16) -> Tile {
+        let mut tile = Tile::blank();
+        for (index, sample) in tile.texels_mut().iter_mut().enumerate() {
+            let bits = (index as u16).wrapping_mul(31).wrapping_add(seed) & 0x3bff;
+            *sample = half::f16::from_bits(bits);
+        }
+        tile
+    }
+
+    fn texels(store: &mut TileStore, surface: SurfaceId, id: TileId) -> Vec<half::f16> {
+        match store.get(surface, id) {
+            Ok(tile) => tile.texels().to_vec(),
+            Err(err) => unreachable!("{err}"),
+        }
+    }
+
+    fn flush(store: &mut TileStore) {
+        if let Err(err) = store.flush() {
+            unreachable!("{err}");
+        }
+    }
+
+    #[test]
+    fn inserted_tiles_go_to_scratch_never_resident_and_page_back_in_exactly() {
+        let (dir, mut store) = store(2);
+        let surface = SurfaceId::from_raw(3);
+        let ids: Vec<TileId> = (0..8).map(|x| TileId { x, y: 1 }).collect();
+        for (seed, id) in ids.iter().enumerate() {
+            store.insert_encoded(surface, *id, EncodedTile::of(&patterned(seed as u16)));
+            assert_eq!(store.resident_len(), 0, "an insert makes nothing resident");
+        }
+        assert_eq!(store.pending.len(), 8, "held until the writer confirms");
+        flush(&mut store);
+        assert!(
+            store.pending.is_empty(),
+            "every write landed and was reconciled"
+        );
+        assert_eq!(store.paged_out.len(), 8);
+        for (seed, id) in ids.iter().enumerate() {
+            let Some(path) = store.paged_out.get(&(surface, *id)) else {
+                unreachable!("inserted");
+            };
+            let on_disk = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("the scratch file was written: {err}"),
+            };
+            assert_eq!(
+                on_disk,
+                crate::codec::encode(patterned(seed as u16).texels()),
+                "the scratch file holds the inserted bytes"
+            );
+            assert!(path.starts_with(dir.path()));
+        }
+        for (seed, id) in ids.iter().enumerate() {
+            assert_eq!(
+                texels(&mut store, surface, *id),
+                patterned(seed as u16).texels(),
+                "page-in from the scratch disk round-trips exactly"
+            );
+            assert!(store.resident_len() <= 2, "the budget holds while reading");
+        }
+        // Evicted again by the reads above and paged back in once more.
+        for (seed, id) in ids.iter().enumerate() {
+            assert_eq!(
+                texels(&mut store, surface, *id),
+                patterned(seed as u16).texels()
+            );
+        }
+        assert!(store.resident_len() <= 2);
+    }
+
+    #[test]
+    fn an_inserted_tile_reads_from_pending_before_its_write_lands() {
+        let (_dir, mut store) = store(4);
+        let surface = SurfaceId::from_raw(0);
+        let id = TileId { x: 2, y: 5 };
+        let tile = EncodedTile::of(&patterned(9));
+        let shared = std::sync::Arc::clone(&tile.0);
+        store.insert_encoded(surface, id, tile);
+        assert!(store.contains_tile(surface, id));
+        assert!(!store.is_resident(surface, id));
+        match store.snapshot_tile(surface, id) {
+            Ok(Some(TileSnapshot::Encoded(bytes))) => {
+                assert_eq!(
+                    *bytes, *shared,
+                    "the autosave snapshot sees the inserted bytes"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
+        assert_eq!(
+            store.snapshot_len_bound(surface, id),
+            Some(shared.len()),
+            "and its budget estimate counts them"
+        );
+        assert_eq!(
+            store.take_dirty(surface, id),
+            Some(WHOLE_TILE),
+            "an inserted tile still owes its GPU upload"
+        );
+        assert_eq!(texels(&mut store, surface, id), patterned(9).texels());
+    }
+
+    #[test]
+    fn forgetting_a_surface_frees_its_inserted_tiles_and_their_scratch_files() {
+        let (_dir, mut store) = store(4);
+        let surface = SurfaceId::from_raw(1);
+        let other = SurfaceId::from_raw(2);
+        for x in 0..3 {
+            store.insert_encoded(
+                surface,
+                TileId { x, y: 0 },
+                EncodedTile::of(&patterned(x as u16)),
+            );
+        }
+        store.insert_encoded(other, TileId { x: 0, y: 0 }, EncodedTile::of(&patterned(7)));
+        flush(&mut store);
+        let paths: Vec<_> = (0..3)
+            .filter_map(|x| store.paged_out.get(&(surface, TileId { x, y: 0 })).cloned())
+            .collect();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(store.forget_surface(surface), 3);
+        for path in paths {
+            assert!(!path.exists(), "the scratch file is deleted");
+        }
+        assert!(!store.contains_tile(surface, TileId { x: 0, y: 0 }));
+        assert_eq!(
+            texels(&mut store, other, TileId { x: 0, y: 0 }),
+            patterned(7).texels(),
+            "another surface's inserted tile is untouched"
+        );
+    }
+
+    #[test]
+    fn inserting_over_a_tile_forgotten_while_its_write_was_pending_keeps_the_new_file() {
+        let (_dir, mut store) = store(1);
+        let surface = SurfaceId::from_raw(0);
+        let id = TileId { x: 0, y: 0 };
+        // Evict `id` (budget 1) so its write is in flight, then forget it
+        // before anything drains the result: the sweep an open does.
+        match store.get_mut(surface, id) {
+            Ok(tile) => tile.texels_mut().copy_from_slice(patterned(1).texels()),
+            Err(err) => unreachable!("{err}"),
+        }
+        let _ = texels(&mut store, surface, TileId { x: 1, y: 0 });
+        assert!(store.pending.contains_key(&(surface, id)));
+        assert!(store.forget_tile(surface, id));
+        assert!(store.forgotten_while_pending.contains(&(surface, id)));
+        store.insert_encoded(surface, id, EncodedTile::of(&patterned(2)));
+        flush(&mut store);
+        assert!(
+            store.pending.is_empty(),
+            "the inserted write was reconciled, not mistaken for the forgotten one"
+        );
+        let Some(path) = store.paged_out.get(&(surface, id)).cloned() else {
+            unreachable!("inserted");
+        };
+        assert!(path.exists(), "the inserted tile's scratch file survives");
+        assert_eq!(texels(&mut store, surface, id), patterned(2).texels());
+    }
+
+    /// 0.153.0 review J1: a failing scratch disk during an open must not
+    /// drop inserted tiles past the failed-write cap — none of them was
+    /// ever resident, so `pending` is their only copy. Every write is made
+    /// to fail by occupying its path with a directory, as the existing
+    /// failed-write tests do.
+    #[test]
+    fn failed_writes_of_inserted_tiles_keep_every_tile_readable_past_the_cap() {
+        const BUDGET: usize = 2;
+        const TILES: u32 = 7;
+        let (_dir, mut store) = store(BUDGET);
+        let surface = SurfaceId::from_raw(4);
+        for x in 0..TILES {
+            if let Err(err) = std::fs::create_dir(store.tile_path(surface, TileId { x, y: 0 })) {
+                unreachable!("{err}");
+            }
+        }
+        for x in 0..TILES {
+            store.insert_encoded(
+                surface,
+                TileId { x, y: 0 },
+                EncodedTile::of(&patterned(x as u16)),
+            );
+        }
+        match store.flush() {
+            Err(crate::TileError::Io { .. }) => {}
+            other => unreachable!("writing over a directory cannot succeed: {other:?}"),
+        }
+        assert_eq!(
+            store.pending.len(),
+            TILES as usize,
+            "every inserted tile's bytes are kept, past the cap of {BUDGET}"
+        );
+        assert_eq!(store.stats().dropped_failed_writes, 0);
+        for x in 0..TILES {
+            assert_eq!(
+                texels(&mut store, surface, TileId { x, y: 0 }),
+                patterned(x as u16).texels(),
+                "tile {x} is still readable, with its content"
+            );
+        }
+        assert!(store.resident_len() <= BUDGET);
+        assert!(
+            store.inserted_unconfirmed.is_empty(),
+            "a read makes a tile ordinary; the exemption only shrinks"
+        );
+    }
+
+    /// 0.153.0 review J4, the pre-existing `make_room` half of the
+    /// tombstone hazard: forget a tile while its write is in flight, touch
+    /// it again (a fresh blank tile), paint it, evict it again, drain.
+    #[test]
+    fn a_tile_forgotten_mid_write_then_re_created_and_evicted_keeps_its_new_file() {
+        let (_dir, mut store) = store(1);
+        let surface = SurfaceId::from_raw(0);
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        let _ = texels(&mut store, surface, a);
+        let _ = texels(&mut store, surface, b); // evicts `a`: write 1 in flight
+        assert!(store.forget_tile(surface, a));
+        assert!(store.forgotten_while_pending.contains(&(surface, a)));
+        match store.get_mut(surface, a) {
+            Ok(tile) => tile.texels_mut().copy_from_slice(patterned(3).texels()),
+            Err(err) => unreachable!("{err}"),
+        }
+        let _ = texels(&mut store, surface, b); // evicts `a` again: write 2
+        flush(&mut store);
+        assert!(
+            !store.pending.contains_key(&(surface, a)),
+            "the second write was reconciled, not mistaken for the forgotten one"
+        );
+        let Some(path) = store.paged_out.get(&(surface, a)).cloned() else {
+            unreachable!("evicted");
+        };
+        assert!(path.exists(), "the second write's scratch file survives");
+        assert_eq!(texels(&mut store, surface, a), patterned(3).texels());
+    }
+
+    #[test]
+    fn an_insert_replaces_a_resident_tile_whole() {
+        let (_dir, mut store) = store(4);
+        let surface = SurfaceId::from_raw(0);
+        let id = TileId { x: 0, y: 0 };
+        match store.get_mut(surface, id) {
+            Ok(tile) => tile.texels_mut().copy_from_slice(patterned(5).texels()),
+            Err(err) => unreachable!("{err}"),
+        }
+        store.insert_encoded(surface, id, EncodedTile::of(&Tile::blank()));
+        assert!(!store.is_resident(surface, id));
+        assert!(
+            texels(&mut store, surface, id)
+                .iter()
+                .all(|s| s.to_bits() == 0),
+            "nothing of the old resident tile survives"
+        );
     }
 }

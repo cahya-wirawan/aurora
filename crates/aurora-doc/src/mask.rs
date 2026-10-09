@@ -449,50 +449,123 @@ pub fn write_mask_coverage_region(
     if x0 >= x1 || y0 >= y1 {
         return Ok(0);
     }
-    let one = half::f16::from_f32(1.0);
     let mut written = 0_usize;
     for ty in (y0 / side)..y1.div_ceil(side) {
         for tx in (x0 / side)..x1.div_ceil(side) {
-            let tile_x0 = tx.saturating_mul(side);
-            let tile_y0 = ty.saturating_mul(side);
-            let cx0 = tile_x0.max(x0);
-            let cy0 = tile_y0.max(y0);
-            let cx1 = tile_x0.saturating_add(side).min(x1);
-            let cy1 = tile_y0.saturating_add(side).min(y1);
-            if cx0 >= cx1 || cy0 >= cy1 {
+            if mask_tile_overlap(tx, ty, (x0, y0, x1, y1)).is_none() {
                 continue;
             }
             let entry = store.get_mut(surface, aurora_tile::TileId { x: tx, y: ty })?;
-            let texels = entry.texels_mut();
-            for y in cy0..cy1 {
-                let row_base = (y - tile_y0) as usize * side as usize;
-                for x in cx0..cx1 {
-                    let raw = coverage(x - x0, y - y0);
-                    let value = if raw.is_nan() {
-                        1.0
-                    } else {
-                        raw.clamp(0.0, 1.0)
-                    };
-                    let value = half::f16::from_f32(value);
-                    let base = (row_base + (x - tile_x0) as usize) * aurora_tile::CHANNELS;
-                    if let Some([r, g, b, a]) = texels.get_mut(base..base + aurora_tile::CHANNELS) {
-                        *r = value;
-                        *g = value;
-                        *b = value;
-                        *a = one;
-                    }
-                }
+            if let Some(dirty) =
+                fill_mask_tile(tx, ty, (x0, y0, x1, y1), &mut coverage, entry.texels_mut())
+            {
+                entry.mark_dirty(dirty);
             }
-            entry.mark_dirty(aurora_core::Rect {
-                x: i64::from(cx0 - tile_x0),
-                y: i64::from(cy0 - tile_y0),
-                width: cx1 - cx0,
-                height: cy1 - cy0,
-            });
             written += 1;
         }
     }
     Ok(written)
+}
+
+/// [`write_mask_coverage_region`]'s tiles, built and encoded **without a
+/// store** (0.153.0) so the per-texel work can run on a background thread;
+/// the caller inserts them with `aurora_tile::TileStore::insert_encoded`.
+///
+/// Bit-identical to what [`write_mask_coverage_region`] leaves on an
+/// empty mask surface: the same tiles (every one the region touches, in
+/// row-major order), each a blank tile filled by the same per-tile body
+/// (`fill_mask_tile`) — clamping, `NaN` failing open, `(v, v, v, 1.0)`.
+/// An empty region gives no tiles.
+#[must_use]
+pub fn encode_mask_coverage_region(
+    origin: (u32, u32),
+    width: u32,
+    height: u32,
+    mut coverage: impl FnMut(u32, u32) -> f32,
+) -> Vec<(aurora_tile::TileId, aurora_tile::EncodedTile)> {
+    let side = aurora_tile::TILE;
+    let (x0, y0) = origin;
+    let x1 = x0.saturating_add(width);
+    let y1 = y0.saturating_add(height);
+    let mut tiles = Vec::new();
+    if x0 >= x1 || y0 >= y1 {
+        return tiles;
+    }
+    for ty in (y0 / side)..y1.div_ceil(side) {
+        for tx in (x0 / side)..x1.div_ceil(side) {
+            if mask_tile_overlap(tx, ty, (x0, y0, x1, y1)).is_none() {
+                continue;
+            }
+            let mut tile = aurora_tile::Tile::blank();
+            let _dirty = fill_mask_tile(tx, ty, (x0, y0, x1, y1), &mut coverage, tile.texels_mut());
+            tiles.push((
+                aurora_tile::TileId { x: tx, y: ty },
+                aurora_tile::EncodedTile::of(&tile),
+            ));
+        }
+    }
+    tiles
+}
+
+/// Tile `(tx, ty)`'s overlap with `region` (`x0, y0, x1, y1`, exclusive
+/// far edges), as the same tuple; `None` when they do not overlap.
+fn mask_tile_overlap(
+    tx: u32,
+    ty: u32,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let side = aurora_tile::TILE;
+    let tile_x0 = tx.saturating_mul(side);
+    let tile_y0 = ty.saturating_mul(side);
+    let cx0 = tile_x0.max(x0);
+    let cy0 = tile_y0.max(y0);
+    let cx1 = tile_x0.saturating_add(side).min(x1);
+    let cy1 = tile_y0.saturating_add(side).min(y1);
+    (cx0 < cx1 && cy0 < cy1).then_some((cx0, cy0, cx1, cy1))
+}
+
+/// Writes `region`'s coverage into tile `(tx, ty)`'s `texels` and returns
+/// the tile-local rectangle written — the one body
+/// [`write_mask_coverage_region`] and [`encode_mask_coverage_region`]
+/// share. `coverage` is region-local, as there.
+fn fill_mask_tile(
+    tx: u32,
+    ty: u32,
+    region: (u32, u32, u32, u32),
+    coverage: &mut impl FnMut(u32, u32) -> f32,
+    texels: &mut [half::f16],
+) -> Option<aurora_core::Rect> {
+    let side = aurora_tile::TILE;
+    let (x0, y0, _, _) = region;
+    let (cx0, cy0, cx1, cy1) = mask_tile_overlap(tx, ty, region)?;
+    let tile_x0 = tx.saturating_mul(side);
+    let tile_y0 = ty.saturating_mul(side);
+    let one = half::f16::from_f32(1.0);
+    for y in cy0..cy1 {
+        let row_base = (y - tile_y0) as usize * side as usize;
+        for x in cx0..cx1 {
+            let raw = coverage(x - x0, y - y0);
+            let value = if raw.is_nan() {
+                1.0
+            } else {
+                raw.clamp(0.0, 1.0)
+            };
+            let value = half::f16::from_f32(value);
+            let base = (row_base + (x - tile_x0) as usize) * aurora_tile::CHANNELS;
+            if let Some([r, g, b, a]) = texels.get_mut(base..base + aurora_tile::CHANNELS) {
+                *r = value;
+                *g = value;
+                *b = value;
+                *a = one;
+            }
+        }
+    }
+    Some(aurora_core::Rect {
+        x: i64::from(cx0 - tile_x0),
+        y: i64::from(cy0 - tile_y0),
+        width: cx1 - cx0,
+        height: cy1 - cy0,
+    })
 }
 
 /// Frees every tile stored under `id`'s mask surface, so a mask on that
