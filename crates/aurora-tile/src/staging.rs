@@ -92,6 +92,10 @@ impl StagingRoot {
         let path = self
             .scratch_dir
             .join(format!("staging-{}-{sequence:x}", self.owner));
+        // `mut` only for the Unix-only `mode` below: on Windows nothing
+        // mutates it, and CI's `-D warnings` turns `unused_mut` into an
+        // error there (0.161.1).
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
