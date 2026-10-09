@@ -56,6 +56,35 @@ design owner's to tune; `aurora_theme::SizeScale`,
 `design/tokens.css` — emitted unitless). 3,043 tests (3,033 + 10).
 **Needs a human** on macOS. Details: "Next action", addendum 0.162.0.
 
+**Previously (2026-10-09, 0.161.1): a CI test race fixed.** GitHub Actions'
+Ubuntu (and Windows) runs failed in
+`prepared_pixels::tests::a_background_autosave_right_after_the_install_recovers_the_document`
+with `NotFound` on `first.aur`. Cause: the test submitted two autosave
+jobs back to back and expected both files, but `AutosaveWorker`
+*coalesces* by design (0.152.0) — a second job submitted while the first
+is still *waiting* replaces it, so `first.aur` is never written. The RTX
+3090 box's worker always started in time; slower CI runners did not.
+Measured on this box under 12 competing CPU-bound processes: the old
+test failed **16 of 40** runs, the fixed one **0 of 40**. Fix (test-only):
+wait for the first write to land before the second snapshot — the
+snapshot is taken at submit, so the bytes were still in `pending` either
+way and nothing about what is tested changes. Every other test that
+submits twice in a row was checked: they gate the first write or do not
+depend on it. No product code changed by that part. **Windows build
+fix in the same version:** the Windows job failed earlier, at compile
+time — `crates/aurora-tile/src/staging.rs` (0.154.0) declared `let mut
+builder = DirBuilder::new()` and mutated it only inside `#[cfg(unix)]`,
+so on Windows `unused_mut` fired and CI's `RUSTFLAGS=-D warnings` made it
+an error (Linux never sees it, which is why the RTX 3090 gate was
+green). Fixed with `#[cfg_attr(not(unix), allow(unused_mut))]`. Checked
+locally with `cargo check --target x86_64-pc-windows-gnu --all-targets`
+and `-D warnings` per crate: every crate that does not depend on
+`lcms2-sys` passes (the 9 that do need a mingw C compiler not present
+here, and are left to CI); a scan of those for the same
+`let mut` + `#[cfg(unix)]`-only-mutation pattern found none. The lesson
+for future rounds: the local gate is Linux-only, so a cfg-gated
+mutation needs a cross-target `cargo check` before it ships.
+
 **Previously (2026-10-09, 0.161.0): the Curves editor is reliably visible.**
 The design owner's real-macOS report (2548 x 1344 physical, Widget Gallery
 open, a new Curves layer active) showed the Properties panel as its title
