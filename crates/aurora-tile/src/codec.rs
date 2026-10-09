@@ -31,6 +31,10 @@ const MAGIC: [u8; 4] = *b"ATIL";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 8;
 
+/// The most bytes [`encode`] can produce for one tile: the header plus
+/// the raw payload, which it stores whenever compression does not help.
+pub const MAX_ENCODED_LEN: usize = HEADER_LEN + crate::SAMPLES * std::mem::size_of::<f16>();
+
 /// The one and only decoded payload length [`decode`] accepts: exactly
 /// one `TILE * TILE` f16 RGBA tile ([`crate::SAMPLES`] samples, two
 /// bytes each). Nothing this module ever encodes is any other size, so

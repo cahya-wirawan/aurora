@@ -26,7 +26,51 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.151.0): opening a file decodes it off the UI
+**Latest (2026-10-09, 0.152.0): the autosave is written off the UI
+thread.** 0.151.0's install spent ~1.9 s of its ~2.6 s writing the
+crash-recovery autosave from the live tile store. Now every autosave
+trigger — a fresh session's startup document (`startup_document`
+snapshots, `App::new` submits), the PNG/JPEG/TIFF/PSD install and the
+`.aur` open (`request_autosave`) — takes an `aurora_io::AurSnapshot` on
+the UI thread and hands it to a new
+`crates/aurora-app/src/background_autosave.rs` `AutosaveWorker`, one
+`std::thread` that encodes, writes to a unique `0o600` temp file,
+`sync_all`s and renames — the same file, format and recovery code
+(design (b); no ADR). One timing difference: the startup autosave is
+now written by the worker after `App::new`, so a crash in the first
+moments of a fresh session can find no autosave yet. The
+snapshot is cheap because of how the store holds tiles: a resident
+tile is decoded `f16` and is `memcpy`d (`peek`, the LRU does not
+move); an evicted tile is already `codec::encode` bytes — the exact
+`.aur` tile entry — and is shared from its pending write or read from
+its scratch file, **never paged in, decoded or evicted** (new
+`aurora_tile::TileStore::snapshot_tile`). Walking the store with
+`get` instead (the first attempt) measured 1.37 s, about as slow as
+the write itself. **Measured** (same 4096², four-layer PSD, dev test
+profile, RTX 3090 box, two runs): snapshot 7.3–7.6 ms (10 MiB),
+submit 0.04 ms; UI-thread install 0.73 s (was 2.55–2.57 s; the
+remaining ~0.72 s is the tile writes); worker write 0.63–0.64 s off the
+UI thread; the old synchronous autosave measured 1.79–1.82 s in the
+same runs. One writer and one queue slot: a newer request replaces a
+waiting one, worker writes land in request order, and the rename
+happens under the worker's lock only for a generation newer than the
+last landed; the over-budget synchronous fallback first supersedes the
+worker (review R1), so the file always ends up holding the newest
+request. On noisy (incompressible) layers the snapshot measured
+98–202 ms (512 MiB copied or read, warm page cache); see the addendum.
+Quit abandons the autosave (a clean quit deletes it anyway): a waiting
+job is dropped, the write in flight is cancelled at its next write
+call, the thread is joined within 500 ms or detached, and no rename can
+happen afterwards (nor once `SESSION_ENDING` is set). A snapshot past
+2 GiB — decided from an I/O-free bound before anything is copied
+(review R2) — falls back to the old streaming write on the UI thread
+(§7.3.1). 17 new tests (16 in `aurora-app`, 1 in `aurora-tile`); test
+count 2,880 (2,863 + 14, gate-measured 2,877, + 3 in the review
+revision). **Needs a human: open a large PSD on macOS; the
+end-of-open pause should be gone or much shorter.** Details: "Next
+action", addendum 0.152.0.
+
+**Previously (2026-10-09, 0.151.0): opening a file decodes it off the UI
 thread.** `App::open_file` now only *starts* an open (invariant
 §7.3.4): a new `crates/aurora-app/src/background_open.rs` `OpenWorker`
 runs `decode_chosen_file` on its own `std::thread` (`aurora-app` has no
@@ -30551,6 +30595,225 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.152.0) — the autosave is written off the UI
+thread.** Done as 0.152.0 (`crates/aurora-app/src/background_autosave.rs`
+(new), `aurora-app`'s `lib.rs` (`request_autosave`, `snapshot_autosave`,
+`write_autosave_temp`, `land_autosave_temp`, `startup_document`,
+`App::new`, both open installs, `finish_shutdown`), `aurora-io`'s
+`aur.rs` (`AurSnapshot`, `snapshot_best_effort`, `write_snapshot`; the
+header/skipped-tile entries now shared with `write_with_policy`),
+`aurora-tile`'s `store.rs` (`TileSnapshot`, `TileStore::snapshot_tile`)).
+This closes 0.151.0's named follow-on A1 with **design (b)**.
+
+*Why (b), measured rather than assumed.* The first snapshot walked the
+store with `get`, like the writer, copying decoded texels: 1.37 s for
+the 4096² four-layer PSD, about as slow as the 1.8 s write — because
+with 1024 tiles against a 16-tile (test) or 256-tile (app) budget the
+cost is paging (read + `codec::decode` per tile, plus a
+`codec::encode` per eviction), not the ZIP write. The store already
+holds an evicted tile as its `codec::encode` bytes, which are the
+`.aur` tile entry verbatim, so `snapshot_tile` copies those (shared
+`Arc` from a pending write, or a scratch-file read) and `memcpy`s only
+resident tiles, peeking so the LRU does not move: 7.3–7.6 ms. Design
+(a) (re-open the source on recovery) was therefore not needed, and
+the file, its format, the partial-file rule and the recovery code are
+all unchanged. No ADR. (Timing differs in one place: see disclosure
+8.)
+
+*Measured* (`measure_installing_a_large_psd_on_the_ui_thread`, now
+reporting the snapshot, the submit, the UI-thread total, the worker
+write and the old synchronous write in the same run; dev test profile,
+RTX 3090 box, two runs; the test store's budget is 16 tiles):
+
+| | before (0.151.0) | after (0.152.0) |
+|---|---|---|
+| tile writes (UI) | 0.68 s | 0.72 s |
+| autosave on the UI thread | 1.88–1.89 s | snapshot 7.3–7.6 ms (10 MiB) + submit 0.04 ms |
+| UI-thread install total | 2.55–2.57 s | 0.73 s |
+| autosave write, worker | — | 0.63–0.64 s |
+| old synchronous autosave, same run | — | 1.79–1.82 s |
+
+*Rules* (module docs of `background_autosave`): one worker thread, one
+queue slot — a newer request replaces a waiting one, which is never
+written; worker writes land in request order; the rename runs under the
+worker's lock and only for a generation newer than the last landed
+(`land`). (After review R1 the over-budget synchronous write first
+calls `AutosaveWorker::supersede`, so the rule is: the file ends up
+holding the newest request, worker or synchronous.) A job owns its snapshot, so an edit, a second open or the
+store being dropped after it cannot reach the file. Quit (clean)
+abandons the autosave, because the cleanup deletes it anyway: the
+waiting job is dropped, the write in flight fails at its next write
+call (`CancellableWriter`, `ErrorKind::Other` — `write_all` retries
+`Interrupted` forever), the thread is joined within 500 ms
+(`SHUTDOWN_WAIT_BOUND`) or detached, and from then on `land` refuses,
+as it does once `SESSION_ENDING` is set — so `remove_autosave` after it
+is final. The worker writes only the temp dir, never the scratch
+directory. A write panic is caught (`catch_unwind`) in unwinding
+builds and logged; in release (`panic = "abort"`) it ends the process.
+A failed autosave is logged and leaves the previous one in place —
+unchanged from before, and still not shown to the user. A snapshot past
+`AUTOSAVE_SNAPSHOT_BUDGET_BYTES` (2 GiB) falls back to the old
+streaming write on the UI thread. An evicted tile whose bytes do not
+decode is left out by the worker and the file routed to the partial
+path.
+
+*Tests* (14 new): 13 in `background_autosave::tests` — recovers to the
+snapshotted document; evicted tiles snapshot without a single fault and
+the file is entry-for-entry identical to the streaming write (blank
+tile included); coalescing (1 and 3 land, 2 is never written); a stale
+generation is refused; an edit (and dropping the store) after the
+snapshot is not in the file; opening another document while the first
+autosave writes (first file is the first document, final file the
+second); `request_autosave` returns before the file exists; quit while
+writing (cancelled, joined, no file, no temp, no submit afterwards);
+a write that finishes after quit does not land; nothing lands once the
+session is ending; a failed write keeps the previous autosave and the
+worker goes on; a panicking write is caught; the snapshot budget. Plus
+`aurora-tile`'s `snapshot_tile_copies_without_paging_in_or_evicting`.
+`startup_document_writes_a_fresh_documents_autosave` now submits the
+returned job and checks it recovers. Test count 2,877 (2,863 + 14).
+
+*Mutations* (each file backed up, mutated, the targeted tests run with
+`AURORA_REQUIRE_GPU=1`, restored, sha256 checked):
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `request_autosave` writes synchronously on the UI thread | killed: `request_autosave_returns_before_the_file_is_written` |
+| M2 | generation check removed from `land` | killed: `a_stale_generation_never_lands_over_a_newer_one` |
+| M3 | coalescing inverted (waiting job kept, newer dropped) | killed: `a_newer_request_replaces_a_waiting_one_and_lands_last` |
+| M4 | temp + rename removed (written straight over the destination) | killed: `a_failed_write_leaves_the_previous_autosave_in_place`, `a_stale_generation_…` |
+| M5 | `shutdown` does not mark the worker cancelled | killed: `a_write_that_finishes_after_quit_does_not_land`, `quitting_while_a_write_is_in_progress_cancels_it` |
+| M6 | `shutdown` does not cancel the write in flight | killed: `quitting_while_a_write_is_in_progress_cancels_it` |
+| M7 | `SESSION_ENDING` guard ignored in `land` | killed: `nothing_lands_once_the_session_is_ending` |
+| M8 | `catch_unwind` removed | killed: `a_panicking_write_is_caught_and_the_worker_goes_on` |
+| M9 | `snapshot_tile` pages in through `get` (the slow walk) | killed: `snapshot_tile_copies_without_paging_in_or_evicting`, `a_background_autosave_of_evicted_tiles_matches_the_streaming_write` |
+| M10 | `CancellableWriter` never cancels | killed: `a_failed_write_leaves_…`, `quitting_while_…` |
+| M11 | `finish_shutdown` does not stop the autosave worker | **survived** — `App` cannot be built headlessly |
+| M12 | `sync_all` before the rename removed | **survived** — only a power loss shows it |
+| M13 | `write_snapshot` stores blank resident tiles | killed: `a_background_autosave_of_evicted_tiles_matches_…` |
+| M14 | `snapshot_tile` ignores pending bytes | killed: `a_background_autosave_of_evicted_tiles_matches_…` |
+
+12 of 14 killed.
+
+*Disclosures.* (1) A "lazy snapshot that reads the live store on the
+worker" cannot be written as a mutation: the worker has no store
+handle (the `TileStore` is `App`'s), so it does not compile; the
+isolation tests pin the behaviour instead. (2) Measured on flat-colour
+layers, whose encoded tiles are tiny; for noisy content each evicted
+tile's scratch read is up to ~512 KiB on the UI thread, and with the
+app's 256-tile budget the resident `memcpy` is up to 128 MiB (measured
+in the review revision below: 98–202 ms for 512 MiB, warm cache). (3) A snapshot holds a second copy of the resident tiles and
+of the evicted tiles' encoded bytes until written (bounded at 2 GiB by
+an I/O-free estimate since review R2, then the old stall). (4) M11: nothing headless calls `finish_shutdown`;
+the shutdown order was reviewed, not tested (review R6 moved it into
+`run_shutdown_cleanup`, where it is tested). (5) An undecodable evicted tile found by the
+worker is recorded in the file and routed to the partial path, but not
+folded back into `App::skipped_tiles`; no test produces one. (6) A
+worker detached at quit can leave its `.tmp` beside the autosave in
+the temp directory if the process exits mid-write; it never lands. (7)
+When a write is cancelled, the `zip` crate prints "ZipWriter drop
+failed: … autosave cancelled" to stderr from its `Drop`; harmless. (8)
+Startup snapshots the demo document before `App` exists and `App::new`
+submits it, so a crash in the first moments of a fresh session may find
+no autosave yet (before 0.152.0 it was written before the window). (9)
+Not run on real macOS hardware; no full-workspace gate this round.
+
+*Review revision.* The candidate's full gate passed
+(`AURORA_REQUIRE_GPU=1`: 2,877 passed, 0 failed, 47 ignored, 0 skipped;
+clippy, strict rustdoc and deny clean); judge REVISE 0.85. After the
+revision the full gate was re-run on the revised tree: all green,
+**2,880 passed, 0 failed, 48 ignored, 0 skipped**; judge round 2
+**PASS 0.906**, no blocking issue. Its non-blocking notes, recorded and
+not done: `snapshot_tile`'s scratch read is an unbounded `fs::read` — the
+budget bound holds only for well-formed scratch files, so a corrupted or
+replaced oversize file (owner-only directory) is read in full before the
+worker's decode refuses it; the UI-thread snapshot scales to roughly
+0.4–0.8 s near the 2 GiB budget from a warm cache, and the ~1 s+
+cold-disk figure is an estimate, so "the autosave no longer blocks the
+UI thread" is partial for large or noisy documents; an over-budget or
+tile-skipping autosave can land a `.partial` while the canonical file
+keeps the previous document's complete autosave (the pre-existing
+partial-autosave rule); `supersede` refuses but does not cancel the
+in-flight write (wasted worker I/O); R6b still survives. Outcomes:
+
+- **R1 (fixed): the wrong document could be recovered.** The
+  over-budget fallback wrote synchronously while an older worker write
+  (for the previous document) was still in flight or waiting; that write
+  then renamed itself over the new one. `request_autosave_within` now
+  calls `AutosaveWorker::supersede` first: under the lock it drops the
+  waiting job and records a new generation as landed, so the in-flight
+  write is refused at its rename (`Landing::Stale`); taking the lock also
+  waits out a rename already under way. The write in flight is not
+  interrupted, only refused. Other synchronous writers and deleters
+  checked: startup's fallback runs before the worker exists; recovery
+  reads before it exists; shutdown deletes only after the worker is
+  shut down. Test
+  `an_older_write_never_lands_over_a_synchronous_over_budget_autosave`.
+- **R2 (fixed): the over-budget path paid twice.** The budget is now
+  decided before any copy or read, from
+  `TileStore::snapshot_len_bound` (I/O-free: resident texel bytes,
+  pending length, or `codec::MAX_ENCODED_LEN` = 8 + 512 KiB for a
+  scratch-disk tile, the codec's own worst case). Test
+  `an_over_budget_document_copies_nothing_before_falling_back` (no
+  scratch bytes read). **Noisy measurement**
+  (`measure_autosave_snapshot_on_noisy_layers`, new, `#[ignore]`: four
+  4096² layers of random `f16` in [0, 1), store flushed so every evicted
+  tile is on the scratch disk, page cache warm), UI-thread snapshot /
+  worker write / old synchronous autosave:
+  dev, 16-tile store 195.5 / 786 / 2,125 ms; dev, 256-tile (app) store
+  105.5 / 848 / 1,776 ms; release, 16-tile 201.7 / 653 / 1,257 ms;
+  release, 256-tile 98.1 / 608 / 1,071 ms; 512 MiB copied or read each
+  time. Release, flat-colour PSD install (the existing measurement):
+  UI-thread total 0.35 s (tile writes 0.34 s, snapshot 7.4 ms) against a
+  1.14 s synchronous autosave. **Worst case**, stated rather than
+  measured: the snapshot reads every evicted tile, up to ~512 KiB each,
+  on the UI thread — 1,024 tiles is 512 MiB, about 0.1–0.2 s from page
+  cache as measured, and roughly 1 s or more from a cold disk at
+  ~500 MB/s; the 2 GiB budget caps it at ~4,000 such tiles.
+- **R3 (done):** "crash-recovery semantics are unchanged" and "writes
+  land in request order" are qualified above and in "Where we are"
+  (same file, format and recovery code; the startup window; the ordering
+  rule after R1).
+- **R4 (not done, disclosed):** feeding worker-found undecodable tiles
+  back to `App::skipped_tiles` needs to know which document they belong
+  to (a later open resets the record), which is more than a cheap
+  change; disclosure 5 stands.
+- **R5 (done):** the temp name is now
+  `<name>.<pid>.<n>.<random>.tmp`, the random part from
+  `std::collections::hash_map::RandomState` (OS-seeded; no new
+  dependency). It was already `create_new` and `0o600`, so this only
+  removes the pre-create denial of service.
+- **R6 (done):** the worker shutdown moved from `finish_shutdown` into
+  `run_shutdown_cleanup`, before the clean and the aborted cleanups,
+  through a new `ShutdownState::autosave_worker`; test
+  `shutdown_cleanup_stops_the_autosave_worker_before_deleting_the_autosave`.
+  What still cannot be tested headlessly is `App`'s own
+  `autosave_worker()` returning the real worker (R6b below).
+
+*Revision mutations* (same procedure; note: restoring a backup with
+`shutil.copy2` keeps its old mtime, which can leave a stale build of a
+*dependency* crate, so these were re-run after touching every file):
+
+| # | mutation | result |
+|---|---|---|
+| R1a | `supersede` call removed from the fallback | killed: `an_older_write_never_lands_over_a_synchronous_over_budget_autosave` |
+| R1b | `supersede` does not mark its generation landed | killed: same |
+| R1c | `supersede` keeps the waiting job | killed: same |
+| R2a | budget pre-check removed | killed: `an_over_budget_document_copies_nothing_before_falling_back`, `a_document_past_the_snapshot_budget_is_not_snapshotted`, the R1 test |
+| R2b | bound counts scratch-disk tiles as 0 bytes | killed: `an_over_budget_document_copies_nothing_before_falling_back` |
+| R6a | `run_shutdown_cleanup` does not stop the worker | killed: `shutdown_cleanup_stops_the_autosave_worker_before_deleting_the_autosave` |
+| R6b | `App::autosave_worker` returns `None` | **survived** — `App` cannot be built headlessly |
+
+Test count 2,880 (2,877 + 3). M11 of the first table is now R6a
+(killed); its remaining headless gap is R6b.
+
+*Needs a human:* open a large PSD on macOS; the end-of-open pause should
+be gone or much shorter.
+
+*Suggested next:* chunk the tile and mask writes of an install across
+frames (the remaining ~0.7 s), then stream PSD layers through the tile
+store (§7.3.1).
 
 **Addendum 2026-10-09 (0.151.0) — opening a file decodes it off the UI
 thread.** Done as 0.151.0 (`crates/aurora-app/src/background_open.rs`,

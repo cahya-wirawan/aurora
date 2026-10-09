@@ -93,6 +93,15 @@ const WHOLE_TILE: Rect = Rect {
     height: TILE,
 };
 
+/// What [`TileStore::snapshot_tile`] copies out of the store.
+#[derive(Debug, Clone)]
+pub enum TileSnapshot {
+    /// A resident tile's texels, copied.
+    Texels(Vec<half::f16>),
+    /// An evicted tile's `codec::encode` bytes, not yet decoded.
+    Encoded(Arc<Vec<u8>>),
+}
+
 /// A sparse, paging, LRU-bounded store of [`Tile`]s, addressed by
 /// `(SurfaceId, TileId)`.
 ///
@@ -778,6 +787,76 @@ impl TileStore {
         self.resident.contains(&key)
             || self.pending.contains_key(&key)
             || self.paged_out.contains_key(&key)
+    }
+
+    /// An upper bound on the bytes [`Self::snapshot_tile`] would copy for
+    /// `(surface, id)`, from what the store already knows and **without
+    /// any I/O** (0.152.0 review R2): a resident tile's texel bytes, a
+    /// pending write's exact length, or [`codec::MAX_ENCODED_LEN`] for a
+    /// tile on the scratch disk. `None` for an absent tile. Lets a caller
+    /// refuse an over-budget snapshot before copying anything. (A scratch
+    /// file that was corrupted to a larger size is not bounded by this; it
+    /// is read and then refused by `codec::decode`.)
+    #[must_use]
+    pub fn snapshot_len_bound(&self, surface: SurfaceId, id: TileId) -> Option<usize> {
+        let key = (surface, id);
+        if self.resident.contains(&key) {
+            Some(crate::SAMPLES * std::mem::size_of::<half::f16>())
+        } else if let Some((_generation, bytes)) = self.pending.get(&key) {
+            Some(bytes.len())
+        } else if self.paged_out.contains_key(&key) {
+            Some(codec::MAX_ENCODED_LEN)
+        } else {
+            None
+        }
+    }
+
+    /// A copy of what this store holds for `(surface, id)` that stays
+    /// valid however the store changes afterwards, taken **without
+    /// paging the tile in** (0.152.0, for `aurora-io`'s autosave
+    /// snapshot). `Ok(None)` for a tile [`Self::contains_tile`] would
+    /// call absent.
+    ///
+    /// A resident tile comes back as a copy of its texels; it is
+    /// `peek`ed, so its place in the LRU does not move. An evicted tile
+    /// comes back as its `codec::encode` bytes, without decoding them:
+    /// shared with the pending write when that has not been confirmed
+    /// yet, otherwise read from its scratch file. Nothing is evicted and
+    /// nothing is decoded — the two costs that made walking the store
+    /// with [`Self::get`] about as slow as writing the container. The
+    /// encoded bytes are *not* validated here; a caller that needs them
+    /// to be a tile decodes them (`codec::decode`) itself.
+    ///
+    /// # Errors
+    ///
+    /// [`TileError::Io`] if an evicted tile's scratch file cannot be read.
+    pub fn snapshot_tile(
+        &mut self,
+        surface: SurfaceId,
+        id: TileId,
+    ) -> Result<Option<TileSnapshot>, TileError> {
+        self.reconcile_pending();
+        let key = (surface, id);
+        if let Some(tile) = self.resident.peek(&key) {
+            return Ok(Some(TileSnapshot::Texels(tile.texels().to_vec())));
+        }
+        if let Some((_generation, bytes)) = self.pending.get(&key) {
+            return Ok(Some(TileSnapshot::Encoded(Arc::clone(bytes))));
+        }
+        let Some(path) = self.paged_out.get(&key) else {
+            return Ok(None);
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                self.stats.bytes_read += bytes.len() as u64;
+                Ok(Some(TileSnapshot::Encoded(Arc::new(bytes))))
+            }
+            Err(source) => Err(TileError::Io {
+                surface,
+                id,
+                source,
+            }),
+        }
     }
 
     /// Drops everything this store holds for `(surface, id)` — resident,
@@ -2214,6 +2293,64 @@ mod tests {
         };
         assert!(tile.texels().iter().all(|s| s.to_f32() == 0.0));
         assert_eq!(store.stats().tiles_created, 1);
+    }
+
+    #[test]
+    fn snapshot_tile_copies_without_paging_in_or_evicting() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        for (id, value) in [(a, 0.25_f32), (b, 0.5)] {
+            let tile = match store.get_mut(s, id) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err}"),
+            };
+            if let Some(first) = tile.texels_mut().first_mut() {
+                *first = half::f16::from_f32(value);
+            }
+        }
+        let faults = store.stats().faults;
+        // `b` is resident, `a` evicted (pending or on disk). The I/O-free
+        // bound covers what `snapshot_tile` then copies.
+        assert_eq!(
+            store.snapshot_len_bound(s, b),
+            Some(crate::SAMPLES * std::mem::size_of::<half::f16>())
+        );
+        let a_bound = store.snapshot_len_bound(s, a);
+        assert!(store.snapshot_len_bound(s, TileId { x: 9, y: 9 }).is_none());
+        let resident = match store.snapshot_tile(s, b) {
+            Ok(Some(super::TileSnapshot::Texels(texels))) => texels,
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(resident.first().map(|t| t.to_f32()), Some(0.5));
+        let evicted = match store.snapshot_tile(s, a) {
+            Ok(Some(super::TileSnapshot::Encoded(bytes))) => bytes,
+            other => unreachable!("{other:?}"),
+        };
+        let decoded = match crate::codec::decode(&evicted) {
+            Ok(texels) => texels,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(decoded.first().map(|t| t.to_f32()), Some(0.25));
+        assert!(a_bound.is_some_and(|bound| bound >= evicted.len()));
+        assert!(evicted.len() <= crate::codec::MAX_ENCODED_LEN);
+        assert!(matches!(
+            store.snapshot_tile(s, TileId { x: 9, y: 9 }),
+            Ok(None)
+        ));
+        assert_eq!(store.stats().faults, faults, "nothing was paged in");
+        assert!(
+            store.is_resident(s, b) && !store.is_resident(s, a),
+            "nothing moved"
+        );
+        // The copy is independent of later edits.
+        if let Ok(tile) = store.get_mut(s, b)
+            && let Some(first) = tile.texels_mut().first_mut()
+        {
+            *first = half::f16::from_f32(1.0);
+        }
+        assert_eq!(resident.first().map(|t| t.to_f32()), Some(0.5));
     }
 
     #[test]

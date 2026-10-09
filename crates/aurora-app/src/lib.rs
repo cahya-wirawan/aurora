@@ -537,6 +537,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+mod background_autosave;
 mod background_open;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -1683,6 +1684,21 @@ fn replace_document_pixels(
 // still-open work either way: an incremental, dirty-tile-only autosave,
 // or a tile store readable from a background thread.
 //
+// **0.152.0: the write moved off the UI thread; the triggers did not
+// change.** Each boundary now takes an `aurora_io::AurSnapshot` on the
+// UI thread ([`snapshot_autosave`], through
+// `aurora_tile::TileStore::snapshot_tile`, which copies a resident
+// tile's texels and an evicted tile's encoded bytes without paging,
+// decoding or evicting anything — ~7.5 ms for a 4096x4096 four-layer
+// document where the old walk took ~1.8 s) and hands it to
+// [`background_autosave::AutosaveWorker`], which writes, syncs and
+// renames it exactly as [`write_autosave`] does. The file and its
+// recovery are unchanged. The per-edit trigger is still not restored:
+// a snapshot is cheap but not free (a resident-tile `memcpy`, plus a
+// scratch-file read per evicted tile) and would still land on the
+// stroke-commit path. A document whose snapshot would pass
+// [`AUTOSAVE_SNAPSHOT_BUDGET_BYTES`] keeps the old streaming write.
+//
 // Both the marker and the autosave file live in `std::env::temp_dir()`
 // under fixed names — deliberately not a proper per-platform app-support
 // directory, a pre-existing choice from when both files held only
@@ -1916,6 +1932,213 @@ fn write_autosave(
     }
 }
 
+/// The most texel bytes an autosave snapshot may copy before
+/// [`request_autosave`] falls back to [`write_autosave`]'s streaming
+/// write on the UI thread (0.152.0). A snapshot is a second in-memory
+/// copy of the document's tiles, so it must stay bounded (§7.3.1); 2 GiB
+/// is four times the 4096x4096 four-layer document the 0.151.0 install
+/// was measured on, and a document past it pays the old stall rather
+/// than an unbounded allocation.
+const AUTOSAVE_SNAPSHOT_BUDGET_BYTES: usize = 2 << 30;
+
+/// Requests this document's autosave without writing it on the UI
+/// thread (0.152.0): takes a snapshot here ([`snapshot_autosave`]) and
+/// hands it to `worker`, which encodes and writes it
+/// ([`background_autosave`]). Both document-replacement triggers go
+/// through this (`App::open_file`'s install, [`App::open_aur_file`]);
+/// the third, a fresh session's startup document, snapshots in
+/// [`startup_document`] and submits in `App::new`.
+///
+/// A document whose tiles would not fit [`AUTOSAVE_SNAPSHOT_BUDGET_BYTES`]
+/// falls back to [`write_autosave`] on this thread — the pre-0.152.0
+/// behaviour, streamed, never holding the document twice.
+fn request_autosave(
+    worker: &mut background_autosave::AutosaveWorker,
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    store: &mut aurora_tile::TileStore,
+) {
+    request_autosave_within(
+        worker,
+        AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
+        path,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        store,
+    );
+}
+
+/// [`request_autosave`] with the snapshot budget passed in, so a test can
+/// reach the over-budget fallback without a 2 GiB document.
+///
+/// **The fallback supersedes the worker first** (0.152.0 review R1):
+/// without it, a write still in flight (or waiting) for the *previous*
+/// document would finish after this synchronous one and rename itself
+/// over it, and a crash would then recover the wrong document.
+#[allow(clippy::too_many_arguments)]
+fn request_autosave_within(
+    worker: &mut background_autosave::AutosaveWorker,
+    budget: usize,
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    store: &mut aurora_tile::TileStore,
+) {
+    match snapshot_autosave(path, layers, history, canvas_size, skipped, budget, store) {
+        SnapshotOutcome::Taken(job) => {
+            let _generation = worker.submit(job);
+        }
+        SnapshotOutcome::OverBudget => {
+            tracing::info!("the document is too large to snapshot; autosaving on the UI thread");
+            let _generation = worker.supersede();
+            write_autosave(path, layers, history, canvas_size, skipped, store);
+        }
+        SnapshotOutcome::Failed => {}
+    }
+}
+
+/// What [`snapshot_autosave`] produced.
+#[derive(Debug)]
+enum SnapshotOutcome {
+    Taken(background_autosave::AutosaveJob),
+    /// Past the byte budget; nothing was taken.
+    OverBudget,
+    /// Refused and logged (the same refusals [`write_autosave`] logs).
+    Failed,
+}
+
+/// The UI-thread half of a background autosave (0.152.0): everything
+/// [`write_autosave`] reads from `store`, copied into an
+/// [`aurora_io::AurSnapshot`] in one call, plus where the write must land.
+/// The same rules as [`write_autosave`]: `skipped` goes in and comes back
+/// out with whatever tile this snapshot could not read folded in, and a
+/// snapshot missing tiles is routed to [`partial_autosave_path`], never
+/// over a complete autosave.
+fn snapshot_autosave(
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    max_texel_bytes: usize,
+    store: &mut aurora_tile::TileStore,
+) -> SnapshotOutcome {
+    let snapshot = match aurora_io::snapshot_aur_best_effort(
+        layers,
+        history,
+        canvas_size,
+        None,
+        skipped,
+        max_texel_bytes,
+        store,
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return SnapshotOutcome::OverBudget,
+        Err(err) => {
+            tracing::warn!(?err, path = %path.display(), "failed to snapshot the autosave container");
+            return SnapshotOutcome::Failed;
+        }
+    };
+    let destination = if snapshot.skipped().is_empty() {
+        path.to_path_buf()
+    } else {
+        skipped.record(snapshot.skipped());
+        let destination = partial_autosave_path(path);
+        tracing::warn!(
+            skipped = snapshot.skipped().len(),
+            known_total = skipped.total(),
+            path = %destination.display(),
+            "autosaving with tiles missing to the *partial* autosave path; the last complete \
+             autosave is left in place"
+        );
+        destination
+    };
+    SnapshotOutcome::Taken(background_autosave::AutosaveJob {
+        path: path.to_path_buf(),
+        destination,
+        snapshot,
+    })
+}
+
+/// The worker half of a background autosave (0.152.0): writes `job`'s
+/// snapshot to a fresh, unique, owner-only temp file beside its path
+/// ([`autosave_temp_path`], [`create_autosave_temp`]) and `sync_all`s
+/// it, returning the temp path for [`land_autosave_temp`] to rename. Any
+/// failure, including `cancel` being set mid-write, is logged and
+/// removes the temp file. A write that found an evicted tile it could
+/// not decode (`aurora_io::write_aur_snapshot`) is redirected to
+/// [`partial_autosave_path`], the rule [`write_autosave`] applies; that
+/// loss is recorded inside the file but, unlike the UI-thread path, not
+/// folded back into `App::skipped_tiles` (the next autosave finds the
+/// same tile unreadable again).
+fn write_autosave_temp(
+    job: &background_autosave::AutosaveJob,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<background_autosave::WrittenTemp> {
+    let temp_path = autosave_temp_path(&job.path);
+    let mut file = create_autosave_temp(&temp_path)?;
+    let written = aurora_io::write_aur_snapshot(
+        background_autosave::CancellableWriter {
+            inner: &mut file,
+            cancel,
+        },
+        &job.snapshot,
+    );
+    let destination = match written {
+        Ok(fresh) if fresh.is_empty() => job.destination.clone(),
+        Ok(fresh) => {
+            let destination = partial_autosave_path(&job.path);
+            tracing::warn!(
+                skipped = fresh.len(),
+                path = %destination.display(),
+                "autosaving with undecodable tiles missing to the *partial* autosave path"
+            );
+            destination
+        }
+        Err(err) => {
+            tracing::warn!(?err, path = %temp_path.display(), "failed to write the autosave container");
+            drop(file);
+            remove_autosave_temp(&temp_path);
+            return None;
+        }
+    };
+    // Before the rename, for [`write_autosave`]'s reason.
+    if let Err(err) = file.sync_all() {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to flush the autosave container");
+        drop(file);
+        remove_autosave_temp(&temp_path);
+        return None;
+    }
+    drop(file);
+    Some(background_autosave::WrittenTemp {
+        temp: temp_path,
+        destination,
+    })
+}
+
+/// Renames a finished temp file over `destination`, the atomic swap
+/// [`write_autosave`] performs, and drops a stale partial autosave once
+/// a complete one has landed on `path`. `false` (temp removed) if the
+/// rename failed.
+fn land_autosave_temp(temp: &Path, destination: &Path, path: &Path) -> bool {
+    if let Err(err) = std::fs::rename(temp, destination) {
+        tracing::warn!(?err, path = %destination.display(), "failed to swap the autosave container into place");
+        remove_autosave_temp(temp);
+        return false;
+    }
+    if destination == path {
+        remove_partial_autosave(path);
+    }
+    true
+}
+
 /// Where a *knowingly incomplete* autosave goes — a sibling of `path`,
 /// never `path` itself.
 ///
@@ -1944,7 +2167,7 @@ fn remove_partial_autosave(path: &Path) {
 }
 
 /// A temp path beside `path`, unique per process **and** per call —
-/// `<name>.<pid>.<n>.tmp`.
+/// `<name>.<pid>.<n>.<random>.tmp`.
 ///
 /// Not cosmetic: a single fixed `.tmp` name is shared state between
 /// every writer that exists, and two writers landing on it interleave
@@ -1960,7 +2183,20 @@ fn autosave_temp_path(path: &Path) -> PathBuf {
         || std::ffi::OsString::from("aurora-autosave.aur"),
         std::ffi::OsStr::to_os_string,
     );
-    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    // An unpredictable component too (0.152.0 review R5): with only the
+    // pid and a counter, another local user could guess the name and
+    // pre-create it, refusing every autosave (`create_new`). `RandomState`
+    // is keyed from the OS's randomness, so no new dependency is needed.
+    let random = {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(sequence);
+        hasher.finish()
+    };
+    name.push(format!(
+        ".{}.{sequence}.{random:016x}.tmp",
+        std::process::id()
+    ));
     path.with_file_name(name)
 }
 
@@ -2215,6 +2451,11 @@ struct StartupDocument {
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
     was_recovered: bool,
+    /// The fresh document's autosave snapshot, for `App::new` to hand
+    /// to its [`background_autosave::AutosaveWorker`] (0.152.0); `None`
+    /// when recovery succeeded (the file already holds this document),
+    /// with no store, or when it fell back to a synchronous write.
+    autosave: Option<background_autosave::AutosaveJob>,
 }
 
 /// Resolves the document [`App::new`] opens with: a crash-recovered one
@@ -2257,6 +2498,7 @@ fn startup_document(
             canvas_size,
             skipped_tiles: aurora_io::SkippedTiles::new(),
             was_recovered: false,
+            autosave: None,
         };
     }
     let recovered = match (had_previous_marker, store_slot.as_mut()) {
@@ -2301,6 +2543,7 @@ fn startup_document(
             canvas_size,
             skipped_tiles,
             was_recovered: true,
+            autosave: None,
         };
     }
     if had_previous_marker {
@@ -2330,15 +2573,29 @@ fn startup_document(
     // temporary, because this write can itself hit an unreadable tile
     // and what it drops has to reach `App::skipped_tiles`.
     let mut skipped_tiles = aurora_io::SkippedTiles::new();
+    let mut autosave = None;
     if let Some(store) = store_slot.as_mut() {
-        write_autosave(
+        // Snapshotted here, written by `App::new`'s worker (0.152.0).
+        match snapshot_autosave(
             autosave_path,
             &layers,
             &history,
             canvas_size,
             &mut skipped_tiles,
+            AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             store,
-        );
+        ) {
+            SnapshotOutcome::Taken(job) => autosave = Some(job),
+            SnapshotOutcome::OverBudget => write_autosave(
+                autosave_path,
+                &layers,
+                &history,
+                canvas_size,
+                &mut skipped_tiles,
+                store,
+            ),
+            SnapshotOutcome::Failed => {}
+        }
     } else {
         tracing::warn!("no live tile store; skipping this session's autosave");
     }
@@ -2348,6 +2605,7 @@ fn startup_document(
         canvas_size,
         skipped_tiles,
         was_recovered: false,
+        autosave,
     }
 }
 
@@ -16801,6 +17059,17 @@ fn remove_session_scratch(state: &mut impl ShutdownState) {
 /// misbehaving machine. Writing that back would overwrite a good saved
 /// layout with defaults for no gain.
 fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
+    // First, on both paths (0.152.0): the autosave is abandoned, never
+    // finished — a clean quit deletes it just below anyway, and an
+    // aborted startup must not replace a previous crash's autosave. Once
+    // this returns no autosave write can land, so the deletion that
+    // follows is final.
+    if let Some(worker) = state.autosave_worker() {
+        let autosave = worker.shutdown(background_autosave::SHUTDOWN_WAIT_BOUND);
+        if autosave.was_writing || autosave.dropped_queued {
+            tracing::info!(?autosave, "quit with an autosave pending; it was abandoned");
+        }
+    }
     if state.aborted() {
         aborted_startup_cleanup(state);
         return;
@@ -16834,6 +17103,9 @@ fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
 /// what let a test drive the failed-vs-clean branch and the layout save
 /// without an event loop.
 trait ShutdownState {
+    /// The background autosave writer, stopped before anything is
+    /// deleted ([`run_shutdown_cleanup`]); `None` when there is none.
+    fn autosave_worker(&mut self) -> Option<&mut background_autosave::AutosaveWorker>;
     /// This run's own "I'm still running" marker.
     fn marker_path(&self) -> &Path;
     /// Where the autosave this run has been writing lives.
@@ -17685,6 +17957,9 @@ struct App {
     /// The open still decoding on a background thread, if any, and the
     /// channel its result comes back on (0.151.0).
     open_worker: OpenWorker,
+    /// Writes the crash-recovery autosave off the UI thread (0.152.0,
+    /// [`background_autosave`]).
+    autosave_worker: background_autosave::AutosaveWorker,
     /// The real workspace layout (`aurora_ui::build_workspace` — canvas
     /// area + the Layers/Properties/History dock, matching the
     /// owner-approved workspace mockup) — a static structure for now,
@@ -18123,6 +18398,10 @@ struct CaretState {
 }
 
 impl ShutdownState for App {
+    fn autosave_worker(&mut self) -> Option<&mut background_autosave::AutosaveWorker> {
+        Some(&mut self.autosave_worker)
+    }
+
     fn marker_path(&self) -> &Path {
         &self.marker_path
     }
@@ -18209,7 +18488,13 @@ impl App {
             canvas_size,
             skipped_tiles,
             was_recovered,
+            autosave,
         } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
+        // The startup autosave's write, off this thread (0.152.0).
+        let mut autosave_worker = background_autosave::AutosaveWorker::default();
+        if let Some(job) = autosave {
+            let _generation = autosave_worker.submit(job);
+        }
         // Every startup panel step lives in [`install_startup_panels`]
         // (review revision, 0.142.0), so the startup "active row is
         // selected" contract is unit-testable without a window. Seeded
@@ -18285,6 +18570,7 @@ impl App {
             adapter: None,
             proxy,
             open_worker: OpenWorker::default(),
+            autosave_worker,
             workspace,
             focus,
             shortcuts: default_shortcuts(),
@@ -19077,7 +19363,9 @@ impl App {
             // the write for the same reason `open_aur_file` assigns its
             // own before its write.
             self.skipped_tiles = aurora_io::SkippedTiles::new();
-            write_autosave(
+            // A snapshot here, the write on the autosave worker (0.152.0).
+            request_autosave(
+                &mut self.autosave_worker,
                 &autosave_path(),
                 &self.layers,
                 &self.history,
@@ -19242,7 +19530,8 @@ impl App {
         // populated the store by now, so the container this writes
         // carries the opened document's real tiles.
         if let Some(store) = self.tile_store.as_mut() {
-            write_autosave(
+            request_autosave(
+                &mut self.autosave_worker,
                 &autosave_path(),
                 &layers,
                 &history,
@@ -20569,6 +20858,9 @@ impl App {
                 "quit with a file still decoding; its thread was detached"
             );
         }
+        // `run_shutdown_cleanup` stops the autosave worker before it
+        // deletes anything (0.152.0; review R6 moved that step there so
+        // the ordering is tested).
         run_shutdown_cleanup(self);
     }
 
@@ -30250,6 +30542,7 @@ mod tests {
         );
 
         let state = FakeShutdownState {
+            autosave_worker: None,
             marker: marker.clone(),
             autosave: autosave.clone(),
             store: Some(store),
@@ -30275,6 +30568,7 @@ mod tests {
     /// out of the running application, backed by throwaway paths instead
     /// of the live session's.
     struct FakeShutdownState {
+        autosave_worker: Option<crate::background_autosave::AutosaveWorker>,
         marker: PathBuf,
         autosave: PathBuf,
         store: Option<aurora_tile::TileStore>,
@@ -30293,6 +30587,10 @@ mod tests {
     }
 
     impl ShutdownState for FakeShutdownState {
+        fn autosave_worker(&mut self) -> Option<&mut crate::background_autosave::AutosaveWorker> {
+            self.autosave_worker.as_mut()
+        }
+
         fn marker_path(&self) -> &std::path::Path {
             &self.marker
         }
@@ -30478,6 +30776,68 @@ mod tests {
     /// gone. Called for its lack of panic, and to pin that an absent
     /// path is not treated as an error.
     #[test]
+    fn shutdown_cleanup_stops_the_autosave_worker_before_deleting_the_autosave() {
+        // 0.152.0 review R6: the ordering `finish_shutdown` relies on,
+        // pinned through `run_shutdown_cleanup`. The worker's write has
+        // finished its temp file and is about to land when the quit
+        // begins; once the cleanup has deleted the autosave, nothing may
+        // put it back.
+        let mut fixture = shutdown_fixture(Aborted::No, None);
+        let path = fixture.autosave.clone();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let started_tx = std::sync::Mutex::new(started_tx);
+        let write = move |job: &crate::background_autosave::AutosaveJob,
+                          cancel: &std::sync::atomic::AtomicBool| {
+            let written = crate::write_autosave_temp(job, cancel);
+            if let Ok(tx) = started_tx.lock() {
+                let _ = tx.send(());
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            written
+        };
+        let mut worker = crate::background_autosave::AutosaveWorker::new(
+            write,
+            crate::background_autosave::test_support::never,
+        );
+        let (_store_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "ink", layer_bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let crate::SnapshotOutcome::Taken(job) = crate::snapshot_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut aurora_io::SkippedTiles::new(),
+            crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
+            &mut store,
+        ) else {
+            unreachable!("a tiny document is snapshotted");
+        };
+        assert_eq!(worker.submit(job), Some(1));
+        assert!(
+            started
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok()
+        );
+        fixture.state.autosave_worker = Some(worker);
+        run_shutdown_cleanup(&mut fixture.state);
+        assert!(!path.exists(), "the clean shutdown deleted the autosave");
+        if let Some(worker) = fixture.state.autosave_worker.as_ref() {
+            assert!(worker.wait_idle(std::time::Duration::from_secs(5)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!path.exists(), "and no late write put it back");
+    }
+
+    #[test]
     fn clean_shutdown_cleanup_tolerates_having_nothing_to_remove() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -30486,6 +30846,7 @@ mod tests {
         let marker = dir.path().join("never-written.marker");
         let autosave = dir.path().join("never-written.aur");
         let mut state = FakeShutdownState {
+            autosave_worker: None,
             marker: marker.clone(),
             autosave: autosave.clone(),
             store: None,
@@ -50869,9 +51230,26 @@ mod tests {
         let mut slot = Some(store);
         let startup = super::startup_document(false, &path, &mut slot);
         assert!(!startup.was_recovered);
+        // Since 0.152.0 startup only snapshots; `App::new` hands the job
+        // to its autosave worker, which this stands in for.
+        assert!(!path.exists(), "startup itself no longer writes the file");
+        let Some(job) = startup.autosave else {
+            unreachable!("a fresh session must request its autosave");
+        };
+        let mut worker = crate::background_autosave::AutosaveWorker::new(
+            crate::write_autosave_temp,
+            crate::background_autosave::test_support::never,
+        );
+        assert_eq!(worker.submit(job), Some(1));
+        assert!(worker.wait_idle(std::time::Duration::from_secs(30)));
         assert!(
             path.exists(),
             "a fresh session must leave a recoverable autosave behind"
+        );
+        let (_fresh_dir, mut fresh) = real_tile_store();
+        assert!(
+            recover_document(&path, &mut fresh).is_some(),
+            "and it must recover"
         );
     }
 
@@ -61436,7 +61814,7 @@ mod tests {
     /// `cargo test -p aurora-app --release -- --ignored --nocapture measure_installing`.
     #[test]
     #[ignore = "measurement, allocates over a gigabyte"]
-    #[allow(clippy::print_stderr)]
+    #[allow(clippy::print_stderr, clippy::too_many_lines)]
     fn measure_installing_a_large_psd_on_the_ui_thread() {
         let side = 4096_i32;
         let layers: Vec<TinyLayer> = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]]
@@ -61490,27 +61868,64 @@ mod tests {
         );
         let pixels = started.elapsed();
         assert_eq!(failed, 0);
+        // 0.152.0: the UI thread takes a snapshot and submits it; the
+        // worker writes. Timed first, so the synchronous comparison
+        // below cannot have warmed the store's LRU for it.
         let autosave = dir.path().join("autosave.aur");
+        let mut worker = crate::background_autosave::AutosaveWorker::new(
+            crate::write_autosave_temp,
+            crate::background_autosave::test_support::never,
+        );
         let mut skipped = aurora_io::SkippedTiles::new();
         let started = std::time::Instant::now();
-        write_autosave(
+        let crate::SnapshotOutcome::Taken(job) = crate::snapshot_autosave(
             &autosave,
             &document.layers,
             &document.history,
             document.canvas_size,
             &mut skipped,
+            crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
+            &mut store,
+        ) else {
+            unreachable!("a 4096x4096 four-layer document fits the snapshot budget");
+        };
+        let snapshot_time = started.elapsed();
+        let snapshot_mb = job.snapshot.texel_bytes() / (1024 * 1024);
+        let started = std::time::Instant::now();
+        assert_eq!(worker.submit(job), Some(1));
+        let submit_time = started.elapsed();
+        let started = std::time::Instant::now();
+        assert!(worker.wait_idle(std::time::Duration::from_mins(10)));
+        let worker_time = started.elapsed();
+        assert!(autosave.exists());
+        // The pre-0.152.0 path, for the before/after comparison.
+        let sync_path = dir.path().join("autosave-sync.aur");
+        let started = std::time::Instant::now();
+        write_autosave(
+            &sync_path,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            &mut aurora_io::SkippedTiles::new(),
             &mut store,
         );
-        let autosave_time = started.elapsed();
+        let sync_time = started.elapsed();
+        let ui = panels + pixels + snapshot_time + submit_time;
         eprintln!(
             "large PSD ({side}x{side}, 4 layers, {file_mb} MiB file): background decode {:.1} ms; \
-             UI-thread install: panels {:.1} ms, tile writes {:.1} ms, autosave {:.1} ms, total {:.1} ms",
+             UI-thread install: panels {:.1} ms, tile writes {:.1} ms, autosave snapshot {:.1} ms \
+             ({snapshot_mb} MiB), submit {:.3} ms, UI-thread total {:.1} ms; worker write {:.1} ms \
+             (off the UI thread); for comparison the synchronous pre-0.152.0 autosave {:.1} ms",
             decode.as_secs_f64() * 1e3,
             panels.as_secs_f64() * 1e3,
             pixels.as_secs_f64() * 1e3,
-            autosave_time.as_secs_f64() * 1e3,
-            (panels + pixels + autosave_time).as_secs_f64() * 1e3,
+            snapshot_time.as_secs_f64() * 1e3,
+            submit_time.as_secs_f64() * 1e3,
+            ui.as_secs_f64() * 1e3,
+            worker_time.as_secs_f64() * 1e3,
+            sync_time.as_secs_f64() * 1e3,
         );
+        let _shutdown = worker.shutdown(crate::background_autosave::SHUTDOWN_WAIT_BOUND);
     }
     /// An [`OpenInstaller`] over a real workspace and dialog slot (0.151.0
     /// review E1). Its install shows what `App::install_finished_open`

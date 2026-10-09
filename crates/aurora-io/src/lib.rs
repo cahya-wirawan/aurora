@@ -42,8 +42,9 @@ pub mod psd;
 pub mod tiff;
 
 pub use aur::{
-    AurDocument, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
-    write as write_aur, write_best_effort as write_aur_best_effort,
+    AurDocument, AurSnapshot, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
+    snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,
+    write_best_effort as write_aur_best_effort, write_snapshot as write_aur_snapshot,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
