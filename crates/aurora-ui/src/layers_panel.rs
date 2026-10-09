@@ -865,8 +865,16 @@ mod tests {
         let mut expected: Vec<_> = ws.tools.buttons.iter().map(|(_, id)| *id).collect();
         expected.push(ws.layers.root);
         expected.extend_from_slice(&row_ids);
+        // 0.164.0: then the group's selected tab (roving focus: one stop
+        // per tab row) and the shown tab panel; History is hidden.
+        let Ok(bar) = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar) else {
+            unreachable!("the group has a bar");
+        };
+        let Some(tab) = bar.selected_tab() else {
+            unreachable!("a tab is selected");
+        };
+        expected.push(tab);
         expected.push(ws.properties.root);
-        expected.push(ws.history.root);
         assert_eq!(
             visited, expected,
             "three layers currently cost three tab stops between Layers and Properties"
@@ -1170,10 +1178,12 @@ mod tests {
             }
             ws.tree.compute_layout(1600.0, 900.0);
 
+            // 0.164.0: the slot under Layers is the Properties + History
+            // group, its tab row over the shown tab (Properties).
             let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
                 ws.tree.bounds(ws.layers.root),
                 ws.tree.bounds(ws.properties.root),
-                ws.tree.bounds(ws.history.root),
+                ws.tree.bounds(ws.panel_group.bar),
             ) else {
                 unreachable!("just laid out");
             };

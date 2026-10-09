@@ -41,6 +41,7 @@ pub mod history_panel;
 pub mod layer_controls;
 pub mod layers_panel;
 pub mod panel;
+pub mod panel_group;
 pub mod properties_panel;
 pub mod status_bar;
 pub mod tool;
@@ -71,6 +72,11 @@ pub use panel::{
     PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel, panel_is_closed,
     panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_sizing,
 };
+pub use panel_group::{
+    PanelGroup, follow_panel_group_tab, insert_panel_group, is_panel_group_tab,
+    panel_group_contains, panel_group_is_collapsed, panel_group_selected, panel_group_shown,
+    refocus_out_of_hidden, set_panel_group_collapsed, show_panel_group_tab, sync_panel_group,
+};
 pub use properties_panel::populate_properties_panel;
 pub use status_bar::{
     STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
@@ -85,4 +91,8 @@ pub use tools_panel::{
     TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel, selected_tool, sync_tools_panel,
     tools_panel_contains,
 };
-pub use workspace::{OPTIONS_BAR_LABEL, Workspace, build_workspace, rail_width, set_rail_width};
+pub use workspace::{
+    OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, Workspace, build_workspace,
+    close_workspace_panel, rail_width, select_panel_tab, set_rail_width, show_workspace_panel,
+    toggle_workspace_panel,
+};

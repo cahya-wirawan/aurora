@@ -42,13 +42,31 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, FlexDirection, Style};
 
-use crate::panel::{PanelHandle, PanelSizing, insert_panel, set_panel_sizing};
+use crate::panel::{
+    PanelHandle, PanelSizing, close_panel, insert_panel, panel_is_closed, panel_is_collapsed,
+    set_panel_collapsed, set_panel_sizing,
+};
+use crate::panel_group::{
+    PanelGroup, insert_panel_group, panel_group_shown, set_panel_group_collapsed,
+    show_panel_group_tab, sync_panel_group,
+};
 use crate::status_bar::{StatusBar, StatusInfo, insert_status_bar};
 use crate::tool::Tool;
 use crate::tools_panel::{ToolsPanel, insert_tools_panel};
 
 /// The options bar's accessible label.
 pub const OPTIONS_BAR_LABEL: &str = "Tool options";
+
+/// The Properties + History tab group's tab-list label (0.164.0).
+pub const PANEL_GROUP_LABEL: &str = "Properties and History";
+
+/// The tab [`build_workspace`] selects in [`Workspace::panel_group`], and
+/// the one a saved layout without a tab falls back to: `0`, Properties
+/// (0.164.0). Properties is where the Curves editor and a layer's own
+/// settings live — what a user reaches for most — while History is
+/// reference; Photoshop's own default likewise opens Properties over its
+/// History-and-friends group.
+pub const PANEL_GROUP_TAB_DEFAULT: usize = 0;
 
 /// [`set_rail_width`]'s own clamp range, in logical px. Engineering
 /// defaults, not design tokens: `design/tokens/scales.toml` has no
@@ -105,8 +123,16 @@ pub struct Workspace {
     /// module's own doc comment).
     pub rail: WidgetId,
     pub layers: PanelHandle,
+    /// The Properties panel — since 0.164.0 the first tab of
+    /// [`Self::panel_group`], still an ordinary [`PanelHandle`].
     pub properties: PanelHandle,
+    /// The History panel — since 0.164.0 the second tab of
+    /// [`Self::panel_group`].
     pub history: PanelHandle,
+    /// The Properties + History tab group (0.164.0, [`crate::panel_group`]):
+    /// one dock slot under Layers, which stays on its own. Its members are
+    /// [`Self::properties`] then [`Self::history`].
+    pub panel_group: PanelGroup,
     /// The History panel's current-step row (0.147.1) — the one
     /// [`crate::populate_history_panel`] last returned, `None` until a
     /// caller first populates it. `aurora-app` records it here so its
@@ -274,13 +300,24 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let properties = match insert_panel(&mut tree, rail, "Properties", scales) {
-        Ok(panel) => panel,
+    // 0.164.0: Properties and History share one slot as tabs; Layers
+    // stays on its own (Photoshop keeps Layers separate and groups
+    // History with other panels). Two non-empty titles and an in-range
+    // default, so the group insert cannot fail.
+    let panel_group = match insert_panel_group(
+        &mut tree,
+        rail,
+        PANEL_GROUP_LABEL,
+        &["Properties", "History"],
+        PANEL_GROUP_TAB_DEFAULT,
+        scales,
+    ) {
+        Ok(group) => group,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let history = match insert_panel(&mut tree, rail, "History", scales) {
-        Ok(panel) => panel,
-        Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
+    let (properties, history) = match panel_group.members.as_slice() {
+        [properties, history] => (*properties, *history),
+        _ => unreachable!("the group was built with exactly two titles"),
     };
     // 0.161.0: Layers and Properties take their content's height (their
     // rows up to the `size.content_panel_max_rows` token, then they scroll); History keeps the zero-basis
@@ -290,6 +327,9 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         if let Err(err) = set_panel_sizing(&mut tree, panel, PanelSizing::Content, scales) {
             unreachable!("the panel was just inserted into this same tree: {err:?}");
         }
+    }
+    if let Err(err) = sync_panel_group(&mut tree, &panel_group) {
+        unreachable!("the group was just inserted into this same tree: {err:?}");
     }
 
     Workspace {
@@ -305,6 +345,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         layers,
         properties,
         history,
+        panel_group,
         history_current: None,
         history_rows: HashMap::new(),
     }
@@ -452,6 +493,117 @@ pub fn set_rail_width(
     let mut updated = node.clone();
     updated.set_numeric_value(f64::from(clamped));
     tree.set_accessibility(divider_id, updated)
+}
+
+/// The panel-toggle command's action on `panel` (0.164.0 for grouped
+/// panels): an ungrouped panel flips collapsed/expanded, as before. A
+/// panel in [`Workspace::panel_group`] that is its group's shown,
+/// expanded tab collapses the group to its tab row; otherwise its tab is
+/// selected and the group expanded (reopening it if it was closed).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed handle.
+pub fn toggle_workspace_panel(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
+    let group = workspace.panel_group.clone();
+    if let Some(index) = group.index_of(panel) {
+        let showing = panel_group_shown(&workspace.tree, &group) == Some(index)
+            && !panel_is_collapsed(&workspace.tree, panel)?;
+        return if showing {
+            set_panel_group_collapsed(&mut workspace.tree, &group, true)
+        } else {
+            show_panel_group_tab(&mut workspace.tree, &group, index)
+        };
+    }
+    let collapsed = panel_is_collapsed(&workspace.tree, panel)?;
+    set_panel_collapsed(&mut workspace.tree, panel, !collapsed)
+}
+
+/// The panel-close command's action (0.164.0): [`close_panel`], then —
+/// for a grouped panel — [`sync_panel_group`], which moves the group to
+/// an open sibling or hides it once every member is closed.
+///
+/// # Errors
+///
+/// As [`close_panel`].
+pub fn close_workspace_panel(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
+    close_panel(&mut workspace.tree, panel)?;
+    let group = workspace.panel_group.clone();
+    if group.index_of(panel).is_some() {
+        sync_panel_group(&mut workspace.tree, &group)?;
+    }
+    Ok(())
+}
+
+/// Selects `panel`'s tab when it is a grouped panel not currently shown
+/// (0.164.0, the panel-focus commands): the group is expanded and the
+/// panel reopened if it was closed. An ungrouped or already-shown panel
+/// is left alone. Returns whether it changed anything.
+///
+/// # Errors
+///
+/// As [`show_panel_group_tab`].
+pub fn select_panel_tab(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<bool, WidgetError> {
+    let group = workspace.panel_group.clone();
+    let Some(index) = group.index_of(panel) else {
+        return Ok(false);
+    };
+    if panel_group_shown(&workspace.tree, &group) == Some(index) {
+        return Ok(false);
+    }
+    show_panel_group_tab(&mut workspace.tree, &group, index)?;
+    Ok(true)
+}
+
+/// Makes `panel` visible and expanded **unless it is closed** — the
+/// Curves auto-show rule's action (0.161.0, extended in 0.164.0): a
+/// collapsed panel is expanded and, for a grouped one, its tab selected.
+/// A closed panel is never reopened. Returns whether it changed anything.
+///
+/// # Errors
+///
+/// As [`show_panel_group_tab`]/[`set_panel_collapsed`].
+pub fn show_workspace_panel(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<bool, WidgetError> {
+    if panel_is_closed(&workspace.tree, panel)? {
+        return Ok(false);
+    }
+    let group = workspace.panel_group.clone();
+    if let Some(index) = group.index_of(panel) {
+        if panel_group_shown(&workspace.tree, &group) == Some(index)
+            && !panel_is_collapsed(&workspace.tree, panel)?
+        {
+            return Ok(false);
+        }
+        show_panel_group_tab(&mut workspace.tree, &group, index)?;
+        return Ok(true);
+    }
+    if !panel_is_collapsed(&workspace.tree, panel)? {
+        return Ok(false);
+    }
+    set_panel_collapsed(&mut workspace.tree, panel, false)?;
+    Ok(true)
+}
+
+/// Shows the History tab (0.164.0 test support): History tests lay it
+/// out, and it is not the default tab.
+#[cfg(test)]
+pub(crate) fn show_history_tab(workspace: &mut Workspace) {
+    let group = workspace.panel_group.clone();
+    if let Err(err) = crate::show_panel_group_tab(&mut workspace.tree, &group, 1) {
+        unreachable!("{err:?}");
+    }
 }
 
 #[cfg(test)]
@@ -613,19 +765,24 @@ mod tests {
         assert_eq!(ws.tree.parent(ws.rail), Some(ws.root));
         assert_eq!(
             ws.tree.children(ws.rail),
-            Some([ws.layers.root, ws.properties.root, ws.history.root].as_slice()),
-            "panels must be docked in the rail in mockup order: Layers, Properties, History"
+            Some([ws.layers.root, ws.panel_group.root].as_slice()),
+            "the rail docks Layers, then the Properties + History tab group (0.164.0)"
+        );
+        assert_eq!(
+            ws.tree.children(ws.panel_group.root),
+            Some([ws.panel_group.bar, ws.properties.root, ws.history.root].as_slice()),
+            "the group holds its tab row, then Properties and History in mockup order"
         );
 
-        for (panel, title) in [
-            (ws.layers, "Layers"),
-            (ws.properties, "Properties"),
-            (ws.history, "History"),
+        for (panel, title, role) in [
+            (ws.layers, "Layers", accesskit::Role::Region),
+            (ws.properties, "Properties", accesskit::Role::TabPanel),
+            (ws.history, "History", accesskit::Role::TabPanel),
         ] {
             let Some(accessibility) = ws.tree.accessibility(panel.root) else {
                 unreachable!("just inserted");
             };
-            assert_eq!(accessibility.role(), accesskit::Role::Region);
+            assert_eq!(accessibility.role(), role);
             assert_eq!(accessibility.label(), Some(title));
         }
 
@@ -673,19 +830,70 @@ mod tests {
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&test_scales()) as u32;
+        let Some(group_bounds) = ws.tree.bounds(ws.panel_group.root) else {
+            unreachable!("just laid out");
+        };
+        let Some(bar_bounds) = ws.tree.bounds(ws.panel_group.bar) else {
+            unreachable!("just laid out");
+        };
+        // 0.164.0: Layers is its title plus one row; the group under it is
+        // its tab row over the shown tab, Properties — content-sized, and
+        // with no title row of its own, so one row — and History, the
+        // hidden tab, takes no space.
         assert_eq!(
             (layers_bounds.height, properties_bounds.height),
-            (2 * row, 2 * row),
-            "an empty content-sized panel is its title plus one row"
+            (2 * row, row),
+            "an empty content-sized panel is its title (or tab) plus one row"
+        );
+        assert_eq!(bar_bounds.height, row, "the tab row is one row");
+        assert_eq!(
+            group_bounds.y,
+            layers_bounds.bottom(),
+            "the group docks under Layers"
+        );
+        assert_eq!(bar_bounds.y, group_bounds.y, "its tab row first");
+        assert_eq!(
+            properties_bounds.y,
+            bar_bounds.bottom(),
+            "then the shown tab"
+        );
+        assert_eq!(
+            group_bounds.height,
+            2 * row,
+            "one slot: the tab row and Properties"
+        );
+        assert_eq!(history_bounds.height, 0, "the hidden tab takes no space");
+    }
+
+    /// 0.164.0: with the History tab shown, History is the rail's `Fill`
+    /// member again, so the group takes what Layers leaves.
+    #[test]
+    fn the_history_tab_fills_what_layers_leaves() {
+        let mut ws = build_workspace(&test_scales());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&test_scales()) as u32;
+        super::show_history_tab(&mut ws);
+        ws.tree.compute_layout(1000.0, 800.0);
+        let (Some(group_bounds), Some(history_bounds), Some(properties_bounds)) = (
+            ws.tree.bounds(ws.panel_group.root),
+            ws.tree.bounds(ws.history.root),
+            ws.tree.bounds(ws.properties.root),
+        ) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            group_bounds.height,
+            800 - 2 * row,
+            "the group fills the rest"
         );
         assert_eq!(
             history_bounds.height,
-            800 - 4 * row,
-            "History takes what the content-sized panels leave"
+            800 - 3 * row,
+            "History under its tab row"
         );
         assert_eq!(
-            history_bounds.y,
-            properties_bounds.y + i64::from(properties_bounds.height)
+            properties_bounds.height, 0,
+            "Properties is now the hidden tab"
         );
     }
 
@@ -928,9 +1136,23 @@ mod tests {
     #[test]
     fn all_three_panels_crowded_at_once_still_share_the_rail_and_stay_hittable() {
         let scales = test_scales();
-        for count in [5_usize, 60, 200] {
+        // 0.164.0: Properties and History are tabs of one slot, so each
+        // count is checked with each tab shown; the hidden one is skipped.
+        for (count, tab) in [
+            (5_usize, 0_usize),
+            (5, 1),
+            (60, 0),
+            (60, 1),
+            (200, 0),
+            (200, 1),
+        ] {
             let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, (true, true, true), count);
+            let group = ws.panel_group.clone();
+            if let Err(err) = crate::show_panel_group_tab(&mut ws.tree, &group, tab) {
+                unreachable!("{err:?}");
+            }
+            let hidden = if tab == 0 { "history" } else { "properties" };
             ws.tree.compute_layout(1600.0, 900.0);
 
             let (Some(layers), Some(properties), Some(history)) = (
@@ -952,7 +1174,10 @@ mod tests {
                 ("layers", layers, ws.layers.body),
                 ("properties", properties, ws.properties.body),
                 ("history", history, ws.history.body),
-            ] {
+            ]
+            .into_iter()
+            .filter(|(name, ..)| *name != hidden)
+            {
                 assert!(
                     name == "history" || panel.height <= cap,
                     "{name} is capped at its title plus the row cap at {count} rows: {panel:?}"
@@ -970,7 +1195,10 @@ mod tests {
                     ("layers", ws.layers.body),
                     ("properties", ws.properties.body),
                     ("history", ws.history.body),
-                ] {
+                ]
+                .into_iter()
+                .filter(|(name, _)| *name != hidden)
+                {
                     assert!(
                         ws.tree.scroll_range(body).is_some_and(|range| range > 0.0),
                         "{name} scrolls at {count} rows"
@@ -987,7 +1215,10 @@ mod tests {
                 ("layers", layers),
                 ("properties", properties),
                 ("history", history),
-            ] {
+            ]
+            .into_iter()
+            .filter(|(name, _)| *name != hidden)
+            {
                 if let Some(before) = previous {
                     assert!(
                         panel.y >= before.y + i64::from(before.height),
@@ -1059,12 +1290,19 @@ mod tests {
             unreachable!("laid out");
         };
         let mut previous = rail.y;
-        for (name, panel) in [
-            ("layers", ws.layers),
-            ("properties", ws.properties),
-            ("history", ws.history),
+        // 0.164.0: the rail's slots are Layers, then the Properties +
+        // History group — its tab row over whichever tab is shown.
+        let shown = match crate::panel_group_shown(&ws.tree, &ws.panel_group) {
+            Some(0) => ("properties", ws.properties.root),
+            Some(_) => ("history", ws.history.root),
+            None => unreachable!("{what}: no tab is shown"),
+        };
+        for (name, root) in [
+            ("layers", ws.layers.root),
+            ("tab row", ws.panel_group.bar),
+            shown,
         ] {
-            let Some(bounds) = ws.tree.bounds(panel.root) else {
+            let Some(bounds) = ws.tree.bounds(root) else {
                 unreachable!("laid out");
             };
             assert!(
@@ -1119,9 +1357,15 @@ mod tests {
                 "{what}: tabs and plot sit inside the Properties panel: {tabs:?} {editor:?} \
                  {properties:?}"
             );
+            // 0.164.0: History is the hidden tab of the same slot, so the
+            // plot has the rest of the rail; it must end inside it.
+            assert_eq!(history.height, 0, "{what}: History is the hidden tab");
+            let Some(rail) = ws.tree.bounds(ws.rail) else {
+                unreachable!("laid out");
+            };
             assert!(
-                bottom(editor) <= history.y,
-                "{what}: the plot ends above History: {editor:?} {history:?}"
+                bottom(editor) <= bottom(rail),
+                "{what}: the plot ends inside the rail: {editor:?} {rail:?}"
             );
             assert_eq!(
                 ws.tree.scroll_range(controls.root),
@@ -1326,6 +1570,21 @@ mod tests {
         fill_panels(&mut ws, &scales, (true, false, true), 20);
         ws.tree.compute_layout(1274.0, 172.0);
         assert_stacked_inside_the_rail(&ws, "1274 x 172");
+        // 0.164.0: History is the other tab of Properties' slot; it is
+        // checked with its own tab shown, below.
+        let mut history_shown = build_workspace(&scales);
+        fill_panels(&mut history_shown, &scales, (true, false, true), 20);
+        super::show_history_tab(&mut history_shown);
+        history_shown.tree.compute_layout(1274.0, 172.0);
+        assert_stacked_inside_the_rail(&history_shown, "1274 x 172, History shown");
+        let (Some(rows), Some(panel)) = (
+            history_shown.tree.bounds(history_shown.history.viewport),
+            history_shown.tree.bounds(history_shown.history.root),
+        ) else {
+            unreachable!("laid out");
+        };
+        assert!(rows.height >= row, "history rows keep one row: {rows:?}");
+        assert!(rows.y >= panel.y && bottom(rows) <= bottom(panel));
         for (name, part, panel) in [
             ("layers rows", ws.layers.viewport, ws.layers.root),
             ("layers controls", layer_controls.root, ws.layers.root),
@@ -1335,7 +1594,6 @@ mod tests {
                 ws.properties.root,
             ),
             ("curves strip", curves.root, ws.properties.root),
-            ("history rows", ws.history.viewport, ws.history.root),
         ] {
             let (Some(part), Some(panel)) = (ws.tree.bounds(part), ws.tree.bounds(panel)) else {
                 unreachable!("laid out");

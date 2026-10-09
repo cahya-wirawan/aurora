@@ -1438,6 +1438,28 @@ impl<W> WidgetTree<W> {
             .map(|(&id, node)| {
                 let mut accessibility = node.accessibility.clone();
                 accessibility.set_children(node.children.clone());
+                // `accesskit_consumer` unwraps every `labelled_by` id it
+                // resolves (0.164.0 review I3), so an id this tree no
+                // longer holds -- a tab replaced after a panel was
+                // labelled by it -- would panic the consumer. Dropped here,
+                // at the one place every update is built.
+                if accessibility
+                    .labelled_by()
+                    .iter()
+                    .any(|id| !self.nodes.contains_key(id))
+                {
+                    let live: Vec<NodeId> = accessibility
+                        .labelled_by()
+                        .iter()
+                        .copied()
+                        .filter(|id| self.nodes.contains_key(id))
+                        .collect();
+                    if live.is_empty() {
+                        accessibility.clear_labelled_by();
+                    } else {
+                        accessibility.set_labelled_by(live);
+                    }
+                }
                 // A scroll container's position, from this tree's own
                 // state at update time rather than stored on the widget's
                 // node -- so a caller replacing that node
@@ -1793,6 +1815,46 @@ mod tests {
         tree.take_damage();
         assert_eq!(tree.is_dirty(a), Some(false));
         assert_eq!(tree.is_dirty(root), Some(false));
+    }
+
+    /// Review I3 (0.164.0): a `labelled_by` id the tree no longer holds is
+    /// dropped from the update — `accesskit_consumer` would unwrap it.
+    #[test]
+    fn accessibility_update_drops_a_dangling_labelled_by_id() {
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style::default());
+        let label = match tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::Label),
+            crate::widgets::WidgetKind::Container,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut node = accesskit::Node::new(accesskit::Role::TabPanel);
+        node.set_labelled_by(vec![label, accesskit::NodeId(9_999)]);
+        let panel = match tree.insert(
+            root,
+            taffy::Style::default(),
+            node,
+            crate::widgets::WidgetKind::Container,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let update = tree.accessibility_update(root);
+        let Some((_, panel_node)) = update.nodes.iter().find(|(id, _)| *id == panel) else {
+            unreachable!("in the update");
+        };
+        assert_eq!(panel_node.labelled_by(), [label]);
+        if let Err(err) = tree.remove(label) {
+            unreachable!("{err:?}");
+        }
+        let update = tree.accessibility_update(root);
+        let Some((_, panel_node)) = update.nodes.iter().find(|(id, _)| *id == panel) else {
+            unreachable!("in the update");
+        };
+        assert!(panel_node.labelled_by().is_empty());
     }
 
     #[test]
