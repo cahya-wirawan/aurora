@@ -12,8 +12,11 @@
 //! [`crate::set_panel_collapsed`] hides it with the body. It sits
 //! **below** the layer list rather than above it, because `WidgetTree`
 //! only appends children and the body already exists by the time the
-//! strip is inserted. `flex_shrink: 0` keeps it at its content height
-//! when the rail is short; the body (`flex_basis: 0`) gives way first.
+//! strip is inserted. Since 0.161.0 it shrinks with the panel once the
+//! rows above it are down to their one-row floor, never below one row
+//! itself (`min_size.height`), and is a scroll container then (no visible
+//! scrollbar yet), so a short rail never pushes it over the Properties
+//! panel.
 //!
 //! **This module knows nothing about undo.** It builds the controls,
 //! mirrors a document's state into them ([`sync_layer_controls`]), and
@@ -26,7 +29,7 @@ use aurora_doc::{BlendMode, LayerId, LayerTree};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::length;
+use taffy::style_helpers::{TaffyZero as _, length};
 use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::panel::PanelHandle;
@@ -106,7 +109,18 @@ fn strip_style(scales: &Scales) -> Style {
     let gap = length(scales.spacing.sm as f32);
     Style {
         flex_direction: FlexDirection::Column,
-        flex_shrink: 0.0,
+        // 0.161.0: shrinks and scrolls like the Properties strip, never
+        // below one row (`crate::tool_controls`' `strip_style` explains),
+        // so a short rail cannot push it over the Properties panel.
+        flex_shrink: 1.0,
+        min_size: Size {
+            width: taffy::Dimension::ZERO,
+            height: length(widgets::row_height(scales)),
+        },
+        overflow: taffy::Point {
+            x: taffy::Overflow::Hidden,
+            y: taffy::Overflow::Hidden,
+        },
         gap: Size {
             width: gap,
             height: gap,
@@ -136,7 +150,10 @@ pub fn insert_layer_controls(
     scales: &Scales,
 ) -> Result<LayerControls, WidgetError> {
     let root = widgets::insert_container(tree, panel.root, strip_style(scales))?;
-    let built = build(tree, root, scales);
+    let built = tree
+        .set_scrollable(root, true)
+        .and_then(|()| build(tree, root, scales))
+        .and_then(|controls| crate::panel::refresh_panel_floor(tree, panel).map(|()| controls));
     if built.is_err() {
         let _ = tree.remove(root);
     }

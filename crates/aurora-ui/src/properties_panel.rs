@@ -494,9 +494,17 @@ mod tests {
                 "{count} property rows must not collapse the sibling panels: \
                  {layers_bounds:?}, {history_bounds:?}"
             );
+            // 0.161.0: a content-sized panel (`crate::PanelSizing::Content`)
+            // is its 21px title plus its rows, up to
+            // `crate::panel::CONTENT_PANEL_MAX_ROWS` rows -- then it
+            // scrolls instead of growing.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cap = crate::panel::CONTENT_PANEL_MAX_ROWS as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = (21 * (1 + count.clamp(1, cap))) as u32;
             assert_eq!(
-                properties_bounds.height, layers_bounds.height,
-                "the three panels must keep sharing the rail equally at {count} rows"
+                properties_bounds.height, expected,
+                "content-sized up to the cap at {count} rows"
             );
             assert!(
                 history_bounds.y + i64::from(history_bounds.height) <= 900,

@@ -26,7 +26,31 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.160.0): a left tools panel and an options bar —
+**Latest (2026-10-09, 0.161.0): the Curves editor is reliably visible.**
+The design owner's real-macOS report (2548 x 1344 physical, Widget Gallery
+open, a new Curves layer active) showed the Properties panel as its title
+row alone, so the only curve editor on screen was the gallery's static
+sample bell. Reproduced headlessly through the real startup, gallery and
+New Curves Layer paths: the Properties panel was **collapsed** (no header
+click collapses a panel; Toggle/Close Properties Panel does, and the saved
+workspace layout restores it collapsed at the next launch) — Layers 292 px,
+Properties 21, History 291 at 604 px of rail. And even expanded, the rail's
+equal thirds (224 px each at 672) left the 21 px title plus the 221 px
+Curves strip no room: body 0, strip overflowing History by 18 px (40 px at
+604). Fix: `aurora_ui::PanelSizing` — Layers and Properties are now
+content-sized (`flex_basis: auto`, their body rows counting up to
+`CONTENT_PANEL_MAX_ROWS` = 10 rows of the `row_height` token, then they
+scroll), History fills the rest; every expanded panel has a token-derived
+floor (title + one body row + one row per controls strip), and the Curves
+and Layers controls strips shrink and scroll instead of overflowing. At the
+reported size Properties is now 263 px with the full 168 px plot and tabs
+above History. A collapsed Properties panel expands automatically on the
+**transition** to a Curves layer only (a deliberate collapse while it stays
+active sticks; a closed panel stays closed). The gallery's demo editor
+is captioned "Sample histogram (demo data)". **Needs a human** on macOS. Details: "Next action", addendum
+0.161.0.
+
+**Previously (2026-10-09, 0.160.0): a left tools panel and an options bar —
 workspace round 1.** Photoshop's layout convention in Aurora's own tokens:
 the workspace root row is now tools panel → canvas column (options bar
 over the canvas area) → divider → rail. The tools panel
@@ -7194,7 +7218,11 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03 (**update 0.160.0:** a left tools panel and an options bar
+  2026-08-03 (**update 0.161.0:** the rail shares height by content —
+  Layers and Properties content-sized and capped, History fills, every
+  panel floored at one body row — and Properties auto-expands on the
+  transition to a Curves layer — "Next action", addendum 0.161.0;
+  **update 0.160.0:** a left tools panel and an options bar
   across the top of the canvas, the radius slider moved into it —
   "Next action", addendum 0.160.0; **update 0.145.0:** every panel body now scrolls, wheel
   and trackpad — "Next action", addendum 0.145.0; **update 0.146.0:** a
@@ -30894,6 +30922,175 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.161.0) — the Curves editor is reliably
+visible.** Files: `aurora-ui` `panel.rs` (`PanelSizing`,
+`set_panel_sizing`, `CONTENT_PANEL_MAX_ROWS`, `panel_floor`/
+`refresh_panel_floor`, `root_style`/`viewport_style` take the sizing),
+`workspace.rs` (Layers and Properties `Content`, History `Fill`; five new
+layout tests, two adapted), `tool_controls.rs` and `layer_controls.rs`
+(the strips shrink, scroll and keep a one-row floor), `gallery_panel.rs`
+(the demo curve editor's caption), `history_panel.rs`/`layers_panel.rs`/
+`properties_panel.rs` (adapted crowding tests), `lib.rs` (exports);
+`aurora-app` `lib.rs` (`expand_properties_for_curves`,
+`CurvesUiState::shown_for`, reset on open; the `curves_editor_visibility`
+test module).
+
+- **Cause, measured headlessly** through `install_startup_panels`,
+  `toggle_gallery`, `perform_layer_command(NewCurves)`, the
+  `sync_curves_ui` loop and text-aware `layout_workspace` at scale 2, on a
+  half-black/half-white document. The screenshot's shape — Properties a
+  title row, Layers a big mostly-empty area, History right below — is a
+  **collapsed** Properties panel: at 1274 x 604 (the screenshot's content
+  area) with the rail at 343 px, Layers 292 px (body 168), Properties 21,
+  History 291; at 672 px, 326 / 21 / 325. No header click collapses a
+  panel; Toggle/Close Properties Panel (palette, macOS menu) does, and
+  `WorkspaceLayout::properties_collapsed` restores it at the next launch,
+  which is the likely route. **And expanded it was still broken:** the
+  rail split into equal thirds by `flex_grow` (224 px each at 672, 201 at
+  604), while the Properties panel needs its 21 px title plus the 221 px
+  Curves strip (8 px padding, 21 px tabs, 4 px gap, 168 px plot, padding).
+  The strip was `flex_shrink: 0`, so the body went to 0 and the strip
+  overflowed into History: plot y 286..454 against History at 448 (18 px
+  under History's title) at 672, 263..431 against 403 at 604 (28 px of
+  plot, 40 px of strip). The histogram itself was always right (the probe
+  read `[(0, 65536), (255, 65536)]` off the hidden editor).
+- **Fix.** The rail shares height by content: Layers and Properties are
+  `PanelSizing::Content` (`flex_basis: auto`, no growth; body rows count
+  up to `CONTENT_PANEL_MAX_ROWS` = 10 rows of `row_height`, then scroll);
+  History is `Fill` and takes the rest. Every expanded panel's
+  `min_size.height` is its floor — the sum of its children's declared
+  minimums: title row, the viewport's one-row floor, one row per controls
+  strip — so nothing is squeezed to zero and nothing overflows into the
+  next panel. Not `min_size: auto`: measured, the automatic minimum counted
+  every visible row and the whole strip, pinning Properties at 263 px and
+  pushing History off a 300 px rail. The viewport is a clipping container
+  for the same reason (without it a 200-step History floored at 4,221 px).
+  Both controls strips (`tool_controls`' Curves strip, `layer_controls`)
+  now shrink, clip and are scroll containers, reached by the wheel through
+  `scroll_container_at`. After: at 1274 x 672 with the gallery open,
+  Layers 166 / Properties 263 (strip 221, plot 168 x 168 at y 249..417) /
+  History 243; at 604, History 175. **Auto-expand rule**
+  (`expand_properties_for_curves`): when the active layer *becomes* a
+  Curves layer — a different one from the last sync, including after a
+  non-Curves layer, an open (the memory resets in `end_curves_gestures`)
+  or startup — a collapsed Properties panel is expanded; while the same
+  Curves layer stays active it does nothing, so a deliberate collapse
+  sticks, and a *closed* panel is never reopened (review J1). **Gallery:** a `Label`, "Sample histogram (demo data)"
+  (`GALLERY_CURVE_CAPTION`), directly under the demo editor in the same
+  column; it is accessible as a `Role::Label` with that text, and the
+  editor keeps its own name. The gallery's minimum height pin moves 500 ->
+  533.
+- **Tests:** 8 new (aurora-ui 6: the caption; full editor at 1274 x
+  672/604/480; short rail scrolls the strip; long Layers list capped and
+  scrolling; 640 x 480 minimum window with the gallery; a rail at its
+  panels' floors. aurora-app 2: AC-2 end to end at 672 and 604, expanded
+  and collapsed at start — full square, inside strip/Properties/rail,
+  above History, hit-testable, two spikes, not the gallery sample; the
+  transition-only auto-expand rule). Adapted, not deleted: the build and
+  crowding tests in `workspace.rs`, the crowding tests of all three
+  panels, History's visible-row count (13 -> 38), the panel min-size
+  style test, the gallery height pins. `cargo test -p aurora-ui` 159
+  passed; `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app` 712 passed,
+  5 ignored (RTX 3090). 3,021 + 8 = 3,029. clippy (`-p aurora-ui -p
+  aurora-app --all-targets --all-features -D warnings`), `fmt --check`
+  and `cargo check --workspace` clean. The full gate was not run.
+- **Mutation matrix** (11, each file backed up, restored, touched and
+  sha256-checked; `AURORA_REQUIRE_GPU=1`; aurora-ui lib + aurora-app
+  `curves_editor*`):
+
+  | # | Mutation | Result | Killed by |
+  |---|---|---|---|
+  | M1 | Properties stays `Fill` | killed (6) | AC-2 test, `the_curves_editor_gets_its_full_height_in_the_reported_window`, build/crowding tests |
+  | M2 | auto-expand removed | killed (2) | AC-2 test (collapsed start), `properties_auto_expands_only_on_the_transition_to_a_curves_layer` |
+  | M3 | auto-expand on every sync | killed (1) | `properties_auto_expands_only_on_the_transition_to_a_curves_layer` |
+  | M4 | Layers rows uncapped | killed (4) | `a_long_layers_list_is_capped_and_scrolls_beside_the_curves_editor`, crowding tests |
+  | M5 | histogram not attached to the Properties editor | killed (6) | AC-2 test, five `curves_editor_ui` histogram tests |
+  | M6 | caption not under the editor | killed (3) | `the_demo_curve_editor_is_captioned_as_a_sample`, both height pins |
+  | M7 | Curves strip `flex_shrink: 0` | killed (1) | `a_short_rail_scrolls_the_curves_strip_instead_of_squeezing_it_away` |
+  | M8 | Curves strip not scrollable | killed (1) | same |
+  | M9 | panel floor zero | killed (2) | `a_rail_at_its_panels_floors_keeps_every_part_one_row_and_inside_its_panel`, min-size style test |
+  | M10 | Curves strip floor removed | killed (1) | `a_rail_at_its_panels_floors_...` |
+  | M11 | Layers controls strip `flex_shrink: 0` | killed (1) | `a_rail_at_its_panels_floors_...` |
+
+  M9-M11 first **survived** (M9 caught only by the style test); the
+  floors test was written for them and re-run: all three killed.
+- **Disclosures.** (1) The cause is reconstructed: the bug build predates
+  0.160.0 (the radius slider was then in the strip too, making it ~50 px
+  taller), and *how* Properties got collapsed is inferred (persisted
+  layout or palette/menu), not observed. The screenshot's Layers/History
+  ratio does not match the 292/291 split exactly; the title-row-only
+  Properties does. (2) `CONTENT_PANEL_MAX_ROWS` = 10 is an engineering
+  default expressed as rows of `row_height` (the `GALLERY_EDITOR_ROWS`
+  precedent), not a token — flagged to the design owner, not invented.
+  (3) With the Curves editor shown, the Properties body still keeps its
+  one empty floor row (21 px) above the strip. (4) **The two controls
+  strips (the Curves strip and the Layers controls) scroll without a
+  visible scrollbar** — wheel/trackpad and focus-follow only; a bar for
+  them is a follow-up. (5) The AC-2 hit test accepts a descendant of the
+  editor (the centre hit lands on one of its parts). (6) The auto-expand
+  changes what the saved layout records (it was first written to reopen
+  a *closed* panel too; fixed in the review revision below). (7) Below the sum of the floors (~170 px of rail,
+  far under `MIN_WINDOW_HEIGHT` 480) panels still overflow the rail.
+  (8) Headless only; GPU used only by the app suite's GPU tests.
+- **Needs a human:** on macOS add a Curves layer and confirm the
+  Properties editor shows the image's histogram (also with Properties
+  collapsed first, and that collapsing it again sticks).
+- **Suggested next:** the status bar (workspace round 2).
+- **Review revision (0.161.0).** The full gate on the candidate passed
+  (`AURORA_REQUIRE_GPU=1`: 3,029 passed, 0 failed, 61 ignored, 0
+  skipped; clippy, strict rustdoc, deny, contrast); the judge returned
+  REVISE at 0.87. Outcomes:
+  - **J1 (fixed).** `expand_properties_for_curves` treated a *closed*
+    Properties panel as collapsed and reopened it with the body Close had
+    emptied. New `aurora_ui::panel_is_closed` (a close hides the title
+    row, a collapse keeps it); only a collapsed, not closed, panel is
+    auto-expanded. Test
+    `a_closed_properties_panel_stays_closed_when_a_curves_layer_becomes_active`
+    (plus `a_closed_panel_is_closed_and_a_collapsed_one_is_not`);
+    mutation M12 (drop the closed check) killed by it.
+  - **J2 (disclosed, product choice).** The auto-expand re-fires whenever
+    the active layer *becomes* a Curves layer again: reselecting one after
+    another layer was active, undo then redo of New Curves Layer, and
+    after an open. Deliberate (a transition is a new request to see the
+    editor); the design owner may ask for per-session memory instead
+    ("stop expanding once the user collapsed it this session").
+  - **J3 (fixed, preferred route).** `PanelHandle::sizing` is gone: the
+    sizing is read from the tree (`aurora_ui::panel_sizing`, the
+    viewport's `flex_basis`, which only `set_panel_sizing` changes), so a
+    stale or copied handle cannot turn a Content panel back into Fill.
+    Test `properties_stays_content_sized_across_a_collapse_and_expand`
+    (live handle and a copy); mutation M14 (sizing always read as Fill)
+    killed by it and two more.
+  - **J4 (fixed).** Stale comments: `workspace.rs` ("half the rail" ->
+    the row cap), `body_style`'s "the only clipping overflow",
+    `root_style`'s opening paragraphs (now say only `Fill` grows from a
+    zero basis), `layer_controls.rs`'s `flex_shrink: 0`.
+  - **J5 (disclosed).** Item (4) above: the controls strips have no
+    visible scrollbar; follow-up.
+  - **J6 (fixed).** `panel_floor` summed hidden children; it now skips
+    `Display::None`, and `set_panel_collapsed` restyles the root *after*
+    the children's `display` is final, so expanding lands on the right
+    floor. Test `a_panels_floor_counts_only_its_shown_children`; mutation
+    M13 killed by it.
+  - **J7 (pending decision).** `CONTENT_PANEL_MAX_ROWS = 10` stays; the
+    design owner is being asked whether it should become a token.
+  - After the revision: 4 more tests (aurora-ui 3, aurora-app 1), so
+    3,029 + 4 = **3,033**; `AURORA_REQUIRE_GPU=1 cargo test -p aurora-ui
+    -p aurora-app` 162 + 713 passed (5 ignored); clippy and fmt clean.
+    M1-M14 all killed.
+  - **Measured after the revision:** full gate green on the RTX 3090 with
+    `AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+    clippy `-D warnings`, **3,033 passed, 0 failed, 61 ignored, 0
+    skipped**, strict rustdoc, `cargo deny`, contrast exit 0. Judge round
+    2: **PASS 0.920**, no blocking issue (the closed marker, the
+    `flex_basis`-derived sizing and the floor ordering each traced). Its
+    recorded note (R2-1): **closing a panel lasts one session only** —
+    `save_workspace_layout` saves just "collapsed" per panel, so after a
+    relaunch a closed Properties comes back collapsed with its title
+    shown, and the next transition to a Curves layer then expands it.
+    Pre-existing (layout saving never recorded "closed"); a separate saved
+    "closed" flag is the follow-up if the design owner wants it to stick.
 
 **Addendum 2026-10-09 (0.160.0) — left tools panel and options bar
 (workspace round 1).** Files: `aurora-widgets` `widgets/button.rs`

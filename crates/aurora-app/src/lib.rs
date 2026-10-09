@@ -5753,6 +5753,10 @@ struct CurvesUiState {
     detached: bool,
     histogram: Option<CurvesHistogram>,
     job: Option<CurvesHistogramJob>,
+    /// The Curves layer the editor was last shown for (0.161.0), the
+    /// memory [`expand_properties_for_curves`] needs to act on a
+    /// transition only.
+    shown_for: Option<aurora_doc::LayerId>,
 }
 
 /// Everything a Curves edit touches — [`LayerControlEdit`]'s shape.
@@ -5973,8 +5977,9 @@ fn end_curves_gesture_before_key(cx: &mut CurvesEdit<'_>, click: &mut ClickTrack
 
 /// Ends every Curves-editor gesture belonging to the document about to
 /// be replaced (every open route): a live drag is committed with the
-/// editor's capture dropped, the histogram cache is dropped and the
-/// channel resets to RGB, so nothing of the old document survives.
+/// editor's capture dropped, the histogram cache and the auto-expand
+/// memory are dropped and the channel resets to RGB, so nothing of the
+/// old document survives.
 fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
     let Some(controls) = cx.controls else {
         return false;
@@ -5986,6 +5991,9 @@ fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> boo
     cx.state.detached = false;
     cx.state.histogram = None;
     cx.state.job = None;
+    // A new document's Curves layer is a transition again (0.161.0,
+    // `expand_properties_for_curves`).
+    cx.state.shown_for = None;
     if let Err(err) = aurora_ui::select_curves_channel(
         &mut cx.workspace.tree,
         controls,
@@ -6306,6 +6314,9 @@ fn sync_curves_ui(
     let curves_layer = cx
         .active_layer
         .filter(|&id| aurora_ui::curves_params(cx.layers, id).is_some());
+    let expanded =
+        expand_properties_for_curves(cx.workspace, &mut cx.state.shown_for, curves_layer);
+    let settled = settled || expanded;
     let revision = cx.undo_order.revision;
     let _ = refresh_curves_histogram(
         cx.state,
@@ -6334,6 +6345,58 @@ fn sync_curves_ui(
         Err(err) => {
             tracing::warn!(?err, "failed to sync the Properties-panel Curves editor");
             settled
+        }
+    }
+}
+
+/// **The Properties auto-expand rule (0.161.0).** The Curves editor lives
+/// in the Properties panel, so a collapsed (or closed) Properties panel
+/// hides it completely — the 0.161.0 bug report, where the panel showed
+/// only its title row (collapsed earlier through Toggle/Close Properties
+/// Panel, and restored collapsed at the next launch from the saved
+/// workspace layout) and the Widget Gallery's static sample was the only
+/// curve editor on screen. So when the active layer **becomes** a Curves
+/// layer — a different one from the last time this ran, including the
+/// first Curves layer after a non-Curves one, a new document or startup —
+/// a collapsed Properties panel is expanded. **Only on that transition**:
+/// while the same Curves layer stays active this does nothing, so a user
+/// who then collapses the panel deliberately keeps it collapsed. **A
+/// closed panel** (Close Properties Panel, `aurora_ui::close_panel`) is
+/// never reopened (review J1): a close empties the body and is the
+/// stronger request. It does re-fire whenever the active layer becomes a
+/// Curves layer again — reselecting one after another layer, undo then
+/// redo of New Curves Layer, after an open — a product choice (review
+/// J2) rather than per-session memory. Returns whether it expanded the
+/// panel (the caller lays out again).
+fn expand_properties_for_curves(
+    workspace: &mut aurora_ui::Workspace,
+    shown_for: &mut Option<aurora_doc::LayerId>,
+    curves_layer: Option<aurora_doc::LayerId>,
+) -> bool {
+    if *shown_for == curves_layer {
+        return false;
+    }
+    *shown_for = curves_layer;
+    if curves_layer.is_none() {
+        return false;
+    }
+    if !aurora_ui::panel_is_collapsed(&workspace.tree, workspace.properties).unwrap_or(false) {
+        return false;
+    }
+    // A *closed* panel stays closed (review J1): Close empties its body
+    // and is a stronger request than a collapse, so only a collapse is
+    // undone here. Treated as closed when the query fails, too.
+    if aurora_ui::panel_is_closed(&workspace.tree, workspace.properties).unwrap_or(true) {
+        return false;
+    }
+    match aurora_ui::set_panel_collapsed(&mut workspace.tree, workspace.properties, false) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to expand the Properties panel for a Curves layer"
+            );
+            false
         }
     }
 }
@@ -65395,6 +65458,404 @@ mod tests {
             aur_verify_scratch_dir_unless(false).is_some(),
             "a live session still gets one"
         );
+    }
+    // -- The Curves editor is visible in the real rail (0.161.0) ----------
+    // Exact float equality is the point: histogram bins are pixel counts.
+    #[allow(clippy::float_cmp)]
+    mod curves_editor_visibility {
+        use super::*;
+        use crate::{
+            CurvesEdit, CurvesUiState, HashMap, LayerCommand, LayerCommandContext,
+            LayerControlsState, layout_workspace, perform_layer_command, sync_curves_ui,
+            test_workspace_scales,
+        };
+        use aurora_doc::BlendMode;
+        use aurora_widgets::{ClickTracker, FocusManager};
+
+        /// The design owner's window (0.161.0's bug report): 2548 x 1344
+        /// physical px at scale factor 2.
+        const SCALE: f64 = 2.0;
+        const WINDOW: (f32, f32) = (1274.0, 672.0);
+        const CANVAS: (u32, u32) = (512, 256);
+
+        /// `App`'s state from startup on, driven through the same free
+        /// functions `App::new`, `App::run_layer_command`,
+        /// `toggle_gallery` and `App::about_to_wait`'s catch-all run.
+        struct Shell {
+            _dir: tempfile::TempDir,
+            store: aurora_tile::TileStore,
+            workspace: aurora_ui::Workspace,
+            engine: aurora_text::TextEngine,
+            focus: FocusManager,
+            gallery: Option<aurora_ui::GalleryPanel>,
+            click: ClickTracker,
+            scales: Scales,
+            layers: aurora_doc::LayerTree,
+            history: aurora_doc::History,
+            pixel_history: aurora_brush::PixelHistory,
+            undo_order: UndoOrder,
+            layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
+            active: Option<aurora_doc::LayerId>,
+            layer_controls: LayerControlsState,
+            tool_controls: aurora_ui::ToolControls,
+            cache: CompositeCache,
+            view: aurora_ui::CanvasView,
+            drag: Option<Drag>,
+            ui: CurvesUiState,
+            window: (f32, f32),
+        }
+
+        impl Shell {
+            /// A half-black, half-white document (two tiles side by
+            /// side), installed the way startup installs one.
+            fn halves(window: (f32, f32)) -> Self {
+                let (dir, mut store) = real_tile_store();
+                let layers = solid_root_stack(
+                    &mut store,
+                    &[("halves", BlendMode::Normal, 1.0, [0.0, 0.0, 0.0, 1.0])],
+                );
+                let Some(surface) = layers.roots().first().and_then(|&id| layers.surface_id(id))
+                else {
+                    unreachable!("a pixel layer");
+                };
+                fill_solid(
+                    &mut store,
+                    surface,
+                    aurora_tile::TileId { x: 1, y: 0 },
+                    [1.0; 4],
+                );
+                Self::new(dir, store, layers, window)
+            }
+
+            fn new(
+                dir: tempfile::TempDir,
+                store: aurora_tile::TileStore,
+                layers: aurora_doc::LayerTree,
+                window: (f32, f32),
+            ) -> Self {
+                let scales = test_workspace_scales();
+                let mut workspace = aurora_ui::build_workspace(&scales);
+                let undo_order = UndoOrder::default();
+                let startup = install_startup_panels(
+                    &mut workspace,
+                    &scales,
+                    &layers,
+                    &undo_order,
+                    Tool::default(),
+                    &ToolSettings::default(),
+                );
+                let Some(tool_controls) = startup.tool_controls else {
+                    unreachable!("the tool controls build");
+                };
+                let engine = match aurora_text::TextEngine::new() {
+                    Ok(engine) => engine,
+                    Err(err) => unreachable!("the bundled UI font loads: {err:?}"),
+                };
+                let mut shell = Self {
+                    _dir: dir,
+                    store,
+                    workspace,
+                    engine,
+                    focus: FocusManager::default(),
+                    gallery: None,
+                    click: ClickTracker::default(),
+                    scales,
+                    layers,
+                    history: aurora_doc::History::new(),
+                    pixel_history: aurora_brush::PixelHistory::new(),
+                    undo_order,
+                    layer_rows: startup.layer_rows,
+                    active: startup.active_layer,
+                    layer_controls: startup.layer_controls,
+                    tool_controls,
+                    cache: CompositeCache::default(),
+                    view: aurora_ui::CanvasView::new(),
+                    drag: None,
+                    ui: CurvesUiState::default(),
+                    window,
+                };
+                shell.sync();
+                shell
+            }
+
+            fn layout(&mut self) {
+                layout_workspace(
+                    &mut self.workspace,
+                    Some(&mut self.engine),
+                    &self.scales,
+                    SCALE,
+                    self.window.0,
+                    self.window.1,
+                );
+            }
+
+            fn toggle_gallery(&mut self) {
+                toggle_gallery(
+                    &mut self.workspace,
+                    &mut self.focus,
+                    &mut self.gallery,
+                    &mut self.click,
+                    &self.scales,
+                );
+                self.layout();
+            }
+
+            /// `App::run_layer_command`, then the event loop's sync.
+            fn run(&mut self, command: LayerCommand) -> bool {
+                let changed = perform_layer_command(
+                    &mut LayerCommandContext {
+                        workspace: &mut self.workspace,
+                        focus: &mut self.focus,
+                        scales: &self.scales,
+                        layers: &mut self.layers,
+                        history: &mut self.history,
+                        pixel_history: &mut self.pixel_history,
+                        undo_order: &mut self.undo_order,
+                        layer_rows: &mut self.layer_rows,
+                        active_layer: &mut self.active,
+                        view: &mut self.view,
+                        composite_cache: &mut self.cache,
+                        drag: &mut self.drag,
+                        layer_controls: &mut self.layer_controls,
+                        click: &mut self.click,
+                        canvas_size: CANVAS,
+                    },
+                    command,
+                );
+                self.sync();
+                changed
+            }
+
+            /// `App::sync_curves_controls_now`, repeated (as the app's
+            /// kept-awake event loop does) until no histogram job is
+            /// left, then a layout.
+            fn sync(&mut self) {
+                for _ in 0..64 {
+                    let captured = self.click.captured();
+                    let _ = sync_curves_ui(
+                        &mut CurvesEdit {
+                            workspace: &mut self.workspace,
+                            layers: &mut self.layers,
+                            history: &mut self.history,
+                            pixel_history: &mut self.pixel_history,
+                            undo_order: &mut self.undo_order,
+                            layer_rows: &self.layer_rows,
+                            active_layer: self.active,
+                            controls: Some(self.tool_controls.curves),
+                            state: &mut self.ui,
+                        },
+                        &mut self.cache,
+                        Some(&mut self.store),
+                        CANVAS,
+                        captured,
+                    );
+                    if self.ui.job.is_none() {
+                        break;
+                    }
+                }
+                self.layout();
+            }
+
+            fn bounds(&self, id: WidgetId) -> aurora_core::Rect {
+                match self.workspace.tree.bounds(id) {
+                    Some(bounds) => bounds,
+                    None => unreachable!("{id:?} is laid out"),
+                }
+            }
+
+            fn editor_histogram(&self, editor: WidgetId) -> Option<Vec<f32>> {
+                match aurora_widgets::widgets::curve_editor_state(&self.workspace.tree, editor) {
+                    Ok(state) => state.histogram().map(<[f32]>::to_vec),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            }
+        }
+
+        fn nonzero(bins: &[f32]) -> Vec<(usize, f32)> {
+            bins.iter()
+                .copied()
+                .enumerate()
+                .filter(|&(_, count)| count > 0.0)
+                .collect()
+        }
+
+        fn properties_collapsed(shell: &Shell) -> bool {
+            match aurora_ui::panel_is_collapsed(&shell.workspace.tree, shell.workspace.properties) {
+                Ok(collapsed) => collapsed,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn collapse_properties(shell: &mut Shell, collapsed: bool) {
+            if let Err(err) = aurora_ui::set_panel_collapsed(
+                &mut shell.workspace.tree,
+                shell.workspace.properties,
+                collapsed,
+            ) {
+                unreachable!("{err:?}");
+            }
+            shell.layout();
+        }
+
+        fn bottom(rect: aurora_core::Rect) -> i64 {
+            rect.y + i64::from(rect.height)
+        }
+
+        fn inside(inner: aurora_core::Rect, outer: aurora_core::Rect) -> bool {
+            inner.x >= outer.x
+                && inner.y >= outer.y
+                && inner.x + i64::from(inner.width) <= outer.x + i64::from(outer.width)
+                && bottom(inner) <= bottom(outer)
+        }
+
+        /// AC-2 (0.161.0), end to end through the real app functions: a
+        /// half-black, half-white document installed the way startup
+        /// installs one, the Widget Gallery opened, New Curves Layer run
+        /// through `perform_layer_command`, the sync loop run until the
+        /// histogram job finishes, laid out text-aware at the reported
+        /// window (1274 x 672 logical, and the 604 px content area the
+        /// screenshot measured). Both starting states: Properties expanded,
+        /// and collapsed — the state the bug report was in, restored from
+        /// the saved workspace layout. The editor must be full-size,
+        /// inside the Properties panel and the rail, above History, really
+        /// hit-testable at its centre (not clipped or covered), and show
+        /// this image's two spikes, not the gallery's sample bell.
+        #[test]
+        fn a_new_curves_layer_shows_the_images_histogram_in_a_visible_properties_editor() {
+            for height in [WINDOW.1, 604.0] {
+                for start_collapsed in [false, true] {
+                    let what = format!("1274 x {height}, collapsed at start: {start_collapsed}");
+                    let mut shell = Shell::halves((WINDOW.0, height));
+                    collapse_properties(&mut shell, start_collapsed);
+                    shell.toggle_gallery();
+                    assert!(shell.run(LayerCommand::NewCurves), "{what}");
+                    assert!(shell.ui.job.is_none(), "{what}: the histogram job finished");
+                    assert!(
+                        !properties_collapsed(&shell),
+                        "{what}: Properties is expanded"
+                    );
+
+                    let ws = &shell.workspace;
+                    let editor = shell.tool_controls.curves.editor;
+                    let side = shell.bounds(editor);
+                    let tabs = shell.bounds(shell.tool_controls.curves.channel);
+                    let properties = shell.bounds(ws.properties.root);
+                    let history = shell.bounds(ws.history.root);
+                    let rail = shell.bounds(ws.rail);
+                    let strip = shell.bounds(shell.tool_controls.root);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let full = aurora_widgets::widgets::row_height(&shell.scales) as u32 * 8;
+                    assert_eq!(
+                        (side.width, side.height),
+                        (full, full),
+                        "{what}: the plot keeps its full square"
+                    );
+                    assert!(tabs.height > 0 && tabs.width > 0, "{what}: {tabs:?}");
+                    for (name, rect) in [("tabs", tabs), ("editor", side)] {
+                        assert!(inside(rect, strip), "{what}: {name} unclipped in its strip");
+                        assert!(inside(rect, properties), "{what}: {name} inside Properties");
+                        assert!(inside(rect, rail), "{what}: {name} inside the rail");
+                    }
+                    assert!(bottom(side) <= history.y, "{what}: above History");
+                    #[allow(clippy::cast_precision_loss)]
+                    let centre = (
+                        (side.x + i64::from(side.width) / 2) as f32,
+                        (side.y + i64::from(side.height) / 2) as f32,
+                    );
+                    let hit = ws.tree.hit_test(centre);
+                    let mut reached = hit;
+                    while let Some(id) = reached.filter(|&id| id != editor) {
+                        reached = ws.tree.parent(id);
+                    }
+                    assert_eq!(
+                        reached,
+                        Some(editor),
+                        "{what}: a click at the editor's centre reaches the editor (or a part \
+                         of it), not History or the gallery: hit {hit:?}, {:?}",
+                        hit.and_then(|id| ws.tree.accessibility(id))
+                            .map(accesskit::Node::role)
+                    );
+
+                    let Some(bins) = shell.editor_histogram(editor) else {
+                        unreachable!("{what}: the Properties editor carries a histogram");
+                    };
+                    assert_eq!(
+                        nonzero(&bins),
+                        vec![(0, 65_536.0), (255, 65_536.0)],
+                        "{what}: one spike per half of the image"
+                    );
+                    let Some(gallery) = shell.gallery.as_ref() else {
+                        unreachable!("the gallery is open");
+                    };
+                    let sample = shell.editor_histogram(gallery.curve);
+                    assert!(sample.is_some(), "{what}: the gallery shows its sample");
+                    assert_ne!(
+                        Some(bins),
+                        sample,
+                        "{what}: the Properties histogram is not the gallery's sample"
+                    );
+                }
+            }
+        }
+
+        /// AC-1's auto-expand rule (0.161.0): it acts on the transition to
+        /// a Curves layer only. A deliberate collapse while that Curves
+        /// layer stays active sticks across any number of syncs; a
+        /// transition to another Curves layer expands again; and a
+        /// non-Curves layer never expands a collapsed panel.
+        #[test]
+        fn properties_auto_expands_only_on_the_transition_to_a_curves_layer() {
+            let mut shell = Shell::halves(WINDOW);
+            collapse_properties(&mut shell, true);
+            shell.sync();
+            assert!(
+                properties_collapsed(&shell),
+                "a pixel layer never expands a collapsed Properties panel"
+            );
+
+            assert!(shell.run(LayerCommand::NewCurves));
+            assert!(!properties_collapsed(&shell), "the transition expands it");
+
+            collapse_properties(&mut shell, true);
+            for _ in 0..4 {
+                shell.sync();
+            }
+            assert!(
+                properties_collapsed(&shell),
+                "a deliberate collapse sticks while the same Curves layer is active"
+            );
+
+            assert!(shell.run(LayerCommand::NewCurves));
+            assert!(
+                !properties_collapsed(&shell),
+                "a new Curves layer is a transition again"
+            );
+        }
+
+        /// Review J1 (0.161.0): Close Properties Panel is not undone by a
+        /// Curves layer becoming active — only a collapse is.
+        #[test]
+        fn a_closed_properties_panel_stays_closed_when_a_curves_layer_becomes_active() {
+            let mut shell = Shell::halves(WINDOW);
+            if let Err(err) =
+                aurora_ui::close_panel(&mut shell.workspace.tree, shell.workspace.properties)
+            {
+                unreachable!("{err:?}");
+            }
+            shell.layout();
+            assert!(shell.run(LayerCommand::NewCurves));
+            assert!(properties_collapsed(&shell), "still collapsed");
+            assert_eq!(
+                aurora_ui::panel_is_closed(&shell.workspace.tree, shell.workspace.properties).ok(),
+                Some(true),
+                "a deliberate Close sticks"
+            );
+            assert_eq!(
+                shell.bounds(shell.tool_controls.curves.editor).height,
+                0,
+                "nothing of the editor shows"
+            );
+        }
     }
     // -- The Properties-panel Curves editor (0.156.0) ---------------------
     // Exact float equality is the point: histogram bins are pixel counts.

@@ -924,9 +924,13 @@ mod tests {
                 "{count} history entries must not collapse the sibling panels: \
                  {layers_bounds:?}, {properties_bounds:?}"
             );
+            // 0.161.0: History is the rail's `Fill` panel, so it takes
+            // exactly what the two (empty, content-sized) panels above it
+            // leave, however many entries it holds.
             assert_eq!(
-                history_bounds.height, layers_bounds.height,
-                "the three panels must keep sharing the rail equally at {count} entries"
+                history_bounds.height,
+                900 - layers_bounds.height - properties_bounds.height,
+                "History takes the rest of the rail at {count} entries"
             );
             assert!(
                 history_bounds.y + i64::from(history_bounds.height) <= 900,
@@ -1000,12 +1004,15 @@ mod tests {
         // 21px rows, with no scrolling of any kind. Pinning the number
         // is what makes a silent change in the visible row count a test
         // failure rather than a shrug.
-        // 300px of share less the 21px title slot (0.142.0) leaves a
-        // 279px body: 13 whole 21px rows.
+        // Since 0.161.0 History is not a third of the rail but the rest
+        // of it: 900px less the two empty content-sized panels (a 21px
+        // title plus a 21px floor row each) is 816px; less its own 21px
+        // title slot, a 795px body: 37 whole 21px rows plus an 18px part
+        // of the 38th, whose centre (787.5px) is still inside.
         assert_eq!(
-            reachable, 13,
-            "279px of History body (300px share less its 21px title row) divided by 21px rows \
-             -- the rows that fit really work, and the other 188 are clipped until scrolled"
+            reachable, 38,
+            "795px of History body divided by 21px rows -- the rows that fit really work, \
+             and the other 163 are clipped until scrolled"
         );
     }
 

@@ -54,9 +54,9 @@ pub use curves_controls::{
     sync_curves_controls, with_channel_curve,
 };
 pub use gallery_panel::{
-    GalleryPanel, apply_gallery_outcome, gallery_close_popovers, gallery_contains,
-    gallery_content_height, gallery_hover, gallery_light_dismiss, gallery_next_deadline,
-    gallery_tick, insert_gallery_panel, remove_gallery_panel,
+    GALLERY_CURVE_CAPTION, GalleryPanel, apply_gallery_outcome, gallery_close_popovers,
+    gallery_contains, gallery_content_height, gallery_hover, gallery_light_dismiss,
+    gallery_next_deadline, gallery_tick, insert_gallery_panel, remove_gallery_panel,
 };
 pub use history_panel::{
     HistoryRows, HistoryStep, UNDONE_STATE, populate_history_panel, populate_history_panel_rows,
@@ -67,8 +67,8 @@ pub use layer_controls::{
 };
 pub use layers_panel::{layer_row_description, populate_layers_panel};
 pub use panel::{
-    PanelHandle, clear_panel_body, close_panel, insert_panel, panel_is_collapsed,
-    set_panel_collapsed,
+    PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel, panel_is_closed,
+    panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_sizing,
 };
 pub use properties_panel::populate_properties_panel;
 pub use tool::Tool;

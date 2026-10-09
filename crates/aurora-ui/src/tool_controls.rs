@@ -32,7 +32,7 @@
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::length;
+use taffy::style_helpers::{TaffyZero as _, length};
 use taffy::{Display, FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::curves_controls::{CurvesControls, insert_curves_controls};
@@ -75,6 +75,18 @@ pub fn radius_readout(tool: Tool, radius: Option<f64>) -> String {
     }
 }
 
+/// The Properties-panel strip's style: a padded column.
+///
+/// **It shrinks and scrolls (0.161.0).** It used to be `flex_shrink: 0`,
+/// so when the rail gave the Properties panel less than its 21 px title
+/// plus the 221 px Curves strip (always, in equal thirds of a 672 px
+/// rail) the body went to zero and the strip overflowed into History.
+/// Now the panel is content-sized ([`crate::PanelSizing::Content`]) and
+/// gets the strip's full height whenever the rail can give it; only a
+/// rail too short for every panel shrinks the strip, which is then a
+/// scroll container (`set_scrollable` in [`insert_tool_controls`]) the
+/// wheel and focus-follow reach like any panel body — never below one
+/// row (`min_size.height`), so the editor is never squeezed to nothing.
 fn strip_style(scales: &Scales, collapsed: bool) -> Style {
     #[allow(clippy::cast_precision_loss)]
     let pad = length(scales.spacing.sm as f32);
@@ -87,7 +99,15 @@ fn strip_style(scales: &Scales, collapsed: bool) -> Style {
             Display::Flex
         },
         flex_direction: FlexDirection::Column,
-        flex_shrink: 0.0,
+        flex_shrink: 1.0,
+        min_size: Size {
+            width: taffy::Dimension::ZERO,
+            height: length(widgets::row_height(scales)),
+        },
+        overflow: taffy::Point {
+            x: taffy::Overflow::Hidden,
+            y: taffy::Overflow::Hidden,
+        },
         gap: Size {
             width: gap,
             height: gap,
@@ -246,7 +266,10 @@ pub fn insert_tool_controls(
             return Err(err);
         }
     };
-    let built = build(tree, options, root, scales);
+    let built = tree
+        .set_scrollable(root, true)
+        .and_then(|()| build(tree, options, root, scales))
+        .and_then(|controls| crate::panel::refresh_panel_floor(tree, panel).map(|()| controls));
     if built.is_err() {
         let _ = tree.remove(root);
         let _ = tree.remove(options);
