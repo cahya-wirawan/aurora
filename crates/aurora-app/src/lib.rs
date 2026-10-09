@@ -27464,6 +27464,267 @@ mod tests {
         }
     }
 
+    /// `curves_rgb.psd`'s committed expected numbers (AC-4), measured on
+    /// 0.158.0 (RTX 3090 box; the CPU compositor is deterministic): per
+    /// channel R, G, B over all 40,000 pixels.
+    const CURVES_RGB_MAX: [f64; 3] = [11.0, 1.0, 4.0];
+    const CURVES_RGB_MEAN: [f64; 3] = [0.1422, 0.16255, 0.23735];
+    /// Solid-mask channel samples (of 120,000) more than one level off,
+    /// and more than two.
+    const CURVES_RGB_OVER_ONE: usize = 209;
+    const CURVES_RGB_OVER_TWO: usize = 3;
+    const PASS_THROUGH_CURVES: &str = "inside a Pass Through group, which Aurora doesn't have";
+    /// Other `curv` corpus files: `(file, max error where no Curves mask is
+    /// fractional, a report line that explains a difference)`.
+    const CURVES_CORPUS_EXPECTED: &[(&str, f64, Option<&str>)] = &[
+        // Identity curves: an exact match.
+        ("layers/curves.psd", 0.0, None),
+        ("layers/curves-with-vectormask.psd", 0.0, None),
+        // 15 other adjustment kinds left out.
+        ("fill_adjustments.psd", 240.0, Some("15 adjustment layers")),
+        // A clipped Curves layer shown unclipped.
+        (
+            "adjustments/adjustment_backdrop_test.psd",
+            2.0,
+            Some("1 clipped layer"),
+        ),
+        (
+            "adjustments/adjustment_clipping.psd",
+            68.0,
+            Some("4 clipped layers"),
+        ),
+        // Curves inside Pass Through groups.
+        (
+            "adjustments/adjustment_nested_composition_1.psd",
+            254.0,
+            Some(PASS_THROUGH_CURVES),
+        ),
+        (
+            "adjustments/adjustment_nested_composition_2.psd",
+            182.0,
+            Some(PASS_THROUGH_CURVES),
+        ),
+        (
+            "adjustments/adjustment_nested_composition_3.psd",
+            1.0,
+            Some(PASS_THROUGH_CURVES),
+        ),
+        (
+            "adjustments/adjustment_nested_composition_4.psd",
+            167.0,
+            Some(PASS_THROUGH_CURVES),
+        ),
+        // A Levels layer left out.
+        (
+            "adjustments/adjustment_nested_composition_5.psd",
+            84.0,
+            Some("1 adjustment layer"),
+        ),
+    ];
+
+    /// One corpus file's Curves differential (0.158.0): Aurora's CPU
+    /// composite through the real open path against Photoshop's own
+    /// stored merged composite, over every pixel, in 8-bit levels.
+    #[derive(Debug)]
+    struct CurvesDiff {
+        /// Per channel, over every pixel.
+        max: [f64; 3],
+        mean: [f64; 3],
+        /// The largest error over pixels where every Curves layer's mask
+        /// is exactly `0` or `1` (no fractional mask edge).
+        max_solid: f64,
+        /// Solid-mask channel samples more than one / two levels off.
+        over_one: usize,
+        over_two: usize,
+        /// How many Curves layers the open imported, and its report.
+        curves: usize,
+        report: Vec<String>,
+    }
+
+    /// `None` when the corpus is absent (prints `SKIPPED`).
+    // Test-only pixel arithmetic over a 200×200 corpus image.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::collapsible_if
+    )]
+    fn curves_corpus_diff(relative: &str) -> Option<CurvesDiff> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpora/psd/reference/psd-tools-fixtures")
+            .join(relative);
+        let Ok(bytes) = std::fs::read(&path) else {
+            println!("SKIPPED: corpus file not present at {}", path.display());
+            return None;
+        };
+        let merged = match aurora_io::decode_psd_merged_image(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{relative}: {err:?}"),
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let (document, image) = open_and_composite_psd(
+            &bytes,
+            &mut store,
+            (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+        );
+        let (w, h) = document.canvas_size;
+        assert_eq!((merged.width(), merged.height()), (w, h), "{relative}");
+        let mut pending = document.layers.roots().to_vec();
+        let mut curves = Vec::new();
+        while let Some(id) = pending.pop() {
+            if document.layers.adjustment(id).is_some() {
+                curves.push(id);
+            }
+            pending.extend(document.layers.children(id).unwrap_or(&[]));
+        }
+        let mut fractional = vec![false; w as usize * h as usize];
+        for mask in document.masks.iter().filter(|m| curves.contains(&m.layer)) {
+            let Some(bounds) = document.layers.mask(mask.layer).map(|m| m.bounds) else {
+                continue;
+            };
+            for (i, v) in mask.coverage.iter().enumerate() {
+                let v = v.to_f32();
+                if v <= 0.0 || v >= 1.0 {
+                    continue;
+                }
+                let x = bounds.x + i64::from(mask.offset.0) + (i % mask.width as usize) as i64;
+                let y = bounds.y + i64::from(mask.offset.1) + (i / mask.width as usize) as i64;
+                if (0..i64::from(w)).contains(&x) && (0..i64::from(h)).contains(&y) {
+                    if let Some(slot) = fractional.get_mut((y * i64::from(w) + x) as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        let (mut max, mut sum, mut max_solid) = ([0.0_f64; 3], [0.0_f64; 3], 0.0_f64);
+        let (mut over_one, mut over_two) = (0_usize, 0_usize);
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                let want = image_pixel(&merged, x, y);
+                // Photoshop's merged image is opaque; a transparent
+                // Aurora pixel is compared as if over white.
+                let a = f64::from(a);
+                for (c, got) in [r, g, b].into_iter().enumerate() {
+                    let got = f64::from(got) * a + (1.0 - a);
+                    let want = f64::from(want.get(c).copied().unwrap_or(0.0));
+                    let error = ((got * 255.0).round() - (want * 255.0).round()).abs();
+                    if let (Some(m), Some(s)) = (max.get_mut(c), sum.get_mut(c)) {
+                        *m = m.max(error);
+                        *s += error;
+                    }
+                    if !fractional
+                        .get((y * w + x) as usize)
+                        .copied()
+                        .unwrap_or(true)
+                    {
+                        max_solid = max_solid.max(error);
+                        over_one += usize::from(error > 1.0);
+                        over_two += usize::from(error > 2.0);
+                    }
+                }
+            }
+        }
+        let n = f64::from(w) * f64::from(h);
+        Some(CurvesDiff {
+            max,
+            mean: sum.map(|s| s / n),
+            max_solid,
+            over_one,
+            over_two,
+            curves: curves.len(),
+            report: document.report.items,
+        })
+    }
+
+    /// AC-4, 0.158.0: `adjustments/curves_rgb.psd` — four Curves layers
+    /// (composite and per-channel curves, moved endpoints at both ends,
+    /// overlapping fractional masks) over a pixel backdrop — opened
+    /// through the real PSD path and composited on the CPU, against
+    /// Photoshop's own merged composite over the **whole** image.
+    ///
+    /// Expected numbers, measured on this build and committed as the
+    /// constants above (no Python at test time): mean error 0.14 / 0.16 /
+    /// 0.24 levels (R / G / B), max 11 / 1 / 4. Tolerance, justified by
+    /// where the errors are: of the 120,000 channel samples where no
+    /// Curves mask is fractional, all but `CURVES_RGB_OVER_ONE` (209,
+    /// 0.17%) are within one level — the merged image's own 8-bit
+    /// rounding plus Aurora's `f16` pipeline — and only
+    /// `CURVES_RGB_OVER_TWO` (3) are more than two: one blue sample of 4
+    /// levels (cause not isolated) and two red samples at
+    /// column 0 under `Curves 4`, whose red curve falls from 229 to 36
+    /// over inputs 185..195 (about -20 output levels per input level),
+    /// so a sub-level difference in the evaluated input moves the output
+    /// by ~10 levels. The 1–2-level blue cluster under `Curves 2` sits on
+    /// its composite curve's steep moved-endpoint segment (slope ~2.8);
+    /// the likely cause is Photoshop's 8-bit intermediate between the
+    /// channel and composite tables, which Aurora deliberately does not
+    /// have (invariant §7.3.1b) — likely, not proven. Pinned at the
+    /// measured values so any regression fails.
+    #[test]
+    fn curves_rgb_psd_composites_like_photoshops_merged_image() {
+        let Some(diff) = curves_corpus_diff("adjustments/curves_rgb.psd") else {
+            return;
+        };
+        println!("curves_rgb.psd: {diff:?}");
+        assert_eq!(diff.curves, 4, "every Curves layer is imported");
+        assert!(
+            !diff
+                .report
+                .iter()
+                .any(|item| item.contains("adjustment layer")),
+            "{:?}",
+            diff.report
+        );
+        assert!(diff.over_one <= CURVES_RGB_OVER_ONE, "{diff:?}");
+        assert!(diff.over_two <= CURVES_RGB_OVER_TWO, "{diff:?}");
+        for c in 0..3 {
+            let got = (diff.max.get(c), diff.mean.get(c));
+            let want = (CURVES_RGB_MAX.get(c), CURVES_RGB_MEAN.get(c));
+            let (Some(max), Some(mean), Some(max_want), Some(mean_want)) =
+                (got.0, got.1, want.0, want.1)
+            else {
+                unreachable!("three channels");
+            };
+            assert!(max <= max_want, "channel {c}: {diff:?}");
+            assert!(*mean <= mean_want + 1e-3, "channel {c}: {diff:?}");
+        }
+    }
+
+    /// AC-4: the other corpus files carrying `curv`, each against its own
+    /// merged image. Where they differ it is for a reason named in the
+    /// file's own report (Pass Through groups, clipping, other adjustment
+    /// kinds), so each is pinned at its measured maximum as a regression
+    /// guard, not claimed as a match; the identity-curve files match.
+    #[test]
+    fn other_corpus_curves_files_match_or_differ_for_their_reported_reasons() {
+        let mut skipped = 0_usize;
+        for &(file, max_solid, needle) in CURVES_CORPUS_EXPECTED {
+            let Some(diff) = curves_corpus_diff(file) else {
+                skipped += 1;
+                println!("not run: {file} (corpus file missing)");
+                continue;
+            };
+            println!("{file}: {diff:?}");
+            assert!(diff.curves > 0, "{file}: {diff:?}");
+            assert!(diff.max_solid <= max_solid, "{file}: {diff:?}");
+            if let Some(needle) = needle {
+                assert!(
+                    diff.report.iter().any(|item| item.contains(needle)),
+                    "{file}: {needle:?} not in {:?}",
+                    diff.report
+                );
+            }
+        }
+        if skipped > 0 {
+            println!(
+                "{skipped} of {} Curves corpus files missing",
+                CURVES_CORPUS_EXPECTED.len()
+            );
+        }
+    }
+
     /// 0.150.0: a PSD vector mask is rasterised and composited — a blue
     /// layer masked by the rectangle x 2.5..6, y 2..6 (normalised in the
     /// file's 8.24 fixed point, vertical first) over a red one on 8×8:
@@ -64700,6 +64961,67 @@ mod tests {
                 (got - want).abs() <= TOLERANCE,
                 "{what}: got {got}, want {want}"
             );
+        }
+
+        /// 0.158.0 (AC-5): a Curves layer imported from a PSD — its
+        /// composite curve starting at input 26, `curves_rgb.psd`'s own
+        /// `Curves 2` — opens through the real PSD path and the editor
+        /// shows exactly that curve, moved endpoint included (endpoint
+        /// edits keeping their `x` are pinned in `aurora-core`).
+        #[test]
+        fn the_editor_shows_a_curve_imported_from_a_psd() {
+            let levels: [(u16, u16); 4] = [(3, 26), (84, 55), (170, 171), (255, 255)];
+            let mut block = vec![0, 0, 1, 0, 0, 0, 1];
+            let mut curve_bytes = vec![0, 4];
+            for (o, i) in levels {
+                curve_bytes.extend_from_slice(&o.to_be_bytes());
+                curve_bytes.extend_from_slice(&i.to_be_bytes());
+            }
+            block.extend_from_slice(&curve_bytes);
+            block.extend_from_slice(b"Crv \0\x04\0\0\0\x01\0\0");
+            block.extend_from_slice(&curve_bytes);
+            let curves_layer = super::TinyLayer {
+                rect: (0, 0, 0, 0),
+                channels: vec![
+                    (-1, Vec::new()),
+                    (0, Vec::new()),
+                    (1, Vec::new()),
+                    (2, Vec::new()),
+                ],
+                mask: None,
+                blocks: vec![(*b"curv", block)],
+            };
+            let bytes = super::tiny_psd(
+                4,
+                4,
+                3,
+                &[
+                    super::tiny_solid((0, 0, 4, 4), [200, 100, 50]),
+                    curves_layer,
+                ],
+            );
+            let (dir, mut store) = real_tile_store();
+            let (document, _image) = super::open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            assert!(document.report.is_empty(), "{:?}", document.report);
+            let Some(&imported) = document.layers.roots().first() else {
+                unreachable!("two roots");
+            };
+            let Some(aurora_doc::Adjustment::Curves(wanted)) =
+                document.layers.adjustment(imported).cloned()
+            else {
+                unreachable!("the top root is the imported Curves layer");
+            };
+            assert_eq!(wanted.composite.input_range().0, 26.0 / 255.0);
+            let (mut rig, _added) = Rig::new(dir, store, document.layers, (4, 4));
+            rig.active = Some(imported);
+            rig.sync();
+            assert!(rig.shown());
+            assert_eq!(rig.shown_curve(), wanted.composite);
+            assert_eq!(rig.params(imported), wanted);
         }
 
         #[test]

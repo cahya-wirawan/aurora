@@ -19,9 +19,11 @@
 //! the old curve on failure:
 //!
 //! - between [`MIN_POINTS`] and [`MAX_POINTS`] points, inclusive;
-//! - every coordinate finite, every `y` in `[0, 1]`;
-//! - the first point's `x` is exactly `0.0` and the last one's exactly
-//!   `1.0` (the endpoints can move vertically, never horizontally);
+//! - every coordinate finite, every `x` and every `y` in `[0, 1]`;
+//! - the first and last points may sit anywhere in `[0, 1]` (0.158.0,
+//!   *movable endpoints*): below the first point's `x` the output is held
+//!   at its `y`, above the last one's at that `y` — Photoshop's own rule,
+//!   which psd-tools reproduces by clamping the input to `[x0, xn]`;
 //! - consecutive `x`s at least [`MIN_POINT_SEPARATION`] apart (so strictly
 //!   increasing — the constructor never sorts silently).
 //!
@@ -64,12 +66,22 @@
 //! evaluate a 256-entry table and interpolate it; Aurora evaluates the
 //! spline directly), and Photoshop's own source.
 //!
-//! **One Photoshop difference kept:** Photoshop lets the first and last
+//! **Movable endpoints (0.158.0).** Photoshop lets the first and last
 //! points move horizontally (a curve may start at input 26) and holds the
-//! output flat beyond them. This type still pins them to `x == 0` and
-//! `x == 1`, so such a PSD curve is not yet representable — adding flat
-//! points at the ends is **not** equivalent for a natural spline. The PSD
-//! `curv` import must relax that invariant (0.158.0).
+//! output flat beyond them; adding flat points at the ends instead is
+//! **not** equivalent for a natural spline. Until 0.157.0 this type pinned
+//! them to `x == 0` and `x == 1`; the PSD `curv` import relaxed that: the
+//! spline is built through the points as given and its **input** is
+//! clamped to `[x0, xn]` before it is evaluated, exactly psd-tools'
+//! `np.clip(t, x_min, x_max)`. Verified against Photoshop's own merged
+//! composite of `adjustments/curves_rgb.psd`, whose `Curves 2` composite
+//! curve starts at input 26 (the `aurora-app` corpus differential). The
+//! editor still moves an endpoint only vertically
+//! ([`ToneCurve::move_point_to`]); an imported interior endpoint keeps its
+//! `x`. `.aur` compatibility: a build older than 0.158.0 re-validates every
+//! decoded curve with its own `x == 0` / `x == 1` rule, so it **refuses**
+//! a file holding a movable-endpoint curve (a typed decode error, the
+//! whole file), rather than opening it with a different curve.
 //!
 //! [`ToneCurve::build_lut`] allocates exactly the length it is asked for,
 //! up to [`MAX_LUT_LEN`] samples (4 MiB of `f32`); a longer request is
@@ -127,12 +139,14 @@ pub enum ToneCurveError {
     /// A coordinate was NaN or infinite.
     #[error("tone curve coordinates must be finite")]
     NonFinite,
-    /// A `y` outside `[0, 1]`, or an inserted `x` not strictly inside
-    /// `(0, 1)`.
+    /// A `y` outside `[0, 1]`, or an inserted `x` not strictly between
+    /// the first and last points' `x`.
     #[error("tone curve coordinates must lie in [0, 1]")]
     OutOfRange,
-    /// The first point's `x` is not `0.0` or the last one's is not `1.0`.
-    #[error("a tone curve's endpoints must sit at x = 0 and x = 1")]
+    /// A point's `x` lies outside `[0, 1]`. Until 0.157.0 this also meant
+    /// "an endpoint not at exactly `0` / `1`"; endpoints may move since
+    /// 0.158.0, so only the unit range is enforced.
+    #[error("a tone curve's points must sit between x = 0 and x = 1")]
     EndpointX,
     /// Two consecutive points are closer than [`MIN_POINT_SEPARATION`]
     /// horizontally (or out of order).
@@ -202,6 +216,17 @@ impl ToneCurve {
         &self.points
     }
 
+    /// The closed input range the points span, `(x0, xn)` — `(0, 1)`
+    /// unless an endpoint was moved. Below `x0` and above `xn` the output
+    /// is flat ([`Self::evaluate`]).
+    #[must_use]
+    pub fn input_range(&self) -> (f32, f32) {
+        match (self.points.first(), self.points.last()) {
+            (Some(a), Some(b)) => (a.x, b.x),
+            _ => (0.0, 1.0),
+        }
+    }
+
     /// Whether this is exactly the two-point identity `(0, 0)`–`(1, 1)`,
     /// which [`Self::evaluate`] maps to itself for every `x` in `[0, 1]`.
     /// A curve with extra points on the diagonal is *not* reported as
@@ -217,7 +242,8 @@ impl ToneCurve {
     }
 
     /// The curve's output at input `x`: the spline clamped to `[0, 1]`
-    /// (see this module's own doc comment). `x` is clamped to `[0, 1]`,
+    /// (see this module's own doc comment). `x` is clamped to `[0, 1]`
+    /// and then to [`Self::input_range`] (flat beyond a moved endpoint),
     /// and a NaN `x` is treated as `0.0`. Exact (`==`) at every control
     /// point, and exactly `x` for the identity curve.
     #[must_use]
@@ -235,16 +261,42 @@ impl ToneCurve {
         self.spline(x) as f32
     }
 
+    /// The spline's own end-interval cubics **continued past a moved
+    /// endpoint** (0.158.0): input clamped to `[0, 1]` only (NaN reads as
+    /// `0.0`), not to [`Self::input_range`], and no output clamp. Inside
+    /// the range it equals [`Self::evaluate_unclamped`]. For a lookup table
+    /// that clamps its *input* to the range itself before interpolating
+    /// (`aurora_filters::curves`), so the flat extension's kink at a moved
+    /// endpoint never falls inside a table interval. Always finite: the
+    /// continuation is at most one unit away from an interval at least
+    /// [`MIN_POINT_SEPARATION`] wide.
+    #[must_use]
+    pub fn evaluate_extrapolated(&self, x: f32) -> f32 {
+        self.spline_at(Self::unit_input(x)) as f32
+    }
+
+    fn unit_input(x: f32) -> f64 {
+        if x.is_nan() {
+            0.0
+        } else {
+            f64::from(x.clamp(0.0, 1.0))
+        }
+    }
+
     /// The natural cubic spline at `x`, in `f64` — the one place the
     /// interpolation formula lives (with `natural_second_derivatives`).
     // The spline formula's own names (`x`, `t`, `u`, `h`, `k`, `a`, `b`).
     #[allow(clippy::many_single_char_names)]
     fn spline(&self, x: f32) -> f64 {
-        let x = if x.is_nan() {
-            0.0
-        } else {
-            f64::from(x.clamp(0.0, 1.0))
-        };
+        let (lo, hi) = self.input_range();
+        // Flat beyond a moved endpoint: psd-tools' `np.clip(t, x0, xn)`.
+        self.spline_at(Self::unit_input(x).clamp(f64::from(lo), f64::from(hi)))
+    }
+
+    /// The spline formula at an already-clamped `x` (beyond the knots it
+    /// continues the end interval's cubic).
+    #[allow(clippy::many_single_char_names)]
+    fn spline_at(&self, x: f64) -> f64 {
         // The interval `[k, k + 1]` holding `x`: `x == 1.0` (and any
         // `x` at the last knot) falls in the last interval, at `t == 1`.
         let after = self.points.partition_point(|p| f64::from(p.x) <= x);
@@ -300,7 +352,8 @@ impl ToneCurve {
     ///
     /// [`ToneCurveError::NonFinite`] for a non-finite `x`,
     /// [`ToneCurveError::TooManyPoints`] at [`MAX_POINTS`],
-    /// [`ToneCurveError::OutOfRange`] unless `0 < x < 1`, and
+    /// [`ToneCurveError::OutOfRange`] unless `x0 < x < xn`
+    /// ([`Self::input_range`]; `0 < x < 1` for unmoved endpoints), and
     /// [`ToneCurveError::TooClose`] if `x` is within
     /// [`MIN_POINT_SEPARATION`] of either neighbour.
     pub fn add_point(&mut self, x: f32) -> Result<usize, ToneCurveError> {
@@ -310,7 +363,8 @@ impl ToneCurve {
         if self.points.len() >= MAX_POINTS {
             return Err(ToneCurveError::TooManyPoints);
         }
-        if x <= 0.0 || x >= 1.0 {
+        let (lo, hi) = self.input_range();
+        if x <= lo || x >= hi {
             return Err(ToneCurveError::OutOfRange);
         }
         let index = self.points.partition_point(|p| p.x < x);
@@ -341,7 +395,8 @@ impl ToneCurve {
     }
 
     /// Moves the point at `index` towards `(x, y)`: `y` is clamped to
-    /// `[0, 1]`; an endpoint **ignores `x`** (it stays at `0` or `1`); an
+    /// `[0, 1]`; an endpoint **ignores `x`** (it keeps its own `x`, `0` or
+    /// `1` unless an imported curve moved it); an
     /// interior point's `x` is clamped to stay [`MIN_POINT_SEPARATION`]
     /// from both neighbours. Returns whether the point actually moved.
     ///
@@ -430,9 +485,6 @@ fn interior_x_range(before: f32, after: f32) -> (f32, f32) {
 
 /// Every invariant in this module's own doc comment, in the order
 /// [`ToneCurve::new`] documents.
-// Exact endpoint comparisons are the invariant itself (`x == 0.0` and
-// `x == 1.0` exactly, both exact in `f32`).
-#[allow(clippy::float_cmp)]
 fn validate(points: &[CurvePoint]) -> Result<(), ToneCurveError> {
     if points.len() < MIN_POINTS {
         return Err(ToneCurveError::TooFewPoints);
@@ -446,10 +498,12 @@ fn validate(points: &[CurvePoint]) -> Result<(), ToneCurveError> {
     if points.iter().any(|p| !(0.0..=1.0).contains(&p.y)) {
         return Err(ToneCurveError::OutOfRange);
     }
+    // Endpoints may move (0.158.0); every `x` must still lie in `[0, 1]`
+    // (with the ordering below, checking the ends is checking them all).
     let (Some(first), Some(last)) = (points.first(), points.last()) else {
         return Err(ToneCurveError::TooFewPoints);
     };
-    if first.x != 0.0 || last.x != 1.0 {
+    if first.x < 0.0 || last.x > 1.0 {
         return Err(ToneCurveError::EndpointX);
     }
     if points
@@ -983,8 +1037,8 @@ mod tests {
             (&[p(0.0, 0.0), p(f32::INFINITY, 1.0)], E::NonFinite),
             (&[p(0.0, -0.01), p(1.0, 1.0)], E::OutOfRange),
             (&[p(0.0, 0.0), p(1.0, 1.01)], E::OutOfRange),
-            (&[p(0.01, 0.0), p(1.0, 1.0)], E::EndpointX),
-            (&[p(0.0, 0.0), p(0.99, 1.0)], E::EndpointX),
+            (&[p(-0.01, 0.0), p(1.0, 1.0)], E::EndpointX),
+            (&[p(0.0, 0.0), p(1.01, 1.0)], E::EndpointX),
             (
                 &[p(0.0, 0.0), p(0.6, 0.5), p(0.4, 0.5), p(1.0, 1.0)],
                 E::TooClose,
@@ -1194,5 +1248,142 @@ mod tests {
             }
             assert_eq!(ToneCurve::new(c.points()).as_ref(), Ok(&c));
         }
+    }
+
+    /// The two movable-endpoint curves `adjustments/curves_rgb.psd`
+    /// carries, as the file's `(input, output)` levels.
+    fn psd_levels(levels: &[(u16, u16)]) -> ToneCurve {
+        let points: Vec<CurvePoint> = levels
+            .iter()
+            .map(|&(i, o)| p(f32::from(i) / 255.0, f32::from(o) / 255.0))
+            .collect();
+        curve(&points)
+    }
+
+    /// 0.158.0: a curve whose endpoints are interior is valid, holds its
+    /// output flat beyond them, and matches an independent natural-spline
+    /// solve (numpy `linalg.solve` of the full tridiagonal system, input
+    /// clamped to `[x0, xn]` as psd-tools does) to `1e-6`.
+    #[test]
+    fn movable_endpoints_hold_the_output_flat_beyond_them() {
+        // `Curves 2`'s composite: starts at input 26.
+        let start = psd_levels(&[(26, 3), (55, 84), (171, 170), (255, 255)]);
+        assert_eq!(start.input_range(), (26.0 / 255.0, 1.0));
+        assert!(!start.is_identity());
+        // `Curves 4`'s red: moved at both ends, 49 and 195.
+        let both = psd_levels(&[(49, 60), (94, 218), (102, 0), (185, 229), (195, 36)]);
+        for (c, reference) in [
+            (
+                &start,
+                [
+                    (0.0, 0.011_764_7),
+                    (0.1, 0.011_764_7),
+                    (0.3, 0.482_915_1),
+                    (0.5, 0.619_479_3),
+                    (0.7, 0.683_161_5),
+                    (0.75, 0.719_544_1),
+                    (0.9, 0.875_275_9),
+                    (1.0, 1.0),
+                ],
+            ),
+            (
+                &both,
+                [
+                    (0.0, 0.235_294_1),
+                    (0.1, 0.235_294_1),
+                    (0.3, 1.0),
+                    (0.5, 0.0),
+                    (0.7, 1.0),
+                    (0.75, 0.456_463_8),
+                    (0.9, 0.141_176_5),
+                    (1.0, 0.141_176_5),
+                ],
+            ),
+        ] {
+            for (x, want) in reference {
+                let got = c.evaluate(x);
+                assert!((got - want).abs() <= 1e-6, "{x}: {got} vs {want}");
+            }
+            // Flat, bit for bit, on both sides of the moved ends.
+            let (lo, hi) = c.input_range();
+            let (Some(first), Some(last)) = (c.points().first(), c.points().last()) else {
+                unreachable!("two points at least");
+            };
+            for i in 0..=64_u16 {
+                let x = f32::from(i) / 64.0;
+                if x <= lo {
+                    assert_eq!(c.evaluate(x), first.y, "below x0 at {x}");
+                }
+                if x >= hi {
+                    assert_eq!(c.evaluate(x), last.y, "above xn at {x}");
+                }
+            }
+            for point in c.points() {
+                assert_eq!(c.evaluate(point.x), point.y);
+            }
+        }
+    }
+
+    /// The extrapolated form agrees with the clamped one inside the range,
+    /// continues past it (not flat), and stays finite everywhere.
+    #[test]
+    fn evaluate_extrapolated_continues_past_moved_endpoints() {
+        let c = psd_levels(&[(26, 3), (55, 84), (171, 170), (255, 255)]);
+        for i in 0..=255_u16 {
+            let x = f32::from(i) / 255.0;
+            let e = c.evaluate_extrapolated(x);
+            assert!(e.is_finite());
+            if x >= c.input_range().0 {
+                assert_eq!(e, c.evaluate_unclamped(x), "{x}");
+            }
+        }
+        // Below 26 the end interval's line continues downwards.
+        assert!(c.evaluate_extrapolated(0.0) < c.evaluate_unclamped(0.0));
+        assert_eq!(
+            c.evaluate_extrapolated(f32::NAN),
+            c.evaluate_extrapolated(0.0)
+        );
+        // The steepest valid end interval, continued a whole unit: finite.
+        let steep = curve(&[p(0.5, 0.0), p(0.5 + MIN_POINT_SEPARATION, 1.0), p(0.6, 0.0)]);
+        for x in [0.0, 1.0] {
+            assert!(steep.evaluate_extrapolated(x).is_finite());
+        }
+    }
+
+    /// Editing a moved-endpoint curve: inserts only between the ends, an
+    /// endpoint drag keeps its own `x`, and the result still validates.
+    #[test]
+    fn editing_respects_moved_endpoints() {
+        let mut c = psd_levels(&[(26, 3), (255, 255)]);
+        assert_eq!(c.add_point(0.05), Err(ToneCurveError::OutOfRange));
+        assert_eq!(c.add_point(0.5), Ok(1));
+        assert_eq!(c.move_point_to(0, 0.0, 0.5), Ok(true));
+        assert_eq!(c.points().first(), Some(&p(26.0 / 255.0, 0.5)));
+        let mut end = psd_levels(&[(0, 0), (238, 255)]);
+        assert_eq!(end.add_point(0.95), Err(ToneCurveError::OutOfRange));
+        assert_eq!(
+            end.remove_point(1),
+            Err(ToneCurveError::EndpointNotRemovable)
+        );
+        assert_eq!(end.move_point_to(1, 1.0, 0.9), Ok(true));
+        assert_eq!(end.points().last(), Some(&p(238.0 / 255.0, 0.9)));
+    }
+
+    /// A moved-endpoint curve survives the `.aur` encoding (its point
+    /// list) unchanged, and a point outside `[0, 1]` is still refused on
+    /// decode.
+    #[test]
+    fn a_moved_endpoint_curve_round_trips_and_out_of_range_x_is_refused() {
+        let c = psd_levels(&[(49, 60), (94, 218), (102, 0), (185, 229), (195, 36)]);
+        let bytes = match postcard::to_allocvec(&c) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(postcard::from_bytes::<ToneCurve>(&bytes).ok(), Some(c));
+        let outside = match postcard::to_allocvec(&vec![(-0.5_f32, 0.0_f32), (1.0, 1.0)]) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(postcard::from_bytes::<ToneCurve>(&outside).is_err());
     }
 }

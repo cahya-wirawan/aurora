@@ -26,7 +26,36 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.157.0): curves interpolate like Photoshop's.**
+**Latest (2026-10-09, 0.158.0): PSD Curves layers open as real Curves
+layers.** A PSD/PSB `curv` block is parsed (`aurora_io::psd`'s
+`parse_curv`, following psd-tools 1.17.4: map flag, version 1 or 4,
+channel bitmap or count, `(output, input)` pairs on `0..=255`, and the
+`Crv ` extra data, which wins when it parses because psd-tools'
+compositor reads only that; the bitmap-indexed legacy curves are the
+fallback) and mapped to `aurora_core::CurvesParams` (channel `0`
+composite, `1..=3` R/G/B, levels / 255), becoming an
+`Adjustment::Curves` layer with its opacity, blend mode, visibility and
+mask. `ToneCurve`'s endpoints may now move (a curve may start at input
+26): the input is clamped to `[x0, xn]`, psd-tools' rule; `CurvesLut`
+tabulates the spline continued past the ends and clamps its input
+first, so the flat extension's kink never sits inside a table interval.
+Refused, with a report line each: over 19 points, unreadable blocks
+(map form, version 4 without `Crv `, bad levels or ordering), and
+Grayscale files' Curves (convention unverified). A Curves layer directly
+inside a Pass Through group is imported but reported (Aurora isolates
+groups). **Oracle**: `curves_rgb.psd` opened through the real path and
+composited on the CPU against Photoshop's stored merged image over all
+40,000 pixels: mean error 0.14 / 0.16 / 0.24 levels (R/G/B), max 11 / 1 /
+4; 209 of 120,000 solid-mask channel samples are over one level and 3
+over two (two on a −20-levels-per-level red segment). `.aur`: a build
+older than 0.158.0 refuses a file holding a moved-endpoint curve. 13 of
+13 mutations killed. 16 new tests. Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`): 2,988 passed, 0 failed, 0 skipped; judge PASS
+0.907. **Needs a human: open a PSD with Curves layers on
+macOS and compare against Photoshop.** Details: "Next action", addendum
+0.158.0.
+
+**Previously (2026-10-09, 0.157.0): curves interpolate like Photoshop's.**
 `aurora_core::ToneCurve` is now a natural cubic spline (second derivative
 `0` at both ends) with its output clamped to `[0, 1]`, replacing
 0.155.0's monotone Fritsch–Carlson spline, and holds up to **19** points
@@ -9396,6 +9425,14 @@ structural design work.
   file's merged image reads the rest of the file at once. Measured: a
   2 GiB PSD peaks at +1,277 MiB (was +4,352 MiB) and opens in 7.3 s —
   over the PRD's 5 s. "Next action", addendum 0.154.0.
+
+  **Update 0.158.0 — Curves layers imported.** A `curv` block becomes a
+  real `Adjustment::Curves` layer (moved endpoints, per-channel curves,
+  opacity, blend mode, visibility, mask) and is no longer reported as
+  left out; other adjustment kinds, Grayscale Curves, over-19-point and
+  unreadable blocks stay reported, and a Curves layer in a Pass Through
+  group is reported. `curves_rgb.psd` matches Photoshop's merged image
+  to a mean 0.14–0.24 levels. "Next action", addendum 0.158.0.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -30797,6 +30834,117 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.158.0) — PSD Curves (`curv`) import.** Files:
+`aurora-core` `tone_curve.rs` (movable endpoints: `validate` now only
+requires every `x` in `[0, 1]`; `spline` clamps its input to
+`input_range()`; new `input_range`, `evaluate_extrapolated`; `add_point`
+refuses outside `(x0, xn)`; an endpoint drag still keeps its `x`; the
+`EndpointX` error now means "an `x` outside `[0, 1]`"), `curves.rs` (one
+decode test's invalid example), `aurora-filters` `curves.rs` (`Table`
+keeps the range, samples `evaluate_extrapolated`, clamps input to the
+range before interpolating), `aurora-io` `psd.rs` (`parse_curv`,
+`read_crv_extra`, `read_curv_points`, `curves_params`,
+`PsdNode::Adjustment`/`PsdAdjustment`, four report notes, the Pass
+Through count in `build_tree`, `Builder` adds the layer with
+`History::add_adjustment_layer_at`, and `merged_image` — exported as
+`decode_psd_merged_image` — for the differential), `psd/tests.rs`,
+`aur.rs`, `aurora-app` `lib.rs` (corpus differentials, editor test).
+
+Corpus differential (AC-4), every corpus file carrying `curv`, max error
+in 8-bit levels over pixels where no Curves mask is fractional, and why:
+
+| File | Curves imported | Max (solid) | Explained by |
+|---|---|---|---|
+| `adjustments/curves_rgb.psd` | 4 | 11 (R), 1 (G), 4 (B); mean 0.14 / 0.16 / 0.24 | steep segments, see below |
+| `layers/curves.psd`, `layers/curves-with-vectormask.psd` | 1 each | 0 | identity curves |
+| `adjustments/adjustment_backdrop_test.psd` | 5 | 2 | a clipped Curves layer shown unclipped |
+| `adjustments/adjustment_clipping.psd` | 5 | 68 | 4 clipped layers shown unclipped |
+| `adjustments/adjustment_nested_composition_1..4.psd` | 8, 1, 1, 2 | 254, 182, 1, 167 | Curves in Pass Through groups (reported) |
+| `adjustments/adjustment_nested_composition_5.psd` | 2 | 84 | a Levels layer left out |
+| `fill_adjustments.psd` | 1 | 240 | 15 other adjustment layers left out |
+
+The expected numbers are committed as constants in the app tests (no
+Python at test time); the non-matching files are pinned at their
+measured maximum as regression guards, not claimed as matches.
+`curves_rgb.psd`'s residuals: two red samples at column 0 under
+`Curves 4`, whose red curve drops from 229 to 36 over inputs 185..195
+(about −20 output levels per input level, so a sub-level input
+difference is ~10 levels); a 1–2-level blue cluster under `Curves 2`, on
+its composite curve's steep moved-endpoint segment — likely Photoshop's
+8-bit intermediate between channel and composite tables, which Aurora
+does not have (invariant §7.3.1b) — likely, not proven; and one 4-level
+blue sample whose cause was not isolated.
+
+Mutations (13, each file backed up to the session scratchpad, restored,
+`touch`ed and its sha256 checked; all 13 restored byte-identical):
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | `(output, input)` read as `(input, output)` | killed | 6 `psd::tests` curv tests, editor test, both corpus differentials |
+| 2 | channel mapping off by one | killed | 5 `psd::tests`, editor test, both differentials |
+| 3 | per-channel curves ignored | killed | 5 `psd::tests`, both differentials |
+| 4 | `ToneCurve` endpoint input clamp removed | killed | `movable_endpoints_hold_the_output_flat_beyond_them`, `evaluate_extrapolated_continues_past_moved_endpoints` |
+| 5 | 19-point cap removed | killed | `hostile_curv_blocks_are_refused_never_a_panic` |
+| 6 | truncated curve panics | killed | `hostile_curv_blocks_...`, `seeded_single_byte_mutations_never_panic` |
+| 7 | report still lists imported Curves | killed | 2 `psd::tests`, editor test, both differentials |
+| 8 | Pass Through note missing | killed | `a_curves_layer_opens_as_a_curves_adjustment_and_is_not_reported`, `other_corpus_curves_files_...` |
+| 9 | `Crv ` extra data ignored | killed | 3 `psd::tests` |
+| 10 | `CurvesLut` range clamp removed | killed | `moved_endpoints_are_flat_beyond_and_within_the_bound_at_the_kink`, both differentials |
+| 11 | Grayscale Curves imported | killed | `curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals` |
+| 12 | adjustment-layer mask dropped | killed | 1 `psd::tests`, both differentials |
+| 13 | legacy bitmap order reversed | killed | `curv_legacy_layout_maps_the_channel_bitmap_low_bit_first` |
+
+Disclosures. Mutation 4 is caught only by `aurora-core`'s tests: the
+compositor reads `CurvesLut`, which clamps on its own (mutation 10), so
+`ToneCurve::evaluate`'s clamp reaches users through the editor's drawing
+alone. Mutation 13 is caught only by a synthetic test, since every
+corpus block carries `Crv ` data. The corpus agrees on legacy versus
+`Crv ` channel order (checked with psd-tools, not in CI). A version-4
+`curv` (no channel ids) is refused, not guessed. The undocumented
+lookup-table ("map") form is refused. Fill opacity on a Curves layer is
+stored but not applied, as for pixel layers, and is not reported. Only
+a Pass Through *parent* is reported; a Curves layer clipped to a layer
+is shown unclipped (reported by the existing clipping note). Grayscale
+stays unimported and reported: `curves_grayscale.psd`'s Curves all sit
+in a Pass Through group, which confounds the comparison. The editor
+cannot drag an endpoint horizontally (an imported moved endpoint keeps
+its `x`). Everything is 8-bit evidence; 16-bit behaviour is unverified.
+The whole-file truncation sweep never cuts *inside* a `curv` block
+(tagged blocks are length-checked first), so the block's own prefix
+sweep and its seeded mutations are what cover that.
+
+Checks this round: `cargo fmt --all --check` clean; `cargo clippy -p
+aurora-core -p aurora-filters -p aurora-io -p aurora-app --all-targets
+--all-features -- -D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test
+-p aurora-core -p aurora-filters -p aurora-io -p aurora-doc -p
+aurora-widgets -p aurora-ui -p aurora-app` 0 failures; the full gate
+was not run.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **2,988 passed, 0 failed, 55 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast check exit 0. Independent judge:
+**PASS 0.907**, no critical or high issue (bounds before every
+allocation, the 1/255-vs-1/256 separation, the LUT bound with the range
+clamp, and Pass-Through-parent semantics each checked). Its uncertain
+point, now confirmed: 0.157.0's `validate` returns `EndpointX` for any
+endpoint `x` other than 0 or 1 (`git show 0add628`), so a 0.155–0.157
+build refuses a file with a moved endpoint. Its notes, applied: the
+"other corpus files" differential now `continue`s past a missing file
+and counts it (it used to `return` and skip the rest silently); the
+README now says the import is close but not pixel-identical (at most 11
+levels, on 2 pixels). Recorded, not changed: `decode_psd_merged_image`
+is public API used only by tests; the pinned maxima for files that
+differ for reported reasons (240, 254, 182) are near-vacuous as
+regression guards; a click in the flat region beyond a moved endpoint
+cannot add a point (UX unverified).
+
+**Needs a human: open a PSD with Curves layers on macOS and compare
+against Photoshop.**
+
+**Suggested next: the Curves GPU port (WGSL), then the workspace rounds
+(left tools panel + options bar first).**
 
 **Addendum 2026-10-09 (0.157.0) — Photoshop-matching curve
 interpolation.** The design owner (Cahya, 2026-10-09, final) decided

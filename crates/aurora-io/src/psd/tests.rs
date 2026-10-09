@@ -13,6 +13,7 @@ use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree};
 use half::f16;
 
 use super::test_writer::{TestLayer, TestPsd, pack_bits};
+use super::{CurvBlock, CurvRefusal, Note, curves_params, parse_curv};
 use super::{
     MAX_GROUP_DEPTH, PIXEL_BUDGET, PsdBlend, PsdDocument, PsdFile, PsdNode, blend_for_key, decode,
     read, unpack_bits,
@@ -932,6 +933,9 @@ fn sweep_fixtures() -> Vec<Vec<u8>> {
                 .write(),
         );
     }
+    // 0.158.0: a Curves layer (legacy curves and `Crv ` extra data, a
+    // moved endpoint, a mask) inside a Pass Through group, over pixels.
+    files.push(curves_file(&curv_rgb_block(), |_| {}).write());
     files
 }
 
@@ -4381,4 +4385,441 @@ fn a_read_failing_once_inside_a_mask_fails_the_open_not_the_mask() {
         "{:?}",
         result.map(|f| f.report())
     );
+}
+
+// ---------------------------------------------------------------------
+// Curves adjustment layers (`curv`, 0.158.0)
+// ---------------------------------------------------------------------
+
+/// One `Crv ` item: channel id and `(output, input)` points.
+type CrvItem<'a> = (u16, &'a [(u16, u16)]);
+
+/// A `curv` block: the map flag `0`, `version`, `count_map`, the legacy
+/// curves, then (when given) the `Crv ` extra data. Points are the file's
+/// `(output, input)` pairs.
+fn curv(
+    version: u16,
+    count_map: u32,
+    legacy: &[&[(u16, u16)]],
+    extra: Option<&[CrvItem<'_>]>,
+) -> Vec<u8> {
+    let points = |out: &mut Vec<u8>, pts: &[(u16, u16)]| {
+        out.extend_from_slice(&u16::try_from(pts.len()).unwrap_or(u16::MAX).to_be_bytes());
+        for (o, i) in pts {
+            out.extend_from_slice(&o.to_be_bytes());
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+    };
+    let mut out = vec![0];
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&count_map.to_be_bytes());
+    for pts in legacy {
+        points(&mut out, pts);
+    }
+    if let Some(extra) = extra {
+        out.extend_from_slice(b"Crv ");
+        out.extend_from_slice(&4_u16.to_be_bytes());
+        out.extend_from_slice(&u32::try_from(extra.len()).unwrap_or(0).to_be_bytes());
+        for (channel, pts) in extra {
+            out.extend_from_slice(&channel.to_be_bytes());
+            points(&mut out, pts);
+        }
+    }
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// `curves_rgb.psd`'s `Curves 1`-like block: composite, red (moved
+/// endpoints), green, blue, in both layouts.
+fn curv_rgb_block() -> Vec<u8> {
+    let c: &[(u16, u16)] = &[(0, 0), (37, 49), (118, 95), (232, 197), (255, 255)];
+    let r: &[(u16, u16)] = &[(0, 11), (34, 33), (255, 238)];
+    let g: &[(u16, u16)] = &[(0, 0), (72, 65), (211, 213), (255, 255)];
+    let b: &[(u16, u16)] = &[(15, 0), (95, 73), (128, 122), (255, 255)];
+    curv(
+        1,
+        0b1111,
+        &[c, r, g, b],
+        Some(&[(0, c), (1, r), (2, g), (3, b)]),
+    )
+}
+
+/// A 2×2 RGB file: a pixel layer under a Curves layer carrying `block`
+/// and a 1-pixel-wide mask, both inside a Pass Through group.
+fn curves_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
+    let block = block.to_vec();
+    let curves = TestLayer::empty("Curves 1").with(|l| {
+        l.blocks.push((*b"curv", block));
+        l.mask = Some((0, 0, 2, 1, 255, 0));
+        l.channels.push((-2, vec![0, 255]));
+        tweak(l);
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        p.layers = vec![
+            TestLayer::divider(),
+            TestLayer::pixels("p", 0, 0, 2, 2, 8, &two_by_two(8)),
+            curves,
+            TestLayer::group("G", *b"pass"),
+        ];
+    })
+}
+
+fn points_of(curve: &aurora_core::ToneCurve) -> Vec<(f32, f32)> {
+    curve.points().iter().map(|p| (p.x, p.y)).collect()
+}
+
+fn levels(pts: &[(u16, u16)]) -> Vec<(f32, f32)> {
+    pts.iter()
+        .map(|&(o, i)| (f32::from(i) / 255.0, f32::from(o) / 255.0))
+        .collect()
+}
+
+fn params_of(block: &[u8]) -> Result<aurora_core::CurvesParams, Note> {
+    match parse_curv(block) {
+        Ok(parsed) => curves_params(&parsed, false),
+        Err(CurvRefusal::TooManyPoints) => Err(Note::CurvesTooManyPoints),
+        Err(CurvRefusal::Unreadable) => Err(Note::CurvesUnreadable),
+    }
+}
+
+/// AC-1: the legacy layout alone — version 1, no `Crv ` data — names its
+/// curves' channels by the bitmap's set bits, lowest first.
+#[test]
+fn curv_legacy_layout_maps_the_channel_bitmap_low_bit_first() {
+    let comp: &[(u16, u16)] = &[(0, 0), (84, 55), (255, 255)];
+    let blue: &[(u16, u16)] = &[(0, 0), (110, 167), (166, 255)];
+    let block = curv(1, 0b1001, &[comp, blue], None);
+    assert_eq!(
+        parse_curv(&block),
+        Ok(CurvBlock {
+            curves: vec![(0, comp.to_vec()), (3, blue.to_vec())]
+        })
+    );
+    let params = match params_of(&block) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(points_of(&params.composite), levels(comp));
+    assert!(params.red.is_none() && params.green.is_none());
+    assert_eq!(params.blue.as_ref().map(points_of), Some(levels(blue)));
+    // Bits 1 and 2: red then green.
+    let block = curv(1, 0b0110, &[comp, blue], None);
+    let params = params_of(&block).unwrap_or_else(|_| aurora_core::CurvesParams::identity());
+    assert!(params.composite.is_identity());
+    assert_eq!(params.red.as_ref().map(points_of), Some(levels(comp)));
+    assert_eq!(params.green.as_ref().map(points_of), Some(levels(blue)));
+}
+
+/// AC-1: the extended layout (`Crv ` extra data, which psd-tools'
+/// compositor reads exclusively) wins over the legacy curves; a damaged
+/// `Crv ` falls back to them, as psd-tools does.
+#[test]
+fn curv_extended_layout_wins_and_a_damaged_one_falls_back_to_legacy() {
+    let a: &[(u16, u16)] = &[(0, 0), (100, 128), (255, 255)];
+    let b: &[(u16, u16)] = &[(0, 0), (200, 128), (255, 255)];
+    let block = curv(1, 0b0001, &[a], Some(&[(2, b)]));
+    let params = match params_of(&block) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert!(params.composite.is_identity());
+    assert_eq!(params.green.as_ref().map(points_of), Some(levels(b)));
+    // The same block with its `Crv ` signature broken, then cut short.
+    let mut broken = block.clone();
+    let at = broken.windows(4).position(|w| w == b"Crv ").unwrap_or(0);
+    if let Some(byte) = broken.get_mut(at) {
+        *byte = b'X';
+    }
+    for damaged in [broken, block.get(..block.len() - 6).unwrap_or(&[]).to_vec()] {
+        let params = match params_of(&damaged) {
+            Ok(params) => params,
+            Err(note) => unreachable!("{note:?}"),
+        };
+        assert_eq!(points_of(&params.composite), levels(a));
+        assert!(params.green.is_none());
+    }
+}
+
+/// AC-1/AC-2: per-channel curves land in their own slots, channel ids
+/// past 3 are ignored, a later curve for the same channel wins, and a
+/// `Crv ` item with fewer than two points is skipped.
+#[test]
+fn curv_per_channel_curves_map_to_curves_params() {
+    let params = match params_of(&curv_rgb_block()) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(
+        points_of(&params.composite),
+        levels(&[(0, 0), (37, 49), (118, 95), (232, 197), (255, 255)])
+    );
+    assert_eq!(
+        params.red.as_ref().map(points_of),
+        Some(levels(&[(0, 11), (34, 33), (255, 238)]))
+    );
+    assert_eq!(
+        params.green.as_ref().map(points_of),
+        Some(levels(&[(0, 0), (72, 65), (211, 213), (255, 255)]))
+    );
+    assert_eq!(
+        params.blue.as_ref().map(points_of),
+        Some(levels(&[(15, 0), (95, 73), (128, 122), (255, 255)]))
+    );
+    let first: &[(u16, u16)] = &[(0, 0), (10, 128), (255, 255)];
+    let second: &[(u16, u16)] = &[(0, 0), (240, 128), (255, 255)];
+    let block = curv(
+        1,
+        0,
+        &[],
+        Some(&[(4, first), (1, first), (1, second), (2, &[(0, 0)])]),
+    );
+    let params = match params_of(&block) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(params.red.as_ref().map(points_of), Some(levels(second)));
+    assert!(params.green.is_none() && params.blue.is_none());
+    // No curves at all (psd-tools' `curves.psd`): the identity.
+    assert_eq!(
+        params_of(&curv(1, 0, &[], Some(&[]))),
+        Ok(aurora_core::CurvesParams::identity())
+    );
+}
+
+/// AC-2: movable endpoints — a first point at input 26 and a last at 238
+/// — come in as given, divided by 255, and hold the output flat.
+#[test]
+fn curv_movable_endpoints_are_kept_and_flat_beyond() {
+    let comp: &[(u16, u16)] = &[(3, 26), (84, 55), (170, 171), (255, 255)];
+    let red: &[(u16, u16)] = &[(0, 11), (34, 33), (255, 238)];
+    let block = curv(1, 0b0011, &[comp, red], Some(&[(0, comp), (1, red)]));
+    let params = match params_of(&block) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(params.composite.input_range(), (26.0 / 255.0, 1.0));
+    assert_eq!(params.composite.evaluate(0.0), 3.0 / 255.0);
+    assert_eq!(params.composite.evaluate(0.1), 3.0 / 255.0);
+    let Some(red) = params.red else {
+        unreachable!("a red curve");
+    };
+    assert_eq!(red.input_range(), (11.0 / 255.0, 238.0 / 255.0));
+    assert_eq!(red.evaluate(1.0), 1.0);
+    assert_eq!(red.evaluate(0.0), 0.0);
+}
+
+/// AC-1 hostile: too many points (either layout), the map form, version
+/// 4, an unknown version, a huge count, levels past 255, inputs out of
+/// order, a short legacy curve — each a typed refusal, nothing allocated
+/// past the caps. And every prefix and seeded mutation of a real block
+/// parses to `Ok` or a refusal, never a panic.
+#[test]
+fn hostile_curv_blocks_are_refused_never_a_panic() {
+    let twenty: Vec<(u16, u16)> = (0..20).map(|i| (i * 13, i * 13)).collect();
+    let ok3: &[(u16, u16)] = &[(0, 0), (100, 128), (255, 255)];
+    assert_eq!(
+        parse_curv(&curv(1, 1, &[&twenty], None)),
+        Err(CurvRefusal::TooManyPoints)
+    );
+    assert_eq!(
+        parse_curv(&curv(1, 1, &[ok3], Some(&[(0, &twenty)]))),
+        Err(CurvRefusal::TooManyPoints)
+    );
+    // A count claiming 65535 points in a 12-byte block: capped first.
+    let mut huge = vec![0, 0, 1, 0, 0, 0, 1, 0xFF, 0xFF];
+    huge.extend_from_slice(&[0; 3]);
+    assert_eq!(parse_curv(&huge), Err(CurvRefusal::TooManyPoints));
+    let mut map = curv(1, 1, &[ok3], None);
+    if let Some(flag) = map.first_mut() {
+        *flag = 1;
+    }
+    let mut v4_huge = curv(4, 0, &[], None);
+    if let Some(count) = v4_huge.get_mut(3..7) {
+        count.copy_from_slice(&u32::MAX.to_be_bytes());
+    }
+    for (name, block) in [
+        ("map form", map),
+        ("version 4", curv(4, 1, &[ok3], None)),
+        ("version 4, huge count", v4_huge),
+        ("version 2", curv(2, 1, &[ok3], None)),
+        ("one point", curv(1, 1, &[&[(0, 0)]], None)),
+        ("empty", Vec::new()),
+    ] {
+        assert_eq!(parse_curv(&block), Err(CurvRefusal::Unreadable), "{name}");
+    }
+    for (name, pts) in [
+        ("level 256", &[(0_u16, 0_u16), (256, 128), (255, 255)][..]),
+        (
+            "inputs out of order",
+            &[(0, 0), (100, 200), (200, 100), (255, 255)][..],
+        ),
+        (
+            "repeated input",
+            &[(0, 0), (100, 128), (200, 128), (255, 255)][..],
+        ),
+    ] {
+        assert_eq!(
+            params_of(&curv(1, 1, &[pts], None)),
+            Err(Note::CurvesUnreadable),
+            "{name}"
+        );
+    }
+    let block = curv_rgb_block();
+    for len in 0..block.len() {
+        let _ = parse_curv(block.get(..len).unwrap_or(&[]));
+    }
+    let mut state: u64 = 0x5851_F42D_4C95_7F2D;
+    for _ in 0..20_000 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let mut mutated = block.clone();
+        let at = (state >> 33) as usize % mutated.len();
+        if let Some(byte) = mutated.get_mut(at) {
+            *byte = (state >> 13) as u8;
+        }
+        if let Ok(parsed) = parse_curv(&mutated) {
+            let _ = curves_params(&parsed, false);
+        }
+    }
+}
+
+/// AC-2/AC-3: through the real reader, a Curves layer becomes an
+/// `Adjustment::Curves` layer above the layer below it, with its
+/// opacity, blend mode, visibility and mask; it is no longer reported as
+/// left out, and its Pass Through group is.
+#[test]
+fn a_curves_layer_opens_as_a_curves_adjustment_and_is_not_reported() {
+    let bytes = curves_file(&curv_rgb_block(), |l| {
+        l.opacity = 128;
+        l.blend = *b"mul ";
+        l.flags = 0x02;
+    })
+    .write();
+    let document = doc(&bytes);
+    let Some(&group) = document.layers.roots().first() else {
+        unreachable!("a group");
+    };
+    let children = document.layers.children(group).unwrap_or(&[]).to_vec();
+    assert_eq!(children.len(), 2);
+    let (Some(&top), Some(&bottom)) = (children.first(), children.get(1)) else {
+        unreachable!("two children");
+    };
+    assert!(matches!(
+        document.layers.kind(bottom),
+        Some(LayerKind::Pixel { .. })
+    ));
+    let Some(aurora_doc::Adjustment::Curves(params)) = document.layers.adjustment(top) else {
+        unreachable!("the top child is the Curves layer");
+    };
+    assert_eq!(
+        params.red.as_ref().map(aurora_core::ToneCurve::input_range),
+        Some((11.0 / 255.0, 238.0 / 255.0))
+    );
+    assert_eq!(document.layers.opacity(top), Some(128.0 / 255.0));
+    assert_eq!(document.layers.blend_mode(top), Some(BlendMode::Multiply));
+    assert_eq!(document.layers.visible(top), Some(false));
+    assert!(document.layers.mask(top).is_some());
+    assert!(document.masks.iter().any(|m| m.layer == top));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("adjustment layer"), "{items}");
+    assert!(
+        items.contains("1 Curves layer is inside a Pass Through group"),
+        "{items}"
+    );
+}
+
+/// AC-2/AC-3: the Pass Through note appears only for a Pass Through
+/// parent; other adjustment kinds, a `curv` record that also carries one,
+/// a Grayscale file's Curves and an unreadable or over-long `curv` stay
+/// reported and left out.
+#[test]
+fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
+    let normal_group = curves_file(&curv_rgb_block(), |_| {}).with(|p| {
+        if let Some(group) = p.layers.last_mut() {
+            *group = TestLayer::group("G", *b"norm");
+        }
+    });
+    let document = doc(&normal_group.write());
+    assert!(document.report.is_empty(), "{:?}", document.report);
+
+    let cases: [(&str, TestPsd, &str); 5] = [
+        (
+            "levels",
+            curves_file(&curv_rgb_block(), |l| {
+                l.blocks = vec![(*b"levl", vec![0; 4])];
+            }),
+            "1 adjustment layer (Levels, Hue/Saturation and similar) was left out",
+        ),
+        (
+            "curv and levl",
+            curves_file(&curv_rgb_block(), |l| l.blocks.push((*b"levl", vec![0; 4]))),
+            "1 adjustment layer",
+        ),
+        (
+            "too many points",
+            curves_file(
+                &curv(
+                    1,
+                    1,
+                    &[&(0..20).map(|i| (i * 13, i * 13)).collect::<Vec<_>>()],
+                    None,
+                ),
+                |_| {},
+            ),
+            "more than 19 points",
+        ),
+        (
+            "unreadable",
+            curves_file(&curv(4, 1, &[&[(0, 0), (255, 255)]], None), |_| {}),
+            "settings could not be read",
+        ),
+        (
+            "grayscale",
+            TestPsd::new(1, 2, 2, 8).with(|p| {
+                p.color_mode = 1;
+                p.channels = 1;
+                p.layers = vec![
+                    TestLayer::gray(
+                        "g",
+                        0,
+                        0,
+                        2,
+                        2,
+                        8,
+                        &[[1, 255], [2, 255], [3, 255], [4, 255]],
+                    ),
+                    TestLayer::empty("Curves 1").with(|l| {
+                        l.channels.retain(|(id, _)| *id < 1);
+                        l.blocks.push((
+                            *b"curv",
+                            curv(1, 2, &[&[(0, 0), (147, 184), (255, 255)]], None),
+                        ));
+                    }),
+                ];
+            }),
+            "in this Grayscale file was left out",
+        ),
+    ];
+    for (name, file, needle) in cases {
+        let document = doc(&file.write());
+        let items = document.report.items.join("\n");
+        assert!(
+            items.contains(needle),
+            "{name}: {needle:?} missing from {items}"
+        );
+        assert!(
+            !items.contains("Pass Through group, which Aurora doesn't have; the group"),
+            "{name}: a left-out Curves layer is not in the group: {items}"
+        );
+        let mut pending = document.layers.roots().to_vec();
+        let mut adjustments = 0;
+        while let Some(id) = pending.pop() {
+            adjustments += usize::from(document.layers.adjustment(id).is_some());
+            pending.extend(document.layers.children(id).unwrap_or(&[]));
+        }
+        assert_eq!(adjustments, 0, "{name}");
+    }
 }

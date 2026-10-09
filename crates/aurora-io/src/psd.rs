@@ -95,7 +95,10 @@
 //!   since the path is not kept. Feather (user or vector) is reported,
 //!   not applied; clipping, layer effects, blending ranges ("Blend If")
 //!   and knockout are not applied either.
-//!   Adjustment and fill layers with no pixels are left out; text,
+//!   Curves adjustment layers (`curv`, 0.158.0) are imported as real
+//!   `aurora_doc::Adjustment::Curves` layers ([`PsdNode::Adjustment`]);
+//!   every other adjustment kind, a Grayscale file's Curves, and fill
+//!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
 //!   one of those that a file actually uses is named in the report.
 //! - Read only: Aurora does not write PSD/PSB yet.
@@ -218,6 +221,9 @@ impl PsdFile {
 #[derive(Debug)]
 pub enum PsdNode {
     Layer(PsdLayer),
+    /// A Curves adjustment layer (0.158.0): no pixels, it re-colours the
+    /// composite below it within its own group.
+    Adjustment(PsdAdjustment),
     /// A layer group. `children` are bottom-to-top. A group can carry a
     /// user mask of its own (0.147.0), applied to its whole result.
     Group {
@@ -244,6 +250,17 @@ pub struct PsdLayer {
     /// not decoded yet (0.154.0): [`decode`] decodes every one before it
     /// returns, [`read_streaming`] one at a time as each is handed on.
     pending: Option<PendingPixels>,
+}
+
+/// One imported Curves adjustment layer (`curv`, 0.158.0).
+#[derive(Debug)]
+pub struct PsdAdjustment {
+    pub props: PsdProps,
+    /// The file's curves: channel `0` is the composite, `1..=3` red,
+    /// green and blue; levels divided by 255.
+    pub curves: aurora_core::CurvesParams,
+    /// The layer's user mask, applied as for any layer.
+    pub mask: Option<PsdMask>,
 }
 
 /// A layer's or group's own properties.
@@ -366,6 +383,10 @@ impl PsdImportReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Note {
     AdjustmentSkipped,
+    CurvesUnreadable,
+    CurvesTooManyPoints,
+    CurvesGrayscale,
+    CurvesInPassThrough,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -432,8 +453,28 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Levels, Curves and similar) {was} left out — Aurora \
-             doesn't have adjustment layers yet."
+            "{n} adjustment layer{s} (Levels, Hue/Saturation and similar) {was} left out — \
+             Aurora shows only Curves adjustment layers so far."
+        ),
+        Note::CurvesUnreadable => format!(
+            "{n} Curves layer{s} {was} left out — {} settings could not be read.",
+            if one { "its" } else { "their" }
+        ),
+        Note::CurvesTooManyPoints => format!(
+            "{n} Curves layer{s} {was} left out — {} a curve with more than {} points, more \
+             than Photoshop itself allows.",
+            if one { "it has" } else { "they have" },
+            aurora_core::MAX_POINTS
+        ),
+        Note::CurvesGrayscale => format!(
+            "{n} Curves layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
+             verified how Photoshop applies Curves to a Grayscale image."
+        ),
+        Note::CurvesInPassThrough => format!(
+            "{n} Curves layer{s} {is} inside a Pass Through group, which Aurora doesn't have; \
+             the group is composited on its own, so the curve{s} change{} only the group's own \
+             layers, not what is below the group.",
+            if one { "s" } else { "" }
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -1158,6 +1199,8 @@ struct Record {
     /// The first `vmsk`/`vsms` block's data (0.150.0), copied out of the
     /// record's extra data (0.154.0) so the record owns it.
     vector: Option<Vec<u8>>,
+    /// The last `curv` block, parsed (0.158.0).
+    curves: Option<Result<CurvBlock, CurvRefusal>>,
 }
 
 impl Record {
@@ -1281,6 +1324,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut nested_section = None;
     let mut fill_opacity = None;
     let mut vector = None;
+    let mut curves = None;
     let mut features = Features {
         blend_if: blend_if_in_use(ranges),
         ..Features::default()
@@ -1306,6 +1350,9 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             }
             b"knko" => features.knockout = data.first().is_some_and(|v| *v != 0),
             k if FILL_KEYS.contains(&k) => features.fill = true,
+            // Before the generic arm: Curves is imported (0.158.0), so it
+            // does not mark the record as an other-kind adjustment.
+            b"curv" => curves = Some(parse_curv(data)),
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
@@ -1326,7 +1373,203 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         fill_opacity,
         features,
         vector,
+        curves,
     })
+}
+
+// ---------------------------------------------------------------------
+// Curves (`curv`, 0.158.0)
+// ---------------------------------------------------------------------
+
+/// The most curves one `curv` block may hold: a version-1 channel bitmap
+/// has 32 bits, so 32 bounds the legacy layout and the `Crv ` count is
+/// held to the same (Photoshop writes at most one per channel plus the
+/// composite).
+const MAX_CURV_CURVES: u32 = 32;
+
+/// A parsed `curv` block: `(channel id, (output, input) levels)` per
+/// curve, in the file's order — channel `0` is the composite, `1..` the
+/// colour channels. Levels are as stored (`0..=255` is checked when they
+/// are mapped, [`curves_params`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurvBlock {
+    curves: Vec<CurvCurve>,
+}
+
+/// One stored curve: its channel id and its `(output, input)` levels.
+type CurvCurve = (u16, Vec<(u16, u16)>);
+
+/// Why a `curv` block cannot be imported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurvRefusal {
+    /// Truncated, an unknown version or the undocumented lookup-table
+    /// form, invalid levels, or a version-4 block without the `Crv `
+    /// data that names its channels.
+    Unreadable,
+    /// A curve with more than [`aurora_core::MAX_POINTS`] points.
+    TooManyPoints,
+}
+
+/// One curve's point list: a `u16` count then `(output, input)` `u16`
+/// pairs. The count is checked against [`aurora_core::MAX_POINTS`] before
+/// anything is allocated; fewer than two points is `Ok(None)` only where
+/// `allow_short` (psd-tools skips such a `Crv ` item), else unreadable.
+fn read_curv_points(
+    r: &mut Reader<'_>,
+    allow_short: bool,
+) -> Result<Option<Vec<(u16, u16)>>, CurvRefusal> {
+    let count = usize::from(
+        r.u16("curve point count")
+            .map_err(|_| CurvRefusal::Unreadable)?,
+    );
+    if count > aurora_core::MAX_POINTS {
+        return Err(CurvRefusal::TooManyPoints);
+    }
+    if r.remaining() < count * 4 {
+        return Err(CurvRefusal::Unreadable);
+    }
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        let output = r.u16("curve point").map_err(|_| CurvRefusal::Unreadable)?;
+        let input = r.u16("curve point").map_err(|_| CurvRefusal::Unreadable)?;
+        points.push((output, input));
+    }
+    if count < aurora_core::MIN_POINTS {
+        return if allow_short {
+            Ok(None)
+        } else {
+            Err(CurvRefusal::Unreadable)
+        };
+    }
+    Ok(Some(points))
+}
+
+/// The `Crv ` extra data after a version-1 block (psd-tools'
+/// `CurvesExtraMarker`): `Crv `, a `u16` version (`3` or `4`), a `u32`
+/// count, then per curve a `u16` channel id and a point list. `Ok(None)`
+/// when it is absent, truncated or not recognised — psd-tools then logs a
+/// warning and keeps the legacy curves, and so does this. Too many points
+/// refuses the layer outright.
+fn read_crv_extra(r: &mut Reader<'_>) -> Result<Option<Vec<CurvCurve>>, CurvRefusal> {
+    let Ok(signature) = r.array::<4>("Crv signature") else {
+        return Ok(None);
+    };
+    if &signature != b"Crv " {
+        return Ok(None);
+    }
+    let (Ok(version), Ok(count)) = (r.u16("Crv version"), r.u32("Crv count")) else {
+        return Ok(None);
+    };
+    if !(3..=4).contains(&version) || count > MAX_CURV_CURVES {
+        return Ok(None);
+    }
+    let mut curves = Vec::new();
+    for _ in 0..count {
+        let Ok(channel) = r.u16("Crv channel") else {
+            return Ok(None);
+        };
+        match read_curv_points(r, true) {
+            Ok(Some(points)) => curves.push((channel, points)),
+            Ok(None) => {}
+            Err(CurvRefusal::TooManyPoints) => return Err(CurvRefusal::TooManyPoints),
+            Err(CurvRefusal::Unreadable) => return Ok(None),
+        }
+    }
+    Ok(Some(curves))
+}
+
+/// Parses a `curv` block the way psd-tools 1.17.4 does (`Curves.read`):
+/// a `u8` map flag, a `u16` version (`1` or `4`), a `u32` channel bitmap
+/// (version 1; its set bits, low first, are the channels of the curves
+/// that follow) or curve count (version 4), the curves, and — version 1
+/// only — the `Crv ` extra data naming each curve's channel. psd-tools'
+/// compositor reads only that extra data (`apply_curves` iterates
+/// `layer.extra`), so it wins when it parses; the bitmap-indexed legacy
+/// curves are used when it is absent or damaged. A version-4 block has no
+/// channel ids at all and is refused. Never panics; every count is bounded
+/// before it allocates.
+fn parse_curv(data: &[u8]) -> Result<CurvBlock, CurvRefusal> {
+    let mut r = Reader::new(data);
+    let unreadable = |_| CurvRefusal::Unreadable;
+    let is_map = r.u8("curves map flag").map_err(unreadable)?;
+    let version = r.u16("curves version").map_err(unreadable)?;
+    let count_map = r.u32("curves channels").map_err(unreadable)?;
+    if version != 1 && version != 4 {
+        return Err(CurvRefusal::Unreadable);
+    }
+    // The 256-byte lookup-table form ("never documented", psd-tools).
+    if is_map != 0 {
+        return Err(CurvRefusal::Unreadable);
+    }
+    let count = if version == 1 {
+        count_map.count_ones()
+    } else {
+        count_map
+    };
+    if count > MAX_CURV_CURVES {
+        return Err(CurvRefusal::Unreadable);
+    }
+    let mut legacy = Vec::new();
+    for _ in 0..count {
+        if let Some(points) = read_curv_points(&mut r, false)? {
+            legacy.push(points);
+        }
+    }
+    if version == 4 {
+        return Err(CurvRefusal::Unreadable);
+    }
+    if let Some(curves) = read_crv_extra(&mut r)? {
+        return Ok(CurvBlock { curves });
+    }
+    let channels = (0..32_u16).filter(|bit| count_map & (1 << bit) != 0);
+    Ok(CurvBlock {
+        curves: channels.zip(legacy).collect(),
+    })
+}
+
+/// A parsed block as Aurora's [`aurora_core::CurvesParams`]: channel `0`
+/// the composite, `1..=3` red, green and blue (a later curve for the same
+/// channel wins, like psd-tools' dict); other channel ids are ignored, as
+/// psd-tools' `_apply_luts` ignores them in RGB. Each `(output, input)`
+/// level pair becomes the point `(input / 255, output / 255)`; the first
+/// and last points may be interior (movable endpoints). A Grayscale file's
+/// curves are not imported: its convention (psd-tools reads channel `1`
+/// as the grey curve and ignores `0`) has not been verified against
+/// Photoshop, and that file's corpus layers all sit in a Pass Through
+/// group, which confounds the comparison.
+fn curves_params(block: &CurvBlock, gray: bool) -> Result<aurora_core::CurvesParams, Note> {
+    if gray {
+        return Err(Note::CurvesGrayscale);
+    }
+    let mut params = aurora_core::CurvesParams::identity();
+    for (channel, levels) in &block.curves {
+        let slot = match channel {
+            0 => None,
+            1 => Some(&mut params.red),
+            2 => Some(&mut params.green),
+            3 => Some(&mut params.blue),
+            _ => continue,
+        };
+        if levels.iter().any(|&(o, i)| o > 255 || i > 255) {
+            return Err(Note::CurvesUnreadable);
+        }
+        let points: Vec<aurora_core::CurvePoint> = levels
+            .iter()
+            .map(|&(o, i)| aurora_core::CurvePoint::new(f32::from(i) / 255.0, f32::from(o) / 255.0))
+            .collect();
+        let curve = match aurora_core::ToneCurve::new(&points) {
+            Ok(curve) => curve,
+            Err(aurora_core::ToneCurveError::TooManyPoints) => {
+                return Err(Note::CurvesTooManyPoints);
+            }
+            Err(_) => return Err(Note::CurvesUnreadable),
+        };
+        match slot {
+            None => params.composite = curve,
+            Some(slot) => *slot = Some(curve),
+        }
+    }
+    Ok(params)
 }
 
 /// Whether a record's blending ranges ("Blend If") differ from the
@@ -2283,6 +2526,7 @@ fn note_unsupported(record: &Record, outcome: &MaskOutcome, notes: &mut Notes) {
 fn subtree_has_blend(nodes: &[PsdNode]) -> bool {
     nodes.iter().any(|node| match node {
         PsdNode::Layer(layer) => layer.props.blend != BlendMode::Normal,
+        PsdNode::Adjustment(adjustment) => adjustment.props.blend != BlendMode::Normal,
         PsdNode::Group {
             props, children, ..
         } => props.blend != BlendMode::Normal || subtree_has_blend(children),
@@ -2325,6 +2569,16 @@ fn build_tree(
                 let props = props_for(record, notes);
                 if props.pass_through && subtree_has_blend(&children) {
                     notes.add(Note::PassThroughGroup);
+                }
+                // A Curves layer directly inside a Pass Through group
+                // reaches below the group in Photoshop and only the
+                // group's own layers here (0.158.0).
+                if props.pass_through {
+                    let curves = children
+                        .iter()
+                        .filter(|child| matches!(child, PsdNode::Adjustment(_)))
+                        .count();
+                    notes.add_n(Note::CurvesInPassThrough, curves as u64);
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =
@@ -2369,7 +2623,30 @@ fn layer_node(
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
 ) -> Option<PsdNode> {
-    if record.features.adjustment {
+    if let (Some(curves), false) = (&record.curves, record.features.adjustment) {
+        let params = match curves {
+            Ok(block) => curves_params(block, header.gray()),
+            Err(CurvRefusal::TooManyPoints) => Err(Note::CurvesTooManyPoints),
+            Err(CurvRefusal::Unreadable) => Err(Note::CurvesUnreadable),
+        };
+        let curves = match params {
+            Ok(curves) => curves,
+            Err(note) => {
+                notes.add(note);
+                return None;
+            }
+        };
+        let props = props_for(record, notes);
+        // No pixels: the mask region is the canvas, as for a group.
+        let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
+        note_unsupported(record, &outcome, notes);
+        return Some(PsdNode::Adjustment(PsdAdjustment {
+            props,
+            curves,
+            mask: outcome.mask,
+        }));
+    }
+    if record.features.adjustment || record.curves.is_some() {
         notes.add(Note::AdjustmentSkipped);
         return None;
     }
@@ -2920,6 +3197,7 @@ fn materialize(
                 }
             }
             PsdNode::Group { children, .. } => materialize(children, src, profile, depth + 1)?,
+            PsdNode::Adjustment(_) => {}
         }
     }
     Ok(())
@@ -3061,6 +3339,35 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         composite,
         notes,
     })
+}
+
+/// The file's own stored merged composite (0.158.0) — what Photoshop
+/// shows — as straight `f16` RGBA tagged sRGB, without reading any layer:
+/// the corpus differentials compare Aurora's composite against it. The
+/// fourth channel is not read as transparency (the image is opaque).
+///
+/// # Errors
+///
+/// As [`decode`] for the header; [`IoError::PsdPixelBudget`] for a canvas
+/// past [`PIXEL_BUDGET`]; a typed truncation or malformed error for a
+/// damaged section.
+pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
+    let mut r = Reader::new(bytes);
+    let header = read_header(&mut r)?;
+    let area = u64::from(header.width) * u64::from(header.height);
+    if area > PIXEL_BUDGET {
+        return Err(IoError::PsdPixelBudget {
+            total: area,
+            max: PIXEL_BUDGET,
+        });
+    }
+    let color = r.length(false, "colour mode data length")?;
+    r.skip(color, "colour mode data")?;
+    let resources = r.length(false, "image resources length")?;
+    r.skip(resources, "image resources")?;
+    let section = r.length(header.psb(), "layer and mask section length")?;
+    r.skip(section, "layer and mask section")?;
+    decode_merged(&mut r, header, false)
 }
 
 /// Builds a real Aurora document from a decoded file: every layer and
@@ -3307,6 +3614,21 @@ impl Builder<'_, '_, '_> {
                             image,
                             offset,
                         })?;
+                    }
+                }
+                PsdNode::Adjustment(adjustment) => {
+                    // On top of what is already at this level, like
+                    // `add_pixel_layer` (index 0 is the top).
+                    let id = self.history.add_adjustment_layer_at(
+                        self.layers,
+                        adjustment.props.name.clone(),
+                        aurora_doc::Adjustment::Curves(adjustment.curves),
+                        parent,
+                        0,
+                    )?;
+                    self.apply(id, &adjustment.props)?;
+                    if let Some(mask) = adjustment.mask {
+                        self.attach_mask(id, mask, self.canvas)?;
                     }
                 }
                 PsdNode::Group {
