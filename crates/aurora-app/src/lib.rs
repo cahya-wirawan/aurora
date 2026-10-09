@@ -5660,6 +5660,39 @@ fn sync_tool_controls(
     }
 }
 
+/// What the status bar shows (0.162.0), read from the app's live state:
+/// the canvas view's zoom, the document's own canvas size
+/// ([`App::canvas_size`], the size a save writes), and the sample format
+/// every document's pixels are stored in ([`aurora_tile::SAMPLE_FORMAT`]
+/// — the tile store is the one place pixels live, invariant §7.3.1). No
+/// colour space: the document model records none yet (an opened file's
+/// ICC profile is not kept past decode), so the bar shows none rather
+/// than a guess.
+fn status_info(view: &aurora_ui::CanvasView, canvas_size: (u32, u32)) -> aurora_ui::StatusInfo {
+    aurora_ui::StatusInfo {
+        zoom: view.zoom(),
+        document_size: canvas_size,
+        sample: aurora_tile::SAMPLE_FORMAT,
+    }
+}
+
+/// Makes the workspace's status bar show [`status_info`]. Returns whether
+/// its text changed (a failure is logged and reads as no change).
+fn sync_status_bar(
+    workspace: &mut aurora_ui::Workspace,
+    view: &aurora_ui::CanvasView,
+    canvas_size: (u32, u32),
+) -> bool {
+    let bar = workspace.status_bar;
+    match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &status_info(view, canvas_size)) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the status bar");
+            false
+        }
+    }
+}
+
 /// Applies one routed Properties-panel tool-control outcome (0.136.0):
 /// a radius slider `ValueChanged` — pointer drag, keyboard or assistive
 /// technology alike — sets the active tool's radius
@@ -19883,6 +19916,9 @@ impl App {
                 was_recovered,
             );
         }
+        // 0.162.0: the status bar shows the startup document from the
+        // first frame and the first accessibility tree on.
+        let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size);
 
         Self {
             window: None,
@@ -22579,6 +22615,17 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// [`sync_status_bar`] once per event-loop iteration (0.162.0):
+    /// whatever ran above — a wheel zoom, a keyboard zoom, an open that
+    /// changed `canvas_size` — the status bar follows, a frame is asked
+    /// for and the accessibility tree is pushed when its text changed.
+    fn sync_status_bar_now(&mut self) {
+        if sync_status_bar(&mut self.workspace, &self.canvas_view, self.canvas_size) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
     /// The Curves editor's catch-all ([`sync_curves_ui`]), run once per
     /// event-loop iteration beside [`Self::sync_tool_controls_now`].
     /// Re-lays out when it changed anything (showing or hiding the editor
@@ -22873,6 +22920,12 @@ impl App {
                 canvas_min_zoom(canvas_size, self.scale_factor),
                 bounds,
             );
+        }
+        // 0.162.0: after the zoom floor above (which can move the zoom),
+        // so the status bar this frame paints shows the zoom it draws at.
+        // Its text is fixed-width items, so no relayout is needed.
+        if sync_status_bar(&mut self.workspace, &self.canvas_view, self.canvas_size) {
+            self.push_accessibility();
         }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -23561,6 +23614,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
         self.sync_curves_controls_now();
+        self.sync_status_bar_now();
         // The caret blink (0.139.0): after everything above that can move
         // focus or edit a field, so the signature it observes is this
         // iteration's. A flip the last frame did not draw asks for one
@@ -23782,11 +23836,11 @@ mod tests {
         resolve_tile, route_accessibility_action, run_command, run_dialog_action,
         run_shutdown_cleanup, sample_pixel, save_failure_message, select_layer, shift_bounds,
         skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
-        take_gpu_blend_dispatch_count, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        tiles_are_bitwise_identical, toggle_command_palette, topmost_pixel_layer,
-        translate_blend_mode, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        status_info, sync_status_bar, take_gpu_blend_dispatch_count, tile_overlaps_doc_rect,
+        tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
+        topmost_pixel_layer, translate_blend_mode, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use super::{
         CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
@@ -55703,6 +55757,140 @@ mod tests {
         }
     }
 
+    /// The status bar's laid-out height, logical px (0.162.0).
+    fn status_bar_height(workspace: &aurora_ui::Workspace) -> f32 {
+        #[allow(clippy::cast_precision_loss)]
+        match workspace.tree.bounds(workspace.status_bar.root) {
+            Some(bounds) => bounds.height as f32,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    /// 0.162.0 AC-1/AC-4: with the status bar under it, the canvas area
+    /// ends one status-bar row above the window's bottom edge; a pointer
+    /// on its last row maps into the canvas and one on the status bar does
+    /// not; and the physical rect, the scissor and a pointer's physical ->
+    /// logical mapping agree at scale 1, 2 and the fractional 1.25 and
+    /// 1.5 — the canvas never draws over the status bar.
+    #[test]
+    fn the_canvas_ends_above_the_status_bar_at_whole_and_fractional_scales() {
+        let workspace = laid_out_workspace();
+        let (ox, oy) = canvas_origin(&workspace);
+        let sh = status_bar_height(&workspace);
+        let Some(status) = workspace.tree.bounds(workspace.status_bar.root) else {
+            unreachable!("laid out");
+        };
+        assert!(sh > 0.0, "the status bar takes a row");
+        #[allow(clippy::cast_precision_loss)]
+        let status_top = status.y as f32;
+        assert!((status_top - (800.0 - sh)).abs() < f32::EPSILON);
+        for scale in [1.0_f64, 2.0, 1.25, 1.5] {
+            // The canvas's last logical row, reached from a physical point.
+            let last_row = (
+                f64::from(ox + 10.0) * scale,
+                f64::from(status_top - 0.5) * scale,
+            );
+            let position = logical_point(last_row, scale);
+            assert_eq!(
+                pointer_in_canvas(&workspace, position),
+                Some((position.0 - ox, position.1 - oy)),
+                "scale {scale}: the canvas's last row is on the canvas"
+            );
+            let on_status = (
+                f64::from(ox + 10.0) * scale,
+                f64::from(status_top + 1.0) * scale,
+            );
+            assert_eq!(
+                pointer_in_canvas(&workspace, logical_point(on_status, scale)),
+                None,
+                "scale {scale}: a point on the status bar is not on the canvas"
+            );
+            let Some(rect) = canvas_area_physical_rect(&workspace, scale) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let scale_f = scale as f32;
+            assert!(
+                (rect.1 + rect.3 - status_top * scale_f).abs() < 1e-3,
+                "scale {scale}: the canvas ends where the status bar begins: {rect:?}"
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let surface = (
+                (1000.0 * scale).round() as u32,
+                (800.0 * scale).round() as u32,
+            );
+            let Some((_, y, _, h)) = clamp_canvas_to_surface(rect, surface) else {
+                unreachable!("scale {scale}: a canvas is visible");
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let status_top_physical = (status_top * scale_f).ceil() as u32;
+            assert!(
+                y + h <= status_top_physical,
+                "scale {scale}: the scissor stops at the status bar: {y}+{h} > {status_top_physical}"
+            );
+        }
+    }
+
+    /// 0.162.0 AC-1/AC-4: for a known document the status bar reads its
+    /// size and the tile store's real sample format, follows a real wheel
+    /// zoom (the same `apply_scroll_zoom` the event loop runs) and a new
+    /// canvas size (an open), and changes nothing when nothing changed.
+    #[test]
+    fn the_status_bar_reads_the_document_and_follows_zoom_and_size() {
+        let mut workspace = laid_out_workspace();
+        let mut view = CanvasView::new();
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000)));
+        assert_eq!(
+            aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar),
+            Some((
+                "100%".to_owned(),
+                "Document: 4000 × 3000 px · 16-bit float".to_owned()
+            ))
+        );
+        assert_eq!(
+            status_info(&view, (4000, 3000)).sample,
+            aurora_tile::SAMPLE_FORMAT,
+            "the bit depth is the tile store's own format"
+        );
+        assert!(
+            !sync_status_bar(&mut workspace, &view, (4000, 3000)),
+            "an unchanged state changes nothing"
+        );
+        let bounds = pan_bounds(
+            &aurora_doc::LayerTree::new(),
+            None,
+            canvas_area_logical_size(&workspace),
+        );
+        apply_scroll_zoom(
+            &mut view,
+            None,
+            (100.0, 100.0),
+            winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+            bounds,
+        );
+        assert!(view.zoom() < 1.0, "zoomed out: {}", view.zoom());
+        assert!(sync_status_bar(&mut workspace, &view, (4000, 3000)));
+        let Some((zoom, _)) = aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar)
+        else {
+            unreachable!("built");
+        };
+        assert_eq!(zoom, aurora_ui::zoom_text(view.zoom()));
+        assert_ne!(zoom, "100%");
+        assert!(sync_status_bar(&mut workspace, &view, (640, 480)));
+        assert_eq!(
+            aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar).map(|t| t.1),
+            Some("Document: 640 × 480 px · 16-bit float".to_owned())
+        );
+        let Some(node) = workspace.tree.accessibility(workspace.status_bar.document) else {
+            unreachable!("built");
+        };
+        assert_eq!(
+            node.label(),
+            Some("Document: 640 × 480 px · 16-bit float"),
+            "a screen reader reads the current document info"
+        );
+    }
+
     fn laid_out_workspace() -> aurora_ui::Workspace {
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         workspace.tree.compute_layout(1000.0, 800.0);
@@ -56076,10 +56264,17 @@ mod tests {
         // (see `pointer_in_canvas_reports_a_canvas_relative_point_when_inside`'s
         // own comment); at a 2x scale factor, physical is double that --
         // the origin included, which is what keeps Retina mapping right.
+        // Since 0.162.0 the status bar takes one row (`sh`) off its bottom.
         let (ox, oy) = canvas_origin(&workspace);
+        let sh = status_bar_height(&workspace);
         assert_eq!(
             canvas_area_physical_rect(&workspace, 2.0),
-            Some((2.0 * ox, 2.0 * oy, 2.0 * (750.0 - ox), 2.0 * (800.0 - oy)))
+            Some((
+                2.0 * ox,
+                2.0 * oy,
+                2.0 * (750.0 - ox),
+                2.0 * (800.0 - oy - sh)
+            ))
         );
     }
 
@@ -56101,8 +56296,9 @@ mod tests {
     fn canvas_area_physical_size_rounds_to_whole_pixels() {
         let workspace = laid_out_workspace();
         let (ox, oy) = canvas_origin(&workspace);
+        let sh = status_bar_height(&workspace);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let expected = ((750.0 - ox) as u32, (800.0 - oy) as u32);
+        let expected = ((750.0 - ox) as u32, (800.0 - oy - sh) as u32);
         assert_eq!(canvas_area_physical_size(&workspace, 1.0), Some(expected));
     }
 
@@ -56144,7 +56340,7 @@ mod tests {
                     );
                 }
                 None => assert!(
-                    rect.2 < 1.0 || rect.0 >= surface.0 as f32,
+                    rect.2 < 1.0 || rect.3 < 1.0 || rect.0 >= surface.0 as f32,
                     "{window:?} @ {scale}: only an empty or off-surface canvas is skipped: {rect:?}"
                 ),
             }

@@ -42,6 +42,7 @@ pub mod layer_controls;
 pub mod layers_panel;
 pub mod panel;
 pub mod properties_panel;
+pub mod status_bar;
 pub mod tool;
 pub mod tool_controls;
 pub mod tools_panel;
@@ -71,6 +72,10 @@ pub use panel::{
     panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_sizing,
 };
 pub use properties_panel::populate_properties_panel;
+pub use status_bar::{
+    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, sample_format_text,
+    status_bar_text, sync_status_bar, zoom_text,
+};
 pub use tool::Tool;
 pub use tool_controls::{
     TOOL_RADIUS_MAX, TOOL_RADIUS_MIN, ToolControls, insert_tool_controls, radius_readout,

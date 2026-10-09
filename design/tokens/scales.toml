@@ -62,6 +62,13 @@ spacious    = 1.25
 # the design owner to tune: 224 = 7 x spacing.xl. Logical px; not scaled
 # by density (only the spacing scale is).
 options_control_width = 224 # a slider in the options bar
+# How many body rows (of `row_height`) a content-sized dock panel —
+# Layers, Properties — grows to before it stops growing and scrolls
+# (0.162.0, design owner's decision 2026-10-09: the 0.161.0 engineering
+# cap `CONTENT_PANEL_MAX_ROWS` made a token, value unchanged). A COUNT of
+# rows, not px: the panel's height follows `row_height`, and so density.
+# The design owner's to tune.
+content_panel_max_rows = 10
 
 [radius]
 none = 0

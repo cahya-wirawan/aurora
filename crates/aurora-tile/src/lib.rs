@@ -26,4 +26,4 @@ pub use scratch::{
 };
 pub use staging::{StagedTile, StagingArea, StagingRoot};
 pub use store::{EncodedTile, Stats, TileSnapshot, TileStore};
-pub use tile::{CHANNELS, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};
+pub use tile::{CHANNELS, SAMPLE_FORMAT, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};

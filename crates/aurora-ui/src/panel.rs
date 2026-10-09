@@ -82,7 +82,7 @@ pub enum PanelSizing {
     #[default]
     Fill,
     /// Take the content's own height (`flex_basis: auto`, no growth), its
-    /// body rows counting up to [`CONTENT_PANEL_MAX_ROWS`] rows, shrinking
+    /// body rows counting up to [`content_panel_max_rows`] rows, shrinking
     /// with the other panels — in proportion to that basis — when the
     /// column is too short for everyone. A shrunk panel scrolls (its body, and the
     /// Properties panel's Curves strip, are scroll containers).
@@ -90,12 +90,17 @@ pub enum PanelSizing {
 }
 
 /// The [`PanelSizing::Content`] cap, as a *count of rows* of the
-/// `row_height` token — the convention the Widget Gallery's
-/// `GALLERY_EDITOR_ROWS` set, since no "panel height" token exists. Past
-/// this many body rows a content-sized panel stops growing and scrolls.
-/// An engineering default, flagged to the design owner (PRD FR-027
-/// *Ownership*) rather than invented as a token.
-pub const CONTENT_PANEL_MAX_ROWS: f32 = 10.0;
+/// `row_height` token: the `size.content_panel_max_rows` design token
+/// (0.162.0, the design owner's decision of 2026-10-09 — it replaced the
+/// 0.161.0 engineering constant `CONTENT_PANEL_MAX_ROWS`, value
+/// unchanged at 10, and is the design owner's to tune). Past this many
+/// body rows a content-sized panel stops growing and scrolls.
+#[must_use]
+pub fn content_panel_max_rows(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let rows = scales.size.content_panel_max_rows as f32;
+    rows
+}
 
 /// Adds a new, empty, titled panel as the last child of `parent`,
 /// initially expanded (not collapsed — see [`set_panel_collapsed`]).
@@ -313,12 +318,12 @@ fn viewport_style(sizing: PanelSizing, scales: &Scales) -> Style {
             height: length(row_height(scales)),
         },
         // The content cap: a content-sized panel's rows count toward its
-        // basis up to `CONTENT_PANEL_MAX_ROWS` rows, then it scrolls.
+        // basis up to `size.content_panel_max_rows` rows, then it scrolls.
         max_size: taffy::Size {
             width: auto(),
             height: match sizing {
                 PanelSizing::Fill => auto(),
-                PanelSizing::Content => length(CONTENT_PANEL_MAX_ROWS * row_height(scales)),
+                PanelSizing::Content => length(content_panel_max_rows(scales) * row_height(scales)),
             },
         },
         // A scroll container's min-content contribution is its own
@@ -372,7 +377,7 @@ fn header_style(scales: &Scales) -> Style {
 /// content's** — `flex_basis: 0` plus a fixed height minimum are what
 /// make that true, and both are load-bearing (0.77.1). A `Content`
 /// panel avoids the same starvation differently: its rows count only up
-/// to [`CONTENT_PANEL_MAX_ROWS`] (the viewport's `max_size`), and its
+/// to [`content_panel_max_rows`] (the viewport's `max_size`), and its
 /// minimum is its fixed floor, never its content. Real bug, with
 /// real numbers: with the default `flex_basis: auto`, a panel's base
 /// size is its *content* height, and flexbox's automatic minimum size
@@ -444,7 +449,7 @@ fn header_style(scales: &Scales) -> Style {
 /// pushed History off a 300 px rail.
 /// The width stays pinned to `0` for the reason above. A
 /// [`PanelSizing::Content`] root is content-based (`flex_basis: auto`,
-/// `flex_grow: 0`), its viewport capped at [`CONTENT_PANEL_MAX_ROWS`]
+/// `flex_grow: 0`), its viewport capped at [`content_panel_max_rows`]
 /// rows; a [`PanelSizing::Fill`] root keeps the zero basis and
 /// `flex_grow: 1`.
 fn root_style(collapsed: bool, sizing: PanelSizing, floor: f32) -> Style {

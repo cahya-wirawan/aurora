@@ -93,7 +93,10 @@ def main():
 
     lines.append("")
     for name, val in scales["size"].items():
-        lines.append(f"  {css_var_name(f'size-{name}')}: {val}px;")
+        # A `*_rows` size is a count of `row_height` rows (0.162.0:
+        # `content_panel_max_rows`), not a length: no unit.
+        unit = "" if name.endswith("_rows") else "px"
+        lines.append(f"  {css_var_name(f'size-{name}')}: {val}{unit};")
 
     lines.append("")
     for name, val in scales["radius"].items():

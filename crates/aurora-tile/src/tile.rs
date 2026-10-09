@@ -32,6 +32,13 @@ pub const TILE: u32 = 256;
 /// layout and ADR 0003's half-float storage decision).
 pub const CHANNELS: usize = 4;
 
+/// The sample format every tile stores — and so the format of every
+/// document's pixels, since all pixel access goes through the tile store
+/// (invariant §7.3.1): half-float (ADR 0003, invariant §7.3.1b). A tag,
+/// not a choice: [`Tile`]'s texels are `f16`, which this crate's own
+/// test pins against it. The status bar reads it (0.162.0).
+pub const SAMPLE_FORMAT: aurora_core::SampleFormat = aurora_core::SampleFormat::F16;
+
 /// Texels per tile (`TILE * TILE`).
 pub const TEXELS: usize = (TILE * TILE) as usize;
 
@@ -141,8 +148,23 @@ impl Tile {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHANNELS, SAMPLES, TEXELS, TILE, Tile, TileId};
+    use super::{CHANNELS, SAMPLE_FORMAT, SAMPLES, TEXELS, TILE, Tile, TileId};
     use aurora_core::Rect;
+
+    /// 0.162.0: [`SAMPLE_FORMAT`] tags what a tile really stores — a
+    /// float sample exactly as wide as one element of `Tile::texels`.
+    #[test]
+    fn the_sample_format_tag_matches_the_real_texel_type() {
+        fn element_size<T>(_: &[T]) -> usize {
+            std::mem::size_of::<T>()
+        }
+        let tile = Tile::from_texels(vec![half::f16::ZERO; SAMPLES]);
+        assert_eq!(
+            element_size(tile.texels()),
+            usize::from(SAMPLE_FORMAT.bytes())
+        );
+        assert!(SAMPLE_FORMAT.is_float());
+    }
 
     #[test]
     fn tile_id_round_trips_through_real_postcard_bytes() {

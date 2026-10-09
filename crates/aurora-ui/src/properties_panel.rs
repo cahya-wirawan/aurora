@@ -496,10 +496,10 @@ mod tests {
             );
             // 0.161.0: a content-sized panel (`crate::PanelSizing::Content`)
             // is its 21px title plus its rows, up to
-            // `crate::panel::CONTENT_PANEL_MAX_ROWS` rows -- then it
+            // `size.content_panel_max_rows` rows (a token) -- then it
             // scrolls instead of growing.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cap = crate::panel::CONTENT_PANEL_MAX_ROWS as usize;
+            let cap = crate::panel::content_panel_max_rows(&scales) as usize;
             #[allow(clippy::cast_possible_truncation)]
             let expected = (21 * (1 + count.clamp(1, cap))) as u32;
             assert_eq!(

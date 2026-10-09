@@ -9,9 +9,11 @@
 //! interactivity so far — dragging the rail's own width is real
 //! pointer-driven interaction `aurora-app` owns, this module only
 //! exposes the pure layout half (see both functions' own doc comments).
-//! The menubar and status bar the mockup also shows are still left out:
-//! they belong to other, separate M1.8 bullets (native menus, general
-//! chrome).
+//! The menubar the mockup also shows is still left out: it belongs to a
+//! separate M1.8 bullet (native menus). The status bar is in since
+//! 0.162.0 ([`crate::status_bar`]): the canvas column's last child, under
+//! the canvas area, so the canvas area ends one `row_height` above the
+//! window's bottom edge.
 //!
 //! **Tools panel and options bar (0.160.0), the first workspace round.**
 //! Following Photoshop's layout convention (not its look), the root row
@@ -41,6 +43,7 @@ use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, FlexDirection, Style};
 
 use crate::panel::{PanelHandle, PanelSizing, insert_panel, set_panel_sizing};
+use crate::status_bar::{StatusBar, StatusInfo, insert_status_bar};
 use crate::tool::Tool;
 use crate::tools_panel::{ToolsPanel, insert_tools_panel};
 
@@ -85,6 +88,11 @@ pub struct Workspace {
     /// rotation, pan, ...` is a separate, still-open M1.8 bullet; this
     /// is an empty container reserving its place in the layout.
     pub canvas_area: WidgetId,
+    /// The status bar (0.162.0): the canvas column's last child, under
+    /// [`Self::canvas_area`] — zoom and document info, a `Role::Status`
+    /// region. It starts showing 100% and a 0 × 0 document; `aurora-app`
+    /// syncs it to the live view and document ([`crate::sync_status_bar`]).
+    pub status_bar: StatusBar,
     /// The boundary between [`Self::canvas_area`] and [`Self::rail`] —
     /// a real `Role::Splitter`, [`rail_width`]/[`set_rail_width`]'s own
     /// target. Currently zero-width in the tree (no pixel rendering
@@ -221,6 +229,15 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     };
 
     let (canvas_column, options_bar, canvas_area) = insert_canvas_column(&mut tree, root, scales);
+    let initial = StatusInfo {
+        zoom: crate::canvas_view::DEFAULT_ZOOM,
+        document_size: (0, 0),
+        sample: aurora_tile::SAMPLE_FORMAT,
+    };
+    let status_bar = match insert_status_bar(&mut tree, canvas_column, scales, &initial) {
+        Ok(bar) => bar,
+        Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
+    };
 
     // Deliberately not `Action::Focus` yet: a real `Tab` stop with no
     // working keyboard handler behind it (no arrow-key-driven resize
@@ -265,7 +282,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
     // 0.161.0: Layers and Properties take their content's height (their
-    // rows up to `CONTENT_PANEL_MAX_ROWS`, then they scroll); History keeps the zero-basis
+    // rows up to the `size.content_panel_max_rows` token, then they scroll); History keeps the zero-basis
     // `Fill` rule and absorbs what they leave. Equal thirds squeezed the
     // Properties panel's Curves editor to nothing (`PanelSizing`).
     for panel in [layers, properties] {
@@ -281,6 +298,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         canvas_column,
         options_bar,
         canvas_area,
+        status_bar,
         divider,
         rail,
         layers,
@@ -302,13 +320,18 @@ fn insert_canvas_column(
     // The only element that grows: once the tools panel claims its
     // content width, the rail its fixed width and the divider none, the
     // canvas column absorbs whatever space is left. `min_size: 0` lets a
-    // narrow window squeeze it to nothing rather than overflow.
+    // narrow window squeeze it to nothing rather than overflow. A zero
+    // `flex_basis` (0.162.0): the column takes exactly the space left,
+    // whatever its own content's width — the status bar's padding, gap
+    // and fixed-width zoom item would otherwise widen its basis and take
+    // width from a crowded window's other children.
     let canvas_column = match widgets::insert_container(
         tree,
         root,
         Style {
             flex_direction: FlexDirection::Column,
             flex_grow: 1.0,
+            flex_basis: Dimension::ZERO,
             min_size: taffy::Size {
                 width: Dimension::ZERO,
                 height: Dimension::ZERO,
@@ -628,7 +651,10 @@ mod tests {
         assert!(tools > 0 && bar > 0, "tools {tools}, bar {bar}");
         assert_eq!(canvas_bounds.width, 750 - tools);
         assert_eq!(rail_bounds.width, 250);
-        assert_eq!(canvas_bounds.height, 800 - bar);
+        // 0.162.0: the status bar takes one row off the column's bottom.
+        let status = bounds_of(&ws, ws.status_bar.root).height;
+        assert!(status > 0, "status bar {status}");
+        assert_eq!(canvas_bounds.height, 800 - bar - status);
         assert_eq!(rail_bounds.height, 800);
         assert_eq!(
             (canvas_bounds.x, canvas_bounds.y),
@@ -915,12 +941,12 @@ mod tests {
             };
 
             // 0.161.0: no longer equal thirds. Layers and Properties take
-            // their content, up to `CONTENT_PANEL_MAX_ROWS` rows each;
+            // their content, up to `size.content_panel_max_rows` rows each;
             // History, the `Fill` panel, takes the rest.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let row = aurora_widgets::widgets::row_height(&scales) as u32;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cap = (1 + crate::panel::CONTENT_PANEL_MAX_ROWS as u32) * row;
+            let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row;
             for (name, panel, body) in [
                 ("layers", layers, ws.layers.body),
                 ("properties", properties, ws.properties.body),
@@ -1141,7 +1167,98 @@ mod tests {
         }
     }
 
-    /// AC-4: Layers with many rows is capped at `CONTENT_PANEL_MAX_ROWS` and
+    /// 0.162.0 AC-1/AC-4: the status bar is exactly one `row_height` tall
+    /// (a token), spans the canvas column under the canvas area, ends at
+    /// the window's bottom edge, and overlaps nothing — at ordinary,
+    /// narrow and short windows. In a window too short for both bars the
+    /// canvas is squeezed to nothing first; in one too narrow for the
+    /// bar's own padding it overhangs its column, like the options bar.
+    #[test]
+    fn the_status_bar_is_one_token_row_under_the_canvas_and_overlaps_nothing() {
+        let scales = test_scales();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&scales) as u32;
+        for (window, rail) in [
+            ((1000.0_f32, 800.0_f32), 250.0),
+            ((1600.0, 900.0), RAIL_MAX_WIDTH),
+            ((480.0, 480.0), 250.0),
+            ((120.0, 200.0), RAIL_MIN_WIDTH),
+            ((1000.0, 60.0), 250.0),
+            ((1000.0, 40.0), 250.0),
+        ] {
+            let mut ws = build_workspace(&scales);
+            if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, rail) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(window.0, window.1);
+            let case = format!("window {window:?}, rail {rail}");
+            let column = bounds_of(&ws, ws.canvas_column);
+            let bar = bounds_of(&ws, ws.options_bar);
+            let canvas = bounds_of(&ws, ws.canvas_area);
+            let status = bounds_of(&ws, ws.status_bar.root);
+            let rail_bounds = bounds_of(&ws, ws.rail);
+            let tools = bounds_of(&ws, ws.tools.root);
+
+            assert_eq!(status.height, row, "{case}: one token row: {status:?}");
+            assert_eq!(status.x, column.x, "{case}");
+            assert_eq!(
+                status.y,
+                canvas.y + i64::from(canvas.height),
+                "{case}: directly under the canvas area"
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let window_height = window.1 as u32;
+            if window_height >= bar.height + row {
+                assert_eq!(
+                    status.y + i64::from(status.height),
+                    i64::from(window_height),
+                    "{case}: along the window's bottom edge"
+                );
+            } else {
+                assert_eq!(canvas.height, 0, "{case}: the canvas gives way first");
+            }
+            if column.width >= 2 * scales.spacing.sm {
+                assert_eq!(status.width, column.width, "{case}");
+                assert!(!overlaps(status, rail_bounds), "{case}: status/rail");
+            }
+            assert!(!overlaps(status, canvas), "{case}: status/canvas");
+            assert!(!overlaps(status, bar), "{case}: status/options bar");
+            assert!(!overlaps(status, tools), "{case}: status/tools");
+            for id in [ws.status_bar.zoom, ws.status_bar.document] {
+                let item = bounds_of(&ws, id);
+                assert!(
+                    item.y >= status.y
+                        && item.y + i64::from(item.height) <= status.y + i64::from(status.height),
+                    "{case}: an item stays inside the bar's row: {item:?} in {status:?}"
+                );
+            }
+        }
+    }
+
+    /// 0.162.0 AC-3: the Layers cap is the `size.content_panel_max_rows`
+    /// token, not a constant — changing the token changes the cap.
+    #[test]
+    fn the_layers_cap_follows_the_content_panel_max_rows_token() {
+        let default_scales = test_scales();
+        assert_eq!(default_scales.size.content_panel_max_rows, 10);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = aurora_widgets::widgets::row_height(&default_scales) as u32;
+        for rows in [10_u32, 4, 15] {
+            let mut scales = test_scales();
+            scales.size.content_panel_max_rows = rows;
+            let mut ws = build_workspace(&scales);
+            fill_panels(&mut ws, &scales, (true, false, false), 200);
+            ws.tree.compute_layout(1600.0, 1200.0);
+            let layers = bounds_of(&ws, ws.layers.root);
+            assert_eq!(
+                layers.height,
+                (1 + rows) * row,
+                "a title row plus {rows} body rows: {layers:?}"
+            );
+        }
+    }
+
+    /// AC-4: Layers with many rows is capped at `size.content_panel_max_rows` and
     /// scrolls, leaving the Curves editor its full square.
     #[test]
     fn a_long_layers_list_is_capped_and_scrolls_beside_the_curves_editor() {
@@ -1161,7 +1278,7 @@ mod tests {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&scales) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let cap = (1 + crate::panel::CONTENT_PANEL_MAX_ROWS as u32) * row;
+        let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row;
         assert!(layers.height <= cap, "capped at the row cap: {layers:?}");
         assert!(
             ws.tree

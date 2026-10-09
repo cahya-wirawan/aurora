@@ -66,13 +66,19 @@ pub struct SpacingScale {
     pub density_multiplier: DensityMultiplier,
 }
 
-/// Fixed control widths for workspace chrome (`[size]` in `scales.toml`,
-/// 0.160.0). Logical px, not scaled by density.
+/// Fixed control sizes for workspace chrome (`[size]` in `scales.toml`,
+/// 0.160.0). Widths are logical px, not scaled by density;
+/// [`Self::content_panel_max_rows`] is a row count.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct SizeScale {
     /// The width of a slider in the options bar — a provisional default
     /// (224) for the design owner to tune.
     pub options_control_width: u32,
+    /// How many body rows (each one `row_height` tall) a content-sized
+    /// dock panel (Layers, Properties) grows to before it scrolls
+    /// (0.162.0: the 0.161.0 engineering cap made a token, value 10, for
+    /// the design owner to tune). A count of rows, not px.
+    pub content_panel_max_rows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -330,6 +336,17 @@ mod tests {
         };
         assert_eq!(scales.size.options_control_width, 224);
         assert_eq!(scales.size.options_control_width, 7 * scales.spacing.xl);
+    }
+
+    /// 0.162.0: the content-panel row-cap token parses, at the design
+    /// owner's value (10 rows, the 0.161.0 engineering cap it replaced).
+    #[test]
+    fn the_content_panel_max_rows_token_parses() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(scales.size.content_panel_max_rows, 10);
     }
 
     #[test]
