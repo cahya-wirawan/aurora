@@ -39,12 +39,19 @@
 //!
 //! **This deliberately differs from Photoshop**, whose Curves dialog
 //! interpolates with a natural cubic spline that overshoots between
-//! close points (and then clips). Which one Aurora should match is a
-//! design-owner decision (PRD FR-027 *Ownership*), flagged, not settled
-//! here: a monotone spline was chosen because it cannot invent tone
-//! reversals the user did not place.
+//! close points (and then clips), and allows 19 points to this type's
+//! [`MAX_POINTS`] of 16. A monotone spline was chosen because it cannot
+//! invent tone reversals the user did not place. **Decided by the design
+//! owner (Cahya, PRD FR-027 *Ownership*, 2026-10-09): Aurora will match
+//! Photoshop** — its natural-cubic-style interpolation with outputs
+//! clamped to `[0, 1]`, and its 19-point limit — so an imported PSD
+//! Curves layer looks identical. **Not implemented yet: scheduled for
+//! 0.157.0** (verified against psd-tools or Photoshop reference curves;
+//! it also moves the curve editor's point cap, the LUT accuracy bound and
+//! every test that assumes a monotone curve). Until then this type is
+//! the monotone interpolation described above.
 //!
-//! A second, smaller design-owner question inside that choice: each
+//! A second, smaller question inside that choice, still open: each
 //! interior tangent starts as the **unweighted** mean of its two
 //! neighbouring secants (Fritsch and Carlson's original 1980 form),
 //! not the interval-width-weighted three-point estimate (e.g. Fritsch

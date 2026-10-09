@@ -29,6 +29,7 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Rect as LayoutRect, Size, Style};
 
+use crate::curves_controls::{CurvesControls, insert_curves_controls};
 use crate::panel::{PanelHandle, panel_is_collapsed};
 use crate::tool::Tool;
 
@@ -47,6 +48,11 @@ pub struct ToolControls {
     /// The radius slider, in pixels
     /// ([`TOOL_RADIUS_MIN`]..=[`TOOL_RADIUS_MAX`]).
     pub radius: WidgetId,
+    /// The Curves editor (0.156.0) — the strip's last child, hidden
+    /// unless the active layer is a Curves adjustment
+    /// ([`crate::sync_curves_controls`]). Inside the strip so
+    /// [`tool_controls_contains`] routes its events here too.
+    pub curves: CurvesControls,
 }
 
 /// The readout's text for `tool` with `radius` (`None`: the tool has no
@@ -126,10 +132,12 @@ fn build(
         TOOL_RADIUS_MIN,
         TOOL_RADIUS_MAX,
     )?;
+    let curves = insert_curves_controls(tree, root, scales)?;
     let controls = ToolControls {
         root,
         readout,
         radius,
+        curves,
     };
     set_disabled(tree, controls, true)?;
     Ok(controls)

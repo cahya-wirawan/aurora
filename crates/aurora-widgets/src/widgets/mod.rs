@@ -102,8 +102,9 @@
 //! a tab stop). Points are selected, moved, added and removed from the
 //! keyboard and the pointer (geometric hit-testing, no pointer capture —
 //! a drag is the caller calling a `*_from_point` function per move), with
-//! no histogram, no channel selector and no text (`curve_editor.rs`'s own
-//! doc comment has the full list). The rest — a number field — still
+//! an optional decorative histogram behind the grid (0.156.0), and no
+//! channel selector and no text (`curve_editor.rs`'s own doc comment has
+//! the full list). The rest — a number field — still
 //! needs number semantics that don't exist yet, and is deliberately left open rather than stubbed out
 //! half-built.
 //!
@@ -184,9 +185,10 @@ pub use command_palette::{
 };
 pub use curve_editor::{
     CurveEditorKey, CurveEditorOutcome, CurveEditorPointState, CurveEditorState,
-    add_curve_point_from_point, curve_editor_of, curve_editor_point_at, curve_editor_state,
-    handle_curve_editor_key, insert_curve_editor, move_selected_point_from_point,
-    select_curve_point, set_curve_editor_disabled, set_curve_editor_points, set_curve_point_output,
+    MAX_HISTOGRAM_BINS, add_curve_point_from_point, curve_editor_of, curve_editor_point_at,
+    curve_editor_state, handle_curve_editor_key, insert_curve_editor,
+    move_selected_point_from_point, select_curve_point, set_curve_editor_disabled,
+    set_curve_editor_histogram, set_curve_editor_points, set_curve_point_output,
 };
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};

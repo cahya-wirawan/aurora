@@ -5,13 +5,21 @@
 //! only the number field remains.
 //!
 //! **Scope: one curve, one channel.** There is **no** channel selector
-//! (RGB / red / green / blue), **no** histogram behind the plot, **no**
+//! (RGB / red / green / blue — an owner composes one beside the editor,
+//! as `aurora-ui`'s Curves controls do with a tab bar, 0.156.0), **no**
 //! input/output numeric fields, **no** presets, and no glyphs of any kind
 //! (this crate draws none). The curve model itself — validation,
 //! Fritsch–Carlson interpolation, editing — is [`ToneCurve`] in
 //! `aurora-core`, so the adjustment that will one day *apply* a curve
 //! shares it without depending on this crate; this module owns only the
 //! interaction and the tree.
+//!
+//! **Histogram (0.156.0).** An owner may hand the editor an optional
+//! bin array ([`set_curve_editor_histogram`]): generic weights, nothing
+//! about documents or channels. It is painted behind the grid as one
+//! filled step area in `text.secondary` (the design owner's "muted
+//! foreground" decision), normalised to the tallest bin. It is
+//! decorative — no accessibility node, no effect on the pointer mapping.
 //!
 //! **Shape: a pure state machine plus a structural reconcile**, the
 //! same split `tab_bar.rs` and `color_picker.rs` use.
@@ -191,7 +199,8 @@
 //!
 //! # What it deliberately does not do
 //!
-//! No text, no histogram, no
+//! No text, no histogram *data* (an owner supplies the bins and this
+//! module only stores and paints them), no
 //! channel selection, no pointer capture, no undo (the owner's history
 //! records curve changes), and no hover state.
 
@@ -302,6 +311,11 @@ pub struct CurveEditorState {
     label: String,
     metrics: EditorMetrics,
     point_ids: Vec<WidgetId>,
+    /// The optional histogram painted behind the grid (0.156.0) — raw,
+    /// non-negative bin weights in input order, normalised to the
+    /// tallest bin at paint. `None` paints none. Decorative: it is not
+    /// part of the editor's accessibility node.
+    histogram: Option<Vec<f32>>,
 }
 
 impl CurveEditorState {
@@ -327,6 +341,13 @@ impl CurveEditorState {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The histogram painted behind the grid, if any
+    /// ([`set_curve_editor_histogram`]).
+    #[must_use]
+    pub fn histogram(&self) -> Option<&[f32]> {
+        self.histogram.as_deref()
     }
 
     /// The caller's `size`, in logical pixels.
@@ -712,6 +733,7 @@ pub fn insert_curve_editor(
             hit_radius: spacing(scales.spacing.sm),
         },
         point_ids: Vec::new(),
+        histogram: None,
     };
     let editor = tree.insert(
         parent,
@@ -956,6 +978,56 @@ pub fn set_curve_editor_points(
     })
 }
 
+/// The largest bin count [`set_curve_editor_histogram`] accepts — far
+/// above the 256 an 8-bit-level histogram needs, low enough that a
+/// mistaken caller cannot make paint build an enormous polygon.
+pub const MAX_HISTOGRAM_BINS: usize = 4096;
+
+/// Sets (or, with `None`, removes) the histogram painted behind
+/// `editor`'s grid (0.156.0) — generic and document-agnostic: `bins` are
+/// non-negative weights for equal-width input intervals across `[0, 1]`,
+/// in input order, drawn as one filled step area normalised to the
+/// tallest bin (an all-zero histogram paints nothing). Owner-driven, so
+/// it works on a disabled editor too. Purely decorative: it changes no
+/// accessibility node, only paint, and a value equal to the current one
+/// is `Ignored` with no damage.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::InvalidRange`] for an empty `bins`, more than
+/// [`MAX_HISTOGRAM_BINS`], or any bin that is negative or not finite;
+/// [`WidgetError::UnknownWidget`]/[`WidgetError::WrongWidgetKind`] for an
+/// id that isn't a curve editor. Nothing changes when any of these
+/// happens.
+pub fn set_curve_editor_histogram(
+    tree: &mut WidgetTree<WidgetKind>,
+    editor: WidgetId,
+    bins: Option<&[f32]>,
+) -> Result<CurveEditorOutcome, WidgetError> {
+    if let Some(bins) = bins
+        && (bins.is_empty()
+            || bins.len() > MAX_HISTOGRAM_BINS
+            || bins.iter().any(|bin| !bin.is_finite() || *bin < 0.0))
+    {
+        return Err(WidgetError::InvalidRange {
+            min: 0.0,
+            max: f64::from(f32::MAX),
+        });
+    }
+    let kind = tree
+        .payload_mut(editor)
+        .ok_or(WidgetError::UnknownWidget(editor))?;
+    let WidgetKind::CurveEditor(state) = kind else {
+        return Err(WidgetError::WrongWidgetKind(editor));
+    };
+    if state.histogram.as_deref() == bins {
+        return Ok(CurveEditorOutcome::Ignored);
+    }
+    state.histogram = bins.map(<[f32]>::to_vec);
+    tree.mark_dirty(editor)?;
+    Ok(CurveEditorOutcome::Changed)
+}
+
 /// Enables or disables `editor` and every point in it. Owner-driven, and
 /// a request matching the current state is `Ignored` — no damage.
 ///
@@ -1135,8 +1207,8 @@ mod tests {
         CurveEditorKey, CurveEditorOutcome, CurveEditorState, MARKER_RING_WIDTH,
         add_curve_point_from_point, curve_editor_of, curve_editor_point_at, curve_editor_state,
         handle_curve_editor_key, insert_curve_editor, keyed, move_selected_point_from_point,
-        select_curve_point, set_curve_editor_disabled, set_curve_editor_points,
-        set_curve_point_output,
+        select_curve_point, set_curve_editor_disabled, set_curve_editor_histogram,
+        set_curve_editor_points, set_curve_point_output,
     };
     use crate::shortcut::NamedKey;
     use crate::tree::{WidgetId, WidgetTree};
@@ -2155,11 +2227,14 @@ mod tests {
         let border = rgba(theme.border.default, 1.0);
         let text = rgba(theme.text.primary, 1.0);
         let panel = rgba(theme.surface.panel, 1.0);
-        let mut want = vec![rgba(theme.surface.sunken, 1.0), border];
+        let sunken = rgba(theme.surface.sunken, 1.0);
+        let mut want = vec![sunken, border];
         want.extend([border; 6]);
-        want.extend([border, text]);
-        want.extend([text, panel, text, panel]);
-        want.extend([rgba(theme.accent.primary, 1.0), text, panel]);
+        // The diagonal, then the curve over its `surface.sunken` halo.
+        want.extend([border, sunken, text]);
+        // Each marker over its own halo disc; the selected one last.
+        want.extend([sunken, text, panel, sunken, text, panel]);
+        want.extend([sunken, rgba(theme.accent.primary, 1.0), text, panel]);
         assert_eq!(colours, want);
         // The selected point's disc is centred on its own data position.
         let Some((disc, _)) = paints.get(paints.len() - 3) else {
@@ -2186,7 +2261,7 @@ mod tests {
             )
         );
         // The curve passes through each knot: its extent is the plot.
-        let Some((line, _)) = paints.get(9) else {
+        let Some((line, _)) = paints.get(10) else {
             unreachable!()
         };
         let (lx0, ly0, lx1, ly1) = extent(line);
@@ -2236,7 +2311,8 @@ mod tests {
         let (mut tree, editor) = inserted();
         ok(set_curve_editor_disabled(&mut tree, editor, true));
         let paints = solids(&tree, editor);
-        assert_eq!(paints.len(), 17);
+        // 17 shapes plus four halos (the curve's and three markers').
+        assert_eq!(paints.len(), 21);
         assert!(
             paints
                 .iter()
@@ -2301,7 +2377,7 @@ mod tests {
         ]);
         let (tree, editor) = inserted_with(peak);
         let paints = solids(&tree, editor);
-        let Some((line, colour)) = paints.get(9) else {
+        let Some((line, colour)) = paints.get(10) else {
             unreachable!()
         };
         assert_eq!(*colour, rgba(dark_theme().text.primary, 1.0));
@@ -2374,5 +2450,193 @@ mod tests {
         ));
         tree.compute_layout(320.0, 320.0);
         assert_eq!(solids(&tree, editor).len(), 2);
+    }
+
+    /// The design owner's option 1 (2026-10-09): the curve and every
+    /// marker are drawn over a `surface.sunken` halo — the curve's a
+    /// stroke wider by one ring width on each side, each marker's a disc
+    /// one ring width wider than the marker — so they stay legible over a
+    /// histogram's `text.secondary` bars.
+    #[test]
+    fn the_curve_and_the_selected_marker_are_drawn_over_a_surface_sunken_halo() {
+        let theme = dark_theme();
+        let (mut tree, editor) = inserted();
+        ok(select_curve_point(&mut tree, editor, 1));
+        let bins = two_spikes();
+        ok(set_curve_editor_histogram(&mut tree, editor, Some(&bins)));
+        let paints = solids(&tree, editor);
+        let sunken = rgba(theme.surface.sunken, 1.0);
+        let text = rgba(theme.text.primary, 1.0);
+        let accent = rgba(theme.accent.primary, 1.0);
+        let at = |colour: [f32; 4]| paints.iter().position(|(_, c)| *c == colour);
+        let Some(curve_at) = at(text) else {
+            unreachable!("the curve is drawn")
+        };
+        let Some((halo, halo_colour)) = curve_at.checked_sub(1).and_then(|i| paints.get(i)) else {
+            unreachable!("something precedes the curve")
+        };
+        assert_eq!(*halo_colour, sunken, "the curve's halo is right under it");
+        let Some((line, _)) = paints.get(curve_at) else {
+            unreachable!()
+        };
+        let ((hx0, hy0, hx1, hy1), (lx0, ly0, lx1, ly1)) = (extent(halo), extent(line));
+        assert!(
+            hx0 < lx0 && hy0 < ly0 && hx1 > lx1 && hy1 > ly1,
+            "the halo is wider than the curve"
+        );
+        let Some(disc_at) = at(accent) else {
+            unreachable!("the selected disc is drawn")
+        };
+        let Some((marker_halo, colour)) = disc_at.checked_sub(1).and_then(|i| paints.get(i)) else {
+            unreachable!()
+        };
+        assert_eq!(
+            *colour, sunken,
+            "the selected marker's halo is right under it"
+        );
+        let Some((disc, _)) = paints.get(disc_at) else {
+            unreachable!()
+        };
+        let ((mx0, _, mx1, _), (dx0, _, dx1, _)) = (extent(marker_halo), extent(disc));
+        assert!(
+            ((mx1 - mx0) - (dx1 - dx0) - 2.0 * MARKER_RING_WIDTH).abs() < 0.05,
+            "one ring width wider on each side"
+        );
+        // The histogram is still under all of it.
+        let Some(histogram_at) = at(rgba(theme.text.secondary, 1.0)) else {
+            unreachable!()
+        };
+        assert!(histogram_at < curve_at - 1);
+    }
+
+    // -- The histogram behind the grid (0.156.0) ---------------------------
+
+    fn two_spikes() -> Vec<f32> {
+        let mut bins = vec![0.0_f32; 256];
+        if let Some(bin) = bins.first_mut() {
+            *bin = 4.0;
+        }
+        if let Some(bin) = bins.last_mut() {
+            *bin = 2.0;
+        }
+        bins
+    }
+
+    /// The histogram is exactly one extra paint, in `text.secondary`,
+    /// right after the well (fill, border) and before the first grid
+    /// band — so the grid, diagonal, curve and markers all draw over it —
+    /// and spans the whole plot, up to its top for the tallest bin.
+    #[test]
+    fn a_histogram_paints_one_text_secondary_area_between_the_well_and_the_grid() {
+        let theme = dark_theme();
+        let (mut tree, editor) = inserted();
+        let without = solids(&tree, editor);
+        let node_before = tree.accessibility(editor).cloned();
+        let bins = two_spikes();
+        assert_eq!(
+            ok(set_curve_editor_histogram(&mut tree, editor, Some(&bins))),
+            CurveEditorOutcome::Changed
+        );
+        assert_eq!(
+            ok(curve_editor_state(&tree, editor)).histogram(),
+            Some(bins.as_slice())
+        );
+        let with = solids(&tree, editor);
+        assert_eq!(with.len(), without.len() + 1);
+        let secondary = rgba(theme.text.secondary, 1.0);
+        let colours: Vec<[f32; 4]> = with.iter().map(|(_, c)| *c).collect();
+        assert_eq!(colours.get(2), Some(&secondary), "{colours:?}");
+        assert_eq!(
+            colours.get(3),
+            Some(&rgba(theme.border.default, 1.0)),
+            "the first grid band paints over the histogram"
+        );
+        assert_eq!(colours.iter().filter(|c| **c == secondary).count(), 1);
+        let mut rest = with.clone();
+        let (area, _) = rest.remove(2);
+        assert_eq!(rest, without, "everything else is unchanged");
+        let (x0, y0, x1, y1) = extent(&area);
+        for (got, want) in [
+            (x0, REACH),
+            (y0, REACH),
+            (x1, REACH + PLOT),
+            (y1, REACH + PLOT),
+        ] {
+            assert!((got - want).abs() < 0.05, "{:?}", (x0, y0, x1, y1));
+        }
+        assert_eq!(
+            tree.accessibility(editor).cloned(),
+            node_before,
+            "decorative: the histogram changes no accessibility node"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_all_zero_histogram_paints_nothing_and_an_echo_costs_no_damage() {
+        let (mut tree, editor) = inserted();
+        let without = solids(&tree, editor);
+        let zeros = vec![0.0_f32; 256];
+        assert_eq!(
+            ok(set_curve_editor_histogram(&mut tree, editor, Some(&zeros))),
+            CurveEditorOutcome::Changed
+        );
+        assert_eq!(solids(&tree, editor), without, "all-zero paints nothing");
+        assert_eq!(
+            ok(set_curve_editor_histogram(&mut tree, editor, Some(&zeros))),
+            CurveEditorOutcome::Ignored
+        );
+        let bins = two_spikes();
+        ok(set_curve_editor_histogram(&mut tree, editor, Some(&bins)));
+        assert_eq!(
+            ok(set_curve_editor_histogram(&mut tree, editor, None)),
+            CurveEditorOutcome::Changed
+        );
+        assert_eq!(
+            ok(set_curve_editor_histogram(&mut tree, editor, None)),
+            CurveEditorOutcome::Ignored
+        );
+        assert_eq!(solids(&tree, editor), without, "removed paints nothing");
+        assert_eq!(ok(curve_editor_state(&tree, editor)).histogram(), None);
+    }
+
+    #[test]
+    fn a_histogram_is_dimmed_with_a_disabled_editor() {
+        let theme = dark_theme();
+        let (mut tree, editor) = inserted();
+        let bins = two_spikes();
+        ok(set_curve_editor_histogram(&mut tree, editor, Some(&bins)));
+        ok(set_curve_editor_disabled(&mut tree, editor, true));
+        let colours: Vec<[f32; 4]> = solids(&tree, editor).iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            colours.get(2),
+            Some(&rgba(theme.text.secondary, theme.state.disabled_opacity))
+        );
+    }
+
+    #[test]
+    fn an_invalid_histogram_is_refused_and_changes_nothing() {
+        let (mut tree, editor) = inserted();
+        let too_many = vec![1.0_f32; super::MAX_HISTOGRAM_BINS + 1];
+        for bad in [
+            vec![],
+            vec![1.0, f32::NAN],
+            vec![1.0, -0.5],
+            vec![f32::INFINITY],
+            too_many,
+        ] {
+            assert!(
+                matches!(
+                    set_curve_editor_histogram(&mut tree, editor, Some(&bad)),
+                    Err(WidgetError::InvalidRange { .. })
+                ),
+                "{} bins",
+                bad.len()
+            );
+            assert_eq!(ok(curve_editor_state(&tree, editor)).histogram(), None);
+        }
+        assert!(matches!(
+            set_curve_editor_histogram(&mut tree, ID, None),
+            Err(WidgetError::UnknownWidget(_))
+        ));
     }
 }

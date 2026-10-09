@@ -2090,14 +2090,28 @@ fn paint_tab(
 ///    `border.default` stroke, and the conditional [`control_outline`].
 ///    Not [`bordered_surface`], which draws at full alpha: every shape
 ///    here is dimmed by `state.disabled_opacity` when disabled.
-/// 2. **The grid**: six filled `border.default` bands, one at each
+/// 2. **The histogram** (0.156.0, optional — [`CurveEditorState::histogram`]):
+///    one filled step area, bin `i` of `n` spanning `[i/n, (i+1)/n]` of
+///    the plot's width and rising from its bottom edge to `bin / max` of
+///    its height, in `text.secondary` (the design owner's "muted
+///    foreground" choice, an existing token — none was added). Drawn
+///    after the well and **before** the grid, so every grid band, the
+///    diagonal, the curve and the markers paint over it. An absent or
+///    all-zero histogram paints nothing; a clipped editor drops it with
+///    the strokes (a filled polygon cannot be cut by the rect clip).
+/// 3. **The grid**: six filled `border.default` bands, one at each
 ///    quarter of the plot along each axis (vertical ones first).
-/// 3. **The identity diagonal**: a `border.default` line from the plot's
+/// 4. **The identity diagonal**: a `border.default` line from the plot's
 ///    bottom-left to its top-right.
-/// 4. **The curve**: a polyline through [`curve_polyline_samples`] —
+/// 5. **The curve**: a polyline through [`curve_polyline_samples`] —
 ///    the `CURVE_SEGMENTS + 1` uniform samples merged with every
-///    control point's own input — stroked in `text.primary`.
-/// 5. **The markers**: per point, the colour picker's own two-ring
+///    control point's own input — stroked in `text.primary` over a
+///    `surface.sunken` **halo** one `MARKER_RING_WIDTH` wider on each
+///    side (design owner, option 1, 2026-10-09: the curve over the
+///    histogram's `text.secondary` bars was as low as 1.00:1).
+/// 6. **The markers**: per point, a `surface.sunken` halo disc one
+///    `MARKER_RING_WIDTH` wider than the marker, then the colour
+///    picker's own two-ring
 ///    marker (`text.primary` outside, `surface.panel` inside) around a
 ///    circle of radius `spacing.xs` (fixed at insert). The **selected**
 ///    point is drawn last, on top of every other marker, with an
@@ -2173,6 +2187,12 @@ fn paint_curve_editor(
         return Ok(paints);
     };
     let (right, bottom) = (left + width, top + height);
+    if !clipped
+        && let Some(area) =
+            curve_editor_histogram_area(state.histogram(), (left, top, width, height), tolerance)?
+    {
+        paints.push((area, rgba(theme.text.secondary)));
+    }
     // The six grid bands, each intersected with the visible rect.
     let half_line = GRID_LINE_WIDTH / 2.0;
     let quarters = [0.25_f32, 0.5, 0.75];
@@ -2209,12 +2229,56 @@ fn paint_curve_editor(
         }
     }
     polyline.end();
-    let polyline = stroke(&polyline.build(), CURVE_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let polyline = polyline.build();
+    // The halo (design owner, option 1, 2026-10-09): the same polyline,
+    // wider by one marker-ring width on each side, in the well's own
+    // `surface.sunken`, under the curve — so the curve stays legible
+    // where it crosses a histogram bar.
+    let halo = stroke(&polyline, CURVE_WIDTH + 2.0 * MARKER_RING_WIDTH, tolerance)
+        .map_err(WidgetError::Paint)?;
+    paints.push((halo, rgba(theme.surface.sunken)));
+    let polyline = stroke(&polyline, CURVE_WIDTH, tolerance).map_err(WidgetError::Paint)?;
     paints.push((polyline, rgba(theme.text.primary)));
     paints.extend(curve_editor_markers(
         state, theme, alpha, tolerance, to_screen,
     )?);
     Ok(paints)
+}
+
+/// [`paint_curve_editor`]'s histogram (step 2): one filled step area
+/// over the plot `(left, top, width, height)`, or `None` for no
+/// histogram, an all-zero one, or a plot with no area.
+fn curve_editor_histogram_area(
+    bins: Option<&[f32]>,
+    plot: (f32, f32, f32, f32),
+    tolerance: f32,
+) -> Result<Option<Mesh>, WidgetError> {
+    let Some(bins) = bins else {
+        return Ok(None);
+    };
+    let (left, top, width, height) = plot;
+    let max = bins.iter().copied().fold(0.0_f32, f32::max);
+    if !(max > 0.0 && max.is_finite() && width > 0.0 && height > 0.0) {
+        return Ok(None);
+    }
+    let bottom = top + height;
+    #[allow(clippy::cast_precision_loss)]
+    let n = bins.len() as f32;
+    let mut area = PathBuilder::new();
+    area.move_to(Point::new(left, bottom));
+    for (i, &bin) in bins.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let (x0, x1) = (
+            left + (i as f32 / n) * width,
+            left + ((i + 1) as f32 / n) * width,
+        );
+        let y = bottom - (bin / max).clamp(0.0, 1.0) * height;
+        area.line_to(Point::new(x0, y)).line_to(Point::new(x1, y));
+    }
+    area.line_to(Point::new(left + width, bottom)).close();
+    Ok(Some(
+        fill(&area.build(), tolerance).map_err(WidgetError::Paint)?,
+    ))
 }
 
 /// [`paint_curve_editor`]'s markers, in draw order — every unselected
@@ -2246,6 +2310,20 @@ fn curve_editor_markers(
             continue;
         };
         let centre = to_screen(point);
+        // The marker's halo (option 1): a `surface.sunken` disc one ring
+        // width wider than the marker, under it.
+        let halo_r = r + MARKER_RING_WIDTH;
+        let halo = rounded_rect(
+            centre.x - halo_r,
+            centre.y - halo_r,
+            2.0 * halo_r,
+            2.0 * halo_r,
+            halo_r,
+        );
+        paints.push((
+            fill(&halo, tolerance).map_err(WidgetError::Paint)?,
+            rgba(theme.surface.sunken),
+        ));
         let outer = rounded_rect(centre.x - r, centre.y - r, 2.0 * r, 2.0 * r, r);
         let inner_r = r - MARKER_RING_WIDTH;
         let inner = rounded_rect(

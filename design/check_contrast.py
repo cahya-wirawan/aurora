@@ -47,6 +47,14 @@ PAIRS = [
     # ring colours against each other so the ring delineates itself.
     ("text.on_accent on border.focus", "text.on_accent", "border.focus", 3.0, "UI boundary"),
     ("accent.primary on surface.panel", "accent.primary", "surface.panel", 3.0, "UI boundary"),
+    # 0.156.0: the curve editor's histogram fills text.secondary (the design
+    # owner's "muted foreground" decision) inside the surface.sunken well.
+    ("text.secondary on surface.sunken", "text.secondary", "surface.sunken", 3.0, "UI graphic (histogram)"),
+    # 0.156.0 review, design owner's option 1 (2026-10-09): the curve
+    # (text.primary, gated above on surface.sunken at 4.5) and the markers
+    # sit on a surface.sunken halo; the halo against the bars is the
+    # text.secondary pair just above. The selected marker's accent disc:
+    ("accent.primary on surface.sunken (marker on its halo)", "accent.primary", "surface.sunken", 3.0, "UI graphic (curve marker)"),
 ]
 
 # Not gated (informational only). (label, fg, bg, reason)
@@ -65,6 +73,19 @@ INFORMATIONAL = [
      "not gated — decorative, see comment in source"),
     ("border.default on surface.app", "border.default", "surface.app",
      "not gated — decorative, see comment in source"),
+]
+
+# Known failures (0.156.0 review GA-2): pairs that are real and below the
+# floor, tracked here so the gap is machine-visible, reported on every run,
+# and NOT counted against the exit code — because the fix is the design
+# owner's decision (PRD FR-027 *Ownership*), not a local one. Remove an
+# entry the moment its decision lands. (label, fg, bg, floor, reason)
+KNOWN_FAILURES = [
+    # Empty as of the 0.156.0 review revision: the curve-editor histogram's
+    # two (curve and selected marker over the text.secondary bars, 1.00:1
+    # at worst) were fixed by the design owner's option 1 (2026-10-09), a
+    # surface.sunken halo under the curve and every marker — now gated
+    # below as curve/marker against the halo and the halo against the bars.
 ]
 
 
@@ -148,6 +169,16 @@ def main():
         bg_hex = resolve_token(bg_path, theme, palette)
         ratio = contrast_ratio(fg_hex, bg_hex)
         print(f"  [info] {label:45s} {ratio:5.2f}:1  ({reason})")
+
+    print()
+    for label, fg_path, bg_path, floor, reason in KNOWN_FAILURES:
+        fg_hex = resolve_token(fg_path, theme, palette)
+        bg_hex = resolve_token(bg_path, theme, palette)
+        ratio = contrast_ratio(fg_hex, bg_hex)
+        status = "KNOWN FAIL" if ratio < floor else "KNOWN FAIL, now passes"
+        print(f"  [{status}] {label:45s} {ratio:5.2f}:1  (floor {floor:.1f}:1; {reason})")
+    if KNOWN_FAILURES:
+        print(f"{len(KNOWN_FAILURES)} known failure(s) tracked above; not counted in the exit code.")
 
     print()
     if failures:

@@ -132,6 +132,18 @@ pub fn gallery_editor_size(scales: &Scales) -> f32 {
     GALLERY_EDITOR_ROWS * row_height(scales)
 }
 
+/// The gallery curve editor's sample histogram (0.156.0): 256 bins of a
+/// smooth bell centred a little below mid-grey — demo data, the shape a
+/// typical photograph's luminosity takes.
+fn gallery_sample_histogram() -> Vec<f32> {
+    (0..256_u16)
+        .map(|level| {
+            let x = (f32::from(level) / 255.0 - 0.45) / 0.18;
+            (-0.5 * x * x).exp()
+        })
+        .collect()
+}
+
 fn gap(scales: &Scales) -> f32 {
     px(scales.spacing.sm)
 }
@@ -309,6 +321,8 @@ fn build(
         size,
         ToneCurve::identity(),
     )?;
+    // The histogram state (0.156.0): a sample bell behind the grid.
+    widgets::set_curve_editor_histogram(tree, curve, Some(&gallery_sample_histogram()))?;
     let tooltip = Tooltip::new(tree, button, scales, "A tooltip", GALLERY_TOOLTIP_DELAY)?;
 
     Ok(GalleryPanel {

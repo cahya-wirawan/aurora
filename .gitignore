@@ -48,6 +48,10 @@ criterion/
 *.swo
 *~
 
+# Python bytecode (the design/ scripts import each other in reviews)
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 .DS_Store?
