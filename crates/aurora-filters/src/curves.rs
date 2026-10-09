@@ -183,6 +183,70 @@ impl CurvesLut {
     }
 }
 
+/// How many `f32`s lead [`CurvesLut::packed_for_gpu`]'s output: four
+/// `[present, range_lo, range_hi, 0.0]` records, red, green, blue,
+/// composite (0.159.0).
+pub const CURVES_PACKED_HEADER: usize = 16;
+
+/// The length of [`CurvesLut::packed_for_gpu`]'s output: the header plus
+/// four tables of [`CURVES_LUT_INTERVALS`]` + 1` samples (0.159.0) —
+/// 65,556 `f32`s, 262,224 bytes.
+pub const CURVES_PACKED_LEN: usize = CURVES_PACKED_HEADER + 4 * (CURVES_LUT_INTERVALS + 1);
+
+impl CurvesLut {
+    /// The tables flattened into one `f32` array for the GPU Curves pass
+    /// (0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`,
+    /// which documents and checks the same layout from its side — this
+    /// crate sits beside `aurora-render`, not below it, so neither can
+    /// name the other's constants; `aurora-app` asserts they agree).
+    ///
+    /// Layout, every value `f32`:
+    /// - `[0, 16)`: four records `[present, lo, hi, 0.0]` for red, green,
+    ///   blue and composite in that order. `present` is `1.0` for a
+    ///   tabulated curve and `0.0` for an identity one (the shader then
+    ///   passes the value through exactly, as [`Self::map_channel`]
+    ///   does); `lo`/`hi` are the table's own input range.
+    /// - `[16 + t * 16385, 16 + (t + 1) * 16385)`: table `t`'s samples,
+    ///   all zero for an identity curve.
+    ///
+    /// The samples are this table's own, bit for bit — no re-sampling and
+    /// no narrowing (invariant §7.3.1b: no 8-bit, and here no `f16`
+    /// either).
+    ///
+    /// **Empty** if any table does not hold exactly
+    /// [`CURVES_LUT_INTERVALS`]` + 1` samples (unreachable through
+    /// [`Self::new`]; 0.159.0 review). The GPU side refuses any length but
+    /// [`CURVES_PACKED_LEN`], so the caller composites on the CPU rather
+    /// than the GPU reading a flagged-present table of zeros (which would
+    /// black that channel out).
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> Vec<f32> {
+        let tables = [
+            self.channels.first().and_then(Option::as_ref),
+            self.channels.get(1).and_then(Option::as_ref),
+            self.channels.get(2).and_then(Option::as_ref),
+            self.composite.as_ref(),
+        ];
+        let mut out = Vec::with_capacity(CURVES_PACKED_LEN);
+        for table in tables {
+            match table {
+                Some(table) => out.extend([1.0, table.range.0, table.range.1, 0.0]),
+                None => out.extend([0.0; 4]),
+            }
+        }
+        for table in tables {
+            match table {
+                Some(table) if table.samples.len() == CURVES_LUT_INTERVALS + 1 => {
+                    out.extend_from_slice(&table.samples);
+                }
+                Some(_) => return Vec::new(),
+                None => out.extend(std::iter::repeat_n(0.0, CURVES_LUT_INTERVALS + 1)),
+            }
+        }
+        out
+    }
+}
+
 impl From<&CurvesParams> for CurvesLut {
     fn from(params: &CurvesParams) -> Self {
         Self::new(params)
@@ -191,7 +255,7 @@ impl From<&CurvesParams> for CurvesLut {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURVES_LUT_INTERVALS, CurvesLut};
+    use super::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut, Table};
     use aurora_core::{CurvePoint, CurvesParams, ToneCurve};
 
     fn curve(points: &[(f32, f32)]) -> ToneCurve {
@@ -415,5 +479,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 0.159.0: the GPU packing is the CPU tables bit for bit, in the
+    /// documented order, with identity curves flagged absent.
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn packed_for_gpu_is_the_cpu_tables_in_order_with_identity_flagged_absent() {
+        let params = CurvesParams {
+            composite: curve(&[(0.1, 0.0), (0.5, 0.7), (0.9, 1.0)]),
+            green: Some(curve(&[(0.0, 1.0), (1.0, 0.0)])),
+            ..CurvesParams::identity()
+        };
+        let lut = CurvesLut::new(&params);
+        let packed = lut.packed_for_gpu();
+        assert_eq!(packed.len(), CURVES_PACKED_LEN);
+        let header = packed.get(..CURVES_PACKED_HEADER).unwrap_or_default();
+        assert_eq!(header.first(), Some(&0.0), "red is identity");
+        assert_eq!(header.get(4), Some(&1.0), "green is tabulated");
+        assert_eq!(header.get(8), Some(&0.0), "blue is identity");
+        assert_eq!(header.get(12), Some(&1.0), "composite is tabulated");
+        assert_eq!(
+            header.get(13),
+            Some(&0.1),
+            "composite range starts at its first point"
+        );
+        assert_eq!(header.get(14), Some(&0.9), "and ends at its last");
+        let samples = CURVES_LUT_INTERVALS + 1;
+        let table = |t: usize| {
+            packed
+                .get(CURVES_PACKED_HEADER + t * samples..CURVES_PACKED_HEADER + (t + 1) * samples)
+                .unwrap_or_default()
+        };
+        assert!(table(0).iter().all(|&v| v == 0.0));
+        // Reading the packed table back the way the shader does gives
+        // `map_channel`'s own answer, bit for bit.
+        for &x in &[0.0_f32, 0.05, 0.3, 0.5, 0.77, 0.95, 1.0] {
+            let green = table(1);
+            let position = x * CURVES_LUT_INTERVALS as f32;
+            let index = (position as usize).min(CURVES_LUT_INTERVALS - 1);
+            let frac = position - index as f32;
+            let (Some(&low), Some(&high)) = (green.get(index), green.get(index + 1)) else {
+                unreachable!("in range");
+            };
+            let got = (high - low).mul_add(frac, low).clamp(0.0, 1.0);
+            let want = CurvesLut::new(&CurvesParams {
+                green: params.green.clone(),
+                ..CurvesParams::identity()
+            })
+            .map_channel(1, x);
+            assert_eq!(got.to_bits(), want.to_bits(), "x = {x}");
+        }
+    }
+
+    /// 0.159.0 review (I6): a malformed table packs to nothing, so the GPU
+    /// side refuses it, rather than to a present-flagged table of zeros.
+    #[test]
+    fn packed_for_gpu_is_empty_for_a_malformed_table() {
+        let lut = CurvesLut {
+            composite: Some(Table {
+                samples: vec![0.5; 3],
+                range: (0.0, 1.0),
+            }),
+            channels: [None, None, None],
+        };
+        assert!(lut.packed_for_gpu().is_empty());
     }
 }

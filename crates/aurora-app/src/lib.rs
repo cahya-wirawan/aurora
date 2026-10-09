@@ -12469,6 +12469,7 @@ fn composite_roots_into_tile(
 fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> bool {
     layers.roots().iter().all(|&id| {
         layers.visible(id) != Some(true)
+            || curves_layer_qualifies_for_gpu(layers, id)
             || matches!(
                 (layers.kind(id), layers.blend_mode(id)),
                 (
@@ -12498,6 +12499,36 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                 )
             )
     })
+}
+
+/// Whether root `id` is a Curves adjustment layer the GPU Curves pass
+/// (0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`)
+/// composites exactly as [`apply_adjustment_layer`] does on the CPU:
+///
+/// - **blend mode**: `Normal` or one of the eighteen with their own GPU
+///   blend math (`aurora_render::curves_mode_code` is the single list —
+///   every separable mode except `Exclusion`). `Exclusion`, the six
+///   non-separable modes and `Dissolve` stay on the CPU. `Dissolve` is
+///   refused because its gate is computed per texel on the CPU for a
+///   pixel layer's *uploaded* texels, and a Curves layer uploads none;
+/// - **no enabled mask**: a pixel layer's mask is applied on the CPU to
+///   the texels it uploads ([`resolve_tile`]), and a Curves layer has no
+///   texels to carry it, so a masked Curves layer stays on the CPU. A
+///   disabled mask is ignored on both paths, so it does not refuse.
+///
+/// Only root level is asked: a group still refuses the whole document in
+/// [`document_qualifies_for_gpu_compositing`], with its children inside.
+#[must_use]
+fn curves_layer_qualifies_for_gpu(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    let mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    matches!(
+        layers.adjustment(id),
+        Some(aurora_doc::Adjustment::Curves(_))
+    ) && !layers.mask(id).is_some_and(|mask| mask.enabled)
+        && mode != aurora_doc::BlendMode::Dissolve
+        && aurora_render::curves_mode_code(translate_blend_mode(mode)).is_some()
 }
 
 /// Decodes a raw, mapped `Rgba16Float`, `TILE`×`TILE` readback buffer's
@@ -12843,6 +12874,91 @@ fn create_composite_accumulator(
 /// it just stored, so there is no second, fallible lookup to guard:
 /// the unreachable state is unrepresentable rather than defended
 /// against. 0.86.1.
+/// Records one root Curves layer's GPU pass into `encoder` (0.159.0),
+/// in [`apply_adjustment_layer`]'s order: the same budget charge, the
+/// same skip for an identity curve under `Normal` (an exact passthrough,
+/// so no pass at all), and nothing to adjust while no layer below has
+/// folded yet (an all-transparent accumulator stays all-transparent on
+/// the CPU too, since the result is written back at the backdrop's own
+/// alpha). Otherwise the pass reads `current`, writes `spare`, and the
+/// two swap, as a blend-math pass does.
+///
+/// `false` only when the compositor refused the pass (a mode without
+/// Curves math, or a malformed table set), so the caller falls back to
+/// the CPU for this tile rather than dropping the layer.
+#[allow(clippy::too_many_arguments)]
+fn begin_gpu_curves_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+    encoder: &mut wgpu::CommandEncoder,
+    current: &mut Option<(wgpu::Texture, wgpu::TextureView)>,
+    spare: &mut Option<(wgpu::Texture, wgpu::TextureView)>,
+    tile_extent: wgpu::Extent3d,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !admit_composite_node(id, layers, 1, budget) {
+        return true;
+    }
+    let (Some(aurora_doc::Adjustment::Curves(params)), Some(opacity)) =
+        (layers.adjustment(id), layers.opacity(id))
+    else {
+        return true;
+    };
+    let raw_blend_mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    let lut = curves_lut(params);
+    if lut.is_identity() && raw_blend_mode == aurora_doc::BlendMode::Normal {
+        return true;
+    }
+    let Some(current_accumulator) = current.as_mut() else {
+        return true;
+    };
+    let spare_accumulator =
+        accumulator_or_create(spare, gpu.device(), encoder, tile_extent, "gpu-composite-b");
+    if !compositor.composite_curves_with_opacity(
+        gpu,
+        encoder,
+        params,
+        || lut.packed_for_gpu(),
+        &current_accumulator.1,
+        &spare_accumulator.1,
+        opacity,
+        translate_blend_mode(raw_blend_mode),
+    ) {
+        return false;
+    }
+    note_gpu_curves_dispatch();
+    std::mem::swap(current_accumulator, spare_accumulator);
+    true
+}
+
+/// Test-only count of GPU Curves passes recorded (0.159.0), the
+/// [`GpuBlendDispatches`] convention for the one pass that is not a blend
+/// mode: the only observable that tells "the Curves layer composited on
+/// the GPU" apart from "the tile silently fell back to the CPU, which
+/// computes the same pixels". Process-global; every reader holds the GPU
+/// test lock, as the blend counters' readers do.
+#[cfg(test)]
+static GPU_CURVES_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn note_gpu_curves_dispatch() {
+    GPU_CURVES_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_curves_dispatch() {}
+
+/// Reads [`GPU_CURVES_DISPATCHES`] and resets it, like
+/// [`take_gpu_blend_dispatch_count`].
+#[cfg(test)]
+fn take_gpu_curves_dispatch_count() -> u64 {
+    GPU_CURVES_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn accumulator_or_create<'slot>(
     slot: &'slot mut Option<(wgpu::Texture, wgpu::TextureView)>,
     device: &wgpu::Device,
@@ -14443,16 +14559,34 @@ fn begin_gpu_composite_tile(
     let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
     for &id in layers.roots().iter().rev() {
-        // 0.155.0: an adjustment layer has no WGSL port yet (a named
-        // follow-on), and `resolve_tile` hands it back as "nothing to
-        // fold", so a GPU pass reaching one would silently drop it. The
-        // predicate refuses such documents before this is ever called;
-        // this is the second, local refusal, so the tile falls back to the
-        // CPU path rather than compositing without the adjustment.
+        // 0.155.0 refused every adjustment layer here: `resolve_tile`
+        // hands one back as "nothing to fold", so a GPU pass reaching it
+        // would silently drop it. As of 0.159.0 a qualifying Curves layer
+        // (`curves_layer_qualifies_for_gpu`) is its own GPU pass; any
+        // other visible adjustment (a mask, `Dissolve`, a mode without
+        // GPU math) is still this second, local refusal behind the
+        // predicate's document-wide one, so the tile falls back to the
+        // CPU rather than compositing without the adjustment.
         if layers.visible(id) == Some(true)
             && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_)))
         {
-            return None;
+            if !curves_layer_qualifies_for_gpu(layers, id) {
+                return None;
+            }
+            if !begin_gpu_curves_pass(
+                gpu,
+                compositor,
+                layers,
+                id,
+                &mut encoder,
+                &mut current,
+                &mut spare,
+                tile_extent,
+                budget,
+            ) {
+                return None;
+            }
+            continue;
         }
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
         // validator starts its budget at. One `budget` for all of this
@@ -65878,46 +66012,984 @@ mod tests {
             );
         }
 
-        #[test]
-        fn the_gpu_predicate_refuses_a_visible_curves_layer_and_admits_a_hidden_one() {
-            let (_dir, mut store) = real_tile_store();
-            let mut layers = backdrop_stack(&mut store);
-            assert!(
-                crate::document_qualifies_for_gpu_compositing(&layers),
-                "setup"
-            );
-            let id = add_curves(&mut layers, invert(), None, 0);
-            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
-            if let Err(err) = layers.set_visible(id, false) {
+        // -- 0.159.0: Curves on the GPU path ------------------------------
+
+        /// The GPU/CPU tolerance for a Curves document: the existing
+        /// blend-mode differential's `2 * f16::EPSILON` (about half an
+        /// 8-bit level). The pass rounds `Cb`, `f(Cb)` and the mix to
+        /// `f16` exactly where the CPU stores them, so what is left is
+        /// WGSL's 2.5-ULP `f32` division in `straight_backdrop` (which can
+        /// move a translucent backdrop's `Cb` by one `f16` step, scaled by
+        /// the curve's slope), `pack2x16float`'s implementation-defined
+        /// rounding direction (one `f16` step), and the final
+        /// premultiply/un-premultiply the blend-mode differentials already
+        /// carry.
+        fn gpu_tolerance() -> f32 {
+            2.0 * f32::from(half::f16::EPSILON)
+        }
+
+        const QUAD: aurora_core::Rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+
+        fn params(
+            composite: &[(f32, f32)],
+            channels: [Option<&[(f32, f32)]>; 3],
+        ) -> aurora_core::CurvesParams {
+            let [red, green, blue] = channels;
+            aurora_core::CurvesParams {
+                composite: curve(composite),
+                red: red.map(curve),
+                green: green.map(curve),
+                blue: blue.map(curve),
+            }
+        }
+
+        fn s_curve() -> aurora_core::CurvesParams {
+            params(
+                &[(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)],
+                [None; 3],
+            )
+        }
+
+        fn per_channel() -> aurora_core::CurvesParams {
+            params(
+                &[(0.0, 0.0), (1.0, 1.0)],
+                [
+                    Some(&[(0.0, 0.1), (0.5, 0.7), (1.0, 0.9)]),
+                    Some(&[(0.0, 1.0), (1.0, 0.0)]),
+                    None,
+                ],
+            )
+        }
+
+        /// A red lift under a non-commuting composite curve, so the order
+        /// (channel first, then composite) is observable.
+        fn channel_then_composite() -> aurora_core::CurvesParams {
+            params(
+                &[(0.0, 0.0), (0.5, 0.2), (1.0, 1.0)],
+                [Some(&[(0.0, 0.3), (1.0, 1.0)]), None, None],
+            )
+        }
+
+        fn moved_endpoints() -> aurora_core::CurvesParams {
+            params(
+                &[(0.2, 0.1), (0.5, 0.6), (0.8, 0.9)],
+                [None, None, Some(&[(0.1, 0.0), (0.9, 1.0)])],
+            )
+        }
+
+        /// Steep (slope ~60) where [`steep_low_ramp`]'s values lie, flat
+        /// below its moved first point.
+        fn steep_low() -> aurora_core::CurvesParams {
+            params(&[(0.015, 0.0), (0.025, 0.6), (1.0, 1.0)], [None; 3])
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        fn ramp(x: u32, y: u32) -> [f32; 4] {
+            [
+                x as f32 / 255.0,
+                y as f32 / 255.0,
+                ((x * 3 + y * 5) % 256) as f32 / 255.0,
+                1.0,
+            ]
+        }
+
+        /// [`ramp`]'s colour at an alpha that varies across the tile, with
+        /// a fully transparent band at the top.
+        #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+        fn translucent_ramp(x: u32, y: u32) -> [f32; 4] {
+            let [r, g, b, _] = ramp(x, y);
+            let a = if y < 16 {
+                0.0
+            } else {
+                0.1 + 0.9 * x as f32 / 255.0
+            };
+            [r, g, b, a]
+        }
+
+        /// Opaque values in `[2^-6, 2^-5)` and `[2^-5, 2^-4)`, where `f16`
+        /// steps are a quarter or a half of a LUT interval, so the lookup
+        /// really interpolates (at `2^-4` and above every `f16` value is
+        /// exactly on a sample).
+        #[allow(clippy::cast_precision_loss)]
+        fn steep_low_ramp(x: u32, y: u32) -> [f32; 4] {
+            let step = 1.0 / 65536.0;
+            [
+                1.0 / 64.0 + x as f32 * step,
+                1.0 / 64.0 + y as f32 * step,
+                1.0 / 32.0 + (x + y) as f32 * step,
+                1.0,
+            ]
+        }
+
+        fn pattern_layer(
+            layers: &mut aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            mode: BlendMode,
+            opacity: f32,
+            tiles: &[aurora_tile::TileId],
+            pattern: impl Fn(u32, u32) -> [f32; 4],
+        ) -> aurora_doc::LayerId {
+            let id = match layers.add_pixel_layer("pattern", QUAD, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
                 unreachable!("{err:?}");
             }
-            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("a pixel layer");
+            };
+            for &tile in tiles {
+                let Ok(t) = store.get_mut(surface, tile) else {
+                    unreachable!("a real store accepts this write");
+                };
+                for (i, sample) in t.texels_mut().iter_mut().enumerate() {
+                    let texel = u32::try_from(i / 4).unwrap_or(0);
+                    let rgba = pattern(texel % aurora_tile::TILE, texel / aurora_tile::TILE);
+                    *sample = half::f16::from_f32(rgba.get(i % 4).copied().unwrap_or(0.0));
+                }
+                t.mark_dirty(aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: aurora_tile::TILE,
+                    height: aurora_tile::TILE,
+                });
+            }
+            id
+        }
+
+        fn set_opacity(layers: &mut aurora_doc::LayerTree, id: aurora_doc::LayerId, opacity: f32) {
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        fn set_mode(layers: &mut aurora_doc::LayerTree, id: aurora_doc::LayerId, mode: BlendMode) {
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        /// The CPU reference for `tile`, straight RGBA samples.
+        fn cpu_tile(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            tile: aurora_tile::TileId,
+        ) -> Vec<f32> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, tile, (0, 0), (0, 0), &mut budget);
+            texels.iter().map(|v| v.to_f32()).collect()
+        }
+
+        /// The GPU path for `tile` (`begin_gpu_composite_tile`, one poll,
+        /// `finish_tile_readback`), straight RGBA samples; `None` when the
+        /// tile fell back.
+        fn gpu_tile(
+            context: &aurora_gpu::GpuContext,
+            compositor: &mut aurora_render::TileCompositor,
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            tile: aurora_tile::TileId,
+        ) -> Option<Vec<f32>> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let pending = crate::begin_gpu_composite_tile(
+                context,
+                compositor,
+                layers,
+                store,
+                tile,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            )?;
+            let _ = context.device().poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            crate::finish_tile_readback(pending).map(|t| t.iter().map(|v| v.to_f32()).collect())
+        }
+
+        fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max)
+        }
+
+        fn assert_gpu_close(gpu: &[f32], cpu: &[f32], tolerance: f32, what: &str) {
+            assert_eq!(gpu.len(), cpu.len(), "{what}");
+            let mut worst = 0.0_f32;
+            for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
+                let d = (g - c).abs();
+                assert!(
+                    d <= tolerance,
+                    "{what}: texel {} channel {}: GPU {g} vs CPU {c} (tolerance {tolerance})",
+                    i / 4,
+                    i % 4
+                );
+                worst = worst.max(d);
+            }
+            println!("{what}: worst |GPU - CPU| = {worst:e}");
+        }
+
+        /// One GPU tile that must have run exactly `passes` Curves passes,
+        /// compared against the CPU reference.
+        fn gpu_matches_cpu(
+            context: &aurora_gpu::GpuContext,
+            compositor: &mut aurora_render::TileCompositor,
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            passes: u64,
+            what: &str,
+        ) -> Vec<f32> {
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(layers),
+                "{what}: setup, must take the GPU path"
+            );
+            let _ = crate::take_gpu_curves_dispatch_count();
+            let Some(gpu) = gpu_tile(context, compositor, layers, store, TILE) else {
+                unreachable!("{what}: the GPU tile fell back");
+            };
+            assert_eq!(
+                crate::take_gpu_curves_dispatch_count(),
+                passes,
+                "{what}: GPU Curves passes recorded -- fewer means a silent CPU fallback"
+            );
+            let cpu = cpu_tile(layers, store, TILE);
+            assert_gpu_close(&gpu, &cpu, gpu_tolerance(), what);
+            cpu
         }
 
         #[test]
-        fn begin_gpu_composite_tile_falls_back_for_a_curves_layer() {
+        fn gpu_curves_matches_the_cpu_reference_across_curve_shapes_and_opacities() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let cases = [
+                ("S curve", s_curve(), 1.0),
+                ("inversion", invert(), 1.0),
+                ("per-channel", per_channel(), 1.0),
+                ("channel then composite", channel_then_composite(), 1.0),
+                ("moved endpoints", moved_endpoints(), 1.0),
+                ("S curve at 35%", s_curve(), 0.35),
+                ("inversion at 60%", invert(), 0.6),
+            ];
+            for (what, curves, opacity) in cases {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _ = pattern_layer(
+                    &mut layers,
+                    &mut store,
+                    BlendMode::Normal,
+                    1.0,
+                    &[TILE],
+                    ramp,
+                );
+                let without = cpu_tile(&layers, &mut store, TILE);
+                let id = add_curves(&mut layers, curves, None, 0);
+                set_opacity(&mut layers, id, opacity);
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                let cpu = gpu_matches_cpu(&context, &mut compositor, &layers, &mut store, 1, what);
+                assert!(
+                    max_diff(&cpu, &without) > 0.02,
+                    "{what}: the curve must really change the composite"
+                );
+            }
+        }
+
+        /// The one fixture where interpolation between LUT samples is
+        /// observable: an opaque backdrop below `2^-4` under a steep curve.
+        /// Everything else rounds identically on both paths here, so the
+        /// bound is one `f16` step of the CPU value, far tighter than
+        /// [`gpu_tolerance`]; nearest-sample lookup misses by several.
+        #[test]
+        fn gpu_curves_interpolates_between_lut_samples_like_the_cpu() {
             let Some(context) = real_gpu_context() else {
                 return;
             };
             let (_dir, mut store) = real_tile_store();
-            let mut layers = backdrop_stack(&mut store);
-            let _ = add_curves(&mut layers, invert(), None, 0);
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Normal,
+                1.0,
+                &[TILE],
+                steep_low_ramp,
+            );
+            let _ = add_curves(&mut layers, steep_low(), None, 0);
             let mut compositor = aurora_render::TileCompositor::new(context.device());
-            let mut budget = CompositeBudget::for_pass(&layers);
-            let pending = crate::begin_gpu_composite_tile(
-                &context,
-                &mut compositor,
+            let cpu = gpu_matches_cpu(&context, &mut compositor, &layers, &mut store, 1, "steep");
+            let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store, TILE) else {
+                unreachable!("qualifies");
+            };
+            let mut worst_steps = 0.0_f32;
+            for (g, c) in gpu.iter().zip(&cpu) {
+                let h = half::f16::from_f32(c.abs());
+                let step = (half::f16::from_bits(h.to_bits() + 1).to_f32() - h.to_f32()).max(1e-7);
+                worst_steps = worst_steps.max((g - c).abs() / step);
+                assert!(
+                    (g - c).abs() <= step,
+                    "GPU {g} vs CPU {c}: more than one f16 step"
+                );
+            }
+            println!("steep: worst {worst_steps} f16 steps");
+            assert!(
+                cpu.chunks_exact(4)
+                    .any(|t| t.first().is_some_and(|&r| r > 0.05)),
+                "setup: the steep section must be reached"
+            );
+        }
+
+        const GPU_CURVES_MODES: [BlendMode; 19] = [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::Screen,
+            BlendMode::Difference,
+            BlendMode::LinearDodge,
+            BlendMode::LinearBurn,
+            BlendMode::ColorBurn,
+            BlendMode::ColorDodge,
+            BlendMode::Overlay,
+            BlendMode::HardLight,
+            BlendMode::LinearLight,
+            BlendMode::VividLight,
+            BlendMode::HardMix,
+            BlendMode::PinLight,
+            BlendMode::SoftLight,
+            BlendMode::Subtract,
+            BlendMode::Divide,
+        ];
+
+        #[test]
+        fn gpu_curves_matches_the_cpu_reference_at_every_gpu_blend_mode() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Normal,
+                1.0,
+                &[TILE],
+                ramp,
+            );
+            let id = add_curves(&mut layers, channel_then_composite(), None, 0);
+            set_opacity(&mut layers, id, 0.75);
+            // One compositor for every mode: the tables are uploaded once.
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let mut normal = Vec::new();
+            for mode in GPU_CURVES_MODES {
+                set_mode(&mut layers, id, mode);
+                let what = format!("{mode:?}");
+                let cpu = gpu_matches_cpu(&context, &mut compositor, &layers, &mut store, 1, &what);
+                if mode == BlendMode::Normal {
+                    normal = cpu;
+                } else {
+                    assert!(
+                        max_diff(&cpu, &normal) > 0.01,
+                        "{what}: must differ from Normal, or a dropped mode would pass"
+                    );
+                }
+            }
+            assert_eq!(
+                compositor.curves_lut_uploads(),
+                1,
+                "one parameter set: one upload across nineteen modes"
+            );
+        }
+
+        /// One `f16` step at the top of the in-gamut range, `[0.5, 1)`:
+        /// `2^-11`, the largest absolute step any colour in `[0, 1]` has.
+        const F16_STEP: f32 = 1.0 / 2048.0;
+
+        /// The steepest the three composed maps (`map_channel`, channel
+        /// curve then composite) get, as grid secants at `h = 2^-10`, times
+        /// 1.25 because a secant can undershoot the spline's own peak slope
+        /// between grid points.
+        #[allow(clippy::cast_precision_loss)]
+        fn curve_slope(params: &aurora_core::CurvesParams) -> f32 {
+            let lut = aurora_filters::CurvesLut::new(params);
+            let h = 1.0 / 1024.0;
+            let mut slope = 0.0_f32;
+            for channel in 0..3 {
+                for i in 0..1024 {
+                    let x = i as f32 * h;
+                    let rise = lut.map_channel(channel, x + h) - lut.map_channel(channel, x);
+                    slope = slope.max(rise.abs() / h);
+                }
+            }
+            1.25 * slope
+        }
+
+        /// I1 (0.159.0 review): the GPU/CPU bound for a **translucent**
+        /// backdrop, derived rather than borrowed. Every operation the two
+        /// paths share is the same `f32` arithmetic; the `f16` roundings
+        /// they share can each land one step apart, and nothing else
+        /// differs. With `S` the curve's slope ([`curve_slope`]), `a` the
+        /// layer's opacity, and `L_b`/`L_s` the blend term's Lipschitz
+        /// constants in `Cb`/`Cs` (`Normal` 0/1, `Screen` 1/1, `Overlay` and
+        /// `HardLight` 2/2), the straight result can differ by at most:
+        ///
+        /// - **`Cb`, one step**: WGSL's division is 2.5 ULP where the CPU's
+        ///   is correctly rounded, which can tip the `f16` rounding of
+        ///   `Cb = p / a_b` to the neighbouring step. It reaches the result
+        ///   through `(1 - a) Cb + a B(Cb, f(Cb))`: weight
+        ///   `w_cb = (1 - a) + a (L_b + L_s S)`;
+        /// - **`Cs = f(Cb)`, one step** (`pack2x16float` may round either
+        ///   way): weight `w_cs = a L_s`;
+        /// - **the mix, one step**;
+        /// - **the premultiplied store and the readback's straighten, three
+        ///   steps**: `f16` is floating point, so storing `p = mixed * a_b`
+        ///   errs by at most `2^-10 p`, which divided back by `a_b` is at most
+        ///   `2^-10 mixed <= 2 F16_STEP` whatever `a_b` is, and the straighten
+        ///   rounds once more. This is why there is **no `1 / a_b`
+        ///   amplification**: it would appear only once `p` falls into `f16`
+        ///   subnormals (below `6.1e-5`), where the absolute step is `2^-24`
+        ///   and even `/ 0.1` stays below `1e-6` — `/ 0.1` because
+        ///   `translucent_ramp` keeps every non-zero backdrop alpha at or
+        ///   above `0.1`; this is a property of the fixture, not a general
+        ///   bound for arbitrarily small `a_b`.
+        ///
+        /// So `bound = F16_STEP (w_cb + w_cs + 4)`. Each term assumes its
+        /// worst case at the same texel, so the bound is not expected to be
+        /// reached: the round that introduced this measured 3–4 steps
+        /// against bounds of 6–8 (printed below). A mutation that changes
+        /// the formula (alpha, opacity, mode, operand order) moves results by
+        /// tenths, two orders of magnitude past it.
+        fn translucent_tolerance(opacity: f32, l_b: f32, l_s: f32, slope: f32) -> f32 {
+            let w_cb = (1.0 - opacity) + opacity * (l_b + l_s * slope);
+            let w_cs = opacity * l_s;
+            F16_STEP * (w_cb + w_cs + 4.0)
+        }
+
+        #[test]
+        fn gpu_curves_keeps_a_translucent_backdrops_alpha_and_matches_the_cpu() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            // (what, curves, mode, opacity, L_b, L_s)
+            for (what, curves, mode, opacity, l_b, l_s) in [
+                (
+                    "translucent inversion",
+                    invert(),
+                    BlendMode::Normal,
+                    1.0,
+                    0.0,
+                    1.0,
+                ),
+                (
+                    "translucent S curve, Screen",
+                    s_curve(),
+                    BlendMode::Screen,
+                    0.8,
+                    1.0,
+                    1.0,
+                ),
+                (
+                    "translucent per-channel, Overlay",
+                    per_channel(),
+                    BlendMode::Overlay,
+                    0.5,
+                    2.0,
+                    2.0,
+                ),
+            ] {
+                let tolerance = translucent_tolerance(opacity, l_b, l_s, curve_slope(&curves));
+                println!(
+                    "{what}: derived bound {tolerance:e} ({} f16 steps)",
+                    tolerance / F16_STEP
+                );
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _ = pattern_layer(
+                    &mut layers,
+                    &mut store,
+                    BlendMode::Normal,
+                    1.0,
+                    &[TILE],
+                    translucent_ramp,
+                );
+                let without = cpu_tile(&layers, &mut store, TILE);
+                let id = add_curves(&mut layers, curves, None, 0);
+                set_mode(&mut layers, id, mode);
+                set_opacity(&mut layers, id, opacity);
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                let _ = crate::take_gpu_curves_dispatch_count();
+                let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store, TILE)
+                else {
+                    unreachable!("{what}: fell back");
+                };
+                assert_eq!(crate::take_gpu_curves_dispatch_count(), 1, "{what}");
+                let cpu = cpu_tile(&layers, &mut store, TILE);
+                assert_gpu_close(&gpu, &cpu, tolerance, what);
+                for (texel, before) in gpu.chunks_exact(4).zip(without.chunks_exact(4)) {
+                    if let ([_, _, _, a], [_, _, _, was]) = (texel, before) {
+                        assert_eq!(a, was, "{what}: alpha is the backdrop's, bit for bit");
+                        if *was == 0.0 {
+                            assert_eq!(texel, [0.0; 4], "{what}: no pixels are created");
+                        }
+                    }
+                }
+                assert!(max_diff(&cpu, &without) > 0.05, "{what}: setup");
+            }
+        }
+
+        #[test]
+        fn gpu_curves_matches_the_cpu_below_between_and_above_pixel_layers() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let top = |_: u32, _: u32| [0.9, 0.3, 0.7, 0.6];
+            // (where, index among the two pixel roots -- 0 is the top --,
+            // expected passes: none below everything, the accumulator
+            // being transparent there, exactly as on the CPU).
+            for (what, index, passes) in [("above", 0, 1), ("between", 1, 1), ("below", 2, 0)] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _ = pattern_layer(
+                    &mut layers,
+                    &mut store,
+                    BlendMode::Normal,
+                    1.0,
+                    &[TILE],
+                    ramp,
+                );
+                let _ = pattern_layer(
+                    &mut layers,
+                    &mut store,
+                    BlendMode::Multiply,
+                    0.5,
+                    &[TILE],
+                    top,
+                );
+                let without = cpu_tile(&layers, &mut store, TILE);
+                let _ = add_curves(&mut layers, s_curve(), None, index);
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                let cpu =
+                    gpu_matches_cpu(&context, &mut compositor, &layers, &mut store, passes, what);
+                if passes == 0 {
+                    assert_eq!(
+                        cpu, without,
+                        "{what}: a Curves layer below everything is a no-op"
+                    );
+                } else {
+                    assert!(max_diff(&cpu, &without) > 0.02, "{what}: setup");
+                }
+            }
+            // Two Curves layers, between and above, each their own pass.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Normal,
+                1.0,
+                &[TILE],
+                ramp,
+            );
+            let lower = add_curves(&mut layers, invert(), None, 0);
+            set_opacity(&mut layers, lower, 0.5);
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Multiply,
+                0.5,
+                &[TILE],
+                top,
+            );
+            let _ = add_curves(&mut layers, per_channel(), None, 0);
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let _ = gpu_matches_cpu(&context, &mut compositor, &layers, &mut store, 2, "two");
+            assert_eq!(compositor.curves_lut_uploads(), 2, "two parameter sets");
+        }
+
+        #[test]
+        fn gpu_curves_uploads_its_tables_once_per_parameter_set_and_again_after_an_edit() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let tiles = [
+                aurora_tile::TileId { x: 0, y: 0 },
+                aurora_tile::TileId { x: 1, y: 0 },
+                aurora_tile::TileId { x: 0, y: 1 },
+                aurora_tile::TileId { x: 1, y: 1 },
+            ];
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Normal,
+                1.0,
+                &tiles,
+                ramp,
+            );
+            let id = add_curves(&mut layers, s_curve(), None, 0);
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let frame = |layers: &aurora_doc::LayerTree,
+                         store: &mut aurora_tile::TileStore,
+                         compositor: &mut aurora_render::TileCompositor,
+                         what: &str| {
+                let _ = crate::take_gpu_curves_dispatch_count();
+                for &tile in &tiles {
+                    let Some(gpu) = gpu_tile(&context, compositor, layers, store, tile) else {
+                        unreachable!("{what}: fell back");
+                    };
+                    assert_gpu_close(&gpu, &cpu_tile(layers, store, tile), gpu_tolerance(), what);
+                }
+                assert_eq!(
+                    crate::take_gpu_curves_dispatch_count(),
+                    4,
+                    "{what}: one pass per tile"
+                );
+            };
+            frame(&layers, &mut store, &mut compositor, "first frame");
+            assert_eq!(compositor.curves_lut_uploads(), 1, "four tiles, one upload");
+            frame(&layers, &mut store, &mut compositor, "unchanged frame");
+            assert_eq!(
+                compositor.curves_lut_uploads(),
+                1,
+                "nothing changed: no re-upload"
+            );
+
+            if let Err(err) = layers.set_adjustment(id, aurora_doc::Adjustment::Curves(invert())) {
+                unreachable!("{err:?}");
+            }
+            // The comparison against the CPU inside `frame` is what fails if
+            // the stale S-curve tables were reused.
+            frame(&layers, &mut store, &mut compositor, "after an edit");
+            assert_eq!(
+                compositor.curves_lut_uploads(),
+                2,
+                "an edit uploads the new set"
+            );
+
+            if let Err(err) = layers.set_adjustment(id, aurora_doc::Adjustment::Curves(s_curve())) {
+                unreachable!("{err:?}");
+            }
+            frame(
                 &layers,
                 &mut store,
-                TILE,
-                (0, 0),
-                (0, 0),
-                &mut budget,
+                &mut compositor,
+                "after undoing the edit",
+            );
+            assert_eq!(
+                compositor.curves_lut_uploads(),
+                2,
+                "the old set is still resident"
+            );
+
+            // Bounded: more distinct sets than the cache holds.
+            for k in 0..aurora_render::CURVES_GPU_LUT_CACHE_LEN + 3 {
+                #[allow(clippy::cast_precision_loss)]
+                let lift = 0.05 + 0.01 * k as f32;
+                let lifted = params(&[(0.0, lift), (1.0, 1.0)], [None; 3]);
+                if let Err(err) = layers.set_adjustment(id, aurora_doc::Adjustment::Curves(lifted))
+                {
+                    unreachable!("{err:?}");
+                }
+                let _ = gpu_tile(&context, &mut compositor, &layers, &mut store, TILE);
+            }
+            assert_eq!(
+                compositor.curves_lut_cache_len(),
+                aurora_render::CURVES_GPU_LUT_CACHE_LEN
+            );
+        }
+
+        #[test]
+        fn the_gpu_predicate_admits_an_unmasked_curves_layer_and_refuses_each_unsupported_configuration()
+         {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = backdrop_stack(&mut store);
+            let id = add_curves(&mut layers, invert(), None, 0);
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "Normal, unmasked"
+            );
+            for mode in GPU_CURVES_MODES {
+                set_mode(&mut layers, id, mode);
+                assert!(
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{mode:?}"
+                );
+            }
+            for mode in [
+                BlendMode::Dissolve,
+                BlendMode::Exclusion,
+                BlendMode::Hue,
+                BlendMode::Saturation,
+                BlendMode::Color,
+                BlendMode::Luminosity,
+                BlendMode::DarkerColor,
+                BlendMode::LighterColor,
+            ] {
+                set_mode(&mut layers, id, mode);
+                assert!(
+                    !crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{mode:?} has no GPU Curves pass and must stay on the CPU"
+                );
+                if let Err(err) = layers.set_visible(id, false) {
+                    unreachable!("{err:?}");
+                }
+                assert!(
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "hidden {mode:?}"
+                );
+                if let Err(err) = layers.set_visible(id, true) {
+                    unreachable!("{err:?}");
+                }
+            }
+            set_mode(&mut layers, id, BlendMode::Normal);
+            if let Err(err) = layers.add_mask(id, QUAD) {
+                unreachable!("{err:?}");
+            }
+            assert!(
+                !crate::document_qualifies_for_gpu_compositing(&layers),
+                "a masked Curves layer stays on the CPU"
+            );
+            if let Err(err) = layers.set_mask_enabled(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(
+                crate::document_qualifies_for_gpu_compositing(&layers),
+                "a disabled mask is ignored on both paths"
+            );
+
+            // A group still forces the CPU, Curves inside it or not.
+            let mut grouped = backdrop_stack(&mut store);
+            let group = match grouped.add_group("Group 1", None) {
+                Ok(group) => group,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _ = add_curves(&mut grouped, invert(), Some(group), 0);
+            assert!(!crate::document_qualifies_for_gpu_compositing(&grouped));
+        }
+
+        #[test]
+        fn begin_gpu_composite_tile_falls_back_for_each_unsupported_curves_layer() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            for refusal in ["mask", "Dissolve", "Exclusion", "Luminosity"] {
+                let mut layers = backdrop_stack(&mut store);
+                let id = add_curves(&mut layers, invert(), None, 0);
+                match refusal {
+                    "mask" => {
+                        if let Err(err) = layers.add_mask(id, QUAD) {
+                            unreachable!("{err:?}");
+                        }
+                    }
+                    "Dissolve" => set_mode(&mut layers, id, BlendMode::Dissolve),
+                    "Exclusion" => set_mode(&mut layers, id, BlendMode::Exclusion),
+                    _ => set_mode(&mut layers, id, BlendMode::Luminosity),
+                }
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                let _ = crate::take_gpu_curves_dispatch_count();
+                assert!(
+                    gpu_tile(&context, &mut compositor, &layers, &mut store, TILE).is_none(),
+                    "{refusal}: the tile must fall back, not drop the layer"
+                );
+                assert_eq!(crate::take_gpu_curves_dispatch_count(), 0, "{refusal}");
+            }
+        }
+
+        #[test]
+        fn the_curves_lut_fits_the_limits_aurora_requests_and_the_adapters_own() {
+            assert_eq!(
+                aurora_filters::CURVES_LUT_INTERVALS,
+                aurora_render::CURVES_GPU_LUT_INTERVALS
+            );
+            assert_eq!(
+                aurora_filters::CURVES_PACKED_LEN,
+                aurora_render::CURVES_GPU_LUT_LEN
+            );
+            let bytes = u64::try_from(aurora_render::CURVES_GPU_LUT_LEN * 4).unwrap_or(u64::MAX);
+            let mut checked = vec![
+                ("requested (Limits::default)", wgpu::Limits::default()),
+                ("downlevel_defaults", wgpu::Limits::downlevel_defaults()),
+            ];
+            let context = real_gpu_context();
+            if let Some(context) = &context {
+                checked.push(("this adapter's device", context.device().limits()));
+            }
+            for (name, limits) in checked {
+                println!(
+                    "{name}: max_storage_buffer_binding_size {} (need {bytes}), \
+                     max_storage_buffers_per_shader_stage {}",
+                    limits.max_storage_buffer_binding_size,
+                    limits.max_storage_buffers_per_shader_stage
+                );
+                assert!(limits.max_storage_buffer_binding_size >= bytes, "{name}");
+                assert!(limits.max_storage_buffers_per_shader_stage >= 1, "{name}");
+            }
+        }
+
+        /// AC-4, 0.159.0: which path `adjustments/curves_rgb.psd` takes.
+        #[test]
+        fn curves_rgb_psd_reports_which_compositing_path_it_takes() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../corpora/psd/reference/psd-tools-fixtures/adjustments/curves_rgb.psd");
+            let Ok(bytes) = std::fs::read(&path) else {
+                println!("SKIPPED: corpus file not present at {}", path.display());
+                return;
+            };
+            let (_scratch, mut store) = real_tile_store();
+            let (document, _image) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            let layers = &document.layers;
+            let roots = layers.roots();
+            let groups = roots
+                .iter()
+                .filter(|&&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. })))
+                .count();
+            let curves: Vec<_> = roots
+                .iter()
+                .filter(|&&id| layers.adjustment(id).is_some())
+                .map(|&id| {
+                    (
+                        layers.visible(id),
+                        layers.blend_mode(id),
+                        layers.mask(id).map(|m| m.enabled),
+                        crate::curves_layer_qualifies_for_gpu(layers, id),
+                    )
+                })
+                .collect();
+            let qualifies = crate::document_qualifies_for_gpu_compositing(layers);
+            println!(
+                "curves_rgb.psd: GPU path {qualifies}; {} roots, {groups} root groups, root \
+                 Curves (visible, mode, mask enabled, qualifies): {curves:?}",
+                roots.len()
+            );
+            assert_eq!(curves.len(), 4, "every Curves layer is a root");
+            assert!(
+                !qualifies,
+                "measured in 0.159.0: its Curves layers carry enabled masks, so it composites on \
+                 the CPU and its pinned numbers are the CPU path's"
             );
             assert!(
-                pending.is_none(),
-                "a Curves layer has no GPU port: the tile must fall back, not drop the layer"
+                curves
+                    .iter()
+                    .any(|&(visible, _, mask, ok)| visible == Some(true)
+                        && mask == Some(true)
+                        && !ok),
+                "the refusal is the documented mask refusal"
             );
+        }
+
+        /// AC-5, 0.159.0: CPU against GPU composite time for a 4096 x 4096
+        /// document (256 tiles), 3 pixel layers plus 1 Curves layer.
+        /// `#[ignore]`d measurement; run with
+        /// `cargo test -p aurora-app --release -- --ignored --nocapture measure_curves`.
+        #[test]
+        #[ignore = "measurement"]
+        fn measure_curves_composite_cpu_against_gpu_on_a_4096_document() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let side = 4096 / aurora_tile::TILE;
+            let tiles: Vec<_> = (0..side)
+                .flat_map(|y| (0..side).map(move |x| aurora_tile::TileId { x, y }))
+                .collect();
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let top = |_: u32, _: u32| [0.9, 0.3, 0.7, 0.6];
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Normal,
+                1.0,
+                &tiles,
+                ramp,
+            );
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Multiply,
+                0.5,
+                &tiles,
+                top,
+            );
+            let _ = pattern_layer(
+                &mut layers,
+                &mut store,
+                BlendMode::Screen,
+                0.4,
+                &tiles,
+                ramp,
+            );
+            let curves = add_curves(&mut layers, s_curve(), None, 0);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            // The same document with the Curves layer hidden isolates
+            // what the Curves step itself costs on each path.
+            for with_curves in [false, true] {
+                if let Err(err) = layers.set_visible(curves, with_curves) {
+                    unreachable!("{err:?}");
+                }
+                let mut cpu_ms = Vec::new();
+                let mut gpu_ms = Vec::new();
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    for &tile in &tiles {
+                        let _ = cpu_tile(&layers, &mut store, tile);
+                    }
+                    cpu_ms.push(start.elapsed().as_secs_f64() * 1e3);
+
+                    let _ = crate::take_gpu_curves_dispatch_count();
+                    let start = std::time::Instant::now();
+                    let mut pending = Vec::new();
+                    for &tile in &tiles {
+                        let mut budget = crate::CompositeBudget::for_pass(&layers);
+                        if let Some(p) = crate::begin_gpu_composite_tile(
+                            &context,
+                            &mut compositor,
+                            &layers,
+                            &mut store,
+                            tile,
+                            (0, 0),
+                            (0, 0),
+                            &mut budget,
+                        ) {
+                            pending.push(p);
+                        }
+                    }
+                    let _ = context.device().poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    let done = pending
+                        .into_iter()
+                        .filter_map(crate::finish_tile_readback)
+                        .count();
+                    gpu_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(done, tiles.len());
+                    assert_eq!(
+                        crate::take_gpu_curves_dispatch_count(),
+                        if with_curves { 256 } else { 0 }
+                    );
+                }
+                println!("4096^2, 3 pixel, Curves {with_curves}: CPU ms per pass {cpu_ms:.1?}");
+                println!("4096^2, 3 pixel, Curves {with_curves}: GPU ms per pass {gpu_ms:.1?}");
+            }
+            assert_eq!(compositor.curves_lut_uploads(), 1);
         }
 
         #[test]
@@ -65948,8 +67020,14 @@ mod tests {
             let without_curves = cpu.clone();
 
             let _ = add_curves(&mut layers, invert(), None, 0);
-            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            // 0.159.0: a Curves layer now takes the GPU path.
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            let _ = crate::take_gpu_curves_dispatch_count();
             let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert!(
+                crate::take_gpu_curves_dispatch_count() >= 1,
+                "the Curves layer composited on the GPU, not by a silent CPU fallback"
+            );
             assert_eq!(gpu.len(), cpu.len());
             for (g, c) in gpu.iter().zip(&cpu) {
                 assert!(

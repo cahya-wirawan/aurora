@@ -60,7 +60,8 @@ mod schedule;
 mod test_support;
 
 pub use composite::{
-    BLEND_MATH_PASS_COUNT, BlendMode, TileCompositor, composite_layer_into, composite_tile_cpu,
+    BLEND_MATH_PASS_COUNT, BlendMode, CURVES_GPU_LUT_CACHE_LEN, CURVES_GPU_LUT_INTERVALS,
+    CURVES_GPU_LUT_LEN, TileCompositor, composite_layer_into, composite_tile_cpu, curves_mode_code,
     transparent_tile, un_premultiply_in_place,
 };
 pub use executor::{Executor, TaskId};

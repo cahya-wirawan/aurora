@@ -389,8 +389,16 @@ fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = cb * s.rgb;                       // blend_rgb(Multiply, cb, cs)
+    let b = blend_multiply(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_multiply`'s blend term, `blend_rgb(multiply, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_multiply(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = cb * cs;                       // blend_rgb(Multiply, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -417,8 +425,16 @@ fn fs_composite_darken(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = min(cb, s.rgb);                   // blend_rgb(Darken, cb, cs)
+    let b = blend_darken(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_darken`'s blend term, `blend_rgb(darken, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_darken(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = min(cb, cs);                   // blend_rgb(Darken, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -445,8 +461,16 @@ fn fs_composite_lighten(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = max(cb, s.rgb);                   // blend_rgb(Lighten, cb, cs)
+    let b = blend_lighten(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_lighten`'s blend term, `blend_rgb(lighten, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_lighten(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = max(cb, cs);                   // blend_rgb(Lighten, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -484,8 +508,16 @@ fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = cb + s.rgb - cb * s.rgb;          // blend_rgb(Screen, cb, cs)
+    let b = blend_screen(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_screen`'s blend term, `blend_rgb(screen, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_screen(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = cb + cs - cb * cs;          // blend_rgb(Screen, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -534,8 +566,16 @@ fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = abs(cb - s.rgb);                  // blend_rgb(Difference, cb, cs)
+    let b = blend_difference(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_difference`'s blend term, `blend_rgb(difference, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_difference(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = abs(cb - cs);                  // blend_rgb(Difference, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -615,8 +655,16 @@ fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = min(cb + s.rgb, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
+    let b = blend_linear_dodge(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_linear_dodge`'s blend term, `blend_rgb(linear_dodge, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_linear_dodge(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = min(cb + cs, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -719,8 +767,16 @@ fn fs_composite_linear_burn(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = max(cb + s.rgb - 1.0, vec3<f32>(0.0)); // blend_rgb(LinearBurn, cb, cs)
+    let b = blend_linear_burn(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_linear_burn`'s blend term, `blend_rgb(linear_burn, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_linear_burn(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = max(cb + cs - 1.0, vec3<f32>(0.0)); // blend_rgb(LinearBurn, cb, cs)
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::ColorBurn` arm (src/composite.rs), one
@@ -816,12 +872,20 @@ fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = vec3<f32>(
-        color_burn_channel(cb.r, s.r),
-        color_burn_channel(cb.g, s.g),
-        color_burn_channel(cb.b, s.b),
-    );
+    let b = blend_color_burn(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_color_burn`'s blend term, `blend_rgb(color_burn, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_color_burn(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = vec3<f32>(
+        color_burn_channel(cb.r, cs.r),
+        color_burn_channel(cb.g, cs.g),
+        color_burn_channel(cb.b, cs.b),
+    );
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::ColorDodge` arm (src/composite.rs), one
@@ -925,12 +989,20 @@ fn fs_composite_color_dodge(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = vec3<f32>(
-        color_dodge_channel(cb.r, s.r),
-        color_dodge_channel(cb.g, s.g),
-        color_dodge_channel(cb.b, s.b),
-    );
+    let b = blend_color_dodge(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_color_dodge`'s blend term, `blend_rgb(color_dodge, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_color_dodge(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = vec3<f32>(
+        color_dodge_channel(cb.r, cs.r),
+        color_dodge_channel(cb.g, cs.g),
+        color_dodge_channel(cb.b, cs.b),
+    );
+    return b;
 }
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -1058,13 +1130,21 @@ fn fs_composite_overlay(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_overlay(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_overlay`'s blend term, `blend_rgb(overlay, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_overlay(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_rgb(Overlay, cb, cs) == blend_channel(HardLight, cs, cb):
     // Multiply(cs, 2*cb) where cb <= 0.5, else Screen(cs, 2*cb - 1).
-    let lo = s.rgb * (2.0 * cb);
+    let lo = cs * (2.0 * cb);
     let t = 2.0 * cb - 1.0;
-    let hi = s.rgb + t - s.rgb * t;
+    let hi = cs + t - cs * t;
     let b = select(hi, lo, cb <= vec3<f32>(0.5));
-    return fold_over(s, bd, b);
+    return b;
 }
 
 // Mirrors `blend_channel(BlendMode::HardLight, cb, cs)` (src/composite.rs)
@@ -1212,14 +1292,22 @@ fn fs_composite_hard_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_hard_light(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_hard_light`'s blend term, `blend_rgb(hard_light, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_hard_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(HardLight, cb, cs): Multiply(cb, 2*cs) where cs <= 0.5,
     // else Screen(cb, 2*cs - 1). The branch tests the SOURCE -- branching on
     // `cb` here is `fs_composite_overlay`, one token away and directly above.
-    let lo = cb * (2.0 * s.rgb);
-    let t = 2.0 * s.rgb - 1.0;
+    let lo = cb * (2.0 * cs);
+    let t = 2.0 * cs - 1.0;
     let hi = cb + t - cb * t;
-    let b = select(hi, lo, s.rgb <= vec3<f32>(0.5));
-    return fold_over(s, bd, b);
+    let b = select(hi, lo, cs <= vec3<f32>(0.5));
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::LinearLight` arm (src/composite.rs),
@@ -1319,12 +1407,20 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_linear_light(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_linear_light`'s blend term, `blend_rgb(linear_light, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_linear_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(LinearLight, cb, cs): clamp(cb + 2*cs - 1, 0, 1), one
     // expression and no branch -- see composite.rs's own arm for why the
     // branch form collapses to this. Dropping the `2.0 *` here is
     // fs_composite_linear_burn exactly.
-    let b = clamp(cb + 2.0 * s.rgb - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
-    return fold_over(s, bd, b);
+    let b = clamp(cb + 2.0 * cs - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::VividLight` arm (src/composite.rs), one
@@ -1563,15 +1659,23 @@ fn fs_composite_vivid_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_vivid_light(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_vivid_light`'s blend term, `blend_rgb(vivid_light, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_vivid_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(VividLight, cb, cs): ColorBurn(cb, 2*cs) where cs <= 0.5,
     // else ColorDodge(cb, 2*cs - 1). The branch tests the SOURCE. Three calls
     // rather than a select(), because both callees' guards are early returns.
     let b = vec3<f32>(
-        vivid_light_channel(cb.r, s.r),
-        vivid_light_channel(cb.g, s.g),
-        vivid_light_channel(cb.b, s.b),
+        vivid_light_channel(cb.r, cs.r),
+        vivid_light_channel(cb.g, cs.g),
+        vivid_light_channel(cb.b, cs.b),
     );
-    return fold_over(s, bd, b);
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::HardMix` arm (src/composite.rs), one
@@ -1800,17 +1904,25 @@ fn fs_composite_hard_mix(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_hard_mix(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_hard_mix`'s blend term, `blend_rgb(hard_mix, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_hard_mix(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(HardMix, cb, cs): 0.0 where VividLight(cb, cs) < 0.5, else
     // 1.0. The comparison is `<`, mirroring the Rust arm; `<=` is a real,
     // killable mutation here, unlike Overlay's/HardLight's/VividLight's own
     // branch boundaries. Three calls rather than a select() over three
     // vivid_light_channel results, for the reason that helper's comment gives.
     let b = vec3<f32>(
-        hard_mix_channel(cb.r, s.r),
-        hard_mix_channel(cb.g, s.g),
-        hard_mix_channel(cb.b, s.b),
+        hard_mix_channel(cb.r, cs.r),
+        hard_mix_channel(cb.g, cs.g),
+        hard_mix_channel(cb.b, cs.b),
     );
-    return fold_over(s, bd, b);
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::PinLight` arm (src/composite.rs),
@@ -1959,15 +2071,23 @@ fn fs_composite_pin_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_pin_light(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_pin_light`'s blend term, `blend_rgb(pin_light, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_pin_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(PinLight, cb, cs): Darken(cb, 2*cs) where cs <= 0.5, else
     // Lighten(cb, 2*cs - 1) -- i.e. min/max, substituted from those two modes'
     // own arms. The branch tests the SOURCE; branching on `cb` here is a real
     // mutation. A select() is legitimate (unlike vivid_light_channel's) because
     // neither arm divides, so evaluating both risks nothing.
-    let lo = min(cb, 2.0 * s.rgb);
-    let hi = max(cb, 2.0 * s.rgb - 1.0);
-    let b = select(hi, lo, s.rgb <= vec3<f32>(0.5));
-    return fold_over(s, bd, b);
+    let lo = min(cb, 2.0 * cs);
+    let hi = max(cb, 2.0 * cs - 1.0);
+    let b = select(hi, lo, cs <= vec3<f32>(0.5));
+    return b;
 }
 
 // `soft_light_d(x)`, the W3C spec's own auxiliary `D(Cb)` function, and
@@ -2272,6 +2392,14 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_soft_light(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_soft_light`'s blend term, `blend_rgb(soft_light, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_soft_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(SoftLight, cb, cs): cb - (1 - 2*cs)*cb*(1 - cb) where
     // cs <= 0.5, else cb + (2*cs - 1)*(soft_light_d(cb) - cb). The branch tests
     // the SOURCE. Three calls to a per-channel helper rather than a
@@ -2279,11 +2407,11 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
     // branch -- see that function's comment for the reachable cb < 0 that makes
     // it load-bearing.
     let b = vec3<f32>(
-        soft_light_channel(cb.r, s.r),
-        soft_light_channel(cb.g, s.g),
-        soft_light_channel(cb.b, s.b),
+        soft_light_channel(cb.r, cs.r),
+        soft_light_channel(cb.g, cs.g),
+        soft_light_channel(cb.b, cs.b),
     );
-    return fold_over(s, bd, b);
+    return b;
 }
 
 // `blend_channel`'s own `BlendMode::Subtract` arm (src/composite.rs),
@@ -2451,8 +2579,16 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
-    let b = max(cb - s.rgb, vec3<f32>(0.0)); // blend_rgb(Subtract, cb, cs)
+    let b = blend_subtract(cb, s.rgb);
     return fold_over(s, bd, b);
+}
+
+// `fs_composite_subtract`'s blend term, `blend_rgb(subtract, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_subtract(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
+    let b = max(cb - cs, vec3<f32>(0.0)); // blend_rgb(Subtract, cb, cs)
+    return b;
 }
 
 // One channel of `blend_channel`'s own `BlendMode::Divide` arm
@@ -2641,11 +2777,19 @@ fn fs_composite_divide(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
     let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let cb = straight_backdrop(bd);
+    let b = blend_divide(cb, s.rgb);
+    return fold_over(s, bd, b);
+}
+
+// `fs_composite_divide`'s blend term, `blend_rgb(divide, cb, cs)` (0.159.0:
+// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// never drift apart).
+fn blend_divide(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_rgb(Divide, cb, cs), one guarded division per channel.
     let b = vec3<f32>(
-        divide_channel(cb.r, s.r),
-        divide_channel(cb.g, s.g),
-        divide_channel(cb.b, s.b),
+        divide_channel(cb.r, cs.r),
+        divide_channel(cb.g, cs.g),
+        divide_channel(cb.b, cs.b),
     );
-    return fold_over(s, bd, b);
+    return b;
 }

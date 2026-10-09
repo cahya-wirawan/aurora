@@ -8,7 +8,7 @@
 
 pub mod curves;
 
-pub use curves::{CURVES_LUT_INTERVALS, CurvesLut};
+pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
 
 /// The crate's own name, kept from the skeleton so CI's crate-name check
 /// still has something to check.

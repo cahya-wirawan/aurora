@@ -26,7 +26,36 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.158.0): PSD Curves layers open as real Curves
+**Latest (2026-10-09, 0.159.0): Curves layers composite on the GPU.** A
+root-level Curves adjustment layer is now its own GPU pass
+(`aurora_render::TileCompositor::composite_curves_with_opacity`,
+`shaders/curves.wgsl`, compiled appended to `composite.wgsl` as a second
+module so the blend-math entry-point roster is unchanged) instead of
+forcing the whole document onto the CPU. It reads the ping-pong
+accumulator, un-premultiplies, maps through the tables (an `f32`
+read-only storage buffer of 65,556 floats, `CurvesLut::packed_for_gpu`:
+the CPU tables bit for bit, linear interpolation with `fma`, the `[0, 1]`
+and input-range clamps, identity tables passed through exactly), blends
+with the layer's own mode and opacity over the opaque backdrop and writes
+back at the backdrop's alpha — `apply_adjustment_layer`, step for step,
+rounding to `f16` where the CPU stores. Admitted: `Normal` plus the 18
+modes with GPU blend math (`aurora_render::curves_mode_code`); masked
+Curves, `Dissolve`, `Exclusion` and the six non-separable modes stay on
+the CPU, and groups still force the CPU. The LUT is uploaded once per
+parameter set (LRU of 8, about 2 MiB) and re-uploaded when an edit
+changes the parameters. Measured on the RTX 3090: worst |GPU − CPU|
+4.9e-4 opaque (within the existing `2·f16::EPSILON` differential) and
+1.95e-3 translucent (within a bound derived per mode and curve, 6.25–8.25
+`f16` steps, about ×2 margin — review I1); `curves_rgb.psd` stays on the CPU (its four Curves
+layers carry enabled masks, the common PSD case), so its pinned numbers
+are unchanged. 4096², 3 pixel
++ 1 Curves, 256 tiles, dev profile: the Curves step costs ~1.45 s on the
+CPU path and is within noise on the GPU path (~3.5 s either way, all of
+it the existing per-tile resolve/upload). **Needs a human: Metal/DX12
+unverified; open a Curves document on macOS and compare.** Details:
+"Next action", addendum 0.159.0.
+
+**Previously (2026-10-09, 0.158.0): PSD Curves layers open as real Curves
 layers.** A PSD/PSB `curv` block is parsed (`aurora_io::psd`'s
 `parse_curv`, following psd-tools 1.17.4: map flag, version 1 or 4,
 channel bitmap or count, `(output, input)` pairs on `0..=255`, and the
@@ -30834,6 +30863,214 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-09 (0.159.0) — Curves on the GPU path.** Files:
+`aurora-filters` `curves.rs`/`lib.rs` (`CurvesLut::packed_for_gpu`,
+`CURVES_PACKED_HEADER`, `CURVES_PACKED_LEN`; 1 test); `aurora-render`
+`composite.rs` (`CURVES_SHADER` = `composite.wgsl` + `curves.wgsl` as its
+own module; `CURVES_GPU_LUT_INTERVALS`/`_LEN`/`_CACHE_LEN`,
+`curves_mode_code`, lazily built `CurvesGpu` — layout, pipeline, LRU LUT
+cache — `TileCompositor::composite_curves_with_opacity`,
+`curves_lut_uploads`, `curves_lut_cache_len`), new
+`shaders/curves.wgsl` (`fs_composite_curves`, `curves_lookup`,
+`curves_apply`, `curves_blend`, `curves_f16`), `lib.rs` re-exports;
+`aurora-app` `lib.rs` (`curves_layer_qualifies_for_gpu`, the predicate's
+new arm, `begin_gpu_composite_tile`'s adjustment branch now dispatching
+`begin_gpu_curves_pass` instead of refusing every adjustment,
+`GPU_CURVES_DISPATCHES` / `note_gpu_curves_dispatch` /
+`take_gpu_curves_dispatch_count`; tests).
+
+- **AC-1.** A root Curves layer is one GPU pass reading the accumulator
+  as backdrop and writing the spare, then swapping (the blend-math
+  ping-pong). Formula is `apply_adjustment_layer`'s:
+  `Cb = f16(clamp(straight_backdrop(bd), ±65504))`, `Cs = f16(f(Cb))`
+  (per-channel table then composite table), `mixed = f16(lerp(Cb,
+  B(Cb, Cs), opacity))`, out `(mixed·a_b, a_b)`. Identity under `Normal`
+  records no pass (exact passthrough, as on the CPU); a Curves layer with
+  nothing folded below it records none either (the CPU's result there is
+  transparent too). **Modes admitted: `Normal` + the 18 with GPU blend math**
+  (Multiply, Darken, Lighten, Screen, Difference, LinearDodge, LinearBurn,
+  ColorBurn, ColorDodge, Overlay, HardLight, LinearLight, VividLight,
+  HardMix, PinLight, SoftLight, Subtract, Divide) via one `switch` reusing
+  `composite.wgsl`'s helpers. **CPU-only:** `Exclusion`, the six
+  non-separable modes, `Dissolve` (its gate is computed on the CPU over a
+  pixel layer's uploaded texels; a Curves layer uploads none), any Curves
+  with an **enabled mask** (pixel-layer masks are also applied on the CPU
+  before upload, and a Curves layer has no texels to carry one; a
+  disabled mask is admitted), and anything inside a group.
+  **Tolerance:** the existing differential's `2·f16::EPSILON` (1.95e-3):
+  the remaining sources are WGSL's 2.5-ULP division in
+  `straight_backdrop` (a translucent `Cb` can move one `f16` step, times
+  the curve's slope), `pack2x16float`'s implementation-defined rounding,
+  and the shared premultiply/un-premultiply. Measured worst: 4.9e-4 on
+  opaque backdrops (every curve shape, every mode except VividLight
+  9.8e-4), 1.46e-3–1.95e-3 on the translucent fixture (the Overlay case
+  sits exactly at the bound, 1.953125e-3 — disclosed, not loosened).
+  The steep-low fixture (the one place interpolation is observable —
+  every `f16` value at or above `2^-4` lies exactly on a LUT sample) is
+  held to one `f16` step and measured at one.
+- **AC-2.** `document_qualifies_for_gpu_compositing` admits a root
+  visible Curves layer through `curves_layer_qualifies_for_gpu`; groups
+  still refuse; `begin_gpu_composite_tile` keeps the local refusal for any
+  other visible adjustment. Refusal tests: predicate (Dissolve, Exclusion,
+  each non-separable mode, enabled mask, group; hidden and disabled-mask
+  admitted) and a GPU test that `begin_gpu_composite_tile` returns `None`
+  with zero Curves passes for mask/Dissolve/Exclusion/Luminosity.
+  `GPU_CURVES_DISPATCHES` is a separate counter (not a `GpuBlendDispatch`
+  variant, so `gpu_blend_dispatch_count_matches_the_render_crates_blend_math_pass_count`
+  is untouched); every differential asserts the exact pass count.
+- **AC-3.** The LUT is an `f32` read-only storage buffer (262,224 B), no
+  `f16` or 8-bit narrowing. Limits checked by test: `Limits::default()`
+  (what `aurora-gpu` requests) and `downlevel_defaults()` both give
+  128 MiB `max_storage_buffer_binding_size` and ≥4 storage buffers per
+  stage; the RTX 3090 device reports 128 MiB / 8. (A 1-D texture of 16,385
+  texels would exceed the 8,192 default 2-D width, hence the buffer.)
+  Cached in the `TileCompositor` keyed by the exact `CurvesParams`, LRU of
+  8: four tiles upload once, an unchanged frame uploads nothing, an edit
+  uploads once, reverting reuses the resident set, 11 distinct sets leave
+  8 resident; one set across 19 modes is one upload.
+- **AC-4.** New tests (all GPU ones run with `AURORA_REQUIRE_GPU=1` on the
+  RTX 3090 / Vulkan / DiscreteGpu): shapes and opacities (S, inversion,
+  per-channel, channel-then-composite, moved endpoints, 35 %, 60 %), steep
+  interpolation, all 19 modes, translucent backdrop with a transparent
+  band (alpha bit-identical, no pixels created), above/between/below plus
+  two Curves layers, LUT cache, predicate refusals, local fallback,
+  limits, and `curves_rgb.psd`'s path. **`curves_rgb.psd` stays on the
+  CPU**: its four root Curves layers all carry enabled masks (7 roots, 2
+  root groups), so `curves_rgb_psd_composites_like_photoshops_merged_image`
+  and its pinned numbers are the CPU path's, unchanged. Three 0.155.0
+  tests were rewritten (two replaced: the predicate test and the
+  "falls back for a Curves layer" test now cover the refusals; the
+  with/without test now expects the GPU path and a pass).
+- **AC-5, measured** (`measure_curves_composite_cpu_against_gpu_on_a_4096_document`,
+  `#[ignore]`d, dev profile: workspace opt-level 1, deps 3; 256 tiles, 5
+  passes each, RTX 3090, idle machine):
+
+  | 4096², 3 pixel layers | CPU path ms/pass | GPU path ms/pass |
+  |---|---|---|
+  | Curves hidden | 3,182–3,385 | 3,409–3,527 |
+  | + 1 visible Curves | 4,717–4,808 | 3,444–3,550 |
+
+  The Curves step costs ~1.45 s (~5.7 ms/tile) on the CPU and is within
+  noise on the GPU. Both paths' remaining ~3.4 s is the existing per-tile
+  `resolve_tile` + upload (the GPU path re-resolves and uploads three
+  layers per tile), not Curves — honest context, not a win claim. Not
+  measured in release.
+
+Mutation matrix — every row really run (`AURORA_REQUIRE_GPU=1 cargo test -p
+aurora-app --lib curves`), each file backed up to the scratchpad, restored,
+`touch`ed and sha256-verified afterwards:
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 1 | LUT read without interpolation (`low` only) | killed | `gpu_curves_interpolates_between_lut_samples_like_the_cpu` |
+| 2 | input-range clamp removed | killed | `..._across_curve_shapes_and_opacities` |
+| 3 | composite table before channel table | killed | shapes; every-mode |
+| 4 | written back at alpha 1, not premultiplied | killed | `gpu_curves_keeps_a_translucent_backdrops_alpha_and_matches_the_cpu` |
+| 5 | opacity ignored | killed | translucent; positions; shapes; every-mode |
+| 6 | blend mode ignored (always Normal) | killed | translucent; every-mode |
+| 7 | predicate admits an enabled mask | killed | predicate refusals; local fallback; `curves_rgb_psd_reports_which_compositing_path_it_takes` |
+| 8 | LUT cache never invalidated | killed | LUT cache; positions (two Curves layers) |
+| 9 | dispatch counter not incremented | killed | 7 GPU tests |
+| 10 | `cb`/`cs` transposed into the blend | killed | 7 GPU tests |
+| 11 | identity-table passthrough ignored | killed | 7 GPU tests |
+| 12 | predicate admits Dissolve | killed | predicate refusals; local fallback |
+| 13 | mode code ColorBurn → ColorDodge | killed | every-mode |
+| 14 | the three `f16` roundings removed | **survived** | — |
+| 15 | refuse instead of skipping when nothing is below | killed | positions ("below") |
+
+14 of 15 killed. #14 survives: at `2·f16::EPSILON` the `f16` emulation is
+not load-bearing on this adapter; it is kept as cheap alignment with the
+CPU's storage grid, but no test proves it.
+
+Disclosures: Metal/DX12 unverified (WGSL `pack2x16float` rounding, `fma`
+fusion and the `!(x >= 0)` NaN test are implementation-defined or
+optimisable there); the translucent Overlay case measures exactly at the
+tolerance bound; masked/Dissolve Curves are CPU-only and would need a
+coverage-texture upload; the f16 emulation is untested (#14); the
+measurement is dev-profile only and shows the GPU path's per-tile CPU
+resolve/upload, not Curves, dominating. Tests: 2,988 + 11 new − 2
+replaced = **2,997, measured** by the full gate (below), plus 3 added in
+the review revision = **3,000, measured**: the full gate re-run on the
+revised tree passed every step (`AURORA_REQUIRE_GPU=1`: 3,000 passed,
+0 failed, 56 ignored, 0 skipped; clippy, strict rustdoc, `cargo deny`,
+contrast check clean). Judge round 2: **PASS 0.915** — the I1 derivation
+checked (chain rule, Lipschitz constants, dropping `1/a_b`); its nits
+applied: CLAUDE.md now states the translucent bound, and the test's
+subnormal remark now says it relies on the fixture's `a_b >= 0.1`.
+Recorded, not changed: a redundant `±65504` clamp before `curves_f16`
+(which clamps again), and the tie test matching entry-point calls
+anywhere in the shader rather than inside each mode's own function.
+
+**Review revision (0.159.0).** The candidate's full gate passed
+(`AURORA_REQUIRE_GPU=1`, RTX 3090: 2,997 passed, 0 failed, 56 ignored,
+0 skipped; clippy, strict rustdoc, deny and contrast clean); the judge
+returned REVISE 0.89 with the GPU path judged correct against the CPU.
+Outcomes:
+- **I1 (blocking), fixed.** The translucent Overlay case measured exactly
+  at the borrowed `2·f16::EPSILON` and passed only on `<=`. The
+  translucent test now uses a bound derived next to it
+  (`translucent_tolerance`): `F16_STEP·(w_cb + w_cs + 4)`, with
+  `F16_STEP = 2^-11`, `w_cb = (1−a) + a(L_b + L_s·S)`, `w_cs = a·L_s`,
+  `S` the curve's measured slope ×1.25, and `L_b`/`L_s` the mode's
+  Lipschitz constants. It covers one `f16` step each for `Cb`, `Cs`
+  and the mix, plus three for the premultiplied store and the
+  straighten. There is no `1/a_b` term: `f16` is floating point, so
+  dividing a stored error by `a_b` keeps it relative, except in
+  subnormals, where it is below 1e-6. Bounds 6.25 / 7.4 / 8.25 steps
+  against measured 3 / 3 / 4: a ×2 margin on the worst case. Opaque
+  fixtures keep `2·f16::EPSILON` (measured 1 step, VividLight 2).
+- **I2, done the preferred way.** Each of the 18 blend-math entry points'
+  blend terms is now a named helper `blend_<mode>(cb, cs)` in
+  `composite.wgsl`. The entry point calls it with `s.rgb`, and the Curves
+  switch calls it with `cs`, so there is one copy of every formula. The 252
+  pre-existing `aurora-render` tests stay green. New
+  `curves_switch_matches_curves_mode_code_and_all_blend_passes` ties
+  `curves_mode_code`, the switch arms (code → helper) and
+  `ALL_BLEND_PASSES` together.
+- **I3, fixed.** `curves_f16` clamps to ±65504 before `pack2x16float`
+  (indeterminate past the `f16` range). No fixture reaches it, so its
+  mutation survives (disclosed below).
+- **I6, fixed.** `packed_for_gpu` returns an empty `Vec` for a malformed
+  table (was: present-flagged zeros, blacking the channel out), which
+  `ensure_lut` refuses, so the tile composites on the CPU. Tests:
+  `packed_for_gpu_is_empty_for_a_malformed_table`,
+  `composite_curves_refuses_a_malformed_table_set_without_uploading`.
+- **I5, recorded as a follow-on** (below).
+
+Revision mutations, really run on the RTX 3090 (`AURORA_REQUIRE_GPU=1`),
+files restored, `touch`ed and sha256-verified. Rows 16–21 test the
+revision itself; 4, 5, 6 and 10 were re-run against the new derived
+bound:
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| 4 | written back at alpha 1 | killed | translucent (derived bound) |
+| 5 | opacity ignored | killed | translucent; positions; shapes; every-mode |
+| 6 | blend mode ignored | killed | translucent; every-mode |
+| 10 | `cb`/`cs` transposed | killed | 7 GPU tests |
+| 16 | a Curves arm re-inlined (`cb * cs` for Multiply) | killed | `curves_switch_matches_curves_mode_code_and_all_blend_passes` |
+| 17 | Overlay's code calls the HardLight helper | killed | tie test; translucent; every-mode |
+| 18 | `blend_overlay` branches on `cs` (one shared copy broken) | killed | 7 `composite_overlay_*` render tests **and** 2 Curves tests: one fix, both paths |
+| 19 | `curves_f16`'s ±65504 clamp removed (I3) | **survived** | — no fixture reaches the `f16` range limit |
+| 20 | malformed table packs as present zeros | killed | `packed_for_gpu_is_empty_for_a_malformed_table` |
+| 21 | `ensure_lut` accepts a wrong length | killed | `composite_curves_refuses_a_malformed_table_set_without_uploading` |
+
+9 of 10 killed. Row 19 is a guard that WGSL's specification requires
+and this adapter does not exercise. It is disclosed, not tested.
+
+**Follow-on (I5, not done):** the Curves pass creates a uniform buffer and
+a bind group per tile (cacheable per opacity/mode and per accumulator
+pair); `composite.wgsl` is compiled a second time inside the Curves module
+(once per compositor, lazily — a shared module or WGSL `override`s would
+avoid it); and the LUT cache holds 8 parameter sets, so a document with
+more than 8 distinct visible Curves layers re-uploads 256 KiB per layer
+per tile (thrashing) — size the cache from the document's own Curves
+count or key it per frame.
+
+**Needs a human: Metal/DX12 unverified; open a Curves document on macOS
+and compare.** **Suggested next: the workspace rounds, starting with the
+left tools panel plus options bar (design owner's queue).**
 
 **Addendum 2026-10-09 (0.158.0) — PSD Curves (`curv`) import.** Files:
 `aurora-core` `tone_curve.rs` (movable endpoints: `validate` now only
