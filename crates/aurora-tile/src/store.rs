@@ -563,17 +563,17 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
 
-    if let Ok(existing) = std::fs::symlink_metadata(dir) {
-        if !existing.is_dir() {
-            return Err(Error::new(
-                ErrorKind::NotADirectory,
-                format!(
-                    "refusing to use {} as a scratch directory: it already exists and is not a \
-                     directory",
-                    dir.display()
-                ),
-            ));
-        }
+    if let Ok(existing) = std::fs::symlink_metadata(dir)
+        && !existing.is_dir()
+    {
+        return Err(Error::new(
+            ErrorKind::NotADirectory,
+            format!(
+                "refusing to use {} as a scratch directory: it already exists and is not a \
+                 directory",
+                dir.display()
+            ),
+        ));
     }
 
     std::fs::create_dir_all(dir)
