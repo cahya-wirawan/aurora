@@ -88,6 +88,61 @@ apps other than Photoshop."); (4) a document becomes clean only after a
 lossless save or one whose only items were carried from open — after a
 "Save Anyway" with changes it stays dirty and keeps its path.
 
+**Previously (2026-10-10, 0.175.1): macOS CI fix — tests that pressed literal
+`Ctrl` chords against the now per-platform shortcut table (patch).** GitHub
+Actions' macOS test job failed on 0.175.0 at
+`document_tabs_tests::a_palette_document_entry_closes_the_palette_before_the_switch`
+("the palette opened", `document_tabs_tests.rs:1099`), and stopped there.
+Cause: 0.175.0 made `default_shortcuts()` call
+`default_shortcuts_for(PRIMARY_IS_META)`, so on macOS Close, Undo, Redo, New
+Layer and the palette bind `Cmd`, but a set of tests still pressed literal
+`Ctrl` chords (`Modifiers { control: true, .. }`, `KeyChord::parse("Ctrl+…")`)
+against that default registry. They pass on Linux and Windows, where the
+primary modifier is `Ctrl`, so the Linux-only local gate could not see it.
+**Reproduced on Linux** by temporarily setting `const PRIMARY_IS_META: bool =
+true` and running `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app -p aurora-ui
+--no-fail-fast`: 11 of 885 `aurora-app` tests failed (`aurora-ui`'s 206 all
+passed) — `document_tabs_tests::a_palette_document_entry_closes_the_palette_before_the_switch`,
+`tests::ctrl_shift_p_still_opens_the_palette_with_the_field_focused`,
+`tests::default_shortcuts_binds_ctrl_z_and_ctrl_shift_z_to_undo_and_redo`,
+`tests::default_shortcuts_binds_tab_shift_tab_and_toggle_palette`,
+`tests::handle_key_reports_ctrl_shift_z_as_redo_instead_of_running_it_when_the_palette_is_closed`,
+`tests::handle_key_reports_ctrl_z_as_undo_instead_of_running_it_when_the_palette_is_closed`,
+`tests::layer_commands::ctrl_shift_n_in_a_focused_text_field_falls_through_to_new_layer`,
+`tests::layer_commands::ctrl_shift_n_is_handed_back_as_an_activated_command`,
+`tests::layer_commands::ctrl_shift_n_resolves_to_new_layer_and_delete_layer_has_no_binding`,
+`tests::undo_in_a_focused_field_with_empty_history_never_undoes_the_document`,
+and `tests::the_paste_chord_is_cmd_on_macos_and_ctrl_elsewhere`. The last is
+an artifact of the simulation, not a macOS failure: it deliberately pins
+`PRIMARY_IS_META` to `cfg!(target_os = "macos")`, so flipping only the const
+is exactly the inversion it exists to catch. On real macOS both are `true`.
+So the real macOS failure set is the other ten. **Fix (tests only, no product
+change):** `aurora-app`'s test module gained `with_primary(Modifiers)` and
+`primary_chord("Shift+P")`, which build the platform's primary-modifier chord
+from `PRIMARY_IS_META` (`primary()` now delegates to `with_primary`), and
+every test that means "the primary shortcut" uses them. Tests about one table
+in particular (`the_shortcut_table_uses_cmd_on_macos_and_ctrl_elsewhere`, on
+`default_shortcuts_for(true/false)`) keep literal chords, and the `Ctrl+Tab`
+tests stay literal `Ctrl`, as the binding does on every platform. The
+Delete-Layer no-binding check now also covers `Cmd+Delete`/`Cmd+Backspace`.
+**Verified:** with the const and the paste test's `cfg!` both temporarily
+`true` (a faithful macOS simulation), all 885 `aurora-app` and 206
+`aurora-ui` tests pass; with both reverted (confirmed by `git diff`), the same
+counts pass, plus `aurora-widgets`. `cargo clippy --target x86_64-apple-darwin
+--workspace --all-targets -- -D warnings` (with a stub `LCMS2_LIB_DIR`) is
+clean. The same check for `x86_64-pc-windows-gnu` found one pre-existing,
+Windows-only `clippy::collapsible_if` in `aurora-tile`'s `#[cfg(not(unix))]`
+`create_private_dir`. CI runs clippy on Linux only, so it never failed CI. It
+is collapsed into a let-chain, with the same behaviour, and the Windows
+workspace clippy is now clean too. Stale doc comments that said the registry
+binds literal `Ctrl` on every platform were corrected (`PRIMARY_IS_META`,
+`TextFieldChord::from_key`). **Not changed, disclosed:** the macOS menu's
+Undo/Redo/New Layer items still carry no accelerator hint, and their comments
+(`lib.rs` module docs and `build_menu`) still justify that by the literal-`Ctrl`
+binding 0.175.0 removed. Showing `⌘Z`/`⇧⌘N` hints is a product follow-up. It
+is not part of this test fix. A green Linux simulation is not a macOS run.
+The fix is confirmed only when macOS CI runs green.
+
 **Previously (2026-10-10, 0.175.0): document-tabs polish — macOS Quit
 through the quit review, Cmd chords, a "×" on every document tab, and
 the autosave follow-ups (document tabs, round R6 of six).** **macOS
