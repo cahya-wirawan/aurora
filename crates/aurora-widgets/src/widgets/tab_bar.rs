@@ -267,6 +267,10 @@ pub struct TabBarState {
     pub label: String,
     disabled: bool,
     labels: Vec<String>,
+    /// Each tab's accessible description (0.174.0), by position; empty or
+    /// missing means none. Kept across [`set_tab_labels`], so a caller
+    /// that changes both sets the labels first.
+    descriptions: Vec<String>,
     /// Always `< labels.len()` — a tab bar has exactly one selected tab.
     selected: usize,
     /// One `Tab` child per label, in order.
@@ -280,6 +284,7 @@ impl TabBarState {
             label,
             disabled: false,
             labels,
+            descriptions: Vec::new(),
             selected,
             tabs: Vec::new(),
             metrics,
@@ -289,6 +294,13 @@ impl TabBarState {
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         self.disabled
+    }
+
+    /// Every tab's accessible description by position (0.174.0); empty
+    /// means none.
+    #[must_use]
+    pub fn descriptions(&self) -> &[String] {
+        &self.descriptions
     }
 
     /// Every tab's label, in order.
@@ -435,9 +447,19 @@ fn bar_node(state: &TabBarState) -> Node {
 /// are set explicitly: `accesskit_consumer` 0.38 computes neither from
 /// the tree (`src/node.rs:626-634` only reads what the node declares), so
 /// a screen reader's "tab 2 of 4" is only announced if the node says so.
-fn tab_node(label: &str, index: usize, len: usize, selected: bool, disabled: bool) -> Node {
+fn tab_node(
+    label: &str,
+    description: &str,
+    index: usize,
+    len: usize,
+    selected: bool,
+    disabled: bool,
+) -> Node {
     let mut node = Node::new(Role::Tab);
     node.set_label(label.to_owned());
+    if !description.is_empty() {
+        node.set_description(description.to_owned());
+    }
     node.set_position_in_set(index.saturating_add(1));
     node.set_size_of_set(len);
     // Present on every tab, true or false -- see this module's doc.
@@ -592,6 +614,28 @@ pub fn select_tab(
     with_tab_bar_mut(tree, bar, |state| state.apply_select(bar, index))
 }
 
+/// Sets each tab's accessible description by position (0.174.0; empty
+/// means none) and rewrites the tabs whose node changed. `Ok(false)` when
+/// the descriptions were already these, with nothing touched.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] if `bar` is not a tab bar.
+pub fn set_tab_descriptions(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    descriptions: Vec<String>,
+) -> Result<bool, WidgetError> {
+    if state(tree, bar)?.descriptions == descriptions {
+        return Ok(false);
+    }
+    if let Some(WidgetKind::TabBar(current)) = tree.payload_mut(bar) {
+        current.descriptions = descriptions;
+    }
+    reconcile(tree, bar)?;
+    Ok(true)
+}
+
 /// Replaces the bar's tab labels and selection in place (0.173.0, the
 /// document tab strip): the tabs that stay keep their widget ids — a
 /// grown list appends tabs, a shrunk one removes only the tail — so
@@ -647,7 +691,7 @@ pub fn set_tab_labels(
             tabs.push(tree.insert(
                 bar,
                 style.clone(),
-                tab_node("", index, len, false, disabled),
+                tab_node("", "", index, len, false, disabled),
                 WidgetKind::Tab(TabState {
                     label: String::new(),
                     selected: false,
@@ -787,7 +831,8 @@ fn reconcile(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), Wid
                 Some(WidgetKind::Tab(t))
                     if t.selected == selected && t.disabled == current.disabled && t.label == label
             );
-            let expected = tab_node(label, index, len, selected, current.disabled);
+            let description = current.descriptions.get(index).map_or("", String::as_str);
+            let expected = tab_node(label, description, index, len, selected, current.disabled);
             let node_ok = tree.accessibility(tab) == Some(&expected);
             (!(payload_ok && node_ok)).then_some((tab, index, expected))
         })
@@ -823,14 +868,16 @@ fn rebuild_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), 
     let selected = current.selected;
     let disabled = current.disabled;
     let style = tab_style(current.metrics);
+    let descriptions = current.descriptions.clone();
     let len = labels.len();
     let mut tabs = Vec::with_capacity(len);
     for (index, label) in labels.into_iter().enumerate() {
         let on = index == selected;
+        let description = descriptions.get(index).map_or("", String::as_str);
         tabs.push(tree.insert(
             bar,
             style.clone(),
-            tab_node(&label, index, len, on, disabled),
+            tab_node(&label, description, index, len, on, disabled),
             WidgetKind::Tab(TabState {
                 label,
                 selected: on,

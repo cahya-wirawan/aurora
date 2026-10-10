@@ -1960,6 +1960,37 @@ impl TileStore {
         }
     }
 
+    /// Retires this store for good (0.174.0, a closed document): waits
+    /// for its background writer to finish every write already submitted
+    /// (so no write can re-create a file after it is removed), then
+    /// removes every scratch file this store's own instance token
+    /// names. Other stores sharing the directory are untouched — their
+    /// files carry another instance token, and a token contains no `_`,
+    /// so `"<token>_"` can never be a prefix of another store's names.
+    /// Returns how many files were removed; a file that fails to go is
+    /// left for the session's own scratch-directory cleanup.
+    #[must_use = "the count says whether any scratch file was removed"]
+    pub fn discard(mut self) -> usize {
+        self.writer.flush();
+        drop(self.writer.drain_results());
+        let prefix = format!("{}_", self.instance);
+        let Ok(entries) = std::fs::read_dir(&self.scratch_dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(&prefix)
+                        && std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext == "tile")
+                })
+            })
+            .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+            .count()
+    }
+
     /// Where `(surface, id)`'s scratch file lives.
     ///
     /// [`Self::instance`] leads the name deliberately: `SurfaceId`
@@ -1980,6 +2011,61 @@ impl TileStore {
 
 #[cfg(test)]
 mod tests {
+    /// 0.174.0: `discard` joins the writer, then removes exactly this
+    /// store's scratch files — another store in the same directory keeps
+    /// its own.
+    #[test]
+    fn discard_removes_only_this_stores_scratch_files() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero")
+        };
+        let new_store = || match TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut closing, mut kept) = (new_store(), new_store());
+        let surface = crate::tile::SurfaceId::from_raw(0);
+        for store in [&mut closing, &mut kept] {
+            for x in 0..3 {
+                if let Err(err) = store.get_mut(surface, crate::tile::TileId { x, y: 0 }) {
+                    unreachable!("{err:?}");
+                }
+            }
+            if let Err(err) = store.flush() {
+                unreachable!("{err:?}");
+            }
+        }
+        let count = |dir: &std::path::Path| {
+            std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tile"))
+                    .count()
+            })
+        };
+        let before = count(dir.path());
+        let kept_files = before / 2;
+        assert!(kept_files >= 1, "both stores paged tiles out: {before}");
+        let removed = closing.discard();
+        assert_eq!(
+            removed,
+            before - kept_files,
+            "only the closing store's files"
+        );
+        assert_eq!(
+            count(dir.path()),
+            kept_files,
+            "the other store's files stay"
+        );
+        for x in 0..3 {
+            assert!(kept.get(surface, crate::tile::TileId { x, y: 0 }).is_ok());
+        }
+    }
+
     use std::sync::Arc;
 
     use super::TileStore;

@@ -332,13 +332,18 @@ pub(crate) const COMMAND_FILE_NEW: &str = "file.new";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentCommand {
     New,
-    Cycle { forward: bool },
+    /// Close Document (0.174.0): the active one.
+    Close,
+    Cycle {
+        forward: bool,
+    },
     Activate(u64),
 }
 
 pub(crate) fn document_command_for(id: &str) -> Option<DocumentCommand> {
     match id {
         COMMAND_FILE_NEW => Some(DocumentCommand::New),
+        crate::document_close::COMMAND_FILE_CLOSE => Some(DocumentCommand::Close),
         COMMAND_DOCUMENT_NEXT => Some(DocumentCommand::Cycle { forward: true }),
         COMMAND_DOCUMENT_PREVIOUS => Some(DocumentCommand::Cycle { forward: false }),
         _ => id
@@ -438,12 +443,13 @@ pub(crate) fn tab_labels(shelf: &DocumentShelf, active: &DocumentSession) -> (Ve
     let labels = order
         .into_iter()
         .map(|id| {
+            // 0.174.0: "• name" while unsaved.
             if id == active.id {
-                active.name.clone()
+                crate::document_close::marked_label(&active.name, active.is_dirty())
             } else {
-                shelf
-                    .get(id)
-                    .map_or_else(String::new, |session| session.name.clone())
+                shelf.get(id).map_or_else(String::new, |session| {
+                    crate::document_close::marked_label(&session.name, session.is_dirty())
+                })
             }
         })
         .collect();
@@ -477,6 +483,12 @@ pub(crate) fn sync_document_tab_bar(
         return false;
     }
     shelf.strip_selection = Some(selected);
+    let descriptions = crate::document_close::tab_descriptions(shelf, active);
+    if let Err(err) =
+        aurora_ui::set_document_tab_descriptions(&mut workspace.tree, bar, descriptions)
+    {
+        tracing::warn!(?err, "failed to describe the document tabs' unsaved state");
+    }
     focus.validate(&workspace.tree);
     if on_bar
         && let Ok(state) = aurora_widgets::widgets::tab_bar_state(&workspace.tree, bar)

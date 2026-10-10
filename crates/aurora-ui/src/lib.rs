@@ -65,7 +65,8 @@ pub use dock::{
 };
 pub use document_tabs::{
     DOCUMENT_TABS_LABEL, INITIAL_DOCUMENT_TAB, document_tab_selected, insert_document_tabs,
-    is_document_strip_tab, is_document_tab, link_document_panel, sync_document_tabs,
+    is_document_strip_tab, is_document_tab, link_document_panel, set_document_tab_descriptions,
+    sync_document_tabs,
 };
 pub use gallery_panel::{
     GALLERY_CURVE_CAPTION, GalleryPanel, apply_gallery_outcome, gallery_close_popovers,

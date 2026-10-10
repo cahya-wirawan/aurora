@@ -1750,3 +1750,524 @@ fn the_strip_follower_ignores_a_selection_no_sync_wrote() {
     assert_eq!(rig.doc.id, a_id);
     assert_eq!(rig.shelf.strip_selection, Some(0));
 }
+
+// -- 0.174.0 (R5): unsaved state, Close Document and the quit review --
+
+use crate::document_close::{
+    self as close, CloseChoice, CloseEffect, CloseStep, QuitEffect, QuitReview, QuitStep,
+};
+
+/// One recorded step on the active document (what any edit does to its
+/// `UndoOrder`).
+fn edit(doc: &mut DocumentSession) {
+    doc.undo_order.record_labelled(
+        crate::UndoKind::Pixel,
+        "Brush Stroke".to_owned(),
+        &mut doc.history,
+        &mut doc.pixel_history,
+    );
+}
+
+fn descriptions(rig: &Rig) -> Vec<String> {
+    match aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, rig.workspace.document_tabs) {
+        Ok(state) => state.descriptions().to_vec(),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn refresh(rig: &mut Rig) -> bool {
+    close::refresh_dirty_marks(&mut rig.workspace, &mut rig.focus, &mut rig.shelf, &rig.doc)
+}
+
+/// AC-1: an open is clean, an edit makes it dirty, a landed `.aur` save
+/// makes it clean, undo past the save makes it dirty again — and so does
+/// undoing and redoing back *to* it (the chosen, conservative rule: a
+/// revision is never reused) — and an export or a failed save never
+/// clears it. A recovered document is unsaved from the start.
+#[test]
+fn dirty_tracking_follows_open_edit_save_undo_and_export() {
+    let dir = tempdir();
+    let (mut doc, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    assert!(!doc.is_dirty(), "an open (or New) is clean");
+    edit(&mut doc);
+    assert!(doc.is_dirty(), "an edit is unsaved");
+    assert!(!close::after_save(
+        &mut doc,
+        std::path::Path::new("/x/out.png"),
+        true
+    ));
+    assert!(doc.is_dirty(), "an export does not clear it");
+    assert!(!close::after_save(
+        &mut doc,
+        std::path::Path::new("/x/out.aur"),
+        false
+    ));
+    assert!(doc.is_dirty(), "a failed save does not clear it");
+    assert!(close::after_save(
+        &mut doc,
+        std::path::Path::new("/x/out.aur"),
+        true
+    ));
+    assert!(!doc.is_dirty(), "a landed .aur save is clean");
+    assert_eq!(
+        doc.path.as_deref(),
+        Some(std::path::Path::new("/x/out.aur"))
+    );
+    assert_eq!(doc.name, "out.aur");
+    doc.undo_order.step_back();
+    assert!(
+        doc.is_dirty(),
+        "undo past the save is unsaved, never falsely clean"
+    );
+    doc.undo_order.step_forward();
+    assert!(
+        doc.is_dirty(),
+        "redo back to the saved state stays unsaved (conservative)"
+    );
+    let (mut recovered, _) = session("Recovered 2", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    recovered.saved_revision = None;
+    assert!(recovered.is_dirty(), "recovered work is in no file");
+}
+
+/// AC-2: the tab shows "• name" and the AT description "unsaved" while
+/// unsaved, and the strip is relabelled only when that changes.
+#[test]
+fn tab_marks_follow_the_dirty_state_and_relabel_only_on_change() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let _ = rig.open(b);
+    assert!(!refresh(&mut rig), "in sync after the open");
+    assert_eq!(strip(&rig).0, tab_names(&["a", "b"]));
+    edit(&mut rig.doc);
+    assert!(refresh(&mut rig), "relabelled on the change");
+    assert_eq!(strip(&rig).0, tab_names(&["a", "\u{2022} b"]));
+    assert_eq!(descriptions(&rig), tab_names(&["", "unsaved"]));
+    let Some(&b_tab) = strip(&rig).2.get(1) else {
+        unreachable!("two tabs")
+    };
+    assert_eq!(
+        rig.workspace
+            .tree
+            .accessibility(b_tab)
+            .and_then(|node| node.description()),
+        Some("unsaved")
+    );
+    assert!(!refresh(&mut rig), "no relabel without a change");
+    assert!(!refresh(&mut rig));
+    rig.doc.mark_clean();
+    assert!(refresh(&mut rig));
+    assert_eq!(strip(&rig).0, tab_names(&["a", "b"]));
+    assert_eq!(descriptions(&rig), tab_names(&["", ""]));
+}
+
+/// AC-3: a clean document closes with no dialog, an unsaved one asks (a
+/// live stroke counts); Don't Save closes, Save closes only once it
+/// landed, and Cancel, a cancelled picker or a failed save keep it.
+#[test]
+fn a_clean_close_needs_no_dialog_and_an_unsaved_one_asks() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    assert_eq!(
+        close::begin_close(&mut rig.cx(None), b_id),
+        CloseStep::Close(b_id)
+    );
+    rig.start_stroke();
+    assert_eq!(
+        close::begin_close(&mut rig.cx(None), b_id),
+        CloseStep::Ask(b_id),
+        "the live stroke was committed and counts"
+    );
+    assert!(rig.drag.is_none());
+    assert_eq!(
+        close::begin_close(&mut rig.cx(None), a_id),
+        CloseStep::Close(a_id)
+    );
+    assert_eq!(
+        close::begin_close(&mut rig.cx(None), DocumentId::next()),
+        CloseStep::Unknown
+    );
+    assert_eq!(
+        close::close_effect(b_id, CloseChoice::DontSave, false),
+        CloseEffect::Close(b_id)
+    );
+    assert_eq!(
+        close::close_effect(b_id, CloseChoice::Save, true),
+        CloseEffect::Close(b_id)
+    );
+    assert_eq!(
+        close::close_effect(b_id, CloseChoice::Save, false),
+        CloseEffect::Keep,
+        "a cancelled picker or a failed save keeps the tab"
+    );
+    assert_eq!(
+        close::close_effect(b_id, CloseChoice::Cancel, true),
+        CloseEffect::Keep
+    );
+    assert_eq!(rig.shelf.len(), 2, "deciding closed nothing");
+}
+
+/// AC-4: closing activates the next tab (else the previous, else a fresh
+/// "Untitled"), focus on the strip lands on a live tab, the store's
+/// scratch files go, and the autosave file and index entry are removed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_close_activates_the_neighbour_and_removes_the_store_and_autosave() {
+    let (dir_a, dir_b, dir_c, autosaves) = (tempdir(), tempdir(), tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4250);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (mut b, _) = session("b", 1, [0.0, 1.0, 0.0, 1.0], &dir_b);
+    // b's store pages tiles out to its scratch directory (budget 1).
+    let Some(one) = std::num::NonZeroUsize::new(1) else {
+        unreachable!("1 is non-zero")
+    };
+    let mut paging = match aurora_tile::TileStore::new(dir_b.path().to_path_buf(), one) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    for x in 0..3 {
+        fill_solid(
+            &mut paging,
+            aurora_tile::SurfaceId::from_raw(7),
+            aurora_tile::TileId { x, y: 0 },
+            [0.5, 0.5, 0.5, 1.0],
+        );
+    }
+    if let Err(err) = paging.flush() {
+        unreachable!("{err:?}");
+    }
+    drop(b.tile_store.replace(paging));
+    let tile_files = || {
+        std::fs::read_dir(dir_b.path()).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tile"))
+                .count()
+        })
+    };
+    let paged = tile_files();
+    assert!(paged >= 1, "b has scratch files before the close: {paged}");
+    let (c, _) = session("c", 1, [0.0, 0.0, 1.0, 1.0], &dir_c);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = worker.configure_index(autosave_files::IndexBook::new(
+        namespace.index_path(),
+        document_tabs::index_entries(&rig.shelf, &rig.doc, namespace.key),
+        Some(a_id.get()),
+        [],
+    ));
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    let _ = rig.open(c);
+    let c_id = rig.doc.id;
+    assert_eq!(rig.switch(b_id), SwitchOutcome::Switched);
+    let _ = document_tabs::sync_autosave_sessions(&mut worker, &rig.shelf, &rig.doc, namespace.key);
+    let b_path = namespace.session_path(b_id.get());
+    {
+        let doc = &mut rig.doc;
+        let Some(store) = doc.tile_store.as_mut() else {
+            unreachable!("a store")
+        };
+        crate::request_autosave(
+            &mut worker,
+            &b_path,
+            doc.id.get(),
+            &doc.layers,
+            &doc.history,
+            doc.canvas_size,
+            &mut doc.skipped_tiles,
+            store,
+        );
+    }
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(b_path.exists(), "b is autosaved before the close");
+    assert!(
+        worker
+            .index_listing()
+            .is_some_and(|index| index.entries.iter().any(|entry| entry.id == b_id.get()))
+    );
+    // Focus on b's tab (the selected one) when it closes.
+    let Some(&b_tab) = strip(&rig).2.get(1) else {
+        unreachable!("three tabs")
+    };
+    if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, b_tab) {
+        unreachable!("{err:?}");
+    }
+    let Some(closed) = close::close_document(&mut rig.cx(None), b_id, None) else {
+        unreachable!("b closes")
+    };
+    assert_eq!(closed.id, b_id);
+    assert_eq!(rig.doc.id, c_id, "the next tab becomes active");
+    assert_eq!(strip(&rig).0, tab_names(&["a", "c"]));
+    assert_eq!(strip(&rig).1, 1);
+    let focused = rig.focus.focused();
+    assert!(
+        focused.is_some_and(|id| strip(&rig).2.contains(&id) && rig.workspace.tree.contains(id)),
+        "focus is on a live tab, not the closed one: {focused:?}"
+    );
+    assert_eq!(focused, strip(&rig).2.get(1).copied(), "the selected tab");
+    let removed = close::retire_session(closed, Some(&mut worker));
+    assert!(removed >= paged, "{removed} of {paged}");
+    assert_eq!(tile_files(), 0, "the store's scratch files are gone");
+    let _ = document_tabs::sync_autosave_sessions(&mut worker, &rig.shelf, &rig.doc, namespace.key);
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(!b_path.exists(), "b's autosave file is removed");
+    assert!(
+        worker
+            .index_listing()
+            .is_some_and(|index| index.entries.iter().all(|entry| entry.id != b_id.get())),
+        "and its index entry"
+    );
+    // The last tab: the previous one becomes active.
+    let Some(closed) = close::close_document(&mut rig.cx(None), c_id, None) else {
+        unreachable!("c closes")
+    };
+    drop(closed);
+    assert_eq!(rig.doc.id, a_id, "the previous tab when there is no next");
+    // The last document: refused without a replacement, else Untitled.
+    assert!(close::close_document(&mut rig.cx(None), a_id, None).is_none());
+    assert_eq!(rig.doc.id, a_id, "nothing changed");
+    let (mut untitled, _) = session("x", 1, [0.0, 0.0, 0.0, 0.0], &dir_c);
+    crate::document_session::UNTITLED.clone_into(&mut untitled.name);
+    let untitled_id = untitled.id;
+    assert!(close::close_document(&mut rig.cx(None), a_id, Some(untitled)).is_some());
+    assert_eq!(rig.doc.id, untitled_id);
+    assert_eq!(strip(&rig).0, tab_names(&["Untitled"]));
+    assert!(!rig.doc.is_dirty());
+}
+
+/// AC-6 (F9): a close for a parked document closes that one, never the
+/// active one, and a dialog's result names its own id.
+#[test]
+fn a_close_applies_to_its_own_document_not_the_active_one() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    // The dialog was for a; b became active meanwhile.
+    let effect = crate::dialog_effect(&crate::DialogResult {
+        purpose: crate::DialogPurpose::CloseDocument(a_id),
+        action: close::CLOSE_DONT_SAVE.to_owned(),
+    });
+    assert_eq!(
+        effect,
+        crate::DialogEffect::Close(a_id, CloseChoice::DontSave)
+    );
+    let Some(closed) = close::close_document(&mut rig.cx(None), a_id, None) else {
+        unreachable!("a closes")
+    };
+    assert_eq!(closed.id, a_id);
+    assert_eq!(rig.doc.id, b_id, "the active document is untouched");
+    assert_eq!(strip(&rig).0, tab_names(&["b"]));
+    assert_eq!(rig.shelf.active_position, 0);
+    let quit = crate::dialog_effect(&crate::DialogResult {
+        purpose: crate::DialogPurpose::QuitReview(a_id),
+        action: close::CLOSE_SAVE.to_owned(),
+    });
+    assert_eq!(quit, crate::DialogEffect::Quit(a_id, CloseChoice::Save));
+}
+
+/// AC-5: the quit review asks about each unsaved document in tab order;
+/// Don't Save and a landed Save move on, Cancel or a failed save abort
+/// (keeping everything, and never running the cleanup), and with nothing
+/// unsaved the quit is immediate.
+#[test]
+fn the_quit_review_goes_through_unsaved_documents_and_cancel_keeps_everything() {
+    let (dir_a, dir_b, dir_c) = (tempdir(), tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 1.0, 0.0, 1.0], &dir_b);
+    let (c, _) = session("c", 1, [0.0, 0.0, 1.0, 1.0], &dir_c);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    assert_eq!(
+        QuitReview::start(close::unsaved_in_tab_order(&rig.shelf, &rig.doc)).1,
+        QuitStep::Quit
+    );
+    assert_eq!(
+        close::quit_effect(QuitStep::Quit),
+        QuitEffect::CleanupAndExit
+    );
+    edit(&mut rig.doc);
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    let _ = rig.open(c);
+    let c_id = rig.doc.id;
+    edit(&mut rig.doc);
+    let unsaved = close::unsaved_in_tab_order(&rig.shelf, &rig.doc);
+    assert_eq!(unsaved, vec![a_id, c_id], "tab order, clean b skipped");
+    let (review, first) = QuitReview::start(unsaved.clone());
+    let Some(mut review) = review else {
+        unreachable!("a review")
+    };
+    assert_eq!(first, QuitStep::Ask(a_id));
+    assert_eq!(
+        review.answer(c_id, CloseChoice::DontSave, false),
+        QuitStep::Abort,
+        "out of turn"
+    );
+    let (Some(mut review2), _) = QuitReview::start(unsaved.clone()) else {
+        unreachable!()
+    };
+    assert_eq!(
+        review2.answer(a_id, CloseChoice::DontSave, false),
+        QuitStep::Ask(c_id)
+    );
+    assert_eq!(
+        review2.answer(c_id, CloseChoice::Save, true),
+        QuitStep::Quit
+    );
+    assert_eq!(
+        review.answer(a_id, CloseChoice::Save, false),
+        QuitStep::Abort,
+        "a failed save"
+    );
+    let (Some(mut review3), _) = QuitReview::start(unsaved) else {
+        unreachable!()
+    };
+    assert_eq!(
+        review3.answer(a_id, CloseChoice::Save, true),
+        QuitStep::Ask(c_id)
+    );
+    assert_eq!(
+        review3.answer(c_id, CloseChoice::Cancel, false),
+        QuitStep::Abort
+    );
+    assert_eq!(
+        close::quit_effect(QuitStep::Abort),
+        QuitEffect::KeepRunning,
+        "no cleanup"
+    );
+    assert_eq!(
+        close::quit_effect(QuitStep::Ask(c_id)),
+        QuitEffect::AskAbout(c_id)
+    );
+    // The review is a value: Cancel touched no document.
+    assert_eq!(rig.shelf.len(), 3);
+    assert!(rig.doc.is_dirty() && rig.parked(a_id).is_dirty() && !rig.parked(b_id).is_dirty());
+}
+
+/// Review Q-1: only an unconfirmed exit with something unsaved keeps the
+/// recovery data; a confirmed quit (Don't Save included — the documents
+/// stay dirty in memory, so the flag comes from the review) or nothing
+/// unsaved cleans up. The final autosave writes each unsaved session, and
+/// only those, and the index lists it.
+#[test]
+fn an_unconfirmed_exit_keeps_unsaved_work_and_writes_its_last_autosave() {
+    let (dir_a, dir_b, autosaves) = (tempdir(), tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4252);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = worker.configure_index(autosave_files::IndexBook::new(
+        namespace.index_path(),
+        document_tabs::index_entries(&rig.shelf, &rig.doc, namespace.key),
+        Some(a_id.get()),
+        [],
+    ));
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    let _ = document_tabs::sync_autosave_sessions(&mut worker, &rig.shelf, &rig.doc, namespace.key);
+    assert!(!close::keeps_unsaved_work(
+        false,
+        &close::unsaved_in_tab_order(&rig.shelf, &rig.doc)
+    ));
+    edit(&mut rig.doc);
+    let unsaved = close::unsaved_in_tab_order(&rig.shelf, &rig.doc);
+    assert_eq!(unsaved, vec![b_id]);
+    assert!(
+        close::keeps_unsaved_work(false, &unsaved),
+        "unconfirmed: kept"
+    );
+    assert!(
+        !close::keeps_unsaved_work(true, &unsaved),
+        "confirmed: cleaned"
+    );
+    // Don't Save, then the review ends: confirmed though still dirty.
+    let (Some(mut review), _) = QuitReview::start(unsaved.clone()) else {
+        unreachable!("a review")
+    };
+    assert_eq!(
+        close::quit_effect(review.answer(b_id, CloseChoice::DontSave, false)),
+        QuitEffect::CleanupAndExit
+    );
+    assert!(rig.doc.is_dirty());
+    let written =
+        close::final_autosave_unsaved(&mut worker, &namespace, &mut rig.shelf, &mut rig.doc);
+    assert_eq!(written, 1, "only the unsaved one");
+    assert!(namespace.session_path(b_id.get()).exists());
+    assert!(
+        !namespace.session_path(a_id.get()).exists(),
+        "clean a is not written"
+    );
+    assert!(
+        worker
+            .index_listing()
+            .is_some_and(|index| index.entries.iter().any(|entry| entry.id == b_id.get())),
+        "the index lists the final autosave"
+    );
+}
+
+/// Review Q-2 and Q-3: a dialog Save onto a non-`.aur` name is an export
+/// that is reported; a window close that waited for a dialog starts the
+/// review once no dialog is open and no review runs.
+#[test]
+fn a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes() {
+    assert_eq!(
+        close::dialog_save_kind(std::path::Path::new("/x/a.aur")),
+        close::DialogSave::Aur
+    );
+    assert_eq!(
+        close::dialog_save_kind(std::path::Path::new("/x/a.png")),
+        close::DialogSave::ExportOnly
+    );
+    let dir = tempdir();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let mut dialog = None;
+    assert!(close::open_exported_not_saved_dialog(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut dialog,
+        &rig.scales,
+        "a",
+    ));
+    assert_eq!(
+        dialog.as_ref().map(|open| open.purpose.clone()),
+        Some(crate::DialogPurpose::ExportedNotSaved)
+    );
+    assert_eq!(
+        crate::dialog_effect(&crate::DialogResult {
+            purpose: crate::DialogPurpose::ExportedNotSaved,
+            action: close::EXPORTED_NOT_SAVED_DISMISS.to_owned(),
+        }),
+        crate::DialogEffect::Acknowledged
+    );
+    assert_eq!(
+        close::exported_not_saved_title("a"),
+        "\u{201c}a\u{201d} Was Exported, Not Saved"
+    );
+    assert!(close::pending_quit_ready(true, false, false));
+    assert!(!close::pending_quit_ready(false, false, false));
+    assert!(
+        !close::pending_quit_ready(true, true, false),
+        "still waits for the dialog"
+    );
+    assert!(
+        !close::pending_quit_ready(true, false, true),
+        "a review already runs"
+    );
+}

@@ -542,6 +542,7 @@ use winit::window::{Window, WindowId};
 mod autosave_files;
 mod background_autosave;
 mod background_open;
+mod document_close;
 mod document_session;
 mod document_tabs;
 #[cfg(test)]
@@ -2748,6 +2749,8 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             },
         );
         session.name = format!("Recovered {}", number + 2);
+        // 0.174.0: recovered work is in no file the user chose.
+        session.saved_revision = None;
         shelf.parked.push(session);
     }
     shelf
@@ -3570,6 +3573,14 @@ enum DialogPurpose {
     /// "Replace Workspace “name”?" (0.169.0): the user saved a workspace
     /// under a taken name.
     ReplaceWorkspace(String),
+    /// "Save changes to “name” before closing?" (0.174.0), for this
+    /// document — by id, never "the active one" (F9).
+    CloseDocument(document_session::DocumentId),
+    /// "Save changes to “name” before quitting?" (0.174.0): one step of
+    /// the quit review, for this document.
+    QuitReview(document_session::DocumentId),
+    /// "“name” Was Exported, Not Saved" (0.174.0 review Q-2).
+    ExportedNotSaved,
 }
 
 /// The open modal dialog (0.169.0): its widgets, what it was opened for,
@@ -3607,6 +3618,10 @@ enum DialogEffect {
     Acknowledged,
     /// Run this workspace command (the Replace Workspace dialog).
     Workspace(workspace_presets::WorkspaceCommand),
+    /// Answer the close dialog for this document (0.174.0).
+    Close(document_session::DocumentId, document_close::CloseChoice),
+    /// Answer the quit review's dialog for this document (0.174.0).
+    Quit(document_session::DocumentId, document_close::CloseChoice),
     /// The action id is not one this purpose's dialog has — logged,
     /// nothing done.
     Unknown,
@@ -3632,12 +3647,23 @@ fn dialog_effect(result: &DialogResult) -> DialogEffect {
             DialogEffect::Acknowledged
         }
         DialogPurpose::MoveRefused if action == MOVE_REFUSED_DISMISS => DialogEffect::Acknowledged,
+        DialogPurpose::ExportedNotSaved if action == document_close::EXPORTED_NOT_SAVED_DISMISS => {
+            DialogEffect::Acknowledged
+        }
         DialogPurpose::ReplaceWorkspace(name) => {
             match workspace_presets::replace_workspace_choice(name, action) {
                 Some(command) => DialogEffect::Workspace(command),
                 None => DialogEffect::Unknown,
             }
         }
+        DialogPurpose::CloseDocument(id) => document_close::close_choice(action)
+            .map_or(DialogEffect::Unknown, |choice| {
+                DialogEffect::Close(*id, choice)
+            }),
+        DialogPurpose::QuitReview(id) => document_close::close_choice(action)
+            .map_or(DialogEffect::Unknown, |choice| {
+                DialogEffect::Quit(*id, choice)
+            }),
         _ => DialogEffect::Unknown,
     }
 }
@@ -5126,6 +5152,9 @@ enum AppCommand {
     /// Next/Previous Document (0.172.0), `Ctrl+Tab`/`Ctrl+Shift+Tab`.
     NextDocument,
     PreviousDocument,
+    /// Close Document (0.174.0), `Ctrl+W` — literally `Ctrl`, even on
+    /// macOS, for the same reason as Undo (no per-platform rebinding).
+    CloseDocument,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -5157,6 +5186,8 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         // never collide with plain `Tab`/`Shift+Tab` focus traversal.
         ("Ctrl+Tab", AppCommand::NextDocument),
         ("Ctrl+Shift+Tab", AppCommand::PreviousDocument),
+        // 0.174.0: the universal close-document chord.
+        ("Ctrl+W", AppCommand::CloseDocument),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
         // users already carry in muscle memory. Every tool here does
@@ -5503,6 +5534,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
         CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
         CommandEntry::new(document_tabs::COMMAND_FILE_NEW, "New Document"),
+        CommandEntry::new(document_close::COMMAND_FILE_CLOSE, "Close Document"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(document_tabs::COMMAND_DOCUMENT_NEXT, "Next Document"),
         CommandEntry::new(
@@ -8392,6 +8424,8 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_FILE_OPEN, "Open File…", true, None),
             &muda::MenuItem::with_id(COMMAND_FILE_SAVE, "Save As…", true, None),
+            // 0.174.0: routed like the palette's Close Document.
+            &muda::MenuItem::with_id(document_close::COMMAND_FILE_CLOSE, "Close", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -9089,7 +9123,9 @@ fn run_command(
         AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
         // Handed back as `ActivatedCommand::Document` by `handle_key`, so
         // never run here; nothing in this document changes either way.
-        AppCommand::NextDocument | AppCommand::PreviousDocument => CompositeInvalidation::None,
+        AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument => {
+            CompositeInvalidation::None
+        }
     }
 }
 
@@ -9608,6 +9644,11 @@ fn handle_key(
         }
         if command == AppCommand::DeleteLayer {
             return Some(ActivatedCommand::DeleteLayer);
+        }
+        if command == AppCommand::CloseDocument {
+            return Some(ActivatedCommand::Document(
+                document_tabs::DocumentCommand::Close,
+            ));
         }
         if let AppCommand::NextDocument | AppCommand::PreviousDocument = command {
             return Some(ActivatedCommand::Document(
@@ -20076,6 +20117,16 @@ fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
         aborted_startup_cleanup(state);
         return;
     }
+    // 0.174.0 review Q-1: an unconfirmed exit with unsaved documents
+    // keeps their recovery data, as a crash would, so the next start
+    // offers it; the layout is still saved (the run came up).
+    if state.keeps_unsaved_work() {
+        remove_session_scratch(state);
+        if let Some((path, workspace)) = state.workspace_layout() {
+            save_workspace_layout(path, workspace);
+        }
+        return;
+    }
     clean_shutdown_cleanup(state);
     if let Some((path, workspace)) = state.workspace_layout() {
         save_workspace_layout(path, workspace);
@@ -20128,6 +20179,13 @@ trait ShutdownState {
     /// finishing normally — `true` means the marker and the autosave
     /// must survive it (see [`aborted_startup_cleanup`]).
     fn aborted(&self) -> bool;
+    /// Whether this exit must keep the recovery data of unsaved documents
+    /// (0.174.0 review Q-1, [`document_close::keeps_unsaved_work`]): the
+    /// marker, the index and every session autosave stay, and only the
+    /// scratch tiles go. `false` by default (test doubles).
+    fn keeps_unsaved_work(&self) -> bool {
+        false
+    }
     /// Where to persist the dock layout, and the workspace to read it
     /// out of — `None` when the OS couldn't report a config directory
     /// ([`layout_path`]).
@@ -20990,6 +21048,7 @@ fn canvas_local_origin(view: &aurora_ui::CanvasView, layer_origin: (f32, f32)) -
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
+#[allow(clippy::struct_excessive_bools)] // independent flags (0.174.0 added `exit_requested`)
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -21095,6 +21154,17 @@ struct App {
     shelf: DocumentShelf,
     /// The tile store the pending background open installs into (0.172.0).
     pending_open: document_tabs::PendingOpenStores,
+    /// The quit review in progress (0.174.0), if any.
+    quit_review: Option<document_close::QuitReview>,
+    /// The quit review finished: `about_to_wait` runs the clean-quit
+    /// cleanup and exits (0.174.0).
+    exit_requested: bool,
+    /// The quit review reached its end (review Q-1): only then does a
+    /// shutdown with unsaved documents clean up their recovery data.
+    quit_confirmed: bool,
+    /// A window close arrived while another dialog was open (review Q-3):
+    /// the quit review starts once it closes.
+    quit_pending: bool,
     /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
     /// Eyedropper tool samples a real pixel and changes it
     /// ([`Self::sample_eyedropper`]). No colour-picker UI exists yet to
@@ -21314,6 +21384,13 @@ impl ShutdownState for App {
 
     fn aborted(&self) -> bool {
         self.failed
+    }
+
+    fn keeps_unsaved_work(&self) -> bool {
+        document_close::keeps_unsaved_work(
+            self.quit_confirmed,
+            &document_close::unsaved_in_tab_order(&self.shelf, &self.doc),
+        )
     }
 
     fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)> {
@@ -21562,20 +21639,31 @@ impl App {
             tool: aurora_ui::Tool::default(),
             // `with_id`, not `new` (0.172.0 fix): the startup autosave and
             // the index already name `document_id`.
-            doc: DocumentSession::with_id(
-                document_id,
-                DocumentContents {
-                    layers,
-                    history,
-                    canvas_size,
-                    skipped_tiles,
-                    active_layer,
-                    canvas_view,
-                    tile_store,
-                },
-            ),
+            doc: {
+                let mut doc = DocumentSession::with_id(
+                    document_id,
+                    DocumentContents {
+                        layers,
+                        history,
+                        canvas_size,
+                        skipped_tiles,
+                        active_layer,
+                        canvas_view,
+                        tile_store,
+                    },
+                );
+                // 0.174.0: a recovered document is unsaved from the start.
+                if was_recovered {
+                    doc.saved_revision = None;
+                }
+                doc
+            },
             shelf: recovered_shelf(extra_sessions),
             pending_open: document_tabs::PendingOpenStores::default(),
+            quit_review: None,
+            exit_requested: false,
+            quit_confirmed: false,
+            quit_pending: false,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
             scroll_follow: ScrollFollow::default(),
@@ -21837,7 +21925,9 @@ impl App {
         );
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
-            Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
+            Some(ActivatedCommand::SaveFile(path)) => {
+                let _saved = self.save_file(&path);
+            }
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
@@ -22201,9 +22291,214 @@ impl App {
         self.after_document_change();
     }
 
+    /// Close Document (0.174.0): a clean document closes at once, an
+    /// unsaved one asks first ([`document_close::begin_close`]).
+    fn request_close_document(&mut self, id: document_session::DocumentId) {
+        if self.dialog.is_some() || self.quit_review.is_some() {
+            return;
+        }
+        let step = {
+            let mut cx = self.switch_context();
+            document_close::begin_close(&mut cx, id)
+        };
+        match step {
+            document_close::CloseStep::Close(id) => self.finish_close(id),
+            document_close::CloseStep::Ask(id) => {
+                let _ = self.open_close_dialog(id, false);
+            }
+            document_close::CloseStep::Unknown => {}
+        }
+    }
+
+    /// Opens the close or quit dialog for `id` and lays it out.
+    fn open_close_dialog(&mut self, id: document_session::DocumentId, quitting: bool) -> bool {
+        let name = if id == self.doc.id {
+            self.doc.name.clone()
+        } else {
+            self.shelf
+                .get(id)
+                .map_or_else(String::new, |session| session.name.clone())
+        };
+        let opened = document_close::open_close_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &self.scales,
+            id,
+            &name,
+            quitting,
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
+    }
+
+    /// A fresh "Untitled" document the active one's size, in its own
+    /// store — what closing the last document leaves (0.174.0).
+    fn fresh_untitled_session(&self) -> DocumentSession {
+        let canvas_size = self.doc.canvas_size;
+        let (layers, mut history, _layer) = document_from_size("Layer 1", canvas_size);
+        history.clear_undo();
+        let active_layer = topmost_pixel_layer(&layers);
+        let canvas_view = load_document_view(
+            &self.doc.canvas_view,
+            &layers,
+            active_layer,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
+            self.scale_factor,
+        );
+        DocumentSession::new(DocumentContents {
+            layers,
+            history,
+            canvas_size,
+            skipped_tiles: aurora_io::SkippedTiles::new(),
+            active_layer,
+            canvas_view,
+            tile_store: open_tile_store(),
+        })
+    }
+
+    /// Closes `id` for good (0.174.0): the neighbour (or a fresh
+    /// "Untitled") becomes active, then the closed session is retired and
+    /// the autosave index rewritten without it, which deletes its file.
+    fn finish_close(&mut self, id: document_session::DocumentId) {
+        let last = self.shelf.parked.is_empty() && id == self.doc.id;
+        let replacement = last.then(|| self.fresh_untitled_session());
+        let closed = {
+            let mut cx = self.switch_context();
+            cx.blocked = false;
+            document_close::close_document(&mut cx, id, replacement)
+        };
+        let Some(closed) = closed else {
+            tracing::warn!(?id, "no open document to close");
+            return;
+        };
+        let removed = document_close::retire_session(closed, Some(&mut self.autosave_worker));
+        tracing::info!(?id, removed, "closed a document");
+        self.after_document_change();
+    }
+
+    /// Saves `id` for a close or quit (0.174.0): it is made active first
+    /// (F9 — the dialog's own document, never whichever is active), then
+    /// the native picker asks where. `true` only when a `.aur` save landed
+    /// and the document is clean; a cancelled picker, a failed save (its
+    /// "Couldn't Save File" dialog is shown) or an export are `false`.
+    fn save_document_for_close(&mut self, id: document_session::DocumentId) -> bool {
+        if id != self.doc.id {
+            self.activate_document(id.get());
+        }
+        if id != self.doc.id {
+            return false;
+        }
+        let Some(path) = self.file_dialog.save_file() else {
+            return false;
+        };
+        if document_close::dialog_save_kind(&path) == document_close::DialogSave::ExportOnly {
+            // Review Q-2: the export the user asked for, then said.
+            self.export_file(&path);
+            let name = self.doc.name.clone();
+            let opened = document_close::open_exported_not_saved_dialog(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.dialog,
+                &self.scales,
+                &name,
+            );
+            if !opened {
+                tracing::info!(path = %path.display(), "exported, not saved; a dialog was already open");
+            }
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+            self.push_accessibility();
+            return false;
+        }
+        self.save_file(&path) && !self.doc.is_dirty()
+    }
+
+    /// The close dialog's answer for `id` (0.174.0).
+    fn answer_close(
+        &mut self,
+        id: document_session::DocumentId,
+        choice: document_close::CloseChoice,
+    ) {
+        let saved = choice == document_close::CloseChoice::Save && self.save_document_for_close(id);
+        match document_close::close_effect(id, choice, saved) {
+            document_close::CloseEffect::Close(id) => self.finish_close(id),
+            document_close::CloseEffect::Keep => {}
+        }
+    }
+
+    /// A window close request (0.174.0): `true` to quit now (nothing
+    /// unsaved); otherwise the quit review starts, or — another dialog
+    /// being open, or a review already running — the request is refused.
+    fn request_quit(&mut self) -> bool {
+        if self.quit_review.is_some() {
+            return false;
+        }
+        {
+            let mut cx = self.switch_context();
+            let _ = document_tabs::commit_live_gestures(&mut cx);
+        }
+        let unsaved = document_close::unsaved_in_tab_order(&self.shelf, &self.doc);
+        if !unsaved.is_empty() && self.dialog.is_some() {
+            // Review Q-3: remembered, and started once the dialog closes.
+            tracing::info!("a quit with unsaved documents waits for the open dialog to close");
+            self.quit_pending = true;
+            return false;
+        }
+        let (review, step) = document_close::QuitReview::start(unsaved);
+        self.quit_review = review;
+        self.run_quit_step(step);
+        false
+    }
+
+    fn run_quit_step(&mut self, step: document_close::QuitStep) {
+        match document_close::quit_effect(step) {
+            document_close::QuitEffect::AskAbout(id) => {
+                if id != self.doc.id {
+                    self.activate_document(id.get());
+                }
+                if id != self.doc.id || !self.open_close_dialog(id, true) {
+                    tracing::warn!(?id, "the quit review could not ask; the quit is cancelled");
+                    self.quit_review = None;
+                }
+            }
+            document_close::QuitEffect::CleanupAndExit => {
+                self.quit_review = None;
+                self.quit_confirmed = true;
+                self.exit_requested = true;
+            }
+            document_close::QuitEffect::KeepRunning => self.quit_review = None,
+        }
+    }
+
+    /// The quit review's dialog answer for `id` (0.174.0).
+    fn answer_quit(
+        &mut self,
+        id: document_session::DocumentId,
+        choice: document_close::CloseChoice,
+    ) {
+        if self.quit_review.is_none() {
+            return;
+        }
+        let saved = choice == document_close::CloseChoice::Save && self.save_document_for_close(id);
+        let step = match self.quit_review.as_mut() {
+            Some(review) => review.answer(id, choice, saved),
+            None => document_close::QuitStep::Abort,
+        };
+        self.run_quit_step(step);
+    }
+
     fn run_document_command(&mut self, command: document_tabs::DocumentCommand) {
         match command {
             document_tabs::DocumentCommand::New => self.new_document(),
+            document_tabs::DocumentCommand::Close => self.request_close_document(self.doc.id),
             document_tabs::DocumentCommand::Cycle { forward } => self.cycle_document(forward),
             document_tabs::DocumentCommand::Activate(raw) => self.activate_document(raw),
         }
@@ -22385,6 +22680,7 @@ impl App {
             tile_store: store,
         });
         session.name = display_file_name(&path);
+        session.path = Some(path.clone());
         let parked_at = {
             let mut cx = self.switch_context();
             document_tabs::activate_new_document(&mut cx, session)
@@ -22394,7 +22690,11 @@ impl App {
             DecodedFile::Psd(document) => self.open_psd_file(&path, document),
             DecodedFile::Aur(bytes) => self.open_aur_file(&path, &bytes),
         };
-        if !installed {
+        if installed {
+            // 0.174.0: an open matches its file once installed, whatever
+            // the install recorded on the way.
+            self.doc.mark_clean();
+        } else {
             // Nothing was installed: the new session goes, and the previous
             // one comes back exactly as it was parked.
             drop(self.shelf.revert_push(&mut self.doc, parked_at));
@@ -23161,11 +23461,19 @@ impl App {
     /// [`run_dialog_action`]), the same split this crate already draws
     /// everywhere else between pure logic and the one platform-bound
     /// call site that feeds it.
-    fn save_file(&mut self, path: &Path) {
+    /// Returns whether a `.aur` save landed (0.174.0) — an export never
+    /// counts, since it does not make the document saved.
+    fn save_file(&mut self, path: &Path) -> bool {
         if is_aur_path(path) {
-            self.save_aur_file(path);
-            return;
+            return self.save_aur_file(path);
         }
+        self.export_file(path);
+        false
+    }
+
+    /// The export half of [`Self::save_file`] (PNG/JPEG/TIFF): never
+    /// changes the document's unsaved state or path.
+    fn export_file(&mut self, path: &Path) {
         let Some(store) = self.doc.tile_store.as_mut() else {
             tracing::error!(path = %path.display(), "refusing to export: no live tile store");
             self.report_save_failure(path, &SaveFailure::NoTileStorage);
@@ -23249,15 +23557,15 @@ impl App {
     /// brush/eraser edits still saves a journal that omits them — a
     /// real, named gap, not the previous "always completely empty" one.
     /// A silent no-op if there's no live tile store.
-    fn save_aur_file(&mut self, path: &Path) {
+    fn save_aur_file(&mut self, path: &Path) -> bool {
         let Some(store) = self.doc.tile_store.as_mut() else {
-            return;
+            return false;
         };
 
         let Some(file_name) = path.file_name() else {
             tracing::warn!(path = %path.display(), "save path has no file name");
             self.report_save_failure(path, &SaveFailure::Write);
-            return;
+            return false;
         };
         let mut temp_name = file_name.to_os_string();
         temp_name.push(".tmp");
@@ -23285,23 +23593,27 @@ impl App {
             tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
             let _ = std::fs::remove_file(&temp_path);
             self.report_save_failure(path, &SaveFailure::Write);
-            return;
+            return false;
         }
 
         if !verify_aur(&temp_path) {
             tracing::warn!(path = %temp_path.display(), "exported .aur file failed to verify by reading it back");
             let _ = std::fs::remove_file(&temp_path);
             self.report_save_failure(path, &SaveFailure::Write);
-            return;
+            return false;
         }
 
         if let Err(err) = std::fs::rename(&temp_path, path) {
             tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
             let _ = std::fs::remove_file(&temp_path);
             self.report_save_failure(path, &SaveFailure::Write);
-            return;
+            return false;
         }
         tracing::info!(path = %path.display(), "exported the document as .aur");
+        // 0.174.0: the document now matches this file.
+        let saved = document_close::after_save(&mut self.doc, path, true);
+        self.after_document_change();
+        saved
     }
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
@@ -24063,7 +24375,9 @@ impl App {
         );
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
-            Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
+            Some(ActivatedCommand::SaveFile(path)) => {
+                let _saved = self.save_file(&path);
+            }
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
@@ -24161,6 +24475,30 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // Review Q-1: an exit the quit review never confirmed (macOS menu
+        // Quit, an OS session end) with unsaved documents writes their
+        // last autosave now, before anything is stopped, and the cleanup
+        // below then keeps the recovery data (`keeps_unsaved_work`).
+        if !self.quit_confirmed && !self.failed {
+            {
+                let mut cx = self.switch_context();
+                let _ = document_tabs::commit_live_gestures(&mut cx);
+            }
+            if !document_close::unsaved_in_tab_order(&self.shelf, &self.doc).is_empty() {
+                let written = document_close::final_autosave_unsaved(
+                    &mut self.autosave_worker,
+                    &self.autosave,
+                    &mut self.shelf,
+                    &mut self.doc,
+                );
+                if written > 0 {
+                    tracing::info!(
+                        written,
+                        "an unconfirmed exit kept the unsaved documents recoverable"
+                    );
+                }
+            }
+        }
         // A decode still running is abandoned, never waited on for long
         // (0.151.0): joined if it finishes within the bound, detached
         // otherwise. A second call (both exit paths run this) finds
@@ -24408,9 +24746,19 @@ impl App {
         match dialog_effect(result) {
             DialogEffect::Acknowledged => {}
             DialogEffect::Workspace(command) => self.run_workspace_command(command),
+            DialogEffect::Close(id, choice) => self.answer_close(id, choice),
+            DialogEffect::Quit(id, choice) => self.answer_quit(id, choice),
             DialogEffect::Unknown => {
                 tracing::warn!(?result, "a dialog result with no handler");
             }
+        }
+        if document_close::pending_quit_ready(
+            self.quit_pending,
+            self.dialog.is_some(),
+            self.quit_review.is_some(),
+        ) {
+            self.quit_pending = false;
+            let _ = self.request_quit();
         }
     }
 
@@ -25528,6 +25876,10 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         match event {
+            WindowEvent::CloseRequested if !self.request_quit() => {
+                // 0.174.0: the quit review is asking about an unsaved
+                // document; it exits through `about_to_wait` once done.
+            }
             WindowEvent::CloseRequested => {
                 // A clean shutdown -- see `App::finish_shutdown` for
                 // what it undoes and why it is one method. `exiting`
@@ -25626,6 +25978,28 @@ impl ApplicationHandler<AppEvent> for App {
     // `next_control_flow`. Setting it only sometimes would leave a stale
     // `WaitUntil` in the past behind, which is a busy loop.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // 0.174.0: the quit review ended with nothing left unsaved.
+        if self.exit_requested {
+            self.exit_requested = false;
+            self.finish_shutdown();
+            el.exit();
+            return;
+        }
+        // 0.174.0: unsaved marks follow every change, relabelled only
+        // when one differs.
+        if document_close::refresh_dirty_marks(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.shelf,
+            &self.doc,
+        ) {
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
         // muda's own events arrive on a plain channel, not through this
         // crate's `accesskit_winit::Event` user-event type (the two
         // don't share one enum -- restructuring the accessibility
@@ -28695,6 +29069,86 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// 0.174.0 AC-3: the close dialog's Save (Enter, the default),
+        /// Don't Save and Cancel (also Escape) are the same typed result by
+        /// key, pointer and AT `Click`, each naming its own document.
+        #[test]
+        fn the_close_dialog_choices_are_the_same_by_key_pointer_and_at() {
+            use crate::document_close::{CLOSE_CANCEL, CLOSE_DONT_SAVE, CLOSE_SAVE, CloseChoice};
+            let id = crate::document_session::DocumentId::next();
+            let open = || {
+                let mut state = AtState::new(
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                    aurora_doc::LayerTree::new(),
+                    None,
+                );
+                state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                assert!(crate::document_close::open_close_dialog(
+                    &mut state.workspace,
+                    &mut state.focus,
+                    &mut state.dialog,
+                    &state.scales,
+                    id,
+                    "a.aur",
+                    false,
+                ));
+                state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                state
+            };
+            let close_result = |action: &str| DialogResult {
+                purpose: DialogPurpose::CloseDocument(id),
+                action: action.to_owned(),
+            };
+            for (action, choice) in [
+                (CLOSE_SAVE, CloseChoice::Save),
+                (CLOSE_DONT_SAVE, CloseChoice::DontSave),
+                (CLOSE_CANCEL, CloseChoice::Cancel),
+            ] {
+                let mut by_key = open();
+                let button = dialog_button(&by_key, action);
+                if let Err(err) = by_key.focus.focus(&mut by_key.workspace.tree, button) {
+                    unreachable!("{err:?}");
+                }
+                let key = press(&mut by_key, Key::Named(NamedKey::Enter), false);
+                let mut by_pointer = open();
+                let button = dialog_button(&by_pointer, action);
+                let pointer = click_at(&mut by_pointer, button);
+                let mut by_at = open();
+                let button = dialog_button(&by_at, action);
+                let at = by_at.act(&a11y_request(button, accesskit::Action::Click));
+                assert_eq!(key, Some(ActivatedCommand::Dialog(close_result(action))));
+                assert_eq!(pointer, DialogPointer::Chosen(close_result(action)));
+                assert_eq!(at.dialog, Some(close_result(action)));
+                assert_eq!(
+                    crate::dialog_effect(&close_result(action)),
+                    DialogEffect::Close(id, choice)
+                );
+                for state in [&by_key, &by_pointer, &by_at] {
+                    assert!(state.dialog.is_none(), "{action}: closed");
+                }
+            }
+            // Enter on the initial focus is Save; Escape is Cancel.
+            let mut state = open();
+            assert_eq!(
+                state.focus.focused(),
+                Some(dialog_button(&state, CLOSE_SAVE))
+            );
+            assert_eq!(
+                press(&mut state, Key::Named(NamedKey::Enter), false),
+                Some(ActivatedCommand::Dialog(close_result(CLOSE_SAVE)))
+            );
+            let mut state = open();
+            assert_eq!(
+                press(&mut state, Key::Named(NamedKey::Escape), false),
+                Some(ActivatedCommand::Dialog(close_result(CLOSE_CANCEL)))
+            );
+            // The title names the document and the occasion.
+            assert_eq!(
+                crate::document_close::close_dialog_title("a.aur", true),
+                "Save changes to \u{201c}a.aur\u{201d} before quitting?"
+            );
         }
 
         /// AC-2: focus starts on the default (Replace); Enter on it is
@@ -35237,6 +35691,7 @@ mod tests {
             store: Some(store),
             scratch: Some(scratch.clone()),
             aborted: aborted == Aborted::Yes,
+            keeps_unsaved: false,
             layout: layout.map(|path| {
                 (
                     path,
@@ -35265,6 +35720,8 @@ mod tests {
         scratch: Option<PathBuf>,
         aborted: bool,
         layout: Option<(PathBuf, aurora_ui::Workspace)>,
+        /// 0.174.0 review Q-1: an unconfirmed exit with unsaved work.
+        keeps_unsaved: bool,
     }
 
     impl FakeShutdownState {
@@ -35303,6 +35760,10 @@ mod tests {
 
         fn aborted(&self) -> bool {
             self.aborted
+        }
+
+        fn keeps_unsaved_work(&self) -> bool {
+            self.keeps_unsaved
         }
 
         fn workspace_layout(&self) -> Option<(&std::path::Path, &aurora_ui::Workspace)> {
@@ -35548,6 +36009,7 @@ mod tests {
             scratch: None,
             aborted: false,
             layout: None,
+            keeps_unsaved: false,
         };
         clean_shutdown_cleanup(&mut state);
         assert!(!marker.exists());
@@ -56339,6 +56801,54 @@ mod tests {
                 );
                 for path in &theirs {
                     assert!(path.exists(), "another run's {} survived", path.display());
+                }
+            }
+        }
+
+        /// 0.174.0 review Q-1: an exit the quit review never confirmed,
+        /// with unsaved work, keeps the marker, the index and every session
+        /// autosave — and the next start recovers the document — while a
+        /// confirmed one (or one with nothing unsaved) cleans up as before.
+        #[test]
+        fn an_unconfirmed_exit_with_unsaved_work_keeps_it_recoverable() {
+            for keeps in [true, false] {
+                let mut fixture = shutdown_fixture(Aborted::No, None);
+                fixture.state.keeps_unsaved = keeps;
+                let dir = tempdir();
+                let pid = 4_000_191;
+                let namespace = AutosaveNamespace::acquire(dir.path().to_path_buf(), pid);
+                let file = namespace.session_path(1);
+                write_document(&file, (31, 7));
+                if let Err(err) = std::fs::write(namespace.index_path(), b"x") {
+                    unreachable!("{err}");
+                }
+                let index = namespace.index_path();
+                fixture.state.namespace = Some(namespace);
+                let marker_before = std::fs::read(&fixture.marker).unwrap_or_default();
+                crate::run_shutdown_cleanup(&mut fixture.state);
+                assert_eq!(file.exists(), keeps, "the session autosave");
+                assert_eq!(index.exists(), keeps, "the index");
+                assert!(!fixture.scratch.exists(), "scratch tiles go either way");
+                if keeps {
+                    assert_eq!(
+                        std::fs::read(&fixture.marker).ok(),
+                        Some(marker_before),
+                        "the marker is untouched"
+                    );
+                    // The run ends: its lock is released.
+                    fixture.state.namespace = None;
+                    let previous = autosave_files::read_marker(&fixture.marker).unwrap_or_default();
+                    let keys = autosave_files::recovery_keys(dir.path(), &previous);
+                    let sources: Vec<u32> =
+                        autosave_files::claim_sources(dir.path(), RunKey::from(4_000_192), &keys)
+                            .iter()
+                            .map(|source| source.key.pid)
+                            .collect();
+                    assert_eq!(sources, vec![pid]);
+                    let (startup, settled, _, _) = recover(dir.path(), 4_000_192, 1, &sources);
+                    assert!(startup.was_recovered, "the next start recovers it");
+                    assert_eq!(startup.canvas_size, (31, 7));
+                    assert!(settled.adopted);
                 }
             }
         }
