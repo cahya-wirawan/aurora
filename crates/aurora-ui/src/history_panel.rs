@@ -776,6 +776,7 @@ mod tests {
     fn history_rows_are_real_list_row_widgets_with_a_hittable_size() {
         let history = history_with(5);
         let mut ws = crate::workspace::build_workspace(&test_scales());
+        crate::workspace::show_history_tab(&mut ws);
         let scales = test_scales();
         if let Err(err) = populate_history_panel(
             &mut ws.tree,
@@ -848,6 +849,7 @@ mod tests {
     fn history_rows_stack_top_to_bottom_without_overlapping() {
         let history = history_with(6);
         let mut ws = crate::workspace::build_workspace(&test_scales());
+        crate::workspace::show_history_tab(&mut ws);
         let scales = test_scales();
         if let Err(err) = populate_history_panel(
             &mut ws.tree,
@@ -899,6 +901,7 @@ mod tests {
         for count in [1_usize, 40, 200, 400] {
             let history = history_with(count);
             let mut ws = crate::workspace::build_workspace(&test_scales());
+            crate::workspace::show_history_tab(&mut ws);
             let scales = test_scales();
             if let Err(err) = populate_history_panel(
                 &mut ws.tree,
@@ -911,9 +914,10 @@ mod tests {
             }
             ws.tree.compute_layout(1600.0, 900.0);
 
+            // 0.164.0: History is a tab under the group's tab row.
             let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
                 ws.tree.bounds(ws.layers.root),
-                ws.tree.bounds(ws.properties.root),
+                ws.tree.bounds(ws.panel_group.bar),
                 ws.tree.bounds(ws.history.root),
             ) else {
                 unreachable!("just laid out");
@@ -937,8 +941,7 @@ mod tests {
                 "no panel may be pushed off the bottom of the window: {history_bounds:?}"
             );
 
-            for (name, panel_bounds) in
-                [("layers", layers_bounds), ("properties", properties_bounds)]
+            for (name, panel_bounds) in [("layers", layers_bounds), ("tab row", properties_bounds)]
             {
                 #[allow(clippy::cast_precision_loss)]
                 let point = (
@@ -962,6 +965,7 @@ mod tests {
     fn rows_past_the_bottom_of_a_bounded_history_panel_are_clipped_until_scrolled() {
         let history = history_with(200);
         let mut ws = crate::workspace::build_workspace(&test_scales());
+        crate::workspace::show_history_tab(&mut ws);
         let scales = test_scales();
         if let Err(err) = populate_history_panel(
             &mut ws.tree,
@@ -1009,9 +1013,13 @@ mod tests {
         // title plus a 21px floor row each) is 816px; less its own 21px
         // title slot, a 795px body: 37 whole 21px rows plus an 18px part
         // of the 38th, whose centre (787.5px) is still inside.
+        // 0.164.0: History is a tab of the slot under Layers. 900px less
+        // Layers (42px) and the group's 21px tab row is 837px, and a
+        // grouped panel has no title slot of its own: an 837px body, 39
+        // whole rows plus 18px of the 40th, whose centre (829.5px) is in.
         assert_eq!(
-            reachable, 38,
-            "795px of History body divided by 21px rows -- the rows that fit really work, \
+            reachable, 40,
+            "837px of History body divided by 21px rows -- the rows that fit really work, \
              and the other 163 are clipped until scrolled"
         );
     }

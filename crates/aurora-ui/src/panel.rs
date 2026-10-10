@@ -191,7 +191,14 @@ pub fn insert_panel(
 /// heights. A hidden child (`Display::None`) or one with an `auto`
 /// minimum adds nothing (review J6).
 fn panel_floor(tree: &WidgetTree<WidgetKind>, panel: PanelHandle) -> f32 {
-    tree.children(panel.root)
+    shown_children_floor(tree, panel.root)
+}
+
+/// The sum of `id`'s *shown* children's own declared minimum heights —
+/// [`panel_floor`]'s rule for any column, shared with a panel tab group's
+/// own root (0.164.0, [`crate::panel_group`]).
+pub(crate) fn shown_children_floor(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> f32 {
+    tree.children(id)
         .unwrap_or_default()
         .iter()
         .filter_map(|&child| tree.style(child))
@@ -221,10 +228,7 @@ pub(crate) fn refresh_panel_floor(
         return Ok(());
     }
     let sizing = panel_sizing(tree, panel)?;
-    tree.set_style(
-        panel.root,
-        root_style(false, sizing, panel_floor(tree, panel)),
-    )
+    set_root_style(tree, panel, false, sizing)
 }
 
 /// How `panel` shares its column's height while expanded — read from the
@@ -272,10 +276,7 @@ pub fn set_panel_sizing(
     if tree.style(panel.viewport).is_none() {
         return Err(WidgetError::UnknownWidget(panel.viewport));
     }
-    tree.set_style(
-        panel.root,
-        root_style(collapsed, sizing, panel_floor(tree, panel)),
-    )?;
+    set_root_style(tree, panel, collapsed, sizing)?;
     let display = tree
         .style(panel.viewport)
         .map_or(Display::Flex, |style| style.display);
@@ -360,6 +361,65 @@ fn header_style(scales: &Scales) -> Style {
         },
         ..Default::default()
     }
+}
+
+/// A grouped panel's title slot (0.164.0, [`crate::panel_group`]): zero
+/// height, so the group's tab — which names the panel — is its only
+/// title. The slot is kept rather than removed because its `display` is
+/// what [`panel_is_closed`] reads, and [`set_panel_collapsed`]/
+/// [`close_panel`] go on toggling exactly that. `aurora_widgets::text`
+/// draws a title only under a `Role::Region`, and a grouped panel is a
+/// `Role::TabPanel`, so nothing is drawn into the zero-height slot either.
+pub(crate) fn grouped_header_style() -> Style {
+    Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: auto(),
+            height: Dimension::ZERO,
+        },
+        min_size: Size {
+            width: Dimension::ZERO,
+            height: Dimension::ZERO,
+        },
+        max_size: Size {
+            width: auto(),
+            height: Dimension::ZERO,
+        },
+        ..Default::default()
+    }
+}
+
+/// Sets `panel.root`'s style to [`root_style`] for `collapsed`/`sizing`
+/// and its current floor, **keeping the root's own `display`** (0.164.0):
+/// a panel tab group hides its unselected panels by their root's
+/// `display` ([`crate::panel_group`]), and a collapse, a sizing change or
+/// a floor refresh of a hidden panel must not show it again.
+fn set_root_style(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    collapsed: bool,
+    sizing: PanelSizing,
+) -> Result<(), WidgetError> {
+    let display = tree
+        .style(panel.root)
+        .ok_or(WidgetError::UnknownWidget(panel.root))?
+        .display;
+    let floor = panel_floor(tree, panel);
+    tree.set_style(
+        panel.root,
+        Style {
+            display,
+            ..root_style(collapsed, sizing, floor)
+        },
+    )?;
+    // A grouped panel's group mirrors its shown member's flex role and
+    // floor, so it follows every change made here.
+    if let Some(parent) = tree.parent(panel.root)
+        && crate::panel_group::is_group_root(tree, parent)
+    {
+        crate::panel_group::refresh_group_root(tree, parent)?;
+    }
+    Ok(())
 }
 
 /// A panel's own root style — `Column` (the body stacks under the
@@ -452,7 +512,7 @@ fn header_style(scales: &Scales) -> Style {
 /// `flex_grow: 0`), its viewport capped at [`content_panel_max_rows`]
 /// rows; a [`PanelSizing::Fill`] root keeps the zero basis and
 /// `flex_grow: 1`.
-fn root_style(collapsed: bool, sizing: PanelSizing, floor: f32) -> Style {
+pub(crate) fn root_style(collapsed: bool, sizing: PanelSizing, floor: f32) -> Style {
     if collapsed {
         return Style {
             flex_direction: taffy::FlexDirection::Column,
@@ -830,17 +890,20 @@ pub fn set_panel_collapsed(
     set_display(tree, panel.header, Display::Flex)?;
     // The root last (0.161.0 review J6): its floor counts only the
     // children shown, so it is computed once their `display` is final.
-    tree.set_style(
-        panel.root,
-        root_style(collapsed, sizing, panel_floor(tree, panel)),
-    )?;
+    set_root_style(tree, panel, collapsed, sizing)?;
 
     let node = tree
         .accessibility(panel.root)
         .ok_or(WidgetError::UnknownWidget(panel.root))?;
     let mut updated = node.clone();
     updated.set_expanded(!collapsed);
-    if collapsed {
+    if updated.role() == Role::TabPanel {
+        // A grouped panel (0.164.0 review I4): its group collapses as one,
+        // and nothing routes a member's own `Collapse`/`Expand`, so it
+        // advertises neither (`crate::panel_group`).
+        updated.remove_action(Action::Collapse);
+        updated.remove_action(Action::Expand);
+    } else if collapsed {
         updated.remove_action(Action::Collapse);
         updated.add_action(Action::Expand);
     } else {
@@ -898,7 +961,7 @@ pub fn close_panel(
 }
 
 /// Sets only `id`'s own `display`, keeping the rest of its style.
-fn set_display(
+pub(crate) fn set_display(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
     display: Display,
@@ -1383,11 +1446,41 @@ mod tests {
         ws.tree.compute_layout(1600.0, 900.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = widgets::row_height(&scales).round() as u32;
-        for (panel, title) in [
-            (ws.layers, "Layers"),
-            (ws.properties, "Properties"),
-            (ws.history, "History"),
-        ] {
+        // 0.164.0: a grouped panel (Properties, History) is a `TabPanel`
+        // whose tab names it; its title slot is still the root's first
+        // child, unlabelled, but zero height.
+        for (panel, title) in [(ws.properties, "Properties"), (ws.history, "History")] {
+            assert_eq!(
+                ws.tree.children(panel.root).and_then(<[_]>::first),
+                Some(&panel.header),
+                "{title}: the title slot is the root's first child"
+            );
+            let Some(root_node) = ws.tree.accessibility(panel.root) else {
+                unreachable!("just built");
+            };
+            assert_eq!(root_node.role(), accesskit::Role::TabPanel);
+            assert_eq!(root_node.label(), Some(title));
+            let Some(header) = ws.tree.style(panel.header) else {
+                unreachable!("just built");
+            };
+            assert_eq!(
+                header.size.height,
+                <taffy::Dimension as taffy::style_helpers::TaffyZero>::ZERO,
+                "{title}: no title row"
+            );
+        }
+        let Some(properties) = ws.tree.bounds(ws.properties.root) else {
+            unreachable!("just laid out");
+        };
+        let Some(body) = ws.tree.bounds(ws.properties.viewport) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            body.y, properties.y,
+            "the shown tab's body starts at its top"
+        );
+        {
+            let (panel, title) = (ws.layers, "Layers");
             assert_eq!(
                 ws.tree.children(panel.root).and_then(<[_]>::first),
                 Some(&panel.header),
@@ -1456,11 +1549,34 @@ mod tests {
             };
             aurora_widgets::text_runs(&ws.tree, id, bounds, bounds, None, &theme, &scales)
         };
-        for (panel, title) in [
-            (ws.layers, "Layers"),
-            (ws.properties, "Properties"),
-            (ws.history, "History"),
-        ] {
+        // 0.164.0: a grouped panel's tab draws its name; its zero-height
+        // title slot draws nothing.
+        let Ok(bar) = widgets::tab_bar_state(&ws.tree, ws.panel_group.bar) else {
+            unreachable!("the group has a bar");
+        };
+        let tabs = bar.tabs().to_vec();
+        for (index, (panel, title)) in [(ws.properties, "Properties"), (ws.history, "History")]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                runs(panel.header).is_empty(),
+                "{title}: a grouped panel's slot draws nothing"
+            );
+            let Some(&tab) = tabs.get(index) else {
+                unreachable!("one tab per member");
+            };
+            if index == 0 {
+                // Only the shown group is laid out with a real tab box.
+                let tab_runs = runs(tab);
+                assert!(
+                    tab_runs.iter().any(|run| run.text == title),
+                    "{title}: its tab draws its name, got {tab_runs:?}"
+                );
+            }
+        }
+        {
+            let (panel, title) = (ws.layers, "Layers");
             let header_runs = runs(panel.header);
             let [run] = &header_runs[..] else {
                 unreachable!("{title}: one title run, got {header_runs:?}");
@@ -1573,11 +1689,14 @@ mod tests {
     fn collapsed_headers_never_overlap_the_next_panel_in_a_rail_shorter_than_three_titles() {
         let scales = test_scales();
         let mut ws = crate::build_workspace(&scales);
-        let panels = [ws.layers, ws.properties, ws.history];
-        for panel in panels {
-            if let Err(err) = set_panel_collapsed(&mut ws.tree, panel, true) {
-                unreachable!("{err:?}");
-            }
+        // 0.164.0: two slots — Layers, and the Properties + History group,
+        // whose collapsed "title" is its tab row.
+        if let Err(err) = set_panel_collapsed(&mut ws.tree, ws.layers, true) {
+            unreachable!("{err:?}");
+        }
+        let group = ws.panel_group.clone();
+        if let Err(err) = crate::set_panel_group_collapsed(&mut ws.tree, &group, true) {
+            unreachable!("{err:?}");
         }
         let row_f = widgets::row_height(&scales);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1586,9 +1705,8 @@ mod tests {
         // window spends height on.
         ws.tree.compute_layout(1600.0, row_f * 1.5);
         let mut boxes = Vec::new();
-        for panel in panels {
-            let (Some(root_box), Some(header)) =
-                (ws.tree.bounds(panel.root), ws.tree.bounds(panel.header))
+        for (root, header) in [(ws.layers.root, ws.layers.header), (group.root, group.bar)] {
+            let (Some(root_box), Some(header)) = (ws.tree.bounds(root), ws.tree.bounds(header))
             else {
                 unreachable!("just laid out");
             };
@@ -1631,7 +1749,7 @@ mod tests {
         assert_eq!(display(&ws, ws.layers.header), taffy::Display::None);
         let (Some(closed_root), Some(next_root)) = (
             ws.tree.bounds(ws.layers.root),
-            ws.tree.bounds(ws.properties.root),
+            ws.tree.bounds(ws.panel_group.root),
         ) else {
             unreachable!("just laid out");
         };

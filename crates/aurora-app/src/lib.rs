@@ -2685,12 +2685,48 @@ fn startup_document(
 /// rail width and whether each of the three panels is collapsed. A
 /// snapshot taken right before writing it to disk
 /// ([`save_workspace_layout`]), not a live view.
+///
+/// **Versioning (0.164.0).** `postcard` is not self-describing, so a
+/// field cannot just be added with a `serde` default: a new field is
+/// appended at the end and [`decode_workspace_layout`] falls back to the
+/// older shape ([`WorkspaceLayoutV1`]) when the bytes run out before it.
+/// `panel_group_tab` is the Properties + History group's selected tab
+/// (`0` Properties, `1` History); a layout saved before 0.164.0 gets
+/// [`aurora_ui::PANEL_GROUP_TAB_DEFAULT`].
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WorkspaceLayout {
     rail_width: f32,
     layers_collapsed: bool,
     properties_collapsed: bool,
     history_collapsed: bool,
+    panel_group_tab: u32,
+}
+
+/// The layout as saved before 0.164.0 — no selected tab.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayoutV1 {
+    rail_width: f32,
+    layers_collapsed: bool,
+    properties_collapsed: bool,
+    history_collapsed: bool,
+}
+
+/// Decodes a saved layout: the current shape first, then the pre-0.164.0
+/// one, whose missing tab becomes the default tab.
+fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Error> {
+    match postcard::from_bytes::<WorkspaceLayout>(bytes) {
+        Ok(layout) => Ok(layout),
+        Err(current) => match postcard::from_bytes::<WorkspaceLayoutV1>(bytes) {
+            Ok(old) => Ok(WorkspaceLayout {
+                rail_width: old.rail_width,
+                layers_collapsed: old.layers_collapsed,
+                properties_collapsed: old.properties_collapsed,
+                history_collapsed: old.history_collapsed,
+                panel_group_tab: u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0),
+            }),
+            Err(_) => Err(current),
+        },
+    }
 }
 
 /// Where this crate's own persisted workspace layout lives — `None` if
@@ -2723,6 +2759,10 @@ fn save_workspace_layout(path: &Path, workspace: &aurora_ui::Workspace) {
         layers_collapsed: collapsed(workspace.layers),
         properties_collapsed: collapsed(workspace.properties),
         history_collapsed: collapsed(workspace.history),
+        panel_group_tab: aurora_ui::panel_group_selected(&workspace.tree, &workspace.panel_group)
+            .ok()
+            .and_then(|tab| u32::try_from(tab).ok())
+            .unwrap_or(0),
     };
     let bytes = match postcard::to_allocvec(&layout) {
         Ok(bytes) => bytes,
@@ -2764,7 +2804,7 @@ fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
             return;
         }
     };
-    let layout: WorkspaceLayout = match postcard::from_bytes(&bytes) {
+    let layout = match decode_workspace_layout(&bytes) {
         Ok(layout) => layout,
         Err(err) => {
             tracing::warn!(?err, "failed to deserialize the workspace layout");
@@ -2779,14 +2819,32 @@ fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
     ) {
         tracing::warn!(?err, "failed to apply the saved rail width");
     }
-    for (panel, collapsed) in [
-        (workspace.layers, layout.layers_collapsed),
-        (workspace.properties, layout.properties_collapsed),
-        (workspace.history, layout.history_collapsed),
-    ] {
-        if let Err(err) = aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, collapsed) {
-            tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
-        }
+    if let Err(err) = aurora_ui::set_panel_collapsed(
+        &mut workspace.tree,
+        workspace.layers,
+        layout.layers_collapsed,
+    ) {
+        tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
+    }
+    // 0.164.0: the group's saved tab (an out-of-range one, from a future
+    // or damaged file, falls back to the default), then the group
+    // collapsed or expanded as that tab was saved — the group's members
+    // collapse together.
+    let group = workspace.panel_group.clone();
+    let tab = usize::try_from(layout.panel_group_tab)
+        .ok()
+        .filter(|&tab| tab < group.members.len())
+        .unwrap_or(aurora_ui::PANEL_GROUP_TAB_DEFAULT);
+    let collapsed = if tab == 0 {
+        layout.properties_collapsed
+    } else {
+        layout.history_collapsed
+    };
+    if let Err(err) = aurora_widgets::widgets::select_tab(&mut workspace.tree, group.bar, tab)
+        .map(|_| ())
+        .and_then(|()| aurora_ui::set_panel_group_collapsed(&mut workspace.tree, &group, collapsed))
+    {
+        tracing::warn!(?err, "failed to apply the saved panel group tab");
     }
 }
 
@@ -3502,6 +3560,10 @@ fn handle_dialog_pointer(
 enum AccessibilityReaction {
     /// Routed at the widget level; nothing app-level follows.
     Handled(aurora_widgets::ActionOutcome),
+    /// An action on the Properties + History tab bar (0.164.0): the widget
+    /// layer selected (or focused) a tab, and [`follow_panel_tabs`] has
+    /// already shown its panel; the caller lays out again.
+    PanelTab(aurora_widgets::ActionOutcome),
     /// A `Click` on one of the open dialog's own action buttons: run it
     /// through [`run_dialog_action`], exactly as `Enter` or a pointer
     /// click on that button does.
@@ -3576,7 +3638,21 @@ fn route_accessibility_action(
     {
         return AccessibilityReaction::JumpHistory(target);
     }
-    match aurora_widgets::handle_action(&mut workspace.tree, focus, request) {
+    // 0.164.0: a tab of the Properties + History group — an assistive
+    // technology's `Click` (or `Focus`) selects it in the widget layer,
+    // and the panel it names is then shown, here, past the modal gate.
+    let on_panel_tabs = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
+        && aurora_ui::panel_group_contains(
+            &workspace.tree,
+            &workspace.panel_group,
+            request.target_node,
+        );
+    let handled = aurora_widgets::handle_action(&mut workspace.tree, focus, request);
+    if on_panel_tabs && handled.is_ok() {
+        follow_panel_tabs(workspace, focus, request.action == accesskit::Action::Click);
+    }
+    match handled {
+        Ok(outcome) if on_panel_tabs => AccessibilityReaction::PanelTab(outcome),
         Ok(aurora_widgets::ActionOutcome::Activated(id)) => {
             if let Some(action) = dialog.and_then(|handle| handle.action_id(id)) {
                 AccessibilityReaction::DialogAction(Some(action.to_owned()))
@@ -4035,6 +4111,9 @@ fn apply_accessibility_action(
                 tracing::warn!(?err, "gallery failed to apply an accessibility outcome");
             }
         }
+        AccessibilityReaction::PanelTab(outcome) => {
+            tracing::debug!(?outcome, "accessibility action on a panel tab");
+        }
         AccessibilityReaction::Handled(outcome) if on_panel_bar => {
             panel_bar_accessibility(cx, &outcome);
         }
@@ -4440,22 +4519,47 @@ fn activate_command(
     file_dialog: &mut dyn FileDialogAccess,
 ) -> Option<ActivatedCommand> {
     if let Some(target) = command_target(workspace, id) {
+        // 0.164.0: a grouped panel's tab is selected first — a hidden tab
+        // panel is not focusable.
+        for panel in [workspace.properties, workspace.history] {
+            if panel.root == target
+                && let Err(err) = aurora_ui::select_panel_tab(workspace, panel)
+            {
+                tracing::warn!(?err, "failed to select the focused panel's tab");
+            }
+        }
         if let Err(err) = focus.focus(&mut workspace.tree, target) {
             tracing::warn!(?err, "activated command's target isn't focusable");
         }
+        // Selecting a tab hid the other member; a failed focus above would
+        // otherwise leave focus inside it (review I1).
+        refocus_out_of_hidden(workspace, focus);
         return None;
     }
     if let Some(panel) = command_collapse_target(workspace, id) {
-        let collapsed = aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
-        if let Err(err) = aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, !collapsed) {
+        // 0.164.0: a grouped panel's toggle selects its tab and expands
+        // the group, or collapses the group when its tab is already shown
+        // expanded (`aurora_ui::toggle_workspace_panel`).
+        if let Err(err) = aurora_ui::toggle_workspace_panel(workspace, panel) {
             tracing::warn!(?err, "failed to toggle panel collapse");
         }
+        refocus_out_of_hidden(workspace, focus);
         return None;
     }
     if let Some(panel) = command_close_target(workspace, id) {
-        if let Err(err) = aurora_ui::close_panel(&mut workspace.tree, panel) {
+        // A close frees the body's widgets, so focus on one of them would
+        // just vanish; it is lifted to the panel itself first, which the
+        // repair below then moves on from once the panel is hidden.
+        if focus.focused().is_some_and(|focused| {
+            focused != panel.root && workspace.tree.is_within(panel.root, focused)
+        }) && let Err(err) = focus.focus(&mut workspace.tree, panel.root)
+        {
+            tracing::debug!(?err, "a closing panel's own root is not focusable");
+        }
+        if let Err(err) = aurora_ui::close_workspace_panel(workspace, panel) {
             tracing::warn!(?err, "failed to close panel");
         }
+        refocus_out_of_hidden(workspace, focus);
         return None;
     }
     if id == COMMAND_FILE_OPEN {
@@ -4564,6 +4668,46 @@ enum WidgetOwner {
     /// The left tools panel's buttons (0.160.0): a click selects a tool
     /// through [`AppCommand::SelectTool`].
     ToolsPanel,
+    /// A panel tab group's tab bar (0.164.0, `aurora_ui::PanelGroup`): a
+    /// click, an arrow key or `Home`/`End` selects a tab in the widget
+    /// layer, then [`follow_panel_tabs`] shows that tab's panel.
+    PanelTabs,
+}
+
+/// After input reached the Properties + History tab bar (0.164.0): shows
+/// the panel of the tab it now selects (`aurora_ui::follow_panel_group_tab`;
+/// `activated` — a pointer press or an AT `Click` — also expands a
+/// collapsed group from its already-selected tab), then moves focus off
+/// anything that is now hidden ([`refocus_out_of_hidden`]). Returns
+/// whether the group changed.
+fn follow_panel_tabs(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    activated: bool,
+) -> bool {
+    let group = workspace.panel_group.clone();
+    match aurora_ui::follow_panel_group_tab(&mut workspace.tree, &group, activated) {
+        Ok(changed) => {
+            refocus_out_of_hidden(workspace, focus);
+            changed
+        }
+        Err(err) => {
+            tracing::warn!(?err, "failed to show the selected panel tab");
+            false
+        }
+    }
+}
+
+/// Moves keyboard focus off a widget a panel change hid (0.164.0 review
+/// I1, `aurora_ui::refocus_out_of_hidden`): to the group's selected tab,
+/// else a shown focusable ancestor (a collapsed panel's root), else
+/// nowhere. Run after every path that can hide a panel — the tab bar
+/// ([`follow_panel_tabs`]), the panel commands ([`activate_command`]) and,
+/// as the backstop for everything else (the Curves rule among them), every
+/// [`App::layout`]. Returns whether focus changed.
+fn refocus_out_of_hidden(workspace: &mut aurora_ui::Workspace, focus: &mut FocusManager) -> bool {
+    let group = workspace.panel_group.clone();
+    aurora_ui::refocus_out_of_hidden(&mut workspace.tree, focus, &group)
 }
 
 /// Closes every open popover a panel scroll could leave stranded
@@ -4697,6 +4841,9 @@ fn widget_owner(
     }
     if is_tool_button(tree, id) {
         return Some(WidgetOwner::ToolsPanel);
+    }
+    if aurora_ui::is_panel_group_tab(tree, id) {
+        return Some(WidgetOwner::PanelTabs);
     }
     None
 }
@@ -4993,6 +5140,9 @@ fn route_widget_pointer(
     {
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
+    if owner == Some(WidgetOwner::PanelTabs) {
+        follow_panel_tabs(workspace, focus, phase == PointerPhase::Down);
+    }
     WidgetPointer {
         outcome: Some(outcome),
         dismissed,
@@ -5163,6 +5313,9 @@ fn route_widget_key(
             aurora_ui::apply_gallery_outcome(&mut workspace.tree, focus, open, scales, handled)
     {
         tracing::warn!(?err, "gallery failed to apply an outcome");
+    }
+    if owner == WidgetOwner::PanelTabs {
+        follow_panel_tabs(workspace, focus, false);
     }
     Some((owner, outcome))
 }
@@ -6424,17 +6577,18 @@ fn expand_properties_for_curves(
     if curves_layer.is_none() {
         return false;
     }
-    if !aurora_ui::panel_is_collapsed(&workspace.tree, workspace.properties).unwrap_or(false) {
-        return false;
-    }
     // A *closed* panel stays closed (review J1): Close empties its body
     // and is a stronger request than a collapse, so only a collapse is
     // undone here. Treated as closed when the query fails, too.
     if aurora_ui::panel_is_closed(&workspace.tree, workspace.properties).unwrap_or(true) {
         return false;
     }
-    match aurora_ui::set_panel_collapsed(&mut workspace.tree, workspace.properties, false) {
-        Ok(()) => true,
+    // 0.164.0: Properties is a tab of the Properties + History group, so
+    // "expand it" is "select its tab and expand the group" — on this
+    // transition only, like the expand itself.
+    let properties = workspace.properties;
+    match aurora_ui::show_workspace_panel(workspace, properties) {
+        Ok(changed) => changed,
         Err(err) => {
             tracing::warn!(
                 ?err,
@@ -20140,7 +20294,9 @@ impl App {
                     }
                 }
                 // A linked panel bar is never focused, so no key reaches it.
-                WidgetOwner::Gallery | WidgetOwner::PanelScrollbar => {}
+                // A tab key has already shown its panel
+                // (`route_widget_key` -> `follow_panel_tabs`).
+                WidgetOwner::Gallery | WidgetOwner::PanelScrollbar | WidgetOwner::PanelTabs => {}
             }
             self.relayout_after_gallery();
             return;
@@ -22746,6 +22902,10 @@ impl App {
     /// the previous one, and lays out a second time only when that
     /// scrolled a panel.
     fn layout(&mut self, width: f32, height: f32) {
+        // Review I1 (0.164.0): every path that hid a panel — the Curves
+        // rule among them — relays out before returning to the event loop,
+        // so this is where focus left on a hidden widget is caught.
+        refocus_out_of_hidden(&mut self.workspace, &mut self.focus);
         layout_workspace(
             &mut self.workspace,
             self.text_engine.as_mut(),
@@ -23812,6 +23972,16 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Shows the History tab of the Properties + History group (0.164.0):
+/// tests that click or scroll History rows need it laid out.
+#[cfg(test)]
+fn show_history_tab_for_test(workspace: &mut aurora_ui::Workspace) {
+    let group = workspace.panel_group.clone();
+    if let Err(err) = aurora_ui::show_panel_group_tab(&mut workspace.tree, &group, 1) {
+        unreachable!("{err:?}");
+    }
+}
+
 /// The committed scales every test workspace is built with
 /// ([`aurora_ui::build_workspace`] takes them since 0.142.0, for the
 /// panels' one-row title slots) — [`load_scales`]'s own file, so a test
@@ -23993,7 +24163,7 @@ mod tests {
     /// real OS clipboard involved (this sandbox has no display server
     /// for a real one to attach to anyway).
     #[derive(Debug, Default)]
-    struct FakeClipboard {
+    pub(crate) struct FakeClipboard {
         contents: Option<String>,
     }
 
@@ -24013,7 +24183,7 @@ mod tests {
     /// real "Open File…"/"Save As…" activation would show two different
     /// dialogs, never the same one.
     #[derive(Debug, Default)]
-    struct FakeFileDialog {
+    pub(crate) struct FakeFileDialog {
         next_pick: Option<PathBuf>,
         next_save: Option<PathBuf>,
     }
@@ -24689,6 +24859,8 @@ mod tests {
             }
 
             fn layout(&mut self) {
+                // 0.164.0: History is a tab; these tests click its rows.
+                crate::show_history_tab_for_test(&mut self.rig.workspace);
                 self.rig.workspace.tree.compute_layout(W, H);
             }
 
@@ -30003,7 +30175,13 @@ mod tests {
             &mut undo_order,
             AppCommand::FocusNext,
         );
-        assert_eq!(focus.focused(), Some(workspace.properties.root));
+        // 0.164.0: then the group's selected tab (one stop per tab row,
+        // roving focus), then the shown tab's panel; History is hidden.
+        let selected_tab =
+            aurora_widgets::widgets::tab_bar_state(&workspace.tree, workspace.panel_group.bar)
+                .ok()
+                .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
+        assert_eq!(focus.focused(), selected_tab);
         let _ = run_command(
             &mut workspace,
             &mut focus,
@@ -30017,7 +30195,7 @@ mod tests {
             &mut undo_order,
             AppCommand::FocusNext,
         );
-        assert_eq!(focus.focused(), Some(workspace.history.root));
+        assert_eq!(focus.focused(), Some(workspace.properties.root));
 
         let _ = run_command(
             &mut workspace,
@@ -30034,8 +30212,8 @@ mod tests {
         );
         assert_eq!(
             focus.focused(),
-            Some(workspace.properties.root),
-            "Shift+Tab must step backward through the same order"
+            selected_tab,
+            "Shift+Tab must step backward through the same order (0.164.0: to the tab)"
         );
     }
 
@@ -31764,6 +31942,23 @@ mod tests {
             match aurora_ui::panel_is_collapsed(&workspace.tree, panel) {
                 Ok(collapsed) => assert!(!collapsed, "starts expanded"),
                 Err(err) => unreachable!("{err:?}"),
+            }
+            // 0.164.0: History starts as the hidden tab of its group; its
+            // first toggle selects its tab (still expanded), and from
+            // there it toggles like any other panel.
+            if panel == workspace.history {
+                let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
+                assert_eq!(picked, None);
+                assert_eq!(
+                    aurora_ui::panel_group_shown(&workspace.tree, &workspace.panel_group),
+                    Some(1),
+                    "toggling a hidden tab selects it"
+                );
+                assert_eq!(
+                    aurora_ui::panel_is_collapsed(&workspace.tree, panel).ok(),
+                    Some(false),
+                    "and expands its group"
+                );
             }
 
             let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
@@ -53560,9 +53755,9 @@ mod tests {
         {
             unreachable!("{err:?}");
         }
-        if let Err(err) =
-            aurora_ui::set_panel_collapsed(&mut original.tree, original.properties, true)
-        {
+        // 0.164.0: Properties is a tab of a group, which collapses as one.
+        let group = original.panel_group.clone();
+        if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut original.tree, &group, true) {
             unreachable!("{err:?}");
         }
 
@@ -53583,9 +53778,14 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         }
         match aurora_ui::panel_is_collapsed(&loaded.tree, loaded.history) {
-            Ok(collapsed) => assert!(!collapsed, "history was never collapsed in the original"),
+            Ok(collapsed) => assert!(collapsed, "history collapses with its group"),
             Err(err) => unreachable!("{err:?}"),
         }
+        assert_eq!(
+            aurora_ui::panel_group_selected(&loaded.tree, &loaded.panel_group).ok(),
+            Some(0),
+            "the default tab round-trips"
+        );
     }
 
     #[test]
@@ -57519,6 +57719,7 @@ mod tests {
             );
         }
         super::refresh_history_panel(&mut workspace, &undo_order);
+        crate::show_history_tab_for_test(&mut workspace);
         workspace.tree.compute_layout(1600.0, 900.0);
         let mut last = super::ScrollFollow::default();
         let current = workspace.history_current;
@@ -65859,6 +66060,8 @@ mod tests {
             }
 
             fn layout(&mut self) {
+                // `App::layout`'s focus backstop (review I1).
+                crate::refocus_out_of_hidden(&mut self.workspace, &mut self.focus);
                 layout_workspace(
                     &mut self.workspace,
                     Some(&mut self.engine),
@@ -66003,10 +66206,31 @@ mod tests {
         #[test]
         fn a_new_curves_layer_shows_the_images_histogram_in_a_visible_properties_editor() {
             for height in [WINDOW.1, 604.0] {
-                for start_collapsed in [false, true] {
-                    let what = format!("1274 x {height}, collapsed at start: {start_collapsed}");
+                for (start_collapsed, start_on_history) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let what = format!(
+                        "1274 x {height}, collapsed at start: {start_collapsed}, \
+                         History tab at start: {start_on_history}"
+                    );
                     let mut shell = Shell::halves((WINDOW.0, height));
                     collapse_properties(&mut shell, start_collapsed);
+                    if start_on_history {
+                        // 0.164.0: the History tab selected — the group's
+                        // collapse follows `start_collapsed`.
+                        let group = shell.workspace.panel_group.clone();
+                        let tree = &mut shell.workspace.tree;
+                        if let Err(err) = aurora_widgets::widgets::select_tab(tree, group.bar, 1)
+                            .map(|_| ())
+                            .and_then(|()| aurora_ui::sync_panel_group(tree, &group))
+                            .and_then(|()| {
+                                aurora_ui::set_panel_group_collapsed(tree, &group, start_collapsed)
+                            })
+                        {
+                            unreachable!("{err:?}");
+                        }
+                        shell.layout();
+                    }
                     shell.toggle_gallery();
                     assert!(shell.run(LayerCommand::NewCurves), "{what}");
                     assert!(shell.ui.job.is_none(), "{what}: the histogram job finished");
@@ -66036,7 +66260,14 @@ mod tests {
                         assert!(inside(rect, properties), "{what}: {name} inside Properties");
                         assert!(inside(rect, rail), "{what}: {name} inside the rail");
                     }
-                    assert!(bottom(side) <= history.y, "{what}: above History");
+                    // 0.164.0: History is the hidden tab of Properties'
+                    // slot, so the editor has the rest of the rail.
+                    assert_eq!(history.height, 0, "{what}: History is the hidden tab");
+                    assert_eq!(
+                        aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group),
+                        Some(0),
+                        "{what}: the Properties tab is the one shown"
+                    );
                     #[allow(clippy::cast_precision_loss)]
                     let centre = (
                         (side.x + i64::from(side.width) / 2) as f32,
@@ -66083,6 +66314,32 @@ mod tests {
         /// layer stays active sticks across any number of syncs; a
         /// transition to another Curves layer expands again; and a
         /// non-Curves layer never expands a collapsed panel.
+        /// Review I1 (0.164.0), through the same sync-then-layout loop the
+        /// app runs: focus on the History panel, then a new Curves layer
+        /// selects the Properties tab — focus must leave the hidden History
+        /// panel for the group's selected tab.
+        #[test]
+        fn the_curves_rule_moves_focus_out_of_the_history_tab_it_hides() {
+            let mut shell = Shell::halves(WINDOW);
+            crate::show_history_tab_for_test(&mut shell.workspace);
+            // The History panel itself: its rows are rebuilt by the new
+            // layer's own History step, so a row would simply vanish.
+            let history = shell.workspace.history.root;
+            if let Err(err) = shell.focus.focus(&mut shell.workspace.tree, history) {
+                unreachable!("{err:?}");
+            }
+            assert!(shell.run(LayerCommand::NewCurves));
+            let ws = &shell.workspace;
+            assert_eq!(
+                aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group),
+                Some(0)
+            );
+            let tab = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar)
+                .ok()
+                .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
+            assert_eq!(shell.focus.focused(), tab, "focus is on the Properties tab");
+        }
+
         #[test]
         fn properties_auto_expands_only_on_the_transition_to_a_curves_layer() {
             let mut shell = Shell::halves(WINDOW);
@@ -69386,5 +69643,748 @@ mod panel_scroll_tests {
         workspace.tree.compute_layout(1000.0, 400.0);
         assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));
         assert_eq!(workspace.tree.scroll_y(workspace.history.body), Some(0.0));
+    }
+
+    /// 0.164.0: the Properties + History panel tab group, end to end
+    /// through the app's own routing, command and persistence functions.
+    mod panel_tab_groups {
+        use std::collections::HashMap;
+
+        use aurora_widgets::widgets::{TabBarState, tab_bar_state};
+
+        use crate::tests::{FakeClipboard, FakeFileDialog};
+        use crate::{
+            AccessibilityReaction, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_PROPERTIES,
+            COMMAND_FOCUS_HISTORY, COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_PROPERTIES, ClickTracker,
+            FocusManager, Key, Modifiers, NamedKey, PointerPhase, WidgetId, WorkspaceLayout,
+            WorkspaceLayoutV1, activate_command, expand_properties_for_curves,
+            route_accessibility_action, route_widget_key, route_widget_pointer,
+        };
+
+        const WINDOW: (f32, f32) = (1274.0, 672.0);
+
+        fn workspace() -> aurora_ui::Workspace {
+            let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            ws
+        }
+
+        fn tab(ws: &aurora_ui::Workspace, index: usize) -> WidgetId {
+            match tab_bar_state(&ws.tree, ws.panel_group.bar)
+                .ok()
+                .and_then(|bar| bar.tabs().get(index).copied())
+            {
+                Some(tab) => tab,
+                None => unreachable!("tab {index} exists"),
+            }
+        }
+
+        fn shown(ws: &aurora_ui::Workspace) -> Option<usize> {
+            aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group)
+        }
+
+        fn selected(ws: &aurora_ui::Workspace) -> Option<usize> {
+            aurora_ui::panel_group_selected(&ws.tree, &ws.panel_group).ok()
+        }
+
+        fn bounds(ws: &aurora_ui::Workspace, id: WidgetId) -> aurora_core::Rect {
+            match ws.tree.bounds(id) {
+                Some(bounds) => bounds,
+                None => unreachable!("laid out"),
+            }
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        fn centre(rect: aurora_core::Rect) -> (f32, f32) {
+            (
+                rect.x as f32 + rect.width as f32 / 2.0,
+                rect.y as f32 + rect.height as f32 / 2.0,
+            )
+        }
+
+        fn press(ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, at: (f32, f32)) {
+            let mut click = ClickTracker::default();
+            let scales = crate::test_workspace_scales();
+            for phase in [PointerPhase::Down, PointerPhase::Up] {
+                let _ = route_widget_pointer(
+                    ws,
+                    focus,
+                    &mut None,
+                    None,
+                    None,
+                    &mut click,
+                    &scales,
+                    false,
+                    phase,
+                    at,
+                    Modifiers::none(),
+                    &mut crate::NoTextHit,
+                );
+            }
+        }
+
+        fn request(id: WidgetId, action: accesskit::Action) -> accesskit::ActionRequest {
+            accesskit::ActionRequest {
+                action,
+                target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                target_node: id,
+                data: None,
+            }
+        }
+
+        fn is_hidden(ws: &aurora_ui::Workspace, id: WidgetId) -> bool {
+            ws.tree
+                .accessibility(id)
+                .is_some_and(accesskit::Node::is_hidden)
+        }
+
+        /// The layout half of AC-1 (the 0.144.1 lesson): one slot under
+        /// Layers holding the tab row over exactly one shown panel, no
+        /// overlap, inside the rail.
+        fn assert_one_slot(ws: &aurora_ui::Workspace, what: &str) {
+            let layers = bounds(ws, ws.layers.root);
+            let group = bounds(ws, ws.panel_group.root);
+            let bar = bounds(ws, ws.panel_group.bar);
+            let rail = bounds(ws, ws.rail);
+            assert_eq!(
+                group.y,
+                layers.bottom(),
+                "{what}: the group docks under Layers"
+            );
+            assert_eq!(bar.y, group.y, "{what}: the tab row is the group's top");
+            let Some(index) = shown(ws) else {
+                unreachable!("{what}: a tab is shown");
+            };
+            let (on, off) = if index == 0 {
+                (ws.properties, ws.history)
+            } else {
+                (ws.history, ws.properties)
+            };
+            let on = bounds(ws, on.root);
+            assert_eq!(
+                on.y,
+                bar.bottom(),
+                "{what}: the shown panel sits under the tab row"
+            );
+            assert!(on.bottom() <= group.bottom(), "{what}: inside its slot");
+            assert!(group.bottom() <= rail.bottom(), "{what}: inside the rail");
+            assert_eq!(
+                bounds(ws, off.root).height,
+                0,
+                "{what}: the hidden tab takes no space"
+            );
+        }
+
+        #[test]
+        fn a_pointer_click_on_a_tab_shows_its_panel_and_hides_the_other() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            assert_eq!(shown(&ws), Some(aurora_ui::PANEL_GROUP_TAB_DEFAULT));
+            assert_one_slot(&ws, "startup");
+            let at = centre(bounds(&ws, tab(&ws, 1)));
+            press(&mut ws, &mut focus, at);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!((selected(&ws), shown(&ws)), (Some(1), Some(1)));
+            assert_one_slot(&ws, "History clicked");
+            let history = bounds(&ws, ws.history.root);
+            assert!(history.height > 0, "History is shown: {history:?}");
+            let hit = ws.tree.hit_test(centre(bounds(&ws, ws.history.viewport)));
+            assert!(
+                hit.is_some_and(|hit| ws.tree.is_within(ws.history.root, hit)),
+                "History's body is really hit-testable"
+            );
+            let at = centre(bounds(&ws, tab(&ws, 0)));
+            press(&mut ws, &mut focus, at);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!((selected(&ws), shown(&ws)), (Some(0), Some(0)));
+            assert_one_slot(&ws, "Properties clicked back");
+        }
+
+        #[test]
+        fn an_at_click_on_a_tab_shows_its_panel_and_hides_the_other_from_the_at_tree() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let bar = ws
+                .tree
+                .accessibility(ws.panel_group.bar)
+                .map(accesskit::Node::role);
+            assert_eq!(bar, Some(accesskit::Role::TabList));
+            for index in [0, 1] {
+                let node = ws.tree.accessibility(tab(&ws, index));
+                assert_eq!(node.map(accesskit::Node::role), Some(accesskit::Role::Tab));
+                assert_eq!(
+                    node.and_then(accesskit::Node::is_selected),
+                    Some(index == 0)
+                );
+            }
+            assert!(
+                is_hidden(&ws, ws.history.root),
+                "the hidden tab's panel is AT-hidden"
+            );
+            assert!(!is_hidden(&ws, ws.properties.root));
+
+            let history_tab = tab(&ws, 1);
+            let reaction = route_accessibility_action(
+                &mut ws,
+                &mut focus,
+                None,
+                &HashMap::new(),
+                None,
+                None,
+                &request(history_tab, accesskit::Action::Click),
+            );
+            assert!(
+                matches!(reaction, AccessibilityReaction::PanelTab(_)),
+                "{reaction:?}"
+            );
+            assert_eq!((selected(&ws), shown(&ws)), (Some(1), Some(1)));
+            assert!(
+                is_hidden(&ws, ws.properties.root),
+                "Properties left the AT tree"
+            );
+            assert!(!is_hidden(&ws, ws.history.root));
+            for (panel, index) in [(ws.properties, 0), (ws.history, 1)] {
+                let Some(node) = ws.tree.accessibility(panel.root) else {
+                    unreachable!("exists");
+                };
+                assert_eq!(node.role(), accesskit::Role::TabPanel);
+                assert_eq!(node.labelled_by(), [tab(&ws, index)], "labelled by its tab");
+                assert!(node.labelled_by().iter().all(|&id| ws.tree.contains(id)));
+                assert_eq!(
+                    node.supports_action(accesskit::Action::Focus),
+                    index == 1,
+                    "only the shown tab panel is a Tab stop"
+                );
+            }
+            assert_eq!(
+                ws.tree
+                    .accessibility(tab(&ws, 1))
+                    .and_then(accesskit::Node::is_selected),
+                Some(true)
+            );
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_one_slot(&ws, "after the AT click");
+        }
+
+        #[test]
+        fn an_open_dialog_blocks_an_at_tab_click() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let mut dialog = None;
+            let scales = crate::test_workspace_scales();
+            crate::open_crash_recovery_dialog(&mut ws, &mut focus, &mut dialog, &scales, false);
+            let target = tab(&ws, 1);
+            let reaction = route_accessibility_action(
+                &mut ws,
+                &mut focus,
+                dialog.as_ref(),
+                &HashMap::new(),
+                None,
+                None,
+                &request(target, accesskit::Action::Click),
+            );
+            assert!(
+                matches!(reaction, AccessibilityReaction::BlockedByModal(id) if id == target),
+                "{reaction:?}"
+            );
+            assert_eq!((selected(&ws), shown(&ws)), (Some(0), Some(0)));
+        }
+
+        #[test]
+        fn arrow_keys_on_the_focused_tab_switch_panels() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let scales = crate::test_workspace_scales();
+            let first = tab(&ws, 0);
+            if let Err(err) = focus.focus(&mut ws.tree, first) {
+                unreachable!("{err:?}");
+            }
+            let mut clipboard = FakeClipboard::default();
+            let mut key = |ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, named| {
+                route_widget_key(
+                    ws,
+                    focus,
+                    &mut None,
+                    None,
+                    None,
+                    &scales,
+                    false,
+                    false,
+                    Modifiers::none(),
+                    Key::Named(named),
+                    None,
+                    &mut clipboard,
+                )
+            };
+            let routed = key(&mut ws, &mut focus, NamedKey::ArrowRight);
+            assert!(
+                matches!(routed, Some((crate::WidgetOwner::PanelTabs, _))),
+                "{routed:?}"
+            );
+            assert_eq!((selected(&ws), shown(&ws)), (Some(1), Some(1)));
+            assert_eq!(focus.focused(), Some(tab(&ws, 1)), "roving focus moved");
+            let _ = key(&mut ws, &mut focus, NamedKey::ArrowLeft);
+            assert_eq!((selected(&ws), shown(&ws)), (Some(0), Some(0)));
+        }
+
+        #[test]
+        fn scroll_offsets_and_sizing_survive_tab_switching() {
+            let mut ws = workspace();
+            let mut history = aurora_doc::History::new();
+            let mut pixel_history = aurora_brush::PixelHistory::new();
+            let mut undo_order = crate::UndoOrder::default();
+            for _ in 0..200 {
+                undo_order.record_labelled(
+                    crate::UndoKind::Pixel,
+                    "Brush Stroke".to_owned(),
+                    &mut history,
+                    &mut pixel_history,
+                );
+            }
+            crate::refresh_history_panel(&mut ws, &undo_order);
+            crate::show_history_tab_for_test(&mut ws);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            if let Err(err) = ws.tree.set_scroll_y(ws.history.body, 300.0) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!(ws.tree.scroll_y(ws.history.body), Some(300.0));
+            let mut focus = FocusManager::default();
+            let at = centre(bounds(&ws, tab(&ws, 0)));
+            press(&mut ws, &mut focus, at);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!(shown(&ws), Some(0));
+            assert_eq!(
+                ws.tree.scroll_y(ws.history.body),
+                Some(300.0),
+                "a hidden tab keeps its offset"
+            );
+            let at = centre(bounds(&ws, tab(&ws, 1)));
+            press(&mut ws, &mut focus, at);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!(shown(&ws), Some(1));
+            assert_eq!(
+                ws.tree.scroll_y(ws.history.body),
+                Some(300.0),
+                "and shows it again"
+            );
+            assert!(
+                ws.tree
+                    .scroll_range(ws.history.body)
+                    .is_some_and(|range| range > 0.0),
+                "the linked scrollbar has a range again"
+            );
+            assert_eq!(
+                aurora_widgets::widgets::scrollbar_target(&ws.tree, ws.history.scrollbar),
+                Some(ws.history.body),
+                "the scrollbar is still linked to its body"
+            );
+            assert_eq!(
+                aurora_ui::panel_sizing(&ws.tree, ws.properties).ok(),
+                Some(aurora_ui::PanelSizing::Content)
+            );
+            assert_eq!(
+                aurora_ui::panel_sizing(&ws.tree, ws.history).ok(),
+                Some(aurora_ui::PanelSizing::Fill)
+            );
+            assert_one_slot(&ws, "History back");
+        }
+
+        fn curves_layers() -> (aurora_doc::LayerId, aurora_doc::LayerId) {
+            let mut layers = aurora_doc::LayerTree::new();
+            let mut add = || match layers.add_adjustment_layer_at(
+                "Curves",
+                aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                None,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            (add(), add())
+        }
+
+        #[test]
+        fn a_curves_transition_selects_the_properties_tab_once_and_respects_a_closed_panel() {
+            let (first, second) = curves_layers();
+            let mut ws = workspace();
+            crate::show_history_tab_for_test(&mut ws);
+            let mut shown_for = None;
+            assert!(expand_properties_for_curves(
+                &mut ws,
+                &mut shown_for,
+                Some(first)
+            ));
+            assert_eq!((selected(&ws), shown(&ws)), (Some(0), Some(0)));
+            // Only on the transition: the user going back to History
+            // while the same Curves layer stays active is respected.
+            crate::show_history_tab_for_test(&mut ws);
+            assert!(!expand_properties_for_curves(
+                &mut ws,
+                &mut shown_for,
+                Some(first)
+            ));
+            assert_eq!(shown(&ws), Some(1), "no auto-select every frame");
+            // A collapsed group on History: a new Curves layer selects
+            // Properties and expands the group.
+            let group = ws.panel_group.clone();
+            if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true) {
+                unreachable!("{err:?}");
+            }
+            assert!(expand_properties_for_curves(
+                &mut ws,
+                &mut shown_for,
+                Some(second)
+            ));
+            assert_eq!(shown(&ws), Some(0));
+            assert_eq!(
+                aurora_ui::panel_group_is_collapsed(&ws.tree, &group).ok(),
+                Some(false)
+            );
+            // A closed Properties panel is never reopened.
+            let properties = ws.properties;
+            if let Err(err) = aurora_ui::close_workspace_panel(&mut ws, properties) {
+                unreachable!("{err:?}");
+            }
+            assert_eq!(
+                shown(&ws),
+                Some(1),
+                "closing the shown tab moves to History"
+            );
+            assert!(!expand_properties_for_curves(&mut ws, &mut shown_for, None));
+            assert!(!expand_properties_for_curves(
+                &mut ws,
+                &mut shown_for,
+                Some(first)
+            ));
+            assert_eq!(shown(&ws), Some(1));
+            assert_eq!(
+                aurora_ui::panel_is_closed(&ws.tree, ws.properties).ok(),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn toggle_close_and_focus_commands_drive_the_group() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let mut files = FakeFileDialog::default();
+            let mut run = |ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, id| {
+                assert_eq!(activate_command(ws, focus, id, &mut files), None);
+            };
+            run(&mut ws, &mut focus, COMMAND_TOGGLE_HISTORY);
+            assert_eq!(shown(&ws), Some(1), "a toggled panel selects its tab");
+            run(&mut ws, &mut focus, COMMAND_TOGGLE_HISTORY);
+            let group = ws.panel_group.clone();
+            assert_eq!(
+                aurora_ui::panel_group_is_collapsed(&ws.tree, &group).ok(),
+                Some(true)
+            );
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            let bar = bounds(&ws, group.bar);
+            assert_eq!(
+                bounds(&ws, group.root).height,
+                bar.height,
+                "a collapsed group is its tab row"
+            );
+            for panel in [ws.properties, ws.history] {
+                let body = ws.tree.style(panel.body).map(|style| style.display);
+                assert_eq!(body, Some(taffy::Display::None), "every body collapsed");
+            }
+            run(&mut ws, &mut focus, COMMAND_TOGGLE_PROPERTIES);
+            assert_eq!(shown(&ws), Some(0), "toggling the other tab selects it");
+            assert_eq!(
+                aurora_ui::panel_group_is_collapsed(&ws.tree, &group).ok(),
+                Some(false)
+            );
+
+            run(&mut ws, &mut focus, COMMAND_FOCUS_HISTORY);
+            assert_eq!(
+                shown(&ws),
+                Some(1),
+                "focusing a hidden tab's panel selects it"
+            );
+            assert_eq!(focus.focused(), Some(ws.history.root));
+
+            run(&mut ws, &mut focus, COMMAND_CLOSE_HISTORY);
+            assert_eq!(
+                shown(&ws),
+                Some(0),
+                "closing the shown tab leaves an open one shown"
+            );
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_one_slot(&ws, "History closed");
+            run(&mut ws, &mut focus, COMMAND_CLOSE_PROPERTIES);
+            assert_eq!(shown(&ws), None);
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_eq!(
+                bounds(&ws, group.root).height,
+                0,
+                "an all-closed group takes no space"
+            );
+            assert!(is_hidden(&ws, group.root), "and leaves the AT tree");
+            let disabled = tab_bar_state(&ws.tree, group.bar).map(TabBarState::is_disabled);
+            assert_eq!(disabled.ok(), Some(true), "its tabs are not Tab stops");
+            run(&mut ws, &mut focus, COMMAND_TOGGLE_PROPERTIES);
+            assert_eq!(shown(&ws), Some(0), "the toggle reopens it");
+            assert!(!is_hidden(&ws, group.root));
+            ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            assert_one_slot(&ws, "Properties reopened");
+        }
+
+        /// A focusable widget inside `body`, standing in for a slider or
+        /// a row a user has focused there.
+        fn focusable_in(
+            ws: &mut aurora_ui::Workspace,
+            body: impl Fn(&aurora_ui::Workspace) -> WidgetId,
+        ) -> WidgetId {
+            let body = body(ws);
+            let mut node = accesskit::Node::new(accesskit::Role::Button);
+            node.add_action(accesskit::Action::Focus);
+            match ws.tree.insert(
+                body,
+                taffy::Style::default(),
+                node,
+                aurora_widgets::widgets::WidgetKind::Container,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn focus_on(ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, id: WidgetId) {
+            if let Err(err) = focus.focus(&mut ws.tree, id) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        /// Review I1: every command that hides a panel moves focus out of
+        /// it — to the group's selected tab — rather than leaving keys on a
+        /// hidden widget.
+        #[test]
+        fn toggle_close_and_focus_commands_move_focus_out_of_a_hidden_tab() {
+            for (command, landing) in [
+                (COMMAND_TOGGLE_HISTORY, "tab"),
+                (COMMAND_CLOSE_PROPERTIES, "tab"),
+                (COMMAND_FOCUS_HISTORY, "history"),
+            ] {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let mut files = FakeFileDialog::default();
+                let inside = focusable_in(&mut ws, |ws| ws.properties.body);
+                focus_on(&mut ws, &mut focus, inside);
+                assert_eq!(
+                    activate_command(&mut ws, &mut focus, command, &mut files),
+                    None
+                );
+                assert_eq!(shown(&ws), Some(1), "{command}: History is shown");
+                let focused = focus.focused();
+                assert!(
+                    focused.is_some_and(|id| !ws.tree.is_within(ws.properties.root, id)),
+                    "{command}: focus left the hidden Properties panel: {focused:?}"
+                );
+                let expected = if landing == "tab" {
+                    tab(&ws, 1)
+                } else {
+                    ws.history.root
+                };
+                assert_eq!(focused, Some(expected), "{command}");
+            }
+        }
+
+        /// Review I1, for an ungrouped panel too: collapsing Layers moves
+        /// focus from one of its rows to the panel itself.
+        #[test]
+        fn collapsing_layers_moves_focus_from_its_body_to_the_panel() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let mut files = FakeFileDialog::default();
+            let inside = focusable_in(&mut ws, |ws| ws.layers.body);
+            focus_on(&mut ws, &mut focus, inside);
+            assert_eq!(
+                activate_command(
+                    &mut ws,
+                    &mut focus,
+                    crate::COMMAND_TOGGLE_LAYERS,
+                    &mut files
+                ),
+                None
+            );
+            assert_eq!(focus.focused(), Some(ws.layers.root));
+        }
+
+        /// Review I1: a tab switch from the bar moves focus out too (here
+        /// an AT `Click` while focus sits in Properties' body).
+        #[test]
+        fn a_tab_switch_moves_focus_out_of_the_panel_it_hides() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let inside = focusable_in(&mut ws, |ws| ws.properties.body);
+            focus_on(&mut ws, &mut focus, inside);
+            let history_tab = tab(&ws, 1);
+            let _ = route_accessibility_action(
+                &mut ws,
+                &mut focus,
+                None,
+                &HashMap::new(),
+                None,
+                None,
+                &request(history_tab, accesskit::Action::Click),
+            );
+            assert_eq!(shown(&ws), Some(1));
+            assert!(
+                focus
+                    .focused()
+                    .is_some_and(|id| !ws.tree.is_within(ws.properties.root, id))
+            );
+        }
+
+        /// Review I5: pressing (or AT-clicking) the already-selected tab of
+        /// a collapsed group expands it; a key on it does not.
+        #[test]
+        fn activating_the_selected_tab_of_a_collapsed_group_expands_it() {
+            let mut ws = workspace();
+            let mut focus = FocusManager::default();
+            let group = ws.panel_group.clone();
+            let collapse = |ws: &mut aurora_ui::Workspace| {
+                if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true) {
+                    unreachable!("{err:?}");
+                }
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            };
+            let collapsed = |ws: &aurora_ui::Workspace| {
+                aurora_ui::panel_group_is_collapsed(&ws.tree, &group).ok()
+            };
+            collapse(&mut ws);
+            let at = centre(bounds(&ws, tab(&ws, 0)));
+            press(&mut ws, &mut focus, at);
+            assert_eq!(collapsed(&ws), Some(false), "a press expands it");
+
+            collapse(&mut ws);
+            let first = tab(&ws, 0);
+            let _ = route_accessibility_action(
+                &mut ws,
+                &mut focus,
+                None,
+                &HashMap::new(),
+                None,
+                None,
+                &request(first, accesskit::Action::Click),
+            );
+            assert_eq!(collapsed(&ws), Some(false), "an AT Click expands it");
+
+            collapse(&mut ws);
+            focus_on(&mut ws, &mut focus, first);
+            let scales = crate::test_workspace_scales();
+            let mut clipboard = FakeClipboard::default();
+            let _ = route_widget_key(
+                &mut ws,
+                &mut focus,
+                &mut None,
+                None,
+                None,
+                &scales,
+                false,
+                false,
+                Modifiers::none(),
+                Key::Named(NamedKey::Home),
+                None,
+                &mut clipboard,
+            );
+            assert_eq!(collapsed(&ws), Some(true), "an ignored key does not");
+        }
+
+        /// Review I4: nothing routes a grouped member's own
+        /// `Collapse`/`Expand`, so neither is declared on it; Layers, on its
+        /// own, keeps its disclosure actions.
+        #[test]
+        fn grouped_panels_do_not_advertise_their_own_collapse_or_expand() {
+            let mut ws = workspace();
+            let group = ws.panel_group.clone();
+            for collapsed in [true, false] {
+                if let Err(err) =
+                    aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, collapsed)
+                {
+                    unreachable!("{err:?}");
+                }
+                for panel in [ws.properties, ws.history] {
+                    let Some(node) = ws.tree.accessibility(panel.root) else {
+                        unreachable!("exists");
+                    };
+                    assert!(!node.supports_action(accesskit::Action::Collapse));
+                    assert!(!node.supports_action(accesskit::Action::Expand));
+                }
+            }
+            let layers = ws.tree.accessibility(ws.layers.root);
+            assert!(layers.is_some_and(|node| node.supports_action(accesskit::Action::Collapse)));
+        }
+
+        #[test]
+        fn the_selected_tab_round_trips_and_an_old_layout_still_loads() {
+            let dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(err) => unreachable!("{err}"),
+            };
+            let path = dir.path().join("workspace-layout.postcard");
+            let mut original = workspace();
+            crate::show_history_tab_for_test(&mut original);
+            crate::save_workspace_layout(&path, &original);
+            let mut loaded = workspace();
+            crate::load_workspace_layout(&path, &mut loaded);
+            assert_eq!((selected(&loaded), shown(&loaded)), (Some(1), Some(1)));
+
+            // A pre-0.164.0 file: no tab field at all.
+            let old = WorkspaceLayoutV1 {
+                rail_width: 320.0,
+                layers_collapsed: false,
+                properties_collapsed: true,
+                history_collapsed: false,
+            };
+            let bytes = match postcard::to_allocvec(&old) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err}"),
+            };
+            if let Err(err) = std::fs::write(&path, bytes) {
+                unreachable!("{err}");
+            }
+            let mut loaded = workspace();
+            crate::show_history_tab_for_test(&mut loaded);
+            crate::load_workspace_layout(&path, &mut loaded);
+            assert_eq!(
+                aurora_ui::rail_width(&loaded.tree, loaded.rail),
+                Some(320.0),
+                "an old layout still loads"
+            );
+            assert_eq!(selected(&loaded), Some(aurora_ui::PANEL_GROUP_TAB_DEFAULT));
+            assert_eq!(
+                aurora_ui::panel_group_is_collapsed(&loaded.tree, &loaded.panel_group).ok(),
+                Some(true),
+                "the default tab's saved collapse applies to the group"
+            );
+
+            // An out-of-range tab (a damaged or future file) is the default.
+            let damaged = WorkspaceLayout {
+                rail_width: 280.0,
+                layers_collapsed: false,
+                properties_collapsed: false,
+                history_collapsed: false,
+                panel_group_tab: 7,
+            };
+            let bytes = match postcard::to_allocvec(&damaged) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err}"),
+            };
+            if let Err(err) = std::fs::write(&path, bytes) {
+                unreachable!("{err}");
+            }
+            let mut loaded = workspace();
+            crate::show_history_tab_for_test(&mut loaded);
+            crate::load_workspace_layout(&path, &mut loaded);
+            assert_eq!(
+                aurora_ui::rail_width(&loaded.tree, loaded.rail),
+                Some(280.0)
+            );
+            assert_eq!(shown(&loaded), Some(aurora_ui::PANEL_GROUP_TAB_DEFAULT));
+        }
     }
 }

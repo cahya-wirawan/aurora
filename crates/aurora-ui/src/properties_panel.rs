@@ -481,10 +481,12 @@ mod tests {
             }
             ws.tree.compute_layout(1600.0, 900.0);
 
+            // 0.164.0: History is a hidden tab; the sibling slot checked
+            // is the group's tab row above Properties.
             let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
                 ws.tree.bounds(ws.layers.root),
                 ws.tree.bounds(ws.properties.root),
-                ws.tree.bounds(ws.history.root),
+                ws.tree.bounds(ws.panel_group.bar),
             ) else {
                 unreachable!("just laid out");
             };
@@ -501,7 +503,9 @@ mod tests {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let cap = crate::panel::content_panel_max_rows(&scales) as usize;
             #[allow(clippy::cast_possible_truncation)]
-            let expected = (21 * (1 + count.clamp(1, cap))) as u32;
+            // 0.164.0: grouped, Properties has no title row of its own
+            // (its tab is the title), so it is its rows alone.
+            let expected = (21 * count.clamp(1, cap)) as u32;
             assert_eq!(
                 properties_bounds.height, expected,
                 "content-sized up to the cap at {count} rows"

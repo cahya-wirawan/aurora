@@ -26,7 +26,43 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-09, 0.163.0): the status bar's zoom is physical, as in
+**Latest (2026-10-10, 0.164.0): Properties and History share one dock
+slot as tabs.** Workspace round 3 (Photoshop's layout convention, Aurora's
+own tokens). A new `aurora_ui::panel_group` module: a group is one rail
+column holding the existing `TabBar` (`Role::TabList`, one `Role::Tab`
+per member, roving focus) over its member panels, each still an ordinary
+`PanelHandle` (collapse, close, Content/Fill sizing, scroll body and
+linked scrollbar all unchanged). The default grouping is **Layers on its
+own, Properties + History as tabs, Properties selected** (Photoshop keeps
+Layers separate and groups History with other panels; Properties holds
+the Curves editor and the layer's settings, the panel reached for most).
+The shown member is a `Role::TabPanel` labelled by its tab; the hidden one
+is `Display::None`, AT-`hidden` (its subtree leaves the accessibility
+tree) and not a `Tab` stop, and keeps its scroll offset, content, sizing
+and collapsed state. A pointer click, `Left`/`Right`/`Home`/`End` on the
+focused tab and an assistive technology's `Click` (behind the modal gate)
+switch tabs — a new `WidgetOwner::PanelTabs` and
+`AccessibilityReaction::PanelTab`. Collapsing the group collapses every
+member to the tab row; the toggle commands select the panel's tab and
+expand the group (or collapse it when already shown), the close commands
+move the group to an open sibling (all closed: the group is hidden and its
+bar disabled), and the focus commands select the tab first. The 0.161.0
+Curves rule now selects the Properties tab, on the transition only and
+never for a closed panel. `WorkspaceLayout` gains `panel_group_tab`;
+older layouts (no field) load through a `WorkspaceLayoutV1` fallback and
+get the default tab. **Rail-to-icons is not in this round**: the design
+owner approved a narrow text-label strip (2026-10-10) as the next task.
+From this round **each task is on its own branch** (this one:
+`000-panel_tab_groups`). Review revision: focus never stays on a widget a
+panel change hid (`aurora_ui::refocus_out_of_hidden`, run by the tab bar,
+the panel commands and every `App::layout`), pressing the selected tab of
+a collapsed group expands it, grouped panels no longer advertise their own
+`Collapse`/`Expand`, and every accessibility update drops a dangling
+`labelled_by` id. 3,065 tests (3,045 + 13 + 7 from the revision). **Needs
+a human** on macOS with VoiceOver. Details: "Next action", addendum
+0.164.0.
+
+**Previously (2026-10-09, 0.163.0): the status bar's zoom is physical, as in
 Photoshop.** Three design-owner decisions (Cahya, 2026-10-09) on 0.162.0's
 status bar: **placement** stays under the canvas only (no change);
 **look** stays plain `Label` text with no background (no change); and
@@ -31004,6 +31040,167 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.164.0) — panel tab groups.** Branch
+`000-panel_tab_groups` (from `main` at 0.163.0); **from now on each task
+is on its own branch.** Files: `aurora-ui` new `panel_group.rs`
+(`PanelGroup`, `insert_panel_group`, `sync_panel_group`,
+`show_panel_group_tab`, `follow_panel_group_tab`,
+`set_panel_group_collapsed`, `panel_group_is_collapsed`/`_selected`/
+`_shown`/`_contains`, `is_panel_group_tab`; four tests), `panel.rs` (root
+style setters keep the root's `display`; `grouped_header_style`;
+`shown_children_floor`; a grouped panel's style change refreshes its
+group's root), `workspace.rs` (`Workspace::panel_group`,
+`PANEL_GROUP_LABEL`, `PANEL_GROUP_TAB_DEFAULT`, `toggle_workspace_panel`,
+`close_workspace_panel`, `select_panel_tab`, `show_workspace_panel`; one
+new test, layout tests adapted), `lib.rs` (re-exports), and tests adapted
+in `history_panel.rs`, `layers_panel.rs`, `properties_panel.rs`;
+`aurora-widgets` `text.rs` (a panel title is drawn only under a
+`Role::Region`); `aurora-app` `lib.rs` (`WidgetOwner::PanelTabs`,
+`follow_panel_tabs`, `AccessibilityReaction::PanelTab`, commands,
+`expand_properties_for_curves`, `WorkspaceLayout::panel_group_tab` with
+`WorkspaceLayoutV1`/`decode_workspace_layout`; eight new tests in
+`panel_scroll_tests::panel_tab_groups`, eleven adapted, none deleted).
+
+Design: a group is a rail column — tab bar first, then the member panels'
+roots. Grouped, a member's title slot is zero height (the tab names it;
+its `display` still marks a closed panel, so `panel_is_closed` works
+unchanged), its root is a `TabPanel` with `labelled_by` its tab (only a
+live tab id — `accesskit_consumer` unwraps every `labelled_by` id), and
+only the selected member is shown. The group's root mirrors the shown
+member's flex role plus a floor of tab row + member floor, so the group is
+exactly one slot and cannot overlap the next (the 0.144.1 lesson). The
+1274 × 672 and 1274 × 604 windows (Widget Gallery open) still show the
+full Curves editor — now with History as the hidden tab, the editor has
+the rest of the rail; the 0.161.0 end-to-end test also starts from the
+History tab, collapsed and expanded.
+
+Mutations (four files backed up to the scratchpad, mutated, `aurora-ui
+--lib` and the `aurora-app --lib` panel/Curves/command/layout filters run
+with `AURORA_REQUIRE_GPU=1`, restored, `touch`ed, sha256 checked — all
+four restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | tab click not routed (`route_widget_pointer` never follows) | killed: `a_pointer_click_on_a_tab_shows_its_panel_and_hides_the_other`, `scroll_offsets_and_sizing_survive_tab_switching` |
+| M2 | AT tab `Click` not routed | killed: `an_at_click_on_a_tab_shows_its_panel_and_hides_the_other_from_the_at_tree` |
+| M3 | hidden tab panel not AT-hidden | killed: the AT-click test |
+| M4 | Curves transition expands without selecting Properties | killed: `a_curves_transition_selects_the_properties_tab_once_and_respects_a_closed_panel`, `a_new_curves_layer_shows_the_images_histogram_in_a_visible_properties_editor` |
+| M5 | Curves rule fires every frame | killed: the Curves transition test, `properties_auto_expands_only_on_the_transition_to_a_curves_layer` |
+| M6 | selected tab not persisted | killed: `the_selected_tab_round_trips_and_an_old_layout_still_loads` |
+| M7 | old layout fails to load (no V1 fallback) | killed: the same test |
+| M8 | scroll offset reset on tab switch | killed: `scroll_offsets_and_sizing_survive_tab_switching` |
+| M9 | group collapse leaves bodies visible | killed: 6 tests incl. `collapsing_the_group_collapses_every_member_and_a_tab_switch_keeps_it_together`, `toggle_close_and_focus_commands_drive_the_group` |
+| M10 | toggle command does not select the tab | killed: the commands test, `activate_command_toggles_collapse_for_every_known_toggle_id` |
+| M11 | a panel style change drops the group's `display` | killed: `a_style_change_on_a_hidden_member_never_shows_it` |
+| M12 | closing the shown tab leaves it selected | killed: the commands and Curves transition tests |
+| M13 | group root ignores the shown member's flex role | killed: `build_workspace_has_a_canvas_area_and_three_docked_panels`, the commands test |
+| M14 | tab panel not labelled by its tab | killed: the AT-click test |
+| M15 | hidden tab panel stays a `Tab` stop | killed: `sync_is_idempotent_and_only_the_shown_tab_panel_is_a_tab_stop`, the AT-click test |
+
+Disclosures: (1) a closed member's tab stays in the tab row and choosing
+it reopens the panel empty until its next repopulation — the same
+contract the toggle command already had for a closed panel — rather than
+the tab disappearing; (2) *fixed in the review revision (I5)*: pressing or
+AT-clicking the already-selected tab of a collapsed group now expands it
+(a key on it still does not); (3) the AT tree was checked node by node
+(`labelled_by` targets exist, `hidden` set), not run through
+`accesskit_consumer` from `aurora-app` — the revision adds a scrub of
+dangling `labelled_by` ids in `WidgetTree::accessibility_update` (I3); (4) the tab bar paints its own
+tabs only — there is no group background behind the gaps between tabs;
+(5a) **group collapse has no single source of truth**: each member
+keeps its own collapsed flag, and the group functions keep them in step.
+A direct `set_panel_collapsed` on one grouped member would still desync
+them (a tab switch re-expands both); no app path does that — the only
+member-level route an assistive technology had, `Collapse`/`Expand` on the
+member's root, was never handled by the widget layer and is no longer
+declared on a grouped member (I4); (5b) *fixed in the review revision
+(I1)*: before it, focus could stay on a widget inside a panel a toggle,
+close, focus command or the Curves rule had just hidden
+(`FocusManager::validate` only drops ids that no longer exist), and keys
+still reached it; (5) the Windows cross-check (`cargo check --target x86_64-pc-windows-gnu
+-p aurora-ui`) could not run here (a C dependency needs
+`x86_64-w64-mingw32-gcc`), but this round adds no `#[cfg(...)]` code
+beyond `#[cfg(test)]`; (6) only the text-blind `compute_layout` path is
+asserted for the group; no real-GPU render or human has seen it.
+
+**Review revision (0.164.0).** Gate on the first candidate: 3,058 passed,
+0 failed, 61 ignored, 0 skipped under `AURORA_REQUIRE_GPU=1`; clippy,
+strict rustdoc, deny and contrast clean. Judge: REVISE (0.872). Outcomes:
+
+- **I1 (fixed)** — focus on a hidden widget. One repair,
+  `aurora_ui::refocus_out_of_hidden(tree, focus, group)`: when the focused
+  widget or an ancestor is `Display::None` or AT-`hidden`, focus moves to
+  the group's selected tab (if it was inside the group), else to the
+  nearest shown, focusable ancestor (a collapsed Layers panel's root —
+  the older ungrouped case is fixed by the same rule), else it is
+  cleared. `aurora-app`'s `refocus_out_of_hidden` runs it after the tab
+  bar (`follow_panel_tabs`), after the toggle/close/focus commands, and at
+  the start of every `App::layout` — the backstop that covers the Curves
+  rule, which relays out whenever it changes anything. A close frees the
+  body's widgets, so focus inside the closing panel is lifted to its root
+  first. Tests: `toggle_close_and_focus_commands_move_focus_out_of_a_hidden_tab`,
+  `collapsing_layers_moves_focus_from_its_body_to_the_panel`,
+  `a_tab_switch_moves_focus_out_of_the_panel_it_hides`,
+  `the_curves_rule_moves_focus_out_of_the_history_tab_it_hides` (through
+  the curves test shell's sync-then-layout loop, which mirrors
+  `App::layout`).
+- **I2 (fixed)** — `follow_panel_tabs`' doc now matches what it does;
+  disclosures (5a) and (5b) added above.
+- **I3 (done)** — `WidgetTree::accessibility_update` drops any
+  `labelled_by` id the tree no longer holds; test
+  `accessibility_update_drops_a_dangling_labelled_by_id`.
+- **I4 (checked)** — no `aurora-app` path routes a panel root's
+  `Collapse`/`Expand` (the widget layer handles them only for tree items
+  and dropdowns), so a grouped member no longer declares them: stripped in
+  `sync_panel_group` and skipped by `set_panel_collapsed` for a
+  `Role::TabPanel`. Layers keeps them. Test
+  `grouped_panels_do_not_advertise_their_own_collapse_or_expand`.
+- **I5 (fixed)** — `follow_panel_group_tab(.., activated)`: a pointer
+  press or an AT `Click` on the selected tab of a collapsed group expands
+  it; a key or a hover does not. Test
+  `activating_the_selected_tab_of_a_collapsed_group_expands_it`.
+
+Revision mutations (same procedure; all restored, `touch`ed, sha256 OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| R1 | the focus repair never moves focus | killed: all four I1 tests |
+| R2 | the layout backstop removed (curves shell, mirroring `App::layout`) | killed: `the_curves_rule_moves_focus_out_of_the_history_tab_it_hides` |
+| R3 | close does not lift focus before freeing the body | killed: `toggle_close_and_focus_commands_move_focus_out_of_a_hidden_tab` |
+| R4 | re-press of the selected collapsed tab does not expand | killed: `activating_the_selected_tab_of_a_collapsed_group_expands_it` |
+| R5 | any input (keys too) expands | killed: the same test |
+| R6a / R6b | `Collapse`/`Expand` kept by `sync` / re-added by `set_panel_collapsed` alone | each **survived** — the two are deliberately redundant |
+| R6c | both together | killed: `grouped_panels_do_not_advertise_their_own_collapse_or_expand` |
+| R7 | `labelled_by` scrub removed | killed: `accessibility_update_drops_a_dangling_labelled_by_id` |
+
+**Rail-to-icons: approved — a narrow text-label strip (design owner,
+2026-10-10), next task.** One button per panel with short text labels
+(for example "Lay", "Prop", "Hist") until an icon set is chosen; on its
+own branch, not part of 0.164.0.
+
+**Measured after the revision:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **3,065 passed, 0 failed, 61 ignored, 0 skipped**,
+strict rustdoc, `cargo deny`, contrast exit 0. Judge round 2: **PASS
+0.911** — the refocus repair judged from declared state (so a panel
+un-hidden before `App::layout` is never mistaken for hidden), the I5
+expand idempotent (Down then Up cannot re-collapse), the `labelled_by`
+scrub linear in an already-O(n) pass. Its notes, recorded: focus moved
+inside `App::layout` could leave IME/caret state one sync behind if a
+call site does not re-sync afterwards (not checked); the scrub hides a
+stale `labelled_by` at output rather than fixing it at its source; with
+every member closed focus is cleared rather than moved to a stable
+target such as the canvas. Branch: `000-panel_tab_groups` (the first
+under the one-branch-per-task rule).
+
+**Needs a human:** on macOS, switch the Properties/History tabs (pointer
+and arrow keys) and check VoiceOver announces the tab list, each tab and
+its selected state, and the shown tab panel.
+
+**Suggested next:** the rail strip — collapse the right rail to a narrow
+strip of text-label buttons (approved 2026-10-10); then drag-to-redock
+and floating panels plus persisted layout (workspace round 4).
 
 **Addendum 2026-10-09 (0.163.0) — the status bar's zoom is physical.**
 Design-owner decisions (Cahya, 2026-10-09) on 0.162.0's open items:

@@ -662,7 +662,10 @@ fn dialog_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
 fn panel_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
     let parent = tree.parent(id)?;
     let node = tree.accessibility(id)?;
+    // Only under a `Region` (0.164.0): a panel in a tab group is a
+    // `TabPanel` whose tab names it, and its title slot is zero height.
     let is_slot = matches!(tree.payload(parent)?, WidgetKind::Panel)
+        && tree.accessibility(parent)?.role() == accesskit::Role::Region
         && node.role() == accesskit::Role::GenericContainer
         && node.label().is_none()
         && tree.children(parent)?.first() == Some(&id);
