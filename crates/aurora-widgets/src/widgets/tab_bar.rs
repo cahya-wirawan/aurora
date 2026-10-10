@@ -592,6 +592,88 @@ pub fn select_tab(
     with_tab_bar_mut(tree, bar, |state| state.apply_select(bar, index))
 }
 
+/// Replaces the bar's tab labels and selection in place (0.173.0, the
+/// document tab strip): the tabs that stay keep their widget ids — a
+/// grown list appends tabs, a shrunk one removes only the tail — so
+/// keyboard focus resting on a surviving tab survives the relabel.
+/// Removing and re-inserting the bar instead would drop it.
+///
+/// A focused tab removed from the tail is gone; the caller validates
+/// focus, as after any removal.
+///
+/// # Errors
+///
+/// Nothing is changed when `labels` is empty or `selected` does not index
+/// it ([`WidgetError::IndexOutOfRange`]), when `bar` is not a tab bar
+/// ([`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`]), or
+/// when a tab the bar records is no longer its child
+/// ([`WidgetError::UnknownWidget`]). A tree error while tabs are being
+/// added or removed returns with the bar's recorded tabs reconciled to
+/// the tab widgets that exist (the next call then rebuilds them).
+pub fn set_tab_labels(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    labels: Vec<String>,
+    selected: usize,
+) -> Result<(), WidgetError> {
+    if selected >= labels.len() {
+        return Err(WidgetError::IndexOutOfRange {
+            index: selected,
+            len: labels.len(),
+        });
+    }
+    let current = state(tree, bar)?;
+    let mut tabs = current.tabs.clone();
+    let style = tab_style(current.metrics);
+    let disabled = current.disabled;
+    let len = labels.len();
+    // Review D-2: validated before anything changes — every recorded tab
+    // must still be a child of the bar — so the only failures left below
+    // are the tree's own, and those are reconciled rather than leaving
+    // `state.tabs` naming widgets that are gone.
+    if tabs.iter().any(|&tab| tree.parent(tab) != Some(bar)) {
+        return Err(WidgetError::UnknownWidget(bar));
+    }
+    let resized = (|| -> Result<(), WidgetError> {
+        while tabs.len() > len {
+            if let Some(tab) = tabs.pop() {
+                tree.remove(tab)?;
+            }
+        }
+        while tabs.len() < len {
+            let index = tabs.len();
+            // Placeholder payload and node; `reconcile` (through
+            // `with_tab_bar_mut`) writes the real label and state below.
+            tabs.push(tree.insert(
+                bar,
+                style.clone(),
+                tab_node("", index, len, false, disabled),
+                WidgetKind::Tab(TabState {
+                    label: String::new(),
+                    selected: false,
+                    disabled,
+                }),
+            )?);
+        }
+        Ok(())
+    })();
+    if let Err(err) = resized {
+        // The tab widgets that exist now, whatever the failure left; the
+        // label count no longer matches, so the next call rebuilds.
+        let live = tab_children(tree, bar);
+        if let Some(WidgetKind::TabBar(state)) = tree.payload_mut(bar) {
+            state.tabs = live;
+        }
+        return Err(err);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.labels = labels;
+        state.selected = selected;
+        state.tabs = tabs;
+        Ok(())
+    })
+}
+
 /// Enables or disables `bar` and every tab in it. A request that matches
 /// the current state changes nothing — no damage.
 ///
@@ -767,7 +849,7 @@ fn rebuild_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), 
 mod tests {
     use super::{
         TabBarKey, TabBarOutcome, TabBarState, TabMetrics, handle_tab_bar_key, insert_tab_bar,
-        select_tab, set_tab_bar_disabled, tab_bar_state,
+        select_tab, set_tab_bar_disabled, set_tab_labels, tab_bar_state,
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
@@ -1710,5 +1792,123 @@ mod tests {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = row_height(&scales) as u32;
         assert_eq!(bounds.height, row, "one row tall, not the parent's 200");
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    fn bar_labels(tree: &WidgetTree<WidgetKind>, bar: WidgetId) -> (Vec<String>, usize) {
+        match tab_bar_state(tree, bar) {
+            Ok(state) => (state.labels().to_vec(), state.selected()),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// 0.173.0: a relabel keeps every surviving tab's widget id (so focus
+    /// on one survives), appends or trims only the tail, updates labels,
+    /// selection and the AT nodes, and leaves a sound structure.
+    #[test]
+    fn set_tab_labels_relabels_in_place_and_focus_survives() {
+        let (mut tree, bar) = inserted(0);
+        let before = match tab_bar_state(&tree, bar) {
+            Ok(state) => state.tabs().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(&first) = before.first() else {
+            unreachable!("four tabs")
+        };
+        let mut focus = crate::FocusManager::new();
+        if let Err(err) = focus.focus(&mut tree, first) {
+            unreachable!("{err:?}");
+        }
+        // Same count, new names, same selection: every id kept.
+        assert_eq!(before.len(), 3);
+        let renamed = strings(&["a.png", "b.psd", "c.aur"]);
+        assert!(set_tab_labels(&mut tree, bar, renamed.clone(), 0).is_ok());
+        assert_eq!(bar_labels(&tree, bar), (renamed, 0));
+        let after = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        assert_eq!(after, before, "no tab was re-inserted");
+        assert!(tree.contains(first));
+        assert_eq!(focus.focused(), Some(first), "focus survived the relabel");
+        assert_eq!(
+            tree.accessibility(first).and_then(accesskit::Node::label),
+            Some("a.png")
+        );
+        assert_structure_is_sound(&tree, bar);
+        // Grow: the first three ids kept, two appended, selection moved.
+        assert!(set_tab_labels(&mut tree, bar, strings(&["a", "b", "c", "d", "e"]), 4).is_ok());
+        let grown = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        assert_eq!(grown.len(), 5);
+        assert_eq!(grown.get(..3), before.get(..3));
+        assert_eq!(bar_labels(&tree, bar).1, 4);
+        let Some(&last) = grown.last() else {
+            unreachable!("five tabs")
+        };
+        let node = tree.accessibility(last).cloned();
+        assert_eq!(node.as_ref().map(accesskit::Node::role), Some(Role::Tab));
+        assert_eq!(
+            node.as_ref().and_then(accesskit::Node::is_selected),
+            Some(true)
+        );
+        assert_eq!(
+            node.as_ref().and_then(accesskit::Node::size_of_set),
+            Some(5)
+        );
+        assert_structure_is_sound(&tree, bar);
+        // Shrink: only the tail goes; the focused first tab stays.
+        assert!(set_tab_labels(&mut tree, bar, strings(&["only"]), 0).is_ok());
+        let shrunk = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        assert_eq!(shrunk, vec![first]);
+        assert!(!tree.contains(last));
+        assert_eq!(focus.focused(), Some(first));
+        assert_structure_is_sound(&tree, bar);
+    }
+
+    #[test]
+    fn set_tab_labels_refuses_an_out_of_range_selection_and_changes_nothing() {
+        let (mut tree, bar) = inserted(1);
+        let before = bar_labels(&tree, bar);
+        assert!(matches!(
+            set_tab_labels(&mut tree, bar, strings(&["x"]), 1),
+            Err(WidgetError::IndexOutOfRange { index: 1, len: 1 })
+        ));
+        assert!(matches!(
+            set_tab_labels(&mut tree, bar, Vec::new(), 0),
+            Err(WidgetError::IndexOutOfRange { index: 0, len: 0 })
+        ));
+        assert_eq!(bar_labels(&tree, bar), before);
+    }
+
+    /// Review D-2: a bar whose recorded tab is no longer its child is
+    /// refused before anything changes.
+    #[test]
+    fn set_tab_labels_refuses_a_bar_whose_tab_is_gone_and_changes_nothing() {
+        let (mut tree, bar) = inserted(0);
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        let Some(&last) = tabs.last() else {
+            unreachable!("three tabs")
+        };
+        assert!(tree.remove(last).is_ok());
+        let before = bar_labels(&tree, bar);
+        let children = tree.children(bar).map(<[WidgetId]>::to_vec);
+        assert!(matches!(
+            set_tab_labels(&mut tree, bar, strings(&["a", "b", "c", "d"]), 3),
+            Err(WidgetError::UnknownWidget(id)) if id == bar
+        ));
+        assert_eq!(bar_labels(&tree, bar), before);
+        assert_eq!(
+            tree.children(bar).map(<[WidgetId]>::to_vec),
+            children,
+            "no tab added or removed"
+        );
     }
 }

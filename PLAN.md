@@ -26,7 +26,47 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.172.0): several open documents and switching
+**Latest (2026-10-10, 0.173.0): the visible document tab strip
+(document tabs, round R4 of six).** A one-row strip of document tabs now
+sits at the top of the canvas column, under the options bar and above
+the canvas (`aurora_ui::document_tabs`, `Workspace::document_tabs`), so
+the canvas area is one row shorter. It is the toolkit's own `TabBar` — a
+`Role::TabList` labelled "Documents", one `Role::Tab` per open document
+named after it, in tab order with the active one selected — relabelled
+in place by a new generic `aurora_widgets::widgets::set_tab_labels(tree,
+bar, labels, selected)`, which keeps every surviving tab's widget id
+(growing appends, shrinking removes only the tail), so focus resting on
+the strip survives a relabel. The canvas area is the strip's
+`Role::TabPanel`, `labelled_by` the selected tab (0.164.0's panel-group
+pattern, `link_document_panel`, never a dangling id). **Switching from the
+strip**: a pointer click, the arrow keys on the focused strip and an
+assistive technology's `Click` each only move the strip's selection (the
+widget's own behaviour, routed as the new `WidgetOwner::DocumentTabs` /
+`AccessibilityReaction::DocumentTab`); a per-loop catch-all
+(`App::follow_document_tabs_now` → `document_tabs::follow_document_tabs`)
+then switches through the very `switch_document` `Ctrl+Tab` runs, or puts
+the strip back when the switch is refused (a modal, a panel drag). Every
+switch, open, New Document and failed-open revert re-syncs the strip from
+`bind_active_document` (`sync_document_tab_bar`), and `App::new` syncs it
+once for a recovered set; a switch from the strip keeps focus on its
+selected tab, and focus is never left on a removed tab. **Overflow: the
+tabs shrink** — equal shares of the strip, labels ellipsized by the
+paint's existing tab-label `TextOverflow::Ellipsis` — rather than a
+scrolling strip, since the toolkit has only vertical scroll containers;
+every document stays visible and clickable, at the cost of legibility past
+a dozen or so. In a window too short for the options bar, strip and status
+bar together, the strip (min height 0) shrinks so the status bar keeps the
+window's bottom edge. The strip is not part of the saved workspace layout
+or presets (nothing persisted changed). **R3 carry-over R-1 closed**: a
+park autosave is skipped when the outgoing session's `UndoOrder::revision`
+(moved by every recorded, undone or redone step) equals the one its last
+park autosave was requested at (`DocumentSession::autosaved_revision`;
+`None` until the first park, so a first park always writes; since the
+review revision it is skipped only once that autosave has landed
+complete, so a failed or partial one is retried). Per-document
+panel scroll stays R6. See the 0.173.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.172.0): several open documents and switching
 between them (document tabs, round R3 of six — no tab bar yet, that is
 R4).** `App::doc` stays the active `DocumentSession`; the others wait,
 intact, on a `DocumentShelf` (`parked: Vec<DocumentSession>` in tab order
@@ -31610,6 +31650,103 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.173.0) — the document tab strip (R4).**
+
+Changed: `aurora-widgets` (`set_tab_labels` + 2 tests), `aurora-ui`
+(new `document_tabs` module, `Workspace::document_tabs`, the canvas
+column's layout test, the tab-order test, a new strip/`TabPanel` test),
+`aurora-app` (`document_tabs.rs`: `tab_labels`,
+`sync_document_tab_bar`, `follow_document_tabs`, the R-1 check;
+`document_session.rs`: `autosaved_revision`; `lib.rs`:
+`WidgetOwner::DocumentTabs`, `AccessibilityReaction::DocumentTab`,
+`App::follow_document_tabs_now`, the startup sync; three existing tests'
+pointer/wheel coordinates and the focus-order test updated for the
+strip). Tests added: `aurora_widgets` `set_tab_labels_relabels_in_place_and_focus_survives`,
+`set_tab_labels_refuses_an_out_of_range_selection_and_changes_nothing`;
+`aurora_ui` `the_document_tab_strip_is_a_tab_list_and_the_canvas_its_tab_panel`;
+`aurora-app` `document_tabs_tests::{the_tab_strip_lists_every_document_and_follows_open_new_switch_and_recovery,
+click_keyboard_and_at_on_the_tab_strip_switch_like_ctrl_tab,
+the_canvas_is_one_row_shorter_and_pointer_mapping_holds_at_scale_1_and_2,
+the_tab_strip_is_not_part_of_the_saved_layout,
+an_unchanged_parked_document_is_not_autosaved_again}`.
+
+| Mutation (RTX 3090, `AURORA_REQUIRE_GPU=1`) | Result |
+|---|---|
+| N1 the strip not updated on a switch | killed (2) |
+| N2 a strip selection not routed to `switch_document` | killed (1) |
+| N3 the canvas area not shortened (strip taken out of flow) | killed (5: the scale-1/2 mapping test and four radius-slider drag tests whose pointer positions move) |
+| N4 `set_tab_labels` drops focus (re-inserts every tab) | killed (1: the widget test) |
+| N5 the AT `TabPanel` link missing | killed (1) |
+| N6 R-1's unchanged check removed | killed (1) |
+| N7 focus not moved to the strip's selected tab after a switch | survived the first run (the strip's own arrow/click handling already focuses the new tab), so `focus_on_the_strip_follows_a_ctrl_tab_switch_to_the_selected_tab` was added for the case it guards (`Ctrl+Tab` with focus on the strip); re-run: killed (1) |
+
+Gate (one pass after the last code change, RTX 3090, Vulkan,
+`AURORA_REQUIRE_GPU=1`): fmt, layering, hardcoded-style, `check --locked`,
+clippy, **3,245 passed, 0 failed, 61 ignored** (9 new), rustdoc
+`-D warnings`, `cargo deny` and contrast green. The mutations ran before
+the last edits, which were lint- and doc-only (`# Errors` sections, test
+`allow`s) plus the strip's zero minimum height spelled
+`Dimension::ZERO` instead of a literal `length(0.0)` (the same value; the
+hardcoded-style check flagged the literal).
+
+**Review revision (0.173.0, judge REVISE 0.89).** **R-1 (required,
+fixed): the park autosave recorded its revision unconditionally** — also
+when the UI-thread snapshot failed or was partial, or when the worker's
+write failed — so a later park at the same revision never retried and an
+edit could stay unsaved. Now `request_autosave`/`request_autosave_within`
+return the generation of a *complete* autosave they submitted or wrote
+(`None` for a failed or partial snapshot, a dropped job, or a synchronous
+over-budget write that did not rewrite the canonical file), the session
+stores `park_autosave: (revision, generation)`, and a park is skipped
+only when the revision is unchanged **and** the worker's per-document
+landed generation (new `AutosaveWorker::landed`) has reached it; a failed
+write never advances it. **D-1 (fixed)**: the strip follower now switches
+only when the strip's selection differs from the one the code last wrote
+(`DocumentShelf::strip_selection`, cleared when a sync fails), so a
+stale selection left by a failed sync cannot switch back every loop.
+**D-2 (fixed)**: `set_tab_labels` checks that every recorded tab is still
+the bar's child before changing anything, and on a tree error part-way it
+reconciles the bar's recorded tabs to the widgets that exist; its doc now
+says exactly when nothing changes. Tests added (4):
+`document_tabs_tests::{a_failed_park_write_is_retried_and_a_landed_one_is_skipped,
+a_partial_park_snapshot_is_retried, the_strip_follower_ignores_a_selection_no_sync_wrote}`,
+`aurora_widgets` `set_tab_labels_refuses_a_bar_whose_tab_is_gone_and_changes_nothing`.
+The partial-snapshot test removes an evicted tile's scratch file, so
+which of "failed" or "partial" the snapshot returns is not separately
+pinned; both take the same `None` path.
+
+| Revision mutation | Result |
+|---|---|
+| U1 skip without checking the write landed (only that something landed) | killed (1, after the failed-write test gained a landed-then-failed sequence; the first version survived) |
+| U2 revision recorded unconditionally | killed (1) |
+| D1 follower trusts a selection no sync wrote | killed (1) |
+| D2 `set_tab_labels` not validated first | killed (1) |
+
+Gate after the review revision (one pass after the last code change,
+RTX 3090, `AURORA_REQUIRE_GPU=1`): fmt, layering, hardcoded-style,
+`check --locked`, clippy, **3,249 passed, 0 failed, 61 ignored** (13 new
+this round), rustdoc `-D warnings`, `cargo deny` and contrast green.
+Stress: the 120 autosave and document-tab tests, 20 runs under 12 `yes`
+processes: 20/20 passed, slowest 2.14 s.
+
+**Not verified, stated plainly**: the App-level wiring
+(`App::follow_document_tabs_now`, the startup strip sync, the
+`switch_context` park autosave) is untested — it needs a window — and
+nothing in this round was run on real hardware or with a screen reader.
+
+No new tokens: the strip uses `TabBar`'s existing token styling, and the
+gallery's TabBar entry is unchanged (the API gained a function, not a
+visible state), so no gallery change and no new contrast pair.
+**Design-owner questions (Cahya)**: whether the strip should eventually
+scroll instead of shrinking tabs, the strip's height and padding (it uses
+`TabBar`'s own `spacing.xs`/`sm` and `row_height`), and whether the active
+tab needs a stronger marker than `TabBar`'s selected state. **Not
+verified**: real hardware, interactive feel, a real screen reader on the
+strip and its `TabPanel` link, HiDPI rendering of ellipsized tab labels;
+the App-level catch-all (`follow_document_tabs_now`) and the startup sync
+are wiring covered through the free functions they call. No close button
+(R6) or dirty marker (R5).
 
 **Addendum 2026-10-10 (0.172.0) — several open documents and switching (R3).**
 

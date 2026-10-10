@@ -2061,7 +2061,7 @@ fn request_autosave(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-) {
+) -> Option<background_autosave::Generation> {
     request_autosave_within(
         worker,
         AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
@@ -2072,7 +2072,7 @@ fn request_autosave(
         canvas_size,
         skipped,
         store,
-    );
+    )
 }
 
 /// [`request_autosave`] with the snapshot budget passed in, so a test can
@@ -2093,23 +2093,38 @@ fn request_autosave_within(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-) {
+) -> Option<background_autosave::Generation> {
+    // 0.173.0 review (R-1): the generation of a *complete* autosave this
+    // call submitted (or wrote), `None` when there is none — a failed or
+    // partial snapshot, a dropped job, a failed synchronous write — so a
+    // caller can tell "saved once it lands" from "not saved at all".
     match snapshot_autosave(path, layers, history, canvas_size, skipped, budget, store) {
         SnapshotOutcome::Taken(mut job) => {
             job.document = document;
-            let _generation = worker.submit(job);
+            let complete = job.destination == job.path;
+            let generation = worker.submit(job);
+            generation.filter(|_| complete)
         }
         SnapshotOutcome::OverBudget => {
             tracing::info!("the document is too large to snapshot; autosaving on the UI thread");
-            let _generation = worker.supersede(document);
+            let generation = worker.supersede(document);
+            let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            let before = modified(path);
             write_autosave(path, layers, history, canvas_size, skipped, store);
+            // Complete only if the canonical file was (re)written: a
+            // failed write leaves it as it was, and a partial one goes to
+            // the partial path. A coarse file clock can only err towards
+            // "not written", which a caller retries.
+            let after = modified(path);
+            let written = after.is_some() && after != before;
             // Written (complete or partial) on this thread, so the index
             // may name it now (0.171.0).
             if path.exists() || partial_autosave_path(path).exists() {
                 let _indexed = worker.note_written(document);
             }
+            written.then_some(generation)
         }
-        SnapshotOutcome::Failed => {}
+        SnapshotOutcome::Failed => None,
     }
 }
 
@@ -4452,6 +4467,8 @@ enum AccessibilityReaction {
     /// layer selected (or focused) a tab, and [`follow_panel_tabs`] has
     /// already shown its panel; the caller lays out again.
     PanelTab(aurora_widgets::ActionOutcome),
+    /// An action on a document tab (0.173.0).
+    DocumentTab(aurora_widgets::ActionOutcome),
     /// A `Click` on a button of the collapsed rail's label strip (0.165.0):
     /// [`open_from_panel_strip`] has already expanded the rail with that
     /// button's panel shown; the caller lays out again.
@@ -4535,6 +4552,12 @@ fn route_accessibility_action(
     // and the panel it names is then shown, here, past the modal gate.
     let on_panel_tabs = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
         && aurora_ui::is_panel_group_tab(&workspace.tree, request.target_node);
+    let on_document_tabs = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
+        && aurora_ui::is_document_tab(
+            &workspace.tree,
+            workspace.document_tabs,
+            request.target_node,
+        );
     let handled = aurora_widgets::handle_action(&mut workspace.tree, focus, request);
     if on_panel_tabs && handled.is_ok() {
         follow_panel_tabs(
@@ -4546,6 +4569,9 @@ fn route_accessibility_action(
     }
     match handled {
         Ok(outcome) if on_panel_tabs => AccessibilityReaction::PanelTab(outcome),
+        // 0.173.0: the strip's selection moved; the switch follows it
+        // (`document_tabs::follow_document_tabs`, every loop iteration).
+        Ok(outcome) if on_document_tabs => AccessibilityReaction::DocumentTab(outcome),
         Ok(aurora_widgets::ActionOutcome::Activated(id)) => {
             if let Some(action) = dialog.and_then(|handle| handle.action_id(id)) {
                 AccessibilityReaction::DialogAction(Some(action.to_owned()))
@@ -5014,6 +5040,9 @@ fn apply_accessibility_action(
         }
         AccessibilityReaction::PanelTab(outcome) => {
             tracing::debug!(?outcome, "accessibility action on a panel tab");
+        }
+        AccessibilityReaction::DocumentTab(outcome) => {
+            tracing::debug!(?outcome, "accessibility action on a document tab");
         }
         AccessibilityReaction::PanelStrip(panel) => {
             tracing::debug!(?panel, "accessibility click on a panel strip button");
@@ -5759,6 +5788,9 @@ enum WidgetOwner {
     /// `aurora_ui::PanelStrip`): an activation (a pointer click,
     /// `Space`/`Enter`) runs [`open_from_panel_strip`].
     PanelStrip,
+    /// The document tab strip (0.173.0): the bar changes its own
+    /// selection; `App::follow_document_tabs_now` then switches.
+    DocumentTabs,
 }
 
 /// A label-strip button's action (0.165.0): expands the rail with the
@@ -6186,6 +6218,9 @@ fn widget_owner(
     }
     if aurora_ui::is_panel_group_tab(tree, id) {
         return Some(WidgetOwner::PanelTabs);
+    }
+    if aurora_ui::is_document_strip_tab(tree, id) {
+        return Some(WidgetOwner::DocumentTabs);
     }
     if aurora_ui::is_panel_strip_button(tree, id) {
         return Some(WidgetOwner::PanelStrip);
@@ -21502,7 +21537,7 @@ impl App {
         // (the `scale_factor` field below); `resumed` re-syncs it.
         let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size, 1.0);
 
-        Self {
+        let mut app = Self {
             window: None,
             gpu: None,
             surface: None,
@@ -21578,7 +21613,16 @@ impl App {
                 window_focused: true,
                 reduced_motion,
             },
-        }
+        };
+        // 0.173.0: the tab strip shows every startup document (several
+        // after a crash recovery) with the active one selected.
+        let _ = document_tabs::sync_document_tab_bar(
+            &mut app.workspace,
+            &mut app.focus,
+            &mut app.shelf,
+            &app.doc,
+        );
+        app
     }
 
     /// Whether the app exited because of an earlier unrecoverable error,
@@ -21732,9 +21776,13 @@ impl App {
                 // (`route_widget_key` -> `follow_panel_tabs`).
                 // A strip key has already expanded the rail
                 // (`route_widget_key` -> `open_from_panel_strip`).
+                // A document tab key has already moved the strip's
+                // selection; `follow_document_tabs_now` (every loop
+                // iteration) switches to it.
                 WidgetOwner::Gallery
                 | WidgetOwner::PanelScrollbar
                 | WidgetOwner::PanelTabs
+                | WidgetOwner::DocumentTabs
                 | WidgetOwner::PanelStrip => {}
             }
             self.relayout_after_gallery();
@@ -22077,6 +22125,21 @@ impl App {
         };
         tracing::debug!(?outcome, raw, "document switch");
         if outcome == document_tabs::SwitchOutcome::Switched {
+            self.after_document_change();
+        }
+    }
+
+    /// The catch-all for the document tab strip (0.173.0), run once per
+    /// event-loop iteration: a click, arrow key or assistive-technology
+    /// `Click` on the strip moves its selection, and this switches to it
+    /// through the same `switch_document` `Ctrl+Tab` runs (or puts the
+    /// strip back when the switch is refused).
+    fn follow_document_tabs_now(&mut self) {
+        let outcome = {
+            let mut cx = self.switch_context();
+            document_tabs::follow_document_tabs(&mut cx)
+        };
+        if outcome == Some(document_tabs::SwitchOutcome::Switched) {
             self.after_document_change();
         }
     }
@@ -25616,6 +25679,7 @@ impl ApplicationHandler<AppEvent> for App {
         // drain, so a menu command's own change is mirrored this
         // iteration, not the next (critic C5).
         self.sync_ime();
+        self.follow_document_tabs_now();
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
         self.sync_curves_controls_now();
@@ -32288,6 +32352,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // 0.173.0 added the strip's stop
     fn run_command_focus_next_visits_every_docked_panel_in_order() {
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
@@ -32316,6 +32381,26 @@ mod tests {
             );
             assert_eq!(focus.focused(), Some(button));
         }
+        // 0.173.0: then the document tab strip's selected tab.
+        let _ = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &crate::ToolSettings::default(),
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::FocusNext,
+        );
+        assert_eq!(
+            focus.focused(),
+            aurora_widgets::widgets::tab_bar_state(&workspace.tree, workspace.document_tabs)
+                .ok()
+                .and_then(aurora_widgets::widgets::TabBarState::selected_tab)
+        );
         let _ = run_command(
             &mut workspace,
             &mut focus,
@@ -59056,8 +59141,8 @@ mod tests {
         let (ox, oy) = canvas_origin(&workspace);
         assert!(ox > 0.0 && oy > 0.0, "the canvas is offset: {ox}, {oy}");
         assert_eq!(
-            pointer_in_canvas(&workspace, (100.0, 50.0)),
-            Some((100.0 - ox, 50.0 - oy))
+            pointer_in_canvas(&workspace, (100.0, oy + 12.0)),
+            Some((100.0 - ox, 12.0))
         );
         assert_eq!(pointer_in_canvas(&workspace, (ox, oy)), Some((0.0, 0.0)));
         assert_eq!(
@@ -71780,12 +71865,12 @@ mod panel_scroll_tests {
     fn a_wheel_over_the_canvas_zooms_and_never_scrolls_a_panel() {
         let (workspace, _, _) = crowded(200);
         assert!(matches!(
-            wheel_target(&workspace, (100.0, 50.0), false, false),
+            wheel_target(&workspace, (100.0, 100.0), false, false),
             WheelTarget::Canvas(_)
         ));
         // ...and still does while a drag owns the pointer.
         assert!(matches!(
-            wheel_target(&workspace, (100.0, 50.0), false, true),
+            wheel_target(&workspace, (100.0, 100.0), false, true),
             WheelTarget::Canvas(_)
         ));
         assert_eq!(workspace.tree.scroll_y(workspace.layers.body), Some(0.0));

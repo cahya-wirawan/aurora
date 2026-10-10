@@ -81,13 +81,26 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
     let Some(park) = cx.autosave.as_mut() else {
         return false;
     };
+    // R-1 (0.173.0, review-revised): unchanged since its last park
+    // autosave — every recorded, undone or redone step moves the revision
+    // — *and* that autosave landed complete, so nothing new to write.
+    let revision = cx.doc.undo_order.revision;
     let id = cx.doc.id.get();
+    if let Some((saved, generation)) = cx.doc.park_autosave
+        && saved == revision
+        && park
+            .worker
+            .landed(id)
+            .is_some_and(|landed| landed >= generation)
+    {
+        return false;
+    }
     let path = park.namespace.session_path(id);
     let Some(store) = cx.doc.tile_store.as_mut() else {
         tracing::warn!(id, "no tile store; the parked document is not autosaved");
         return false;
     };
-    crate::request_autosave(
+    let submitted = crate::request_autosave(
         park.worker,
         &path,
         id,
@@ -97,6 +110,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
         &mut cx.doc.skipped_tiles,
         store,
     );
+    cx.doc.park_autosave = submitted.map(|generation| (revision, generation));
     true
 }
 
@@ -204,6 +218,7 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
     if let Some(residency) = cx.residency.as_deref_mut() {
         residency.forget_slots();
     }
+    let _ = sync_document_tab_bar(cx.workspace, cx.focus, cx.shelf, cx.doc);
     cx.focus.validate(&cx.workspace.tree);
     let _ = sync_status_bar(
         cx.workspace,
@@ -414,4 +429,92 @@ pub(crate) fn sync_autosave_sessions(
     key: crate::autosave_files::RunKey,
 ) -> bool {
     worker.set_sessions(index_entries(shelf, active, key), Some(active.id.get()))
+}
+
+/// Every open document's name in tab order, and the active one's index.
+pub(crate) fn tab_labels(shelf: &DocumentShelf, active: &DocumentSession) -> (Vec<String>, usize) {
+    let order = shelf.tab_order(active);
+    let selected = order.iter().position(|&id| id == active.id).unwrap_or(0);
+    let labels = order
+        .into_iter()
+        .map(|id| {
+            if id == active.id {
+                active.name.clone()
+            } else {
+                shelf
+                    .get(id)
+                    .map_or_else(String::new, |session| session.name.clone())
+            }
+        })
+        .collect();
+    (labels, selected)
+}
+
+/// Shows every open document on the tab strip with the active one
+/// selected (0.173.0), and relinks the canvas `TabPanel`. Focus resting on
+/// the strip moves to the selected tab (a switch from the bar keeps focus
+/// on the bar); focus is never left on a removed tab.
+pub(crate) fn sync_document_tab_bar(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    shelf: &mut DocumentShelf,
+    active: &DocumentSession,
+) -> bool {
+    let bar = workspace.document_tabs;
+    let on_bar = focus
+        .focused()
+        .is_some_and(|id| aurora_ui::is_document_tab(&workspace.tree, bar, id));
+    let (labels, selected) = tab_labels(shelf, active);
+    if let Err(err) = aurora_ui::sync_document_tabs(
+        &mut workspace.tree,
+        bar,
+        workspace.canvas_area,
+        labels,
+        selected,
+    ) {
+        tracing::warn!(?err, "failed to update the document tab strip");
+        shelf.strip_selection = None;
+        return false;
+    }
+    shelf.strip_selection = Some(selected);
+    focus.validate(&workspace.tree);
+    if on_bar
+        && let Ok(state) = aurora_widgets::widgets::tab_bar_state(&workspace.tree, bar)
+        && let Some(tab) = state.selected_tab()
+        && focus.focused() != Some(tab)
+        && let Err(err) = focus.focus(&mut workspace.tree, tab)
+    {
+        tracing::warn!(?err, "failed to keep focus on the document tab strip");
+    }
+    true
+}
+
+/// Follows the strip's selection (0.173.0): when a click, arrow key or
+/// assistive-technology `Click` has selected another document's tab, this
+/// switches to it through [`switch_document`] — exactly as `Ctrl+Tab`
+/// does. A refused switch puts the strip back on the active document.
+/// `None` when the strip already shows the active document.
+pub(crate) fn follow_document_tabs(cx: &mut SwitchContext<'_>) -> Option<SwitchOutcome> {
+    let selected =
+        aurora_ui::document_tab_selected(&cx.workspace.tree, cx.workspace.document_tabs)?;
+    // Review D-1: follow only a selection the user moved away from the one
+    // this code last wrote — never one a failed sync left stale, which
+    // would otherwise switch back every loop iteration.
+    let written = cx.shelf.strip_selection?;
+    if selected == written {
+        return None;
+    }
+    let order = cx.shelf.tab_order(cx.doc);
+    let target = order.get(selected).copied();
+    if target == Some(cx.doc.id) {
+        return None;
+    }
+    let outcome = match target {
+        Some(target) => switch_document(cx, target),
+        None => SwitchOutcome::Unknown,
+    };
+    if outcome != SwitchOutcome::Switched {
+        let _ = sync_document_tab_bar(cx.workspace, cx.focus, cx.shelf, cx.doc);
+    }
+    Some(outcome)
 }

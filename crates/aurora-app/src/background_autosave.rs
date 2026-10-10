@@ -323,6 +323,14 @@ impl AutosaveWorker {
     /// Gives this worker the run's index to keep (0.171.0) and writes it
     /// if it already has something to list; `true` when the index on
     /// disk matches.
+    /// The newest generation landed (or superseded by a synchronous
+    /// write) for `document` (0.173.0 review R-1): a job of generation `g`
+    /// is on disk once this is `>= g`. A failed write never advances it.
+    pub(crate) fn landed(&self, document: u64) -> Option<Generation> {
+        self.shared.lock().landed.get(&document).copied()
+    }
+
+    /// Installs the index book (see [`IndexBook`]).
     pub(crate) fn configure_index(&mut self, book: IndexBook) -> bool {
         let write = self.shared.lock().index.insert(book).prepare();
         finish_index_write(&self.shared, write)
