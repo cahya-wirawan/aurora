@@ -328,6 +328,13 @@ impl Default for FocusManager {
 
 /// Every focusable widget in `tree`, pre-order (depth-first, parent
 /// before children) — [`FocusManager`]'s own `Tab` order.
+///
+/// **A hidden subtree is skipped whole (0.165.0)**: a widget whose own
+/// style is `Display::None`, or whose accessibility node is `hidden`,
+/// contributes neither itself nor any descendant. `Tab` must never land
+/// on something the user cannot see and an assistive technology cannot
+/// reach — a collapsed panel's body, the hidden tab of a panel group, or
+/// the whole right rail while it is collapsed to its label strip.
 fn focus_order<W>(tree: &WidgetTree<W>) -> Vec<WidgetId> {
     let mut order = Vec::new();
     collect_focusable(tree, tree.root(), &mut order);
@@ -335,6 +342,15 @@ fn focus_order<W>(tree: &WidgetTree<W>) -> Vec<WidgetId> {
 }
 
 fn collect_focusable<W>(tree: &WidgetTree<W>, id: WidgetId, out: &mut Vec<WidgetId>) {
+    let hidden = tree
+        .style(id)
+        .is_some_and(|style| style.display == taffy::Display::None)
+        || tree
+            .accessibility(id)
+            .is_some_and(accesskit::Node::is_hidden);
+    if hidden {
+        return;
+    }
     let is_focusable = tree
         .accessibility(id)
         .is_some_and(|node| node.supports_action(Action::Focus));
@@ -777,6 +793,59 @@ mod tests {
             Some(b),
             "must wrap back to the last focusable widget"
         );
+    }
+
+    /// 0.165.0: `Tab` skips a hidden subtree — `Display::None` or
+    /// AT-`hidden` — whole, the widget itself and every descendant.
+    #[test]
+    fn focus_next_skips_a_hidden_subtree() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let insert = |tree: &mut WidgetTree<&'static str>, parent, style, node, name| match tree
+            .insert(parent, style, node, name)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let a = insert(&mut tree, root, Style::default(), focusable("a"), "a");
+        let gone = insert(
+            &mut tree,
+            root,
+            Style {
+                display: taffy::Display::None,
+                ..Default::default()
+            },
+            focusable("gone"),
+            "gone",
+        );
+        let inside = insert(
+            &mut tree,
+            gone,
+            Style::default(),
+            focusable("inside"),
+            "inside",
+        );
+        let mut hidden_node = Node::new(Role::GenericContainer);
+        hidden_node.set_hidden();
+        let shy = insert(&mut tree, root, Style::default(), hidden_node, "shy");
+        let shy_child = insert(
+            &mut tree,
+            shy,
+            Style::default(),
+            focusable("shy"),
+            "shy child",
+        );
+        let b = insert(&mut tree, root, Style::default(), focusable("b"), "b");
+        let mut focus = FocusManager::new();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            if let Some(id) = focus.focus_next(&mut tree) {
+                seen.push(id);
+            }
+        }
+        assert_eq!(seen, vec![a, b, a, b]);
+        for skipped in [gone, inside, shy_child] {
+            assert!(!seen.contains(&skipped));
+        }
     }
 
     #[test]

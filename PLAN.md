@@ -26,7 +26,43 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.164.0): Properties and History share one dock
+**Latest (2026-10-10, 0.165.0): the right rail collapses to a narrow
+label strip.** Design-owner decision (Cahya, 2026-10-10): short text
+labels until an icon set is chosen. A new `aurora_ui::panel_strip`
+module and `Workspace::panel_strip`: a vertical `Role::Toolbar` labelled
+"Panels" with **one button per panel** — "Lay", "Prop", "Hist", defined
+once in `PANEL_SHORT_LABELS` — rather than one per dock slot (Photoshop's
+icon dock is per panel too, a group button would need a name neither
+member has, and "Hist" can open the History tab directly). "Collapse or
+Expand Panels" (command palette and a new macOS **Window** menu;
+`window.toggle_panels`) hides the rail and its divider (`Display::None`,
+AT-`hidden`) and shows the strip; the canvas column takes the freed
+width. The strip's width is the widest measured label plus the button's
+`spacing.md` padding plus `spacing.xs` either side (the tools panel's
+style) — no literal. A strip button **expands the rail with its panel
+shown** (`aurora_ui::expand_rail_showing`: tab selected, slot expanded; a
+closed panel stays closed) — chosen over a flyout, which would need a
+floating layer, light dismiss and focus trapping the dock does not have.
+The buttons are outlined, AT-named by the **full** panel name, report
+`expanded: false` and no `toggled`, are `Tab` stops, and route pointer,
+`Space`/`Enter` and AT `Click` (behind the modal gate; new
+`WidgetOwner::PanelStrip`, `AccessibilityReaction::PanelStrip`). Focus
+inside a collapsing rail moves to its panel's strip button and focus on
+a hidden strip to the shown panel (`aurora_ui::refocus_workspace`, which
+the app's `refocus_out_of_hidden` — and so every `App::layout` — now
+runs); and `FocusManager`'s `Tab` order now **skips any `Display::None`
+or AT-hidden subtree** (before, a collapsed body or hidden tab's widgets
+were still `Tab` stops). The divider cannot be grabbed while collapsed;
+the rail width is kept across collapse/expand. `WorkspaceLayout` gains
+`rail_collapsed` with a second fallback level (`WorkspaceLayoutV2`, the
+0.164.0 shape); V1 and 0.164.0 layouts load expanded. A Curves
+transition expands a collapsed rail (on the transition only, never for a
+closed Properties panel). Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`): 3,082 passed, 0 failed, 0 skipped; judge PASS
+≈0.91. Branch `001-rail_label_strip`. **Needs a human** on macOS with
+VoiceOver. Details: "Next action", addendum 0.165.0.
+
+**Previously (2026-10-10, 0.164.0): Properties and History share one dock
 slot as tabs.** Workspace round 3 (Photoshop's layout convention, Aurora's
 own tokens). A new `aurora_ui::panel_group` module: a group is one rail
 column holding the existing `TabBar` (`Role::TabList`, one `Role::Tab`
@@ -31040,6 +31076,117 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.165.0) — the rail collapses to a label strip.**
+Branch `001-rail_label_strip` (from `main` at 1438c38, 0.164.0). Design-
+owner decision (Cahya, 2026-10-10): a narrow vertical strip with short
+text labels until an icon set is chosen; no icons, glyphs or new tokens
+were added, and none was needed. Files: `aurora-ui` new `panel_strip.rs`
+(`PanelStrip`, `PANEL_STRIP_LABEL`, `PANEL_SHORT_LABELS`,
+`panel_short_label`, `is_panel_strip_button`, `panel_strip_shown`; two
+tests), `workspace.rs` (`Workspace::panel_strip`, `rail_collapsed`,
+`set_rail_collapsed`, `toggle_rail_collapsed`, `expand_rail_showing`,
+`refocus_workspace`; `set_rail_width` keeps the collapse; five tests),
+`lib.rs` (re-exports), `gallery_panel.rs` (two root-children assertions
+adapted); `aurora-widgets` `input.rs` (`Tab` order skips hidden
+subtrees; one test); `aurora-app` `lib.rs` (`COMMAND_TOGGLE_PANELS`,
+palette entry, macOS Window menu, `WidgetOwner::PanelStrip`,
+`open_from_panel_strip`, `AccessibilityReaction::PanelStrip`, the
+rail-aware `refocus_out_of_hidden`, the Curves rule, the divider guard,
+`WorkspaceLayout::rail_collapsed` + `WorkspaceLayoutV2`; nine tests in
+`panel_scroll_tests::panel_tab_groups::rail_label_strip`, two adapted,
+none deleted). 3,065 + 17 = **3,082 tests** (computed from the added
+tests; not a full-gate run).
+
+Choices, justified: **one button per panel** (Photoshop's icon dock is per
+panel; a group button would need a name that is neither member's; "Hist"
+opens History directly). **Expand and show**, not a flyout (no floating
+dock layer, light dismiss or focus trap exists to build one on). The strip
+is never visible together with the rail, so "click the button again" has
+no second state; Escape is **not** bound to re-collapse (the expand is a
+persistent layout change, not a transient flyout, and Escape already
+belongs to dialogs, popovers and canvas tools); the command re-collapses.
+**Another fallback level** for the layout (`WorkspaceLayoutV2`), not a
+tagged encoding: files on disk carry no tag, so the untagged fallbacks
+would stay anyway; appended fields keep each older shape a strict prefix,
+decoded newest first. A tag becomes right the day a field is removed.
+The **Curves transition expands a collapsed rail** (on the transition
+only, never for a closed Properties panel) — the rule exists to make the
+editor visible. Strip buttons are toggle buttons that are always off (the
+tools panel's outlined look) with their AT `toggled` cleared and
+`expanded: false` set; the payload toggle is reset every time the strip
+is shown.
+
+Mutations (four files backed up to the scratchpad, mutated, `aurora-ui
+--lib` and `aurora-app --lib` run with `AURORA_REQUIRE_GPU=1`, restored,
+`touch`ed, sha256 checked — all four restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | toggle does not collapse | killed: 9 tests incl. `the_toggle_command_collapses_the_rail_and_widens_the_canvas` |
+| M2 | rail stays shown (canvas not widened) | killed: 10 tests incl. `collapsing_the_rail_shows_a_token_sized_strip_and_widens_the_canvas`, `canvas_coordinates_stay_exact_at_the_collapsed_width` |
+| M3 | strip buttons open the wrong panel (Prop/Hist swapped) | killed: `the_strip_is_a_panels_toolbar_whose_buttons_carry_the_full_names`, `a_strip_button_click_expands_the_rail_with_its_own_panel` |
+| M4 | AT name left abbreviated | killed: the toolbar test, `an_at_click_on_a_strip_button_opens_its_panel_and_a_dialog_blocks_it` |
+| M5 | focus left in the hidden rail/strip | killed: 4 tests incl. `collapsing_moves_focus_from_the_rail_to_its_strip_button`, `focus_follows_a_rail_collapse_to_the_strip_and_back` |
+| M6 | `Tab` order enters hidden subtrees | killed: `focus_follows_a_rail_collapse_to_the_strip_and_back` |
+| M7 | collapse not persisted | killed: `the_rail_collapse_round_trips_and_older_layouts_still_load` |
+| M8 | 0.164.0 layout fails to load (no V2 fallback) | killed: the same test |
+| M9a | divider guard in `pointer_on_rail_divider` removed | **survived** — redundant with the hidden divider |
+| M9b | divider kept shown while collapsed | killed: `the_divider_cannot_be_grabbed_while_the_rail_is_collapsed`, `the_rail_width_survives_a_collapse_and_the_divider_hides_with_the_rail` |
+| M9c | both | killed: the same two |
+| M10a | rail width reset on expand | killed: 4 tests incl. `the_rail_width_survives_...`, `writing_then_loading_a_workspace_layout_round_trips_the_real_values` |
+| M10b | a width change while collapsed drops the collapse | killed: `the_rail_width_survives_...` |
+| M11 | hardcoded strip width (48 px) | killed: `the_strips_width_is_its_widest_measured_label_plus_spacing_tokens` |
+| M12 | Curves rule does not expand the rail | killed: `the_curves_transition_expands_a_collapsed_rail_once` |
+| M13 | AT `Click` on a strip button not routed | killed: the AT-click test |
+| M14 | strip buttons not owned (pointer and key unrouted) | killed: the pointer-click test, `tab_reaches_a_strip_button_and_enter_opens_its_panel` |
+
+Disclosures: (1) M9a survives because a `Display::None` divider lays out
+zero-sized, so the explicit guard is belt-and-braces (deliberately
+redundant, like 0.164.0's R6a/R6b); (2) the `Tab`-order change in
+`aurora-widgets` is cross-cutting: a collapsed panel's body and the hidden
+tab's widgets were `Tab` stops before and no longer are — every existing
+test still passes, but no human has tabbed through the app since; (3) the
+palette and menu label is one static "Collapse or Expand Panels" (neither
+is rebuilt on state change), not a label that flips; (4) the macOS Window
+menu code is `#[cfg(target_os = "macos")]` and was **not compiled here**
+(Linux only); (5) the Widget Gallery is a root-level column, not a rail
+panel: it has no strip button and is left as it is by a collapse; (6) a
+closed panel keeps its strip button, which expands the rail without
+reopening it; (7) the strip button AT state is fixed at `expanded: false`
+(it is only ever visible while the rail is collapsed); no
+`accesskit_consumer` or screen reader has read it; (8) only headless
+layout (text-blind and one text-aware case at scale 1) — no real-GPU
+render or human has seen the strip.
+
+**Measured after the review:** full gate green on the RTX 3090 with
+`AURORA_REQUIRE_GPU=1` — fmt, layering, style lint, `check --locked`,
+clippy `-D warnings`, **3,082 passed, 0 failed, 61 ignored, 0 skipped**
+(the computed figure, now measured), strict rustdoc, `cargo deny`,
+contrast exit 0. Independent judge: **PASS ≈0.91**, no blocking issue —
+it read the never-compiled macOS Window-menu code against the
+File/Edit/Layer/View menus and found the same pattern throughout (no
+compile or panic hazard by inspection; the first real compile is the
+macOS CI job or the design owner's Mac), and confirmed every AT-hidden
+site is also `Display::None` or not drawn, so the app-wide Tab-order
+change cannot cut off a visible widget. Disclosed, not changed: **while
+the rail is collapsed, the Focus *X* Panel and Toggle *X* Panel commands
+do not expand it** — Focus sets focus inside the hidden rail and the
+repair bounces it to that panel's strip button; Toggle changes a
+collapsed state the user cannot see. Only Collapse/Expand Panels, a
+strip click and the Curves rule expand the rail; routing those commands
+through `expand_rail_showing` is the follow-up. The layout decoder's doc
+now says a *damaged* current file can decode as V2 (postcard ignores
+trailing bytes) — harmless, it loads expanded. The Window menu is not
+registered as NSApp's windows menu, so Cocoa adds no window list or
+Minimize to it.
+
+**Needs a human:** on macOS collapse the rail, click Lay/Prop/Hist, check
+VoiceOver reads the full names ("Layers", "Properties", "History"), and
+check the Window menu item.
+
+**Suggested next:** drag-to-redock and floating panels plus persisted
+layout (workspace round 4).
 
 **Addendum 2026-10-10 (0.164.0) — panel tab groups.** Branch
 `000-panel_tab_groups` (from `main` at 0.163.0); **from now on each task

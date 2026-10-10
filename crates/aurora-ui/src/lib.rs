@@ -42,6 +42,7 @@ pub mod layer_controls;
 pub mod layers_panel;
 pub mod panel;
 pub mod panel_group;
+pub mod panel_strip;
 pub mod properties_panel;
 pub mod status_bar;
 pub mod tool;
@@ -77,6 +78,10 @@ pub use panel_group::{
     panel_group_contains, panel_group_is_collapsed, panel_group_selected, panel_group_shown,
     refocus_out_of_hidden, set_panel_group_collapsed, show_panel_group_tab, sync_panel_group,
 };
+pub use panel_strip::{
+    PANEL_SHORT_LABELS, PANEL_STRIP_LABEL, PanelStrip, is_panel_strip_button, panel_short_label,
+    panel_strip_shown,
+};
 pub use properties_panel::populate_properties_panel;
 pub use status_bar::{
     STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
@@ -93,6 +98,7 @@ pub use tools_panel::{
 };
 pub use workspace::{
     OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, Workspace, build_workspace,
-    close_workspace_panel, rail_width, select_panel_tab, set_rail_width, show_workspace_panel,
-    toggle_workspace_panel,
+    close_workspace_panel, expand_rail_showing, rail_collapsed, rail_width, refocus_workspace,
+    select_panel_tab, set_rail_collapsed, set_rail_width, show_workspace_panel,
+    toggle_rail_collapsed, toggle_workspace_panel,
 };

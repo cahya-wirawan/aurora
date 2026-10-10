@@ -2693,8 +2693,38 @@ fn startup_document(
 /// `panel_group_tab` is the Properties + History group's selected tab
 /// (`0` Properties, `1` History); a layout saved before 0.164.0 gets
 /// [`aurora_ui::PANEL_GROUP_TAB_DEFAULT`].
+///
+/// **0.165.0: `rail_collapsed`**, whether the rail is collapsed to its
+/// label strip, appended the same way, with a second fallback level
+/// ([`WorkspaceLayoutV2`], the 0.164.0 shape; a layout without it loads
+/// expanded). Another level, not a switch to a tagged, self-describing
+/// encoding: a tag would not help the files already on disk — they carry
+/// none, so the untagged V1/V2 fallbacks would have to stay anyway — and
+/// a tagged format is a migration of its own with no second consumer to
+/// justify it yet. Each decode is a few bytes, tried newest first, so a
+/// *well-formed* newer file can never be mistaken for an older one (an
+/// older shape is a strict prefix of every newer one, and `postcard`
+/// refuses to run out of bytes mid-struct). A *damaged* newer file can
+/// be: `postcard::from_bytes` ignores trailing bytes, so a current file
+/// whose last `rail_collapsed` byte is corrupt fails as current and then
+/// decodes as V2 — harmlessly, loading with the rail expanded. The day a field is ever *removed*, not appended,
+/// this scheme stops working and a version tag becomes the right call.
+// Four independent on/off preferences in a fixed wire format: an enum
+// per flag would change nothing on disk and only obscure the layout.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WorkspaceLayout {
+    rail_width: f32,
+    layers_collapsed: bool,
+    properties_collapsed: bool,
+    history_collapsed: bool,
+    panel_group_tab: u32,
+    rail_collapsed: bool,
+}
+
+/// The layout as saved by 0.164.0 — a selected tab, no rail collapse.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayoutV2 {
     rail_width: f32,
     layers_collapsed: bool,
     properties_collapsed: bool,
@@ -2711,21 +2741,35 @@ struct WorkspaceLayoutV1 {
     history_collapsed: bool,
 }
 
-/// Decodes a saved layout: the current shape first, then the pre-0.164.0
-/// one, whose missing tab becomes the default tab.
+/// Decodes a saved layout: the current shape first, then the 0.164.0 one
+/// (the rail loads expanded), then the pre-0.164.0 one (whose missing tab
+/// also becomes the default tab). The error reported is the current
+/// shape's.
 fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Error> {
-    match postcard::from_bytes::<WorkspaceLayout>(bytes) {
-        Ok(layout) => Ok(layout),
-        Err(current) => match postcard::from_bytes::<WorkspaceLayoutV1>(bytes) {
-            Ok(old) => Ok(WorkspaceLayout {
-                rail_width: old.rail_width,
-                layers_collapsed: old.layers_collapsed,
-                properties_collapsed: old.properties_collapsed,
-                history_collapsed: old.history_collapsed,
-                panel_group_tab: u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0),
-            }),
-            Err(_) => Err(current),
-        },
+    let current = match postcard::from_bytes::<WorkspaceLayout>(bytes) {
+        Ok(layout) => return Ok(layout),
+        Err(err) => err,
+    };
+    if let Ok(v2) = postcard::from_bytes::<WorkspaceLayoutV2>(bytes) {
+        return Ok(WorkspaceLayout {
+            rail_width: v2.rail_width,
+            layers_collapsed: v2.layers_collapsed,
+            properties_collapsed: v2.properties_collapsed,
+            history_collapsed: v2.history_collapsed,
+            panel_group_tab: v2.panel_group_tab,
+            rail_collapsed: false,
+        });
+    }
+    match postcard::from_bytes::<WorkspaceLayoutV1>(bytes) {
+        Ok(old) => Ok(WorkspaceLayout {
+            rail_width: old.rail_width,
+            layers_collapsed: old.layers_collapsed,
+            properties_collapsed: old.properties_collapsed,
+            history_collapsed: old.history_collapsed,
+            panel_group_tab: u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0),
+            rail_collapsed: false,
+        }),
+        Err(_) => Err(current),
     }
 }
 
@@ -2763,6 +2807,7 @@ fn save_workspace_layout(path: &Path, workspace: &aurora_ui::Workspace) {
             .ok()
             .and_then(|tab| u32::try_from(tab).ok())
             .unwrap_or(0),
+        rail_collapsed: aurora_ui::rail_collapsed(workspace),
     };
     let bytes = match postcard::to_allocvec(&layout) {
         Ok(bytes) => bytes,
@@ -2845,6 +2890,10 @@ fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
         .and_then(|()| aurora_ui::set_panel_group_collapsed(&mut workspace.tree, &group, collapsed))
     {
         tracing::warn!(?err, "failed to apply the saved panel group tab");
+    }
+    // 0.165.0: the rail collapsed to its label strip, or expanded, as saved.
+    if let Err(err) = aurora_ui::set_rail_collapsed(workspace, layout.rail_collapsed) {
+        tracing::warn!(?err, "failed to apply the saved rail collapse");
     }
 }
 
@@ -3564,6 +3613,10 @@ enum AccessibilityReaction {
     /// layer selected (or focused) a tab, and [`follow_panel_tabs`] has
     /// already shown its panel; the caller lays out again.
     PanelTab(aurora_widgets::ActionOutcome),
+    /// A `Click` on a button of the collapsed rail's label strip (0.165.0):
+    /// [`open_from_panel_strip`] has already expanded the rail with that
+    /// button's panel shown; the caller lays out again.
+    PanelStrip(aurora_ui::PanelHandle),
     /// A `Click` on one of the open dialog's own action buttons: run it
     /// through [`run_dialog_action`], exactly as `Enter` or a pointer
     /// click on that button does.
@@ -3660,6 +3713,9 @@ fn route_accessibility_action(
                 AccessibilityReaction::PressLayer(layer_id)
             } else if let Some(tool) = tool_button_target(workspace, id) {
                 AccessibilityReaction::SelectTool(tool)
+            } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
+                open_from_panel_strip(workspace, focus, id);
+                AccessibilityReaction::PanelStrip(panel)
             } else {
                 AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
             }
@@ -4114,6 +4170,9 @@ fn apply_accessibility_action(
         AccessibilityReaction::PanelTab(outcome) => {
             tracing::debug!(?outcome, "accessibility action on a panel tab");
         }
+        AccessibilityReaction::PanelStrip(panel) => {
+            tracing::debug!(?panel, "accessibility click on a panel strip button");
+        }
         AccessibilityReaction::Handled(outcome) if on_panel_bar => {
             panel_bar_accessibility(cx, &outcome);
         }
@@ -4383,6 +4442,13 @@ const COMMAND_TOGGLE_HISTORY: &str = "view.toggle_history";
 const COMMAND_CLOSE_LAYERS: &str = "view.close_layers";
 const COMMAND_CLOSE_PROPERTIES: &str = "view.close_properties";
 const COMMAND_CLOSE_HISTORY: &str = "view.close_history";
+/// Collapses the whole right rail to its label strip, or expands it back
+/// (0.165.0, `aurora_ui::toggle_rail_collapsed`). One toggle id with one
+/// static label, like every other toggle here: neither the palette's
+/// entries nor the native menu's items are rebuilt when state changes.
+const COMMAND_TOGGLE_PANELS: &str = "window.toggle_panels";
+/// [`COMMAND_TOGGLE_PANELS`]' label in the palette and the Window menu.
+const COMMAND_TOGGLE_PANELS_LABEL: &str = "Collapse or Expand Panels";
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
@@ -4438,6 +4504,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
         CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
         CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
@@ -4562,6 +4629,16 @@ fn activate_command(
         refocus_out_of_hidden(workspace, focus);
         return None;
     }
+    if id == COMMAND_TOGGLE_PANELS {
+        // 0.165.0: the rail collapses to its label strip or expands back;
+        // focus inside whichever side is now hidden moves to the other
+        // (`aurora_ui::refocus_workspace`).
+        if let Err(err) = aurora_ui::toggle_rail_collapsed(workspace) {
+            tracing::warn!(?err, "failed to collapse or expand the panels");
+        }
+        refocus_out_of_hidden(workspace, focus);
+        return None;
+    }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
     }
@@ -4672,6 +4749,34 @@ enum WidgetOwner {
     /// click, an arrow key or `Home`/`End` selects a tab in the widget
     /// layer, then [`follow_panel_tabs`] shows that tab's panel.
     PanelTabs,
+    /// A button of the collapsed rail's label strip (0.165.0,
+    /// `aurora_ui::PanelStrip`): an activation (a pointer click,
+    /// `Space`/`Enter`) runs [`open_from_panel_strip`].
+    PanelStrip,
+}
+
+/// A label-strip button's action (0.165.0): expands the rail with the
+/// button's panel shown (`aurora_ui::expand_rail_showing` — "expand and
+/// show", see `aurora_ui::panel_strip`), then moves focus off the strip it
+/// hid to that panel ([`refocus_out_of_hidden`]). Returns whether anything
+/// changed; `false` for an id that is not a strip button.
+fn open_from_panel_strip(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    id: WidgetId,
+) -> bool {
+    let Some(panel) = workspace.panel_strip.panel_for(id) else {
+        return false;
+    };
+    let changed = match aurora_ui::expand_rail_showing(workspace, panel) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to expand the rail from its label strip");
+            false
+        }
+    };
+    refocus_out_of_hidden(workspace, focus);
+    changed
 }
 
 /// After input reached the Properties + History tab bar (0.164.0): shows
@@ -4705,9 +4810,12 @@ fn follow_panel_tabs(
 /// ([`follow_panel_tabs`]), the panel commands ([`activate_command`]) and,
 /// as the backstop for everything else (the Curves rule among them), every
 /// [`App::layout`]. Returns whether focus changed.
+///
+/// 0.165.0: the rail collapse first — focus inside a collapsed rail moves
+/// to its label-strip button, focus on a hidden strip to the panel the
+/// button showed (`aurora_ui::refocus_workspace`), then the group repair.
 fn refocus_out_of_hidden(workspace: &mut aurora_ui::Workspace, focus: &mut FocusManager) -> bool {
-    let group = workspace.panel_group.clone();
-    aurora_ui::refocus_out_of_hidden(&mut workspace.tree, focus, &group)
+    aurora_ui::refocus_workspace(workspace, focus)
 }
 
 /// Closes every open popover a panel scroll could leave stranded
@@ -4844,6 +4952,9 @@ fn widget_owner(
     }
     if aurora_ui::is_panel_group_tab(tree, id) {
         return Some(WidgetOwner::PanelTabs);
+    }
+    if aurora_ui::is_panel_strip_button(tree, id) {
+        return Some(WidgetOwner::PanelStrip);
     }
     None
 }
@@ -5143,6 +5254,11 @@ fn route_widget_pointer(
     if owner == Some(WidgetOwner::PanelTabs) {
         follow_panel_tabs(workspace, focus, phase == PointerPhase::Down);
     }
+    if owner == Some(WidgetOwner::PanelStrip)
+        && let PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) = &outcome
+    {
+        open_from_panel_strip(workspace, focus, *id);
+    }
     WidgetPointer {
         outcome: Some(outcome),
         dismissed,
@@ -5316,6 +5432,13 @@ fn route_widget_key(
     }
     if owner == WidgetOwner::PanelTabs {
         follow_panel_tabs(workspace, focus, false);
+    }
+    if owner == WidgetOwner::PanelStrip
+        && let KeyOutcome::Handled(PointerOutcome::Action(
+            aurora_widgets::ActionOutcome::Activated(id),
+        )) = &outcome
+    {
+        open_from_panel_strip(workspace, focus, *id);
     }
     Some((owner, outcome))
 }
@@ -6586,9 +6709,18 @@ fn expand_properties_for_curves(
     // 0.164.0: Properties is a tab of the Properties + History group, so
     // "expand it" is "select its tab and expand the group" — on this
     // transition only, like the expand itself.
+    // 0.165.0: a rail collapsed to its label strip is expanded too, so the
+    // editor is really visible — on this transition only, like the rest.
+    let expanded = match aurora_ui::set_rail_collapsed(workspace, false) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to expand the rail for a Curves layer");
+            false
+        }
+    };
     let properties = workspace.properties;
     match aurora_ui::show_workspace_panel(workspace, properties) {
-        Ok(changed) => changed,
+        Ok(changed) => changed || expanded,
         Err(err) => {
             tracing::warn!(
                 ?err,
@@ -7047,9 +7179,29 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
-    if let Err(err) =
-        menu.append_items(&[&app_menu, &file_menu, &edit_menu, &layer_menu, &view_menu])
-    {
+    // 0.165.0: the macOS Window menu, holding the rail collapse toggle.
+    let window_menu = match muda::Submenu::with_items(
+        "Window",
+        true,
+        &[&muda::MenuItem::with_id(
+            COMMAND_TOGGLE_PANELS,
+            COMMAND_TOGGLE_PANELS_LABEL,
+            true,
+            None,
+        )],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
+
+    if let Err(err) = menu.append_items(&[
+        &app_menu,
+        &file_menu,
+        &edit_menu,
+        &layer_menu,
+        &view_menu,
+        &window_menu,
+    ]) {
         tracing::warn!(?err, "failed to build the native menu bar structure");
     }
     menu
@@ -8406,6 +8558,11 @@ const RAIL_DIVIDER_HIT_TOLERANCE: f32 = 4.0;
 /// the divider sits *outside* the canvas area entirely.
 #[must_use]
 fn pointer_on_rail_divider(workspace: &aurora_ui::Workspace, window_position: (f32, f32)) -> bool {
+    // 0.165.0: a collapsed rail has no divider to drag (it is hidden, and
+    // its stale zero-size bounds must not catch a press).
+    if aurora_ui::rail_collapsed(workspace) {
+        return false;
+    }
     let Some(bounds) = workspace.tree.bounds(workspace.divider) else {
         return false;
     };
@@ -20296,7 +20453,12 @@ impl App {
                 // A linked panel bar is never focused, so no key reaches it.
                 // A tab key has already shown its panel
                 // (`route_widget_key` -> `follow_panel_tabs`).
-                WidgetOwner::Gallery | WidgetOwner::PanelScrollbar | WidgetOwner::PanelTabs => {}
+                // A strip key has already expanded the rail
+                // (`route_widget_key` -> `open_from_panel_strip`).
+                WidgetOwner::Gallery
+                | WidgetOwner::PanelScrollbar
+                | WidgetOwner::PanelTabs
+                | WidgetOwner::PanelStrip => {}
             }
             self.relayout_after_gallery();
             return;
@@ -60831,8 +60993,8 @@ mod tests {
         let checkbox = rig.g().checkbox;
         assert_eq!(
             rig.workspace.tree.children(root).map(<[WidgetId]>::len),
-            Some(5),
-            "tools, canvas column, divider, rail, gallery"
+            Some(6),
+            "tools, canvas column, divider, rail, label strip (0.165.0), gallery"
         );
         if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, checkbox) {
             unreachable!("{err:?}");
@@ -60848,7 +61010,8 @@ mod tests {
                     rig.workspace.tools.root,
                     rig.workspace.canvas_column,
                     rig.workspace.divider,
-                    rig.workspace.rail
+                    rig.workspace.rail,
+                    rig.workspace.panel_strip.root,
                 ]
                 .as_slice()
             ),
@@ -70369,6 +70532,7 @@ mod panel_scroll_tests {
                 properties_collapsed: false,
                 history_collapsed: false,
                 panel_group_tab: 7,
+                rail_collapsed: false,
             };
             let bytes = match postcard::to_allocvec(&damaged) {
                 Ok(bytes) => bytes,
@@ -70385,6 +70549,465 @@ mod panel_scroll_tests {
                 Some(280.0)
             );
             assert_eq!(shown(&loaded), Some(aurora_ui::PANEL_GROUP_TAB_DEFAULT));
+        }
+
+        /// 0.165.0: the right rail collapsed to a narrow label strip, end
+        /// to end through the app's own command, routing, focus,
+        /// persistence, Curves and pointer-mapping functions.
+        mod rail_label_strip {
+            use std::collections::HashMap;
+
+            use super::{bounds, centre, curves_layers, press, request, selected, shown, tab};
+            use crate::tests::{FakeClipboard, FakeFileDialog};
+            use crate::{
+                AccessibilityReaction, COMMAND_TOGGLE_PANELS, FocusManager, Key, Modifiers,
+                NamedKey, WidgetId, WorkspaceLayout, WorkspaceLayoutV1, WorkspaceLayoutV2,
+                activate_command, expand_properties_for_curves, route_accessibility_action,
+                route_widget_key,
+            };
+
+            const WINDOW: (f32, f32) = (1000.0, 800.0);
+
+            fn workspace() -> aurora_ui::Workspace {
+                let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                ws
+            }
+
+            fn toggle(ws: &mut aurora_ui::Workspace, focus: &mut FocusManager) {
+                let mut dialog = FakeFileDialog::default();
+                assert_eq!(
+                    activate_command(ws, focus, COMMAND_TOGGLE_PANELS, &mut dialog),
+                    None
+                );
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            }
+
+            fn button(ws: &aurora_ui::Workspace, panel: aurora_ui::PanelHandle) -> WidgetId {
+                match ws.panel_strip.button_for(panel) {
+                    Some(id) => id,
+                    None => unreachable!("every rail panel has a strip button"),
+                }
+            }
+
+            /// AC-1/AC-6: the command is in the palette, collapses the rail
+            /// to the strip (the canvas gains the rail's width less the
+            /// strip's) and, run again, expands it at its old width.
+            #[test]
+            fn the_toggle_command_collapses_the_rail_and_widens_the_canvas() {
+                assert!(
+                    crate::palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == COMMAND_TOGGLE_PANELS),
+                    "the command palette lists it"
+                );
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let canvas = bounds(&ws, ws.canvas_area).width;
+                let rail = bounds(&ws, ws.rail).width;
+                toggle(&mut ws, &mut focus);
+                assert!(aurora_ui::rail_collapsed(&ws));
+                let strip = bounds(&ws, ws.panel_strip.root);
+                assert!(strip.width > 0 && strip.width < rail, "{strip:?}");
+                assert_eq!(bounds(&ws, ws.rail).width, 0);
+                assert_eq!(
+                    bounds(&ws, ws.canvas_area).width,
+                    canvas + rail - strip.width
+                );
+                assert_eq!(
+                    bounds(&ws, ws.status_bar.root).width,
+                    bounds(&ws, ws.canvas_area).width,
+                    "the status bar widens with the canvas"
+                );
+                toggle(&mut ws, &mut focus);
+                assert!(!aurora_ui::rail_collapsed(&ws));
+                assert_eq!(bounds(&ws, ws.rail).width, rail, "the old width");
+                assert_eq!(bounds(&ws, ws.canvas_area).width, canvas);
+                assert_eq!(bounds(&ws, ws.panel_strip.root).width, 0);
+            }
+
+            /// AC-2/AC-6: a pointer click on Lay, Prop or Hist expands the
+            /// rail with that panel shown (its tab selected, its slot
+            /// expanded) and moves focus off the strip it hid.
+            #[test]
+            fn a_strip_button_click_expands_the_rail_with_its_own_panel() {
+                for (which, want_tab) in [(0_usize, None), (1, Some(0_usize)), (2, Some(1))] {
+                    let mut ws = workspace();
+                    let mut focus = FocusManager::default();
+                    let group = ws.panel_group.clone();
+                    if let Err(err) =
+                        aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true).and_then(
+                            |()| aurora_ui::set_panel_collapsed(&mut ws.tree, ws.layers, true),
+                        )
+                    {
+                        unreachable!("{err:?}");
+                    }
+                    toggle(&mut ws, &mut focus);
+                    let Some(&(panel, id)) = ws.panel_strip.buttons.get(which) else {
+                        unreachable!("three buttons");
+                    };
+                    let at = centre(bounds(&ws, id));
+                    press(&mut ws, &mut focus, at);
+                    ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                    assert!(!aurora_ui::rail_collapsed(&ws), "button {which}");
+                    assert_eq!(
+                        aurora_ui::panel_is_collapsed(&ws.tree, panel).ok(),
+                        Some(false),
+                        "button {which}: its panel is expanded"
+                    );
+                    if let Some(want) = want_tab {
+                        assert_eq!((selected(&ws), shown(&ws)), (Some(want), Some(want)));
+                        assert_eq!(focus.focused(), Some(tab(&ws, want)), "to the tab");
+                    } else {
+                        assert_eq!(focus.focused(), Some(ws.layers.root), "to Layers");
+                    }
+                    assert!(bounds(&ws, panel.root).height > 0, "button {which}: shown");
+                }
+            }
+
+            /// AC-3: each strip button is a `Tab` stop and `Enter` on it
+            /// opens its panel, the same as a tools-panel button.
+            #[test]
+            fn tab_reaches_a_strip_button_and_enter_opens_its_panel() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                toggle(&mut ws, &mut focus);
+                let hist = button(&ws, ws.history);
+                let mut reached = false;
+                for _ in 0..16 {
+                    if focus.focus_next(&mut ws.tree) == Some(hist) {
+                        reached = true;
+                        break;
+                    }
+                }
+                assert!(reached, "Hist is a Tab stop");
+                let scales = crate::test_workspace_scales();
+                let mut clipboard = FakeClipboard::default();
+                let routed = route_widget_key(
+                    &mut ws,
+                    &mut focus,
+                    &mut None,
+                    None,
+                    None,
+                    &scales,
+                    false,
+                    false,
+                    Modifiers::none(),
+                    Key::Named(NamedKey::Enter),
+                    None,
+                    &mut clipboard,
+                );
+                assert!(
+                    matches!(routed, Some((crate::WidgetOwner::PanelStrip, _))),
+                    "{routed:?}"
+                );
+                assert!(!aurora_ui::rail_collapsed(&ws));
+                assert_eq!((selected(&ws), shown(&ws)), (Some(1), Some(1)));
+                assert_eq!(focus.focused(), Some(tab(&ws, 1)));
+            }
+
+            /// AC-3: an assistive technology reads the full names, and its
+            /// `Click` on a strip button opens that panel — unless a modal
+            /// dialog is open, which blocks it.
+            #[test]
+            fn an_at_click_on_a_strip_button_opens_its_panel_and_a_dialog_blocks_it() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                toggle(&mut ws, &mut focus);
+                for ((_, id), full) in
+                    ws.panel_strip
+                        .buttons
+                        .iter()
+                        .zip(["Layers", "Properties", "History"])
+                {
+                    let node = ws.tree.accessibility(*id);
+                    assert_eq!(node.and_then(accesskit::Node::label), Some(full));
+                    assert_eq!(node.and_then(accesskit::Node::is_expanded), Some(false));
+                }
+                let hist = button(&ws, ws.history);
+                let scales = crate::test_workspace_scales();
+                let mut blocked = workspace();
+                toggle(&mut blocked, &mut focus);
+                let mut dialog = None;
+                let mut modal_focus = FocusManager::default();
+                crate::open_crash_recovery_dialog(
+                    &mut blocked,
+                    &mut modal_focus,
+                    &mut dialog,
+                    &scales,
+                    false,
+                );
+                let target = button(&blocked, blocked.history);
+                let reaction = route_accessibility_action(
+                    &mut blocked,
+                    &mut modal_focus,
+                    dialog.as_ref(),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    &request(target, accesskit::Action::Click),
+                );
+                assert!(
+                    matches!(reaction, AccessibilityReaction::BlockedByModal(id) if id == target),
+                    "{reaction:?}"
+                );
+                assert!(aurora_ui::rail_collapsed(&blocked), "still collapsed");
+
+                let reaction = route_accessibility_action(
+                    &mut ws,
+                    &mut focus,
+                    None,
+                    &HashMap::new(),
+                    None,
+                    None,
+                    &request(hist, accesskit::Action::Click),
+                );
+                assert!(
+                    matches!(reaction, AccessibilityReaction::PanelStrip(panel) if panel == ws.history),
+                    "{reaction:?}"
+                );
+                assert!(!aurora_ui::rail_collapsed(&ws));
+                assert_eq!((selected(&ws), shown(&ws)), (Some(1), Some(1)));
+            }
+
+            /// AC-2/AC-6: focus inside the rail moves to the strip button of
+            /// the panel that held it when the command collapses the rail,
+            /// and `App::layout`'s backstop does the same for any other path.
+            #[test]
+            fn collapsing_moves_focus_from_the_rail_to_its_strip_button() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let first = tab(&ws, 0);
+                if let Err(err) = focus.focus(&mut ws.tree, first) {
+                    unreachable!("{err:?}");
+                }
+                toggle(&mut ws, &mut focus);
+                assert_eq!(focus.focused(), Some(button(&ws, ws.properties)));
+                toggle(&mut ws, &mut focus);
+                assert_eq!(focus.focused(), Some(tab(&ws, 0)), "and back");
+                // A collapse by another path (a saved layout): the backstop.
+                if let Err(err) = focus
+                    .focus(&mut ws.tree, ws.layers.root)
+                    .and_then(|()| aurora_ui::set_rail_collapsed(&mut ws, true).map(|_| ()))
+                {
+                    unreachable!("{err:?}");
+                }
+                assert!(crate::refocus_out_of_hidden(&mut ws, &mut focus));
+                assert_eq!(focus.focused(), Some(button(&ws, ws.layers)));
+            }
+
+            /// AC-4: the collapse round-trips, and a 0.164.0 layout (no
+            /// collapse) and a pre-0.164.0 one (no tab either) still load,
+            /// expanded.
+            #[test]
+            fn the_rail_collapse_round_trips_and_older_layouts_still_load() {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let path = dir.path().join("workspace-layout.postcard");
+                let mut original = workspace();
+                if let Err(err) = aurora_ui::set_rail_width(
+                    &mut original.tree,
+                    original.rail,
+                    original.divider,
+                    333.0,
+                )
+                .and_then(|()| aurora_ui::set_rail_collapsed(&mut original, true).map(|_| ()))
+                {
+                    unreachable!("{err:?}");
+                }
+                crate::save_workspace_layout(&path, &original);
+                let mut loaded = workspace();
+                crate::load_workspace_layout(&path, &mut loaded);
+                assert!(aurora_ui::rail_collapsed(&loaded), "collapsed, as saved");
+                assert_eq!(
+                    aurora_ui::rail_width(&loaded.tree, loaded.rail),
+                    Some(333.0)
+                );
+                assert!(
+                    aurora_ui::panel_strip_shown(&loaded.tree, &loaded.panel_strip),
+                    "the strip with it"
+                );
+
+                let write = |bytes: Vec<u8>| {
+                    if let Err(err) = std::fs::write(&path, bytes) {
+                        unreachable!("{err}");
+                    }
+                };
+                let encode = |result: Result<Vec<u8>, postcard::Error>| match result {
+                    Ok(bytes) => bytes,
+                    Err(err) => unreachable!("{err}"),
+                };
+                // 0.164.0: a tab, no collapse.
+                write(encode(postcard::to_allocvec(&WorkspaceLayoutV2 {
+                    rail_width: 300.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 1,
+                })));
+                let mut loaded = workspace();
+                if let Err(err) = aurora_ui::set_rail_collapsed(&mut loaded, true) {
+                    unreachable!("{err:?}");
+                }
+                crate::load_workspace_layout(&path, &mut loaded);
+                assert!(
+                    !aurora_ui::rail_collapsed(&loaded),
+                    "a 0.164.0 file loads expanded"
+                );
+                assert_eq!(
+                    aurora_ui::rail_width(&loaded.tree, loaded.rail),
+                    Some(300.0)
+                );
+                assert_eq!(selected(&loaded), Some(1), "its tab still applies");
+                // Pre-0.164.0: no tab, no collapse.
+                write(encode(postcard::to_allocvec(&WorkspaceLayoutV1 {
+                    rail_width: 310.0,
+                    layers_collapsed: true,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                })));
+                let mut loaded = workspace();
+                crate::load_workspace_layout(&path, &mut loaded);
+                assert!(!aurora_ui::rail_collapsed(&loaded));
+                assert_eq!(
+                    aurora_ui::rail_width(&loaded.tree, loaded.rail),
+                    Some(310.0)
+                );
+                assert_eq!(
+                    aurora_ui::panel_is_collapsed(&loaded.tree, loaded.layers).ok(),
+                    Some(true)
+                );
+                // And the current shape decodes as itself.
+                let current = WorkspaceLayout {
+                    rail_width: 290.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                    rail_collapsed: true,
+                };
+                let bytes = encode(postcard::to_allocvec(&current));
+                assert_eq!(crate::decode_workspace_layout(&bytes).ok(), Some(current));
+            }
+
+            /// AC-5: a new Curves layer expands a collapsed rail (so the
+            /// editor is visible) on the transition only, and never for a
+            /// closed Properties panel.
+            #[test]
+            fn the_curves_transition_expands_a_collapsed_rail_once() {
+                let (first, second) = curves_layers();
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                toggle(&mut ws, &mut focus);
+                let mut shown_for = None;
+                assert!(expand_properties_for_curves(
+                    &mut ws,
+                    &mut shown_for,
+                    Some(first)
+                ));
+                assert!(!aurora_ui::rail_collapsed(&ws));
+                assert_eq!(shown(&ws), Some(0), "Properties is shown");
+                toggle(&mut ws, &mut focus);
+                assert!(!expand_properties_for_curves(
+                    &mut ws,
+                    &mut shown_for,
+                    Some(first)
+                ));
+                assert!(aurora_ui::rail_collapsed(&ws), "not every frame");
+                let properties = ws.properties;
+                if let Err(err) = aurora_ui::close_workspace_panel(&mut ws, properties) {
+                    unreachable!("{err:?}");
+                }
+                assert!(!expand_properties_for_curves(
+                    &mut ws,
+                    &mut shown_for,
+                    Some(second)
+                ));
+                assert!(aurora_ui::rail_collapsed(&ws), "a closed panel stays put");
+            }
+
+            /// AC-5: the divider cannot be grabbed while the rail is
+            /// collapsed — not at its old place, not at its stale bounds.
+            #[test]
+            fn the_divider_cannot_be_grabbed_while_the_rail_is_collapsed() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                #[allow(clippy::cast_precision_loss)]
+                let boundary = bounds(&ws, ws.divider).x as f32;
+                assert!(crate::pointer_on_rail_divider(&ws, (boundary, 50.0)));
+                toggle(&mut ws, &mut focus);
+                #[allow(clippy::cast_precision_loss)]
+                let strip_x = bounds(&ws, ws.panel_strip.root).x as f32;
+                for at in [(boundary, 50.0), (strip_x, 50.0), (0.0, 0.0)] {
+                    assert!(!crate::pointer_on_rail_divider(&ws, at), "{at:?}");
+                }
+                assert!(
+                    ws.tree
+                        .accessibility(ws.divider)
+                        .is_some_and(accesskit::Node::is_hidden),
+                    "no AT SetValue target either"
+                );
+            }
+
+            /// AC-1/AC-6: the 0.160.0/0.162.0 coordinate checks at the
+            /// collapsed width — the canvas's top-left and right edge map a
+            /// pointer exactly, a point on the strip is not on the canvas,
+            /// and the physical rect and scissor end at the strip at scale
+            /// 1, 2, 1.25 and 1.5.
+            #[test]
+            fn canvas_coordinates_stay_exact_at_the_collapsed_width() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                toggle(&mut ws, &mut focus);
+                let canvas = bounds(&ws, ws.canvas_area);
+                let strip = bounds(&ws, ws.panel_strip.root);
+                assert_eq!(canvas.right(), strip.x, "the canvas reaches the strip");
+                #[allow(clippy::cast_precision_loss)]
+                let (ox, oy, right) = (canvas.x as f32, canvas.y as f32, canvas.right() as f32);
+                assert!(ox > 0.0 && oy > 0.0);
+                for scale in [1.0_f64, 2.0, 1.25, 1.5] {
+                    let last_column = crate::logical_point(
+                        (f64::from(right - 0.5) * scale, f64::from(oy + 10.0) * scale),
+                        scale,
+                    );
+                    assert_eq!(
+                        crate::pointer_in_canvas(&ws, last_column),
+                        Some((last_column.0 - ox, last_column.1 - oy)),
+                        "scale {scale}: the canvas's last column, where the rail was"
+                    );
+                    let on_strip = crate::logical_point(
+                        (f64::from(right + 1.0) * scale, f64::from(oy + 10.0) * scale),
+                        scale,
+                    );
+                    assert_eq!(
+                        crate::pointer_in_canvas(&ws, on_strip),
+                        None,
+                        "scale {scale}"
+                    );
+                    let Some(rect) = crate::canvas_area_physical_rect(&ws, scale) else {
+                        unreachable!("laid out");
+                    };
+                    #[allow(clippy::cast_possible_truncation)]
+                    let scale_f = scale as f32;
+                    assert!(
+                        (rect.0 + rect.2 - right * scale_f).abs() < 1e-3,
+                        "scale {scale}: {rect:?}"
+                    );
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let surface = (
+                        (f64::from(WINDOW.0) * scale).round() as u32,
+                        (f64::from(WINDOW.1) * scale).round() as u32,
+                    );
+                    let Some((x, _, w, _)) = crate::clamp_canvas_to_surface(rect, surface) else {
+                        unreachable!("scale {scale}: visible");
+                    };
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let strip_physical = (strip.x as f32 * scale_f).ceil() as u32;
+                    assert!(x + w <= strip_physical, "scale {scale}: scissor {x}+{w}");
+                }
+            }
         }
     }
 }

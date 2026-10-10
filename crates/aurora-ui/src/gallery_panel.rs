@@ -1066,7 +1066,16 @@ mod tests {
         assert!(!ws.tree.contains(panel_root));
         assert_eq!(
             ws.tree.children(ws.root),
-            Some([ws.tools.root, ws.canvas_column, ws.divider, ws.rail].as_slice())
+            Some(
+                [
+                    ws.tools.root,
+                    ws.canvas_column,
+                    ws.divider,
+                    ws.rail,
+                    ws.panel_strip.root,
+                ]
+                .as_slice()
+            )
         );
     }
 
@@ -1435,7 +1444,16 @@ mod tests {
         assert!(!ws.tree.contains(node));
         assert_eq!(
             ws.tree.children(ws.root),
-            Some([ws.tools.root, ws.canvas_column, ws.divider, ws.rail].as_slice())
+            Some(
+                [
+                    ws.tools.root,
+                    ws.canvas_column,
+                    ws.divider,
+                    ws.rail,
+                    ws.panel_strip.root,
+                ]
+                .as_slice()
+            )
         );
     }
 
