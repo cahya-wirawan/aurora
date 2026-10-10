@@ -857,10 +857,12 @@ impl TextFieldChord {
     /// chord never has `Alt` held — `Ctrl+Alt` is how Windows reports
     /// `AltGr`, which types — nor the other of `Ctrl`/`Cmd`.
     ///
-    /// macOS also maps `Ctrl+Z`/`Ctrl+Shift+Z`: the app's shortcut
-    /// registry binds document undo/redo to the literal `Ctrl` chord on
-    /// every platform, so without this arm `Ctrl+Z` pressed inside a
-    /// focused field would undo the *document*.
+    /// macOS also maps `Ctrl+Z`/`Ctrl+Shift+Z`: before 0.175.0 the app's
+    /// shortcut registry bound document undo/redo to the literal `Ctrl`
+    /// chord on every platform, so without this arm `Ctrl+Z` pressed
+    /// inside a focused field would undo the *document*. The registry
+    /// now binds `Cmd` on macOS; the arm is kept, so `Ctrl+Z` in a field
+    /// is still the field's undo there.
     #[must_use]
     pub fn from_key(key: &Key, modifiers: Modifiers, primary_is_meta: bool) -> Option<Self> {
         let (primary, other) = if primary_is_meta {
@@ -903,7 +905,8 @@ impl TextFieldChord {
                         _ => None,
                     };
                 }
-                // macOS only: the registry's literal `Ctrl+Z`/`Ctrl+Shift+Z`.
+                // macOS only: `Ctrl+Z`/`Ctrl+Shift+Z` (the registry's
+                // undo/redo chords before 0.175.0).
                 if primary_is_meta && modifiers.control && !modifiers.meta && c == 'z' {
                     return Some(if shift { Self::Redo } else { Self::Undo });
                 }

@@ -6829,10 +6829,12 @@ fn route_widget_key(
 }
 
 /// Whether the platform's primary shortcut modifier is `Cmd` (macOS) —
-/// `Ctrl` everywhere else. Only the text-field chords
-/// ([`TextFieldChord::from_key`]) and the command palette's clipboard
-/// chords read it: the shortcut registry itself ([`default_shortcuts`])
-/// still binds the literal `Ctrl` chords on every platform.
+/// `Ctrl` everywhere else. The text-field chords
+/// ([`TextFieldChord::from_key`]), the command palette's clipboard
+/// chords and, as of 0.175.0, the shortcut registry
+/// ([`default_shortcuts`]) all read it. Tests that press "the primary
+/// shortcut" build it from this too (`tests::primary_chord`,
+/// `tests::with_primary`, 0.175.1), so they hold on macOS as well.
 const PRIMARY_IS_META: bool = cfg!(target_os = "macos");
 
 /// Applies an editing chord to the focused text field `id` (0.137.0):
@@ -26500,17 +26502,40 @@ mod tests {
 
     /// The platform's primary shortcut modifier alone — `Cmd` on macOS,
     /// `Ctrl` elsewhere ([`PRIMARY_IS_META`]).
-    fn primary() -> Modifiers {
+    pub(crate) fn primary() -> Modifiers {
+        with_primary(Modifiers::none())
+    }
+
+    /// `modifiers` with the platform's primary shortcut modifier added
+    /// (0.175.1): `meta` on macOS, `control` elsewhere. For a test that
+    /// presses "the primary shortcut" (`Primary+Shift+P`, say) against
+    /// [`default_shortcuts`] — a literal `control: true` is the `Ctrl`
+    /// table only, and fails on macOS, where 0.175.0 binds `Cmd`.
+    pub(crate) fn with_primary(modifiers: Modifiers) -> Modifiers {
         if PRIMARY_IS_META {
             Modifiers {
                 meta: true,
-                ..Modifiers::none()
+                ..modifiers
             }
         } else {
             Modifiers {
                 control: true,
-                ..Modifiers::none()
+                ..modifiers
             }
+        }
+    }
+
+    /// The chord `rest` (`"Shift+P"`, `"Z"`) held with the platform's
+    /// primary shortcut modifier (0.175.1) — `Cmd+…` on macOS, `Ctrl+…`
+    /// elsewhere, the spelling [`default_shortcuts`] binds its
+    /// `Primary+…` entries with. Tests about one table in particular keep
+    /// literal chords against [`default_shortcuts_for`] instead, and
+    /// `Ctrl+Tab` stays literal `Ctrl` on every platform.
+    pub(crate) fn primary_chord(rest: &str) -> KeyChord {
+        let source = format!("{}+{rest}", super::primary_modifier(PRIMARY_IS_META));
+        match KeyChord::parse(&source) {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{source}: {err:?}"),
         }
     }
     use aurora_doc::SelectionSet;
@@ -32829,10 +32854,7 @@ mod tests {
             Ok(chord) => chord,
             Err(err) => unreachable!("{err:?}"),
         };
-        let toggle = match KeyChord::parse("Ctrl+Shift+P") {
-            Ok(chord) => chord,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let toggle = primary_chord("Shift+P");
         assert_eq!(shortcuts.resolve(tab), Some(&AppCommand::FocusNext));
         assert_eq!(
             shortcuts.resolve(shift_tab),
@@ -32844,17 +32866,13 @@ mod tests {
         );
     }
 
+    /// `Primary+Z`/`Primary+Shift+Z` — `Ctrl` here, `Cmd` on macOS
+    /// (0.175.0); the name predates the per-platform binding.
     #[test]
     fn default_shortcuts_binds_ctrl_z_and_ctrl_shift_z_to_undo_and_redo() {
         let shortcuts = default_shortcuts();
-        let undo = match KeyChord::parse("Ctrl+Z") {
-            Ok(chord) => chord,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let redo = match KeyChord::parse("Ctrl+Shift+Z") {
-            Ok(chord) => chord,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let undo = primary_chord("Z");
+        let redo = primary_chord("Shift+Z");
         assert_eq!(shortcuts.resolve(undo), Some(&AppCommand::Undo));
         assert_eq!(shortcuts.resolve(redo), Some(&AppCommand::Redo));
     }
@@ -34236,10 +34254,7 @@ mod tests {
             None,
             &mut undo_order,
             &shortcuts,
-            Modifiers {
-                control: true,
-                ..Modifiers::none()
-            },
+            primary(),
             Key::Character('z'),
             None,
             &mut FakeClipboard::default(),
@@ -34301,11 +34316,10 @@ mod tests {
             None,
             &mut undo_order,
             &shortcuts,
-            Modifiers {
-                control: true,
+            with_primary(Modifiers {
                 shift: true,
                 ..Modifiers::none()
-            },
+            }),
             Key::Character('z'),
             None,
             &mut FakeClipboard::default(),
@@ -65203,15 +65217,17 @@ mod tests {
     };
 
     /// The chord the shortcut registry binds to document undo is the
-    /// literal `Ctrl+Z` on every platform. With a text field focused it
-    /// is the *field's* undo — and even with the field's own history
-    /// empty it must be consumed, never fall through to the document.
+    /// platform's primary `Z` (`Cmd+Z` on macOS, `Ctrl+Z` elsewhere,
+    /// 0.175.0). With a text field focused it is the *field's* undo — as
+    /// is literal `Ctrl+Z`, which macOS's field table also maps — and
+    /// even with the field's own history empty it must be consumed,
+    /// never fall through to the document.
     #[test]
     fn undo_in_a_focused_field_with_empty_history_never_undoes_the_document() {
         let mut rig = GalleryRig::open();
-        // The rig can see a document undo at all: unfocused, `Ctrl+Z`
-        // reaches the registry.
-        let (_, picked, _) = rig.key_event(Key::Character('z'), Some("\u{1a}"), LITERAL_CTRL);
+        // The rig can see a document undo at all: unfocused, the primary
+        // `Z` reaches the registry.
+        let (_, picked, _) = rig.key_event(Key::Character('z'), None, primary());
         assert_eq!(picked, Some(ActivatedCommand::Undo), "the control case");
 
         let field = rig.focus_text_field();
@@ -65465,14 +65481,16 @@ mod tests {
         assert_eq!(rig.text(), "ab x");
     }
 
+    /// The registry's palette chord is the platform's primary
+    /// `Shift+P` (`Cmd` on macOS, `Ctrl` elsewhere, 0.175.0).
     #[test]
     fn ctrl_shift_p_still_opens_the_palette_with_the_field_focused() {
         let mut rig = GalleryRig::open();
         rig.focus_text_field();
         let (routed, _, palette_open) =
-            rig.key_event(Key::Character('p'), None, with_shift(LITERAL_CTRL));
+            rig.key_event(Key::Character('p'), None, with_shift(primary()));
         assert_eq!(routed, Some(KeyOutcome::Ignored));
-        assert!(palette_open, "the registry's Ctrl+Shift+P still runs");
+        assert!(palette_open, "the registry's primary Shift+P still runs");
     }
 
     #[test]
@@ -65705,8 +65723,8 @@ mod tests {
             sync_layer_rows_after_undo_redo,
         };
         use super::{
-            FakeFileDialog, GalleryRig, a_brush_drag_that_painted, commit_test_store, row_of,
-            selected_layer_rows,
+            FakeFileDialog, GalleryRig, a_brush_drag_that_painted, commit_test_store,
+            primary_chord, row_of, selected_layer_rows, with_primary,
         };
         use aurora_doc::{LayerId, LayerTree};
         use aurora_theme::Scales;
@@ -66377,10 +66395,17 @@ mod tests {
                 Err(err) => unreachable!("{err:?}"),
             };
             assert_eq!(
-                shortcuts.resolve(chord("Ctrl+Shift+N")),
+                shortcuts.resolve(primary_chord("Shift+N")),
                 Some(&AppCommand::NewLayer)
             );
-            for unbound in ["Delete", "Backspace", "Ctrl+Delete", "Ctrl+Backspace"] {
+            for unbound in [
+                "Delete",
+                "Backspace",
+                "Ctrl+Delete",
+                "Ctrl+Backspace",
+                "Cmd+Delete",
+                "Cmd+Backspace",
+            ] {
                 assert_eq!(shortcuts.resolve(chord(unbound)), None, "{unbound}");
             }
         }
@@ -66391,12 +66416,10 @@ mod tests {
             let (_, picked, _) = rig.key_event(
                 Key::Character('n'),
                 Some("\u{e}"),
-                Modifiers {
-                    control: true,
+                with_primary(Modifiers {
                     shift: true,
-                    alt: false,
-                    meta: false,
-                },
+                    ..Modifiers::none()
+                }),
             );
             assert_eq!(picked, Some(ActivatedCommand::NewLayer));
         }
@@ -66417,12 +66440,10 @@ mod tests {
             let (routed, picked, _) = rig.key_event(
                 Key::Character('n'),
                 Some("\u{e}"),
-                Modifiers {
-                    control: true,
+                with_primary(Modifiers {
                     shift: true,
-                    alt: false,
-                    meta: false,
-                },
+                    ..Modifiers::none()
+                }),
             );
             assert!(
                 !matches!(routed, Some(KeyOutcome::Handled(_))),

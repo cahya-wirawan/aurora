@@ -12,7 +12,7 @@ use crate::document_tabs::{
 };
 use crate::tests::{
     FakeClipboard, FakeFileDialog, fill_solid, read_all_texels, real_gpu_context,
-    render_and_sample_pixel,
+    render_and_sample_pixel, with_primary,
 };
 use crate::{
     ActivatedCommand, AppCommand, CurvesUiState, Drag, LayerControlsState, PendingCurves,
@@ -1090,11 +1090,11 @@ fn a_palette_document_entry_closes_the_palette_before_the_switch() {
             &mut FakeFileDialog::default(),
         )
     };
-    let open = Modifiers {
-        control: true,
+    // The platform's primary `Shift+P` (`Cmd` on macOS, 0.175.0).
+    let open = with_primary(Modifiers {
         shift: true,
         ..Modifiers::none()
-    };
+    });
     let _ = press(&mut rig, &mut palette, open, Key::Character('p'), None);
     assert!(palette.is_some(), "the palette opened");
     assert!(document_tabs::add_document_entries_if_opened(
