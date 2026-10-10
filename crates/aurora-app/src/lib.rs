@@ -19761,9 +19761,9 @@ fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
     match own {
         Some((dir, key)) => {
             let marker = state.marker_path().to_path_buf();
-            let remaining = autosave_files::read_marker(&marker)
-                .map(|keys| autosave_files::marker_after_quit(&dir, key, &keys))
-                .unwrap_or_default();
+            // A missing marker still gets the scan (0.171.1 review L-2).
+            let previous = autosave_files::read_marker(&marker).unwrap_or_default();
+            let remaining = autosave_files::marker_after_quit(&dir, key, &previous);
             if remaining.is_empty() {
                 clear_session_marker(&marker);
             } else {
@@ -21182,6 +21182,8 @@ impl App {
             &mut open_tile_store,
         );
         let mut autosave_worker = background_autosave::AutosaveWorker::default();
+        // 0.171.1 (L-a): keep this run's lock and index visibly alive.
+        autosave_worker.set_liveness(autosave.liveness(), autosave_files::LIVENESS_REFRESH);
         let settled = settle_startup_autosave(
             &mut autosave_worker,
             &autosave,
@@ -25348,23 +25350,19 @@ pub fn run() -> anyhow::Result<()> {
     let own_pid = std::process::id();
     let autosave = autosave_files::AutosaveNamespace::acquire(std::env::temp_dir(), own_pid);
     let previous_marker = autosave_files::read_marker(&marker_path);
-    // 0.171.0 review N1/N2: an empty or damaged marker falls back to a
-    // scan of the directory; otherwise its keys, those with files first.
-    let marker_runs = previous_marker
-        .as_deref()
-        .map(|keys| autosave_files::recovery_keys(&autosave.dir, keys));
-    let claimed = marker_runs.as_deref().map_or_else(Vec::new, |keys| {
-        autosave_files::claim_sources(&autosave.dir, autosave.key, keys)
-    });
-    let sources: Vec<autosave_files::RunKey> = claimed.iter().map(|source| source.key).collect();
-    let had_previous_marker = previous_marker
-        .as_deref()
-        .is_some_and(|keys| keys.is_empty() || !sources.is_empty());
+    // The marker's keys plus a scan of the directory -- even with no
+    // marker at all (0.171.1 review L-2) -- those with files first; see
+    // `autosave_files::startup_sources`.
+    let found =
+        autosave_files::startup_sources(&autosave.dir, autosave.key, previous_marker.as_deref());
+    let sources: Vec<autosave_files::RunKey> =
+        found.claimed.iter().map(|source| source.key).collect();
+    let had_previous_marker = found.had_previous_marker;
     let mut marker_keys = vec![autosave.key];
     marker_keys.extend(autosave_files::inherited_marker_keys(
         &autosave.dir,
         autosave.key,
-        marker_runs.as_deref().unwrap_or_default(),
+        &found.keys,
     ));
     write_session_marker_contents(&marker_path, &autosave_files::encode_marker(&marker_keys));
     // Strictly before this session's own scratch directory is first
@@ -25400,7 +25398,7 @@ pub fn run() -> anyhow::Result<()> {
         preferences.reduced_motion,
     );
     // The crashed runs' locks were held through recovery and adoption.
-    drop(claimed);
+    drop(found);
     event_loop
         .run_app(&mut app)
         .map_err(|err| anyhow::anyhow!("event loop run failed: {err}"))?;
@@ -55836,7 +55834,15 @@ mod tests {
                 fixture.state.namespace = Some(namespace);
                 assert!(fixture.marker.exists(), "the fixture starts with a marker");
                 crate::run_shutdown_cleanup(&mut fixture.state);
-                assert_eq!(fixture.marker.exists(), aborted == Aborted::Yes);
+                // Kept either way: another run still has files here, and
+                // a clean quit names it (0.171.1 review L-2).
+                assert!(fixture.marker.exists());
+                if aborted == Aborted::No {
+                    assert_eq!(
+                        autosave_files::read_marker(&fixture.marker),
+                        Some(vec![RunKey::from(4_000_082)])
+                    );
+                }
                 for path in &ours {
                     assert_eq!(path.exists(), aborted == Aborted::Yes, "{}", path.display());
                 }
@@ -55857,6 +55863,10 @@ mod tests {
             let dir = tempdir();
             let crashed = 4_000_171;
             write_document(&dir.path().join(session_file_name(crashed, 1)), (27, 8));
+            // A crashed run leaves its (unheld) lock file behind.
+            if let Err(err) = std::fs::write(autosave_files::lock_path(dir.path(), crashed), b"") {
+                unreachable!("{err}");
+            }
             let marker = dir.path().join("aurora-session.marker");
             if let Err(err) = std::fs::write(&marker, [0_u8; 512]) {
                 unreachable!("{err}");
