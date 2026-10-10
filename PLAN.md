@@ -26,7 +26,58 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.168.0): workspace presets, Photoshop-style.**
+**Latest (2026-10-10, 0.169.0): dialog actions reach the App as typed
+results.** A prerequisite for document tabs (closing an unsaved tab needs
+a real Save / Don't Save / Cancel), not tabs itself. **Until now no
+dialog choice reached the App at all**: `run_dialog_action` closed the
+dialog and only logged the id. That was harmless only because every
+dialog had one acknowledgement action. Now:
+**widget layer (`aurora-widgets`, generic)**: `DialogAction::as_default`/
+`as_cancel`; `DialogHandle` records `default_action`/`cancel_action`,
+`initial_focus()` (the default, else the first action);
+`DialogHandle::key(&KeyChord, focused)` → `DialogKeyOutcome`
+(`Enter` = the focused action button, else the default — the
+Windows/GTK "focused wins" convention, the same as the default on an
+untouched dialog since focus opens there; `Space` = the focused button
+only; `Escape` = the cancel, **and nothing when there is none** — such a
+dialog is not dismissable by `Escape`; `Tab`/`Shift+Tab` = focus trapped
+in the buttons, wrapping; `Ctrl`/`Alt`/`Meta` chords and `Shift` with
+anything but `Tab` ignored); `DialogHandle::choice_for(button)` for a
+pointer or AT `Click`. Every path yields one `DialogChoice { dialog,
+action }` — "action id on dialog root", nothing document-specific.
+**App layer (`aurora-app`)**: every dialog opened carries a
+`DialogPurpose` (`CrashRecovery`, `OpenedWithChanges`, `OpenFailed`,
+`SaveFailed`, `ExportRefused`, `SkippedTiles`, `MoveRefused`,
+`ReplaceWorkspace(name)`) in an `OpenDialog` slot (which also records
+`restore_focus`); `run_dialog_action` returns a `DialogResult { purpose,
+action }`, reached by the key path (`handle_dialog_key` →
+`ActivatedCommand::Dialog`), the pointer path (`handle_dialog_pointer` →
+`DialogPointer::Chosen`) and the AT path (`AccessibilityEffects::dialog`),
+and `App::run_dialog_result` dispatches it through the free
+`dialog_effect`. **Close**: the dialog is removed and focus returns to
+the widget focused when it opened, if it still exists and can take
+focus; else focus stays cleared (the palette's own fallback).
+**Stacking**: unchanged — one dialog at a time, a second request is
+refused (logged, `open_dialog` returns `false`), not queued; 0.151.0's
+"a finished open waits for the dialog to close" still holds (its tests
+pass unchanged). **Audit**: all seven existing dialogs are one
+acknowledgement ("OK", crash recovery's "Continue"), now marked default
+and cancel so `Escape` keeps dismissing them; each does what it says
+(closes; the condition it reports already happened). Crash recovery
+never offered Recover/Discard — recovery is automatic and the dialog
+reports it — so no lost choice existed to fix. **Used once more**: 0.168.0's
+"second Enter in the prompt" overwrite confirmation is now a real
+AlertDialog, "Replace Workspace “X”?", Replace (default) / Cancel
+(cancel); Cancel saves nothing and **returns to the name prompt with the
+name typed** (the macOS Save panel's "Replace?" convention — the user
+wanted to save, so a cancelled replace is usually "pick another name";
+a second `Escape` there closes the prompt). The prompt's replace mode
+and `COMMAND_WORKSPACE_NAME_REPLACE` are gone. Not done: no AccessKit
+"default button" marking (accesskit's API for it was not checked), no
+scrim, no human or screen reader has used any of it on real hardware.
+See the 0.169.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.168.0): workspace presets, Photoshop-style.**
 Workspace round 6. A built-in **Essentials** preset is the default
 layout (`workspace_presets::essentials_layout`: the default arrangement,
 every panel docked, the rail expanded at the now-public
@@ -31286,6 +31337,122 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.169.0) — dialog actions reach the App.** Branch
+`007-dialog_actions` (from `main` at 476dff2, 0.168.0). Files:
+`aurora-widgets` `widgets/dialog.rs` (`DialogAction::as_default`/
+`as_cancel`, `DialogHandle::{default_action, cancel_action,
+initial_focus, choice_for, key}`, `DialogChoice`, `DialogKeyOutcome`; six
+widget-level tests), `widgets/mod.rs` (exports); `aurora-app` `lib.rs`
+(`DialogPurpose`, `OpenDialog` with `restore_focus`, `DialogResult`,
+`DialogEffect`/`dialog_effect`, `DialogPointer`, `acknowledge_action`;
+`open_dialog` takes a purpose and focuses the default; `close_dialog`
+restores focus; `handle_dialog_key`/`handle_dialog_pointer`/
+`run_dialog_action` return results; `AccessibilityEffects::dialog`
+(no longer `Copy`); `ActivatedCommand::Dialog` at both dispatch sites,
+one of them macOS-only and checked by inspection only;
+`App::run_dialog_result`; six app tests), `workspace_presets.rs` (the
+Replace Workspace dialog, `replace_workspace_choice`,
+`WorkspaceCommand::ReturnToNamePrompt`, the prompt's replace mode
+removed; its overwrite test rewritten for the dialog).
+
+**Dialog audit** (every dialog the App opens; all are one action, now
+default and cancel, so `Enter`, `Space`, `Escape`, click and AT `Click`
+all acknowledge): crash recovery "Aurora Didn't Close Properly" /
+Continue (`open_crash_recovery_dialog`); "Opened With Changes" / OK (PSD
+import report); "Couldn't Open File" / OK (`open_open_failed_dialog`);
+"Couldn't Save File" / OK; "Couldn't Export This Document" / OK; "This
+Document Is Missing Content" / OK; "Can't Move This Layer Further" / OK;
+new: "Replace Workspace “X”?" / Replace (default) + Cancel (cancel).
+**No previously broken action was found**: crash recovery is automatic
+and never offered Recover/Discard, and every other action's label
+("OK"/"Continue") is exactly what closing does. What *was* broken is the
+mechanism — no choice ever reached the App — which this round fixes.
+
+**Evidence (AC → tests).** AC-1:
+`a_dialog_choice_is_the_same_typed_result_by_key_pointer_and_at_click`
+(Enter, Space, pointer, AT `Click`; both actions; each closes),
+`pointer_and_accessibility_clicks_make_the_same_choice_as_the_keyboard`
+(widget level). AC-2:
+`enter_is_the_default_escape_the_cancel_and_tab_stays_in_the_dialog`,
+`escape_leaves_a_dialog_without_a_cancel_action_open`,
+`enter_space_and_escape_choose_the_right_action`,
+`escape_does_nothing_without_a_cancel_action`,
+`default_and_cancel_are_recorded_and_initial_focus_is_the_default`,
+`without_a_default_initial_focus_is_the_first_action_and_the_first_marked_wins`,
+`tab_and_shift_tab_cycle_the_action_buttons_and_wrap`. AC-3:
+`every_app_dialog_action_dispatches_to_its_own_purpose`. AC-4:
+`save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites`.
+AC-5: `focus_returns_to_where_it_was_when_the_dialog_closes`,
+`a_second_dialog_is_refused_while_one_is_open`, and the unchanged
+`a_finished_open_waits_for_an_open_dialog_to_close_then_installs_and_shows_its_report`.
+
+**Gate** (one run after the last code change, `AURORA_REQUIRE_GPU=1`,
+so a CPU or missing adapter would have failed it; the adapter's name
+was not captured in the log — this box's GPU is an RTX 3090): fmt, layering, hardcoded-style, `check
+--locked`, clippy `-D warnings` all clean; `cargo test --workspace
+--no-fail-fast` **3,155 passed, 0 failed, 61 ignored, 0 SKIPPED**;
+`cargo doc` with `-D warnings` clean; `cargo deny check all` ok
+(pre-existing duplicate-crate warnings only); contrast check passes.
+
+**Review hardening (0.169.0, judge PASS 0.907).** Two of the judge's
+low-severity recommendations were applied after its verdict:
+- J1: `close_dialog` now runs `aurora_ui::refocus_workspace` after
+  restoring focus, so a restored focus never rests on a widget a panel
+  change hid. Previously this relied on the next layout's backstop.
+- J2: if the "Replace Workspace?" dialog is refused because another
+  dialog is open, the name prompt reopens with the typed name instead of
+  losing it. Test:
+  `workspace_presets::tests::a_refused_replace_dialog_keeps_the_typed_name_in_the_prompt`.
+  The mutation that drops the reopen was killed by it.
+
+Full gate re-run in one pass after these changes, with
+`AURORA_REQUIRE_GPU=1` on the RTX 3090: fmt, layering, style,
+`check --locked` and clippy clean; **3,156 passed, 0 failed, 61 ignored,
+0 SKIPPED**; strict rustdoc, `cargo deny` and contrast clean.
+
+Not applied, both disclosed:
+- J3: holding Enter, or a quick double Enter, on a taken name confirms
+  Replace, as 0.168.0's second Enter did.
+- J4: a half-built dialog subtree is left behind if `insert_button`
+  fails partway.
+
+**Mutation matrix** (each really run, `cargo test -p aurora-app -p
+aurora-widgets`, `AURORA_REQUIRE_GPU=1`, restored from a backup and
+sha256-verified after the run; all 12 killed):
+
+| # | Mutation | Killed by |
+|---|---|---|
+| M1 | key path drops the choice (`handle_key` returns `None`) | 2 (AC-1 three-path test, AC-2 Enter/Escape test) |
+| M2 | pointer path drops the choice | 1 (AC-1 three-path test) |
+| M3 | AT path drops the choice (`AccessibilityEffects::dialog` unset) | 1 (AC-1 three-path test) |
+| M4 | `Escape` maps to the default instead of the cancel | 5 (two widget, two app, the overwrite test) |
+| M5 | focus not restored on close | 1 (focus-restore test) |
+| M6a | wrong purpose dispatch in `dialog_effect` | 1 (audit test) |
+| M6b | open-failure dialog opened with the `SaveFailed` purpose | 1 (second-dialog test) |
+| M7 | the overwrite dialog's Cancel replaces anyway | 2 (audit test, overwrite test) |
+| M8 | `open_dialog` focuses the first action, not the default | 1 (no-cancel test) |
+| M9 | `Tab`'s focus move dropped | 1 (AC-2 Tab test) |
+| M10 | `Enter` with no focused button ignores the default | 1 (widget key test) |
+| M11 | Replace dialog declares no cancel | 4 |
+
+No crash-recovery fix was needed, so there is no recovery mutation row.
+
+**Not verified / known weaknesses.** No human, no screen reader, no real
+macOS hardware has used any dialog this round; the macOS menu dispatch
+arm of `ActivatedCommand::Dialog` compiles only on macOS and was checked
+by inspection. The default button is not marked to accessibility (no
+AccessKit "default" state set; not investigated) and is not painted
+differently — a visual default-button treatment is a design-owner
+question (no token exists for it). `Enter` follows the *focused* button
+(Windows/GTK) rather than always the default (macOS); on macOS, after
+`Tab` to Cancel, `Enter` cancels — a platform-convention question for the
+design owner. Button order is Replace then Cancel, not the macOS
+default-rightmost order. A second dialog is still refused, not queued;
+document tabs' Save / Don't Save / Cancel will need to decide whether a
+refusal is acceptable there. The app-level audit test landed in the
+last test module of `lib.rs` (`panel_scroll_tests`), not beside the
+dialog tests.
 
 **Addendum 2026-10-10 (0.168.0) — workspace presets.** Branch
 `006-workspace_presets` (from `main` at 7b25b62, 0.167.0). Files:

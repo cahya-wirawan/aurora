@@ -41,14 +41,14 @@ use std::path::{Path, PathBuf};
 
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{
-    CommandEntry, command_palette_state, insert_command_prompt, set_command_palette_commands,
-    set_command_palette_message, set_command_palette_query,
+    CommandEntry, DialogAction, command_palette_state, insert_command_prompt,
+    set_command_palette_commands, set_command_palette_message, set_command_palette_query,
 };
 
 use super::{
-    FocusManager, WidgetId, WorkspaceLayout, apply_saved_collapse, arrangement_from_saved,
-    command_palette_style, decode_workspace_layout, default_saved_dock, refocus_out_of_hidden,
-    saved_dock, saved_float_stack, workspace_layout,
+    DialogPurpose, FocusManager, OpenDialog, WidgetId, WorkspaceLayout, apply_saved_collapse,
+    arrangement_from_saved, command_palette_style, decode_workspace_layout, default_saved_dock,
+    refocus_out_of_hidden, saved_dock, saved_float_stack, workspace_layout,
 };
 
 /// The built-in preset's name.
@@ -69,8 +69,10 @@ pub(crate) const COMMAND_WORKSPACE_SWITCH_PREFIX: &str = "workspace.switch/";
 pub(crate) const COMMAND_WORKSPACE_DELETE_PREFIX: &str = "workspace.delete/";
 /// The name prompt's row: save under the typed name.
 pub(crate) const COMMAND_WORKSPACE_NAME_SAVE: &str = "workspace.name.save";
-/// The name prompt's row once the typed name is taken: replace it.
-pub(crate) const COMMAND_WORKSPACE_NAME_REPLACE: &str = "workspace.name.replace";
+/// The Replace Workspace dialog's default action (0.169.0).
+pub(crate) const WORKSPACE_REPLACE: &str = "workspace.replace";
+/// The Replace Workspace dialog's cancel action (0.169.0).
+pub(crate) const WORKSPACE_REPLACE_CANCEL: &str = "workspace.replace.cancel";
 
 /// The most user presets kept (0.168.0 review J2, an engineering cap):
 /// Save As refuses a new name beyond it, and decoding stops there.
@@ -332,8 +334,12 @@ pub(crate) enum WorkspaceCommand {
     ResetActive,
     /// "Save Workspace As…": open the name prompt.
     PromptSaveAs,
-    /// The prompt's Enter on a valid name; `replace` once the user has
-    /// been told the name is taken.
+    /// Back to the name prompt with `name` typed (0.169.0): the Replace
+    /// Workspace dialog's Cancel.
+    ReturnToNamePrompt(String),
+    /// The prompt's Enter on a valid name (`replace: false`; a taken name
+    /// then opens the Replace Workspace dialog), or that dialog's Replace
+    /// (`replace: true`).
     Save { name: String, replace: bool },
 }
 
@@ -414,14 +420,8 @@ pub(crate) fn add_workspace_entries_if_opened(
 }
 
 /// The name prompt's one row for `query`: what Enter does.
-fn name_prompt_entries(query: &str, replace: bool) -> Vec<CommandEntry> {
+fn name_prompt_entries(query: &str) -> Vec<CommandEntry> {
     let name = query.trim();
-    if replace {
-        return vec![CommandEntry::new(
-            COMMAND_WORKSPACE_NAME_REPLACE,
-            format!("Replace Workspace \u{201c}{name}\u{201d}"),
-        )];
-    }
     let title = if name.is_empty() {
         "Save Workspace".to_owned()
     } else {
@@ -432,19 +432,19 @@ fn name_prompt_entries(query: &str, replace: bool) -> Vec<CommandEntry> {
 
 /// Whether `id` is one of the name prompt's rows.
 fn is_name_prompt_row(id: &str) -> bool {
-    id == COMMAND_WORKSPACE_NAME_SAVE || id == COMMAND_WORKSPACE_NAME_REPLACE
+    id == COMMAND_WORKSPACE_NAME_SAVE
 }
 
 /// Opens the name prompt (a no-op if a palette or prompt is open): the
-/// typed text starts as `query`; with `replace`, its row and message say
-/// the name is taken and that Enter replaces it. Focus moves to it.
-/// Returns whether it opened.
+/// typed text starts as `query`. Focus moves to it. Returns whether it
+/// opened. (0.168.0's "replace" mode of this prompt — a second Enter on a
+/// taken name — is gone: 0.169.0 asks in a real dialog,
+/// [`open_replace_workspace_dialog`].)
 pub(crate) fn open_workspace_name_prompt(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     query: &str,
-    replace: bool,
 ) -> bool {
     if palette.is_some() {
         return false;
@@ -453,7 +453,7 @@ pub(crate) fn open_workspace_name_prompt(
         &mut workspace.tree,
         workspace.root,
         WORKSPACE_NAME_PROMPT_LABEL,
-        name_prompt_entries(query, replace),
+        name_prompt_entries(query),
     ) {
         Ok(root) => root,
         Err(err) => {
@@ -469,16 +469,6 @@ pub(crate) fn open_workspace_name_prompt(
     {
         tracing::warn!(?err, "failed to fill the workspace name prompt");
     }
-    if replace {
-        let message = format!(
-            "A workspace named \u{201c}{}\u{201d} exists. Press Enter to replace it, \
-             or Escape to cancel.",
-            query.trim()
-        );
-        if let Err(err) = set_command_palette_message(&mut workspace.tree, root, Some(message)) {
-            tracing::warn!(?err, "failed to describe the workspace name prompt");
-        }
-    }
     if let Err(err) = focus.focus(&mut workspace.tree, root) {
         tracing::warn!(?err, "failed to focus the workspace name prompt");
     }
@@ -487,7 +477,7 @@ pub(crate) fn open_workspace_name_prompt(
 }
 
 /// After the typed text changed: a name prompt's row follows it (and a
-/// replace confirmation or a refusal is withdrawn — an edited name is
+/// refusal is withdrawn — an edited name is
 /// checked afresh). A no-op for the ordinary palette.
 pub(crate) fn follow_name_prompt_query(
     tree: &mut aurora_widgets::WidgetTree<super::WidgetKind>,
@@ -500,7 +490,7 @@ pub(crate) fn follow_name_prompt_query(
         return;
     }
     let query = state.query().to_owned();
-    if let Err(err) = set_command_palette_commands(tree, root, name_prompt_entries(&query, false)) {
+    if let Err(err) = set_command_palette_commands(tree, root, name_prompt_entries(&query)) {
         tracing::warn!(?err, "failed to update the workspace name prompt");
     }
     if let Err(err) = set_command_palette_message(tree, root, None) {
@@ -529,7 +519,7 @@ pub(crate) fn name_prompt_enter(
     match validate_workspace_name(&query) {
         Ok(name) => Some(Ok(WorkspaceCommand::Save {
             name,
-            replace: id == COMMAND_WORKSPACE_NAME_REPLACE,
+            replace: false,
         })),
         Err(err) => {
             let message = err.message();
@@ -568,6 +558,59 @@ pub(crate) fn emptied_panels(workspace: &aurora_ui::Workspace) -> Vec<aurora_ui:
         .collect()
 }
 
+/// The Replace Workspace dialog's title for `name` (0.169.0).
+pub(crate) fn replace_workspace_title(name: &str) -> String {
+    format!("Replace Workspace \u{201c}{name}\u{201d}?")
+}
+
+/// Opens "Replace Workspace “`name`”?" (0.169.0): Replace (the default:
+/// focused, `Enter`) and Cancel (`Escape`). Nothing is saved until Replace
+/// is chosen ([`replace_workspace_choice`]). A no-op returning `false` if
+/// a dialog is already open — the App's one-dialog rule
+/// (`super::open_dialog`).
+pub(crate) fn open_replace_workspace_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<OpenDialog>,
+    scales: &Scales,
+    name: &str,
+) -> bool {
+    let message = format!(
+        "A workspace named \u{201c}{name}\u{201d} already exists. Replacing it saves the \
+         current layout under that name."
+    );
+    super::open_dialog(
+        workspace,
+        focus,
+        dialog,
+        scales,
+        &replace_workspace_title(name),
+        &message,
+        vec![
+            DialogAction::new(WORKSPACE_REPLACE, "Replace").as_default(),
+            DialogAction::new(WORKSPACE_REPLACE_CANCEL, "Cancel").as_cancel(),
+        ],
+        DialogPurpose::ReplaceWorkspace(name.to_owned()),
+    )
+}
+
+/// What the Replace Workspace dialog's `action` does for `name`
+/// (0.169.0): Replace saves over it; Cancel goes back to the name prompt
+/// with `name` typed, so another name can be chosen — the macOS Save
+/// panel's "Replace?" convention, where Cancel returns to the panel
+/// rather than abandoning the save (a second `Escape` there closes it).
+/// `None` for an id the dialog does not have.
+pub(crate) fn replace_workspace_choice(name: &str, action: &str) -> Option<WorkspaceCommand> {
+    match action {
+        WORKSPACE_REPLACE => Some(WorkspaceCommand::Save {
+            name: name.to_owned(),
+            replace: true,
+        }),
+        WORKSPACE_REPLACE_CANCEL => Some(WorkspaceCommand::ReturnToNamePrompt(name.to_owned())),
+        _ => None,
+    }
+}
+
 /// What [`run_workspace_command`] changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct WorkspaceCommandOutcome {
@@ -583,6 +626,7 @@ pub(crate) fn run_workspace_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
+    dialog: &mut Option<OpenDialog>,
     presets: &mut WorkspacePresets,
     scales: &Scales,
     command: WorkspaceCommand,
@@ -616,7 +660,11 @@ pub(crate) fn run_workspace_command(
             presets_changed: presets.delete(&name),
         },
         WorkspaceCommand::PromptSaveAs => {
-            open_workspace_name_prompt(workspace, focus, palette, "", false);
+            open_workspace_name_prompt(workspace, focus, palette, "");
+            WorkspaceCommandOutcome::default()
+        }
+        WorkspaceCommand::ReturnToNamePrompt(name) => {
+            open_workspace_name_prompt(workspace, focus, palette, &name);
             WorkspaceCommandOutcome::default()
         }
         WorkspaceCommand::Save { name, replace } => {
@@ -624,13 +672,17 @@ pub(crate) fn run_workspace_command(
                 return WorkspaceCommandOutcome::default();
             };
             if !replace && presets.has_user(&name) {
-                // Taken: ask again, in the prompt itself.
-                open_workspace_name_prompt(workspace, focus, palette, &name, true);
+                // Taken: ask in a real dialog (0.169.0), saving nothing yet.
+                if !open_replace_workspace_dialog(workspace, focus, dialog, scales, &name) {
+                    // Review J2 (0.169.0): another dialog refused this one;
+                    // keep the typed name rather than losing it.
+                    open_workspace_name_prompt(workspace, focus, palette, &name);
+                }
                 return WorkspaceCommandOutcome::default();
             }
             if !presets.has_user(&name) && presets.user.len() >= MAX_WORKSPACE_PRESETS {
                 // Review J2: full — say so in the prompt, save nothing.
-                if open_workspace_name_prompt(workspace, focus, palette, &name, false)
+                if open_workspace_name_prompt(workspace, focus, palette, &name)
                     && let Some(root) = *palette
                 {
                     let message = format!(
@@ -837,13 +889,13 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_WORKSPACE_NAME_REPLACE, COMMAND_WORKSPACE_NAME_SAVE, COMMAND_WORKSPACE_SAVE_AS,
-        ESSENTIALS, MAX_WORKSPACE_PRESETS, PRESETS_FILE_MAX_BYTES, PRESETS_MAGIC, PresetsHeader,
-        SavedPreset, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_NAME_PROMPT_LABEL, WorkspaceCommand,
-        WorkspaceCommandOutcome, WorkspaceNameError, WorkspacePresets,
-        add_workspace_entries_if_opened, decode_presets, encode_presets, essentials_layout,
-        live_layout, load_presets, presets_path_for, run_workspace_command, save_presets,
-        validate_workspace_name, workspace_command_for, workspace_palette_entries,
+        COMMAND_WORKSPACE_NAME_SAVE, COMMAND_WORKSPACE_SAVE_AS, ESSENTIALS, MAX_WORKSPACE_PRESETS,
+        PRESETS_FILE_MAX_BYTES, PRESETS_MAGIC, PresetsHeader, SavedPreset,
+        WORKSPACE_NAME_MAX_CHARS, WORKSPACE_NAME_PROMPT_LABEL, WORKSPACE_REPLACE,
+        WORKSPACE_REPLACE_CANCEL, WorkspaceCommand, WorkspaceCommandOutcome, WorkspaceNameError,
+        WorkspacePresets, add_workspace_entries_if_opened, decode_presets, encode_presets,
+        essentials_layout, live_layout, load_presets, presets_path_for, run_workspace_command,
+        save_presets, validate_workspace_name, workspace_command_for, workspace_palette_entries,
     };
     use crate::tests::{FakeClipboard, FakeFileDialog};
     use crate::{
@@ -877,6 +929,7 @@ mod tests {
         ws: aurora_ui::Workspace,
         focus: FocusManager,
         palette: Option<WidgetId>,
+        dialog: Option<crate::OpenDialog>,
         presets: WorkspacePresets,
     }
 
@@ -886,6 +939,7 @@ mod tests {
                 ws: workspace(),
                 focus: FocusManager::default(),
                 palette: None,
+                dialog: None,
                 presets: WorkspacePresets::default(),
             }
         }
@@ -895,6 +949,7 @@ mod tests {
                 &mut self.ws,
                 &mut self.focus,
                 &mut self.palette,
+                &mut self.dialog,
                 &mut self.presets,
                 &crate::test_layout_scales(),
                 command,
@@ -915,6 +970,29 @@ mod tests {
             );
             lay(&mut self.ws, 1.0, WINDOW);
             picked
+        }
+
+        /// A key while the replace dialog is open: the chosen result.
+        fn dialog_key(&mut self, key: Key) -> crate::DialogResult {
+            let result = crate::handle_dialog_key(
+                &mut self.ws,
+                &mut self.focus,
+                &mut self.dialog,
+                KeyChord::new(Modifiers::none(), key),
+            );
+            lay(&mut self.ws, 1.0, WINDOW);
+            match result {
+                Some(result) => result,
+                None => unreachable!("{key:?} chose nothing"),
+            }
+        }
+
+        /// What `App::run_dialog_result` does with a workspace result.
+        fn run_dialog_result(&mut self, result: &crate::DialogResult) -> WorkspaceCommandOutcome {
+            match crate::dialog_effect(result) {
+                crate::DialogEffect::Workspace(command) => self.run(command),
+                other => unreachable!("{other:?}"),
+            }
         }
 
         fn type_text(&mut self, text: &str) {
@@ -1319,9 +1397,46 @@ mod tests {
 
     /// AC-2: Save As captures the full layout and makes it active; invalid
     /// names keep the prompt open with the reason as its row and its
-    /// accessible description; saving over a taken name asks once, in the
-    /// prompt, then overwrites.
+    /// accessible description; saving over a taken name asks in a real
+    /// "Replace Workspace" `AlertDialog` (0.169.0) whose Cancel returns to
+    /// the prompt and saves nothing, and whose Replace overwrites.
     #[test]
+    fn a_refused_replace_dialog_keeps_the_typed_name_in_the_prompt() {
+        // Review J2 (0.169.0): if another dialog is already up, the replace
+        // confirmation is refused; the name prompt comes back instead of
+        // the typed name being lost, and nothing is saved over.
+        let mut rig = Rig::new();
+        rig.save("Paint");
+        let before = rig.presets.layout_of("paint");
+        let opened = crate::open_dialog(
+            &mut rig.ws,
+            &mut rig.focus,
+            &mut rig.dialog,
+            &crate::test_layout_scales(),
+            "Couldn't Open File",
+            "test",
+            vec![super::DialogAction::new(crate::OPEN_FAILED_DISMISS, "OK")],
+            crate::DialogPurpose::OpenFailed,
+        );
+        assert!(opened);
+        rig.run(WorkspaceCommand::Save {
+            name: "PAINT".to_owned(),
+            replace: false,
+        });
+        assert!(
+            rig.dialog
+                .as_ref()
+                .is_some_and(|d| d.purpose == crate::DialogPurpose::OpenFailed),
+            "the first dialog stays; no replace dialog replaced it"
+        );
+        assert!(rig.palette.is_some(), "the name prompt is back");
+        let (label, _, _) = rig.prompt();
+        assert_eq!(label, WORKSPACE_NAME_PROMPT_LABEL);
+        assert_eq!(rig.presets.layout_of("paint"), before, "nothing saved over");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites() {
         let mut rig = Rig::new();
         edit_everything(&mut rig);
@@ -1391,18 +1506,87 @@ mod tests {
         let outcome = rig.run(command);
         assert!(!outcome.presets_changed, "not yet");
         assert_eq!(rig.presets.layout_of("Paint"), Some(captured.clone()));
+        // 0.169.0: a real AlertDialog asks, the prompt is closed.
+        assert!(rig.palette.is_none(), "the prompt closed on Enter");
+        let Some(open) = rig.dialog.clone() else {
+            unreachable!("the replace dialog is open");
+        };
+        assert_eq!(
+            open.purpose,
+            crate::DialogPurpose::ReplaceWorkspace("PAINT".to_owned())
+        );
+        let node = rig.ws.tree.accessibility(open.root).cloned();
+        assert_eq!(
+            node.as_ref().map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(
+            node.as_ref().and_then(|n| n.label()),
+            Some("Replace Workspace \u{201c}PAINT\u{201d}?")
+        );
+        let labels: Vec<_> = open
+            .actions
+            .iter()
+            .map(|(id, button)| {
+                let label = rig
+                    .ws
+                    .tree
+                    .accessibility(*button)
+                    .and_then(|n| n.label())
+                    .map(str::to_owned);
+                (id.clone(), label)
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (WORKSPACE_REPLACE.to_owned(), Some("Replace".to_owned())),
+                (
+                    WORKSPACE_REPLACE_CANCEL.to_owned(),
+                    Some("Cancel".to_owned())
+                ),
+            ]
+        );
+        assert_eq!(open.default_action, open.actions.first().map(|a| a.1));
+        assert_eq!(open.cancel_action, open.actions.get(1).map(|a| a.1));
+        assert_eq!(rig.focus.focused(), open.default_action, "Replace focused");
+
+        // Cancel (Escape) replaces nothing and returns to the prompt with
+        // the name still typed.
+        let result = rig.dialog_key(Key::Named(NamedKey::Escape));
+        assert!(rig.dialog.is_none(), "closed");
+        let outcome = rig.run_dialog_result(&result);
+        assert!(!outcome.presets_changed, "Cancel saved nothing");
+        assert_eq!(rig.presets.layout_of("paint"), Some(captured.clone()));
+        assert_eq!(rig.presets.active_name(), "Paint");
+        let Some(root) = rig.palette else {
+            unreachable!("back in the prompt");
+        };
+        assert_eq!(rig.focus.focused(), Some(root));
+        assert_eq!(
+            command_palette_state(&rig.ws.tree, root)
+                .ok()
+                .map(|state| state.query().to_owned()),
+            Some("PAINT".to_owned())
+        );
         let (_, description, rows) = rig.prompt();
-        assert!(description.is_some_and(|d| d.contains("exists")));
+        assert_eq!(description, None);
         assert_eq!(
             rows.first().map(|r| r.0.as_str()),
-            Some(COMMAND_WORKSPACE_NAME_REPLACE)
+            Some(COMMAND_WORKSPACE_NAME_SAVE)
         );
-        assert_eq!(rig.focus.focused(), rig.palette);
+
+        // Enter again asks again; Enter on the dialog (Replace) replaces.
         let picked = rig.key(Key::Named(NamedKey::Enter), None);
         let Some(ActivatedCommand::Workspace(command)) = picked else {
             unreachable!("{picked:?}");
         };
-        assert!(rig.run(command).presets_changed);
+        assert!(!rig.run(command).presets_changed);
+        assert!(rig.dialog.is_some(), "asked again");
+        let result = rig.dialog_key(Key::Named(NamedKey::Enter));
+        assert!(rig.run_dialog_result(&result).presets_changed);
+        assert!(rig.dialog.is_none());
+        assert!(rig.palette.is_none());
         assert_eq!(rig.presets.user().len(), 1, "overwritten, not added");
         assert_eq!(rig.presets.active_name(), "PAINT", "the new spelling");
         assert_eq!(rig.presets.layout_of("paint"), Some(live_layout(&rig.ws)));
@@ -1870,8 +2054,7 @@ mod tests {
             &mut rig.ws,
             &mut rig.focus,
             &mut rig.palette,
-            "",
-            false
+            ""
         ));
         assert_eq!(rig.key(Key::Named(NamedKey::Escape), None), None);
         assert!(rig.palette.is_none());
