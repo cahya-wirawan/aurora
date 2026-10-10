@@ -38,9 +38,9 @@ use std::collections::HashMap;
 use accesskit::{Action, Node, Role};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
-use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
+use aurora_widgets::{FocusManager, WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
-use taffy::{Dimension, FlexDirection, Style};
+use taffy::{Dimension, Display, FlexDirection, Style};
 
 use crate::panel::{
     PanelHandle, PanelSizing, close_panel, insert_panel, panel_is_closed, panel_is_collapsed,
@@ -49,6 +49,9 @@ use crate::panel::{
 use crate::panel_group::{
     PanelGroup, insert_panel_group, panel_group_shown, set_panel_group_collapsed,
     show_panel_group_tab, sync_panel_group,
+};
+use crate::panel_strip::{
+    PanelStrip, insert_panel_strip, panel_strip_shown, set_panel_strip_shown,
 };
 use crate::status_bar::{StatusBar, StatusInfo, insert_status_bar};
 use crate::tool::Tool;
@@ -133,6 +136,11 @@ pub struct Workspace {
     /// one dock slot under Layers, which stays on its own. Its members are
     /// [`Self::properties`] then [`Self::history`].
     pub panel_group: PanelGroup,
+    /// The collapsed rail's label strip (0.165.0, [`crate::panel_strip`]):
+    /// the root's child right after [`Self::rail`], hidden while the rail
+    /// is expanded and shown in its place while it is collapsed
+    /// ([`set_rail_collapsed`]).
+    pub panel_strip: PanelStrip,
     /// The History panel's current-step row (0.147.1) — the one
     /// [`crate::populate_history_panel`] last returned, `None` until a
     /// caller first populates it. `aurora-app` records it here so its
@@ -331,6 +339,9 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     if let Err(err) = sync_panel_group(&mut tree, &panel_group) {
         unreachable!("the group was just inserted into this same tree: {err:?}");
     }
+    // 0.165.0: the collapsed rail's label strip, right after the rail,
+    // hidden until the rail collapses.
+    let panel_strip = insert_rail_strip(&mut tree, root, scales, [layers, properties, history]);
 
     Workspace {
         tree,
@@ -346,6 +357,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         properties,
         history,
         panel_group,
+        panel_strip,
         history_current: None,
         history_rows: HashMap::new(),
     }
@@ -354,6 +366,29 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
 /// The canvas column (0.160.0): the options bar over the canvas area,
 /// inserted into `root`. Infallible for the same reason
 /// [`build_workspace`] is: `root` is a node of this brand-new tree.
+/// Builds [`Workspace::panel_strip`] under `root`: one button per rail
+/// panel, `[layers, properties, history]`, each named by its own title.
+fn insert_rail_strip(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    [layers, properties, history]: [PanelHandle; 3],
+) -> PanelStrip {
+    match insert_panel_strip(
+        tree,
+        root,
+        scales,
+        [
+            (layers, "Layers"),
+            (properties, "Properties"),
+            (history, "History"),
+        ],
+    ) {
+        Ok(strip) => strip,
+        Err(err) => unreachable!("root was just created by new_tree: {err:?}"),
+    }
+}
+
 fn insert_canvas_column(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
@@ -485,7 +520,14 @@ pub fn set_rail_width(
     width: f32,
 ) -> Result<(), WidgetError> {
     let clamped = width.clamp(RAIL_MIN_WIDTH, RAIL_MAX_WIDTH);
-    tree.set_style(rail_id, rail_style(clamped))?;
+    // 0.165.0: a width change keeps the rail collapsed or expanded as it
+    // was — `display` is the collapse, `size.width` the remembered width.
+    let mut style = rail_style(clamped);
+    style.display = tree
+        .style(rail_id)
+        .ok_or(WidgetError::UnknownWidget(rail_id))?
+        .display;
+    tree.set_style(rail_id, style)?;
 
     let node = tree
         .accessibility(divider_id)
@@ -493,6 +535,149 @@ pub fn set_rail_width(
     let mut updated = node.clone();
     updated.set_numeric_value(f64::from(clamped));
     tree.set_accessibility(divider_id, updated)
+}
+
+/// Shows (`Display::Flex`, AT not `hidden`) or hides (`Display::None`, AT
+/// `hidden`, so the subtree leaves the accessibility tree and the `Tab`
+/// order) `id`. A no-op for what is already so.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub(crate) fn set_shown(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    shown: bool,
+) -> Result<(), WidgetError> {
+    let style = tree.style(id).ok_or(WidgetError::UnknownWidget(id))?;
+    let display = if shown { Display::Flex } else { Display::None };
+    if style.display != display {
+        let mut updated = style.clone();
+        updated.display = display;
+        tree.set_style(id, updated)?;
+    }
+    let node = tree
+        .accessibility(id)
+        .ok_or(WidgetError::UnknownWidget(id))?;
+    if node.is_hidden() == shown {
+        let mut updated = node.clone();
+        if shown {
+            updated.clear_hidden();
+        } else {
+            updated.set_hidden();
+        }
+        tree.set_accessibility(id, updated)?;
+    }
+    Ok(())
+}
+
+/// Whether the right rail is collapsed to its label strip (0.165.0). The
+/// rail's own `display` is the single source of truth; the divider and
+/// the strip follow it ([`set_rail_collapsed`]).
+#[must_use]
+pub fn rail_collapsed(workspace: &Workspace) -> bool {
+    workspace
+        .tree
+        .style(workspace.rail)
+        .is_some_and(|style| style.display == Display::None)
+}
+
+/// Collapses the whole right rail to its label strip, or expands it back
+/// (0.165.0). Collapsed, the rail and its divider are `Display::None` and
+/// AT-`hidden` (no layout, no hits, no `Tab` stop, no divider drag) and
+/// the strip ([`Workspace::panel_strip`]) is shown in their place; the
+/// canvas column, the one growing element, takes the freed width. The
+/// rail's width ([`rail_width`]) is never touched, so expanding restores
+/// it exactly, and every panel keeps its own collapsed, closed, scroll
+/// and tab state. Returns whether anything changed. The caller repairs
+/// focus afterwards ([`refocus_workspace`]).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn set_rail_collapsed(workspace: &mut Workspace, collapsed: bool) -> Result<bool, WidgetError> {
+    let changed = rail_collapsed(workspace) != collapsed
+        || panel_strip_shown(&workspace.tree, &workspace.panel_strip) != collapsed;
+    set_shown(&mut workspace.tree, workspace.rail, !collapsed)?;
+    set_shown(&mut workspace.tree, workspace.divider, !collapsed)?;
+    let strip = workspace.panel_strip;
+    set_panel_strip_shown(&mut workspace.tree, &strip, collapsed)?;
+    Ok(changed)
+}
+
+/// Flips [`set_rail_collapsed`] — the "Collapse or Expand Panels"
+/// command. Returns whether the rail is collapsed afterwards.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn toggle_rail_collapsed(workspace: &mut Workspace) -> Result<bool, WidgetError> {
+    let collapse = !rail_collapsed(workspace);
+    set_rail_collapsed(workspace, collapse)?;
+    Ok(collapse)
+}
+
+/// A strip button's action (0.165.0, "expand and show"): expands the rail
+/// and shows `panel` there — its tab selected and its slot expanded
+/// ([`show_workspace_panel`]). A *closed* panel stays closed, the same
+/// rule the Curves transition keeps; the rail still expands. Returns
+/// whether anything changed.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn expand_rail_showing(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<bool, WidgetError> {
+    let expanded = set_rail_collapsed(workspace, false)?;
+    let shown = show_workspace_panel(workspace, panel)?;
+    Ok(expanded || shown)
+}
+
+/// Moves keyboard focus off anything a rail change hid (0.165.0), then
+/// runs the panel-group repair ([`crate::refocus_out_of_hidden`]) as the
+/// backstop. Collapsing the rail moves focus inside it to the strip
+/// button of the panel that held it (Layers, or the group's shown
+/// member); expanding it moves focus on a strip button to the panel that
+/// button showed — the Layers panel itself, or the group's selected tab.
+/// Returns whether focus changed.
+pub fn refocus_workspace(workspace: &mut Workspace, focus: &mut FocusManager) -> bool {
+    let mut moved = false;
+    if let Some(focused) = focus.focused()
+        && workspace.tree.contains(focused)
+    {
+        let collapsed = rail_collapsed(workspace);
+        let target = if collapsed && workspace.tree.is_within(workspace.rail, focused) {
+            let panel = if workspace.tree.is_within(workspace.layers.root, focused) {
+                Some(workspace.layers)
+            } else {
+                panel_group_shown(&workspace.tree, &workspace.panel_group)
+                    .and_then(|index| workspace.panel_group.members.get(index).copied())
+            };
+            panel.and_then(|panel| workspace.panel_strip.button_for(panel))
+        } else if !collapsed
+            && workspace
+                .tree
+                .is_within(workspace.panel_strip.root, focused)
+        {
+            workspace.panel_strip.panel_for(focused).and_then(|panel| {
+                match workspace.panel_group.index_of(panel) {
+                    Some(_) => widgets::tab_bar_state(&workspace.tree, workspace.panel_group.bar)
+                        .ok()
+                        .and_then(widgets::TabBarState::selected_tab),
+                    None => Some(panel.root),
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            moved = focus.focus(&mut workspace.tree, target).is_ok();
+        }
+    }
+    let group = workspace.panel_group.clone();
+    crate::refocus_out_of_hidden(&mut workspace.tree, focus, &group) || moved
 }
 
 /// The panel-toggle command's action on `panel` (0.164.0 for grouped
@@ -609,6 +794,7 @@ pub(crate) fn show_history_tab(workspace: &mut Workspace) {
 #[cfg(test)]
 mod tests {
     use super::{RAIL_MAX_WIDTH, RAIL_MIN_WIDTH, build_workspace, rail_width, set_rail_width};
+    use aurora_widgets::FocusManager;
 
     fn bounds_of(ws: &super::Workspace, id: aurora_widgets::WidgetId) -> aurora_core::Rect {
         match ws.tree.bounds(id) {
@@ -1647,5 +1833,280 @@ mod tests {
         let h = editor.height as f32;
         assert!((h - side).abs() < 1.0, "{editor:?}");
         assert_stacked_inside_the_rail(&ws, "after collapse and expand");
+    }
+
+    /// 0.165.0 AC-1/AC-6: collapsed, the rail and its divider take no
+    /// space, the label strip sits at the window's right edge with a width
+    /// from spacing tokens alone (text-blind: each button is its
+    /// `spacing.md` padding, the strip `spacing.xs` either side, the tools
+    /// panel's own style), its buttons stack inside it, and the canvas
+    /// column takes exactly the width the rail gave back.
+    #[test]
+    fn collapsing_the_rail_shows_a_token_sized_strip_and_widens_the_canvas() {
+        let scales = test_scales();
+        let (xs, md) = (scales.spacing.xs, scales.spacing.md);
+        for (window, rail) in [
+            ((1000.0, 800.0), 250.0),
+            ((1600.0, 900.0), RAIL_MAX_WIDTH),
+            ((1274.0, 672.0), RAIL_MIN_WIDTH),
+            ((480.0, 480.0), 250.0),
+        ] {
+            let case = format!("window {window:?}, rail {rail}");
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rail_px = rail as u32;
+            let mut ws = build_workspace(&scales);
+            if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, rail) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(window.0, window.1);
+            let expanded_canvas = bounds_of(&ws, ws.canvas_area).width;
+            assert_eq!(bounds_of(&ws, ws.panel_strip.root).width, 0, "{case}");
+            assert!(matches!(super::set_rail_collapsed(&mut ws, true), Ok(true)));
+            assert!(super::rail_collapsed(&ws));
+            ws.tree.compute_layout(window.0, window.1);
+            let tools = bounds_of(&ws, ws.tools.root);
+            let column = bounds_of(&ws, ws.canvas_column);
+            let canvas = bounds_of(&ws, ws.canvas_area);
+            let strip = bounds_of(&ws, ws.panel_strip.root);
+            assert_eq!(strip.width, 2 * xs + 2 * md, "{case}: {strip:?}");
+            #[allow(clippy::cast_possible_truncation)]
+            let right = window.0 as i64;
+            assert_eq!(strip.x + i64::from(strip.width), right, "{case}");
+            assert_eq!(
+                column.x + i64::from(column.width),
+                strip.x,
+                "{case}: the canvas column ends where the strip begins"
+            );
+            assert_eq!(bounds_of(&ws, ws.rail).width, 0, "{case}: rail hidden");
+            assert_eq!(bounds_of(&ws, ws.divider).width, 0, "{case}");
+            assert_eq!(
+                canvas.width,
+                expanded_canvas + rail_px - strip.width,
+                "{case}: the canvas gains the rail's width less the strip's"
+            );
+            for (name, a, b) in [
+                ("tools/strip", tools, strip),
+                ("column/strip", column, strip),
+                ("canvas/strip", canvas, strip),
+            ] {
+                assert!(!overlaps(a, b), "{case}: {name} overlap: {a:?} {b:?}");
+            }
+            let mut previous: Option<aurora_core::Rect> = None;
+            for (_, id) in ws.panel_strip.buttons {
+                let button = bounds_of(&ws, id);
+                assert!(button.width > 0 && button.height > 0, "{case}");
+                assert!(
+                    button.x >= strip.x && button.right() <= strip.right(),
+                    "{case}: {button:?} outside {strip:?}"
+                );
+                if let Some(before) = previous {
+                    assert!(button.y >= before.bottom(), "{case}: stacked");
+                }
+                previous = Some(button);
+            }
+        }
+    }
+
+    /// 0.165.0 AC-1: with the text engine, the strip is its widest
+    /// measured label plus the button's `spacing.md` padding plus the
+    /// strip's `spacing.xs` either side — narrower than the narrowest rail,
+    /// and every button the same height (one row plus padding).
+    #[test]
+    fn the_strips_width_is_its_widest_measured_label_plus_spacing_tokens() {
+        let scales = test_scales();
+        let (xs, md) = (scales.spacing.xs, scales.spacing.md);
+        let mut ws = build_workspace(&scales);
+        if let Err(err) = super::set_rail_collapsed(&mut ws, true) {
+            unreachable!("{err:?}");
+        }
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads")
+        };
+        aurora_widgets::compute_text_layout(
+            &mut ws.tree,
+            1000.0,
+            800.0,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
+        let strip = bounds_of(&ws, ws.panel_strip.root);
+        let widest = ws
+            .panel_strip
+            .buttons
+            .iter()
+            .map(|(_, id)| bounds_of(&ws, *id).width)
+            .max()
+            .unwrap_or(0);
+        assert!(widest > 2 * md, "the label is measured: {widest}");
+        assert_eq!(strip.width, widest + 2 * xs, "{strip:?}");
+        #[allow(clippy::cast_precision_loss)]
+        let strip_width = strip.width as f32;
+        assert!(strip_width < RAIL_MIN_WIDTH, "a narrow strip: {strip:?}");
+        let column = bounds_of(&ws, ws.canvas_column);
+        assert_eq!(column.right(), strip.x);
+    }
+
+    /// 0.165.0 AC-5: the rail's width is remembered across collapse and
+    /// expand, a width change while collapsed keeps it collapsed, and the
+    /// divider is hidden (no layout, AT-`hidden`) while collapsed.
+    #[test]
+    fn the_rail_width_survives_a_collapse_and_the_divider_hides_with_the_rail() {
+        let mut ws = build_workspace(&test_scales());
+        if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 320.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(matches!(super::toggle_rail_collapsed(&mut ws), Ok(true)));
+        let hidden = |ws: &super::Workspace, id| {
+            ws.tree
+                .accessibility(id)
+                .is_some_and(accesskit::Node::is_hidden)
+        };
+        assert!(hidden(&ws, ws.divider), "the divider leaves the AT tree");
+        assert!(hidden(&ws, ws.rail), "so does the rail");
+        assert!(!hidden(&ws, ws.panel_strip.root), "the strip joins it");
+        assert_eq!(rail_width(&ws.tree, ws.rail), Some(320.0));
+        if let Err(err) = set_rail_width(&mut ws.tree, ws.rail, ws.divider, 300.0) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            super::rail_collapsed(&ws),
+            "a width change keeps it collapsed"
+        );
+        assert!(matches!(
+            super::set_rail_collapsed(&mut ws, true),
+            Ok(false)
+        ));
+        assert!(matches!(super::toggle_rail_collapsed(&mut ws), Ok(false)));
+        assert!(!hidden(&ws, ws.divider) && !hidden(&ws, ws.rail));
+        assert!(hidden(&ws, ws.panel_strip.root));
+        ws.tree.compute_layout(1000.0, 800.0);
+        assert_eq!(bounds_of(&ws, ws.rail).width, 300, "the width came back");
+        assert_eq!(bounds_of(&ws, ws.panel_strip.root).width, 0);
+    }
+
+    /// 0.165.0 AC-2: a strip button expands the rail with its own panel
+    /// shown — Layers expanded, or the group's tab for Properties/History
+    /// selected and the group expanded — and a closed panel stays closed.
+    #[test]
+    fn expand_rail_showing_opens_the_buttons_own_panel_or_tab() {
+        let mut ws = build_workspace(&test_scales());
+        let history = ws.history;
+        let group = ws.panel_group.clone();
+        for (panel, tab) in [
+            (ws.history, Some(1)),
+            (ws.properties, Some(0)),
+            (ws.layers, None),
+        ] {
+            if let Err(err) = crate::set_panel_group_collapsed(&mut ws.tree, &group, true)
+                .and_then(|()| crate::set_panel_collapsed(&mut ws.tree, ws.layers, true))
+                .and_then(|()| super::set_rail_collapsed(&mut ws, true).map(|_| ()))
+            {
+                unreachable!("{err:?}");
+            }
+            assert!(matches!(
+                super::expand_rail_showing(&mut ws, panel),
+                Ok(true)
+            ));
+            assert!(!super::rail_collapsed(&ws));
+            assert!(matches!(
+                crate::panel_is_collapsed(&ws.tree, panel),
+                Ok(false)
+            ));
+            if let Some(tab) = tab {
+                assert_eq!(crate::panel_group_shown(&ws.tree, &group), Some(tab));
+            }
+        }
+        if let Err(err) = super::close_workspace_panel(&mut ws, history)
+            .and_then(|()| super::set_rail_collapsed(&mut ws, true).map(|_| ()))
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(matches!(
+            super::expand_rail_showing(&mut ws, history),
+            Ok(true)
+        ));
+        assert!(!super::rail_collapsed(&ws), "the rail still expands");
+        assert!(matches!(
+            crate::panel_is_closed(&ws.tree, ws.history),
+            Ok(true)
+        ));
+    }
+
+    /// 0.165.0 AC-2/AC-3: collapsing moves focus from inside the rail to
+    /// the strip button of the panel that held it; expanding moves focus
+    /// from a strip button to that button's panel (Layers itself, or the
+    /// group's selected tab); and `Tab` never enters the hidden side.
+    #[test]
+    fn focus_follows_a_rail_collapse_to_the_strip_and_back() {
+        let mut ws = build_workspace(&test_scales());
+        let history = ws.history;
+        let mut focus = FocusManager::new();
+        let Some(lay) = ws.panel_strip.button_for(ws.layers) else {
+            unreachable!("built");
+        };
+        if let Err(err) = focus.focus(&mut ws.tree, ws.layers.root) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = super::set_rail_collapsed(&mut ws, true) {
+            unreachable!("{err:?}");
+        }
+        assert!(super::refocus_workspace(&mut ws, &mut focus));
+        assert_eq!(focus.focused(), Some(lay));
+        // `Tab` cycles the tools and the strip, never the hidden rail.
+        for _ in 0..12 {
+            if let Some(id) = focus.focus_next(&mut ws.tree) {
+                assert!(
+                    !ws.tree.is_within(ws.rail, id),
+                    "{id:?} is in the hidden rail"
+                );
+            }
+        }
+        let Some(hist) = ws.panel_strip.button_for(ws.history) else {
+            unreachable!("built");
+        };
+        if let Err(err) = focus
+            .focus(&mut ws.tree, hist)
+            .and_then(|()| super::expand_rail_showing(&mut ws, history).map(|_| ()))
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(super::refocus_workspace(&mut ws, &mut focus));
+        let selected_tab = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar)
+            .ok()
+            .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
+        assert_eq!(focus.focused(), selected_tab, "the History tab");
+        // Focus in the shown History tab moves to Hist on collapse.
+        if let Err(err) = focus
+            .focus(&mut ws.tree, ws.history.root)
+            .and_then(|()| super::set_rail_collapsed(&mut ws, true).map(|_| ()))
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(super::refocus_workspace(&mut ws, &mut focus));
+        assert_eq!(focus.focused(), Some(hist));
+        for _ in 0..12 {
+            if let Some(id) = focus.focus_next(&mut ws.tree) {
+                assert!(
+                    !ws.tree.is_within(ws.rail, id),
+                    "{id:?} is in the hidden rail"
+                );
+            }
+        }
+        // And once expanded, `Tab` never lands on the hidden strip.
+        if let Err(err) = super::set_rail_collapsed(&mut ws, false) {
+            unreachable!("{err:?}");
+        }
+        let _ = super::refocus_workspace(&mut ws, &mut focus);
+        for _ in 0..40 {
+            if let Some(id) = focus.focus_next(&mut ws.tree) {
+                assert!(
+                    !ws.tree.is_within(ws.panel_strip.root, id),
+                    "{id:?} is in the hidden strip"
+                );
+            }
+        }
     }
 }
