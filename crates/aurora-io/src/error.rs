@@ -284,6 +284,21 @@ pub enum IoError {
     /// [`crate::write_into_store_at`] was asked to place an image so far
     /// from its surface's own origin that a tile coordinate would not
     /// fit in `u32`.
+    /// A PSD save that cannot be made at all (0.176.0): see
+    /// [`crate::PsdSaveRefusal`].
+    #[error("{0}")]
+    PsdSaveRefused(crate::psd::PsdSaveRefusal),
+    /// A length or position in a PSD being written does not fit its
+    /// field (0.176.0).
+    #[error("the Photoshop file would be too large to write ({what})")]
+    PsdWriteTooLarge { what: &'static str },
+    /// A [`crate::PsdCompositeSource`] could not supply row `y` at the
+    /// canvas's width (0.176.0 review).
+    #[error("the merged image has no row {y} of the canvas's width")]
+    PsdCompositeRow { y: u32 },
+    /// A written PSD did not read back as it was written (0.176.0).
+    #[error("the written Photoshop file did not read back correctly ({what})")]
+    PsdVerifyFailed { what: String },
     #[error("cannot place a {width}x{height} image at ({x}, {y}) in a tile surface")]
     ImagePlacementOutOfRange {
         x: u32,

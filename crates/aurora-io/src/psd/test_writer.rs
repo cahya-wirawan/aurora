@@ -486,8 +486,9 @@ fn predict(data: &mut [u8], row_bytes: usize, bps: usize) {
     }
 }
 
-/// `PackBits`: runs of two or more equal bytes as repeats, everything else
-/// as literals, both capped at 128.
+/// `PackBits`: a run of two or more equal bytes starting a packet as a
+/// repeat, literals that stop only before a run of three or more, both
+/// capped at 128.
 pub(crate) fn pack_bits(row: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = row;
@@ -499,11 +500,14 @@ pub(crate) fn pack_bits(row: &[u8]) -> Vec<u8> {
             rest = rest.get(run..).unwrap_or(&[]);
         } else {
             let mut n = 1;
+            // Breaks a literal only before a run of three or more, the
+            // same rule as the shipped writer's `pack_bits` (0.176.0
+            // review), so the two produce identical bytes.
             while n < 128 {
-                match (rest.get(n), rest.get(n + 1)) {
-                    (Some(a), Some(b)) if a == b => break,
-                    (Some(_), _) => n += 1,
-                    (None, _) => break,
+                match (rest.get(n), rest.get(n + 1), rest.get(n + 2)) {
+                    (Some(a), Some(b), Some(c)) if a == b && b == c => break,
+                    (Some(_), _, _) => n += 1,
+                    (None, _, _) => break,
                 }
             }
             out.push(u8::try_from(n - 1).unwrap_or(0));

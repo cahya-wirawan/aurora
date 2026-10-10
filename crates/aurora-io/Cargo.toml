@@ -28,6 +28,5 @@ serde = { workspace = true }
 postcard = { workspace = true }
 zip = { workspace = true }
 flate2 = { workspace = true }
-
-[dev-dependencies]
+# `replace_verified`'s unique, `O_EXCL` temp file next to the target (0.176.0).
 tempfile = { workspace = true }
