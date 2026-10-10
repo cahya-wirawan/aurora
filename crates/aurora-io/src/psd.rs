@@ -47,7 +47,7 @@
 //! claims to be. Only the first channel of each id is decoded; a
 //! duplicate is skipped without being decompressed. Group nesting is
 //! walked with an explicit stack and capped at [`MAX_GROUP_DEPTH`]; the
-//! only recursion ([`build_document`], `subtree_has_blend`) runs over a
+//! only recursion ([`build_document`]) runs over a
 //! tree already proven no deeper than that constant.
 //!
 //! **Streaming (0.154.0).** The parser reads through a seekable reader
@@ -287,9 +287,6 @@ pub struct PsdProps {
     pub visible: bool,
     /// Clipped to the layer below — not supported, so shown unclipped.
     pub clipped: bool,
-    /// The file said Pass Through (`pass`), which Aurora has no mode for;
-    /// [`Self::blend`] is then `Normal`.
-    pub pass_through: bool,
 }
 
 /// A layer's or group's user mask (channel `-2`), as stored: what
@@ -398,7 +395,6 @@ enum Note {
     CurvesUnreadable,
     CurvesTooManyPoints,
     CurvesGrayscale,
-    CurvesInPassThrough,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -419,7 +415,7 @@ enum Note {
     EffectsNotShown,
     BlendIfNotApplied,
     KnockoutNotApplied,
-    PassThroughGroup,
+    PassThroughFillNotApplied,
     UnknownBlendMode,
     UnknownChannel,
     MissingColorChannel,
@@ -481,12 +477,6 @@ fn note_text(note: Note, n: u64) -> String {
         Note::CurvesGrayscale => format!(
             "{n} Curves layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
              verified how Photoshop applies Curves to a Grayscale image."
-        ),
-        Note::CurvesInPassThrough => format!(
-            "{n} Curves layer{s} {is} inside a Pass Through group, which Aurora doesn't have; \
-             the group is composited on its own, so the curve{s} change{} only the group's own \
-             layers, not what is below the group.",
-            if one { "s" } else { "" }
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -580,13 +570,11 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} layer{s} or group{s} use{} Knockout, which Aurora doesn't apply yet.",
             if one { "s" } else { "" }
         ),
-        Note::PassThroughGroup => format!(
-            "{n} group{s} use{} Pass Through blending, which Aurora doesn't have; {} composited \
-             as a normal group, so blend modes inside {} affect only {} own layers.",
-            if one { "s" } else { "" },
+        Note::PassThroughFillNotApplied => format!(
+            "{n} Pass Through group{s} {has} a Fill below 100%, which Aurora doesn't apply to a \
+             group yet; {} composited at full Fill.",
             if one { "it is" } else { "they are" },
-            if one { "it" } else { "them" },
-            if one { "its" } else { "their" },
+            has = if one { "has" } else { "have" },
         ),
         Note::UnknownBlendMode => format!(
             "{n} layer{s} or group{s} use a blend mode Aurora doesn't recognise and {is} shown \
@@ -2412,8 +2400,8 @@ enum PsdBlend {
     Unknown,
 }
 
-/// The PSD blend-key table — every one of Aurora's 27 modes, plus
-/// `pass` (Pass Through, groups only).
+/// The PSD blend-key table — every one of Aurora's 27 layer modes, plus
+/// `pass` (Pass Through, which [`props_for`] keeps on a group only).
 fn blend_for_key(key: [u8; 4]) -> PsdBlend {
     let mode = match &key {
         b"norm" => BlendMode::Normal,
@@ -2453,12 +2441,19 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
     // A group's own blend mode lives in its section divider; it wins over
     // the record's.
     let key = record.section.and_then(|s| s.blend).unwrap_or(record.blend);
-    let (blend, pass_through) = match blend_for_key(key) {
-        PsdBlend::Mode(mode) => (mode, false),
-        PsdBlend::PassThrough => (BlendMode::Normal, true),
-        PsdBlend::Unknown => {
+    // A group's folder record is section type 1 (open) or 2 (closed).
+    let is_group = record.section.is_some_and(|s| matches!(s.kind, 1 | 2));
+    let blend = match blend_for_key(key) {
+        PsdBlend::Mode(mode) => mode,
+        // Pass Through is a real Aurora mode since 0.179.0, valid on a
+        // group only (`aurora_doc::BlendMode::PassThrough`).
+        PsdBlend::PassThrough if is_group => BlendMode::PassThrough,
+        // On a layer Photoshop never writes it; Aurora's tree refuses it
+        // there, so it is shown as Normal and reported like any other
+        // blend key Aurora cannot use.
+        PsdBlend::PassThrough | PsdBlend::Unknown => {
             notes.add(Note::UnknownBlendMode);
-            (BlendMode::Normal, false)
+            BlendMode::Normal
         }
     };
     PsdProps {
@@ -2469,7 +2464,6 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
         // Flags bit 1 set means *hidden*.
         visible: record.flags & 0x02 == 0,
         clipped: record.clipping != 0,
-        pass_through,
     }
 }
 
@@ -2532,19 +2526,6 @@ fn note_unsupported(record: &Record, outcome: &MaskOutcome, notes: &mut Notes) {
 // The group tree
 // ---------------------------------------------------------------------
 
-/// Whether any node in `nodes` (at any depth) uses a blend mode other
-/// than Normal — the case where Pass Through and an isolated group
-/// actually look different. Recursion bounded by [`MAX_GROUP_DEPTH`].
-fn subtree_has_blend(nodes: &[PsdNode]) -> bool {
-    nodes.iter().any(|node| match node {
-        PsdNode::Layer(layer) => layer.props.blend != BlendMode::Normal,
-        PsdNode::Adjustment(adjustment) => adjustment.props.blend != BlendMode::Normal,
-        PsdNode::Group {
-            props, children, ..
-        } => props.blend != BlendMode::Normal || subtree_has_blend(children),
-    })
-}
-
 /// Turns the records (bottom-to-top) into the group tree, decoding each
 /// kept layer's pixels. Section dividers: `3` (the bounding "end of
 /// group" marker, which sits *below* its children) opens a group; `1` or
@@ -2579,18 +2560,10 @@ fn build_tree(
                     Vec::new()
                 };
                 let props = props_for(record, notes);
-                if props.pass_through && subtree_has_blend(&children) {
-                    notes.add(Note::PassThroughGroup);
-                }
-                // A Curves layer directly inside a Pass Through group
-                // reaches below the group in Photoshop and only the
-                // group's own layers here (0.158.0).
-                if props.pass_through {
-                    let curves = children
-                        .iter()
-                        .filter(|child| matches!(child, PsdNode::Adjustment(_)))
-                        .count();
-                    notes.add_n(Note::CurvesInPassThrough, curves as u64);
+                // Pass Through groups composite for real since 0.179.0;
+                // only a Fill below 100% on one is not applied.
+                if props.blend == BlendMode::PassThrough && props.fill_opacity < 1.0 {
+                    notes.add(Note::PassThroughFillNotApplied);
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =

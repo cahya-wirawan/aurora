@@ -467,24 +467,8 @@ fn nested_groups_rebuild_the_tree_in_order_with_their_own_properties() {
 }
 
 #[test]
-fn a_pass_through_group_is_normal_and_reported_only_when_it_matters() {
+fn a_pass_through_group_opens_as_pass_through_and_is_not_reported() {
     let px1 = [[0, 0, 0, 255]];
-    let plain = TestPsd::new(1, 1, 1, 8)
-        .with(|p| {
-            p.layers = vec![
-                TestLayer::divider(),
-                TestLayer::pixels("a", 0, 0, 1, 1, 8, &px1),
-                TestLayer::group("G", *b"pass"),
-            ];
-        })
-        .write();
-    let document = doc(&plain);
-    assert_eq!(
-        document.layers.blend_mode(root(&document.layers, 0)),
-        Some(BlendMode::Normal)
-    );
-    assert!(document.report.is_empty(), "{:?}", document.report);
-
     let blended = TestPsd::new(1, 1, 1, 8)
         .with(|p| {
             p.layers = vec![
@@ -495,12 +479,60 @@ fn a_pass_through_group_is_normal_and_reported_only_when_it_matters() {
         })
         .write();
     let document = doc(&blended);
+    let group = root(&document.layers, 0);
+    assert_eq!(
+        document.layers.blend_mode(group),
+        Some(BlendMode::PassThrough)
+    );
+    assert_eq!(
+        document
+            .layers
+            .blend_mode(child(&document.layers, group, 0)),
+        Some(BlendMode::Screen)
+    );
+    assert!(document.report.is_empty(), "{:?}", document.report);
+
+    // A Fill below 100% on one is not applied, and says so.
+    let filled = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.layers = vec![
+                TestLayer::divider(),
+                TestLayer::pixels("a", 0, 0, 1, 1, 8, &px1),
+                TestLayer::group("G", *b"pass")
+                    .with(|l| l.blocks.push((*b"iOpa", vec![102, 0, 0, 0]))),
+            ];
+        })
+        .write();
+    let document = doc(&filled);
     assert!(
         document
             .report
             .items
             .iter()
-            .any(|i| i.contains("Pass Through")),
+            .any(|i| i.contains("1 Pass Through group has a Fill below 100%")),
+        "{:?}",
+        document.report
+    );
+
+    // `pass` on a plain layer record (Photoshop never writes it) is
+    // refused by the tree, so it is shown as Normal and reported.
+    let on_layer = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.layers =
+                vec![TestLayer::pixels("a", 0, 0, 1, 1, 8, &px1).with(|l| l.blend = *b"pass")];
+        })
+        .write();
+    let document = doc(&on_layer);
+    assert_eq!(
+        document.layers.blend_mode(root(&document.layers, 0)),
+        Some(BlendMode::Normal)
+    );
+    assert!(
+        document
+            .report
+            .items
+            .iter()
+            .any(|i| i.contains("blend mode Aurora doesn't recognise")),
         "{:?}",
         document.report
     );
@@ -4689,7 +4721,7 @@ fn hostile_curv_blocks_are_refused_never_a_panic() {
 /// AC-2/AC-3: through the real reader, a Curves layer becomes an
 /// `Adjustment::Curves` layer above the layer below it, with its
 /// opacity, blend mode, visibility and mask; it is no longer reported as
-/// left out, and its Pass Through group is.
+/// left out, and neither (0.179.0) is its Pass Through group.
 #[test]
 fn a_curves_layer_opens_as_a_curves_adjustment_and_is_not_reported() {
     let bytes = curves_file(&curv_rgb_block(), |l| {
@@ -4725,10 +4757,7 @@ fn a_curves_layer_opens_as_a_curves_adjustment_and_is_not_reported() {
     assert!(document.masks.iter().any(|m| m.layer == top));
     let items = document.report.items.join("\n");
     assert!(!items.contains("adjustment layer"), "{items}");
-    assert!(
-        items.contains("1 Curves layer is inside a Pass Through group"),
-        "{items}"
-    );
+    assert!(!items.contains("Pass Through"), "{items}");
 }
 
 /// AC-2/AC-3: the Pass Through note appears only for a Pass Through
@@ -4811,8 +4840,8 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
             "{name}: {needle:?} missing from {items}"
         );
         assert!(
-            !items.contains("Pass Through group, which Aurora doesn't have; the group"),
-            "{name}: a left-out Curves layer is not in the group: {items}"
+            !items.contains("Pass Through"),
+            "{name}: Pass Through is not reported (0.179.0): {items}"
         );
         let mut pending = document.layers.roots().to_vec();
         let mut adjustments = 0;

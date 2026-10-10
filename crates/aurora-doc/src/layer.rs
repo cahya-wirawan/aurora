@@ -131,9 +131,52 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    /// Photoshop's **Pass Through** (`pass`), 0.179.0 — valid on a
+    /// [`LayerKind::Group`] only. A pass-through group does not composite
+    /// its children into an isolated buffer: they composite straight onto
+    /// whatever is below the group, in order, and the group's own opacity
+    /// and mask then interpolate between the backdrop before the group and
+    /// the result after its children. `aurora-app`'s compositor implements
+    /// it; this crate only stores it and refuses it on anything that is not
+    /// a group ([`crate::LayerTree::set_blend_mode`], and every validator a
+    /// decoded tree goes through).
+    ///
+    /// Appended last, like every `postcard`-encoded enum here, so older
+    /// `.aur` files decode unchanged. An Aurora older than 0.179.0 cannot
+    /// read a file that uses it: the variant index is unknown to it, so
+    /// `postcard` refuses the whole layer tree and the open fails with an
+    /// error (ADR 0009).
+    PassThrough,
 }
 
 impl BlendMode {
+    /// Whether this mode is valid on a group only (0.179.0:
+    /// [`Self::PassThrough`]). Every other mode is valid on every layer
+    /// kind.
+    #[must_use]
+    pub const fn is_group_only(self) -> bool {
+        matches!(self, Self::PassThrough)
+    }
+
+    /// Every mode a layer of the given kind may carry, in the order a
+    /// blend-mode menu lists them: for a group, [`Self::PassThrough`] first
+    /// (Photoshop's own group menu order) and then the 27 layer modes; for
+    /// anything else, the 27 layer modes only.
+    #[must_use]
+    pub fn modes_for(is_group: bool) -> Vec<Self> {
+        let layer_modes = Self::ALL
+            .iter()
+            .copied()
+            .filter(|mode| !mode.is_group_only());
+        if is_group {
+            std::iter::once(Self::PassThrough)
+                .chain(layer_modes)
+                .collect()
+        } else {
+            layer_modes.collect()
+        }
+    }
+
     /// Every variant, once, in declaration order — the enumeration Rust
     /// itself does not provide.
     ///
@@ -148,7 +191,7 @@ impl BlendMode {
     /// get it by iterating the variants, and without this constant every
     /// such caller writes its own copy of the list.
     ///
-    /// The fixed `[Self; 27]` length is one part of the guard: a
+    /// The fixed `[Self; N]` length (28 since 0.179.0) is one part of the guard: a
     /// twenty-eighth variant cannot be appended without the author also
     /// editing the count, and *deleting* an entry is a compile error rather
     /// than a silent gap. `blend_mode_all_lists_every_variant_exactly_once`
@@ -169,7 +212,7 @@ impl BlendMode {
     ///
     /// The enum has no `#[non_exhaustive]`, so this list being complete is
     /// a property downstream crates may rely on.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Normal,
         Self::Dissolve,
         Self::Darken,
@@ -197,6 +240,7 @@ impl BlendMode {
         Self::Saturation,
         Self::Color,
         Self::Luminosity,
+        Self::PassThrough,
     ];
 }
 
@@ -510,6 +554,7 @@ mod tests {
             BlendMode::Saturation => variant_index_in_range::<24>(),
             BlendMode::Color => variant_index_in_range::<25>(),
             BlendMode::Luminosity => variant_index_in_range::<26>(),
+            BlendMode::PassThrough => variant_index_in_range::<27>(),
         }
     }
 
@@ -602,5 +647,97 @@ mod adjustment_wire_tests {
             Ok(decoded) => assert_eq!(decoded, curves),
             Err(err) => unreachable!("{err:?}"),
         }
+    }
+}
+
+/// `BlendMode::PassThrough` is appended, so every pre-0.179.0 encoding
+/// still decodes, and an older reader refuses the new one rather than
+/// misreading it (0.179.0, ADR 0009).
+#[cfg(test)]
+mod pass_through_wire_tests {
+    use super::BlendMode;
+
+    /// `BlendMode` exactly as it was before 0.179.0 (27 variants).
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum OldBlendMode {
+        Normal,
+        Dissolve,
+        Darken,
+        Multiply,
+        ColorBurn,
+        LinearBurn,
+        DarkerColor,
+        Lighten,
+        Screen,
+        ColorDodge,
+        LinearDodge,
+        LighterColor,
+        Overlay,
+        SoftLight,
+        HardLight,
+        VividLight,
+        LinearLight,
+        PinLight,
+        HardMix,
+        Difference,
+        Exclusion,
+        Subtract,
+        Divide,
+        Hue,
+        Saturation,
+        Color,
+        Luminosity,
+    }
+
+    #[test]
+    fn old_blend_mode_bytes_decode_unchanged_and_an_old_reader_refuses_pass_through() {
+        for (old, new) in [
+            (OldBlendMode::Normal, BlendMode::Normal),
+            (OldBlendMode::Multiply, BlendMode::Multiply),
+            (OldBlendMode::Luminosity, BlendMode::Luminosity),
+        ] {
+            let old_bytes = match postcard::to_allocvec(&old) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            match postcard::from_bytes::<BlendMode>(&old_bytes) {
+                Ok(decoded) => assert_eq!(decoded, new),
+                Err(err) => unreachable!("old bytes must still decode: {err:?}"),
+            }
+            match postcard::to_allocvec(&new) {
+                Ok(bytes) => assert_eq!(bytes, old_bytes, "old variants encode unchanged"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let bytes = match postcard::to_allocvec(&BlendMode::PassThrough) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(bytes, vec![27], "appended as ordinal 27");
+        assert_eq!(
+            postcard::from_bytes::<BlendMode>(&bytes).ok(),
+            Some(BlendMode::PassThrough)
+        );
+        assert!(
+            postcard::from_bytes::<OldBlendMode>(&bytes).is_err(),
+            "a pre-0.179.0 reader must refuse the new variant, not misread it"
+        );
+    }
+
+    #[test]
+    fn pass_through_is_the_only_group_only_mode_and_listed_first_for_groups() {
+        let group_only: Vec<BlendMode> = BlendMode::ALL
+            .iter()
+            .copied()
+            .filter(|mode| mode.is_group_only())
+            .collect();
+        assert_eq!(group_only, vec![BlendMode::PassThrough]);
+        let for_group = BlendMode::modes_for(true);
+        let for_layer = BlendMode::modes_for(false);
+        assert_eq!(for_group.first(), Some(&BlendMode::PassThrough));
+        assert_eq!(for_group.len(), BlendMode::ALL.len());
+        assert_eq!(for_layer.len(), BlendMode::ALL.len() - 1);
+        assert!(!for_layer.contains(&BlendMode::PassThrough));
+        assert_eq!(for_group.get(1..), Some(for_layer.as_slice()));
     }
 }

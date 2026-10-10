@@ -26,7 +26,49 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.178.0): groups and layer masks in the PSD
+**Latest (2026-10-10, 0.179.0): real Pass Through groups (design-owner
+choice, Cahya).** `aurora_doc::BlendMode::PassThrough` is appended (last,
+ordinal 27, so every older `.aur` decodes unchanged; `BlendMode::ALL` is
+28 long) and valid on a group only: `LayerTree::set_blend_mode` refuses it
+on a pixel or adjustment layer (`DocError::GroupOnlyBlendMode`, the layer
+unchanged, no undo step), and every decoded or restored tree is checked
+(`validate_blend_modes` in `try_from`, `restore` and `validate`). The CPU
+compositor's `fold_layer_into` routes a visible Pass Through group to
+`fold_pass_through_group`: its children fold, bottom to top, straight
+into the accumulator below the group (so a Multiply child darkens the
+design beneath it, a Curves child adjusts layers below the group, nested
+Pass Through recurses), then the group's opacity and enabled mask
+interpolate, premultiplied, `B + (C - B) * opacity * coverage` between the
+backdrop before the group and the result after it (psd-tools'
+`_apply_passthrough_source` is the reference model; over a transparent
+backdrop this is a source-over at that opacity). Group **Fill** is not
+applied (as for every layer in Aurora) and is now reported for a Pass
+Through group with Fill below 100%. A visible group still refuses the
+whole document's GPU fast path, so Pass Through never reaches an
+isolated GPU composite. The PSD reader maps `pass` on a group folder to
+Pass Through (on a plain layer record it is shown Normal and reported as
+an unknown blend key); the "groups use Pass Through blending" and
+"Curves inside a Pass Through group" notes are gone. The writer writes
+`pass` in the folder record and its `lsct`. The Layers panel's blend
+dropdown lists "Pass Through" first for a group and not at all for any
+other layer (`aurora_ui::blend_mode_options_for`/`blend_mode_at`, a new
+`aurora_widgets::widgets::set_dropdown_options`); undo goes through the
+existing `SetBlendMode` op. There is no New Group command in the app, so
+there is no new-group default to choose. **Accuracy against Photoshop's
+own merged images (8-bit levels, max over solid pixels):** psd-tools'
+`passthrough_blendmodes1/2/3.psd` went from 253/251/252 to 1/1/2,
+`passthrough_clipping_mask_blendmode.psd` 124 → 1, the Curves files
+`adjustment_nested_composition_1–4.psd` 254/182/1/167 → 137/3/1/113
+(what remains is a Levels layer Aurora leaves out); the user's Nyepi
+template (1080×1920, 277 layers, 54 Pass Through groups) went from a mean
+error of 20.7/26.6/26.4 levels (R/G/B) to 2.65/2.67/2.69, max 111 → 105,
+the residual being the 56 layers' effects and other reported losses. Not
+compared against Photoshop by a human, and the app-level dropdown was not
+clicked on real hardware. Measured: 3,363 tests pass, 0 failed (64
+ignored), `AURORA_REQUIRE_GPU=1` on the RTX 3090. See the 0.179.0
+addendum under "Next action".
+
+**Previously (2026-10-10, 0.178.0): groups and layer masks in the PSD
 writer (PSD write, round R3 of six).** Save As `.psd` now works for
 documents with groups and masks; nothing new was needed in the app.
 `aurora_io::write_psd` walks the whole tree (`file_order`, shared with
@@ -162,8 +204,10 @@ pending temp file, refusals through "Couldn't Save File", and the sRGB
 ICC profile resource (1039; done in 0.177.0) — moved here from R4 by the 0.176.0 review,
 because invariant §7.3.6 (every buffer carries its colour space) means
 no PSD may be written untagged once saving is user-reachable; R3
-(0.178.0, done) groups (`lsct` divider/folder pairs, `norm`, never `pass`) and
-masks; R4 (0.179.0) Curves (`curv`), losses carried from open, and
+(0.178.0, done) groups (`lsct` divider/folder pairs, the group's own key —
+`pass` for a Pass Through group since 0.179.0) and
+masks; R4 (next PSD-write round — 0.179.0 went to Pass Through groups,
+Cahya's choice) Curves (`curv`), losses carried from open, and
 clean-state rules; R5 (0.180.0) PSB and a banded,
 streamed composite; R6 (optional, 0.181.0) ZIP with prediction and a
 psd-tools workflow. **Design-owner decisions (Cahya, 2026-10-10):**
@@ -31973,6 +32017,125 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.179.0) — real Pass Through groups.**
+
+Semantics (sources: psd-tools 1.17.4's `composite.py` —
+`_get_group` composites a `pass` group's children on a non-isolated
+compositor seeded with the backdrop, and `_apply_passthrough_source`
+then mixes `color * mask + (1 - mask) * backdrop` with
+`mask = shape_mask * opacity_mask * opacity`; the W3C Compositing and
+Blending Level 1 spec's *isolation* section, where a non-isolated group
+composites its elements against the backdrop; and Photoshop's own
+merged images in psd-tools' `passthrough_*` fixtures, measured below).
+Aurora: children fold, bottom to top, into the accumulator below the
+group; then `result = B + (C - B) * opacity * mask_coverage`, per texel,
+premultiplied. *Fill on a Pass Through group:* not applied, reported at
+PSD open ("1 Pass Through group has a Fill below 100% …"); psd-tools
+treats group Fill as a further multiplier and, below 100%, isolates the
+group's adjustments — not verified against Photoshop, so not copied.
+*Representation:* an appended `BlendMode` variant rather than a field on
+`LayerKind::Group` (positional `postcard` cannot grow a struct; PSD
+itself stores Pass Through as a blend key). *Old versions:* an Aurora
+before 0.179.0 refuses a file using it (unknown variant index → the open
+fails with "Couldn't Open File"; ADR 0009 note). *New Group:* the app has
+no New Group command, so no default to choose; PSD-opened groups keep
+their own mode. *GPU:* unchanged — a visible group of any mode refuses
+the whole document's GPU path.
+
+Changed: `crates/aurora-doc/src/{layer,tree,history,error}.rs`
+(`BlendMode::PassThrough`, `is_group_only`, `modes_for`, `ALL` 28,
+`DocError::GroupOnlyBlendMode`, `validate_blend_modes`);
+`crates/aurora-app/src/lib.rs` (`fold_pass_through_group`, the
+`fold_layer_into` route, `translate_blend_mode` arm, dropdown index via
+`aurora_ui::blend_mode_at`, stale "no Pass Through" docs, tests);
+`crates/aurora-io/src/psd.rs` (`pass` kept on a group folder; notes
+`PassThroughGroup`/`CurvesInPassThrough` removed,
+`PassThroughFillNotApplied` added, `subtree_has_blend` removed),
+`psd/write.rs` (`pass` key), `psd/tests.rs`, `psd/write_tests.rs`;
+`crates/aurora-ui/src/{layer_controls,lib}.rs` (per-kind options);
+`crates/aurora-widgets/src/widgets/{dropdown,mod}.rs`
+(`set_dropdown_options`); ADR 0009, CLAUDE.md, README.md, version.
+
+Tests. AC-1: `old_blend_mode_bytes_decode_unchanged_and_an_old_reader_refuses_pass_through`,
+`pass_through_is_the_only_group_only_mode_and_listed_first_for_groups`,
+`pass_through_is_group_only_and_round_trips_on_a_group` (setter refusal,
+postcard round trip, crafted-tree refusal),
+`set_blend_mode_pass_through_on_a_group_undoes_and_a_pixel_layer_refuses`.
+AC-2 (CPU, `aurora-app`):
+`a_pass_through_groups_multiply_child_darkens_the_backdrop_below_the_group`
+(with the isolated-Normal regression half),
+`a_pass_through_groups_opacity_lerps_from_the_backdrop`,
+`a_pass_through_groups_mask_lerps_per_pixel`,
+`nested_pass_through_groups_recurse`,
+`curves_inside_a_pass_through_group_adjust_layers_below_the_group`,
+`a_visible_pass_through_group_refuses_the_gpu_fast_path`. AC-3:
+`a_pass_through_group_opens_as_pass_through_and_is_not_reported`,
+`pass_through_group_writes_pass_and_round_trips`, the updated
+`write_psd_all_27_blend_keys_round_trip`, and the psd-tools fixture
+(`write_psd_group_fixtures_for_psd_tools`'s "Inner" group is now Pass
+Through; `scripts/verify_psd_write.py` read `pass` from its record and
+`lsct`: "OK: psd-tools read 2 groups, 5 layers and 2 masks"). AC-4:
+`pass_through_corpus_files_composite_like_photoshops_merged_image`,
+`other_corpus_curves_files_match_or_differ_for_their_reported_reasons`
+(re-pinned), and the ignored
+`a_local_pass_through_psd_against_its_merged_image`
+(`AURORA_PASS_THROUGH_PSD`). AC-5:
+`the_dropdown_lists_pass_through_first_for_a_group_and_never_for_a_layer`,
+`set_dropdown_options_replaces_options_and_closes_an_open_list`.
+
+Accuracy (Aurora's composite against the file's merged image, 8-bit
+levels; "before" = 0.178.0 behaviour, reproduced by mutation M1):
+
+| File | max solid before | after | mean R/G/B after |
+|---|---|---|---|
+| passthrough_blendmodes1.psd | 253 | 1 | 0.12 / 0.01 / 0.01 |
+| passthrough_blendmodes2.psd | 251 | 1 | 0.03 / 0.03 / 0.00 |
+| passthrough_blendmodes3.psd | 252 | 2 | 0.38 / 0.29 / 0.30 |
+| passthrough_clipping_mask_blendmode.psd | 124 | 1 | 0.01 / 0 / 0 |
+| passthrough_opacity.psd | 86 | 86 | Exposure layer left out |
+| passthrough_fill_blendmode.psd | 134 | 134 | group Fill 120/255 not applied |
+| passthrough_fill_adjustment.psd | 152 | 152 | Exposure left out, Fill |
+| passthrough_vector_mask.psd | 156 | 156 | Exposure left out |
+| passthrough_clipping_mask_adjustment.psd | 170 | 170 | 2 adjustments left out, clipping |
+| adjustment_nested_composition_1–4.psd | 254 / 182 / 1 / 167 | 137 / 3 / 1 / 113 | Levels left out in 1 and 4 |
+| Nyepi template (user's, not committed) | max 111, mean 20.7 / 26.6 / 26.4 | max 105, mean 2.65 / 2.67 / 2.69 | 56 layers' effects not shown |
+
+Mutations (each backed up, mutated, run with `AURORA_REQUIRE_GPU=1`,
+restored, touched and sha256-checked):
+
+| # | Mutation | Killed by |
+|---|---|---|
+| M1 | Pass Through composited isolated (`fold_layer_into` route off) | 7: multiply, opacity, mask, nested, Curves tests; PT corpus; Curves corpus |
+| M2 | group opacity not applied (`t = coverage`) | 3: opacity, nested, PT corpus |
+| M3 | group mask not applied (`t = opacity`) | 2: mask test, PT corpus |
+| M4 | reader maps `pass` to Normal | 4: reader test, writer round trip, both corpus tests |
+| M5 | writer writes `norm` | 2: `pass_through_group_writes_pass_and_round_trips`, blend-key table |
+| M6 | pixel layer accepts Pass Through (setter) | 2: tree and history tests |
+| M7 | Pass Through doc takes the GPU path (predicate) | 1: `a_visible_pass_through_group_refuses_the_gpu_fast_path` |
+| M8 | tree validator accepts it on a pixel layer | 1: `pass_through_is_group_only_and_round_trips_on_a_group` |
+
+Gate, in one pass after the last code change (`df -h /home`: 50G
+free): `cargo fmt --check`, layering, hardcoded-style, `cargo check
+--workspace --locked`, workspace clippy `-D warnings`, and
+`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` on the RTX
+3090 — **3,363 passed, 0 failed, 64 ignored**; `cargo doc` with
+`-D warnings` and private items, `cargo deny check all` and
+`design/check_contrast.py` clean; `aurora-app` clippy for
+`x86_64-pc-windows-gnu` and `x86_64-apple-darwin` (lcms2 stub) clean.
+The mutation runs preceded two test-only edits (a clippy `allow` on a
+test helper, and the psd-tools fixture's group set to Pass Through); no
+non-test code changed after them.
+
+Known weaknesses: group Fill not applied; the lerp's behaviour for a
+partially transparent backdrop is psd-tools' model and premultiplied
+algebra, not checked against Photoshop pixels beyond the fixtures above
+(their backdrops are opaque); `resolve_tile` called on a Pass Through
+group as a unit (no current caller on the compositing paths) composites
+it isolated at Normal; a pass-through group with no visible effect still
+copies the backdrop tile when opacity < 1 or a mask is enabled (one
+512 KiB copy per such group per tile); the dropdown swap was tested
+headlessly, not clicked on real hardware or with a screen reader.
 
 **Addendum 2026-10-10 (0.178.0) — groups and layer masks in the PSD
 writer (PSD write R3).**

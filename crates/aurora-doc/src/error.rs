@@ -24,6 +24,10 @@ pub enum DocError {
     /// not an adjustment layer (0.155.0).
     #[error("layer {0:?} is not an adjustment layer")]
     NotAnAdjustment(LayerId),
+    /// A group-only blend mode ([`crate::BlendMode::PassThrough`],
+    /// 0.179.0) was set on, or decoded for, a layer that is not a group.
+    #[error("layer {0:?} is not a group, so it cannot use Pass Through blending")]
+    GroupOnlyBlendMode(LayerId),
     /// [`crate::LayerTree::set_bounds`] was called on a layer that names
     /// a group — a group has no `bounds` of its own to move (see
     /// [`crate::LayerKind::Group`]).

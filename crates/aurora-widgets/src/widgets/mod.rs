@@ -204,7 +204,7 @@ pub use drop_indicator::{
 pub use dropdown::{
     DropdownKey, DropdownOutcome, DropdownState, commit_dropdown_row, dropdown_of_row,
     dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
-    set_dropdown_selected, toggle_dropdown,
+    set_dropdown_options, set_dropdown_selected, toggle_dropdown,
 };
 pub use label::{LabelState, insert_label, label_state, set_label_disabled, set_label_text};
 pub use list_row::ListRowState;

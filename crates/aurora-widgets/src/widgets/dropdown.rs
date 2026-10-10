@@ -734,6 +734,36 @@ pub fn set_dropdown_selected(
     with_dropdown_mut(tree, id, |state| Ok(((), state.apply_selected(selected)?)))
 }
 
+/// Replaces `id`'s options and committed selection together (0.179.0) —
+/// an owner-driven change, like [`set_dropdown_selected`], so it is
+/// allowed on a disabled dropdown. An open list is closed first, without
+/// committing: its rows named the old options. Setting the options and
+/// selection it already has changes nothing — no rebuild, no damage.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`]/[`WidgetError::WrongWidgetKind`]
+/// for an id that isn't a dropdown, or [`WidgetError::IndexOutOfRange`]
+/// if `selected` names none of the new `options`. Nothing changes when
+/// any happens.
+pub fn set_dropdown_options(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    options: Vec<String>,
+    selected: Option<usize>,
+) -> Result<(), WidgetError> {
+    with_dropdown_mut(tree, id, |state| {
+        checked_selection(selected, options.len())?;
+        if state.options == options {
+            return Ok(((), state.apply_selected(selected)?));
+        }
+        state.highlighted = None;
+        state.options = options;
+        state.selected = selected;
+        Ok(((), true))
+    })
+}
+
 /// Commits `row` — one of open dropdown `id`'s own option rows — as the
 /// selection and closes the list: the pointer's equivalent of moving the
 /// highlight onto that row and pressing `Enter`, and implemented as
@@ -1071,7 +1101,8 @@ mod tests {
     use super::{
         DropdownKey, DropdownOutcome, DropdownState, close_after_failure, commit_dropdown_row,
         dropdown_of_row, dropdown_state, handle_dropdown_key, insert_dropdown,
-        set_dropdown_disabled, set_dropdown_open, set_dropdown_selected, toggle_dropdown,
+        set_dropdown_disabled, set_dropdown_open, set_dropdown_options, set_dropdown_selected,
+        toggle_dropdown,
     };
     use crate::WidgetError;
     use crate::shortcut::NamedKey;
@@ -1309,6 +1340,47 @@ mod tests {
         assert!(state.apply_disabled(false));
         assert!(!state.is_disabled());
         assert!(!state.is_open(), "re-enabling does not reopen");
+    }
+
+    /// 0.179.0: replacing the options closes an open list, takes the new
+    /// selection, refuses a selection past the new list, and is a no-op
+    /// when nothing differs.
+    #[test]
+    fn set_dropdown_options_replaces_options_and_closes_an_open_list() {
+        let (mut tree, id) = inserted(Some(1));
+        assert!(set_dropdown_open(&mut tree, id, true).is_ok());
+        assert!(
+            set_dropdown_options(
+                &mut tree,
+                id,
+                vec!["x".into(), "a".into(), "b".into()],
+                Some(2)
+            )
+            .is_ok()
+        );
+        let Ok(state) = dropdown_state(&tree, id) else {
+            unreachable!("state")
+        };
+        assert_eq!(state.options(), ["x", "a", "b"]);
+        assert_eq!(state.selected(), Some(2));
+        assert!(!state.is_open(), "the old rows are gone");
+        assert!(matches!(
+            set_dropdown_options(&mut tree, id, vec!["x".into()], Some(1)),
+            Err(WidgetError::IndexOutOfRange { index: 1, len: 1 })
+        ));
+        let Ok(state) = dropdown_state(&tree, id) else {
+            unreachable!("state")
+        };
+        assert_eq!(state.options().len(), 3, "unchanged on refusal");
+        assert!(
+            set_dropdown_options(
+                &mut tree,
+                id,
+                vec!["x".into(), "a".into(), "b".into()],
+                Some(2)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
