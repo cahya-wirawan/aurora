@@ -166,6 +166,42 @@ impl DocumentShelf {
         Some(abandoned)
     }
 
+    /// Removes the parked session with this id (0.174.0, closing a
+    /// document that is not active), keeping the active one's position
+    /// in the tab order.
+    pub(crate) fn remove(&mut self, id: DocumentId) -> Option<DocumentSession> {
+        let index = self.parked.iter().position(|session| session.id == id)?;
+        let removed = self.parked.remove(index);
+        if index < self.active_position {
+            self.active_position -= 1;
+        }
+        self.active_position = self.active_position.min(self.parked.len());
+        Some(removed)
+    }
+
+    /// Closes the active session (0.174.0): the next tab becomes active,
+    /// else the previous one, else `replacement` (the last document
+    /// closed leaves a fresh one). Returns the closed session; `None`
+    /// (nothing moved) for the last document with no replacement.
+    pub(crate) fn close_active(
+        &mut self,
+        active: &mut DocumentSession,
+        replacement: Option<DocumentSession>,
+    ) -> Option<DocumentSession> {
+        let position = self.active_position.min(self.parked.len());
+        let incoming = if position < self.parked.len() {
+            // The next tab sits at the active one's own position.
+            self.parked.remove(position)
+        } else if let Some(previous) = self.parked.pop() {
+            self.active_position = self.parked.len();
+            previous
+        } else {
+            self.active_position = 0;
+            replacement?
+        };
+        Some(std::mem::replace(active, incoming))
+    }
+
     /// The parked session with this id, to read (tests, palette names).
     pub(crate) fn get(&self, id: DocumentId) -> Option<&DocumentSession> {
         self.parked.iter().find(|session| session.id == id)
@@ -205,6 +241,20 @@ pub(crate) struct DocumentSession {
     /// generation. A failed or partial snapshot, or a failed synchronous
     /// write, records `None`, so the next park retries.
     pub(crate) park_autosave: Option<(crate::UndoRevision, u64)>,
+    /// The file this document came from or was last saved to as `.aur`
+    /// (0.174.0): set by a successful open (any format) and by a
+    /// successful `.aur` save, never by an export. **For display, not a
+    /// save target**: Save always asks where with the native picker (it
+    /// is "Save As…"), so no path here is ever written to without the
+    /// user choosing it — Aurora writes no PSD, and an export is lossy.
+    pub(crate) path: Option<std::path::PathBuf>,
+    /// The [`crate::UndoOrder`] revision this document was last known to
+    /// match a file at (0.174.0): set at creation (a New Document, the
+    /// startup demo, an open before its install), re-set after a
+    /// successful open's install and after a successful `.aur` save;
+    /// `None` for a crash-recovered document, whose contents exist in no
+    /// file the user chose. See [`Self::is_dirty`].
+    pub(crate) saved_revision: Option<crate::UndoRevision>,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -397,6 +447,24 @@ impl DocumentSession {
         Self::with_id(DocumentId::next(), contents)
     }
 
+    /// Whether the document has changes no file holds (0.174.0): its
+    /// revision differs from the one it was last saved or opened at, or
+    /// it never matched a file at all (recovered). Every recorded, undone
+    /// or redone step takes a fresh revision, so this is conservative:
+    /// undoing back past a save is dirty, and so is undoing and redoing
+    /// back *to* it (the revision is new, never the saved one again).
+    /// Live gestures not yet committed are not counted; every close and
+    /// quit path commits them first.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.saved_revision != Some(self.undo_order.revision)
+    }
+
+    /// Records that the document now matches a file (an open's install,
+    /// a successful `.aur` save).
+    pub(crate) fn mark_clean(&mut self) {
+        self.saved_revision = Some(self.undo_order.revision);
+    }
+
     /// [`Self::new`] with an id taken earlier — `App::new` needs it to
     /// name the startup autosave before the session exists (0.171.0).
     pub(crate) fn with_id(id: DocumentId, contents: DocumentContents) -> Self {
@@ -409,9 +477,12 @@ impl DocumentSession {
             canvas_view,
             tile_store,
         } = contents;
+        let undo_order = UndoOrder::new_document();
         Self {
             id,
             name: UNTITLED.to_owned(),
+            path: None,
+            saved_revision: Some(undo_order.revision),
             park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),
@@ -420,7 +491,7 @@ impl DocumentSession {
             skipped_tiles,
             history,
             pixel_history: aurora_brush::PixelHistory::new(),
-            undo_order: UndoOrder::new_document(),
+            undo_order,
             composite_cache: CompositeCache::default(),
             active_layer,
             tile_store,

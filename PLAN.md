@@ -26,7 +26,67 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.173.0): the visible document tab strip
+**Latest (2026-10-10, 0.174.0): unsaved changes, Close Document and the
+quit review (document tabs, round R5 of six).** Each `DocumentSession`
+now has a `path` (the file it was opened from, or last saved to as
+`.aur`; for display only — Save is still "Save As…" and always asks
+where with the native picker, so no path is ever written to unasked:
+Aurora writes no PSD and an export is lossy) and a `saved_revision`, the
+`UndoOrder::revision` it last matched a file at. A document is unsaved
+when its revision differs (`DocumentSession::is_dirty`): an open is
+clean once installed, a New Document and the startup demo are clean
+until their first recorded step, a crash-recovered document is unsaved
+from the start (its work is in no file the user chose), a landed `.aur`
+save makes it clean and gives it that path and name
+(`document_close::after_save`), and an export or a failed save changes
+nothing. The rule is conservative: undoing past a save is unsaved, and
+so is undoing and redoing back *to* it, since a revision is never
+reused (a deliberate divergence from Photoshop, which shows the
+redo-to-saved state as clean). An unsaved tab reads "• name" (a text
+bullet, no new token) with the accessible description "unsaved"
+(`aurora_widgets::widgets::set_tab_descriptions`, new), refreshed every
+loop iteration but relabelled only when a mark changes
+(`document_close::refresh_dirty_marks`). **Close Document** (`Ctrl+W`,
+literally `Ctrl` on macOS too; palette; a macOS File menu "Close" item,
+not compiled here) commits live gestures, closes a clean document at
+once and asks about an unsaved one: "Save changes to “name” before
+closing?" — Save (default, `Enter`), Don't Save, Cancel (`Escape`), the
+same typed result by key, pointer and AT `Click`, under
+`DialogPurpose::CloseDocument(DocumentId)`. Save runs the picker for that
+document (switched to first if needed — F9); a cancelled picker, a failed
+save (its "Couldn't Save File" dialog shows) or a non-`.aur` pick (an
+export) keep the tab. A close activates the next tab, else the previous
+one; closing the last document leaves a fresh, clean "Untitled" —
+**design-owner decision (Cahya, 2026-10-10): closing the last document
+replaces it with a new blank "Untitled" document, not an empty
+workspace.** The closed session is then retired: its autosave slot is
+superseded (no in-flight write can re-create its file), its tile store
+is discarded (`aurora_tile::TileStore::discard`, new: joins the writer,
+then removes only that store's own scratch files), and the index is
+rewritten without it, which deletes its autosave file. **Quit review:**
+a window close request commits live gestures and collects the unsaved
+documents in tab order; with none it quits as before, otherwise it
+switches to each in turn and asks "Save changes to “name” before
+quitting?" (`DialogPurpose::QuitReview(DocumentId)`,
+`document_close::QuitReview`); Cancel, a cancelled picker or a failed
+save abort the whole quit and touch nothing; only an empty list runs the
+clean-quit cleanup (`about_to_wait`, `exit_requested`). **Review revision (judge REVISE 0.86):** Q-1 — an exit the review
+never confirmed (macOS menu Quit, an OS session end) no longer deletes
+unsaved work: with anything unsaved it writes each unsaved session's
+last autosave synchronously and keeps the marker, the index and every
+session autosave, removing only scratch tiles, so the next start offers
+recovery; Q-2 — a close/quit Save onto a non-`.aur` name exports and
+says "“name” Was Exported, Not Saved"; Q-3 — a window close while
+another dialog is open is remembered and starts the review once it
+closes. Measured: 3,260 tests pass, 0 failed (61 ignored),
+`AURORA_REQUIRE_GPU=1` on the RTX 3090. **Not verified:** no human has
+closed or quit on real hardware, macOS menu Quit still does not *ask*
+(it keeps the work recoverable instead, below), and the App glue
+between the tested pure functions (`App::answer_close`,
+`App::answer_quit`, `App::request_quit`, `App::save_document_for_close`)
+is not run by any test. See the 0.174.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.173.0): the visible document tab strip
 (document tabs, round R4 of six).** A one-row strip of document tabs now
 sits at the top of the canvas column, under the options bar and above
 the canvas (`aurora_ui::document_tabs`, `Workspace::document_tabs`), so
@@ -31650,6 +31710,90 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.174.0) — unsaved changes, close and quit (R5).**
+
+Changed: `aurora-app` (`document_close.rs`, new; `document_session.rs`
+path/`saved_revision`/`is_dirty`/`mark_clean`, `DocumentShelf::remove`/
+`close_active`; `document_tabs.rs` marked labels, descriptions,
+`DocumentCommand::Close`; `lib.rs` dialog purposes and effects, `Ctrl+W`,
+palette and macOS menu entries, the save outcome, open/recovery marks,
+the close and quit glue), `aurora-widgets` (`set_tab_descriptions`,
+`TabBarState::descriptions`), `aurora-ui` (`set_document_tab_descriptions`),
+`aurora-tile` (`TileStore::discard`).
+
+Tests per AC: AC-1 `dirty_tracking_follows_open_edit_save_undo_and_export`;
+AC-2 `tab_marks_follow_the_dirty_state_and_relabel_only_on_change`; AC-3
+`a_clean_close_needs_no_dialog_and_an_unsaved_one_asks`,
+`the_close_dialog_choices_are_the_same_by_key_pointer_and_at`; AC-4
+`a_close_activates_the_neighbour_and_removes_the_store_and_autosave`,
+`discard_removes_only_this_stores_scratch_files`; AC-5
+`the_quit_review_goes_through_unsaved_documents_and_cancel_keeps_everything`;
+AC-6 `a_close_applies_to_its_own_document_not_the_active_one`.
+
+Gate (one pass after the last code change): fmt, layering, style lint,
+`cargo check --locked`, clippy `-D warnings`, `AURORA_REQUIRE_GPU=1 cargo
+test --workspace` 3,257 passed / 0 failed / 61 ignored, `cargo doc -D
+warnings --document-private-items`, `cargo deny`, contrast — all green.
+Stress: the close, quit, tab and autosave tests 20 times under 12 `yes`
+processes, 0 failures.
+
+Mutation matrix (each applied, `AURORA_REQUIRE_GPU=1 cargo test -p
+aurora-app`, restored from a scratchpad backup, touched, sha256 checked):
+
+| Mutation | Result |
+|---|---|
+| export clears dirty | killed: dirty_tracking_follows_open_edit_save_undo_and_export |
+| undo past the save stays clean | killed: dirty_tracking_follows_open_edit_save_undo_and_export |
+| a dirty close needs no dialog | killed: a_clean_close_needs_no_dialog_and_an_unsaved_one_asks |
+| Don't Save keeps the doc | killed: a_clean_close_needs_no_dialog_and_an_unsaved_one_asks |
+| Save closes before the save lands | killed: a_clean_close_needs_no_dialog_and_an_unsaved_one_asks |
+| Cancel closes anyway | killed: a_clean_close_needs_no_dialog_and_an_unsaved_one_asks |
+| the close doesn't remove the store's files | survived the first run (the test's store paged nothing out, so "0 files" was vacuous); test fixed to page b out at budget 1; re-run: killed: a_close_activates_the_neighbour_and_removes_the_store_and_autosave |
+| the close doesn't remove the autosave (index keeps it) | killed: a_close_activates_the_neighbour_and_removes_the_store_and_autosave, every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order |
+| the quit review skips a dirty doc | killed: the_quit_review_goes_through_unsaved_documents_and_cancel_keeps_everything |
+| quit Cancel still runs cleanup | killed: the_quit_review_goes_through_unsaved_documents_and_cancel_keeps_everything |
+| quit review Cancel moves on | killed: the_quit_review_goes_through_unsaved_documents_and_cancel_keeps_everything |
+| the close acts on the active doc, not its id | killed: a_close_applies_to_its_own_document_not_the_active_one |
+| tab marks relabel every call | killed: tab_marks_follow_the_dirty_state_and_relabel_only_on_change |
+| no AT description | killed: tab_marks_follow_the_dirty_state_and_relabel_only_on_change |
+
+Review revision (Q-1 to Q-3) mutations, same procedure:
+
+| Mutation | Result |
+|---|---|
+| Q-1 flag ignored (unconfirmed check dropped) | killed: an_unconfirmed_exit_keeps_unsaved_work_and_writes_its_last_autosave |
+| Q-1 keep branch removed from run_shutdown_cleanup | killed: an_unconfirmed_exit_with_unsaved_work_keeps_it_recoverable |
+| Q-1 keep branch also deletes autosaves | killed: an_unconfirmed_exit_with_unsaved_work_keeps_it_recoverable |
+| Q-1 final autosave writes clean sessions too | killed: an_unconfirmed_exit_keeps_unsaved_work_and_writes_its_last_autosave |
+| Q-1 final autosave skips the index | killed: an_unconfirmed_exit_keeps_unsaved_work_and_writes_its_last_autosave |
+| Q-2 non-.aur counted as a save | killed: a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes |
+| Q-3 pending quit ignores the open dialog | killed: a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes |
+
+Revision tests: `an_unconfirmed_exit_with_unsaved_work_keeps_it_recoverable`
+(marker, index and autosave kept, next start recovers; a confirmed exit
+cleans), `an_unconfirmed_exit_keeps_unsaved_work_and_writes_its_last_autosave`
+(flag table, Don't Save then quit is confirmed, final autosave and index),
+`a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes`.
+
+Open design questions: the unsaved mark's glyph ("•", a text stand-in);
+whether redo back to the saved state should read as clean (Photoshop
+does; Aurora conservatively does not); `Cmd+W`/`Cmd+Q` on macOS (the
+registry has no per-platform chords). Decided: closing the last document
+leaves a blank "Untitled" (Cahya, 2026-10-10).
+
+Known weaknesses and what was NOT verified: **macOS menu Quit (`Cmd+Q`)
+still does not ask** — `PredefinedMenuItem::quit` reaches `exiting`
+directly and cannot be cancelled there. Since the review revision that
+exit keeps the unsaved documents recoverable (last autosave written,
+recovery data kept; the next start shows the crash-recovery dialog),
+but the real interception (a custom menu item and
+`applicationShouldTerminate`, macOS-only code this Linux box cannot
+compile) is the first R6 item. The final autosave runs synchronously on
+the UI thread at exit, unbounded by the snapshot budget. Removing the closed session's autosave file relies on the
+index book; with no index (no autosave namespace) the file stays until
+the run's own cleanup. The App glue around the pure functions is
+untested; nothing here was run on real hardware or with a screen reader.
 
 **Addendum 2026-10-10 (0.173.0) — the document tab strip (R4).**
 

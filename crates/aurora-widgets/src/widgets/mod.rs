@@ -220,7 +220,7 @@ pub use scrollbar::{
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use tab_bar::{
     TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key, insert_tab_bar,
-    select_tab, set_tab_bar_disabled, set_tab_labels, tab_bar_state,
+    select_tab, set_tab_bar_disabled, set_tab_descriptions, set_tab_labels, tab_bar_state,
 };
 pub use text_field::{
     ChordEffect, Composition, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldKey, TextFieldState,

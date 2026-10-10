@@ -118,6 +118,20 @@ pub fn sync_document_tabs(
     link_document_panel(tree, bar, panel)
 }
 
+/// Sets each document tab's accessible description (0.174.0: ", unsaved"
+/// state), by tab position. `Ok(false)` when nothing changed.
+///
+/// # Errors
+///
+/// [`WidgetError`] if `bar` is not a tab bar.
+pub fn set_document_tab_descriptions(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    descriptions: Vec<String>,
+) -> Result<bool, WidgetError> {
+    widgets::set_tab_descriptions(tree, bar, descriptions)
+}
+
 /// Whether `id` is one of the strip's tabs.
 #[must_use]
 pub fn is_document_tab(tree: &WidgetTree<WidgetKind>, bar: WidgetId, id: WidgetId) -> bool {
