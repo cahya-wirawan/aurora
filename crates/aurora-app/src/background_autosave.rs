@@ -26,7 +26,15 @@
 //!   tells it the session's file is complete, under the same state lock
 //!   as the rename, and the book rewrites the run's index only if that
 //!   changes what it lists. So the index never names a file before it
-//!   has landed (`crate::autosave_files`).
+//!   has landed (`crate::autosave_files`). Since 0.171.1 (L3) only the
+//!   listing is computed under the lock; the index's temp file is
+//!   written and synced outside it, and renamed back under it only if
+//!   no newer listing has landed ([`IndexWrite`]).
+//! - **The run stays visibly alive** (0.171.1, L-a). Given the run's
+//!   [`Liveness`] ([`AutosaveWorker::set_liveness`]), the worker
+//!   refreshes it after every landing and on a timer while idle, so a
+//!   temp cleaner never removes a live run's lock file for age, and one
+//!   removed anyway is re-created.
 //! - **A stale write never lands.** Every request carries a
 //!   [`Generation`], and the rename that publishes a write happens under
 //!   the state lock and only if no newer generation has landed
@@ -64,7 +72,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::autosave_files::{IndexBook, IndexEntry};
+use crate::autosave_files::{IndexBook, IndexEntry, IndexWrite, Liveness};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -130,6 +138,8 @@ struct State {
     cancelled: bool,
     /// The run's index, when this worker keeps one.
     index: Option<IndexBook>,
+    /// The run's liveness and how often to refresh it while idle.
+    liveness: Option<(Arc<Liveness>, Duration)>,
     /// Every [`Landing`] in order, for tests and the shutdown report.
     landings: Vec<(Generation, Landing)>,
 }
@@ -141,7 +151,14 @@ struct Shared {
     cancel: AtomicBool,
     session_ending: fn() -> bool,
     write: Box<WriteTemp>,
+    /// Index temp files started, for tests (0.171.1 review L-3).
+    #[cfg(test)]
+    index_temps: std::sync::atomic::AtomicUsize,
 }
+
+/// How many times one index write is retried at once before the idle
+/// timer takes over (0.171.1 review L-1).
+const INDEX_ATTEMPTS: usize = 3;
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -201,6 +218,8 @@ impl AutosaveWorker {
                 cancel: AtomicBool::new(false),
                 session_ending,
                 write: Box::new(write),
+                #[cfg(test)]
+                index_temps: std::sync::atomic::AtomicUsize::new(0),
             }),
             last_generation: 0,
             thread: None,
@@ -230,26 +249,46 @@ impl AutosaveWorker {
             }
         }
         self.shared.changed.notify_all();
-        if self.thread.is_none() {
-            let shared = Arc::clone(&self.shared);
-            match std::thread::Builder::new()
-                .name("aurora-autosave".to_owned())
-                .spawn(move || run(&shared))
-            {
-                Ok(handle) => self.thread = Some(handle),
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "could not start the autosave thread; writing on this one"
-                    );
-                    let queued = std::mem::take(&mut self.shared.lock().queued);
-                    for (generation, job) in queued.into_values() {
-                        write_and_land(&self.shared, generation, &job);
-                    }
-                }
+        if !self.ensure_thread() {
+            tracing::warn!("could not start the autosave thread; writing on this one");
+            let queued = std::mem::take(&mut self.shared.lock().queued);
+            for (generation, job) in queued.into_values() {
+                write_and_land(&self.shared, generation, &job);
             }
         }
         Some(generation)
+    }
+
+    /// Starts the worker thread unless it is running; `false` if it could
+    /// not be started.
+    fn ensure_thread(&mut self) -> bool {
+        if self.thread.is_some() {
+            return true;
+        }
+        let shared = Arc::clone(&self.shared);
+        match std::thread::Builder::new()
+            .name("aurora-autosave".to_owned())
+            .spawn(move || run(&shared))
+        {
+            Ok(handle) => {
+                self.thread = Some(handle);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(?err, "could not start the autosave thread");
+                false
+            }
+        }
+    }
+
+    /// Gives the worker the run's liveness to refresh after every landing
+    /// and every `every` while idle (0.171.1, L-a), starting its thread.
+    pub(crate) fn set_liveness(&mut self, liveness: Arc<Liveness>, every: Duration) {
+        self.shared.lock().liveness = Some((liveness, every));
+        self.shared.changed.notify_all();
+        if !self.ensure_thread() {
+            tracing::warn!("the autosave lock will only be refreshed when a write lands");
+        }
     }
 
     /// Makes every job submitted so far unable to land, for a caller
@@ -285,8 +324,8 @@ impl AutosaveWorker {
     /// if it already has something to list; `true` when the index on
     /// disk matches.
     pub(crate) fn configure_index(&mut self, book: IndexBook) -> bool {
-        let mut state = self.shared.lock();
-        state.index.insert(book).sync()
+        let write = self.shared.lock().index.insert(book).prepare();
+        finish_index_write(&self.shared, write)
     }
 
     /// Replaces the index's session set and active session (a later
@@ -297,21 +336,60 @@ impl AutosaveWorker {
         expect(dead_code, reason = "sessions are created and closed from 0.172.0")
     )]
     pub(crate) fn set_sessions(&mut self, order: Vec<IndexEntry>, active: Option<u64>) -> bool {
-        self.shared
+        let write = self
+            .shared
             .lock()
             .index
             .as_mut()
-            .is_none_or(|book| book.set_sessions(order, active))
+            .and_then(|book| book.set_sessions(order, active));
+        finish_index_write(&self.shared, write)
     }
 
     /// `document`'s file was written on the calling thread (the
     /// over-budget fallback): it is complete, so the index may list it.
     pub(crate) fn note_written(&mut self, document: u64) -> bool {
-        self.shared
+        let write = self
+            .shared
             .lock()
             .index
             .as_mut()
-            .is_none_or(|book| book.mark_complete(document))
+            .and_then(|book| book.mark_complete(document));
+        finish_index_write(&self.shared, write)
+    }
+
+    /// How many index writes are prepared and not yet finished or
+    /// abandoned, for tests: zero whenever the worker is idle.
+    #[cfg(test)]
+    pub(crate) fn index_in_flight(&self) -> usize {
+        self.shared
+            .lock()
+            .index
+            .as_ref()
+            .map_or(0, IndexBook::in_flight)
+    }
+
+    /// Lets the idle timer's index retry run now, for tests.
+    #[cfg(test)]
+    pub(crate) fn retry_index(&mut self) -> bool {
+        let write = self
+            .shared
+            .lock()
+            .index
+            .as_mut()
+            .and_then(IndexBook::retry_write);
+        finish_index_write(&self.shared, write)
+    }
+
+    /// How many index temp files were started, for tests.
+    #[cfg(test)]
+    pub(crate) fn index_temps_started(&self) -> usize {
+        self.shared.index_temps.load(Ordering::SeqCst)
+    }
+
+    /// What the index must list now, for tests.
+    #[cfg(test)]
+    pub(crate) fn index_listing(&self) -> Option<crate::autosave_files::AutosaveIndex> {
+        self.shared.lock().index.as_ref().map(IndexBook::listing)
     }
 
     /// How many times the index was written.
@@ -411,10 +489,32 @@ fn run(shared: &Shared) {
                     state.in_flight = Some(queued.0);
                     break queued;
                 }
-                state = match shared.changed.wait(state) {
-                    Ok(state) => state,
-                    Err(poisoned) => poisoned.into_inner(),
+                let Some((liveness, every)) = state.liveness.clone() else {
+                    state = match shared.changed.wait(state) {
+                        Ok(state) => state,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    continue;
                 };
+                let timed_out;
+                (state, timed_out) = match shared.changed.wait_timeout(state, every) {
+                    Ok((state, result)) => (state, result.timed_out()),
+                    Err(poisoned) => {
+                        let (state, result) = poisoned.into_inner();
+                        (state, result.timed_out())
+                    }
+                };
+                if timed_out && !state.cancelled {
+                    // An index that lags its book is retried here too
+                    // (0.171.1 review L-1).
+                    let retry = state.index.as_mut().and_then(IndexBook::retry_write);
+                    // Outside the state lock: `Liveness` has its own,
+                    // and refuses once released by a clean quit.
+                    drop(state);
+                    let _held = liveness.refresh();
+                    let _indexed = finish_index_write(shared, retry);
+                    state = shared.lock();
+                }
             }
         };
         write_and_land(shared, generation, &job);
@@ -432,8 +532,15 @@ fn write_and_land(shared: &Shared, generation: Generation, job: &AutosaveJob) {
     }));
     match written {
         Ok(Some(written)) => {
-            let landing = land(shared, generation, &written, job);
-            if landing != Landing::Landed {
+            let (landing, index) = land(shared, generation, &written, job);
+            if landing == Landing::Landed {
+                // Both outside the state lock (0.171.1, L3 and L-a).
+                let _indexed = finish_index_write(shared, index);
+                let liveness = shared.lock().liveness.clone();
+                if let Some((liveness, _)) = liveness {
+                    let _held = liveness.refresh();
+                }
+            } else {
                 tracing::info!(generation, ?landing, "an autosave write did not land");
             }
         }
@@ -449,15 +556,82 @@ fn write_and_land(shared: &Shared, generation: Generation, job: &AutosaveJob) {
     }
 }
 
+/// Carries out a prepared index write: its temp file is written and
+/// synced outside the state lock, then renamed under it by
+/// [`IndexBook::finish`] — refused once cancelled or the session is
+/// ending, so no index can land after a clean quit deleted it. `true`
+/// when there was nothing to write or the index is at least this new.
+///
+/// No temp file is even started once the worker is cancelled (0.171.1
+/// review L-3), so a write racing a clean quit cannot leave one behind
+/// for a thread detached at exit; and when the index on disk is left
+/// behind its book (a failed write, or an older write landing last) it
+/// is retried at once, up to [`INDEX_ATTEMPTS`] times, then on the idle
+/// timer (review L-1).
+///
+/// **Every prepared write is finished or abandoned** (0.171.1 review
+/// R-1): no retry is prepared on the last attempt, and a write dropped
+/// unexecuted — cancelled, or refused — goes back to its book through
+/// [`IndexBook::abandon`], so the book's count of writes in flight
+/// returns to zero and the removals it carried are kept for the next
+/// write. Otherwise one write lost this way would block every later
+/// retry for good.
+fn finish_index_write(shared: &Shared, write: Option<IndexWrite>) -> bool {
+    let mut write = write;
+    let mut landed = true;
+    for attempt in 1..=INDEX_ATTEMPTS {
+        let Some(this) = write.take() else {
+            return landed;
+        };
+        if shared.cancel.load(Ordering::SeqCst) {
+            abandon_index_write(shared, this);
+            return false;
+        }
+        #[cfg(test)]
+        shared.index_temps.fetch_add(1, Ordering::SeqCst);
+        let temp = crate::autosave_files::write_index_temp(&this);
+        let mut state = shared.lock();
+        let refused = state.cancelled || (shared.session_ending)();
+        match state.index.as_mut() {
+            Some(book) if !refused => {
+                landed = book.finish(this, temp);
+                if attempt < INDEX_ATTEMPTS {
+                    write = book.retry_write();
+                }
+            }
+            book => {
+                if let Some(temp) = temp {
+                    crate::remove_autosave_temp(&temp);
+                }
+                if let Some(book) = book {
+                    book.abandon(this);
+                }
+                return false;
+            }
+        }
+    }
+    landed
+}
+
+/// Hands an unexecuted index write back to its book.
+fn abandon_index_write(shared: &Shared, write: IndexWrite) {
+    if let Some(book) = shared.lock().index.as_mut() {
+        book.abandon(write);
+    }
+}
+
 /// Publishes a finished temp file, under the state lock: refused (and
 /// the temp file removed) once cancelled or the session is ending, or
-/// when a newer generation already landed.
+/// when a newer generation already landed. Also returns the index write
+/// the landing calls for, which the caller carries out after the lock is
+/// released.
 fn land(
     shared: &Shared,
     generation: Generation,
     written: &WrittenTemp,
     job: &AutosaveJob,
-) -> Landing {
+) -> (Landing, Option<IndexWrite>) {
+    let mut index = None;
     let mut state = shared.lock();
     let landing = if state.cancelled || (shared.session_ending)() {
         crate::remove_autosave_temp(&written.temp);
@@ -469,15 +643,16 @@ fn land(
         state.landed.insert(job.document, generation);
         // After the rename, under the same lock: the index can only name
         // a file that has landed.
-        if let Some(book) = state.index.as_mut() {
-            let _written = book.mark_complete(job.document);
-        }
+        index = state
+            .index
+            .as_mut()
+            .and_then(|book| book.mark_complete(job.document));
         Landing::Landed
     } else {
         Landing::RenameFailed
     };
     state.landings.push((generation, landing));
-    landing
+    (landing, index)
 }
 
 /// A writer that fails every call once `cancel` is set, so a cancelled
@@ -855,6 +1030,177 @@ mod tests {
         assert_eq!(worker.index_writes(), 2);
     }
 
+    /// 0.171.1 review L-3: once the worker is shut down for a clean quit,
+    /// no index temp file is even started, so a thread detached at exit
+    /// cannot leave one in the temp directory.
+    #[test]
+    fn no_index_temp_is_started_after_shutdown() {
+        let dir = tempdir();
+        let pid = 4_100_041;
+        let mut worker = real_worker();
+        assert!(
+            worker.configure_index(crate::autosave_files::IndexBook::new(
+                crate::autosave_files::index_path(dir.path(), pid),
+                vec![index_entry(pid, 1)],
+                Some(1),
+                [],
+            ))
+        );
+        let _ = worker.shutdown(super::SHUTDOWN_WAIT_BOUND);
+        let started = worker.index_temps_started();
+        assert!(!worker.note_written(1), "refused after shutdown");
+        assert_eq!(worker.index_temps_started(), started);
+        // The dropped write went back to its book (0.171.1 review R-1).
+        assert_eq!(worker.index_in_flight(), 0);
+        assert!(temp_files(dir.path()).is_empty());
+        assert!(!crate::autosave_files::index_path(dir.path(), pid).exists());
+    }
+
+    /// 0.171.1 review R-1: three failed attempts in a row leave no write
+    /// in flight, so the next retry still runs, lands the index and
+    /// carries out the removals the failed writes carried.
+    #[test]
+    fn three_failed_index_writes_still_leave_the_next_retry_free_to_land() {
+        let dir = tempdir();
+        let pid = 4_100_051;
+        let index = crate::autosave_files::index_path(dir.path(), pid);
+        // A non-empty directory where the index goes: every rename fails.
+        assert!(std::fs::create_dir_all(index.join("occupied")).is_ok());
+        let closed = dir
+            .path()
+            .join(crate::autosave_files::session_file_name(pid, 2));
+        assert!(std::fs::write(&closed, b"x").is_ok());
+        let mut worker = real_worker();
+        assert!(
+            !worker.configure_index(crate::autosave_files::IndexBook::new(
+                index.clone(),
+                vec![index_entry(pid, 1), index_entry(pid, 2)],
+                Some(1),
+                [1, 2],
+            ))
+        );
+        assert_eq!(worker.index_in_flight(), 0);
+        // Session 2 closes: its file may go only once an index without it
+        // has landed, which cannot happen yet.
+        assert!(!worker.set_sessions(vec![index_entry(pid, 1)], Some(1)));
+        assert_eq!(worker.index_in_flight(), 0);
+        assert!(closed.exists());
+        assert!(temp_files(dir.path()).is_empty());
+        // The obstacle goes; the next retry lands everything.
+        assert!(std::fs::remove_dir_all(&index).is_ok());
+        assert!(worker.retry_index());
+        assert_eq!(
+            crate::autosave_files::read_index(&index, pid.into()).map(|listing| listing.entries),
+            Ok(vec![index_entry(pid, 1)])
+        );
+        assert!(!closed.exists(), "the carried removal ran");
+        assert_eq!(worker.index_in_flight(), 0);
+        // A refused write (the session is ending) is abandoned too.
+        let mut ending = AutosaveWorker::new(crate::write_autosave_temp, always);
+        assert!(
+            !ending.configure_index(crate::autosave_files::IndexBook::new(
+                crate::autosave_files::index_path(dir.path(), pid + 1),
+                vec![index_entry(pid + 1, 1)],
+                Some(1),
+                [1],
+            ))
+        );
+        assert_eq!(ending.index_in_flight(), 0);
+    }
+
+    /// 0.171.1 (L-a): the worker refreshes the run's liveness after a
+    /// landing (the lock file's time is bumped) and on its idle timer (a
+    /// deleted lock file is re-created).
+    #[test]
+    fn the_worker_refreshes_liveness_on_landing_and_on_a_timer() {
+        let dir = tempdir();
+        let namespace =
+            crate::autosave_files::AutosaveNamespace::acquire(dir.path().to_path_buf(), 4_100_021);
+        let lock = crate::autosave_files::lock_path(dir.path(), namespace.key);
+        let old = std::time::SystemTime::now() - Duration::from_hours(120);
+        let set_old = || match std::fs::OpenOptions::new().write(true).open(&lock) {
+            Ok(file) => assert!(file.set_modified(old).is_ok()),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let modified = || {
+            std::fs::metadata(&lock)
+                .and_then(|meta| meta.modified())
+                .ok()
+        };
+        // A long timer first: only the landing can refresh.
+        let mut worker = real_worker();
+        worker.set_liveness(namespace.liveness(), Duration::from_hours(1));
+        set_old();
+        let mut doc = Doc::new("a", 0.25);
+        assert!(
+            worker
+                .submit(job_for(&mut doc, &namespace.session_path(1), 1))
+                .is_some()
+        );
+        assert!(worker.wait_idle(WAIT));
+        assert!(modified().is_some_and(|time| time > old + Duration::from_mins(1)));
+        drop(worker);
+        // A short timer: a deleted lock comes back while the worker idles.
+        let mut worker = real_worker();
+        worker.set_liveness(namespace.liveness(), Duration::from_millis(10));
+        assert!(std::fs::remove_file(&lock).is_ok());
+        let deadline = std::time::Instant::now() + WAIT;
+        while !lock.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lock.exists(), "the timer re-created the lock file");
+        assert!(
+            crate::autosave_files::try_lock(&lock, false).is_none(),
+            "and holds it"
+        );
+        let _ = worker.shutdown(super::SHUTDOWN_WAIT_BOUND);
+    }
+
+    /// 0.171.1 (L3): with the index written outside the state lock, landings
+    /// on the worker thread racing set changes on this one still leave the
+    /// index exactly at the newest listing — never an older one.
+    #[test]
+    fn concurrent_landings_and_set_changes_leave_the_newest_listing() {
+        let dir = tempdir();
+        let pid = 4_100_031;
+        let index = crate::autosave_files::index_path(dir.path(), pid);
+        let order: Vec<_> = (1..=4).map(|id| index_entry(pid, id)).collect();
+        let mut worker = real_worker();
+        assert!(
+            worker.configure_index(crate::autosave_files::IndexBook::new(
+                index.clone(),
+                order.clone(),
+                Some(1),
+                [],
+            ))
+        );
+        let mut docs: Vec<Doc> = (1..=4)
+            .map(|n| Doc::new("d", 0.125 * f32::from(u8::try_from(n).unwrap_or(1))))
+            .collect();
+        for round in 0..6_u64 {
+            for (id, doc) in (1..=4_u64).zip(docs.iter_mut()) {
+                let path = dir
+                    .path()
+                    .join(crate::autosave_files::session_file_name(pid, id));
+                assert!(worker.submit(job_for(doc, &path, id)).is_some());
+                // Meanwhile the active session keeps changing.
+                assert!(worker.set_sessions(order.clone(), Some(1 + (id + round) % 4)));
+            }
+        }
+        assert!(worker.wait_idle(WAIT));
+        assert!(worker.set_sessions(order.clone(), Some(3)));
+        let expected = worker.index_listing();
+        assert_eq!(
+            expected.as_ref().map(|listing| listing.entries.len()),
+            Some(4)
+        );
+        assert_eq!(
+            crate::autosave_files::read_index(&index, pid.into()).ok(),
+            expected
+        );
+        assert!(temp_files(dir.path()).is_empty());
+    }
+
     /// AC-4 (0.171.0): replacing the document keeps the session's id, so
     /// the opened document's autosave lands on the same path by one
     /// rename; until it does, the file still holds the old document.
@@ -1024,10 +1370,13 @@ mod tests {
             unreachable!("the write succeeds");
         };
         assert_eq!(
-            land(&worker.shared, 2, &newer_temp, &newer),
+            land(&worker.shared, 2, &newer_temp, &newer).0,
             Landing::Landed
         );
-        assert_eq!(land(&worker.shared, 1, &older_temp, &older), Landing::Stale);
+        assert_eq!(
+            land(&worker.shared, 1, &older_temp, &older).0,
+            Landing::Stale
+        );
         assert_eq!(recovered(&path), Some(vec![("ink".to_owned(), 0.75)]));
         assert!(
             !older_temp.temp.exists(),

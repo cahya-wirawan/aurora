@@ -46,6 +46,23 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+/// How often a live run touches its lock file and index (0.171.1, L-a):
+/// on every autosave landing, and on this timer on the autosave thread.
+/// `systemd-tmpfiles` removes `/tmp` files untouched for 10 days by
+/// default, so a refreshed lock is never old enough to be cleaned.
+pub(crate) const LIVENESS_REFRESH: Duration = Duration::from_mins(30);
+
+/// A run whose lock file is missing but whose index or session files were
+/// modified within this window is treated as possibly alive and left
+/// alone (0.171.1, L-a). Four refresh intervals: a live run's index is
+/// at most one interval old (plus scheduling delay), and a crashed run's
+/// files stop being touched, so they age out of it and the run is
+/// recovered after at most two hours — never blocked forever.
+pub(crate) const LIVENESS_WINDOW: Duration = Duration::from_hours(2);
 
 /// Every autosave file name starts with this.
 const PREFIX: &str = "aurora-autosave";
@@ -347,12 +364,19 @@ pub(crate) fn write_index(path: &Path, index: &AutosaveIndex) -> bool {
     true
 }
 
+/// The names in `dir` that start with `aurora-autosave` — only those are
+/// copied (0.171.1, L-b): the temp directory can hold thousands of
+/// unrelated files.
 fn dir_names(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
-                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_str()?;
+                    name.starts_with(PREFIX).then(|| name.to_owned())
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -572,12 +596,19 @@ fn prioritised(
 /// damaged marker can never strand a crashed run's documents (a live
 /// run among them is then skipped by [`claim_sources`]). Otherwise the
 /// marker's keys, those with data first, at most [`MARKER_MAX_KEYS`].
+///
+/// Since 0.171.1 (L-c) the scan always runs: every run with data the
+/// marker does not name is appended after the marker's own keys, so a
+/// stale marker — a failed marker write leaves the old one — can order
+/// recovery but never hide a crashed run.
 pub(crate) fn recovery_keys(dir: &Path, previous: &[RunKey]) -> Vec<RunKey> {
     let data = keys_with_data(&dir_names(dir));
-    if previous.is_empty() {
-        return data.into_iter().take(MARKER_MAX_KEYS).collect();
-    }
-    prioritised(previous.iter().copied(), &data, MARKER_MAX_KEYS)
+    let named: BTreeSet<RunKey> = previous.iter().copied().collect();
+    let keys = previous
+        .iter()
+        .copied()
+        .chain(data.iter().copied().filter(|key| !named.contains(key)));
+    prioritised(keys, &data, MARKER_MAX_KEYS)
 }
 
 /// Opens (creating when `create`) the lock file at `path` and takes its
@@ -625,12 +656,32 @@ pub(crate) struct RecoverySource {
 /// second Aurora — and is skipped, so its files are never read, adopted
 /// or deleted. `own` is never a source: its namespace was chosen empty
 /// ([`AutosaveNamespace::acquire`]).
+///
+/// A missing lock file is not proof of death on its own (0.171.1, L-a):
+/// a temp cleaner may have removed a live run's. If the run's index or
+/// session files were modified within [`LIVENESS_WINDOW`] it is treated
+/// as possibly alive and skipped this time.
 pub(crate) fn claim_sources(dir: &Path, own: RunKey, marker: &[RunKey]) -> Vec<RecoverySource> {
+    claim_sources_at(dir, own, marker, SystemTime::now())
+}
+
+/// [`claim_sources`] at a given `now`, for tests.
+pub(crate) fn claim_sources_at(
+    dir: &Path,
+    own: RunKey,
+    marker: &[RunKey],
+    now: SystemTime,
+) -> Vec<RecoverySource> {
+    let names = dir_names(dir);
     let mut sources = Vec::new();
     for &key in marker.iter().filter(|&&key| key != own) {
         let path = lock_path(dir, key);
         if !path.exists() {
-            sources.push(RecoverySource { key, _lock: None });
+            if recently_modified(dir, key, &names, now) {
+                tracing::info!(%key, "a run without a lock file has recent files; treated as possibly alive");
+            } else {
+                sources.push(RecoverySource { key, _lock: None });
+            }
             continue;
         }
         if let Some(lock) = try_lock(&path, false) {
@@ -642,7 +693,48 @@ pub(crate) fn claim_sources(dir: &Path, own: RunKey, marker: &[RunKey]) -> Vec<R
             tracing::info!(%key, "another Aurora is still running; its autosaves are left alone");
         }
     }
+    // A gone run with nothing to recover — only index temp files, say from
+    // a thread detached at exit — is retired here, silently: it is no
+    // source, so it cannot show a crash dialog that recovers nothing
+    // (0.171.1 review R-2). Its lock, when it had one, is held right now.
+    sources.retain(|source| {
+        let recoverable = names.iter().any(|name| {
+            file_run_key(name) == Some((source.key, true)) && !is_index_temp(name)
+        });
+        if !recoverable {
+            tracing::info!(key = %source.key, "a gone run left nothing to recover; its leftovers are removed");
+            retire_namespace(dir, source.key);
+        }
+        recoverable
+    });
     sources
+}
+
+/// Whether `name` is an index temp file (`aurora-autosave-<key>.index.*.tmp`).
+fn is_index_temp(name: &str) -> bool {
+    name.strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.split_once(".index."))
+        .is_some_and(|(_, tail)| tail.rsplit('.').next() == Some("tmp"))
+}
+
+/// Whether any of run `key`'s data files among `names` was modified
+/// within [`LIVENESS_WINDOW`] of `now`, either side: a modification time
+/// far in the future (clock skew, or a hostile file) counts as old, so it
+/// can never keep a crashed run from recovery forever. An unreadable time
+/// counts as old for the same reason.
+fn recently_modified(dir: &Path, key: RunKey, names: &[String], now: SystemTime) -> bool {
+    names
+        .iter()
+        .filter(|name| file_run_key(name) == Some((key, true)))
+        .filter_map(|name| std::fs::metadata(dir.join(name)).ok()?.modified().ok())
+        .any(|modified| {
+            let distance = match now.duration_since(modified) {
+                Ok(age) => age,
+                Err(ahead) => ahead.duration(),
+            };
+            distance < LIVENESS_WINDOW
+        })
 }
 
 /// Whether anything of run `key` is among `names`: its lock (alive, or
@@ -682,8 +774,54 @@ pub(crate) fn inherited_marker_keys(dir: &Path, own: RunKey, previous: &[RunKey]
 /// have files — a crashed run whose other documents were kept for a
 /// later round, or a second Aurora still running. Empty means the marker
 /// can be deleted.
+///
+/// Since the 0.171.1 review (L-2) the directory scan is added too: a run
+/// another run's stale marker never named (its own marker write failed)
+/// still has files, so it must stay in the marker this quit leaves —
+/// otherwise this quit could delete the marker and strand that run when
+/// it later crashes.
 pub(crate) fn marker_after_quit(dir: &Path, own: RunKey, marker: &[RunKey]) -> Vec<RunKey> {
-    inherited_marker_keys(dir, own, marker)
+    let data = keys_with_data(&dir_names(dir));
+    let named: BTreeSet<RunKey> = marker.iter().copied().collect();
+    let keys: Vec<RunKey> = marker
+        .iter()
+        .copied()
+        .chain(data.into_iter().filter(|key| !named.contains(key)))
+        .collect();
+    inherited_marker_keys(dir, own, &keys)
+}
+
+/// Where startup recovers from (0.171.1 review L-2): the runs to try
+/// ([`recovery_keys`]: the marker's keys plus the directory scan — the
+/// scan runs even when there is **no marker at all**, so a missing marker
+/// can never strand a crashed run), the ones claimed as really gone
+/// ([`claim_sources`]), and whether this start is a crash recovery: a
+/// marker naming a gone run, a legacy (empty) marker, or — with no marker
+/// — any gone run with files the scan found.
+#[derive(Debug)]
+pub(crate) struct StartupSources {
+    pub(crate) keys: Vec<RunKey>,
+    pub(crate) claimed: Vec<RecoverySource>,
+    pub(crate) had_previous_marker: bool,
+}
+
+/// [`StartupSources`] for this run (`own`) and the previous marker.
+pub(crate) fn startup_sources(
+    dir: &Path,
+    own: RunKey,
+    previous: Option<&[RunKey]>,
+) -> StartupSources {
+    let keys = recovery_keys(dir, previous.unwrap_or_default());
+    let claimed = claim_sources(dir, own, &keys);
+    let had_previous_marker = match previous {
+        Some(marker) => marker.is_empty() || !claimed.is_empty(),
+        None => !claimed.is_empty(),
+    };
+    StartupSources {
+        keys,
+        claimed,
+        had_previous_marker,
+    }
 }
 
 fn remove_quietly(path: &Path) {
@@ -769,13 +907,77 @@ pub(crate) fn adopt(from: &Path, to: &Path) -> bool {
     moved
 }
 
+/// The proof that a run is alive (0.171.1, L-a): its exclusive lock,
+/// re-created if a temp cleaner removed the file, and its lock file's and
+/// index's modification times, bumped by [`Self::refresh`] on every
+/// autosave landing and every [`LIVENESS_REFRESH`] on the autosave
+/// thread. Shared by the run's [`AutosaveNamespace`] and its worker.
+#[derive(Debug)]
+pub(crate) struct Liveness {
+    dir: PathBuf,
+    key: RunKey,
+    /// The held lock; `None` when it could not be taken.
+    lock: Mutex<Option<File>>,
+    /// Set once by [`Self::release`] (a clean quit), under `lock`, so no
+    /// refresh can re-create the lock file after it is deleted.
+    released: AtomicBool,
+}
+
+impl Liveness {
+    fn held(&self) -> std::sync::MutexGuard<'_, Option<File>> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Re-creates and re-takes the lock if its file is gone, then bumps
+    /// the lock file's and the index's modification times. `true` while
+    /// the lock is held. A no-op after [`Self::release`].
+    pub(crate) fn refresh(&self) -> bool {
+        let mut held = self.held();
+        if self.released.load(Ordering::SeqCst) {
+            return false;
+        }
+        let path = lock_path(&self.dir, self.key);
+        if held.is_none() || !path.exists() {
+            if let Some(fresh) = try_lock(&path, true) {
+                *held = Some(fresh);
+            } else {
+                tracing::warn!(key = %self.key, "could not re-create this run's autosave lock");
+            }
+        }
+        let now = SystemTime::now();
+        if let Some(file) = held.as_ref()
+            && let Err(err) = file.set_modified(now)
+        {
+            tracing::debug!(?err, "could not refresh the autosave lock's time");
+        }
+        if let Ok(index) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(index_path(&self.dir, self.key))
+            && let Err(err) = index.set_modified(now)
+        {
+            tracing::debug!(?err, "could not refresh the autosave index's time");
+        }
+        held.is_some()
+    }
+
+    /// Releases the lock for good (a clean quit): no later refresh does
+    /// anything.
+    pub(crate) fn release(&self) {
+        let mut held = self.held();
+        self.released.store(true, Ordering::SeqCst);
+        drop(held.take());
+    }
+}
+
 /// This run's own corner of the autosave directory: its key and the lock
-/// that tells other runs it is alive.
+/// that tells other runs it is alive ([`Liveness`]).
 #[derive(Debug)]
 pub(crate) struct AutosaveNamespace {
     pub(crate) dir: PathBuf,
     pub(crate) key: RunKey,
-    lock: Option<File>,
+    liveness: Arc<Liveness>,
 }
 
 impl AutosaveNamespace {
@@ -783,36 +985,41 @@ impl AutosaveNamespace {
     /// nothing on disk when a crashed run with the same pid left files
     /// (0.171.0 review M1) — and takes its lock (logged, not fatal, if it
     /// cannot: the run then looks crashed to a second Aurora, which is
-    /// the pre-0.171.0 behaviour).
+    /// the pre-0.171.0 behaviour; [`Liveness::refresh`] tries again).
     pub(crate) fn acquire(dir: PathBuf, pid: u32) -> Self {
         let names = dir_names(&dir);
-        for generation in 0..MAX_GENERATIONS {
-            let key = RunKey { pid, generation };
-            if has_files(key, &names) {
-                continue;
-            }
-            let lock = try_lock(&lock_path(&dir, key), true);
-            if lock.is_none() {
-                tracing::warn!(%key, "could not take this run's autosave lock");
-            }
-            return Self { dir, key, lock };
+        let key = (0..MAX_GENERATIONS)
+            .map(|generation| RunKey { pid, generation })
+            .find(|&key| !has_files(key, &names))
+            .unwrap_or_else(|| {
+                tracing::warn!(pid, "every autosave generation of this pid is taken");
+                RunKey {
+                    pid,
+                    generation: MAX_GENERATIONS,
+                }
+            });
+        let lock = try_lock(&lock_path(&dir, key), true);
+        if lock.is_none() {
+            tracing::warn!(%key, "could not take this run's autosave lock");
         }
-        tracing::warn!(pid, "every autosave generation of this pid is taken");
-        let key = RunKey {
-            pid,
-            generation: MAX_GENERATIONS,
-        };
-        Self {
-            dir,
+        let liveness = Arc::new(Liveness {
+            dir: dir.clone(),
             key,
-            lock: None,
-        }
+            lock: Mutex::new(lock),
+            released: AtomicBool::new(false),
+        });
+        Self { dir, key, liveness }
+    }
+
+    /// The run's liveness, for its autosave worker to refresh.
+    pub(crate) fn liveness(&self) -> Arc<Liveness> {
+        Arc::clone(&self.liveness)
     }
 
     /// Whether this run holds its lock.
     #[cfg(test)]
     pub(crate) fn locked(&self) -> bool {
-        self.lock.is_some()
+        self.liveness.held().is_some()
     }
 
     /// Where session `id`'s autosave lives.
@@ -825,15 +1032,62 @@ impl AutosaveNamespace {
         index_path(&self.dir, self.key)
     }
 
-    /// A clean quit's cleanup: every file in this run's namespace and its
-    /// index, then the lock is released and its file removed. Only this
-    /// run's key is touched — never a crashed run's, even one with the
-    /// same pid (it has another generation). Idempotent.
+    /// A clean quit's cleanup: the lock is released for good (so no
+    /// refresh can re-create it), then every file in this run's namespace,
+    /// its index and its lock file are removed. Only this run's key is
+    /// touched — never a crashed run's, even one with the same pid (it
+    /// has another generation). Idempotent.
     pub(crate) fn remove_all(&mut self) {
+        self.liveness.release();
         remove_session_files(&self.dir, self.key);
         remove_quietly(&self.index_path());
-        drop(self.lock.take());
         remove_quietly(&lock_path(&self.dir, self.key));
+    }
+}
+
+/// One index write (0.171.1, L3): its listing is computed under the
+/// autosave worker's state lock ([`IndexBook::prepare`]), its temp file
+/// written and synced outside it ([`write_index_temp`]), and it is
+/// renamed into place back under the lock by [`IndexBook::finish`] only
+/// if no newer write has landed — so a slow fsync never holds the lock,
+/// and an older listing can never overwrite a newer one.
+#[derive(Debug)]
+#[must_use = "a prepared index write must be finished or abandoned"]
+pub(crate) struct IndexWrite {
+    seq: u64,
+    path: PathBuf,
+    listing: AutosaveIndex,
+    /// Files of removed sessions, deleted once this index has landed.
+    then_remove: Vec<PathBuf>,
+}
+
+/// Writes a prepared listing to a synced temp file beside its index —
+/// the slow half of [`IndexWrite`], run outside any lock.
+pub(crate) fn write_index_temp(write: &IndexWrite) -> Option<PathBuf> {
+    let temp = crate::autosave_temp_path(&write.path);
+    let mut file = crate::create_autosave_temp(&temp)?;
+    let written = file
+        .write_all(encode_index(&write.listing).as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = written {
+        tracing::warn!(?err, path = %temp.display(), "failed to write the autosave index");
+        crate::remove_autosave_temp(&temp);
+        return None;
+    }
+    Some(temp)
+}
+
+/// Prepares, writes and finishes one index write on the calling thread —
+/// for a book no other thread shares (tests).
+#[cfg(test)]
+pub(crate) fn apply_index_write(book: &mut IndexBook, write: Option<IndexWrite>) -> bool {
+    match write {
+        None => true,
+        Some(write) => {
+            let temp = write_index_temp(&write);
+            book.finish(write, temp)
+        }
     }
 }
 
@@ -848,7 +1102,14 @@ pub(crate) struct IndexBook {
     order: Vec<IndexEntry>,
     active: Option<u64>,
     complete: BTreeSet<u64>,
-    written: Option<AutosaveIndex>,
+    /// What the index on disk lists, and the write that put it there.
+    renamed: Option<AutosaveIndex>,
+    renamed_seq: u64,
+    next_seq: u64,
+    /// Removed sessions' files, deleted once an index without them lands.
+    pending_remove: Vec<PathBuf>,
+    /// Writes prepared and not yet finished.
+    in_flight: usize,
     writes: usize,
 }
 
@@ -866,7 +1127,11 @@ impl IndexBook {
             order,
             active,
             complete: complete.into_iter().collect(),
-            written: None,
+            renamed: None,
+            renamed_seq: 0,
+            next_seq: 0,
+            pending_remove: Vec::new(),
+            in_flight: 0,
             writes: 0,
         }
     }
@@ -887,35 +1152,103 @@ impl IndexBook {
         AutosaveIndex { active, entries }
     }
 
-    /// Writes the index if its listing changed; `true` when the file on
-    /// disk now matches (or there is still nothing to list).
-    pub(crate) fn sync(&mut self) -> bool {
+    /// The write that brings the index on disk up to [`Self::listing`],
+    /// numbered after every earlier one; `None` when it already matches
+    /// (or there is still nothing to list) and nothing awaits removal.
+    pub(crate) fn prepare(&mut self) -> Option<IndexWrite> {
         let listing = self.listing();
-        if self.written.as_ref() == Some(&listing)
-            || (self.written.is_none() && listing.entries.is_empty())
-        {
-            return true;
+        let current = self.renamed.as_ref() == Some(&listing)
+            || (self.renamed.is_none() && listing.entries.is_empty());
+        if current && self.pending_remove.is_empty() {
+            return None;
         }
-        if write_index(&self.path, &listing) {
-            self.written = Some(listing);
+        self.next_seq += 1;
+        self.in_flight += 1;
+        Some(IndexWrite {
+            seq: self.next_seq,
+            path: self.path.clone(),
+            listing,
+            then_remove: std::mem::take(&mut self.pending_remove),
+        })
+    }
+
+    /// Lands a prepared write's synced temp file (`None`: writing it
+    /// failed): renamed over the index only if no newer write has landed,
+    /// else discarded. `true` when the index on disk is at least as new as
+    /// this write. Removed sessions' files go once their index has landed.
+    pub(crate) fn finish(&mut self, write: IndexWrite, temp: Option<PathBuf>) -> bool {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        let Some(temp) = temp else {
+            self.pending_remove.extend(write.then_remove);
+            return false;
+        };
+        let landed = if write.seq <= self.renamed_seq {
+            crate::remove_autosave_temp(&temp);
+            true
+        } else if let Err(err) = std::fs::rename(&temp, &write.path) {
+            tracing::warn!(?err, path = %write.path.display(), "failed to swap the autosave index into place");
+            crate::remove_autosave_temp(&temp);
+            false
+        } else {
+            self.renamed = Some(write.listing);
+            self.renamed_seq = write.seq;
             self.writes += 1;
             true
+        };
+        if landed {
+            for file in write.then_remove {
+                remove_quietly(&file);
+            }
         } else {
-            false
+            self.pending_remove.extend(write.then_remove);
+        }
+        landed
+    }
+
+    /// The write that catches the index on disk up with the book when no
+    /// other write is in flight (0.171.1 review L-1): after a failed write,
+    /// or after an older write landed last while the newer one failed, the
+    /// disk can lag the book until something else changes; the worker
+    /// calls this after every finish and on its idle timer.
+    pub(crate) fn retry_write(&mut self) -> Option<IndexWrite> {
+        if self.in_flight == 0 {
+            self.prepare()
+        } else {
+            None
         }
     }
 
-    /// Session `id`'s file landed complete; rewrites the index if that
-    /// adds it.
-    pub(crate) fn mark_complete(&mut self, id: u64) -> bool {
-        self.complete.insert(id);
-        self.sync()
+    /// Hands back a prepared write that was never carried out — cancelled,
+    /// refused, or dropped after the last attempt (0.171.1 review R-1):
+    /// it no longer counts as in flight, and the removals it carried wait
+    /// for the next write.
+    pub(crate) fn abandon(&mut self, write: IndexWrite) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.pending_remove.extend(write.then_remove);
     }
 
-    /// Replaces the session set (creation, closing) and the active one.
-    /// Once the index without them has landed, removed sessions' files
-    /// are deleted — never before, so a crash in between still has them.
-    pub(crate) fn set_sessions(&mut self, order: Vec<IndexEntry>, active: Option<u64>) -> bool {
+    /// How many writes are prepared and not yet finished or abandoned.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Session `id`'s file landed complete: the index write that adds it,
+    /// if any.
+    pub(crate) fn mark_complete(&mut self, id: u64) -> Option<IndexWrite> {
+        self.complete.insert(id);
+        self.prepare()
+    }
+
+    /// Replaces the session set (creation, closing) and the active one:
+    /// the index write without the removed sessions, whose files are
+    /// deleted once it has landed — never before, so a crash in between
+    /// still has them.
+    pub(crate) fn set_sessions(
+        &mut self,
+        order: Vec<IndexEntry>,
+        active: Option<u64>,
+    ) -> Option<IndexWrite> {
         let removed: Vec<IndexEntry> = self
             .order
             .iter()
@@ -924,21 +1257,18 @@ impl IndexBook {
             .collect();
         self.order = order;
         self.active = active;
-        let dir = self.path.parent().map(Path::to_path_buf);
+        if let Some(dir) = self.path.parent() {
+            for entry in &removed {
+                let file = dir.join(&entry.file);
+                self.pending_remove
+                    .push(crate::partial_autosave_path(&file));
+                self.pending_remove.push(file);
+            }
+        }
         for entry in &removed {
             self.complete.remove(&entry.id);
         }
-        if !self.sync() {
-            return false;
-        }
-        if let Some(dir) = dir {
-            for entry in removed {
-                let file = dir.join(&entry.file);
-                remove_quietly(&file);
-                remove_quietly(&crate::partial_autosave_path(&file));
-            }
-        }
-        true
+        self.prepare()
     }
 
     /// How many times the index file was written.
@@ -952,7 +1282,45 @@ impl IndexBook {
 mod tests {
     use std::path::Path;
 
+    use super::{IndexWrite, LIVENESS_WINDOW, apply_index_write, claim_sources_at, dir_names};
     use super::{inherited_marker_keys, recovery_keys, retire_namespace, write_marker};
+    use super::{marker_after_quit as after_quit, startup_sources};
+
+    fn sync(book: &mut IndexBook) -> bool {
+        let write = book.prepare();
+        apply_index_write(book, write)
+    }
+
+    fn mark(book: &mut IndexBook, id: u64) -> bool {
+        let write = book.mark_complete(id);
+        apply_index_write(book, write)
+    }
+
+    fn set(book: &mut IndexBook, order: Vec<IndexEntry>, active: Option<u64>) -> bool {
+        let write = book.set_sessions(order, active);
+        apply_index_write(book, write)
+    }
+
+    /// Every name in `dir`, not only Aurora's.
+    fn all_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => assert!(file.set_modified(time).is_ok()),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
 
     use super::{
         AutosaveIndex, AutosaveNamespace, IndexBook, IndexEntry, IndexError, RunKey, claim_sources,
@@ -1353,7 +1721,7 @@ mod tests {
         assert!(write_marker(&path, &encode_marker(&[key(5), key(6)])));
         assert_eq!(read_marker(&path), Some(vec![key(5), key(6)]));
         assert_eq!(
-            super::dir_names(dir.path()),
+            all_names(dir.path()),
             vec!["aurora-session.marker".to_owned()]
         );
         // The rename fails: a non-empty directory sits where it goes.
@@ -1362,8 +1730,7 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert!(!write_marker(&blocked, "aurora-session 1\n5\n"));
-        let mut left = super::dir_names(dir.path());
-        left.sort();
+        let left = all_names(dir.path());
         assert_eq!(
             left,
             vec![
@@ -1394,12 +1761,255 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_that_omits_a_crashed_run_still_recovers_it() {
+        // 0.171.1 (L-c): a failed marker write leaves an older marker
+        // that does not name a run that crashed since; the scan adds it.
+        let dir = tempdir();
+        for pid in [81, 82] {
+            touch(&lock_path(dir.path(), pid));
+            touch(&dir.path().join(session_file_name(pid, 1)));
+        }
+        let keys = recovery_keys(dir.path(), &[key(81)]);
+        assert_eq!(
+            keys,
+            vec![key(81), key(82)],
+            "the marker orders, the scan adds"
+        );
+        let claimed: Vec<RunKey> = claim_sources(dir.path(), key(83), &keys)
+            .iter()
+            .map(|source| source.key)
+            .collect();
+        assert_eq!(claimed, vec![key(81), key(82)]);
+        let plan = plan_recovery(dir.path(), &claimed);
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|candidate| candidate.path == dir.path().join(session_file_name(82, 1)))
+        );
+    }
+
+    #[test]
+    fn a_missing_lock_with_recent_files_is_left_alone_and_old_files_are_recovered() {
+        // 0.171.1 (L-a): a temp cleaner removed a live run's lock file.
+        let dir = tempdir();
+        let file = dir.path().join(session_file_name(91, 1));
+        touch(&file);
+        touch(&index_path(dir.path(), 91));
+        let now = std::time::SystemTime::now();
+        assert!(
+            claim_sources_at(dir.path(), key(92), &[key(91)], now).is_empty(),
+            "recent files: possibly alive"
+        );
+        // Once its files are older than the window, it is a crashed run.
+        let later = now + LIVENESS_WINDOW + std::time::Duration::from_mins(1);
+        assert_eq!(
+            claim_sources_at(dir.path(), key(92), &[key(91)], later).len(),
+            1
+        );
+        let old = now - LIVENESS_WINDOW - std::time::Duration::from_mins(1);
+        set_mtime(&file, old);
+        set_mtime(&index_path(dir.path(), 91), old);
+        assert_eq!(claim_sources(dir.path(), key(92), &[key(91)]).len(), 1);
+    }
+
+    #[test]
+    fn a_far_future_file_time_never_blocks_recovery() {
+        let dir = tempdir();
+        let file = dir.path().join(session_file_name(93, 1));
+        touch(&file);
+        let far = std::time::SystemTime::now() + LIVENESS_WINDOW * 100;
+        set_mtime(&file, far);
+        assert_eq!(claim_sources(dir.path(), key(94), &[key(93)]).len(), 1);
+    }
+
+    #[test]
+    fn a_deleted_lock_is_recreated_by_refresh_and_never_after_release() {
+        let dir = tempdir();
+        let mut ours = AutosaveNamespace::acquire(dir.path().to_path_buf(), 95);
+        let lock = lock_path(dir.path(), 95);
+        assert!(std::fs::remove_file(&lock).is_ok());
+        let liveness = ours.liveness();
+        assert!(liveness.refresh());
+        assert!(lock.exists());
+        assert!(try_lock(&lock, false).is_none(), "held again by this run");
+        // A refresh bumps an index's time too.
+        touch(&ours.index_path());
+        let old = std::time::SystemTime::now() - LIVENESS_WINDOW * 4;
+        set_mtime(&ours.index_path(), old);
+        assert!(liveness.refresh());
+        let index_time = std::fs::metadata(ours.index_path())
+            .and_then(|meta| meta.modified())
+            .ok();
+        assert!(index_time.is_some_and(|time| time > old + LIVENESS_WINDOW));
+        ours.remove_all();
+        assert!(!liveness.refresh());
+        assert!(!lock.exists(), "a released run never re-creates its lock");
+    }
+
+    #[test]
+    fn an_older_index_write_never_overwrites_a_newer_one() {
+        // 0.171.1 (L3): two writes prepared in order, landing out of
+        // order; the index on disk stays at the newer listing.
+        let dir = tempdir();
+        let path = index_path(dir.path(), 5);
+        let mut book = IndexBook::new(path.clone(), vec![entry(5, 1), entry(5, 2)], Some(1), []);
+        let older: Option<IndexWrite> = book.mark_complete(1);
+        let newer: Option<IndexWrite> = book.mark_complete(2);
+        let (Some(older), Some(newer)) = (older, newer) else {
+            unreachable!("both change the listing");
+        };
+        let older_temp = super::write_index_temp(&older);
+        let newer_temp = super::write_index_temp(&newer);
+        assert!(book.finish(newer, newer_temp));
+        assert!(
+            book.finish(older, older_temp),
+            "the disk is at least as new"
+        );
+        assert_eq!(
+            read_index(&path, key(5)).map(|index| index.entries),
+            Ok(vec![entry(5, 1), entry(5, 2)])
+        );
+        assert_eq!(book.writes(), 1);
+        assert_eq!(
+            all_names(dir.path()),
+            vec!["aurora-autosave-5.index".to_owned()]
+        );
+    }
+
+    #[test]
+    fn only_autosave_names_are_read_from_the_directory() {
+        // 0.171.1 (L-b).
+        let dir = tempdir();
+        for name in [
+            "unrelated.txt",
+            "aurora-session.marker",
+            "systemd-private-x",
+            "aurora-autosave-1-1.aur",
+        ] {
+            touch(&dir.path().join(name));
+        }
+        assert_eq!(
+            dir_names(dir.path()),
+            vec!["aurora-autosave-1-1.aur".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_stale_marker_and_a_clean_quit_never_strand_a_run_that_crashes_later() {
+        // 0.171.1 review L-2: B's startup marker write failed, so the old
+        // marker still says [A]. A quits cleanly; then B crashes.
+        let dir = tempdir();
+        let marker = dir.path().join("aurora-session.marker");
+        let mut a = AutosaveNamespace::acquire(dir.path().to_path_buf(), 101);
+        assert!(write_marker(&marker, &encode_marker(&[a.key])));
+        let b = AutosaveNamespace::acquire(dir.path().to_path_buf(), 102);
+        touch(&b.session_path(1));
+        touch(&b.index_path());
+        // A's clean quit: its namespace goes, and the marker it leaves
+        // keeps B, which the stale marker never named.
+        a.remove_all();
+        let remaining = after_quit(dir.path(), a.key, &read_marker(&marker).unwrap_or_default());
+        assert_eq!(remaining, vec![b.key]);
+        // B crashes: its lock is released, its files stay.
+        drop(b);
+        let found = startup_sources(dir.path(), key(103), Some(&remaining));
+        assert_eq!(
+            found.claimed.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec![key(102)]
+        );
+        assert!(found.had_previous_marker);
+        // Its claim holds B's lock; release it for the next start.
+        drop(found);
+        // And even with no marker at all, the scan still finds B, and the
+        // start is a crash recovery.
+        let found = startup_sources(dir.path(), key(103), None);
+        assert_eq!(
+            found.claimed.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec![key(102)]
+        );
+        assert!(found.had_previous_marker);
+    }
+
+    #[test]
+    fn with_no_marker_a_clean_start_is_not_a_crash() {
+        let dir = tempdir();
+        assert!(!startup_sources(dir.path(), key(111), None).had_previous_marker);
+        // A live second Aurora with files is not a crash either.
+        let live = AutosaveNamespace::acquire(dir.path().to_path_buf(), 112);
+        touch(&live.session_path(1));
+        let found = startup_sources(dir.path(), key(113), None);
+        assert!(found.claimed.is_empty());
+        assert!(!found.had_previous_marker);
+        drop(live);
+    }
+
+    #[test]
+    fn an_index_left_behind_by_a_failed_write_is_retried() {
+        // 0.171.1 review L-1: W1 in flight, W2's write fails, W1 lands —
+        // the disk lags the book until a retry brings it up to date.
+        let dir = tempdir();
+        let path = index_path(dir.path(), 5);
+        let mut book = IndexBook::new(path.clone(), vec![entry(5, 1), entry(5, 2)], Some(1), []);
+        let (Some(first), Some(second)) = (book.mark_complete(1), book.mark_complete(2)) else {
+            unreachable!("both change the listing");
+        };
+        let first_temp = super::write_index_temp(&first);
+        assert!(book.retry_write().is_none(), "writes are still in flight");
+        assert!(!book.finish(second, None), "the newer write failed");
+        assert!(book.finish(first, first_temp));
+        assert_eq!(
+            read_index(&path, key(5)).map(|index| index.entries.len()),
+            Ok(1),
+            "the disk lags the book"
+        );
+        let retry = book.retry_write();
+        assert!(retry.is_some());
+        assert!(apply_index_write(&mut book, retry));
+        assert_eq!(read_index(&path, key(5)), Ok(book.listing()));
+        assert!(book.retry_write().is_none(), "caught up");
+    }
+
+    #[test]
+    fn a_gone_run_with_only_index_temps_is_retired_without_a_dialog() {
+        // 0.171.1 review R-2.
+        let dir = tempdir();
+        // One with an unheld lock and a fresh stray temp, one without a
+        // lock whose stray temp is old.
+        touch(&lock_path(dir.path(), 121));
+        let fresh = dir.path().join("aurora-autosave-121.index.121.0.00ff.tmp");
+        touch(&fresh);
+        let old = dir.path().join("aurora-autosave-122.index.122.0.00ff.tmp");
+        touch(&old);
+        set_mtime(&old, std::time::SystemTime::now() - LIVENESS_WINDOW * 2);
+        let found = startup_sources(dir.path(), key(123), None);
+        assert!(found.claimed.is_empty());
+        assert!(
+            !found.had_previous_marker,
+            "nothing to recover, so no dialog"
+        );
+        drop(found);
+        assert!(!fresh.exists() && !old.exists());
+        assert!(!lock_path(dir.path(), 121).exists());
+        // A run with a real session file beside its stray temp is a source.
+        touch(&lock_path(dir.path(), 124));
+        touch(&dir.path().join("aurora-autosave-124.index.124.0.00ff.tmp"));
+        touch(&dir.path().join(session_file_name(124, 1)));
+        assert_eq!(startup_sources(dir.path(), key(123), None).claimed.len(), 1);
+    }
+
+    #[test]
     fn a_live_runs_lock_keeps_its_files_out_of_recovery() {
         let dir = tempdir();
         let live = AutosaveNamespace::acquire(dir.path().to_path_buf(), 77);
         assert!(live.locked());
         // A crashed run leaves its lock file, but no process holds it.
         touch(&lock_path(dir.path(), 66));
+        touch(&dir.path().join(session_file_name(66, 1)));
+        // One that never made a lock, its files long untouched. (A gone
+        // run with nothing to recover is retired, not a source: review R-2.)
+        let file = dir.path().join(session_file_name(55, 1));
+        touch(&file);
+        set_mtime(&file, std::time::SystemTime::now() - LIVENESS_WINDOW * 2);
         let claimed = claim_sources(dir.path(), key(99), &[key(77), key(66), key(55), key(99)]);
         let sources: Vec<RunKey> = claimed.iter().map(|source| source.key).collect();
         // 77 is alive; 66 is unlocked; 55 never made a lock; 99 is us.
@@ -1478,7 +2088,14 @@ mod tests {
             marker_after_quit(dir.path(), own, &[own, key(30), key(31), key(33)]),
             vec![key(30), key(31)]
         );
-        assert!(marker_after_quit(dir.path(), own, &[own, key(33)]).is_empty());
+        // A run the marker does not name but that has files is kept too
+        // (0.171.1 review L-2); with nothing left anywhere, nothing is.
+        assert_eq!(
+            marker_after_quit(dir.path(), own, &[own, key(33)]),
+            vec![key(30)]
+        );
+        let empty = tempdir();
+        assert!(marker_after_quit(empty.path(), own, &[own, key(33)]).is_empty());
     }
 
     #[test]
@@ -1486,15 +2103,15 @@ mod tests {
         let dir = tempdir();
         let path = index_path(dir.path(), 5);
         let mut book = IndexBook::new(path.clone(), vec![entry(5, 1)], Some(1), []);
-        assert!(book.sync());
+        assert!(sync(&mut book));
         assert_eq!(read_index(&path, key(5)), Err(IndexError::Missing));
-        assert!(book.mark_complete(1));
+        assert!(mark(&mut book, 1));
         assert_eq!(book.writes(), 1);
         // A second landing of the same session changes nothing.
-        assert!(book.mark_complete(1));
+        assert!(mark(&mut book, 1));
         assert_eq!(book.writes(), 1);
         // A new session is not listed until its file lands.
-        assert!(book.set_sessions(vec![entry(5, 1), entry(5, 2)], Some(2)));
+        assert!(set(&mut book, vec![entry(5, 1), entry(5, 2)], Some(2)));
         assert_eq!(book.writes(), 1);
         assert_eq!(
             read_index(&path, key(5)),
@@ -1503,7 +2120,7 @@ mod tests {
                 entries: vec![entry(5, 1)],
             })
         );
-        assert!(book.mark_complete(2));
+        assert!(mark(&mut book, 2));
         assert_eq!(
             read_index(&path, key(5)),
             Ok(AutosaveIndex {
@@ -1514,7 +2131,7 @@ mod tests {
         // Closing session 1 drops it from the index, then its file.
         let one = dir.path().join(session_file_name(5, 1));
         touch(&one);
-        assert!(book.set_sessions(vec![entry(5, 2)], Some(2)));
+        assert!(set(&mut book, vec![entry(5, 2)], Some(2)));
         assert!(!one.exists());
         assert_eq!(
             read_index(&path, key(5)).map(|index| index.entries),

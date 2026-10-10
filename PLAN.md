@@ -26,7 +26,139 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.171.0): per-session crash-recovery autosave
+**Latest (2026-10-10, 0.171.1): autosave hardening before R3 (patch).**
+Closes the four follow-ups the 0.171.0 judge listed as due before
+multiple documents arrive. **L-c, a stale marker is trusted**: recovery
+now always adds every run key the directory scan finds with an index or
+session files to the marker's keys (`autosave_files::recovery_keys`); the
+marker orders recovery but is no longer the only source of truth. Since
+the review revision (L-2) the scan also runs when there is **no marker
+at all** (a gone run it finds is a crash to recover; a live one is not),
+and a clean quit's marker keeps every other run the scan finds with files
+(`marker_after_quit`), so neither a stale marker (a failed marker write)
+nor a missing one (another run's clean quit) can hide a crashed run. The
+1024-key cap and the files-first priority are kept.
+**L-a, a temp cleaner can delete a live run's lock**: the lock is now a
+shared `autosave_files::Liveness`, refreshed by the autosave worker after
+every landing and every 30 minutes on its idle timer
+(`LIVENESS_REFRESH`), which bumps the lock file's and the index's
+modification times and re-creates and re-takes a lock file that has gone
+(`systemd-tmpfiles` removes `/tmp` files untouched for 10 days by default,
+so a refreshed lock is never cleaned for age). A clean quit releases it
+for good first, so no refresh can re-create it after deletion. A run
+whose lock file is missing but whose index or session files were modified
+within `LIVENESS_WINDOW` (2 hours, four refresh intervals) is treated as
+possibly alive and left alone; a crashed run's files stop being touched,
+so it is recovered once they age past the window, and a modification
+time far in the future counts as old, so nothing can block recovery
+forever. **L3, the index fsync ran under the worker's state lock**: an
+index write is now prepared under the lock (`IndexBook::prepare`, which
+numbers it), its temp file written and synced outside it
+(`write_index_temp`), and renamed back under the lock by
+`IndexBook::finish` only if no newer write has landed, so a UI-thread
+submit never waits on that fsync and an older listing can never overwrite
+a newer one; a write prepared before a clean quit cannot land after it.
+**L-b, every temp-dir name was copied several times per startup**:
+`dir_names` keeps only names starting with `aurora-autosave` while
+reading. (The directory is still read once per step, about five times at
+startup; with the filter that copies only Aurora's own names.)
+
+Tests (8 new in the first pass, 12 with the review revision): `autosave_files::tests::{a_marker_that_omits_a_crashed_run_still_recovers_it,
+a_missing_lock_with_recent_files_is_left_alone_and_old_files_are_recovered,
+a_far_future_file_time_never_blocks_recovery,
+a_deleted_lock_is_recreated_by_refresh_and_never_after_release,
+an_older_index_write_never_overwrites_a_newer_one,
+only_autosave_names_are_read_from_the_directory}`;
+`background_autosave::tests::{the_worker_refreshes_liveness_on_landing_and_on_a_timer,
+concurrent_landings_and_set_changes_leave_the_newest_listing}`. Changed:
+the `IndexBook` test drives prepare/finish through a helper; two tests read
+the whole directory themselves now that `dir_names` filters; the zeroed-marker
+end-to-end test gives its crashed run the lock file a real crash leaves.
+
+| Mutation | Result |
+|---|---|
+| T1 scan keys no longer added to a non-empty marker (L-c) | killed (1) |
+| T2 missing lock always treated as dead (L-a) | killed (1) |
+| T3 refresh never re-creates a missing lock (L-a) | killed (2) |
+| T4 a far-future file time counts as recent (L-a) | killed (1) |
+| T5 no refresh on the idle timer (L-a) | killed (1) |
+| T6 no refresh on a landing (L-a) | killed (1) |
+| T7 no sequence check when an index write lands (L3) | killed (1: the deterministic out-of-order test; the concurrent test checks the end state and did not catch it) |
+| T8 `dir_names` unfiltered (L-b) | killed (1) |
+| T9 a released liveness still refreshes (L-a) | killed (1) |
+
+**Review revision (0.171.1, judge REVISE 0.897).** **L-2 (required,
+fixed)**: the clean-quit marker was rebuilt from the marker alone, so if
+B's startup marker write failed (old marker `[A]`), A's clean quit
+deleted the marker and B's later crash was never looked for. Now
+`marker_after_quit` adds the directory scan's keys with data, the clean
+quit runs it even when the marker is missing, and startup
+(`autosave_files::startup_sources`) scans even with no marker; the crash
+dialog shows when a marker names a gone run, the marker is legacy, or —
+with no marker — the scan found a gone run with files. **L-1 (fixed)**:
+an index left behind its book (a failed write, or an older write
+landing last) is retried at once, up to 3 times, when no other write is
+in flight (`IndexBook::retry_write`), then on the idle timer. **L-3
+(fixed)**: no index temp file is started once the worker is cancelled,
+so a thread detached at exit cannot leave one. **L-4 (disclosed)**: on
+Windows `Liveness::refresh` opens the index while a `MoveFileEx` may be
+replacing it (the open or the rename can then fail; both are logged and
+retried later, but this is untested), and a filesystem where `try_lock`
+is unsupported makes every run look alive forever (its files would never
+be adopted, so never lost, but never recovered either). Tests added (4):
+`autosave_files::tests::{a_stale_marker_and_a_clean_quit_never_strand_a_run_that_crashes_later,
+with_no_marker_a_clean_start_is_not_a_crash,
+an_index_left_behind_by_a_failed_write_is_retried}`,
+`background_autosave::tests::no_index_temp_is_started_after_shutdown`;
+changed: `the_marker_after_a_quit_keeps_only_runs_that_still_have_files`
+and the clean-quit session test now expect the scan-found run to be kept.
+
+| Revision mutation | Result |
+|---|---|
+| U1 clean-quit marker without the scan (L-2) | killed (3) |
+| U2 no scan when there is no marker (L-2) | killed (1) |
+| U3 no retry of a lagging index (L-1) | killed (1) |
+| U4 no cancel check before an index temp (L-3) | killed (1) |
+
+**Review revision 2 (0.171.1, judge REVISE 0.888).** **R-1 (fixed)**:
+the L-1 retry leaked its in-flight count. Each attempt ended by
+preparing a retry, so after three failures in a row the last prepared
+write was dropped unexecuted (as were writes dropped on the cancelled
+and refused paths). `in_flight` then never returned to zero, every later
+retry returned nothing, and that write's pending removals were lost. Now
+no retry is prepared on the last attempt, and every unexecuted write goes
+back through `IndexBook::abandon` (decrements `in_flight`, keeps its
+removals); `IndexWrite` is `#[must_use]`. **R-2 (fixed)**: a gone run
+whose only files are index temps (a thread detached at exit) is retired
+silently in `claim_sources` and is not a source, so it can no longer show
+a crash dialog that recovers nothing. Tests added (2):
+`background_autosave::tests::three_failed_index_writes_still_leave_the_next_retry_free_to_land`
+(three failed renames, then a retry lands the index, runs the carried
+removal, and leaves nothing in flight; a refused write is abandoned too)
+and `autosave_files::tests::a_gone_run_with_only_index_temps_is_retired_without_a_dialog`;
+changed: `no_index_temp_is_started_after_shutdown` also asserts nothing is
+left in flight, and `a_live_runs_lock_keeps_its_files_out_of_recovery`
+gives its gone runs real session files (a gone run with nothing to
+recover is no longer a source).
+
+| Revision-2 mutation | Result |
+|---|---|
+| V1 a retry prepared and dropped on the last attempt (R-1) | killed (1) |
+| V2 the cancelled path drops its write (R-1) | killed (1) |
+| V3 the refused path drops its write (R-1) | killed (1) |
+| V4 a temp-only gone run is still a source (R-2) | killed (1) |
+
+Stress: the 104 autosave, recovery, marker, shutdown and startup tests, 20
+runs under 12 `yes` processes: 20/20 passed, slowest 2.11 s. Gate (one
+pass after the last code change, after review revision 2, RTX 3090,
+`AURORA_REQUIRE_GPU=1`): 3,219 passed, 0 failed, 61 ignored; fmt, layering, hardcoded-style,
+`check --locked`, clippy, rustdoc, `cargo deny` and contrast green. Not
+verified: a real temp cleaner, suspend (the idle timer's monotonic clock
+may not advance while suspended, so a lock deleted during a long suspend
+could be judged by stale file times right after resume), Windows lock
+re-creation and `set_modified`, a real crash on real hardware.
+
+**Previously (2026-10-10, 0.171.0): per-session crash-recovery autosave
 plus an index (document tabs, round R2 of six — still one document).**
 Each document session now autosaves to its own file,
 `aurora-autosave-<pid>-<docid>.aur`, in the same temp directory as
@@ -31509,9 +31641,8 @@ file another process has open, deleting an open lock file — std opens
 with `FILE_SHARE_DELETE`, but untested here) and Windows/macOS `try_lock`
 behaviour; `aurora-app` cannot be cross-checked for Windows here (no
 mingw). Known weaknesses: the index is written under the worker's state
-lock, so a UI-thread submit can wait out one small fsync (review L3,
-left for before R3: compute the listing under the lock and write it
-outside with a sequence check); damaged files are deleted when their
+lock, so a UI-thread submit can wait out one small fsync (review L3 —
+closed in 0.171.1); damaged files are deleted when their
 run is retired; R2 recovers one document per start, so a crashed run
 with several documents needs several starts until R3 opens them all.
 
