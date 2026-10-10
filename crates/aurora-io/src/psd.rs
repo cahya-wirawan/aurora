@@ -101,9 +101,10 @@
 //!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
 //!   one of those that a file actually uses is named in the report.
-//! - Writing (0.176.0) is a separate, library-only module, [`write`](mod@write):
-//!   flat documents (root-level pixel layers) as 16-bit RGB PSD, not yet
-//!   reachable from the app. Groups, masks, Curves and PSB are refused.
+//! - Writing (0.176.0) is a separate module, [`write`](mod@write): 16-bit
+//!   RGB PSD, reachable from the app's Save As (0.177.0); pixel layers,
+//!   groups and user masks on layers and groups (0.178.0). Curves and
+//!   PSB are refused.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -127,9 +128,9 @@ pub mod write;
 mod write_tests;
 
 pub use write::{
-    PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation, PsdExpectedLayer,
-    PsdFormat, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_blend_key,
-    psd_save_preflight, verify_psd_file, write_psd,
+    PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
+    PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal,
+    PsdWriteOutcome, PsdWriteReport, psd_blend_key, psd_save_preflight, verify_psd_file, write_psd,
 };
 
 /// The largest canvas side a version-1 PSD file may declare.

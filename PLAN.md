@@ -26,7 +26,47 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.177.0): Save As Photoshop from the app, safely
+**Latest (2026-10-10, 0.178.0): groups and layer masks in the PSD
+writer (PSD write, round R3 of six).** Save As `.psd` now works for
+documents with groups and masks; nothing new was needed in the app.
+`aurora_io::write_psd` walks the whole tree (`file_order`, shared with
+the verifier): each group is written as a bottom bounding divider
+(`lsct` type 3 alone, named `</Layer group>` — `PSD_GROUP_END_NAME` —
+empty rectangle, four 2-byte channels), its children bottom-to-top
+recursively, then the folder record (`lsct` type 1, open — Aurora's tree
+has no collapsed state and open/closed is UI-only — plus `8BIM` and the
+group's own blend key, also in the record) carrying name, opacity, fill,
+blend and visibility. Groups are written with their own mode (`norm` for
+Normal), never `pass`: Aurora's groups are isolated and the reader maps
+`pass` to Normal with a Pass Through note at open, so a re-save writes
+what Aurora shows and that loss was already reported. Nesting is capped
+at the reader's `MAX_GROUP_DEPTH` (255) — deeper is refused,
+`PsdSaveRefusal::GroupsTooDeep` — and dividers count toward the 32,767
+record limit ("a group takes two"). A layer's or group's
+`LayerMask` is written as a user mask: 20 bytes of mask data — the
+rectangle (its document-space `bounds`, the reader's frame), default
+colour, flags (bit 1 disabled, bit 4 parameters), then either the
+parameter block (presence bit 0 + the user density as a `u8`, only below
+full density) or two padding bytes — and a `-2` channel at the
+rectangle's size, `u16`, streamed by tile bands from the mask surface
+exactly like the colour channels (`PlaneSource::Mask`; an absent tile is
+unpainted coverage 1.0). Aurora's coverage outside a mask's bounds is
+0.0 (`apply_mask`), so the default colour is 0; an `inverted` mask is
+baked (`1 - c`, default 255) with flags bit 2 clear. A density that is
+not a multiple of 1/255 is rounded and itemised ("1 layer mask density
+will be rounded to Photoshop's 255 steps."). Both verifier passes check
+the new records (raw: record kinds, `lsct` bytes, mask data, exact `u16`
+mask hash; reader: tree shape, folder props, mask enabled/density/
+bounds/decoded coverage). The group and mask preflight refusals are
+gone; Curves (R4) and PSB (R5) are still refused. Not supported and
+disclosed: mask feather (Aurora has none, nothing to write); vector
+masks (converted to pixel masks at open, written as pixel masks);
+Photoshop's Pass Through (see above). Checked with psd-tools 1.17.4, not
+with Photoshop. Measured: 3,349 tests pass, 0 failed (63 ignored),
+`AURORA_REQUIRE_GPU=1` on the RTX 3090. See the 0.178.0 addendum under
+"Next action".
+
+**Previously (2026-10-10, 0.177.0): Save As Photoshop from the app, safely
 (PSD write, round R2 of six).** Save As routes a `.psd` name to
 `App::save_psd_file` (a `.psb` is refused, "PSB isn't supported yet",
 until R5; `export_file` no longer sees either), and the save picker now
@@ -122,7 +162,7 @@ pending temp file, refusals through "Couldn't Save File", and the sRGB
 ICC profile resource (1039; done in 0.177.0) — moved here from R4 by the 0.176.0 review,
 because invariant §7.3.6 (every buffer carries its colour space) means
 no PSD may be written untagged once saving is user-reachable; R3
-(0.178.0) groups (`lsct` divider/folder pairs, `norm`, never `pass`) and
+(0.178.0, done) groups (`lsct` divider/folder pairs, `norm`, never `pass`) and
 masks; R4 (0.179.0) Curves (`curv`), losses carried from open, and
 clean-state rules; R5 (0.180.0) PSB and a banded,
 streamed composite; R6 (optional, 0.181.0) ZIP with prediction and a
@@ -31933,6 +31973,123 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.178.0) — groups and layer masks in the PSD
+writer (PSD write R3).**
+
+Design notes. *Mask frame:* the PSD rectangle is the mask's own
+`LayerMask::bounds`, in document coordinates — the frame the reader reads
+it in (`attach_mask`: "in document coordinates, like the layer's own";
+flags bit 0 is never set); the `-2` samples are read from the mask
+surface addressed from that bounds origin (`aurora_doc::mask`'s
+addressing convention). *Default colour:* Aurora's coverage outside a
+mask's bounds is 0.0 (`aurora-app` `apply_mask`; unpainted texels inside
+are 1.0), so it is written `0`; an inverted mask is baked (`1 - c`, an
+unpainted texel `0`) with default `255` and flags bit 2 clear. Read
+back, a `255` default makes the reader use the layer's region (its
+extent ∪ canvas, or the canvas for a group) as the bounds, so the
+effective coverage matches wherever the layer has pixels, not beyond —
+tested, and disclosed. *Group blend:* the group's own mode in both the
+record and `lsct` (`norm` for Normal), never `pass`. *Collapse state:*
+always `lsct` type 1 (open); Aurora has no collapse state and Photoshop
+treats it as UI-only. The divider's `lsct` is the type alone (4 bytes),
+as the test writer writes it (psd-tools reads a 4-byte `lsct` as a type with no blend key; whether Photoshop writes 4 or 12 bytes there is not checked).
+
+Changed: `crates/aurora-io/src/psd/write.rs` (groups, masks, census
+preflight, `file_order`, `PlaneSource`, `PsdRecordKind`,
+`PsdExpectedMask`, `PSD_GROUP_END_NAME`, `PsdSaveRefusal::GroupsTooDeep`
+replacing `GroupsNotYetSupported`/`MasksNotYetSupported`, both verifier
+passes; `write_records`/`write_all_channels`/`raw_record`/`raw_mask`/
+`reader_mask` split out), `psd/write_tests.rs`, `psd.rs` and `lib.rs`
+(exports, module doc), `crates/aurora-app/src/psd_save_tests.rs` (end to
+end test; the refusal test now uses a Curves layer),
+`scripts/verify_psd_write.py` (group/mask pass), CLAUDE.md, README.md,
+version 0.178.0.
+
+Tests (AC-1): `nested_groups_round_trip_order_and_membership`,
+`group_divider_precedes_children_folder_follows`,
+`group_blend_and_props_round_trip`, `mask_bounds_and_default_round_trip`,
+`mask_outside_bounds_round_trips`, `inverted_mask_baked_and_flag_clear`,
+`mask_density_parameter_round_trips`, `mask_density_rounding_itemised`,
+`disabled_mask_round_trips`, `group_mask_round_trips`,
+`record_count_limit_counts_dividers`, `group_depth_limit_respected`,
+`unpainted_mask_tiles_write_full_coverage` (added after the absent-tile
+mutation survived), and in `aurora-app`
+`save_as_psd_round_trips_nested_groups_and_a_masked_layer` (nested
+groups and a masked layer through `begin_psd_save` → reopen: same tree,
+group props, exact layer pixels, mask bounds and coverage);
+`preflight_refuses_curves_and_oversize_but_not_groups_or_masks` (renamed).
+The ignored `write_psd_group_fixtures_for_psd_tools` writes the psd-tools
+fixture.
+
+psd-tools 1.17.4 (`AURORA_PSD_FIXTURE_DIR=… cargo test -p aurora-io --lib
+fixtures_for_psd_tools -- --ignored`, then `python3
+scripts/verify_psd_write.py …`), after the last code change: `OK: psd-tools
+1.17.4 read 3 layers and the merged image; largest pixel difference
+0.001/65535` and `OK: psd-tools read 2 groups, 5 layers and 2 masks (tree,
+props, bbox, flags, density, exact samples); largest pixel difference
+0.000/65535` — membership and order, blend key (record and `lsct`),
+opacity, fill, visibility of every group and layer; each mask's bbox,
+default colour, disabled flag, invert flag clear, parameters flag and
+user density; and every `u16` of the `-2` channel exactly.
+
+Mutations (each run with `AURORA_REQUIRE_GPU=1` over `aurora-io`'s
+`psd::write` tests and `aurora-app`'s `psd_save` tests, `write.rs`
+restored from a scratchpad copy and its sha256 checked after each):
+
+| Mutation | Result |
+|---|---|
+| divider and folder swapped | killed (6: five `aurora-io` + the app end to end) |
+| children written top-to-bottom inside a group | killed (nested groups + app) |
+| group written as `pass` in `lsct` | killed (3) |
+| mask rect in the mask-local frame | killed (7) |
+| inverted flag set instead of baked (default 0, bit 2) | killed (2) |
+| density parameter block omitted | killed (3) |
+| disabled bit ignored | killed (1) |
+| `default_color` wrong (inverted sense) | killed (7) |
+| dividers not counted in the record limit | killed (1) |
+| an absent (never-painted) mask tile written as 0 | **survived** first run; killed after `unpainted_mask_tiles_write_full_coverage` was added |
+| group depth limit one too lax | killed (1) |
+
+Gate, one pass after the last code change (RTX 3090): fmt, layering,
+style, `check --locked`, clippy `-D warnings` clean;
+`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,349 passed,
+0 failed, 63 ignored, no `SKIPPED`; `cargo doc` with `-D warnings`
+clean; `cargo deny check all` ok; contrast check passes; cross-clippy
+`-p aurora-io -p aurora-app --all-targets -D warnings` for
+`x86_64-pc-windows-gnu` and `x86_64-apple-darwin` (stub `LCMS2_LIB_DIR`)
+clean.
+
+**Not verified:** Photoshop itself — whether it opens these groups and
+masks as written (the `Lr16`/negative-count question from R1 stands);
+a human saving such a document from the running app; mask feather
+(Aurora has none; a PSD feather was already reported at open);
+Photoshop's group Pass Through (Aurora groups are isolated; a PSD opened
+with one was reported as converted at open, and that carried loss covers
+its re-saves); vector masks (converted to pixel masks at open, written as
+pixel masks). Known limits: the reader pass cannot compare the decoded
+coverage of an inverted mask whose rectangle extends past the layer's
+region (it is cropped on read; the raw pass still checks every sample);
+an inverted mask reopens with its bounds widened to the layer's region;
+mask rows too wide for a `u16` RLE row count (about 32,000 px) fail the
+write as "too large" exactly like layer rows.
+
+**Judge review (0.178.0, PASS 0.91): Photoshop-compatibility notes,
+disclosed but not fixed.**
+- **Nesting depth (L-1).** Photoshop limits group nesting to about 10
+  levels (from memory, not checked against the spec). Aurora writes up to
+  255 without warning, so a deeper file may not open in Photoshop with its
+  layers intact. Candidate fix: a report item for nesting deeper than 10.
+- **Group record flags (L-2).** Group records leave flags 0x18 ("pixel
+  data irrelevant") clear. Photoshop sets them. The spec doesn't require
+  it and psd-tools accepts the files.
+- **Wide mask rows (L-5).** A mask row wider than about 32.5k px hits the
+  PSD u16 row-count limit and refuses the save safely ("RLE row"), as
+  layer rows already do.
+- **Verifier order check (L-4).** The verifier's reader pass rebuilds
+  record order with the writer's own `file_order`, so it can't catch an
+  ordering bug by itself. The order mutations, the app end-to-end test and
+  psd-tools do catch one.
 
 **Addendum 2026-10-10 (0.177.0) — Save As Photoshop (PSD write R2).**
 

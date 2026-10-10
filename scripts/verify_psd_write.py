@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Checks a PSD written by Aurora's PSD writer with psd-tools, an
-independent reader (0.176.0, PSD write round R1).
+independent reader (0.176.0, PSD write round R1; groups and masks
+0.178.0, R3).
 
 Not part of the CI gate: it needs `psd-tools` and `numpy`
 (`pip install psd-tools`). Write the fixture first, then check it:
 
     mkdir -p /tmp/psdw
     AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
-        write_psd_fixtures_for_psd_tools -- --ignored
+        fixtures_for_psd_tools -- --ignored
     python3 scripts/verify_psd_write.py /tmp/psdw
 
 The Rust test writes `fixture.psd` and `fixture.json` (what the file
@@ -15,6 +16,13 @@ should hold: canvas, layers bottom-to-top with name, blend key, opacity,
 fill, visibility, position and every expected 16-bit sample, and the
 white-matted merged image). This script asserts each of them, pixels
 within 1/65535. Exit status 0 means every check passed.
+
+Since 0.178.0 a second fixture, `groups.psd` / `groups.json`, holds
+nested groups and user masks on a layer and a group: the tree (every
+group's membership and order, its blend key, opacity, fill and
+visibility), each mask's bounding box, default colour, disabled flag,
+user-mask density, and every `u16` mask sample read from the `-2`
+channel's own decompressed data — exactly, not within a tolerance.
 """
 
 import json
@@ -133,5 +141,84 @@ def main():
     )
 
 
+def check_mask(tag, layer, want):
+    if want is None:
+        if layer.mask is not None and layer.mask.width > 0:
+            fail(f"{tag}: a mask that was not written")
+        return
+    mask = layer.mask
+    if mask is None:
+        fail(f"{tag}: no mask")
+    check(f"{tag} mask bbox", tuple(mask.bbox), tuple(want["bbox"]))
+    check(f"{tag} mask default colour", mask.background_color, want["default"])
+    check(f"{tag} mask disabled", bool(mask.disabled), want["disabled"])
+    check(f"{tag} mask invert flag", bool(mask.flags.invert_mask), False)
+    check(f"{tag} mask parameters flag", bool(mask.flags.parameters_applied), want["density"] is not None)
+    density = None
+    if mask.parameters is not None:
+        density = mask.parameters.user_mask_density
+    check(f"{tag} mask density", density, want["density"])
+    left, top, right, bottom = want["bbox"]
+    width, height = right - left, bottom - top
+    channels = dict(
+        (int(info.id), data)
+        for info, data in zip(layer._record.channel_info, layer._channels)
+    )
+    raw = channels[-2].get_data(width, height, 16, 1)
+    got = np.frombuffer(raw, dtype=">u2").reshape(height, width)
+    want_data = np.asarray(want["data"], dtype=np.uint16)
+    if not np.array_equal(got, want_data):
+        diff = int(np.max(np.abs(got.astype(np.int64) - want_data)))
+        fail(f"{tag} mask samples differ by up to {diff}/65535")
+
+
+def check_nodes(path, layers, nodes, counts):
+    check(f"{path} member count", len(layers), len(nodes))
+    for layer, want in zip(layers, nodes):
+        tag = f"{path}/{want['name']}"
+        check(f"{tag} name", layer.name, want["name"])
+        check(f"{tag} blend", layer.blend_mode.value, want["blend"].encode("ascii"))
+        check(f"{tag} opacity", layer.opacity, want["opacity"])
+        fill = layer.tagged_blocks.get_data(Tag.BLEND_FILL_OPACITY)
+        check(f"{tag} fill", fill, want["fill"])
+        check(f"{tag} visible", layer.visible, want["visible"])
+        check_mask(tag, layer, want["mask"])
+        if want["kind"] == "group":
+            check(f"{tag} kind", layer.kind, "group")
+            divider = layer._record.tagged_blocks.get_data(Tag.SECTION_DIVIDER_SETTING)
+            check(f"{tag} lsct blend", divider.blend_mode.value, want["blend"].encode("ascii"))
+            counts["groups"] += 1
+            check_nodes(tag, list(layer), want["children"], counts)
+        else:
+            check(f"{tag} kind", layer.kind, "pixel")
+            check(f"{tag} left", layer.left, want["left"])
+            check(f"{tag} top", layer.top, want["top"])
+            check(f"{tag} size", (layer.width, layer.height), (want["width"], want["height"]))
+            counts["worst"] = max(counts["worst"], check_pixels(f"{tag} pixels", layer.numpy(), want))
+            counts["layers"] += 1
+        if want["mask"] is not None:
+            counts["masks"] += 1
+
+
+def check_groups(folder):
+    spec_path = folder / "groups.json"
+    if not spec_path.exists():
+        print("no groups.json: the group and mask pass was skipped")
+        return
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "groups.psd")
+    check("groups width", psd.width, spec["width"])
+    check("groups height", psd.height, spec["height"])
+    check("groups depth", psd.depth, 16)
+    counts = {"groups": 0, "layers": 0, "masks": 0, "worst": 0.0}
+    check_nodes("", list(psd), spec["tree"], counts)
+    print(
+        f"OK: psd-tools read {counts['groups']} groups, {counts['layers']} layers and "
+        f"{counts['masks']} masks (tree, props, bbox, flags, density, exact samples); "
+        f"largest pixel difference {counts['worst'] * 65535.0:.3f}/65535"
+    )
+
+
 if __name__ == "__main__":
     main()
+    check_groups(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
