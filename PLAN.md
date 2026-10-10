@@ -26,7 +26,21 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.165.0): the right rail collapses to a narrow
+**Latest (2026-10-10, 0.165.1): a second CI test race fixed.** GitHub
+Actions' Ubuntu run failed in
+`store::insert_encoded_tests::an_inserted_tile_reads_from_pending_before_its_write_lands`
+(`left: Some(524296)`, `right: Some(19842)`). Cause: the test asserted
+that `TileStore::snapshot_len_bound` returns the pending write's exact
+length, but the store's writer thread can land that write — and the
+preceding `snapshot_tile` reconcile it — between the two calls, after
+which the bound is the conservative `codec::MAX_ENCODED_LEN`. Both are
+correct: the autosave budget only needs an upper bound. The test now
+asserts `len <= bound <= MAX_ENCODED_LEN`, as its sibling
+`snapshot_tile_copies_without_paging_in_or_evicting` already did. Run 40
+times under 12 competing CPU-bound processes: 40/40 green. Test-only; no
+product code changed. Branch `002-fix_insert_encoded_test_race`.
+
+**Previously (2026-10-10, 0.165.0): the right rail collapses to a narrow
 label strip.** Design-owner decision (Cahya, 2026-10-10): short text
 labels until an icon set is chosen. A new `aurora_ui::panel_strip`
 module and `Workspace::panel_strip`: a vertical `Role::Toolbar` labelled
