@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-10-10**.
+Last updated: **2026-10-11**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -26,7 +26,152 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.180.0): layer effects, round E1 — descriptor
+**Latest (2026-10-11, 0.181.0): layer effects, round E2 — Fill applied
+everywhere, and Color Overlay drawn.** **Fill** (`iOpa`, "fill opacity"),
+stored since 0.144.0 but never composited, is now applied wherever a
+layer's content is composited: `aurora-app`'s `content_opacity` (opacity ×
+Fill) is what `resolve_tile` hands both the CPU fold and the GPU fast path
+for a pixel layer, what an isolated group's composited content is laid down
+at, and what a Curves adjustment (CPU and GPU pass) uses. Semantics:
+Photoshop's Fill fades the pixels a layer paints and not its effects, while
+Opacity fades both, so without drawn effects the two multiply exactly —
+which is why the GPU path needs no refusal for Fill (it is handed `opacity ×
+fill`, the identical scalar the CPU fold uses; a GPU-required differential
+test pins agreement and a dispatch counter proves the GPU ran). **Group
+Fill decision:** on an isolated (non-Pass-Through) group, Fill fades the
+group's composited content exactly like its opacity (psd-tools'
+`Compositor.apply` multiplies its `shape_const` into the group the same
+way; effects on groups are not drawn yet, so nothing distinguishes the two
+there). **Pass Through group Fill stays reported, not applied**: psd-tools
+treats a Pass Through group with Fill < 100 % specially (it isolates
+adjustments inside it and falls back from pass-through compositing), which
+is not reproduced. **Color Overlay (`SoFi`)** is drawn on the CPU by a new
+`fold_layer_with_effects`, entered from `fold_layer_into` for a visible
+pixel layer with a shown overlay (`layer_renders_effects`). Per texel, with
+backdrop `B`, content colour `C`, shape `s` = content alpha × mask, opacity
+`L`, Fill `F`, layer mode `Ml` and each shown overlay's colour `O`,
+opacity `o`, mode `Mo` (any of the 27, `Dissolve` through `dissolve_gate`):
+`Y = composite(B, C @ F, Ml)`; `X = composite(Y, O @ o, Mo)` for each
+overlay bottom to top in file order; `result = B + (X − B)·s·L`
+(premultiplied). So Fill never fades the overlay (the Fill-0 trick: at
+Fill 0 the overlay still shows at the content's shape), Opacity fades the
+layer and its effects as one, and the overlay blends against
+backdrop-plus-faded-content in its own mode, not through the layer's mode
+("Blend Interior Effects as Group" off, Photoshop's default; `infx` is E6).
+Without overlays the three steps reduce mathematically (not bitwise: `Y`
+is rounded to `f16`) to the plain composite at `s·L·F`, since every
+non-`Dissolve` mode's composite is affine in its source alpha; a layer
+without a shown overlay never takes this path, so the rounding never
+reaches it.
+psd-tools 1.17.4's `_apply_color_overlay` agrees on Fill, opacity and mode
+but folds the overlay as a second source over the composite; the two
+differ only where `s·L` is fractional (anti-aliased edges, opacity < 100 %),
+where psd-tools lets content colour show through a 100 % Normal overlay and
+raises alpha above the shape. Aurora's form matched `layer_effects.psd`
+slightly better (mean 10.99/9.19/10.47 levels against 11.02/9.26/10.51 for
+the psd-tools form). **Multiple overlays** (`lmfx` `solidFillMulti`) fold
+bottom to top in list order — psd-tools' order; not verified against a
+Photoshop file with two overlays (none in the corpus). **GPU refusal is
+live** but narrow: a visible root layer that *draws* an effect (a shown
+colour overlay) sends the document to the CPU; a layer whose shown effects
+are all still undrawn (shadows, strokes, glows, the rest) keeps the GPU
+path, since both paths draw the same pixels for it, and keeps the plain CPU
+fold too, so the two stay bit-comparable. On PSD open a pixel layer's
+colour overlays are no longer reported as not shown; a group's still are
+(E9), and every other kind is still reported. PSD save still lists effects
+as not saved. Nothing is baked: overlays are computed at composite time
+from the stored settings.
+
+**0.181.0 addendum: accuracy, gate and mutations.** Corpus files with a
+colour overlay or Fill < 100 % (and a merged image), CPU composite through
+the real open path against the file's merged image, 8-bit levels, max over
+channels / per-channel mean, before (0.180.0) and after:
+
+| File | Before | After | Why it changed |
+|---|---|---|---|
+| advanced-blending.psd | 255 / 95.81, 90.41, 86.53 | 255 / 93.87, 91.46, 89.36 | Fill 28/255 on a shape with a colour overlay (now drawn); blend-if/knockout and clipping still not applied |
+| effects/shape-fx2.psd | 255 / 56.29, 63.67, 69.87 | 255 / 57.82, 63.18, 69.87 | Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet |
+| effects/stroke-composite.psd | 255 / 43.94, 47.46, 22.82 | 255 / 52.68, 53.56, 26.10 | overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's |
+| effects/stroke-effect-transparent-shape.psd | 255 / 220.34, 52.00, 220.34 | 153 / 34.66, 52.00, 34.66 | Fill 0 hides the shape's pixels; its stroke is not drawn yet |
+| layer_effects.psd | 191 / 109.21, 106.14, 108.66 | 168 / 10.99, 9.19, 10.47 | two colour overlays now drawn; shadows, glows, bevels, strokes still not |
+| masks.psd | 161 / 1.36, 1.32, 1.32 | 65 / 1.19, 1.15, 1.14 | Fill 0 'divider' shape no longer drawn |
+| masks.psb | 161 / 1.28, 1.28, 1.29 | 59 / 1.11, 1.11, 1.11 | Fill 0 'divider' shape no longer drawn |
+| opacity-fill.psd | 56 / 0.00, 56.00, 56.00 | 0 / 0.00, 0.00, 0.00 | Fill 171/255: now an exact match |
+| transparency/clip-opacity.psd | 81 / 20.70, 19.69, 19.70 | 1 / 0.11, 0.12, 0.12 | Fill 128/255 applied: within one level |
+| transparency/fill-opacity.psd | 204 / 18.22, 6.35, 16.77 | 204 / 18.22, 21.36, 10.93 | Fill 0 text hidden; its other effect is not drawn yet |
+| blend-and-clipping.psd | 255 / 2.60, 2.60, 2.60 | 255 / 2.60, 2.60, 2.60 | no real merged image (Maximize Compatibility off, stored blank white); clipping not applied |
+| effects/effects-enabled.psd | 0 / 0.00, 0.00, 0.00 | 49 / 0.00, 9.00, 49.00 | no real merged image (stored blank white): Aurora (255, 246, 206) at (16, 16) vs psd-tools' composite (254, 245, 206) |
+
+`effects_corpus_files_composite_like_photoshops_merged_image` pins the
+after column. The existing pins (`curves_rgb.psd`, the other Curves files,
+the nine Pass Through files) are unchanged — none has Fill < 100 % on a
+layer the change touches (the two Pass Through files with group Fill keep
+it reported and unapplied). **Nyepi** (`AURORA_EFFECTS_PSD`, ignored test
+`a_local_effects_psd_against_its_merged_image`, release): globally max 105,
+mean 2.653/2.674/2.687, **identical before and after**; inside the union
+of the nine overlay layers' painted bounding boxes (2,038,176 px) max 105,
+mean 2.699/2.720/2.733, also identical. That is the right answer, not a
+missed path: all nine overlays are `Lighten` at 100 % with colour (111, 30,
+33) over grey vector-smart-object content (159–193 per channel), so
+`max(content, overlay)` is the content in every channel, and Photoshop's
+merged image agrees. The Nyepi residual is the 38 undrawn drop shadows
+(E3) and unclipped clipping layers.
+
+**Review revision (judge pass at 0.90, three small fixes).** FX-1:
+colour overlays on a clipped layer (clipping is still not supported, so the
+layer is shown unclipped) are still drawn, and the open report now says so
+specifically — "N colour overlays on clipped layers are drawn unclipped,
+over the layer's whole shape, because Aurora doesn't have clipping masks
+yet." (`Note::ClippedOverlaysUnclipped`). Option (b), not (a): suppressing
+them would need either editing the stored effects (which E7 must write back
+intact) or a new per-layer flag (persistent state for a transient import
+decision); there is no existing per-layer place to carry it, and a flag
+lost at the first `.aur` save would change the picture on reopen.
+`stroke-composite.psd` is therefore unchanged (its pin stands). Test
+`overlays_on_clipped_layers_are_reported_as_drawn_unclipped`; mutation M11
+(the report branch removed) killed by it. FX-2: the `Dissolve`-with-Fill
+difference is disclosed, not changed — the plain path dithers on
+`s·L·F`, the effects path fades the content by `F` and dithers `s·L`; a
+`Dissolve` layer with a colour overlay is rare and neither form has been
+compared with Photoshop. FX-3: "every mode's composite is affine" now
+reads "every non-`Dissolve` mode", and the reduction is stated as
+mathematical, not bitwise (`Y` is rounded to `f16`; a layer without a
+shown overlay never takes this path).
+
+Gate, one pass after the last code change (RTX 3090, `/home` 41G free
+before): `cargo fmt --check`, layering, no-hardcoded-style, `cargo check
+--locked`, workspace clippy `-D warnings`, and `AURORA_REQUIRE_GPU=1 cargo
+test --workspace --no-fail-fast` — **3,406 passed, 0 failed, 66 ignored**
+after the review revision (3,405 before it; 17 new in all; the new ignored
+one is the Nyepi measurement); `cargo doc
+--document-private-items` with `-D warnings` clean; `cargo deny check all`
+ok; `check_contrast.py` passes; cross-clippy (`aurora-app --all-targets`)
+for `x86_64-pc-windows-gnu` and `x86_64-apple-darwin` clean. Tested
+headlessly and on a real GPU only; no overlay has been compared with
+Photoshop by a human.
+
+Twelve mutations (M11, the clipped-overlay report, from the review revision), each backed up, applied, run under `AURORA_REQUIRE_GPU=1`
+(RTX 3090), restored and sha256-checked against the backup — all killed
+(M1b survived its first run: no test had Fill < 1 under a translucent
+overlay; `fill_fades_content_under_a_translucent_overlay` was added and
+kills it):
+
+| Mutation | Killed by |
+|---|---|
+| Fill ignored (`content_opacity` returns opacity) | `fill_scales_content_alpha_not_opacity`, `fill_and_opacity_multiply_without_effects`, `isolated_group_fill_fades_its_content_like_opacity`, `adjustment_fill_multiplies_its_opacity`, the GPU differential, the corpus pin, `color_overlay_survives_fill_zero` |
+| Fill ignored in the effects path only (CPU) | `fill_fades_content_under_a_translucent_overlay` |
+| Fill ignored on the GPU only (raw opacity after `resolve_tile`) | `recomposite_visible_tiles_gpu_and_cpu_agree_with_fill_below_one` (and the Dissolve differential) |
+| Fill applied to the overlay | `color_overlay_survives_fill_zero`, `color_overlay_respects_layer_mask_and_opacity` |
+| overlay ignores its blend mode | `color_overlay_multiply_half_opacity_hand_golden` |
+| overlay ignores its opacity | `color_overlay_multiply_half_opacity_hand_golden`, `multiple_overlays_apply_in_order` |
+| overlay not clipped to shape | `color_overlay_normal_100_replaces_colour_keeps_alpha`, `…_survives_fill_zero`, `…_respects_layer_mask_and_opacity`, the corpus pin |
+| overlay order reversed | `multiple_overlays_apply_in_order` |
+| GPU refusal for overlays removed | `a_layer_with_rendered_effects_refuses_the_gpu_fast_path` |
+| GPU refused for unrendered-only effects | `a_layer_with_only_unrendered_effects_keeps_the_gpu_path`, the E1 predicate test, the GPU differential |
+| pixel-layer overlays still reported on open | `colour_overlays_are_reported_only_on_groups`, `per_kind_effect_notes_on_open` |
+| clipped-layer overlay report removed (M11) | `overlays_on_clipped_layers_are_reported_as_drawn_unclipped` |
+
+**Previously (2026-10-10, 0.180.0): layer effects, round E1 — descriptor
 parser, model and storage; no visual change.** The effects plan (planner,
 2026-10-10) is ten rounds: **E1** parser/model/storage (this one), **E2**
 Fill applied everywhere plus Color Overlay (all 27 modes; the GPU refusal is
@@ -125,7 +270,7 @@ clean. Sixteen mutations, each backed up, applied, run under
 | `set_effects` adjustment guard removed | `set_effects_undo_redo_and_journal_replay` |
 | newer entry version accepted | `a_newer_effects_entry_version_refuses_loudly` |
 
-**Previously (2026-10-10, 0.179.0): real Pass Through groups (design-owner
+**Earlier (2026-10-10, 0.179.0): real Pass Through groups (design-owner
 choice, Cahya).** `aurora_doc::BlendMode::PassThrough` is appended (last,
 ordinal 27, so every older `.aur` decodes unchanged; `BlendMode::ALL` is
 28 long) and valid on a group only: `LayerTree::set_blend_mode` refuses it

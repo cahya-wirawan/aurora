@@ -13058,137 +13058,26 @@ fn resolve_tile(
     if !admit_composite_node(id, layers, depth, budget) {
         return None;
     }
-    let opacity = layers.opacity(id)?;
+    // Opacity times Fill (0.181.0, [`content_opacity`]): for a pixel
+    // layer Fill fades its own pixels, and without effects the two simply
+    // multiply; for an isolated group Fill fades the group's content the
+    // same way.
+    let opacity = content_opacity(layers, id)?;
     let raw_blend_mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
     let blend_mode = translate_blend_mode(raw_blend_mode);
     match layers.kind(id)? {
         aurora_doc::LayerKind::Pixel { .. } => {
-            let surface = layers.surface_id(id)?;
-            let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
-            let texels = if origin == reference_origin {
-                // **Nothing was ever stored here, so there is nothing to
-                // composite** (0.87.0). `TileStore::get` *materializes* an
-                // untouched tile -- allocates it, makes it resident,
-                // promotes it in the LRU and (residency being capped) can
-                // evict a real tile to make room, paying a synchronous
-                // encode and scratch-disk write -- purely to hand back
-                // zeros. `contains_tile` answers the same question in
-                // three hash lookups, and this is exactly the guard
-                // `read_layer_window` (the windowed sibling below) already
-                // applies to each of its up-to-four source tiles.
-                //
-                // Returning `None` is **bit-identical** to the
-                // `Some(`all-zero texels`)` it replaces:
-                // `aurora_render::composite_layer_into` derives
-                // `as = src_a * opacity`, which is `0.0` at every texel of
-                // a blank tile, and the fold then reduces to
-                // `Co = Cb` and `result_a = dst_a` -- the destination
-                // untouched.
-                //
-                // That holds for a mode whose blend function returns a
-                // *finite* value, which is the precondition, not "for
-                // every mode unconditionally" (0.87.0's own wording; see
-                // this function's doc comment for the correction). Every
-                // mode satisfies it as of 0.87.1; three did not before,
-                // because `0.0 * NaN` is NaN rather than `0.0` and
-                // `aurora_render`'s `clip_color` could return NaN.
-                //
-                // The mask and `Dissolve` tails below are
-                // skipped for the same reason: masking can only *reduce*
-                // an already-zero alpha, and `dissolve_gate` weights each
-                // texel's gate by `texel_alpha * opacity`, so it too
-                // yields a fully transparent buffer.
-                //
-                // **"Never stored" is not "transparent."** The two look
-                // the same in the texels and are different facts, and only
-                // the first one is safe to skip. A tile that was painted
-                // and then erased to `(0, 0, 0, 0)` has
-                // `contains_tile == true` -- the check consults
-                // `resident`/`pending`/`paged_out`, never tile content --
-                // so it still takes the full path below, which is what
-                // keeps this from quietly changing the meaning of an
-                // eraser stroke. See
-                // `resolve_tile_still_resolves_a_tile_written_to_full_transparency`.
-                if !store.contains_tile(surface, tile_id) {
-                    return None;
-                }
-                match store.get(surface, tile_id) {
-                    Ok(tile) => tile.texels().to_vec(),
-                    Err(err) => {
-                        // Recorded, not just logged: the live canvas is
-                        // content to skip this layer and repaint, but the
-                        // export path must be able to tell that it did.
-                        // See `CompositeBudget::note_store_error`.
-                        budget.note_store_error(&err);
-                        // Gated like both bound warnings above, and for a
-                        // reason 0.52.2 made concrete: a tile whose
-                        // page-in fails now fails on *every* touch rather
-                        // than healing into a blank one, so an ungated
-                        // warning here is one log line per layer per tile
-                        // per frame for as long as the scratch file stays
-                        // broken. The count still reaches the caller
-                        // exactly (`note_store_error`), which is what the
-                        // export refusal is built on -- only the logging
-                        // is rate-limited.
-                        if budget.should_report() {
-                            tracing::warn!(
-                                ?err,
-                                ?tile_id,
-                                "skipping layer for this composite tile"
-                            );
-                        }
-                        return None;
-                    }
-                }
-            } else {
-                let window = read_layer_window(
-                    store,
-                    surface,
-                    origin,
-                    doc_origin,
-                    budget,
-                    WindowKind::LayerPixels,
-                );
-                // The windowed half of the same-origin guard above, and
-                // the same bit-identical reasoning: a window with nothing
-                // stored under any of the up-to-four source tiles it
-                // overlaps contributes no texel to this composite, so skip
-                // it rather than materializing the all-zero buffer
-                // `into_texels` would.
-                //
-                // [`LayerWindow::is_blank`], deliberately, and **not**
-                // `texels.is_none()` alone: the latter is also true when
-                // every overlapping source tile existed but *failed to
-                // read*, which must keep going down the ordinary path so
-                // `read_layer_window`'s own error charging
-                // (`CompositeBudget::note_store_error`, which the export
-                // refusal is built on) is not quietly dropped. `is_blank`
-                // is "blank *and known to be*" -- nothing stored and
-                // nothing unread.
-                if window.is_blank() {
-                    return None;
-                }
-                window.into_texels()
-            };
-            // Masking runs first, ahead of `Dissolve` below: it
-            // restricts which pixels are even in play, and by how much,
-            // before any blend mode acts on what's left. See
-            // `resolve_tile`'s own doc comment for the full ordering
-            // rationale and `apply_mask`'s own doc comment for how
-            // `mask.bounds` and real per-pixel coverage combine.
-            let texels = match layers.mask(id) {
-                Some(mask) if mask.enabled => apply_mask(
-                    &texels,
-                    mask,
-                    layers.mask_surface_id(id),
-                    store,
-                    doc_origin,
-                    budget,
-                ),
-                _ => texels,
-            };
+            let texels = pixel_layer_texels(
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                budget,
+            )?;
             // `Dissolve` is intercepted here, ahead of the translated
             // `blend_mode` below, rather than as a real
             // `aurora_render::BlendMode` variant -- see `dissolve_gate`'s
@@ -13307,6 +13196,351 @@ fn resolve_tile(
     }
 }
 
+/// A pixel layer's own texels on composite tile `tile_id` (0.181.0, out
+/// of [`resolve_tile`]): straight RGBA, read from the layer's surface
+/// (same-origin or windowed) and multiplied by its enabled mask. Alpha is
+/// the layer's *shape* — content alpha times mask coverage — with no
+/// opacity or Fill applied; [`resolve_tile`] and
+/// [`fold_layer_with_effects`] apply those. `None` when nothing was ever
+/// stored under the tile (bit-identical to a transparent buffer, see the
+/// comments below) or the read failed (charged to `budget`).
+fn pixel_layer_texels(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+) -> Option<Vec<half::f16>> {
+    let surface = layers.surface_id(id)?;
+    let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+    let texels = if origin == reference_origin {
+        // **Nothing was ever stored here, so there is nothing to
+        // composite** (0.87.0). `TileStore::get` *materializes* an
+        // untouched tile -- allocates it, makes it resident,
+        // promotes it in the LRU and (residency being capped) can
+        // evict a real tile to make room, paying a synchronous
+        // encode and scratch-disk write -- purely to hand back
+        // zeros. `contains_tile` answers the same question in
+        // three hash lookups, and this is exactly the guard
+        // `read_layer_window` (the windowed sibling below) already
+        // applies to each of its up-to-four source tiles.
+        //
+        // Returning `None` is **bit-identical** to the
+        // `Some(`all-zero texels`)` it replaces:
+        // `aurora_render::composite_layer_into` derives
+        // `as = src_a * opacity`, which is `0.0` at every texel of
+        // a blank tile, and the fold then reduces to
+        // `Co = Cb` and `result_a = dst_a` -- the destination
+        // untouched.
+        //
+        // That holds for a mode whose blend function returns a
+        // *finite* value, which is the precondition, not "for
+        // every mode unconditionally" (0.87.0's own wording; see
+        // this function's doc comment for the correction). Every
+        // mode satisfies it as of 0.87.1; three did not before,
+        // because `0.0 * NaN` is NaN rather than `0.0` and
+        // `aurora_render`'s `clip_color` could return NaN.
+        //
+        // The mask and `Dissolve` tails below are
+        // skipped for the same reason: masking can only *reduce*
+        // an already-zero alpha, and `dissolve_gate` weights each
+        // texel's gate by `texel_alpha * opacity`, so it too
+        // yields a fully transparent buffer.
+        //
+        // **"Never stored" is not "transparent."** The two look
+        // the same in the texels and are different facts, and only
+        // the first one is safe to skip. A tile that was painted
+        // and then erased to `(0, 0, 0, 0)` has
+        // `contains_tile == true` -- the check consults
+        // `resident`/`pending`/`paged_out`, never tile content --
+        // so it still takes the full path below, which is what
+        // keeps this from quietly changing the meaning of an
+        // eraser stroke. See
+        // `resolve_tile_still_resolves_a_tile_written_to_full_transparency`.
+        if !store.contains_tile(surface, tile_id) {
+            return None;
+        }
+        match store.get(surface, tile_id) {
+            Ok(tile) => tile.texels().to_vec(),
+            Err(err) => {
+                // Recorded, not just logged: the live canvas is
+                // content to skip this layer and repaint, but the
+                // export path must be able to tell that it did.
+                // See `CompositeBudget::note_store_error`.
+                budget.note_store_error(&err);
+                // Gated like both bound warnings above, and for a
+                // reason 0.52.2 made concrete: a tile whose
+                // page-in fails now fails on *every* touch rather
+                // than healing into a blank one, so an ungated
+                // warning here is one log line per layer per tile
+                // per frame for as long as the scratch file stays
+                // broken. The count still reaches the caller
+                // exactly (`note_store_error`), which is what the
+                // export refusal is built on -- only the logging
+                // is rate-limited.
+                if budget.should_report() {
+                    tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                }
+                return None;
+            }
+        }
+    } else {
+        let window = read_layer_window(
+            store,
+            surface,
+            origin,
+            doc_origin,
+            budget,
+            WindowKind::LayerPixels,
+        );
+        // The windowed half of the same-origin guard above, and
+        // the same bit-identical reasoning: a window with nothing
+        // stored under any of the up-to-four source tiles it
+        // overlaps contributes no texel to this composite, so skip
+        // it rather than materializing the all-zero buffer
+        // `into_texels` would.
+        //
+        // [`LayerWindow::is_blank`], deliberately, and **not**
+        // `texels.is_none()` alone: the latter is also true when
+        // every overlapping source tile existed but *failed to
+        // read*, which must keep going down the ordinary path so
+        // `read_layer_window`'s own error charging
+        // (`CompositeBudget::note_store_error`, which the export
+        // refusal is built on) is not quietly dropped. `is_blank`
+        // is "blank *and known to be*" -- nothing stored and
+        // nothing unread.
+        if window.is_blank() {
+            return None;
+        }
+        window.into_texels()
+    };
+    // Masking runs first, ahead of `Dissolve` below: it
+    // restricts which pixels are even in play, and by how much,
+    // before any blend mode acts on what's left. See
+    // `resolve_tile`'s own doc comment for the full ordering
+    // rationale and `apply_mask`'s own doc comment for how
+    // `mask.bounds` and real per-pixel coverage combine.
+    Some(match layers.mask(id) {
+        Some(mask) if mask.enabled => apply_mask(
+            &texels,
+            mask,
+            layers.mask_surface_id(id),
+            store,
+            doc_origin,
+            budget,
+        ),
+        _ => texels,
+    })
+}
+
+/// A layer's opacity times its Fill (0.181.0): the factor its own content
+/// is composited at. Photoshop's Fill ("fill opacity", `iOpa`) fades the
+/// pixels a layer paints and not its effects, while Opacity fades both, so
+/// without effects the two simply multiply. Used for pixel layers, isolated
+/// groups (where Fill fades the group's composited content exactly like
+/// opacity, as psd-tools' `Compositor.apply` does with its `shape_const`)
+/// and adjustment layers (psd-tools' `_apply_adjustment` multiplies Fill in
+/// the same way). Not for a Pass Through group, whose Fill is still
+/// reported rather than applied (see [`fold_pass_through_group`]).
+#[must_use]
+fn content_opacity(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> Option<f32> {
+    let opacity = layers.opacity(id)?;
+    Some(opacity * layers.fill_opacity(id).unwrap_or(1.0))
+}
+
+/// Whether `id` has an effect this round actually draws (0.181.0): a
+/// pixel layer with a shown colour overlay. What refuses the GPU fast path
+/// ([`document_qualifies_for_gpu_compositing`]); a layer whose only shown
+/// effects are not drawn yet (shadows, strokes, glows, the rest) keeps the
+/// GPU path, since both paths draw exactly the same pixels for it.
+#[must_use]
+fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+        && layers
+            .effects(id)
+            .is_some_and(|fx| fx.shown_color_overlays() > 0)
+}
+
+/// Folds a pixel layer that draws layer effects into `accumulator`
+/// (0.181.0). Only colour overlays are drawn so far (shadows, strokes and
+/// glows are stored and reported, not drawn). Per texel, with backdrop
+/// `B` (the accumulator), the layer's content colour `C` and *shape*
+/// `s` — content alpha times mask coverage ([`pixel_layer_texels`]) — its
+/// opacity `L`, Fill `F` and blend mode `Ml`, and each shown overlay's
+/// colour `O`, opacity `o` and mode `Mo`:
+///
+/// 1. the *interior* starts from the backdrop and takes the content at
+///    full shape and alpha `F` in the layer's mode:
+///    `Y = composite(B, C @ F, Ml)`;
+/// 2. each shown overlay, bottom to top in the order the file lists them
+///    (`SoFi`, or `lmfx`'s `solidFillMulti`), folds over it at alpha `o`
+///    in its own mode (any of the 27, `Dissolve` through
+///    [`dissolve_gate`]): `X = composite(Y, O @ o, Mo)`;
+/// 3. the layer is laid down at its shape times opacity, in premultiplied
+///    space: `result = B + (X - B) * s * L` (a `Dissolve` layer gates
+///    `s * L` through [`dissolve_gate`] instead).
+///
+/// Sources. **Fill fades the content and not the overlay** — Adobe: "Fill
+/// opacity affects pixels painted in a layer or shapes drawn on a layer
+/// without affecting the opacity of layer effects" — so at Fill 0 an
+/// overlay still shows at the content's shape (the Fill-0 trick).
+/// **Opacity fades the layer and its effects together**, which is step 3.
+/// The overlay blends against the backdrop-plus-faded-content, so a
+/// Multiply overlay at Fill 0 multiplies what is below the layer, and not
+/// through the layer's own mode: Photoshop's default with "Blend Interior
+/// Effects as Group" (`infx`) off, Adobe's description of that option
+/// being that it applies the layer's blend mode to interior effects such
+/// as Color Overlay. psd-tools 1.17.4's `Compositor._apply_color_overlay`
+/// agrees on all three (`_apply_source(color, shape * shape_e, alpha *
+/// shape_e * opacity, effect.blend_mode)`, its `alpha` carrying layer
+/// opacity and no Fill), but folds the overlay as a second source *over*
+/// the composite; the two agree wherever `s * L` is `0` or `1` and differ
+/// on anti-aliased edges and at layer opacity below 100 %, where
+/// psd-tools lets the content's own colour show through a 100 % Normal
+/// overlay and raises alpha above the shape. Step 3 does not, which is
+/// what Photoshop shows; the corpus fit is in PLAN.md's 0.181.0
+/// addendum. Without overlays the three steps reduce mathematically (not
+/// bitwise: `Y` is rounded to `f16` before step 3) to the plain composite
+/// at `s * L * F`, every non-`Dissolve` mode's composite being affine in
+/// its source alpha. The layer never reaches this path without a shown
+/// overlay ([`layer_renders_effects`]), so that rounding never touches a
+/// layer without drawn effects.
+///
+/// **Known difference, `Dissolve` layer with Fill below 100 %**
+/// (disclosed, review of 0.181.0): the plain path ([`resolve_tile`])
+/// dithers the content on `s * L * F`, while here the content is faded
+/// smoothly by `F` inside the interior and only the final coverage
+/// `s * L` is dithered. Neither has been compared with Photoshop; a
+/// `Dissolve` layer that also carries a colour overlay is rare.
+///
+/// Effects are computed here, at composite time, from the stored settings
+/// — never baked into the layer's pixels. `infx` is not modelled (E6).
+#[allow(clippy::too_many_arguments)]
+fn fold_layer_with_effects(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !admit_composite_node(id, layers, depth, budget) {
+        return false;
+    }
+    let (Some(opacity), Some(fill), Some(fx)) = (
+        layers.opacity(id),
+        layers.fill_opacity(id),
+        layers.effects(id),
+    ) else {
+        return false;
+    };
+    let Some(shape) = pixel_layer_texels(
+        id,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        budget,
+    ) else {
+        return false;
+    };
+    let raw_blend_mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    let one = half::f16::from_f32(1.0);
+    // Step 1: the content at full shape, alpha `F`, in the layer's mode
+    // (`Dissolve` gates the final coverage instead, step 3).
+    let mut interior = accumulator.to_vec();
+    let mut source = shape.clone();
+    for texel in source.chunks_exact_mut(aurora_tile::CHANNELS) {
+        if let Some(alpha) = texel.get_mut(3) {
+            *alpha = one;
+        }
+    }
+    let content_mode = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+        aurora_doc::BlendMode::Normal
+    } else {
+        raw_blend_mode
+    };
+    fold_texels_in_mode(&mut interior, &source, fill, content_mode, doc_origin);
+    // Step 2: each shown overlay, bottom to top.
+    for overlay in fx.color_overlays.iter().filter(|o| fx.shows(o.gate)) {
+        let colour =
+            [overlay.color.r, overlay.color.g, overlay.color.b, 1.0].map(half::f16::from_f32);
+        for texel in source.chunks_exact_mut(aurora_tile::CHANNELS) {
+            for (channel, value) in texel.iter_mut().zip(colour) {
+                *channel = value;
+            }
+        }
+        fold_texels_in_mode(
+            &mut interior,
+            &source,
+            overlay.opacity,
+            aurora_doc::BlendMode::from(overlay.blend_mode),
+            doc_origin,
+        );
+    }
+    // Step 3: lay the interior down at shape × opacity.
+    let coverage = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+        dissolve_gate(&shape, opacity, doc_origin)
+    } else {
+        shape
+    };
+    let scale = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+        1.0
+    } else {
+        opacity.clamp(0.0, 1.0)
+    };
+    for ((out, inside), cover) in accumulator
+        .chunks_exact_mut(aurora_tile::CHANNELS)
+        .zip(interior.chunks_exact(aurora_tile::CHANNELS))
+        .zip(coverage.chunks_exact(aurora_tile::CHANNELS))
+    {
+        let t = (cover.get(3).map_or(0.0, |a| a.to_f32()) * scale).clamp(0.0, 1.0);
+        if t <= 0.0 {
+            continue;
+        }
+        for (channel, &x) in out.iter_mut().zip(inside) {
+            let b = channel.to_f32();
+            *channel = half::f16::from_f32((x.to_f32() - b).mul_add(t, b));
+        }
+    }
+    true
+}
+
+/// Folds straight-alpha `texels` into `accumulator` at `opacity` in
+/// `mode`, `Dissolve` through [`dissolve_gate`] as [`resolve_tile`] does.
+fn fold_texels_in_mode(
+    accumulator: &mut [half::f16],
+    texels: &[half::f16],
+    opacity: f32,
+    mode: aurora_doc::BlendMode,
+    doc_origin: (i64, i64),
+) {
+    if mode == aurora_doc::BlendMode::Dissolve {
+        let gated = dissolve_gate(texels, opacity, doc_origin);
+        aurora_render::composite_layer_into(
+            accumulator,
+            &gated,
+            1.0,
+            aurora_render::BlendMode::Normal,
+        );
+    } else {
+        aurora_render::composite_layer_into(
+            accumulator,
+            texels,
+            opacity,
+            translate_blend_mode(mode),
+        );
+    }
+}
+
 /// Folds one layer into a premultiplied accumulator (0.155.0): an
 /// adjustment layer through [`apply_adjustment_layer`], which transforms
 /// what is already in `accumulator`; anything else exactly as before,
@@ -13331,6 +13565,24 @@ fn fold_layer_into(
         && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
     {
         return fold_pass_through_group(
+            accumulator,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
+    // A pixel layer drawing layer effects (0.181.0): only a shown colour
+    // overlay draws yet. A layer whose shown effects are all undrawn
+    // (`layer_shows_effects` without `layer_renders_effects`) keeps the
+    // plain path below, so it stays bit-identical to the GPU path, which
+    // it keeps too (`document_qualifies_for_gpu_compositing`).
+    if layer_renders_effects(layers, id) {
+        return fold_layer_with_effects(
             accumulator,
             id,
             layers,
@@ -13382,8 +13634,11 @@ fn fold_layer_into(
 /// in straight colour). With opacity `1` and no enabled mask the
 /// backdrop is not copied at all and the result is `C` exactly.
 ///
-/// The group's **Fill** opacity is not applied, like every other layer's
-/// in Aurora today (the PSD reader reports it for a pass-through group).
+/// The group's **Fill** opacity is still not applied (the PSD reader
+/// reports it), though every other layer's is since 0.181.0
+/// ([`content_opacity`]): psd-tools treats a Pass Through group with Fill
+/// below 100 % specially (it isolates adjustments inside it and falls back
+/// from pass-through compositing), and that is not reproduced here yet.
 /// `Dissolve` cannot occur: the group's mode *is* Pass Through.
 ///
 /// Returns whether anything changed the accumulator, the same contract
@@ -13536,9 +13791,8 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
 /// Inside a Pass Through group (0.179.0) the accumulator is the one below
 /// the group, so the adjustment reaches layers below the group too
 /// ([`fold_pass_through_group`]); inside any other group it is that
-/// group's isolated accumulator. Known difference from Photoshop,
-/// disclosed: fill opacity is not applied, matching how pixel layers
-/// composite today.
+/// group's isolated accumulator. Fill multiplies opacity (0.181.0,
+/// [`content_opacity`]), as psd-tools' `_apply_adjustment` does.
 #[allow(clippy::too_many_arguments)]
 fn apply_adjustment_layer(
     accumulator: &mut [half::f16],
@@ -13555,7 +13809,7 @@ fn apply_adjustment_layer(
     let Some(aurora_doc::Adjustment::Curves(params)) = layers.adjustment(id) else {
         return false;
     };
-    let Some(opacity) = layers.opacity(id) else {
+    let Some(opacity) = content_opacity(layers, id) else {
         return false;
     };
     let raw_blend_mode = layers
@@ -14653,21 +14907,26 @@ fn composite_roots_into_tile(
 #[must_use]
 fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> bool {
     layers.roots().iter().all(|&id| {
-        // 0.180.0: `layer_shows_effects` is deliberately *not* asked here
-        // yet. No path draws effects before E2, so refusing the GPU for a
-        // document with effects would only make it slower for no visual
-        // change; E2 wires the refusal in, alongside the CPU rendering.
+        // 0.181.0: a visible layer with an effect the CPU path draws
+        // (a colour overlay, `layer_renders_effects`) refuses the GPU, which
+        // has no effects pass yet (E8). A layer whose shown effects are all
+        // still undrawn (shadows, strokes, glows) keeps the GPU path: both
+        // paths draw the same pixels for it, so refusing would only be
+        // slower. Fill needs no refusal: `resolve_tile` hands the GPU path
+        // `opacity * fill`, which is exact for a layer without drawn
+        // effects.
         layers.visible(id) != Some(true)
-            || curves_layer_qualifies_for_gpu(layers, id)
-            || pixel_layer_mode_qualifies_for_gpu(layers, id)
+            || (!layer_renders_effects(layers, id)
+                && (curves_layer_qualifies_for_gpu(layers, id)
+                    || pixel_layer_mode_qualifies_for_gpu(layers, id)))
     })
 }
 
 /// Whether `id` has a layer effect Photoshop would draw (master switch,
-/// `present` and `enab` all on) — what will refuse the GPU fast path
-/// once E2 renders effects. Not wired into
-/// [`document_qualifies_for_gpu_compositing`] in 0.180.0 (see there), so
-/// only its own test calls it until then.
+/// `present` and `enab` all on). Both the CPU effects path and the GPU
+/// refusal ask the narrower [`layer_renders_effects`] (0.181.0), since
+/// only colour overlays are drawn yet; this is what later rounds widen
+/// that to.
 #[must_use]
 #[cfg_attr(not(test), allow(dead_code))]
 fn layer_shows_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
@@ -15114,7 +15373,7 @@ fn begin_gpu_curves_pass(
         return true;
     }
     let (Some(aurora_doc::Adjustment::Curves(params)), Some(opacity)) =
-        (layers.adjustment(id), layers.opacity(id))
+        (layers.adjustment(id), content_opacity(layers, id))
     else {
         return true;
     };
@@ -31522,6 +31781,12 @@ mod tests {
         /// How many Curves layers the open imported, and its report.
         curves: usize,
         report: Vec<String>,
+        /// 0.181.0: the same error over the union of the bounding boxes
+        /// of every pixel layer with a shown colour overlay: max over the
+        /// three channels, per-channel mean, and how many pixels.
+        overlay_max: f64,
+        overlay_mean: [f64; 3],
+        overlay_pixels: usize,
     }
 
     /// `None` when the corpus is absent (prints `SKIPPED`).
@@ -31538,6 +31803,67 @@ mod tests {
             .join("../../corpora/psd/reference/psd-tools-fixtures")
             .join(relative);
         psd_merged_diff(&path, relative)
+    }
+
+    /// 0.181.0: per pixel of a `w`×`h` canvas, whether it lies in the
+    /// bounding box of the painted pixels (alpha > 0) of some pixel layer
+    /// drawing a colour overlay.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::many_single_char_names
+    )]
+    fn overlay_box_mask(
+        layers: &aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        w: u32,
+        h: u32,
+    ) -> Vec<bool> {
+        let mut in_overlay = vec![false; w as usize * h as usize];
+        let mut pending = layers.roots().to_vec();
+        while let Some(id) = pending.pop() {
+            pending.extend(layers.children(id).unwrap_or(&[]));
+            if !super::layer_renders_effects(layers, id) {
+                continue;
+            }
+            // The bounding box of the layer's painted pixels (alpha > 0):
+            // a PSD layer's own bounds are the canvas.
+            let (Some(b), Some(surface)) = (layers.bounds(id), layers.surface_id(id)) else {
+                continue;
+            };
+            let t = i64::from(aurora_tile::TILE);
+            let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+            for ty in 0..=((i64::from(h) + t - 1) / t) {
+                for tx in 0..=((i64::from(w) + t - 1) / t) {
+                    let tile = aurora_tile::TileId {
+                        x: tx as u32,
+                        y: ty as u32,
+                    };
+                    if !store.contains_tile(surface, tile) {
+                        continue;
+                    }
+                    let Ok(texels) = store.get(surface, tile).map(|t| t.texels().to_vec()) else {
+                        continue;
+                    };
+                    for (i, px) in texels.chunks_exact(4).enumerate() {
+                        if px.get(3).is_some_and(|a| a.to_f32() > 0.0) {
+                            let x = b.x + tx * t + (i as i64 % t);
+                            let y = b.y + ty * t + (i as i64 / t);
+                            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                        }
+                    }
+                }
+            }
+            for y in y0.max(0)..=y1.min(i64::from(h) - 1) {
+                for x in x0.max(0)..=x1.min(i64::from(w) - 1) {
+                    if let Some(slot) = in_overlay.get_mut((y * i64::from(w) + x) as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        in_overlay
     }
 
     /// [`curves_corpus_diff`] for any PSD path: Aurora's composite against
@@ -31593,10 +31919,18 @@ mod tests {
                 }
             }
         }
+        let in_overlay = overlay_box_mask(&document.layers, &mut store, w, h);
+        let (mut overlay_max, mut overlay_sum, mut overlay_pixels) =
+            (0.0_f64, [0.0_f64; 3], 0_usize);
         let (mut max, mut sum, mut max_solid) = ([0.0_f64; 3], [0.0_f64; 3], 0.0_f64);
         let (mut over_one, mut over_two) = (0_usize, 0_usize);
         for y in 0..h {
             for x in 0..w {
+                let overlaid = in_overlay
+                    .get((y * w + x) as usize)
+                    .copied()
+                    .unwrap_or(false);
+                overlay_pixels += usize::from(overlaid);
                 let [r, g, b, a] = image_pixel(&image, x, y);
                 let want = image_pixel(&merged, x, y);
                 // Photoshop's merged image is opaque; a transparent
@@ -31609,6 +31943,12 @@ mod tests {
                     if let (Some(m), Some(s)) = (max.get_mut(c), sum.get_mut(c)) {
                         *m = m.max(error);
                         *s += error;
+                    }
+                    if overlaid {
+                        overlay_max = overlay_max.max(error);
+                        if let Some(s) = overlay_sum.get_mut(c) {
+                            *s += error;
+                        }
                     }
                     if !fractional
                         .get((y * w + x) as usize)
@@ -31631,6 +31971,9 @@ mod tests {
             over_two,
             curves: curves.len(),
             report: document.report.items,
+            overlay_max,
+            overlay_mean: overlay_sum.map(|s| s / overlay_pixels.max(1) as f64),
+            overlay_pixels,
         })
     }
 
@@ -73138,6 +73481,605 @@ mod tests {
             }
         }
     }
+
+    /// 0.181.0 (E2): Fill applied everywhere, and Color Overlay drawn.
+    mod fill_and_overlay_tests {
+        use super::*;
+        use crate::{fold_layer_into, layer_renders_effects, layer_shows_effects};
+
+        const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const TOL: f32 = 2.0e-3;
+
+        fn bounds() -> aurora_core::Rect {
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }
+        }
+
+        fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+            match r {
+                Ok(v) => v,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// Adds a solid pixel layer on top of `parent` (or the roots).
+        fn solid(
+            layers: &mut aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            parent: Option<aurora_doc::LayerId>,
+            rgba: [f32; 4],
+        ) -> aurora_doc::LayerId {
+            let id = ok(layers.add_pixel_layer("l", bounds(), parent));
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(store, surface, TILE0, rgba);
+            id
+        }
+
+        fn overlay(
+            mode: aurora_core::effects::EffectBlendMode,
+            rgb: [f32; 3],
+            opacity: f32,
+        ) -> aurora_core::effects::ColorOverlay {
+            aurora_core::effects::ColorOverlay {
+                blend_mode: mode,
+                color: aurora_core::effects::EffectColor {
+                    r: rgb[0],
+                    g: rgb[1],
+                    b: rgb[2],
+                },
+                opacity,
+                ..aurora_core::effects::ColorOverlay::default()
+            }
+        }
+
+        fn set_overlays(
+            layers: &mut aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+            overlays: Vec<aurora_core::effects::ColorOverlay>,
+        ) {
+            let fx = aurora_core::LayerEffects {
+                color_overlays: overlays,
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+        }
+
+        /// The CPU composite of the whole tree on tile (0, 0), premultiplied.
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<half::f16> {
+            let mut acc = aurora_render::transparent_tile();
+            let mut budget = CompositeBudget::for_pass(layers);
+            for &id in layers.roots().iter().rev() {
+                let _ = fold_layer_into(
+                    &mut acc,
+                    id,
+                    layers,
+                    store,
+                    TILE0,
+                    (0, 0),
+                    (0, 0),
+                    0,
+                    &mut budget,
+                );
+            }
+            acc
+        }
+
+        fn texel(acc: &[half::f16], x: usize, y: usize) -> [f32; 4] {
+            let i = (y * aurora_tile::TILE as usize + x) * 4;
+            let get = |k: usize| acc.get(i + k).map_or(f32::NAN, |v| v.to_f32());
+            [get(0), get(1), get(2), get(3)]
+        }
+
+        #[track_caller]
+        fn near(got: [f32; 4], want: [f32; 4]) {
+            assert!(
+                got.iter().zip(want).all(|(g, w)| (g - w).abs() <= TOL),
+                "got {got:?}, want {want:?}"
+            );
+        }
+
+        /// Fill fades the layer's own pixels (alpha), and leaves its
+        /// opacity value alone.
+        #[test]
+        fn fill_scales_content_alpha_not_opacity() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [1.0, 0.0, 0.0, 1.0],
+            );
+            ok(layers.set_fill_opacity(id, 0.25));
+            assert_eq!(layers.opacity(id), Some(1.0), "opacity untouched");
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.25, 0.0, 0.0, 0.25],
+            );
+            ok(layers.set_fill_opacity(id, 0.0));
+            near(texel(&composite(&layers, &mut store), 0, 0), [0.0; 4]);
+        }
+
+        /// Without effects Fill and Opacity multiply, bit for bit.
+        #[test]
+        fn fill_and_opacity_multiply_without_effects() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
+            let top = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+            ok(layers.set_opacity(top, 0.5));
+            ok(layers.set_fill_opacity(top, 0.5));
+            let both = composite(&layers, &mut store);
+            near(texel(&both, 0, 0), [0.25, 0.0, 0.75, 1.0]);
+            ok(layers.set_opacity(top, 0.25));
+            ok(layers.set_fill_opacity(top, 1.0));
+            assert_eq!(composite(&layers, &mut store), both);
+        }
+
+        /// The group-Fill decision (0.181.0): an isolated (non-Pass
+        /// Through) group's Fill fades its composited content exactly like
+        /// its opacity (psd-tools' `shape_const`); a Pass Through group's
+        /// Fill is still not applied, and reported on open.
+        #[test]
+        fn isolated_group_fill_fades_its_content_like_opacity() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
+            let group = ok(layers.add_group("g", None));
+            let _inner = solid(&mut layers, &mut store, Some(group), [1.0, 0.0, 0.0, 1.0]);
+            ok(layers.set_fill_opacity(group, 0.5));
+            let filled = composite(&layers, &mut store);
+            near(texel(&filled, 0, 0), [0.5, 0.0, 0.5, 1.0]);
+            ok(layers.set_fill_opacity(group, 1.0));
+            ok(layers.set_opacity(group, 0.5));
+            assert_eq!(composite(&layers, &mut store), filled);
+            // Pass Through: Fill ignored (reported by the PSD reader).
+            ok(layers.set_opacity(group, 1.0));
+            ok(layers.set_fill_opacity(group, 0.5));
+            ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [1.0, 0.0, 0.0, 1.0],
+            );
+        }
+
+        /// Fill on a Curves adjustment multiplies its opacity, like
+        /// psd-tools' `_apply_adjustment`.
+        #[test]
+        fn adjustment_fill_multiplies_its_opacity() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _bottom = solid(&mut layers, &mut store, None, [0.25, 0.5, 0.75, 1.0]);
+            let mut params = aurora_core::CurvesParams::identity();
+            params.composite = ok(aurora_core::ToneCurve::new(&[
+                aurora_core::CurvePoint { x: 0.0, y: 1.0 },
+                aurora_core::CurvePoint { x: 1.0, y: 0.0 },
+            ]));
+            let curves = ok(layers.add_adjustment_layer_at(
+                "c",
+                aurora_doc::Adjustment::Curves(params),
+                None,
+                0,
+            ));
+            ok(layers.set_opacity(curves, 0.5));
+            ok(layers.set_fill_opacity(curves, 0.5));
+            let both = composite(&layers, &mut store);
+            ok(layers.set_opacity(curves, 0.25));
+            ok(layers.set_fill_opacity(curves, 1.0));
+            assert_eq!(composite(&layers, &mut store), both);
+            // Inverted at a quarter: 0.25 -> 0.25 + 0.25 * (0.75 - 0.25).
+            near(texel(&both, 0, 0), [0.375, 0.5, 0.625, 1.0]);
+        }
+
+        /// GPU and CPU agree with Fill < 1: the GPU pass is handed
+        /// `opacity * fill`, exact for a layer without drawn effects.
+        #[test]
+        fn recomposite_visible_tiles_gpu_and_cpu_agree_with_fill_below_one() {
+            let Some(context) = real_gpu_context() else {
+                return;
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    (
+                        "bottom",
+                        aurora_doc::BlendMode::Normal,
+                        1.0,
+                        [0.25, 0.5, 0.75, 1.0],
+                    ),
+                    (
+                        "mul",
+                        aurora_doc::BlendMode::Multiply,
+                        0.8,
+                        [0.5, 1.0, 0.25, 1.0],
+                    ),
+                    (
+                        "top",
+                        aurora_doc::BlendMode::Normal,
+                        1.0,
+                        [1.0, 0.0, 0.0, 0.75],
+                    ),
+                ],
+            );
+            let roots = layers.roots().to_vec();
+            let (Some(&top), Some(&mul)) = (roots.first(), roots.get(1)) else {
+                unreachable!("three roots");
+            };
+            let (_, cpu_unfilled) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            ok(layers.set_fill_opacity(mul, 0.5));
+            ok(layers.set_fill_opacity(top, 0.3));
+            // A drop shadow is not drawn yet, so it must not refuse the GPU.
+            let fx = aurora_core::LayerEffects {
+                drop_shadows: vec![aurora_core::effects::DropShadow::default()],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(top, Some(fx)));
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+            let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply);
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(
+                take_gpu_blend_dispatch_count(GpuBlendDispatch::Multiply),
+                1,
+                "the GPU path really ran"
+            );
+            assert_eq!(gpu.len(), cpu.len());
+            let worst = gpu
+                .iter()
+                .zip(&cpu)
+                .map(|(g, c)| (g - c).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(worst <= TOL, "GPU vs CPU differ by {worst}");
+            assert_ne!(cpu, cpu_unfilled, "Fill changed the composite");
+            // Hand check at texel 0: bottom, Multiply at 0.4, red at 0.225.
+            let b = [0.25_f32, 0.5, 0.75];
+            let m = [0.5_f32, 1.0, 0.25];
+            let after_mul: Vec<f32> = b
+                .iter()
+                .zip(m)
+                .map(|(&cb, cs)| cb + 0.4 * (cb * cs - cb))
+                .collect();
+            let red = [1.0_f32, 0.0, 0.0];
+            for (c, (&below, top_c)) in after_mul.iter().zip(red).enumerate() {
+                let want = below + 0.225 * (top_c - below);
+                let got = cpu.get(c).copied().unwrap_or(f32::NAN);
+                assert!((got - want).abs() <= TOL, "channel {c}: {got} vs {want}");
+            }
+        }
+
+        #[test]
+        fn color_overlay_normal_100_replaces_colour_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.2, 0.4, 0.6, 0.5]);
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    [0.0, 1.0, 0.0],
+                    1.0,
+                )],
+            );
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.0, 0.5, 0.0, 0.5],
+            );
+        }
+
+        /// The Fill-0 trick: the content vanishes, the overlay stays at
+        /// the content's shape.
+        #[test]
+        fn color_overlay_survives_fill_zero() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 0.5]);
+            ok(layers.set_fill_opacity(id, 0.0));
+            near(texel(&composite(&layers, &mut store), 0, 0), [0.0; 4]);
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    [0.0, 0.0, 1.0],
+                    1.0,
+                )],
+            );
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.0, 0.0, 0.5, 0.5],
+            );
+        }
+
+        /// Multiply at 50 % over opaque grey content on an opaque
+        /// backdrop: `Cb + 0.5 * (Cb * Cs - Cb)`, computed by hand.
+        #[test]
+        fn color_overlay_multiply_half_opacity_hand_golden() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _bottom = solid(&mut layers, &mut store, None, [0.8, 0.6, 0.4, 1.0]);
+            let id = solid(&mut layers, &mut store, None, [0.5, 0.5, 0.5, 1.0]);
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Multiply,
+                    [0.5, 1.0, 0.25],
+                    0.5,
+                )],
+            );
+            // Cb = 0.5; Cb * Cs = (0.25, 0.5, 0.125).
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.375, 0.5, 0.3125, 1.0],
+            );
+        }
+
+        /// Fill fades the content inside the interior and a translucent
+        /// overlay sits over what is left: `Y = lerp(blue, red, 0.5)`,
+        /// then `lerp(Y, green, 0.5)`.
+        #[test]
+        fn fill_fades_content_under_a_translucent_overlay() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
+            let id = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+            ok(layers.set_fill_opacity(id, 0.5));
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    [0.0, 1.0, 0.0],
+                    0.5,
+                )],
+            );
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.25, 0.5, 0.25, 1.0],
+            );
+        }
+
+        /// Shape = content alpha × mask; layer opacity fades the overlay;
+        /// Fill does not.
+        #[test]
+        fn color_overlay_respects_layer_mask_and_opacity() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+            ok(layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+            ));
+            ok(layers.set_mask_density(id, 0.5));
+            ok(layers.set_opacity(id, 0.5));
+            ok(layers.set_fill_opacity(id, 0.0));
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    [0.0, 1.0, 0.0],
+                    1.0,
+                )],
+            );
+            let acc = composite(&layers, &mut store);
+            // Inside the mask: coverage 1, opacity 0.5.
+            near(texel(&acc, 0, 0), [0.0, 0.5, 0.0, 0.5]);
+            // Outside it: coverage 1 - density = 0.5, so 0.25.
+            near(texel(&acc, 8, 8), [0.0, 0.25, 0.0, 0.25]);
+        }
+
+        /// Two overlays fold bottom to top in list order: red, then blue
+        /// at 50 %, gives purple; the reverse order would give red.
+        #[test]
+        fn multiple_overlays_apply_in_order() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+            set_overlays(
+                &mut layers,
+                id,
+                vec![
+                    overlay(
+                        aurora_core::effects::EffectBlendMode::Normal,
+                        [1.0, 0.0, 0.0],
+                        1.0,
+                    ),
+                    overlay(
+                        aurora_core::effects::EffectBlendMode::Normal,
+                        [0.0, 0.0, 1.0],
+                        0.5,
+                    ),
+                ],
+            );
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.5, 0.0, 0.5, 1.0],
+            );
+        }
+
+        /// A turned-off overlay draws nothing.
+        #[test]
+        fn a_disabled_overlay_draws_nothing() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+            let mut off = overlay(
+                aurora_core::effects::EffectBlendMode::Normal,
+                [1.0, 0.0, 0.0],
+                1.0,
+            );
+            off.gate.enabled = false;
+            set_overlays(&mut layers, id, vec![off]);
+            near(
+                texel(&composite(&layers, &mut store), 0, 0),
+                [0.0, 1.0, 0.0, 1.0],
+            );
+            assert!(!layer_renders_effects(&layers, id));
+        }
+
+        #[test]
+        fn a_layer_with_rendered_effects_refuses_the_gpu_fast_path() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+            set_overlays(
+                &mut layers,
+                id,
+                vec![overlay(
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    [1.0, 0.0, 0.0],
+                    1.0,
+                )],
+            );
+            assert!(layer_renders_effects(&layers, id));
+            assert!(!document_qualifies_for_gpu_compositing(&layers));
+            // A hidden layer never disqualifies.
+            ok(layers.set_visible(id, false));
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+        }
+
+        #[test]
+        fn a_layer_with_only_unrendered_effects_keeps_the_gpu_path() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+            let mut off = overlay(
+                aurora_core::effects::EffectBlendMode::Normal,
+                [1.0, 0.0, 0.0],
+                1.0,
+            );
+            off.gate.enabled = false;
+            let fx = aurora_core::LayerEffects {
+                drop_shadows: vec![aurora_core::effects::DropShadow::default()],
+                strokes: vec![aurora_core::effects::Stroke::default()],
+                outer_glows: vec![aurora_core::effects::OuterGlow::default()],
+                color_overlays: vec![off],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+            assert!(layer_shows_effects(&layers, id));
+            assert!(!layer_renders_effects(&layers, id));
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+        }
+
+        /// The corpus fixtures with colour overlays or Fill below 100 %
+        /// and a merged image: `(file, max error over all channels, mean
+        /// error per channel)` measured after 0.181.0 (8-bit levels; CPU
+        /// compositor, deterministic). The before (0.180.0) numbers are in
+        /// PLAN.md's 0.181.0 addendum.
+        const EFFECTS_CORPUS_EXPECTED: &[(&str, f64, [f64; 3])] = &[
+            // Fill 28/255 on a shape with a colour overlay (now drawn); blend-if/knockout and clipping still not applied. Before (0.180.0): max 3e+02, mean 95.806, 90.406, 86.526.
+            ("advanced-blending.psd", 255.0, [93.8710, 91.4632, 89.3564]),
+            // Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before (0.180.0): max 3e+02, mean 56.294, 63.672, 69.868.
+            ("effects/shape-fx2.psd", 255.0, [57.8164, 63.1807, 69.8682]),
+            // overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before (0.180.0): max 3e+02, mean 43.937, 47.462, 22.816.
+            (
+                "effects/stroke-composite.psd",
+                255.0,
+                [52.6774, 53.5591, 26.0986],
+            ),
+            // Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before (0.180.0): max 3e+02, mean 220.336, 51.996, 220.336.
+            (
+                "effects/stroke-effect-transparent-shape.psd",
+                153.0,
+                [34.6641, 51.9961, 34.6641],
+            ),
+            // two colour overlays now drawn; shadows, glows, bevels, strokes still not. Before (0.180.0): max 2e+02, mean 109.205, 106.142, 108.661.
+            ("layer_effects.psd", 168.0, [10.9903, 9.1865, 10.4665]),
+            // Fill 0 'divider' shape no longer drawn. Before (0.180.0): max 2e+02, mean 1.359, 1.322, 1.317.
+            ("masks.psd", 65.0, [1.1912, 1.1477, 1.1366]),
+            // Fill 0 'divider' shape no longer drawn. Before (0.180.0): max 2e+02, mean 1.276, 1.282, 1.287.
+            ("masks.psb", 59.0, [1.1088, 1.1077, 1.1069]),
+            // Fill 171/255: now an exact match. Before (0.180.0): max 6e+01, mean 0.000, 56.000, 56.000.
+            ("opacity-fill.psd", 0.0, [0.0000, 0.0000, 0.0000]),
+            // Fill 128/255 applied: within one level. Before (0.180.0): max 8e+01, mean 20.700, 19.690, 19.698.
+            (
+                "transparency/clip-opacity.psd",
+                1.0,
+                [0.1123, 0.1172, 0.1201],
+            ),
+            // Fill 0 text hidden; its other effect is not drawn yet. Before (0.180.0): max 2e+02, mean 18.220, 6.352, 16.774.
+            (
+                "transparency/fill-opacity.psd",
+                204.0,
+                [18.2197, 21.3564, 10.9336],
+            ),
+            // no real merged image (Maximize Compatibility off, stored blank white); clipping not applied. Before (0.180.0): max 3e+02, mean 2.600, 2.600, 2.600.
+            ("blend-and-clipping.psd", 255.0, [2.6003, 2.6003, 2.6003]),
+            // no real merged image (stored blank white): Aurora (255, 246, 206) at (16, 16) vs psd-tools' composite (254, 245, 206). Before (0.180.0): max 0e+00, mean 0.000, 0.000, 0.000.
+            (
+                "effects/effects-enabled.psd",
+                49.0,
+                [0.0000, 9.0000, 49.0000],
+            ),
+        ];
+
+        #[test]
+        fn effects_corpus_files_composite_like_photoshops_merged_image() {
+            let mut over = Vec::new();
+            for &(file, max_want, mean_want) in EFFECTS_CORPUS_EXPECTED {
+                let Some(diff) = curves_corpus_diff(file) else {
+                    return;
+                };
+                let max = diff.max.iter().copied().fold(0.0_f64, f64::max);
+                println!(
+                    "FX {file}: max {:?} mean {:?} overlay max {} mean {:?} px {} report {:?}",
+                    diff.max,
+                    diff.mean,
+                    diff.overlay_max,
+                    diff.overlay_mean,
+                    diff.overlay_pixels,
+                    diff.report
+                );
+                if max > max_want
+                    || diff
+                        .mean
+                        .iter()
+                        .zip(mean_want)
+                        .any(|(got, want)| *got > want + 1e-3)
+                {
+                    over.push(format!("{file}: max {max} mean {:?}", diff.mean));
+                }
+            }
+            assert!(over.is_empty(), "{over:?}");
+        }
+
+        /// AC-3 (0.181.0): the user's Nyepi template (not committed; point
+        /// `AURORA_EFFECTS_PSD` at it), globally and inside the bounding
+        /// boxes of its colour-overlay layers. Prints what PLAN.md records.
+        #[test]
+        #[ignore = "needs a local PSD named by AURORA_EFFECTS_PSD"]
+        fn a_local_effects_psd_against_its_merged_image() {
+            let Some(path) = std::env::var_os("AURORA_EFFECTS_PSD") else {
+                println!("SKIPPED: AURORA_EFFECTS_PSD not set");
+                return;
+            };
+            let path = std::path::PathBuf::from(path);
+            let Some(diff) = psd_merged_diff(&path, "local") else {
+                unreachable!("could not read {}", path.display());
+            };
+            println!(
+                "EFFECTS max {:?} mean {:?} | overlay boxes: max {} mean {:?} over {} px",
+                diff.max, diff.mean, diff.overlay_max, diff.overlay_mean, diff.overlay_pixels
+            );
+        }
+    }
 }
 
 /// 0.140.0: the app's one production layout path is text-aware.
@@ -77006,8 +77948,9 @@ mod panel_scroll_tests {
 #[cfg(test)]
 mod effects_gpu_predicate_tests {
     /// 0.180.0: `layer_shows_effects` sees an effect that would draw and
-    /// not a turned-off one; and, until E2 renders effects, a document
-    /// with visible effects still takes the GPU path (no refusal yet).
+    /// not a turned-off one. Since 0.181.0 the GPU refusal is live but only
+    /// for drawn effects (colour overlays), so a layer whose only effect
+    /// is a drop shadow, undrawn until E3, still takes the GPU path.
     #[test]
     fn layer_shows_effects_gates_and_the_gpu_path_is_unchanged_in_e1() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -77030,7 +77973,7 @@ mod effects_gpu_predicate_tests {
             unreachable!("{err:?}");
         }
         assert!(super::layer_shows_effects(&layers, id));
-        // E1: nothing draws effects, so the document keeps the GPU path.
+        // A drop shadow is not drawn yet (E3), so the GPU path is kept.
         assert!(super::document_qualifies_for_gpu_compositing(&layers));
         fx.enabled = false;
         if let Err(err) = layers.set_effects(id, Some(fx.clone())) {

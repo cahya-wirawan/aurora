@@ -419,6 +419,7 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
+    ClippedOverlaysUnclipped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
     StrokesNotShown,
@@ -568,6 +569,10 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} turned-off vector mask{s} {was} left out; {} had no effect on the image, but \
              can't be turned back on.",
             if one { "it" } else { "they" },
+        ),
+        Note::ClippedOverlaysUnclipped => format!(
+            "{n} colour overlay{s} on clipped layers {is} drawn unclipped, over the layer's \
+             whole shape, because Aurora doesn't have clipping masks yet."
         ),
         Note::ClippingDropped => format!(
             "{n} clipped layer{s} {is} shown unclipped — Aurora doesn't have clipping masks \
@@ -2565,8 +2570,16 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
 }
 
 /// Notes for the features a record uses that Aurora does not apply.
-fn note_unsupported(record: &Record, outcome: &MaskOutcome, notes: &mut Notes) {
-    note_unsupported_kept(record, outcome, notes, true);
+/// `overlays_drawn` is true for a pixel layer, whose colour overlays are
+/// composited since 0.181.0; a group's are still not (E9), so it reports
+/// them.
+fn note_unsupported(
+    record: &Record,
+    outcome: &MaskOutcome,
+    notes: &mut Notes,
+    overlays_drawn: bool,
+) {
+    note_unsupported_kept(record, outcome, notes, true, overlays_drawn);
 }
 
 /// [`note_unsupported`], with `effects_kept` false for a record whose
@@ -2576,6 +2589,7 @@ fn note_unsupported_kept(
     outcome: &MaskOutcome,
     notes: &mut Notes,
     effects_kept: bool,
+    overlays_drawn: bool,
 ) {
     match &record.effects {
         Some(Ok(read)) if !effects_kept => {
@@ -2586,10 +2600,19 @@ fn note_unsupported_kept(
         Some(Ok(read)) => {
             let fx = &read.effects;
             notes.add_n(Note::DropShadowsNotShown, fx.shown_drop_shadows() as u64);
-            notes.add_n(
-                Note::ColorOverlaysNotShown,
-                fx.shown_color_overlays() as u64,
-            );
+            if !overlays_drawn {
+                notes.add_n(
+                    Note::ColorOverlaysNotShown,
+                    fx.shown_color_overlays() as u64,
+                );
+            } else if record.clipping != 0 {
+                // Review of 0.181.0: the overlay is drawn, but the layer is
+                // shown unclipped, so it covers more than Photoshop's.
+                notes.add_n(
+                    Note::ClippedOverlaysUnclipped,
+                    fx.shown_color_overlays() as u64,
+                );
+            }
             notes.add_n(Note::StrokesNotShown, fx.shown_strokes() as u64);
             notes.add_n(Note::OuterGlowsNotShown, fx.shown_outer_glows() as u64);
             notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
@@ -2698,7 +2721,7 @@ fn build_tree(
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =
                     masks_for(src, record, header, canvas_of(header), notes, vector_budget);
-                note_unsupported(record, &outcome, notes);
+                note_unsupported(record, &outcome, notes, false);
                 let mask = outcome.mask;
                 if let Some(parent) = stack.last_mut() {
                     parent.push(PsdNode::Group {
@@ -2757,7 +2780,7 @@ fn layer_node(
         props.effects = None;
         // No pixels: the mask region is the canvas, as for a group.
         let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
-        note_unsupported_kept(record, &outcome, notes, false);
+        note_unsupported_kept(record, &outcome, notes, false, false);
         return Some(PsdNode::Adjustment(PsdAdjustment {
             props,
             curves,
@@ -2796,7 +2819,7 @@ fn layer_node(
         canvas
     };
     let outcome = masks_for(src, record, header, region, notes, vector_budget);
-    note_unsupported(record, &outcome, notes);
+    note_unsupported(record, &outcome, notes, true);
     let mask = outcome.mask;
     Some(PsdNode::Layer(PsdLayer {
         props,

@@ -886,7 +886,6 @@ fn per_kind_effect_notes_on_open() {
     let items = doc.report.items.join("\n");
     for needle in [
         "2 drop shadows aren't shown yet",
-        "1 colour overlay isn't shown yet",
         "1 stroke effect isn't shown yet",
         "1 outer glow isn't shown yet",
         "1 other effect (inner shadow, inner glow, bevel",
@@ -895,6 +894,8 @@ fn per_kind_effect_notes_on_open() {
     ] {
         assert!(items.contains(needle), "{needle:?} missing from\n{items}");
     }
+    // 0.181.0: a pixel layer's colour overlay is drawn, so not reported.
+    assert!(!items.contains("colour overlay"), "{items}");
     // The effects are on the layer, as data; nothing on the other two.
     let fx = find(&doc.layers, "a").and_then(|id| doc.layers.effects(id));
     assert_eq!(fx.map(|fx| fx.drop_shadows.len()), Some(2));
@@ -1060,5 +1061,68 @@ fn an_adjustment_layers_effects_are_reported_as_not_kept() {
         every_layer(&doc.layers)
             .into_iter()
             .all(|id| doc.layers.effects(id).is_none())
+    );
+}
+
+/// 0.181.0: colour overlays on a pixel layer are drawn and no longer
+/// reported; on a group (effects on groups are E9) they still are.
+#[test]
+fn colour_overlays_are_reported_only_on_groups() {
+    let block = effects_block(&[(b"SoFi", V::Obj(vec![]))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::divider(),
+                    TestLayer::pixels("inside", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                    TestLayer::group("g", *b"norm")
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    assert!(
+        items.contains("1 colour overlay isn't shown yet"),
+        "only the group's: {items}"
+    );
+    for name in ["inside", "g"] {
+        let fx = find(&doc.layers, name).and_then(|id| doc.layers.effects(id));
+        assert_eq!(fx.map(|fx| fx.color_overlays.len()), Some(1), "{name}");
+    }
+}
+
+/// Review of 0.181.0: a clipped layer's colour overlay is drawn, but the
+/// layer is shown unclipped, so the open report says so specifically.
+#[test]
+fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
+    let block = effects_block(&[(b"SoFi", V::Obj(vec![]))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::pixels("base", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]]),
+                    TestLayer::pixels("clipped", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]]).with(|l| {
+                        l.clipping = 1;
+                        l.blocks.push((*b"lfx2", block.clone()));
+                    }),
+                    TestLayer::pixels("free", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    assert!(
+        items.contains("1 colour overlay on clipped layers is drawn unclipped"),
+        "only the clipped layer's: {items}"
+    );
+    assert!(!items.contains("isn't shown yet"), "{items}");
+    // The effects data itself is untouched (E7 writes it back).
+    let fx = find(&doc.layers, "clipped").and_then(|id| doc.layers.effects(id));
+    assert_eq!(
+        fx.map(aurora_core::LayerEffects::shown_color_overlays),
+        Some(1)
     );
 }
