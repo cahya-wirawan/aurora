@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-08-25**.
+Last updated: **2026-10-10**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -26,7 +26,59 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.165.1): a second CI test race fixed.** GitHub
+**Latest (2026-10-10, 0.166.0): drag-to-redock docked panels, the
+arrangement persisted.** Workspace round 5, first half (floating panels
+are 0.167.0). A press on a lone panel's title row or on a group's tab
+that travels more than `aurora_ui::PANEL_DRAG_THRESHOLD` (4 logical px,
+an interaction tolerance like `RAIL_DIVIDER_HIT_TOLERANCE`, not a style
+token) becomes an `aurora_ui::PanelDrag`; below it the press is still a
+click (a tab press still switches tabs, through its ordinary routing).
+While dragging, a drop indicator — a new generic
+`aurora_widgets::WidgetKind::DropIndicator`, `accent.primary`, an
+`Insertion` line across the rail or a `Target` outline, both
+`size.indicator_width` thick — a **new token** (design-owner decision,
+Cahya, 2026-10-10, name and value delegated: `[size] indicator_width =
+2`, PROVISIONAL, logical px, not density-scaled), which the selected
+tab's underline now uses too in place of its `UNDERLINE_WIDTH` literal
+(goldens unchanged at 2) — hidden and AT-hidden otherwise —
+shows the target: a gap between slots (reorder, or a tab dragged out of
+its group into a slot of its own) or a slot's title row/tab strip (join
+it as its last tab, selected); the title zone's top quarter is still the
+gap above, so the top gap stays reachable over a short slot. A slot a
+move empties is removed. Escape (any key, in fact), a drop on no target
+(the canvas, status bar and tools panel never are), `CursorLeft`, a lost
+window focus and a second press cancel with the tree unchanged.
+Dragging is **disabled while the rail is collapsed** (no source; a live
+drag finds no target). The model is pure data, `aurora_ui::dock`
+(`DockPanel`, `DockSlot`, `DockArrangement`, `DropTarget`, `PanelMove`,
+`DockPlacement` — `Rail` only, the room 0.167.0 needs);
+`aurora_ui::redock::apply_dock_arrangement` applies it by **moving**
+panel subtrees with the new `WidgetTree::move_child` (ids, content,
+scroll and collapsed/closed state survive; only group roots and tab
+bars are rebuilt). `Workspace::panel_group` became `Workspace::slots`
+(`RailSlot::{Panel, Group}`, any number of groups), with `group_of`,
+`group_holding`, `panel_holding`, `dock_arrangement`. Keyboard path
+(invariant 9): nine palette commands, "Move <Layers|Properties|History>
+Panel Up / Down / to Next Group", which land focus on the moved panel
+(its tab if grouped), and "Reset Panel Layout"; the label strip's
+buttons follow the panel order. Persistence: `WorkspaceLayout` gains
+`dock` (a fourth version; the 0.165.0 shape is `WorkspaceLayoutV3`, so
+the chain is current → V3 → V2 → V1), each slot with an enum placement;
+a damaged arrangement is repaired (`DockArrangement::repaired`: unknown
+and duplicate panels dropped, empty slots dropped, bad tabs reset,
+missing panels appended), never refused. Layout moves never reach
+`History`. Review revision: the App's press/move/release panel halves
+are free functions (`panel_pointer_pressed`/`_moved`/`_released`), the
+move half runs first, and a test drives them in the App's own order;
+Reset Panel Layout keeps focus (`apply_dock_arrangement_keeping_focus`);
+the 4 px threshold is logical (tested at scale 2); the rebuild prechecks
+every id before moving anything. Full gate green on the RTX 3090
+(`AURORA_REQUIRE_GPU=1`), one pass: fmt, layering, style lint, `check --locked`, clippy `-D warnings`, **3,106 passed, 0 failed, 61 ignored, 0 skipped**, strict rustdoc, `cargo deny`, contrast exit 0. Branch
+`004-floating_panels`.
+**Not verified:** interactive drag feel on real hardware, VoiceOver.
+Details: "Next action", addendum 0.166.0.
+
+**Previously (2026-10-10, 0.165.1): a second CI test race fixed.** GitHub
 Actions' Ubuntu run failed in
 `store::insert_encoded_tests::an_inserted_tile_reads_from_pending_before_its_write_lands`
 (`left: Some(524296)`, `right: Some(19842)`). Cause: the test asserted
@@ -7386,7 +7438,10 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03 (**update 0.161.0:** the rail shares height by content —
+  2026-08-03 (**update 0.166.0:** drag-to-redock — reorder, join as a
+  tab, tab out; a keyboard/palette path; the arrangement persisted and
+  repaired on load; floating panels still open (0.167.0) — "Next action",
+  addendum 0.166.0; **update 0.161.0:** the rail shares height by content —
   Layers and Properties content-sized and capped, History fills, every
   panel floored at one body row — and Properties auto-expands on the
   transition to a Curves layer — "Next action", addendum 0.161.0;
@@ -31090,6 +31145,130 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.166.0) — drag-to-redock, the arrangement
+persisted.** Branch `004-floating_panels` (from `main` at baef68f,
+0.165.1). Files: `aurora-widgets` `tree.rs` (`WidgetTree::move_child`,
+one test), `error.rs` (`MoveIntoOwnSubtree`), new
+`widgets/drop_indicator.rs` (`WidgetKind::DropIndicator`, insert/show/
+hide; one test), `paint.rs` (`paint_drop_indicator`), `action.rs`/
+`tooltip.rs` (the every-kind guards extended); `aurora-ui` new `dock.rs`
+(the model; five tests) and `redock.rs` (apply, moves, drop targets,
+indicator geometry, `PanelDrag`; eight tests), `panel.rs`
+(`set_panel_grouped`), `panel_group.rs` (`build_panel_group`,
+`panel_group_label`, `refocus_out_of_hidden_in`), `workspace.rs`
+(`slots`, `RailSlot`, `drop_indicator`, accessors,
+`panel_focus_target`; every group function now finds its group),
+`gallery_panel.rs` (two root-children assertions), `lib.rs`; `aurora-app`
+`lib.rs` (`WorkspaceLayout.dock` + `WorkspaceLayoutV3`,
+`SavedDockSlot`/`SavedPlacement`, `apply_workspace_layout`,
+`PANEL_MOVE_COMMANDS`, `COMMAND_RESET_PANELS`,
+`ActivatedCommand::{MovePanel, ResetPanels}` (both dispatch sites,
+the macOS menu one included), `run_panel_move`,
+`reset_panel_arrangement`, `App::panel_drag` and its press/move/release/
+Escape/`CursorLeft`/focus-loss wiring, `follow_panel_tabs` by group;
+eight tests in `panel_tab_groups::panel_redock`, three adapted, none
+deleted); `aurora-theme` `scales.rs` (`SizeScale::indicator_width`, one
+test), `design/tokens/scales.toml`, regenerated `design/tokens.css`
+(`vocabulary.md` lists colour tokens only, unchanged). 3,082 + 24 =
+**3,106 tests**, measured.
+
+Evidence per criterion: AC-1 `a_drag_past_the_threshold_reorders_and_a_
+click_below_it_changes_nothing`, `a_tab_click_below_the_threshold_leaves_
+the_arrangement_alone`, `a_tab_click_with_a_panel_press_still_just_
+switches_tabs`, `moves_reorder_join_split_and_remove_empty_slots`; AC-2
+`a_tab_strip_drop_joins_a_drag_out_splits_and_empty_groups_go`,
+`no_move_ever_leaves_an_empty_slot`; AC-3 `a_cancel_or_a_drop_outside_
+any_target_changes_nothing` (the whole AccessKit tree plus every bound
+compared); AC-4 `the_drop_indicator_is_drawn_from_tokens_and_only_
+during_a_drag`, `a_drop_indicator_is_hidden_until_shown_and_lays_out_
+where_it_is_put`; AC-5 `keyboard_moves_keep_focus_and_accessibility_
+order_consistent`, `the_move_commands_rearrange_with_focus_and_order_
+kept_and_reset_restores`, `keyboard_moves_map_to_targets_and_stop_at_the_
+ends`, `move_child_reorders_reparents_and_refuses_cycles`; AC-6
+`the_arrangement_round_trips_and_older_layouts_still_decode`,
+`a_damaged_layout_repairs_so_every_panel_appears_exactly_once`,
+`a_damaged_arrangement_repairs_to_every_panel_exactly_once`; AC-7
+`a_collapsed_rail_disables_panel_dragging`.
+
+Mutations (each file backed up to the scratchpad, mutated, the named
+crate's tests run with `AURORA_REQUIRE_GPU=1`, restored, `touch`ed,
+sha256 checked — all fourteen restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | any travel starts a drag (threshold ignored) | killed: `a_drag_past_the_threshold_reorders_and_a_click_below_it_changes_nothing` |
+| M1b | a press never becomes a drag | killed: 4 redock tests |
+| M2a | the model keeps a slot a move emptied | killed: `moves_reorder_join_split_and_remove_empty_slots`, `no_move_ever_leaves_an_empty_slot` |
+| M2b | a dissolved group's root stays in the tree | killed: 3 redock tests incl. `a_tab_strip_drop_joins_a_drag_out_splits_and_empty_groups_go` |
+| M3a | cancel leaves the indicator shown | killed: `a_cancel_or_a_drop_outside_any_target_changes_nothing` |
+| M3b | a point outside the rail is still a target | killed: the cancel test and the indicator test |
+| M3c | `finish` ignores the active flag | **survived** — redundant: a target is only ever set once active |
+| M4a | repair does not append missing panels | killed: `a_damaged_layout_repairs_so_every_panel_appears_exactly_once` |
+| M4b | repair keeps duplicates | killed: the same test |
+| M5 | load ignores the saved arrangement | killed: the round-trip and damaged-layout tests |
+| M6 | no V3 (0.165.0) fallback | killed: `the_arrangement_round_trips_and_older_layouts_still_decode` |
+| M7 | a keyboard move does not focus the moved panel | killed: `keyboard_moves_keep_focus_and_accessibility_order_consistent` |
+| M8 | drag sources allowed on a collapsed rail | **survived** — redundant: a hidden rail lays out zero-sized, so no title is hit (the 0.165.0 M9a pattern) |
+| M9 | indicator painted `border.default` | killed: `the_drop_indicator_is_drawn_from_tokens_and_only_during_a_drag` |
+
+Disclosures: (1) **interactive feel is not verified** — every test is
+headless; no human has dragged a panel, and the threshold, the
+top-quarter gap rule and the indicator's look are untested by eye. (2)
+`App`'s own press/move/release/Escape wiring is not exercised by a test
+(no headless `App`); the state machine it calls is, and the routing a
+tab click takes beside it is. (3) Any key cancels a live panel drag
+(Escape is then consumed, other keys go on) — simpler than routing a
+command mid-drag. (4) Moving a closed panel reopens it (the tab-click
+contract), empty until its next repopulation. (5) A tab cannot be
+reordered within its own strip, and a whole group cannot be dragged at
+once (only a panel/tab). (6) While the rail is collapsed the move
+commands still rearrange it (data only; the strip follows); the drag is
+off. (7) The drop threshold is an engineering constant, not a token; if
+the design owner wants it themable, a token is a decision for Cahya.
+(8) Missing panels in a damaged file are appended as their own slots at
+the bottom, not put back in their default places. (9) A group joining
+inherits the selected member's collapse; a move always shows the moved
+panel expanded. (10) The new palette entries are not in the macOS menus;
+the macOS dispatch arm was added by inspection and **not compiled here**
+(Linux only). (11) `README`, `CLAUDE.md` updated; no ADR.
+
+**Review revision (same round).** I1 (medium) — *mitigated, not a live
+bug*: traced, a tab press only *arms* the click tracker (a tab selects on
+release, `pointer.rs` `Interactive::Tab`) and a title-row press is
+nobody's widget, so neither captures it and the drag was reachable; the
+order is now explicit anyway — `panel_pointer_moved` runs before the
+gallery-capture check — and extracted into free functions with
+`the_app_pointer_order_drops_a_drag_and_a_click_still_switches_tabs`
+(a tab dragged to the rail's foot, a title row onto another title row,
+a 2 px tab click that still switches). I2 — *fixed*: Reset Panel Layout
+goes through `aurora_ui::apply_dock_arrangement_keeping_focus` (the
+helper `move_workspace_panel` now shares), test
+`reset_panel_layout_keeps_focus_on_the_panel_it_held`. Threshold units —
+*confirmed logical* (`App` divides every cursor position by the scale
+factor, `logical_point`), test `the_drag_threshold_is_logical_at_scale_
+two` (3 pt a click, 5 pt a drag at scale 2). I3 — *fixed by a precheck*:
+`apply_dock_arrangement` checks every id it will touch before moving
+anything, after which no step can fail (argued in its doc; not a
+rollback). I6 — *fixed*: `drop_target_at`'s doc says zero-height slots
+are skipped. Item 7 — the `size.indicator_width` token above, test
+`the_indicator_width_token_parses`. Revision mutations, all killed:
+
+| # | Mutation | Result |
+|---|---|---|
+| R1 | release cancels instead of dropping | killed: the App-order test |
+| R2 | a panel press does not own moves | killed: the App-order and scale-2 tests |
+| R3 | a press never starts a panel drag | killed: the same two |
+| R4 | Reset uses the plain apply (focus dropped) | killed: `reset_panel_layout_keeps_focus_on_the_panel_it_held` |
+| R5 | threshold 2 (a physical-pixel reading at scale 2) | killed: `the_drag_threshold_is_logical_at_scale_two` |
+| R6 | `indicator_width = 3` | killed: `the_indicator_width_token_parses`, `the_selected_tab_paints_a_2px_accent_underline_and_an_inactive_one_nothing` |
+
+Still untested: the `App` methods themselves calling these functions in
+this order (no headless `App`; inspection only).
+
+**Needs a human:** drag Layers, Properties and History around on macOS
+(reorder, join, tab out), check the indicator reads clearly in every
+theme, check VoiceOver after a move, and restart to confirm the layout.
 
 **Addendum 2026-10-10 (0.165.0) — the rail collapses to a label strip.**
 Branch `001-rail_label_strip` (from `main` at 1438c38, 0.164.0). Design-

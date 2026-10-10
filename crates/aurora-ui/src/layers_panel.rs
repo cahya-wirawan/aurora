@@ -867,7 +867,9 @@ mod tests {
         expected.extend_from_slice(&row_ids);
         // 0.164.0: then the group's selected tab (roving focus: one stop
         // per tab row) and the shown tab panel; History is hidden.
-        let Ok(bar) = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar) else {
+        let Ok(bar) =
+            aurora_widgets::widgets::tab_bar_state(&ws.tree, crate::workspace::test_group(&ws).bar)
+        else {
             unreachable!("the group has a bar");
         };
         let Some(tab) = bar.selected_tab() else {
@@ -1183,7 +1185,7 @@ mod tests {
             let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
                 ws.tree.bounds(ws.layers.root),
                 ws.tree.bounds(ws.properties.root),
-                ws.tree.bounds(ws.panel_group.bar),
+                ws.tree.bounds(crate::workspace::test_group(&ws).bar),
             ) else {
                 unreachable!("just laid out");
             };

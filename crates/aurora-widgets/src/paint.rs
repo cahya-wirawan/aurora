@@ -299,9 +299,11 @@ pub fn paint_widget_ops_frame(
 
 /// The keyboard focus ring's stroke width, in logical pixels — the
 /// mockup's `outline: 2px solid var(--border-focus)`. **Not a token**:
-/// `design/tokens/scales.toml` has no stroke-weight scale, the same gap
-/// the tab underline's `UNDERLINE_WIDTH` records. Flagged to the design
-/// owner (Cahya, PRD FR-027 *Ownership*) rather than invented here.
+/// `design/tokens/scales.toml` has no focus-ring weight. (The tab
+/// underline, which shared this gap, became the `size.indicator_width`
+/// token in 0.166.0; the ring was left out of that decision.) Flagged to
+/// the design owner (Cahya, PRD FR-027 *Ownership*) rather than invented
+/// here.
 pub const FOCUS_RING_WIDTH: f32 = 2.0;
 
 /// A slider's track (and value fill) thickness, in logical pixels — the
@@ -469,6 +471,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
         WidgetKind::Label(state) => state.disabled,
         WidgetKind::Container
+        | WidgetKind::DropIndicator(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
         | WidgetKind::Panel
@@ -1102,6 +1105,9 @@ pub fn paint_widget(
         }
         WidgetKind::CurveEditor(state) => {
             paint_curve_editor(tree, id, state, theme, scales, scale_factor)
+        }
+        WidgetKind::DropIndicator(state) => {
+            paint_drop_indicator(*state, bounds, theme, scales, scale_factor)
         }
         // A label paints no solids; `crate::text_runs` draws its text.
         WidgetKind::ColorPicker(_)
@@ -2058,11 +2064,10 @@ fn paint_tab(
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     // The mockup's `.tab.active { border-bottom: 2px solid
-    // var(--accent-primary) }`. **Not a token**: `design/tokens/
-    // scales.toml` has no stroke-weight scale at all, the same gap every
-    // `BORDER_WIDTH` above records. Flagged to the design owner (Cahya,
-    // PRD FR-027 *Ownership*) rather than invented as a token here.
-    const UNDERLINE_WIDTH: f32 = 2.0;
+    // var(--accent-primary) }`: the `size.indicator_width` token (0.166.0,
+    // design owner's decision; provisional value 2).
+    #[allow(clippy::cast_precision_loss)]
+    let underline_width = scales.size.indicator_width as f32;
 
     let (left, top) = (bounds.x as f32, bounds.y as f32);
     let (width, height) = (bounds.width as f32, bounds.height as f32);
@@ -2079,7 +2084,7 @@ fn paint_tab(
         .into_iter()
         .collect();
     if state.is_selected() {
-        let underline = UNDERLINE_WIDTH.min(height);
+        let underline = underline_width.min(height);
         if let Some(mesh) = band(
             left,
             top + height - underline,
@@ -2160,7 +2165,7 @@ fn paint_curve_editor(
     /// The identity diagonal's stroke width — not a token, as above.
     const DIAGONAL_WIDTH: f32 = 1.0;
     /// The curve's stroke width — not a token, as above; the tab
-    /// underline's `UNDERLINE_WIDTH` weight, so the curve reads heavier
+    /// underline's former 2 px weight, so the curve reads heavier
     /// than the 1 px chrome under it. Provisional, flagged to the design
     /// owner (Cahya, PRD FR-027 *Ownership*).
     const CURVE_WIDTH: f32 = 2.0;
@@ -2635,6 +2640,62 @@ fn paint_panel(
         (fill_mesh, [fr, fg, fb, 1.0]),
         (border_mesh, [br, bg, bb, 1.0]),
     ])
+}
+
+/// A drop indicator's paint (0.166.0, `widgets::drop_indicator`):
+/// nothing while hidden; an [`crate::widgets::DropIndicatorKind::Insertion`] fills its
+/// whole box with `accent.primary`; a [`crate::widgets::DropIndicatorKind::Target`]
+/// strokes a `size.indicator_width` `accent.primary` outline just inside
+/// its box. `accent.primary` is the selection-highlight token, gated at
+/// 3:1 against `surface.panel`; the stroke is the `size.indicator_width`
+/// token (0.166.0), the selected tab underline's weight.
+fn paint_drop_indicator(
+    state: crate::widgets::DropIndicatorState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    use crate::widgets::DropIndicatorKind;
+    let Some(kind) = state.shown() else {
+        return Ok(vec![]);
+    };
+    let (x, y, width, height) = (
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+    );
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(vec![]);
+    }
+    let accent = theme.accent.primary.to_srgb_f32();
+    let mesh = match kind {
+        DropIndicatorKind::Insertion => band(x, y, width, height, scale_factor)?,
+        DropIndicatorKind::Target => {
+            #[allow(clippy::cast_precision_loss)]
+            let stroke_width = scales.size.indicator_width as f32;
+            let half = stroke_width / 2.0;
+            if width <= stroke_width || height <= stroke_width {
+                band(x, y, width, height, scale_factor)?
+            } else {
+                let path = rounded_rect(
+                    x + half,
+                    y + half,
+                    width - stroke_width,
+                    height - stroke_width,
+                    0.0,
+                );
+                let tolerance = tolerance_for_scale_factor(scale_factor);
+                Some(stroke(&path, stroke_width, tolerance).map_err(WidgetError::Paint)?)
+            }
+        }
+    };
+    let [red, green, blue] = accent;
+    Ok(mesh
+        .map(|mesh| (mesh, [red, green, blue, 1.0]))
+        .into_iter()
+        .collect())
 }
 
 #[cfg(test)]

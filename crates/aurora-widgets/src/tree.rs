@@ -573,6 +573,57 @@ impl<W> WidgetTree<W> {
         Ok(())
     }
 
+    /// Moves `id` (with its whole subtree) to be child `index` of
+    /// `new_parent` (0.166.0, drag-to-redock): the same widget, ids,
+    /// state, scroll offset and accessibility node, only its place in the
+    /// tree changes — so a caller holding ids into the subtree keeps them.
+    /// `index` is clamped to the new parent's child count (after `id` has
+    /// left its old place), so `usize::MAX` appends. Moving within the
+    /// same parent reorders. The old bounds and the moved widget are
+    /// marked dirty; the caller re-runs layout.
+    ///
+    /// # Errors
+    ///
+    /// [`WidgetError::CannotRemoveRoot`] for the root,
+    /// [`WidgetError::UnknownWidget`] if `id` or `new_parent` doesn't
+    /// exist, and [`WidgetError::MoveIntoOwnSubtree`] if `new_parent` is
+    /// `id` or lies below it. Nothing changes on an error.
+    pub fn move_child(
+        &mut self,
+        id: WidgetId,
+        new_parent: WidgetId,
+        index: usize,
+    ) -> Result<(), WidgetError> {
+        if id == self.root {
+            return Err(WidgetError::CannotRemoveRoot(id));
+        }
+        if !self.nodes.contains_key(&new_parent) {
+            return Err(WidgetError::UnknownWidget(new_parent));
+        }
+        let node = self.nodes.get(&id).ok_or(WidgetError::UnknownWidget(id))?;
+        if self.is_within(id, new_parent) {
+            return Err(WidgetError::MoveIntoOwnSubtree {
+                id,
+                parent: new_parent,
+            });
+        }
+        let Some(old_parent) = node.parent else {
+            unreachable!("only the root (rejected above) can have no parent");
+        };
+        if let Some(old) = self.nodes.get_mut(&old_parent) {
+            old.children.retain(|&child| child != id);
+        }
+        let Some(parent_node) = self.nodes.get_mut(&new_parent) else {
+            unreachable!("new_parent's existence was already checked above");
+        };
+        let at = index.min(parent_node.children.len());
+        parent_node.children.insert(at, id);
+        if let Some(moved) = self.nodes.get_mut(&id) {
+            moved.parent = Some(new_parent);
+        }
+        self.mark_dirty(id)
+    }
+
     fn remove_subtree(&mut self, id: WidgetId) {
         let Some(node) = self.nodes.remove(&id) else {
             unreachable!("a parent's recorded children must exist in the tree by construction");
@@ -1666,6 +1717,69 @@ mod tests {
         assert!(!tree.contains(group));
         assert!(!tree.contains(leaf));
         assert_eq!(tree.len(), 1);
+    }
+
+    /// 0.166.0: `move_child` reorders within a parent, reparents with the
+    /// subtree and its ids intact, clamps the index, and refuses a cycle,
+    /// the root and unknown ids without changing anything.
+    #[test]
+    fn move_child_reorders_reparents_and_refuses_cycles() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let insert = |tree: &mut WidgetTree<&str>, parent, name| match tree.insert(
+            parent,
+            Style::default(),
+            label(name),
+            name,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let a = insert(&mut tree, root, "a");
+        let b = insert(&mut tree, root, "b");
+        let c = insert(&mut tree, root, "c");
+        let leaf = insert(&mut tree, a, "leaf");
+        if let Err(err) = tree.move_child(c, root, 0) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.children(root), Some([c, a, b].as_slice()));
+        if let Err(err) = tree.move_child(a, b, usize::MAX) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.children(root), Some([c, b].as_slice()));
+        assert_eq!(tree.children(b), Some([a].as_slice()));
+        assert_eq!(tree.parent(a), Some(b));
+        assert_eq!(tree.parent(leaf), Some(a), "the subtree moves whole");
+        assert!(tree.is_within(b, leaf));
+        let before: Vec<_> = tree.children(root).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(matches!(
+            tree.move_child(b, leaf, 0),
+            Err(WidgetError::MoveIntoOwnSubtree { .. })
+        ));
+        assert!(matches!(
+            tree.move_child(b, b, 0),
+            Err(WidgetError::MoveIntoOwnSubtree { .. })
+        ));
+        assert!(matches!(
+            tree.move_child(root, b, 0),
+            Err(WidgetError::CannotRemoveRoot(_))
+        ));
+        assert!(matches!(
+            tree.move_child(accesskit::NodeId(999), root, 0),
+            Err(WidgetError::UnknownWidget(_))
+        ));
+        assert!(matches!(
+            tree.move_child(b, accesskit::NodeId(999), 0),
+            Err(WidgetError::UnknownWidget(_))
+        ));
+        assert_eq!(tree.children(root).map(<[_]>::to_vec), Some(before));
+        assert_eq!(tree.parent(b), Some(root));
+        // The accessibility tree follows the structure.
+        let update = tree.accessibility_update(root);
+        let root_node = update.nodes.iter().find(|(id, _)| *id == root);
+        assert_eq!(
+            root_node.map(|(_, node)| node.children().to_vec()),
+            Some(vec![c, b])
+        );
     }
 
     #[test]

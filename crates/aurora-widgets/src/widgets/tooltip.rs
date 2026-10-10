@@ -492,7 +492,8 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::ColorPickerPart(_)
         | WidgetKind::CurveEditor(_)
         | WidgetKind::CurveEditorPoint(_)
-        | WidgetKind::Label(_) => false,
+        | WidgetKind::Label(_)
+        | WidgetKind::DropIndicator(_) => false,
     }
 }
 
@@ -1248,6 +1249,7 @@ mod tests {
             WidgetKind::CurveEditor(_) => 21,
             WidgetKind::CurveEditorPoint(_) => 22,
             WidgetKind::Label(_) => 23,
+            WidgetKind::DropIndicator(_) => 24,
         }
     }
 
@@ -1374,12 +1376,13 @@ mod tests {
             aurora_core::ToneCurve::identity(),
         ));
         ok(insert_label(&mut tree, root, &scales, "Size"));
+        ok(super::super::insert_drop_indicator(&mut tree, root));
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 24];
+        let mut seen = [false; 25];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1398,7 +1401,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 24], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 25], "every WidgetKind was built and asked");
     }
 
     #[test]

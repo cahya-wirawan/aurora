@@ -92,4 +92,9 @@ pub enum WidgetError {
     /// garbage on the next layout.
     #[error("invalid scroll offset {offset} for widget {id:?}: it must be finite")]
     InvalidScrollOffset { id: WidgetId, offset: f32 },
+    /// [`crate::WidgetTree::move_child`] (0.166.0) was asked to move a
+    /// widget under itself or one of its own descendants, which would
+    /// detach the subtree from the root as a cycle.
+    #[error("cannot move {id:?} under {parent:?}: that is inside its own subtree")]
+    MoveIntoOwnSubtree { id: WidgetId, parent: WidgetId },
 }

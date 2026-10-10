@@ -1073,6 +1073,7 @@ mod tests {
                     ws.divider,
                     ws.rail,
                     ws.panel_strip.root,
+                    ws.drop_indicator,
                 ]
                 .as_slice()
             )
@@ -1451,6 +1452,7 @@ mod tests {
                     ws.divider,
                     ws.rail,
                     ws.panel_strip.root,
+                    ws.drop_indicator,
                 ]
                 .as_slice()
             )

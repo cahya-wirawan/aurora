@@ -132,6 +132,80 @@ pub fn insert_panel_group(
     Ok(group)
 }
 
+/// A tab group's tab-list label from its members' titles (0.166.0):
+/// "Properties and History", "Layers, Properties and History" — the
+/// default group's label is exactly [`crate::PANEL_GROUP_LABEL`].
+#[must_use]
+pub fn panel_group_label(titles: &[&str]) -> String {
+    match titles {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Builds a tab group at child `index` of `parent` (0.166.0,
+/// drag-to-redock) from panels that already exist: a new group root and
+/// tab bar (one tab per `members` entry, labelled by its title), each
+/// member's root moved in — its subtree, ids, content, scroll offset and
+/// collapsed or closed state intact — and given the grouped title slot,
+/// tab `selected` shown ([`sync_panel_group`]).
+///
+/// # Errors
+///
+/// [`WidgetError::IndexOutOfRange`] if `members` is empty or `selected`
+/// names no member (nothing is built), else
+/// [`WidgetError::UnknownWidget`] for a malformed handle.
+pub(crate) fn build_panel_group(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    index: usize,
+    members: &[(PanelHandle, &str)],
+    selected: usize,
+    scales: &Scales,
+) -> Result<PanelGroup, WidgetError> {
+    if selected >= members.len() {
+        return Err(WidgetError::IndexOutOfRange {
+            index: selected,
+            len: members.len(),
+        });
+    }
+    let titles: Vec<&str> = members.iter().map(|(_, title)| *title).collect();
+    let root = tree.insert(
+        parent,
+        root_style(false, PanelSizing::Fill, 0.0),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
+    tree.move_child(root, parent, index)?;
+    let bar = widgets::insert_tab_bar(
+        tree,
+        root,
+        scales,
+        &panel_group_label(&titles),
+        titles.iter().map(|title| (*title).to_owned()).collect(),
+        selected,
+    )?;
+    let mut bar_style = tree
+        .style(bar)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(bar))?;
+    bar_style.flex_shrink = 0.0;
+    bar_style.min_size.height = length(row_height(scales));
+    tree.set_style(bar, bar_style)?;
+    for &(member, _) in members {
+        tree.move_child(member.root, root, usize::MAX)?;
+        crate::panel::set_panel_grouped(tree, member, true, scales)?;
+    }
+    let group = PanelGroup {
+        root,
+        bar,
+        members: members.iter().map(|(member, _)| *member).collect(),
+    };
+    sync_panel_group(tree, &group)?;
+    Ok(group)
+}
+
 /// The tab the group's bar has selected.
 ///
 /// # Errors
@@ -385,6 +459,17 @@ pub fn refocus_out_of_hidden(
     focus: &mut FocusManager,
     group: &PanelGroup,
 ) -> bool {
+    refocus_out_of_hidden_in(tree, focus, Some(group))
+}
+
+/// [`refocus_out_of_hidden`] for a workspace that may hold no group at
+/// all (0.166.0: every panel can be docked on its own) — `group` is the
+/// group holding the focused widget, if any.
+pub(crate) fn refocus_out_of_hidden_in(
+    tree: &mut WidgetTree<WidgetKind>,
+    focus: &mut FocusManager,
+    group: Option<&PanelGroup>,
+) -> bool {
     if focus.validate(tree) {
         return true;
     }
@@ -394,10 +479,9 @@ pub fn refocus_out_of_hidden(
     if !hidden_in_tree(tree, focused) {
         return false;
     }
-    let tab = tree
-        .is_within(group.root, focused)
-        .then(|| widgets::tab_bar_state(tree, group.bar).ok()?.selected_tab())
-        .flatten()
+    let tab = group
+        .filter(|group| tree.is_within(group.root, focused))
+        .and_then(|group| widgets::tab_bar_state(tree, group.bar).ok()?.selected_tab())
         .filter(|&tab| focusable_shown(tree, tab));
     let target = tab.or_else(|| {
         let mut current = tree.parent(focused);

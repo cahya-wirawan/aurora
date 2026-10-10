@@ -69,6 +69,12 @@ options_control_width = 224 # a slider in the options bar
 # rows, not px: the panel's height follows `row_height`, and so density.
 # The design owner's to tune.
 content_panel_max_rows = 10
+# The stroke thickness of selection and target indicators — the selected
+# tab's underline and the drag-to-redock drop indicator (0.166.0, design
+# owner's decision 2026-10-10, who delegated name and value). PROVISIONAL
+# for the design owner to tune: 2, the weight both used as literals
+# before. Logical px; not scaled by density (only the spacing scale is).
+indicator_width = 2
 
 [radius]
 none = 0
