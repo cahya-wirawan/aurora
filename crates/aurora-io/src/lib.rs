@@ -39,6 +39,7 @@ pub mod import;
 pub mod jpeg;
 pub mod png;
 pub mod psd;
+mod safe_save;
 pub mod tiff;
 
 pub use aur::{
@@ -53,8 +54,14 @@ pub use import::{
     write_into_store, write_into_store_at,
 };
 pub use psd::{
+    PsdCompositeSource, PsdExpectation, PsdExpectedLayer, PsdFormat, PsdSaveOptions,
+    PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_save_preflight, verify_psd_file,
+    write_psd,
+};
+pub use psd::{
     PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,
     build_document as build_psd_document, decode as decode_psd,
     encode_mask_pixels as encode_psd_mask, merged_image as decode_psd_merged_image,
     read as read_psd, read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
 };
+pub use safe_save::replace_verified;

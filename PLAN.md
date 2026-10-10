@@ -26,7 +26,69 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.175.1): macOS CI fix — tests that pressed literal
+**Latest (2026-10-10, 0.176.0): a library PSD writer for flat documents,
+safe by construction, not yet wired to the UI (PSD write, round R1 of
+six).** `aurora_io::write_psd` (`crates/aurora-io/src/psd/write.rs`)
+writes root-level pixel layers as a version-1, 16-bit RGB, PackBits
+PSD: layer info in an `Lr16` block (layer-info length 0), records
+bottom-to-top, each with a Pascal name (ASCII-folded, padded to 4) plus
+`luni`, opacity byte, `iOpa` fill, the blend key from an exhaustive,
+wildcard-free `psd_blend_key` (the inverse of the reader's
+`blend_for_key`, all 27 modes), visibility (flags bit 1 set = hidden),
+and channels `-1, 0, 1, 2` over the layer's tile-occupied extent
+intersected with its bounds; then a planar, four-channel, white-matted
+(`c' = c*a + 1 - a`) merged image behind a negative layer count, pulled
+row by row from a `PsdCompositeSource` (an `&Image` impl for now — the
+compositor lives above `aurora-io`). It streams: records go out with
+placeholder channel lengths, then each channel reserves its row table
+and walks the extent one tile-row band at a time through
+`TileStore::get` (absent tiles are zeros and are never materialised),
+patching the row table and the length (compression field included) by
+seeking back; every length is checked (`IoError::PsdWriteTooLarge`).
+Samples are straight alpha in the store, so they are quantised with
+`aurora_color::quantize_u16` and nothing else; clipped and `NaN` values
+are counted. `psd_save_preflight` refuses PSB, groups, masks and Curves
+("not yet supported"), a canvas over 30,000 px a side ("use .psb"), an
+empty document and more than 32,767 records, and returns the structural
+part of the `PsdWriteReport` (long names, opacity/fill rounded to
+1/255 when that changes the value, Dissolve); the measured part (clipped,
+`NaN`) follows from the write. `aurora_io::replace_verified` writes a
+`tempfile` `O_EXCL` temp file beside the target, `sync_all`s it,
+verifies it by path, renames it over the target and fsyncs the directory
+(Unix); on any error the temp file goes and the target is untouched.
+`verify_psd_file` re-reads the file twice — with its own small parser
+(header, `Lr16`, count and order, every record field, exact `u16` sample
+hashes per layer and for the merged image, RLE row lengths) and through
+the real `read_streaming` (one layer in memory), checking the built
+document's names, modes, opacity, fill, visibility, sizes and decoded
+`f16` samples. psd-tools 1.17.4 reads the writer's fixture with every
+layer field and pixel exact and the merged image within 0.001/65535
+(`scripts/verify_psd_write.py`, not in CI). Nothing in the app calls any
+of it yet. Measured: 3,302 tests pass, 0 failed (62 ignored, after the review revision),
+`AURORA_REQUIRE_GPU=1` on the RTX 3090. See the 0.176.0 addendum under
+"Next action".
+
+**The PSD write plan (2026-10-10), six rounds:** R1 (0.176.0, this) the
+flat library writer; R2 (0.177.0) app wiring — `save_psd_file`, picker
+filters, a "Save With Changes" dialog (Save Anyway / Cancel) holding the
+pending temp file, refusals through "Couldn't Save File", and the sRGB
+ICC profile resource (1039) — moved here from R4 by the 0.176.0 review,
+because invariant §7.3.6 (every buffer carries its colour space) means
+no PSD may be written untagged once saving is user-reachable; R3
+(0.178.0) groups (`lsct` divider/folder pairs, `norm`, never `pass`) and
+masks; R4 (0.179.0) Curves (`curv`), losses carried from open, and
+clean-state rules; R5 (0.180.0) PSB and a banded,
+streamed composite; R6 (optional, 0.181.0) ZIP with prediction and a
+psd-tools workflow. **Design-owner decisions (Cahya, 2026-10-10):**
+(1) deep-shadow `f16` → `u16` rounding (≤ 2^-17) is documented, not
+itemised in the warning; (2) a `.psd` over 30,000 px a side is refused
+with a hint to use `.psb`, never written as PSB under a `.psd` name;
+(3) Dissolve is warned about ("Dissolve layers will look different in
+apps other than Photoshop."); (4) a document becomes clean only after a
+lossless save or one whose only items were carried from open — after a
+"Save Anyway" with changes it stays dirty and keeps its path.
+
+**Previously (2026-10-10, 0.175.1): macOS CI fix — tests that pressed literal
 `Ctrl` chords against the now per-platform shortcut table (patch).** GitHub
 Actions' macOS test job failed on 0.175.0 at
 `document_tabs_tests::a_palette_document_entry_closes_the_palette_before_the_switch`
@@ -31824,6 +31886,119 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.176.0) — flat PSD writer (PSD write R1).**
+
+Changed: `aurora-io` (`src/psd/write.rs` new: `write_psd`,
+`psd_save_preflight`, `PsdWriteReport`, `PsdSaveRefusal`,
+`PsdSaveOptions`/`PsdFormat`, `PsdCompositeSource`, `psd_blend_key`,
+`verify_psd_file`, `PsdExpectation`; `src/psd/write_tests.rs` new;
+`src/safe_save.rs` new: `replace_verified`; `error.rs`:
+`PsdSaveRefused`, `PsdWriteTooLarge`, `PsdVerifyFailed`; `psd.rs`
+module doc no longer says "read only"; `Cargo.toml`: `tempfile` moved
+from dev- to a normal dependency — already in the lock and allowed by
+`cargo deny`); `scripts/verify_psd_write.py` new; version 0.176.0.
+
+Overflow is `IoError::PsdWriteTooLarge { what }`, a new variant, not the
+reader's `PsdTooLarge { width, height, max }`, whose message ("the file
+declares a … image") would be wrong for a length overflow.
+
+The writer's bytes equal the test-only writer's (`test_writer.rs`) for
+a two-layer file with a hidden, Screen, 200/100 opacity/fill, non-ASCII
+layer and a matted merged image
+(`writer_matches_test_writer_bytes_for_a_two_layer_file`); its PackBits
+is its own copy, so that equality also checks the two encoders agree.
+
+Mutations (each run with `AURORA_REQUIRE_GPU=1 cargo test -p aurora-io
+--lib psd::write_tests`, restored from a scratchpad backup, sha256
+re-checked):
+
+| Mutation | Result |
+|---|---|
+| visibility bit inverted | killed (8 tests) |
+| channel length without the compression field | killed (12) |
+| records written top-to-bottom | killed (4) |
+| merged planes interleaved by row | killed (8) |
+| no white matte | killed (2) |
+| Screen's key swapped to `lite` | killed (2) |
+| `replace_verified` renames before verifying | killed (2) |
+| temp file not removed on error (`disable_cleanup`) | killed (3) |
+| preflight does not refuse groups | killed (1) |
+| no Dissolve item | killed (1) |
+| Pascal name padded to 2 | killed (7) |
+| `NaN` not counted | killed (1) |
+| opacity-rounding comparison inverted | killed (5) |
+| `Lr16` padding dropped | survived at first; killed (1) by the added `lr16_block_is_padded_to_4_outside_its_length` |
+| no `sync_all` on the temp file | **survives** — durability is not observable without a power cut |
+
+psd-tools: `scripts/verify_psd_write.py` on the fixture the ignored
+`write_psd_fixtures_for_psd_tools` writes (300 × 270, three layers: a
+Normal background, a Multiply 128-opacity "Ébauche 草稿" layer, a hidden
+Screen layer with fill 51) — `OK: psd-tools 1.17.4 read 3 layers and the
+merged image; largest pixel difference 0.001/65535`. Every layer name,
+blend key, opacity, fill, visibility, position, size and 16-bit sample
+was exact; psd-tools un-mattes the merged image exactly as expected.
+
+Gate (one pass after the last code change, RTX 3090): `cargo fmt --check`, layering, no-hardcoded-style, `cargo check --workspace --locked`, `cargo clippy --workspace --all-targets --all-features -D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,296 passed, 0 failed, 62 ignored (3,272 + 24 new; the one new ignored test is the psd-tools fixture writer); `cargo doc … --document-private-items --keep-going` with `-D warnings` clean; `cargo deny check all` ok; `design/check_contrast.py` passes. The mutation matrix was run before the last two edits, which were a clippy-suggested `is_multiple_of` in a test and a `mod@` doc link — neither touches a mutated line.
+
+**Review revision (0.176.0, same version, judge REVISE 0.87, no safety
+defect found).** W-1: `pack_bits` broke a literal at every two-byte run,
+so `x y y …` grew by a third and a 16-bit row past 24,576 px overflowed
+the `u16` row count — a valid 30,000 px `.psd` would have been refused.
+A literal now stops only before a run of three or more (a two-byte run
+is a repeat only when it starts a packet), giving the standard bound
+`n + ceil(n/128)`; new direct tests (`pack_bits_edge_rows`,
+`pack_bits_stays_within_n_plus_n_over_128` — `x y y`, alternating,
+mixed and random rows, all round-tripped through the reader's
+`unpack_bits` — and `a_30000_px_worst_case_row_fits_a_u16_row_count`).
+The test-only writer's `pack_bits` got the same rule so the byte-equality
+test still compares whole files; PackBits correctness is now carried by
+those direct tests rather than by the two encoders' independence. C-1:
+a `.psd` is refused once it would reach 2 GiB (`PSD_MAX_FILE_BYTES` =
+2^31 - 1, checked after every channel band and every merged row,
+`PsdWriteTooLarge`, "use .psb instead";
+`a_psd_reaching_the_size_limit_is_refused_with_a_psb_hint`, through a
+test-only small limit). S-2: on Unix the target's permission bits are
+now set through the temp file's handle, so they are kept exactly
+whatever the umask (`replace_verified_keeps_0o664_exactly_whatever_the_umask`;
+this machine's umask is 0002, so the 0o640 test is the one that kills
+the "not copied" mutation here); Windows copies nothing, so a read-only
+target fails at the rename and the temp file is removed. S-3: the unused
+reopened handle is gone; `verify` opens the path itself. V-1:
+`&Image::read_row` reports a bad row as `IoError::PsdCompositeRow { y }`.
+D-1: the limitations below. Re-run: every mutation of the table above is
+still killed (the rename-before-verify one re-targeted at the new code),
+plus — PackBits literal breaking at a two-byte run again: killed (3);
+2 GiB check removed from channels: killed (1) once the test also checks
+the write stopped early; 2 GiB check removed everywhere: killed (1);
+target permissions not copied: killed (1); verify's reader pass always
+skipped: killed (1), by a new tampered-`decoded_hash` case. psd-tools
+re-run on a fresh fixture: `OK: psd-tools 1.17.4 read 3 layers and the merged image; largest pixel difference 0.001/65535`. Gate, one pass after the last code change: fmt, layering, style, `check --locked`, clippy `-D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,302 passed, 0 failed, 62 ignored (6 new); `cargo doc` `-D warnings` clean; `cargo deny` ok; contrast passes; Windows `cargo check --target x86_64-pc-windows-gnu --all-targets -p aurora-io` `-D warnings` clean (stubbed `lcms2-sys`).
+
+**Known limitations (0.176.0):** each layer's tiles are read four times
+(once per channel), so an evicted tile can page in four times; the
+merged image comes from a whole in-memory `&Image` (R5 streams it); the
+layer extent is tile-granular (transparent pixels inside an occupied tile
+are written); opacity/fill "rounded" is an exact `f32` comparison, so a
+value only float-close to k/255 is reported; a name containing U+0000
+reads back cut short (the reader stops at NUL) and then fails
+verification; clipped/`NaN` counts include the merged image, so one bad
+pixel can count twice; the directory fsync is a no-op off Unix;
+**`verify_psd_file`'s reader pass decodes one whole layer into an
+`Image`** (up to 2 GiB of `f16` RGBA under the reader's `PIXEL_BUDGET`,
+which would be ~7.2 GB for a 30,000² layer) — so for a file whose layers
+add up to more than 2^28 px that pass is skipped and only the streaming
+raw check (exact `u16` hashes, one RLE row at a time) runs; that skip
+branch has no test. `replace_verified` keeps no owner, group, ACLs or
+extended attributes and breaks hard links.
+
+**Not verified:** Photoshop itself has not opened a file this writer
+wrote; whether Photoshop accepts layers in `Lr16` with an empty layer
+info, and how it reads the negative-count merged alpha, are unverified
+(psd-tools and Aurora's reader accept both). The writer is not
+reachable from the app. Windows: `cargo check --target
+x86_64-pc-windows-gnu --all-targets -p aurora-io` with `-D warnings` is
+clean (`lcms2-sys` stubbed through `LCMS2_LIB_DIR`; type-check only).
 
 **Addendum 2026-10-10 (0.175.0) — document-tabs polish (R6).**
 
