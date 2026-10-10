@@ -1203,6 +1203,23 @@ impl TileResidency {
         self.write_uniform(queue, viewport_px, 1.0);
     }
 
+    /// Forgets which tile every slot holds (0.172.0), so the next
+    /// [`Self::sync`] re-uploads every visible slot. For when the store
+    /// behind the atlas changes — a document switch: the incoming
+    /// document's composite tiles have the same ids as the outgoing one's
+    /// and may well be clean, so the ordinary resident-and-clean check
+    /// would skip them and keep drawing the previous document. Keeps the
+    /// texture, the origin and the uniform; only the slot map goes.
+    pub fn forget_slots(&mut self) {
+        self.slots.clear();
+    }
+
+    /// How many slots currently hold a tile (0.172.0, for tests).
+    #[must_use]
+    pub fn resident_slots(&self) -> usize {
+        self.slots.len()
+    }
+
     /// The atlas grid — slots across, slots down — for a viewport:
     /// `viewport.div_ceil(TILE) + 1` on each axis (the spike's own
     /// `ct = viewport/TILE + 1`; the `+ 1` is one tile of margin, which
