@@ -738,6 +738,18 @@ mod tests {
                 .collect();
 
             let held = take_lock(&dir);
+            // Keep the pollers running until one of them has probed the
+            // held lock. On a loaded machine they may not be scheduled at
+            // all before `take_lock` returns, and stopping them at once
+            // would leave the run racing nothing (0.165.2). Bounded so a
+            // poller that never runs fails the sightings assertion below
+            // rather than hanging the test.
+            let seen = sightings.load(Ordering::Relaxed);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sightings.load(Ordering::Relaxed) == seen && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
             stop.store(true, Ordering::Relaxed);
             for poller in pollers {
                 if poller.join().is_err() {
