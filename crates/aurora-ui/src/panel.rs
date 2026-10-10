@@ -959,6 +959,51 @@ pub fn close_panel(
     tree.set_accessibility(panel.body, Node::new(Role::GenericContainer))
 }
 
+/// The accessible description a floating panel carries (0.167.0), so a
+/// screen reader can tell a floating panel from a docked one.
+pub const FLOATING_DESCRIPTION: &str = "Floating";
+
+/// Marks `panel` as floating (0.167.0) or docked: its root becomes a
+/// `WidgetKind::RaisedPanel` (`surface.raised`, one elevation step up) or
+/// back to a `WidgetKind::Panel`, and carries [`FLOATING_DESCRIPTION`] or
+/// no description. Its role, label, title slot and content are untouched.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] if `panel.root` doesn't exist.
+pub(crate) fn set_panel_raised(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    raised: bool,
+) -> Result<(), WidgetError> {
+    let kind = if raised {
+        WidgetKind::RaisedPanel
+    } else {
+        WidgetKind::Panel
+    };
+    let payload = tree
+        .payload_mut(panel.root)
+        .ok_or(WidgetError::UnknownWidget(panel.root))?;
+    let kind_changed = *payload != kind;
+    *payload = kind;
+    let node = tree
+        .accessibility(panel.root)
+        .ok_or(WidgetError::UnknownWidget(panel.root))?;
+    let mut updated = node.clone();
+    if raised {
+        updated.set_description(FLOATING_DESCRIPTION);
+    } else {
+        updated.clear_description();
+    }
+    if updated != *node {
+        tree.set_accessibility(panel.root, updated)?;
+    }
+    if kind_changed {
+        tree.mark_dirty(panel.root)?;
+    }
+    Ok(())
+}
+
 /// Puts `panel` into the shape a tab group needs, or back into a lone
 /// docked panel's (0.166.0, drag-to-redock — [`crate::panel_group`] then
 /// takes over a grouped one's role, label and visibility). Grouped: its

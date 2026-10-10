@@ -43,7 +43,7 @@ use aurora_widgets::{FocusManager, WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, Display, FlexDirection, Style};
 
-use crate::dock::{DockArrangement, DockPanel};
+use crate::dock::{DockArrangement, DockPanel, DockPlacement};
 use crate::panel::{
     PanelHandle, PanelSizing, close_panel, insert_panel, panel_is_closed, panel_is_collapsed,
     set_panel_collapsed, set_panel_sizing,
@@ -146,6 +146,14 @@ pub struct Workspace {
     /// placed root child, hidden except during a panel drag
     /// ([`crate::PanelDrag`]).
     pub drop_indicator: WidgetId,
+    /// The floating slots (0.167.0, [`crate::dock`]'s floating panels),
+    /// bottom to top: each a frame — an absolutely placed child of
+    /// [`Self::canvas_area`], so it is drawn over the canvas, under every
+    /// root child after the canvas column (the drop indicator, dialogs,
+    /// the palette) and every popover — holding a lone panel or a tab
+    /// group. The canvas area's children are exactly these frames, in this
+    /// order, which is also their `Tab` and accessibility order.
+    pub floating: Vec<FloatFrame>,
     /// The collapsed rail's label strip (0.165.0, [`crate::panel_strip`]):
     /// the root's child right after [`Self::rail`], hidden while the rail
     /// is expanded and shown in its place while it is collapsed
@@ -165,7 +173,27 @@ pub struct Workspace {
     pub history_rows: HashMap<WidgetId, usize>,
 }
 
-/// One rail dock slot (0.166.0): a lone docked panel, or a tab group.
+/// A floating slot in the tree (0.167.0): its frame (a
+/// `WidgetKind::RaisedPanel`, an unlabelled `Role::GenericContainer`
+/// holding the content), a group's grip, the content, and its position in logical px from
+/// the canvas area's top-left — the source of truth the frame's style is
+/// written from ([`sync_floating_frames`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatFrame {
+    pub frame: WidgetId,
+    /// A floating *group's* grip (the frame's first child, above the tab
+    /// strip): a `spacing.sm`-tall bare strip, the handle that moves the
+    /// whole group — a group's tabs share the strip's whole width, so the
+    /// strip itself has no bare part to grab. `None` for a lone panel,
+    /// whose title row is its handle.
+    pub grip: Option<WidgetId>,
+    pub content: RailSlot,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// One dock slot (0.166.0): a lone panel, or a tab group — in the rail
+/// or, since 0.167.0, the content of a [`FloatFrame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RailSlot {
     Panel(PanelHandle),
@@ -212,9 +240,18 @@ impl Workspace {
             .find(|&candidate| self.panel(candidate).root == panel.root)
     }
 
-    /// Every tab group in the rail, top to bottom.
+    /// Every slot, the rail's top to bottom and then the floating ones
+    /// bottom to top (0.167.0).
+    pub fn all_slots(&self) -> impl Iterator<Item = &RailSlot> {
+        self.slots
+            .iter()
+            .chain(self.floating.iter().map(|float| &float.content))
+    }
+
+    /// Every tab group, the rail's top to bottom, then the floating ones
+    /// (0.167.0) bottom to top.
     pub fn groups(&self) -> impl Iterator<Item = &PanelGroup> {
-        self.slots.iter().filter_map(|slot| match slot {
+        self.all_slots().filter_map(|slot| match slot {
             RailSlot::Group(group) => Some(group),
             RailSlot::Panel(_) => None,
         })
@@ -251,27 +288,49 @@ impl Workspace {
             .find(|panel| self.tree.contains(panel.root) && self.tree.is_within(panel.root, id))
     }
 
-    /// The current arrangement, read from the slots and each group's
-    /// selected tab.
+    /// The current arrangement, read from the slots, each group's
+    /// selected tab and (0.167.0) the floating frames' positions.
     #[must_use]
     pub fn dock_arrangement(&self) -> DockArrangement {
+        let entry = |placement: DockPlacement, slot: &RailSlot| {
+            let panels = slot
+                .panels()
+                .into_iter()
+                .map(|panel| self.dock_panel(panel))
+                .collect();
+            let selected = match slot {
+                RailSlot::Panel(_) => 0,
+                RailSlot::Group(group) => panel_group_selected(&self.tree, group).unwrap_or(0),
+            };
+            (placement, panels, selected)
+        };
         let raw = self
             .slots
             .iter()
-            .map(|slot| {
-                let panels = slot
-                    .panels()
-                    .into_iter()
-                    .map(|panel| self.dock_panel(panel))
-                    .collect();
-                let selected = match slot {
-                    RailSlot::Panel(_) => 0,
-                    RailSlot::Group(group) => panel_group_selected(&self.tree, group).unwrap_or(0),
-                };
-                (panels, selected)
-            })
+            .map(|slot| entry(DockPlacement::Rail, slot))
+            .chain(self.floating.iter().map(|float| {
+                entry(
+                    DockPlacement::Floating {
+                        x: float.x,
+                        y: float.y,
+                    },
+                    &float.content,
+                )
+            }))
             .collect();
-        DockArrangement::repaired(raw).0
+        DockArrangement::repaired_placed(raw).0
+    }
+
+    /// The floating frame holding `panel`, by index, if it floats.
+    #[must_use]
+    pub fn floating_index_of(&self, panel: PanelHandle) -> Option<usize> {
+        self.floating.iter().position(|float| {
+            float
+                .content
+                .panels()
+                .iter()
+                .any(|member| member.root == panel.root)
+        })
     }
 }
 
@@ -451,11 +510,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     // rows up to the `size.content_panel_max_rows` token, then they scroll); History keeps the zero-basis
     // `Fill` rule and absorbs what they leave. Equal thirds squeezed the
     // Properties panel's Curves editor to nothing (`PanelSizing`).
-    for panel in [layers, properties] {
-        if let Err(err) = set_panel_sizing(&mut tree, panel, PanelSizing::Content, scales) {
-            unreachable!("the panel was just inserted into this same tree: {err:?}");
-        }
-    }
+    size_docked_panels(&mut tree, layers, properties, scales);
     if let Err(err) = sync_panel_group(&mut tree, &panel_group) {
         unreachable!("the group was just inserted into this same tree: {err:?}");
     }
@@ -483,10 +538,238 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         history,
         slots: vec![RailSlot::Panel(layers), RailSlot::Group(panel_group)],
         drop_indicator,
+        floating: Vec::new(),
         panel_strip,
         history_current: None,
         history_rows: HashMap::new(),
     }
+}
+
+/// Gives the two content-sized panels their docked sizing at build time
+/// ([`docked_sizing`]); History keeps `insert_panel_group`'s `Fill`.
+fn size_docked_panels(
+    tree: &mut WidgetTree<WidgetKind>,
+    layers: PanelHandle,
+    properties: PanelHandle,
+    scales: &Scales,
+) {
+    for (panel, id) in [
+        (layers, DockPanel::Layers),
+        (properties, DockPanel::Properties),
+    ] {
+        if let Err(err) = set_panel_sizing(tree, panel, docked_sizing(id), scales) {
+            unreachable!("the panel was just inserted into this same tree: {err:?}");
+        }
+    }
+}
+
+/// How a panel shares the rail's height while docked (0.161.0's rule, one
+/// place since 0.167.0): Layers and Properties take their content's height
+/// up to `size.content_panel_max_rows` rows, History fills what they
+/// leave. A floating panel is always [`PanelSizing::Content`] — a float
+/// has no column to fill, so a `Fill` panel would shrink to its one-row
+/// floor — and returns to this sizing when docked.
+#[must_use]
+pub fn docked_sizing(panel: DockPanel) -> PanelSizing {
+    match panel {
+        DockPanel::Layers | DockPanel::Properties => PanelSizing::Content,
+        DockPanel::History => PanelSizing::Fill,
+    }
+}
+
+/// A floating frame's style (0.167.0): absolutely placed at `x`, `y`
+/// logical px from the canvas area's top-left, `width` wide, a column as
+/// tall as its content up to `max_height` (the canvas area's height, once
+/// known; past it the content shrinks and its body scrolls).
+pub(crate) fn float_frame_style(x: f32, y: f32, width: f32, max_height: Option<f32>) -> Style {
+    Style {
+        position: taffy::Position::Absolute,
+        flex_direction: FlexDirection::Column,
+        inset: taffy::Rect {
+            left: taffy::style_helpers::length(x),
+            top: taffy::style_helpers::length(y),
+            right: taffy::style_helpers::auto(),
+            bottom: taffy::style_helpers::auto(),
+        },
+        size: taffy::Size {
+            width: taffy::style_helpers::length(width),
+            height: taffy::style_helpers::auto(),
+        },
+        max_size: taffy::Size {
+            width: taffy::style_helpers::auto(),
+            height: max_height
+                .map_or_else(taffy::style_helpers::auto, taffy::style_helpers::length),
+        },
+        ..Default::default()
+    }
+}
+
+/// A floating group's grip style (0.167.0, [`FloatFrame::grip`]): one
+/// `spacing.sm` tall, never shrunk, full width.
+pub(crate) fn float_grip_style(scales: &Scales) -> Style {
+    #[allow(clippy::cast_precision_loss)]
+    let height = taffy::style_helpers::length(scales.spacing.sm as f32);
+    Style {
+        flex_shrink: 0.0,
+        size: taffy::Size {
+            width: taffy::style_helpers::auto(),
+            height,
+        },
+        min_size: taffy::Size {
+            width: Dimension::ZERO,
+            height,
+        },
+        ..Default::default()
+    }
+}
+
+/// The width a floating panel takes (0.167.0): the rail's width — its
+/// default and, today, its only width (floats are not resized on their
+/// own) — capped at the canvas area's width once that is known.
+pub(crate) fn float_width(workspace: &Workspace) -> f32 {
+    let rail = rail_width(&workspace.tree, workspace.rail).unwrap_or(RAIL_WIDTH_DEFAULT);
+    #[allow(clippy::cast_precision_loss)]
+    match workspace.tree.bounds(workspace.canvas_area) {
+        Some(canvas) if canvas.width > 0 => rail.min(canvas.width as f32),
+        _ => rail,
+    }
+}
+
+/// Keeps every floating panel inside the canvas area (0.167.0), from the
+/// last layout: each frame takes the float width (the rail's, capped at
+/// the canvas area's), at most the canvas area's height, and a position
+/// clamped so the whole frame — its title
+/// row first of all — lies inside the canvas area (its left edge in
+/// `[0, W - width]`, its top in `[0, H - min(height, H)]`). The clamped
+/// position is stored ([`FloatFrame::x`]/`y`), so a saved layout records
+/// where the panel really is. Run after every layout — a window resize, a
+/// rail resize or collapse, a scale-factor change and the first layout
+/// after a load all reach it through the one layout path — and lay out
+/// again when it returns `true`. A canvas area not laid out yet, or of
+/// zero size, clamps nothing (so a load's positions survive until the
+/// first real layout).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn sync_floating_frames(workspace: &mut Workspace) -> Result<bool, WidgetError> {
+    let shown_changed = sync_floating_shown(workspace)?;
+    let Some(canvas) = workspace.tree.bounds(workspace.canvas_area) else {
+        return Ok(shown_changed);
+    };
+    if canvas.width == 0 || canvas.height == 0 {
+        return Ok(shown_changed);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (canvas_w, canvas_h) = (canvas.width as f32, canvas.height as f32);
+    let width = float_width(workspace);
+    let mut changed = shown_changed;
+    for index in 0..workspace.floating.len() {
+        let Some(float) = workspace.floating.get(index).cloned() else {
+            continue;
+        };
+        // A hidden frame (everything in it closed) keeps its position, so
+        // reopening shows it where it was.
+        if !float_frame_shown(&workspace.tree, float.frame) {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let height = workspace
+            .tree
+            .bounds(float.frame)
+            .map_or(0.0, |bounds| bounds.height as f32)
+            .min(canvas_h);
+        let x = float.x.clamp(0.0, (canvas_w - width).max(0.0));
+        let y = float.y.clamp(0.0, (canvas_h - height).max(0.0));
+        let style = float_frame_style(x, y, width, Some(canvas_h));
+        if workspace.tree.style(float.frame) != Some(&style) {
+            workspace.tree.set_style(float.frame, style)?;
+            changed = true;
+        }
+        if let Some(entry) = workspace.floating.get_mut(index) {
+            entry.x = x;
+            entry.y = y;
+        }
+    }
+    Ok(changed)
+}
+
+/// Whether a floating frame is shown — `false` once every panel in it is
+/// closed ([`sync_floating_shown`]).
+pub(crate) fn float_frame_shown(tree: &WidgetTree<WidgetKind>, frame: WidgetId) -> bool {
+    tree.style(frame)
+        .is_some_and(|style| style.display != Display::None)
+}
+
+/// Hides every floating frame whose panels are all closed and shows the
+/// others again (0.167.0 review J-1): hidden is `Display::None` and
+/// AT-`hidden`, so a closed floating panel — or a fully closed floating
+/// group's grip — leaves no invisible band over the canvas that would
+/// block strokes, the wheel or start a drag, and no `Tab` stop. The
+/// frame's position is untouched, so a reopened panel comes back where it
+/// was. Run by every path that closes or reopens a panel (the close,
+/// toggle, show and tab-select actions, a dock rearrangement) and, as a
+/// backstop, by [`sync_floating_frames`] after every layout. Returns
+/// whether any frame changed. The caller repairs focus
+/// ([`crate::refocus_out_of_hidden`]).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn sync_floating_shown(workspace: &mut Workspace) -> Result<bool, WidgetError> {
+    let mut changed = false;
+    for float in workspace.floating.clone() {
+        let mut open = false;
+        for panel in float.content.panels() {
+            open |= !panel_is_closed(&workspace.tree, panel)?;
+        }
+        let before = float_frame_shown(&workspace.tree, float.frame)
+            && !workspace
+                .tree
+                .accessibility(float.frame)
+                .is_some_and(Node::is_hidden);
+        if before != open {
+            set_shown(&mut workspace.tree, float.frame, open)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// The floating frame under `point` (window-logical px), topmost first
+/// (0.167.0): the one holding the widget a press there would hit
+/// (`WidgetTree::hit_test`), so a popover opened from a floating panel
+/// counts as that panel's, and one from anywhere else counts as none.
+#[must_use]
+pub fn floating_index_at(workspace: &Workspace, point: (f32, f32)) -> Option<usize> {
+    let hit = workspace.tree.hit_test(point)?;
+    workspace.floating.iter().position(|float| {
+        float_frame_shown(&workspace.tree, float.frame)
+            && workspace.tree.is_within(float.frame, hit)
+    })
+}
+
+/// Raises floating frame `index` above every other floating panel
+/// (0.167.0, a press on it): the frame moves to the canvas area's last
+/// child and the slot to the top of [`Workspace::floating`]. Nothing is
+/// rebuilt — the frame and everything in it keep their ids and bounds, so
+/// the press that raised it still lands where it was aimed. Returns
+/// whether anything moved (`false` for the top one).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed workspace.
+pub fn raise_floating(workspace: &mut Workspace, index: usize) -> Result<bool, WidgetError> {
+    if index.saturating_add(1) >= workspace.floating.len() {
+        return Ok(false);
+    }
+    let float = workspace.floating.remove(index);
+    let frame = float.frame;
+    workspace.floating.push(float);
+    workspace
+        .tree
+        .move_child(frame, workspace.canvas_area, usize::MAX)?;
+    Ok(true)
 }
 
 /// The canvas column (0.160.0): the options bar over the canvas area,
@@ -756,7 +1039,14 @@ pub fn expand_rail_showing(
     workspace: &mut Workspace,
     panel: PanelHandle,
 ) -> Result<bool, WidgetError> {
-    let expanded = set_rail_collapsed(workspace, false)?;
+    // 0.167.0: a floating panel is not in the rail, so showing it never
+    // expands a collapsed rail.
+    let floating = workspace.floating_index_of(panel).is_some();
+    let expanded = if floating {
+        false
+    } else {
+        set_rail_collapsed(workspace, false)?
+    };
     let shown = show_workspace_panel(workspace, panel)?;
     Ok(expanded || shown)
 }
@@ -832,6 +1122,15 @@ pub fn toggle_workspace_panel(
     workspace: &mut Workspace,
     panel: PanelHandle,
 ) -> Result<(), WidgetError> {
+    toggle_workspace_panel_in(workspace, panel)?;
+    // 0.167.0: a reopened floating panel's frame is shown again.
+    sync_floating_shown(workspace).map(|_| ())
+}
+
+fn toggle_workspace_panel_in(
+    workspace: &mut Workspace,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
     if let Some(group) = workspace.group_of(panel).cloned()
         && let Some(index) = group.index_of(panel)
     {
@@ -862,7 +1161,8 @@ pub fn close_workspace_panel(
     if let Some(group) = workspace.group_of(panel).cloned() {
         sync_panel_group(&mut workspace.tree, &group)?;
     }
-    Ok(())
+    // 0.167.0 review J-1: a floating frame with nothing open is hidden.
+    sync_floating_shown(workspace).map(|_| ())
 }
 
 /// Selects `panel`'s tab when it is a grouped panel not currently shown
@@ -887,6 +1187,7 @@ pub fn select_panel_tab(
         return Ok(false);
     }
     show_panel_group_tab(&mut workspace.tree, &group, index)?;
+    sync_floating_shown(workspace)?;
     Ok(true)
 }
 
