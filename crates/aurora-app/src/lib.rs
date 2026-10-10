@@ -548,6 +548,9 @@ mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
 mod prepared_pixels;
+mod psd_save;
+#[cfg(test)]
+mod psd_save_tests;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -1942,6 +1945,7 @@ fn write_autosave(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
 ) {
     let temp_path = autosave_temp_path(path);
     let Some(mut file) = create_autosave_temp(&temp_path) else {
@@ -1957,13 +1961,14 @@ fn write_autosave(
     // Where this write is allowed to land, decided by whether it turned
     // out to be complete -- see this function's own doc comment.
     let destination;
-    match aurora_io::write_aur_best_effort(
+    match aurora_io::write_aur_best_effort_with_import_losses(
         &mut file,
         layers,
         history,
         canvas_size,
         None,
         skipped,
+        import_losses,
         store,
     ) {
         // The complete-vs-`.partial` choice keys on what *this* write
@@ -2062,6 +2067,7 @@ fn request_autosave(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
 ) -> Option<background_autosave::Generation> {
     request_autosave_within(
         worker,
@@ -2073,6 +2079,7 @@ fn request_autosave(
         canvas_size,
         skipped,
         store,
+        import_losses,
     )
 }
 
@@ -2094,12 +2101,22 @@ fn request_autosave_within(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
 ) -> Option<background_autosave::Generation> {
     // 0.173.0 review (R-1): the generation of a *complete* autosave this
     // call submitted (or wrote), `None` when there is none — a failed or
     // partial snapshot, a dropped job, a failed synchronous write — so a
     // caller can tell "saved once it lands" from "not saved at all".
-    match snapshot_autosave(path, layers, history, canvas_size, skipped, budget, store) {
+    match snapshot_autosave(
+        path,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        budget,
+        store,
+        import_losses,
+    ) {
         SnapshotOutcome::Taken(mut job) => {
             job.document = document;
             let complete = job.destination == job.path;
@@ -2111,7 +2128,15 @@ fn request_autosave_within(
             let generation = worker.supersede(document);
             let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let before = modified(path);
-            write_autosave(path, layers, history, canvas_size, skipped, store);
+            write_autosave(
+                path,
+                layers,
+                history,
+                canvas_size,
+                skipped,
+                store,
+                import_losses,
+            );
             // Complete only if the canonical file was (re)written: a
             // failed write leaves it as it was, and a partial one goes to
             // the partial path. A coarse file clock can only err towards
@@ -2155,6 +2180,7 @@ enum SnapshotOutcome {
 /// out with whatever tile this snapshot could not read folded in, and a
 /// snapshot missing tiles is routed to [`partial_autosave_path`], never
 /// over a complete autosave.
+#[allow(clippy::too_many_arguments)]
 fn snapshot_autosave(
     path: &Path,
     layers: &aurora_doc::LayerTree,
@@ -2163,8 +2189,9 @@ fn snapshot_autosave(
     skipped: &mut aurora_io::SkippedTiles,
     max_texel_bytes: usize,
     store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
 ) -> SnapshotOutcome {
-    let snapshot = match aurora_io::snapshot_aur_best_effort(
+    let mut snapshot = match aurora_io::snapshot_aur_best_effort(
         layers,
         history,
         canvas_size,
@@ -2180,6 +2207,11 @@ fn snapshot_autosave(
             return SnapshotOutcome::Failed;
         }
     };
+    // Review B-1: what the document's open dropped survives a recovery.
+    if let Err(err) = snapshot.set_import_losses(import_losses) {
+        tracing::warn!(?err, path = %path.display(), "failed to encode the autosave's import losses");
+        return SnapshotOutcome::Failed;
+    }
     let destination = if snapshot.skipped().is_empty() {
         path.to_path_buf()
     } else {
@@ -2545,6 +2577,7 @@ fn read_autosave_container(
             history: document.history,
             canvas_size: document.canvas_size,
             skipped_tiles: document.skipped_tiles,
+            import_losses: document.import_losses,
         }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
@@ -2568,6 +2601,10 @@ struct RecoveredDocument {
     /// carried into [`DocumentSession::skipped_tiles`], not warned about yet; see
     /// [`read_autosave_container`]'s own comment.
     skipped_tiles: aurora_io::SkippedTiles,
+    /// What its own open changed (0.177.0 review B-1), carried into
+    /// [`DocumentSession::import_losses`] so a recovered document's
+    /// Photoshop save still lists it.
+    import_losses: Option<Vec<String>>,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -2585,6 +2622,8 @@ struct StartupDocument {
     /// [`DocumentSession::skipped_tiles`] so this session's own writes keep the
     /// record instead of erasing it.
     skipped_tiles: aurora_io::SkippedTiles,
+    /// A recovered document's carried open report (0.177.0 review B-1).
+    import_losses: Option<Vec<String>>,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -2731,6 +2770,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             history,
             canvas_size,
             skipped_tiles,
+            import_losses,
         } = document;
         let active_layer = topmost_pixel_layer(&layers);
         let canvas_view = load_document_view(
@@ -2754,6 +2794,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             },
         );
         session.name = format!("Recovered {}", number + 2);
+        session.import_losses = import_losses;
         // 0.174.0: recovered work is in no file the user chose.
         session.saved_revision = None;
         shelf.parked.push(session);
@@ -2761,6 +2802,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
     shelf
 }
 
+#[allow(clippy::too_many_lines)] // one more carried field (0.177.0) tipped it over
 fn startup_document_from(
     had_previous_marker: bool,
     candidates: &[PathBuf],
@@ -2781,6 +2823,7 @@ fn startup_document_from(
             history,
             canvas_size,
             skipped_tiles: aurora_io::SkippedTiles::new(),
+            import_losses: None,
             was_recovered: false,
             autosave: None,
             recovered_from: None,
@@ -2814,6 +2857,7 @@ fn startup_document_from(
                 history,
                 canvas_size,
                 skipped_tiles,
+                import_losses,
             }) = recovered
             {
                 // Nothing written back out: the file on disk *is* this
@@ -2830,6 +2874,7 @@ fn startup_document_from(
                     history,
                     canvas_size,
                     skipped_tiles,
+                    import_losses,
                     was_recovered: true,
                     autosave: None,
                     recovered_from: Some(position),
@@ -2875,6 +2920,7 @@ fn startup_document_from(
             &mut skipped_tiles,
             AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             store,
+            None,
         ) {
             SnapshotOutcome::Taken(job) => autosave = Some(job),
             SnapshotOutcome::OverBudget => write_autosave(
@@ -2884,6 +2930,7 @@ fn startup_document_from(
                 canvas_size,
                 &mut skipped_tiles,
                 store,
+                None,
             ),
             SnapshotOutcome::Failed => {}
         }
@@ -2895,6 +2942,7 @@ fn startup_document_from(
         history,
         canvas_size,
         skipped_tiles,
+        import_losses: None,
         was_recovered: false,
         autosave,
         recovered_from: None,
@@ -3586,6 +3634,9 @@ enum DialogPurpose {
     QuitReview(document_session::DocumentId),
     /// "“name” Was Exported, Not Saved" (0.174.0 review Q-2).
     ExportedNotSaved,
+    /// "Save With Changes?" (0.177.0): a written PSD whose report is not
+    /// empty waits in `App::pending_psd_save` for Save Anyway or Cancel.
+    PsdSaveWithChanges,
 }
 
 /// The open modal dialog (0.169.0): its widgets, what it was opened for,
@@ -3627,6 +3678,8 @@ enum DialogEffect {
     Close(document_session::DocumentId, document_close::CloseChoice),
     /// Answer the quit review's dialog for this document (0.174.0).
     Quit(document_session::DocumentId, document_close::CloseChoice),
+    /// Answer the Save With Changes dialog (0.177.0).
+    PsdSave(psd_save::PsdSaveChoice),
     /// The action id is not one this purpose's dialog has — logged,
     /// nothing done.
     Unknown,
@@ -3654,6 +3707,9 @@ fn dialog_effect(result: &DialogResult) -> DialogEffect {
         DialogPurpose::MoveRefused if action == MOVE_REFUSED_DISMISS => DialogEffect::Acknowledged,
         DialogPurpose::ExportedNotSaved if action == document_close::EXPORTED_NOT_SAVED_DISMISS => {
             DialogEffect::Acknowledged
+        }
+        DialogPurpose::PsdSaveWithChanges => {
+            psd_save::psd_save_choice(action).map_or(DialogEffect::Unknown, DialogEffect::PsdSave)
         }
         DialogPurpose::ReplaceWorkspace(name) => {
             match workspace_presets::replace_workspace_choice(name, action) {
@@ -3940,7 +3996,7 @@ const OPENABLE_FORMATS: &str =
 
 /// The formats this build saves — [`save_failure_message`]'s own
 /// counterpart to [`OPENABLE_FORMATS`]. The same set today.
-const SAVEABLE_FORMATS: &str = "PNG, JPEG, TIFF or Aurora document (.aur)";
+const SAVEABLE_FORMATS: &str = "PNG, JPEG, TIFF, Photoshop (.psd) or Aurora document (.aur)";
 
 /// `path`'s own file name for a dialog message, made safe to show.
 ///
@@ -4159,6 +4215,18 @@ enum SaveFailure {
     /// This session has no live tile store, so there are no pixels to
     /// export. Nothing is written.
     NoTileStorage,
+}
+
+/// What [`App::save_psd_file`] did (0.177.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsdSaveOutcome {
+    /// Written and in place (a lossless copy).
+    Saved,
+    /// Waiting for the Save With Changes dialog (shown now, or once the
+    /// open dialog closes).
+    Pending,
+    /// Refused or failed; already reported.
+    Failed,
 }
 
 /// The refused-save dialog's own title.
@@ -5361,7 +5429,11 @@ impl FileDialogAccess for SystemFileDialog {
     }
 
     fn save_file(&mut self) -> Option<PathBuf> {
-        rfd::FileDialog::new().save_file()
+        let mut dialog = rfd::FileDialog::new();
+        for (name, extensions) in psd_save::save_file_filters() {
+            dialog = dialog.add_filter(name, extensions);
+        }
+        dialog.save_file()
     }
 }
 
@@ -21251,6 +21323,11 @@ struct App {
     pending_open: document_tabs::PendingOpenStores,
     /// The quit review in progress (0.174.0), if any.
     quit_review: Option<document_close::QuitReview>,
+    /// A written PSD waiting for the Save With Changes dialog (0.177.0).
+    pending_psd_save: Option<psd_save::PendingPsdSave>,
+    /// Its dialog could not open (another held the slot): shown once no
+    /// dialog is open (review L-2, `psd_save::take_deferred_dialog`).
+    psd_dialog_deferred: bool,
     /// The quit review finished: `about_to_wait` runs the clean-quit
     /// cleanup and exits (0.174.0).
     exit_requested: bool,
@@ -21571,6 +21648,7 @@ impl App {
             history,
             canvas_size,
             skipped_tiles,
+            import_losses: startup_import_losses,
             was_recovered,
             autosave: startup_autosave,
             recovered_from,
@@ -21751,11 +21829,14 @@ impl App {
                 if was_recovered {
                     doc.saved_revision = None;
                 }
+                doc.import_losses = startup_import_losses;
                 doc
             },
             shelf: recovered_shelf(extra_sessions),
             pending_open: document_tabs::PendingOpenStores::default(),
             quit_review: None,
+            pending_psd_save: None,
+            psd_dialog_deferred: false,
             exit_requested: false,
             quit_confirmed: false,
             quit_pending: false,
@@ -22385,6 +22466,7 @@ impl App {
                 self.doc.canvas_size,
                 &mut self.doc.skipped_tiles,
                 store,
+                self.doc.import_losses.as_deref(),
             );
         } else {
             tracing::warn!("no live tile store; the new document is not autosaved");
@@ -22507,6 +22589,12 @@ impl App {
         let Some(path) = self.file_dialog.save_file() else {
             return false;
         };
+        if document_close::dialog_save_kind(&path) == document_close::DialogSave::Psd {
+            // 0.177.0 (design-owner decision): a lossless PSD save is a save
+            // and the close or quit goes ahead; one with changes leaves its
+            // Save With Changes dialog open and the close or quit stops.
+            return self.save_psd_file(&path) == PsdSaveOutcome::Saved && !self.doc.is_dirty();
+        }
         if document_close::dialog_save_kind(&path) == document_close::DialogSave::ExportOnly {
             // Review Q-2: the export the user asked for, then said.
             self.export_file(&path);
@@ -22850,6 +22938,7 @@ impl App {
             return false;
         };
         if let Some(item) = unwritten_layers_item(unwritten) {
+            self.doc.import_losses = Some(vec![item.clone()]);
             let report = aurora_io::PsdImportReport { items: vec![item] };
             if let Some(message) = psd_report_message(&display_file_name(path), &report)
                 && !self.open_psd_report_dialog(&message)
@@ -22892,12 +22981,16 @@ impl App {
             report,
         } = document;
         let mut report = report;
+        // Review B-1: set before the install, whose autosave carries it.
+        self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
         let Some(unwritten) =
             self.install_opened_document(layers, history, pixels, masks, canvas_size)
         else {
             return false;
         };
         report.items.extend(unwritten_layers_item(unwritten));
+        // Review H-1: kept for a later Photoshop save of this document.
+        self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
         if let Some(message) = psd_report_message(&display_file_name(path), &report) {
             tracing::info!(path = %path.display(), items = report.items.len(), "opened a PSD with changes");
             if !self.open_psd_report_dialog(&message) {
@@ -23042,6 +23135,7 @@ impl App {
                 canvas_size,
                 &mut self.doc.skipped_tiles,
                 store,
+                self.doc.import_losses.as_deref(),
             );
         } else {
             // Nothing to free beyond the in-memory structure itself:
@@ -23173,7 +23267,11 @@ impl App {
             canvas_size,
             profile: _profile,
             skipped_tiles,
+            import_losses,
         } = document;
+        // Review B-1: what this document's own first open dropped, kept
+        // across the `.aur` (set before the install's autosave).
+        self.doc.import_losses = import_losses;
         let (layer_rows, active_layer) = match replace_document(
             &mut self.workspace,
             &scales,
@@ -23215,6 +23313,7 @@ impl App {
                 canvas_size,
                 &mut self.doc.skipped_tiles,
                 store,
+                self.doc.import_losses.as_deref(),
             );
         }
 
@@ -23577,8 +23676,134 @@ impl App {
         if is_aur_path(path) {
             return self.save_aur_file(path);
         }
+        if psd_save::is_psd_save_path(path) || psd_save::is_psb_save_path(path) {
+            // 0.177.0: saved only when lossless (`psd_save::record_psd_save`).
+            return self.save_psd_file(path) == PsdSaveOutcome::Saved && !self.doc.is_dirty();
+        }
         self.export_file(path);
         false
+    }
+
+    /// Save As Photoshop (0.177.0, [`psd_save`]): preflight, composite,
+    /// write and verify beside `path`; an empty report is swapped in at
+    /// once, anything else waits in [`Self::pending_psd_save`] behind the
+    /// "Save With Changes?" dialog. A refusal or failure is shown in
+    /// "Couldn't Save File". A lossless save is a real save (clean, the
+    /// `.psd` path and name); anything else leaves the document's saved
+    /// state and path alone. Returns what happened.
+    fn save_psd_file(&mut self, path: &Path) -> PsdSaveOutcome {
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            self.report_save_failure(path, &SaveFailure::NoTileStorage);
+            return PsdSaveOutcome::Failed;
+        };
+        // A newer save replaces any pending one (its temp file goes).
+        self.pending_psd_save = None;
+        let source = psd_save::PsdSaveSource {
+            layers: &self.doc.layers,
+            canvas: self.doc.canvas_size,
+            store,
+            doc_id: self.doc.id,
+            revision: self.doc.undo_order.revision,
+            carried: psd_save::carried_losses(
+                self.doc.import_losses.as_deref(),
+                &self.doc.skipped_tiles,
+            ),
+        };
+        match psd_save::begin_psd_save(source, path) {
+            Ok(psd_save::PsdSaveStep::Saved) => {
+                tracing::info!(path = %path.display(), "saved as a lossless Photoshop file");
+                psd_save::record_psd_save(&mut self.doc, path, true);
+                self.after_document_change();
+                PsdSaveOutcome::Saved
+            }
+            Ok(psd_save::PsdSaveStep::NeedsConfirmation(pending)) => {
+                self.pending_psd_save = Some(pending);
+                // Review L-2: if another dialog holds the modal slot, the
+                // question waits for it to close (`about_to_wait`).
+                self.psd_dialog_deferred = !self.open_psd_save_dialog();
+                PsdSaveOutcome::Pending
+            }
+            Err(failure) => {
+                tracing::warn!(path = %path.display(), ?failure, "PSD save failed");
+                self.report_psd_save_failure(path, &failure);
+                PsdSaveOutcome::Failed
+            }
+        }
+    }
+
+    /// Opens Save With Changes for [`Self::pending_psd_save`]; `false`
+    /// when there is none or another dialog is open.
+    fn open_psd_save_dialog(&mut self) -> bool {
+        let Some(pending) = self.pending_psd_save.as_ref() else {
+            return false;
+        };
+        let message =
+            psd_save::psd_save_message(&display_file_name(pending.temp.target()), &pending.report);
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &self.scales,
+            psd_save::PSD_SAVE_WITH_CHANGES_TITLE,
+            &message,
+            psd_save::psd_save_dialog_actions(),
+            DialogPurpose::PsdSaveWithChanges,
+        );
+        if opened {
+            self.relayout_and_announce();
+        } else {
+            tracing::info!("Save With Changes waits for the open dialog to close");
+        }
+        opened
+    }
+
+    /// The Save With Changes dialog's answer (0.177.0).
+    fn answer_psd_save(&mut self, choice: psd_save::PsdSaveChoice) {
+        let Some(pending) = self.pending_psd_save.take() else {
+            return;
+        };
+        if choice == psd_save::PsdSaveChoice::Cancel {
+            tracing::info!(path = %pending.temp.target().display(), "PSD save cancelled");
+            return; // dropping `pending` deletes the temp file
+        }
+        let target = pending.temp.target().to_path_buf();
+        // Decision 4: a save with changes is a copy, Save Anyway included —
+        // the document is left as it is.
+        match psd_save::finish_psd_save(pending, self.doc.id, self.doc.undo_order.revision) {
+            Ok(()) => {
+                tracing::info!(path = %target.display(), "saved a Photoshop copy with changes");
+            }
+            Err(failure) => {
+                tracing::warn!(path = %target.display(), ?failure, "Save Anyway failed");
+                self.report_psd_save_failure(&target, &failure);
+            }
+        }
+    }
+
+    fn report_psd_save_failure(&mut self, path: &Path, failure: &psd_save::PsdSaveFailure) {
+        let message = psd_save::psd_save_failure_message(&display_file_name(path), failure);
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &self.scales,
+            SAVE_FAILED_TITLE,
+            &message,
+            save_failed_dialog_actions(),
+            DialogPurpose::SaveFailed,
+        );
+        if !opened {
+            tracing::warn!(path = %path.display(), %message, "the PSD save failure could not be shown (a dialog is already open)");
+        }
+        self.relayout_and_announce();
+    }
+
+    fn relayout_and_announce(&mut self) {
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
     }
 
     /// The export half of [`Self::save_file`] (PNG/JPEG/TIFF): never
@@ -23683,7 +23908,7 @@ impl App {
 
         let write_result: Result<(), aurora_io::IoError> = (|| {
             let file = std::fs::File::create(&temp_path)?;
-            aurora_io::write_aur(
+            aurora_io::write_aur_with_import_losses(
                 file,
                 &self.doc.layers,
                 &self.doc.history,
@@ -23696,6 +23921,7 @@ impl App {
                 // record names tiles that are not in the store at all,
                 // so it can never turn into a fresh skip here.
                 &self.doc.skipped_tiles,
+                self.doc.import_losses.as_deref(),
                 store,
             )
         })();
@@ -24602,6 +24828,13 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // Review L-3: a Save With Changes still waiting is abandoned —
+        // dropping it deletes its temp file; the target was never touched.
+        // (A quit is not deferred for it.)
+        if self.pending_psd_save.take().is_some() {
+            tracing::info!("quit with a PSD save awaiting Save Anyway; abandoned");
+        }
+        self.psd_dialog_deferred = false;
         // Review Q-1: an exit the quit review never confirmed (macOS menu
         // Quit, an OS session end) with unsaved documents writes their
         // last autosave now, before anything is stopped, and the cleanup
@@ -24875,6 +25108,7 @@ impl App {
             DialogEffect::Workspace(command) => self.run_workspace_command(command),
             DialogEffect::Close(id, choice) => self.answer_close(id, choice),
             DialogEffect::Quit(id, choice) => self.answer_quit(id, choice),
+            DialogEffect::PsdSave(choice) => self.answer_psd_save(choice),
             DialogEffect::Unknown => {
                 tracing::warn!(?result, "a dialog result with no handler");
             }
@@ -26103,6 +26337,15 @@ impl ApplicationHandler<AppEvent> for App {
             self.finish_shutdown();
             el.exit();
             return;
+        }
+        // 0.177.0 review L-2: a Save With Changes that found the modal
+        // slot taken asks the first iteration no dialog is open.
+        if psd_save::take_deferred_dialog(
+            &mut self.psd_dialog_deferred,
+            self.pending_psd_save.is_some(),
+            self.dialog.is_some(),
+        ) {
+            self.psd_dialog_deferred = !self.open_psd_save_dialog();
         }
         // 0.175.0 (F-3): a window close that waited for a dialog starts
         // the quit review the first iteration no dialog is open.
@@ -29587,6 +29830,7 @@ mod tests {
             (320, 160),
             &mut aurora_io::SkippedTiles::new(),
             &mut store,
+            None,
         );
 
         let (_fresh_dir, mut fresh_store) = real_tile_store();
@@ -31721,15 +31965,18 @@ mod tests {
 
     #[test]
     fn save_failure_message_covers_every_failure_and_says_nothing_was_written() {
-        let psd = save_failure_message(
-            "export.psd",
-            &SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension("psd".to_owned())),
+        // 0.177.0: `.psd` is saved (`psd_save`) and `.psb` is refused
+        // there, so this generic wording is reached only by a format
+        // with no writer at all.
+        let psb = save_failure_message(
+            "export.psb",
+            &SaveFailure::Encode(aurora_io::IoError::UnsupportedExtension("psb".to_owned())),
         );
         assert_eq!(
-            psd,
-            "Aurora can't save \"export.psd\": this version can't write Photoshop (PSD) files \
-             yet. It can save as PNG, JPEG, TIFF or Aurora document (.aur). Nothing was saved, \
-             and any existing file with that name is unchanged."
+            psb,
+            "Aurora can't save \"export.psb\": this version can't write Photoshop Large Document \
+             (PSB) files yet. It can save as PNG, JPEG, TIFF, Photoshop (.psd) or Aurora document \
+             (.aur). Nothing was saved, and any existing file with that name is unchanged."
         );
         let jpeg = save_failure_message(
             "huge.jpg",
@@ -31760,7 +32007,7 @@ mod tests {
             no_store.contains("no storage for image data"),
             "{no_store:?}"
         );
-        for message in [&psd, &jpeg, &write, &composite, &no_store] {
+        for message in [&psb, &jpeg, &write, &composite, &no_store] {
             assert!(message.ends_with(SAVE_FAILED_UNCHANGED), "{message:?}");
         }
     }
@@ -36137,6 +36384,7 @@ mod tests {
             &mut aurora_io::SkippedTiles::new(),
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             &mut store,
+            None,
         ) else {
             unreachable!("a tiny document is snapshotted");
         };
@@ -55898,6 +56146,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
 
         let full_len = match std::fs::metadata(&path) {
@@ -55931,6 +56180,7 @@ mod tests {
     /// the complete snapshot was gone and its dropped tiles were
     /// unrecoverable from anywhere.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_degraded_autosave_never_overwrites_a_complete_one() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -55975,6 +56225,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
         let Ok(complete) = std::fs::read(&path) else {
             unreachable!("the complete autosave must have been written");
@@ -56026,6 +56277,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
 
         let Ok(after) = std::fs::read(&path) else {
@@ -56137,6 +56389,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
 
         // Nothing complete was ever written here, so the salvaged
@@ -56211,6 +56464,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
 
         let file = match std::fs::File::open(&path) {
@@ -56298,6 +56552,7 @@ mod tests {
                 (37, 21),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
             );
             painted
         };
@@ -56366,6 +56621,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
         let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
         write_autosave(
@@ -56375,6 +56631,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
 
         let leftovers: Vec<String> = match std::fs::read_dir(dir.path()) {
@@ -56421,6 +56678,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
         );
         let mode = match std::fs::metadata(&path) {
             Ok(meta) => meta.permissions().mode() & 0o777,
@@ -56453,6 +56711,7 @@ mod tests {
                 (37, 21),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
             );
         }
         // A good partial snapshot beside a canonical file that is then
@@ -56524,6 +56783,7 @@ mod tests {
                 size,
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
             );
             assert!(path.exists(), "the fixture container was written");
         }
@@ -56914,6 +57174,7 @@ mod tests {
                 (12, 6),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
             );
             assert!(own.exists());
             assert_eq!(
@@ -57228,6 +57489,7 @@ mod tests {
                 (10, 10),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
             );
         }
         let before = match std::fs::read(&path) {
@@ -58599,6 +58861,7 @@ mod tests {
             document.canvas_size,
             &mut carried,
             &mut fresh_store,
+            None,
         );
         assert!(
             autosave.exists(),
@@ -68508,6 +68771,7 @@ mod tests {
                 &mut skipped,
                 crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
                 &mut staged_store,
+                None,
             ),
             crate::SnapshotOutcome::Taken(_)
         ));
@@ -68982,6 +69246,7 @@ mod tests {
             &mut skipped,
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             &mut store,
+            None,
         ) else {
             unreachable!("a 4096x4096 four-layer document fits the snapshot budget");
         };
@@ -69004,6 +69269,7 @@ mod tests {
             document_canvas_size,
             &mut aurora_io::SkippedTiles::new(),
             &mut store,
+            None,
         );
         let sync_time = started.elapsed();
         let ui = panels + pixels + snapshot_time + submit_time;

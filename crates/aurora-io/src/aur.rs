@@ -320,6 +320,98 @@ fn reduced_mask_densities(layers: &LayerTree) -> Vec<(u64, f32)> {
         .collect()
 }
 
+/// The entry holding what the document's own open changed or left out
+/// (0.177.0 review B-1): the lines of a PSD's "Opened With Changes"
+/// report, so a later Photoshop save of the document lists them even
+/// after it went through a `.aur` save or a crash recovery. Optional and
+/// append-only, like [`MASK_DENSITY_ENTRY`]: written only when there are
+/// lines, so an ordinary save is byte-identical to before; a file without
+/// it decodes as before, and an older Aurora ignores it.
+const IMPORT_LOSSES_ENTRY: &str = "import-losses";
+
+/// [`IMPORT_LOSSES_ENTRY`]'s own schema version.
+const IMPORT_LOSSES_VERSION: u32 = 1;
+
+/// The most lines, and characters per line, [`IMPORT_LOSSES_ENTRY`]
+/// keeps when read: the strings are untrusted file data.
+const MAX_IMPORT_LOSS_LINES: usize = 256;
+const MAX_IMPORT_LOSS_CHARS: usize = 1024;
+
+/// What a damaged, unreadable or empty `import-losses` entry reads as:
+/// one generic line, never none — so a later Photoshop save still asks.
+pub const IMPORT_LOSSES_FALLBACK: &str = "This document was opened with changes from another file.";
+
+/// [`IMPORT_LOSSES_ENTRY`]'s payload: version first (frozen), then the
+/// lines.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ImportLossesWire {
+    version: u32,
+    lines: Vec<String>,
+}
+
+fn encode_import_losses(lines: Option<&[String]>) -> Result<Option<Vec<u8>>, IoError> {
+    let Some(lines) = lines.filter(|lines| !lines.is_empty()) else {
+        return Ok(None);
+    };
+    let wire = ImportLossesWire {
+        version: IMPORT_LOSSES_VERSION,
+        lines: lines.to_vec(),
+    };
+    postcard::to_allocvec(&wire)
+        .map(Some)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))
+}
+
+/// One untrusted line, made safe to show: control and text-direction
+/// characters dropped (`aurora_doc::sanitize_display_name`, the rule
+/// layer names follow), at most [`MAX_IMPORT_LOSS_CHARS`] characters.
+fn sanitize_import_loss(line: &str) -> String {
+    aurora_doc::sanitize_display_name(line)
+        .chars()
+        .take(MAX_IMPORT_LOSS_CHARS)
+        .collect()
+}
+
+/// Reads [`IMPORT_LOSSES_ENTRY`]: `None` when the file has none; the
+/// sanitised, capped lines when it decodes; [`IMPORT_LOSSES_FALLBACK`]
+/// alone on any problem (an oversized, damaged, empty or unknown-version
+/// entry) — erring on the side of asking. Never fails the open.
+fn read_import_losses<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Option<Vec<String>> {
+    let fallback = || Some(vec![IMPORT_LOSSES_FALLBACK.to_owned()]);
+    let bytes = match zip.by_name(IMPORT_LOSSES_ENTRY) {
+        Ok(file) => match read_capped(
+            file,
+            IMPORT_LOSSES_ENTRY,
+            (MAX_IMPORT_LOSS_LINES * MAX_IMPORT_LOSS_CHARS * 4 + 64) as u64,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => return fallback(),
+        },
+        Err(zip::result::ZipError::FileNotFound) => return None,
+        Err(_) => return fallback(),
+    };
+    let Ok(wire) = postcard::from_bytes::<ImportLossesWire>(&bytes) else {
+        return fallback();
+    };
+    if wire.version != IMPORT_LOSSES_VERSION {
+        return fallback();
+    }
+    let mut lines: Vec<String> = wire
+        .lines
+        .iter()
+        .map(|line| sanitize_import_loss(line))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return fallback();
+    }
+    if lines.len() > MAX_IMPORT_LOSS_LINES {
+        lines.truncate(MAX_IMPORT_LOSS_LINES - 1);
+        lines.push("…and more changes than can be listed.".to_owned());
+    }
+    Some(lines)
+}
+
 /// Reads [`MASK_DENSITY_ENTRY`] if present and applies it to `layers`.
 ///
 /// # Errors
@@ -758,6 +850,7 @@ pub fn write<W: Write + Seek>(
             profile,
             known_missing,
             unreadable: UnreadableTile::Refuse,
+            import_losses: None,
         },
         store,
     )?;
@@ -1092,6 +1185,73 @@ pub fn write_best_effort<W: Write + Seek>(
             profile,
             known_missing,
             unreadable: UnreadableTile::Skip,
+            import_losses: None,
+        },
+        store,
+    )
+}
+
+/// [`write()`], also recording what the document's own open changed or
+/// left out as the optional `import-losses` entry (0.177.0 review B-1).
+/// `None` (or no lines) writes exactly what [`write()`] does.
+///
+/// # Errors
+///
+/// As [`write()`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_with_import_losses<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
+    import_losses: Option<&[String]>,
+    store: &mut TileStore,
+) -> Result<(), IoError> {
+    let _empty = write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Refuse,
+            import_losses,
+        },
+        store,
+    )?;
+    Ok(())
+}
+
+/// [`write_best_effort`], also recording the `import-losses` entry, as
+/// [`write_with_import_losses`] does for [`write()`].
+///
+/// # Errors
+///
+/// As [`write_best_effort`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_best_effort_with_import_losses<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
+    import_losses: Option<&[String]>,
+    store: &mut TileStore,
+) -> Result<Vec<SkippedTile>, IoError> {
+    write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Skip,
+            import_losses,
         },
         store,
     )
@@ -1122,6 +1282,8 @@ struct WritePolicy<'a> {
     profile: Option<&'a aurora_color::IccProfile>,
     known_missing: &'a SkippedTiles,
     unreadable: UnreadableTile,
+    /// What the document's open changed (0.177.0 review B-1).
+    import_losses: Option<&'a [String]>,
 }
 
 fn write_with_policy<W: Write + Seek>(
@@ -1136,6 +1298,7 @@ fn write_with_policy<W: Write + Seek>(
         profile,
         known_missing,
         unreadable,
+        import_losses,
     } = policy;
     // Before a single byte is written: every rectangle the tile loop
     // below will derive a grid from, range-checked, and their grids
@@ -1153,7 +1316,8 @@ fn write_with_policy<W: Write + Seek>(
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    let header = DocumentEntries::build(layers, history, canvas_size, profile)?;
+    let mut header = DocumentEntries::build(layers, history, canvas_size, profile)?;
+    header.import_losses = encode_import_losses(import_losses)?;
     header.write_to(&mut zip, stored, deflated)?;
 
     for (surface, bounds) in persisted_surfaces(layers) {
@@ -1274,6 +1438,8 @@ struct DocumentEntries {
     manifest: Vec<u8>,
     history: Vec<u8>,
     mask_densities: Option<Vec<u8>>,
+    /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
+    import_losses: Option<Vec<u8>>,
 }
 
 impl DocumentEntries {
@@ -1314,6 +1480,7 @@ impl DocumentEntries {
             manifest,
             history,
             mask_densities,
+            import_losses: None,
         })
     }
 
@@ -1332,6 +1499,10 @@ impl DocumentEntries {
         zip.write_all(&self.history)?;
         if let Some(bytes) = &self.mask_densities {
             zip.start_file(MASK_DENSITY_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.import_losses {
+            zip.start_file(IMPORT_LOSSES_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         Ok(())
@@ -1381,6 +1552,18 @@ pub struct AurSnapshot {
 }
 
 impl AurSnapshot {
+    /// Records what the document's own open changed or left out, written
+    /// as the optional `import-losses` entry (0.177.0 review B-1); `None`
+    /// or no lines writes none.
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::ManifestSerialization`] if the lines cannot be encoded.
+    pub fn set_import_losses(&mut self, lines: Option<&[String]>) -> Result<(), IoError> {
+        self.entries.import_losses = encode_import_losses(lines)?;
+        Ok(())
+    }
+
     /// The tiles [`snapshot_best_effort`] had to leave out because the
     /// store could not read them; empty for a complete snapshot.
     #[must_use]
@@ -1586,6 +1769,11 @@ pub struct AurDocument {
     /// the next [`write()`]/[`write_best_effort`] of the same document
     /// — see [`SkippedTiles`] for why nothing rediscovers it.
     pub skipped_tiles: SkippedTiles,
+    /// What the document's own open of another file changed or left out
+    /// (the optional `import-losses` entry, 0.177.0 review B-1): `None`
+    /// for a file without one, sanitised lines when it reads, a single
+    /// generic line ([`IMPORT_LOSSES_FALLBACK`]) when it is damaged.
+    pub import_losses: Option<Vec<String>>,
 }
 
 /// Reads a complete `.aur` document from `reader`, writing every
@@ -1691,6 +1879,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let history = History::load_journal(&history_bytes)?;
 
     let skipped_tiles = read_skipped_tiles(&mut zip)?;
+    let import_losses = read_import_losses(&mut zip);
 
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial
@@ -1714,6 +1903,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         canvas_size: (manifest.canvas_width, manifest.canvas_height),
         profile,
         skipped_tiles,
+        import_losses,
     })
 }
 
@@ -5691,5 +5881,151 @@ mod tests {
         canvas_height: u32,
         color_space: super::ColorSpaceTag,
         layers: LayerTree,
+    }
+}
+
+/// The `import-losses` entry (0.177.0 review B-1).
+#[cfg(test)]
+mod import_losses_tests {
+    use std::io::Cursor;
+
+    use aurora_doc::{History, LayerTree};
+    use aurora_tile::TileStore;
+
+    use super::{
+        IMPORT_LOSSES_ENTRY, IMPORT_LOSSES_FALLBACK, IMPORT_LOSSES_VERSION, ImportLossesWire,
+        MAX_IMPORT_LOSS_CHARS, MAX_IMPORT_LOSS_LINES, SkippedTiles, read, write_with_import_losses,
+    };
+
+    fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, TileStore) {
+        let dir = ok(tempfile::tempdir());
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("non-zero")
+        };
+        let store = ok(TileStore::new(dir.path().to_path_buf(), budget));
+        (dir, store)
+    }
+
+    fn container(lines: Option<&[String]>) -> Vec<u8> {
+        let (_dir, mut store) = store();
+        let mut tree = LayerTree::new();
+        ok(tree.add_pixel_layer(
+            "A",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            None,
+        ));
+        let mut out = Cursor::new(Vec::new());
+        ok(write_with_import_losses(
+            &mut out,
+            &tree,
+            &History::new(),
+            (4, 4),
+            None,
+            &SkippedTiles::new(),
+            lines,
+            &mut store,
+        ));
+        out.into_inner()
+    }
+
+    fn read_losses(bytes: &[u8]) -> Option<Vec<String>> {
+        let (_dir, mut store) = store();
+        ok(read(Cursor::new(bytes), &mut store)).import_losses
+    }
+
+    fn entry_names(bytes: &[u8]) -> Vec<String> {
+        let archive = ok(zip::ZipArchive::new(Cursor::new(bytes)));
+        archive.file_names().map(str::to_owned).collect()
+    }
+
+    /// `bytes` with the `import-losses` entry replaced by `payload`.
+    fn with_entry(bytes: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut archive = ok(zip::ZipArchive::new(Cursor::new(bytes)));
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let file = ok(archive.by_index_raw(index));
+            if file.name() == IMPORT_LOSSES_ENTRY {
+                continue;
+            }
+            ok(out.raw_copy_file(file));
+        }
+        ok(out.start_file(
+            IMPORT_LOSSES_ENTRY,
+            zip::write::SimpleFileOptions::default(),
+        ));
+        ok(std::io::Write::write_all(&mut out, payload));
+        ok(out.finish()).into_inner()
+    }
+
+    #[test]
+    fn import_losses_round_trip_and_an_ordinary_save_writes_no_entry() {
+        let lines = vec![
+            "Clipping masks are shown unclipped.".to_owned(),
+            "Layer effects are not shown.".to_owned(),
+        ];
+        let bytes = container(Some(&lines));
+        assert!(entry_names(&bytes).iter().any(|n| n == IMPORT_LOSSES_ENTRY));
+        assert_eq!(read_losses(&bytes), Some(lines));
+        // An old file, or a document with nothing to carry: no entry, None.
+        let plain = container(None);
+        assert!(!entry_names(&plain).iter().any(|n| n == IMPORT_LOSSES_ENTRY));
+        assert_eq!(read_losses(&plain), None);
+        assert_eq!(read_losses(&container(Some(&[]))), None);
+    }
+
+    #[test]
+    fn a_damaged_or_hostile_import_losses_entry_errs_safe() {
+        let base = container(None);
+        let fallback = Some(vec![IMPORT_LOSSES_FALLBACK.to_owned()]);
+        let encode = |version: u32, lines: Vec<String>| -> Vec<u8> {
+            ok(postcard::to_allocvec(&ImportLossesWire { version, lines }))
+        };
+        // Garbage, an unknown version, and nothing but blank lines.
+        assert_eq!(read_losses(&with_entry(&base, b"\xff\xff\xff")), fallback);
+        assert_eq!(
+            read_losses(&with_entry(
+                &base,
+                &encode(IMPORT_LOSSES_VERSION + 1, vec!["x".into()])
+            )),
+            fallback
+        );
+        assert_eq!(
+            read_losses(&with_entry(
+                &base,
+                &encode(IMPORT_LOSSES_VERSION, vec![" ".into()])
+            )),
+            fallback
+        );
+        // Control and text-direction characters are dropped, long lines cut,
+        // too many lines capped with a closing line.
+        let hostile = format!("evil\u{202e}gnp.\u{0007}{}", "x".repeat(5000));
+        let many: Vec<String> = std::iter::once(hostile)
+            .chain((0..1000).map(|i| format!("line {i}")))
+            .collect();
+        let Some(read_back) = read_losses(&with_entry(&base, &encode(IMPORT_LOSSES_VERSION, many)))
+        else {
+            unreachable!("read")
+        };
+        assert_eq!(read_back.len(), MAX_IMPORT_LOSS_LINES);
+        let first = read_back.first().cloned().unwrap_or_default();
+        assert!(first.starts_with("evilgnp."), "{first:?}");
+        assert!(!first.contains('\u{202e}') && !first.contains('\u{0007}'));
+        assert!(first.chars().count() <= MAX_IMPORT_LOSS_CHARS);
+        assert!(read_back.last().is_some_and(|l| l.contains("and more")));
+        // An entry far past its size cap is not read at all.
+        let huge = vec![0u8; MAX_IMPORT_LOSS_LINES * MAX_IMPORT_LOSS_CHARS * 4 + 1024];
+        assert_eq!(read_losses(&with_entry(&base, &huge)), fallback);
     }
 }

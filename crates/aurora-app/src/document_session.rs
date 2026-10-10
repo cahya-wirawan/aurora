@@ -255,6 +255,12 @@ pub(crate) struct DocumentSession {
     /// `None` for a crash-recovered document, whose contents exist in no
     /// file the user chose. See [`Self::is_dirty`].
     pub(crate) saved_revision: Option<crate::UndoRevision>,
+    /// What the open of this document's file changed or left out — the
+    /// "Opened With Changes" report's lines (0.177.0 review H-1), in
+    /// memory only. `None` for a faithful open, a New document, a `.aur`
+    /// open and a recovered document. A Photoshop save lists them, so a
+    /// file re-saved over itself never loses that content silently.
+    pub(crate) import_losses: Option<Vec<String>>,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -483,6 +489,7 @@ impl DocumentSession {
             name: UNTITLED.to_owned(),
             path: None,
             saved_revision: Some(undo_order.revision),
+            import_losses: None,
             park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),

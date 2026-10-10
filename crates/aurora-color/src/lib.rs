@@ -34,5 +34,5 @@ mod transform;
 pub use dither::{dither_quantize, promote_u8, promote_u16, quantize_u8, quantize_u16};
 pub use error::ColorError;
 pub use linear::{linear_to_srgb, srgb_to_linear};
-pub use profile::IccProfile;
+pub use profile::{IccProfile, icc_bytes_match_ignoring_stamps};
 pub use transform::{RenderingIntent, Transform};

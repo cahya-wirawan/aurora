@@ -42,10 +42,13 @@ pub mod psd;
 mod safe_save;
 pub mod tiff;
 
+pub use aur::IMPORT_LOSSES_FALLBACK;
 pub use aur::{
     AurDocument, AurSnapshot, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
     snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,
-    write_best_effort as write_aur_best_effort, write_snapshot as write_aur_snapshot,
+    write_best_effort as write_aur_best_effort,
+    write_best_effort_with_import_losses as write_aur_best_effort_with_import_losses,
+    write_snapshot as write_aur_snapshot, write_with_import_losses as write_aur_with_import_losses,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
@@ -64,4 +67,4 @@ pub use psd::{
     encode_mask_pixels as encode_psd_mask, merged_image as decode_psd_merged_image,
     read as read_psd, read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
 };
-pub use safe_save::replace_verified;
+pub use safe_save::{VerifiedTemp, replace_verified, resolve_save_target, write_verified_temp};

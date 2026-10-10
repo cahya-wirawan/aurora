@@ -173,6 +173,9 @@ struct Losses {
     dissolve: usize,
     clipped: u64,
     nan: u64,
+    /// The written layers add up to more than the reader's
+    /// `PIXEL_BUDGET`, so Aurora cannot reopen the file (0.177.0, N-1).
+    unreopenable: bool,
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -207,6 +210,13 @@ impl Losses {
                 "Dissolve layers will look different in apps other than Photoshop.".to_owned(),
             );
         }
+        if self.unreopenable {
+            items.push(format!(
+                "Aurora can't reopen this file yet: its layers add up to more than {} pixels. \
+                 Photoshop can open it.",
+                group_thousands(super::PIXEL_BUDGET)
+            ));
+        }
         if self.clipped > 0 {
             items.push(format!(
                 "{} outside the 0–1 range will be clipped.",
@@ -222,6 +232,19 @@ impl Losses {
         }
         PsdWriteReport { items }
     }
+}
+
+/// `268435456` as `268,435,456`.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The PSD blend key for each of Aurora's 27 modes — the inverse of the
@@ -492,6 +515,48 @@ fn quantize(value: f32, losses: &mut Losses) -> u16 {
         }
         quantize_u16(value)
     }
+}
+
+/// The image resources section's body (0.177.0): one resource, 1039, the
+/// built-in sRGB ICC profile — Aurora's pixels are sRGB, and a file
+/// without a profile would be untagged (invariant §7.3.6).
+///
+/// The profile's bytes are made once per process
+/// ([`aurora_color::IccProfile::srgb_bytes`]): `lcms2` stamps the time
+/// into a serialised profile's header, and a file's verify (or a test
+/// comparing two writes) must see the bytes the write used.
+pub(crate) fn icc_resource() -> Result<Vec<u8>, IoError> {
+    let profile = aurora_color::IccProfile::srgb_bytes()?;
+    let size = u32::try_from(profile.len()).map_err(|_| too_large("ICC profile"))?;
+    let mut out = Vec::with_capacity(profile.len() + 13);
+    out.extend_from_slice(b"8BIM");
+    out.extend_from_slice(&1039u16.to_be_bytes());
+    out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&profile);
+    if !profile.len().is_multiple_of(2) {
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// The smallest the file could possibly be (0.177.0, N-4): every
+/// channel row and merged row as `PackBits`' best case, one two-byte
+/// packet per 128 bytes, plus its row count and compression field. Known
+/// before a byte is written, from the planned extents.
+fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32)) -> u64 {
+    let rows = |w: u32, h: u32, channels: u64| -> u64 {
+        let row_min = 2 * (u64::from(w) * 2).div_ceil(128);
+        channels.saturating_mul(2 + u64::from(h).saturating_mul(2 + row_min))
+    };
+    let layers = plans
+        .iter()
+        .map(|p| rows(p.extent.2, p.extent.3, 4))
+        .fold(0u64, u64::saturating_add);
+    // The merged image has one compression field for all four planes.
+    let merged_row_min = 2 * (u64::from(width) * 2).div_ceil(128);
+    let merged = 2 + 4 * u64::from(height).saturating_mul(2 + merged_row_min);
+    layers.saturating_add(merged)
 }
 
 /// One root pixel layer, planned before anything is written.
@@ -765,8 +830,48 @@ pub fn write_psd<W: Write + Seek>(
         composite,
         store,
         opts,
-        PSD_MAX_FILE_BYTES,
+        WriteLimits::default(),
     )
+}
+
+/// The limits [`write_psd_limited`] applies — parameters so tests reach
+/// them without gigabyte files.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WriteLimits {
+    /// The file must stay at or under this many bytes.
+    pub max_bytes: u64,
+    /// More written pixels than this and Aurora's reader would refuse the
+    /// file: reported, not refused (N-1).
+    pub reopen_budget: u64,
+}
+
+impl Default for WriteLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: PSD_MAX_FILE_BYTES,
+            reopen_budget: super::PIXEL_BUDGET,
+        }
+    }
+}
+
+/// The file header, empty colour-mode data and the image resources.
+fn write_header<W: Write>(w: &mut W, (width, height): (u32, u32)) -> Result<(), IoError> {
+    // Header: 4 channels (RGB + merged transparency), 16-bit, RGB.
+    w.write_all(b"8BPS")?;
+    w.write_all(&1u16.to_be_bytes())?;
+    w.write_all(&[0; 6])?;
+    w.write_all(&4u16.to_be_bytes())?;
+    w.write_all(&height.to_be_bytes())?;
+    w.write_all(&width.to_be_bytes())?;
+    w.write_all(&16u16.to_be_bytes())?;
+    w.write_all(&3u16.to_be_bytes())?;
+    w.write_all(&0u32.to_be_bytes())?; // colour mode data
+    let resources = icc_resource()?;
+    let resources_len = u32::try_from(resources.len()).map_err(|_| too_large("resources"))?;
+    w.write_all(&resources_len.to_be_bytes())?;
+    w.write_all(&resources)?;
+
+    Ok(())
 }
 
 /// [`write_psd`] with the file-size limit as a parameter, so a test can
@@ -778,8 +883,9 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     composite: &mut dyn PsdCompositeSource,
     store: &mut TileStore,
     opts: PsdSaveOptions,
-    max_bytes: u64,
+    limits: WriteLimits,
 ) -> Result<PsdWriteOutcome, IoError> {
+    let max_bytes = limits.max_bytes;
     let mut losses = preflight_losses(layers, canvas, opts).map_err(refused)?;
     if composite.size() != canvas {
         return Err(refused(PsdSaveRefusal::CompositeSizeMismatch {
@@ -788,22 +894,22 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         }));
     }
     let mut plans = plan_layers(layers, store)?;
+    if minimum_file_size(&plans, canvas) > max_bytes {
+        return Err(too_large(
+            "a .psd file must be smaller than 2 GiB; use .psb instead",
+        ));
+    }
+    let area = plans
+        .iter()
+        .map(|p| u64::from(p.extent.2) * u64::from(p.extent.3))
+        .fold(0u64, u64::saturating_add);
+    losses.unreopenable = area > limits.reopen_budget;
     let mut buffered = std::io::BufWriter::new(&mut writer);
     let w = &mut buffered;
     let (width, height) = canvas;
     let limit = pos(w)?.saturating_add(max_bytes);
 
-    // Header: 4 channels (RGB + merged transparency), 16-bit, RGB.
-    w.write_all(b"8BPS")?;
-    w.write_all(&1u16.to_be_bytes())?;
-    w.write_all(&[0; 6])?;
-    w.write_all(&4u16.to_be_bytes())?;
-    w.write_all(&height.to_be_bytes())?;
-    w.write_all(&width.to_be_bytes())?;
-    w.write_all(&16u16.to_be_bytes())?;
-    w.write_all(&3u16.to_be_bytes())?;
-    w.write_all(&0u32.to_be_bytes())?; // colour mode data
-    w.write_all(&0u32.to_be_bytes())?; // image resources
+    write_header(w, canvas)?;
 
     let section_at = pos(w)?;
     w.write_all(&0u32.to_be_bytes())?; // section length, filled in below
@@ -1070,10 +1176,11 @@ fn raw_channel<R: std::io::Read + Seek>(
     Ok(hash)
 }
 
-/// Checks the file structure field by field, with its own parser (not
-/// the reader's), and every sample against the writer's hashes.
-fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> Result<(), IoError> {
-    let mut raw = Raw { inner };
+/// The header, colour-mode data and the sRGB ICC resource.
+fn raw_header<R: std::io::Read + Seek>(
+    raw: &mut Raw<R>,
+    expected: &PsdExpectation,
+) -> Result<(), IoError> {
     check("signature", raw.array::<4>()?, *b"8BPS")?;
     check("version", raw.u16()?, 1)?;
     raw.skip(6)?;
@@ -1085,7 +1192,20 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
     let color = raw.u32()?;
     raw.skip(u64::from(color))?;
     let resources = raw.u32()?;
-    raw.skip(u64::from(resources))?;
+    let want = icc_resource()?;
+    check("image resources length", resources as usize, want.len())?;
+    let got = raw.bytes(want.len())?;
+    if got != want {
+        return Err(mismatch("the sRGB ICC profile resource (1039)"));
+    }
+    Ok(())
+}
+
+/// Checks the file structure field by field, with its own parser (not
+/// the reader's), and every sample against the writer's hashes.
+fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> Result<(), IoError> {
+    let mut raw = Raw { inner };
+    raw_header(&mut raw, expected)?;
     let section = u64::from(raw.u32()?);
     let section_start = raw.pos()?;
     check("layer info length", raw.u32()?, 0)?;
@@ -1252,6 +1372,16 @@ impl PsdPixelSink for CheckingSink {
 /// [`IoError::PsdVerifyFailed`] naming the first difference;
 /// [`IoError::Io`] if the file cannot be read; any error of the reader.
 pub fn verify_psd_file(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
+    verify_psd_file_with_budget(path, expected, super::PIXEL_BUDGET)
+}
+
+/// [`verify_psd_file`] with the reader pass's pixel budget as a
+/// parameter (0.177.0, N-3), so a test reaches the skip branch.
+pub(crate) fn verify_psd_file_with_budget(
+    path: &Path,
+    expected: &PsdExpectation,
+    budget: u64,
+) -> Result<(), IoError> {
     let file = std::fs::File::open(path)?;
     verify_raw(std::io::BufReader::new(file), expected)?;
 
@@ -1268,7 +1398,7 @@ pub fn verify_psd_file(path: &Path, expected: &PsdExpectation) -> Result<(), IoE
             w.saturating_mul(h)
         })
         .fold(0u64, u64::saturating_add);
-    if total > super::PIXEL_BUDGET {
+    if total > budget {
         return Ok(());
     }
     let file = std::fs::File::open(path)?;

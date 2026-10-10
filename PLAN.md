@@ -26,7 +26,54 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.176.0): a library PSD writer for flat documents,
+**Latest (2026-10-10, 0.177.0): Save As Photoshop from the app, safely
+(PSD write, round R2 of six).** Save As routes a `.psd` name to
+`App::save_psd_file` (a `.psb` is refused, "PSB isn't supported yet",
+until R5; `export_file` no longer sees either), and the save picker now
+offers Aurora document / Photoshop / PNG / JPEG / TIFF filters
+(`psd_save::save_file_filters`). The flow is free functions in the new
+`aurora-app` module `psd_save`: `begin_psd_save` runs
+`psd_save_preflight` (a refusal goes to "Couldn't Save File" with its own
+reason), composites the document (`composite_document`, the whole image
+in memory — disclosed, banded in R5), and writes and verifies the PSD
+into a temp file beside the target with the new
+`aurora_io::write_verified_temp` → `VerifiedTemp` (persist or drop). An
+empty report is persisted at once; anything else is kept as a
+`PendingPsdSave { temp, doc_id, revision, report }` behind a "Save With
+Changes?" dialog listing the report's items in their fixed order, with
+**Save Anyway** and **Cancel — the default and the `Escape` action**,
+because Save Anyway replaces a file on disk with one that differs from
+the document. Save Anyway (`finish_psd_save`) persists only for the
+same document at the same undo revision; Cancel drops (deletes) the
+temp file; the target is untouched until then. **After the review:** a
+*lossless* PSD save (empty report, nothing carried from the open) is a
+real save — the document becomes clean and takes the `.psd` path and
+name (`psd_save::record_psd_save` → `document_close::after_save`), and a
+close or quit dialog's Save to it lets the close or quit go ahead; a
+save with changes is a copy — the document stays dirty and keeps its
+path even after Save Anyway, and a close or quit stops with its Save
+With Changes dialog open. And what the document's own open changed or
+left out (the "Opened With Changes" lines, kept on the session as
+`DocumentSession::import_losses`, plus tiles a `.aur` open found
+missing) is carried into every PSD save's report under "This file was
+opened with changes; saving writes it as Aurora shows it:", so re-saving
+an opened PSD over itself always asks first. `write_psd` now writes the sRGB ICC
+profile as image resource 1039 (moved here from R4; lcms2's built-in
+sRGB, serialised once per process because lcms2 stamps the time into
+the header — an earlier per-call serialisation made verification flaky
+across a second boundary, found by the mutation runs), and the reader
+still opens the file as sRGB with nothing reported. Carry-overs: a
+written file whose layers exceed the reader's 2^28 px budget is
+itemised ("Aurora can't reopen this file yet …", N-1); a symbolic-link
+target is followed and the real file replaced, a dangling link refused
+(`aurora_io::resolve_save_target`, N-2); the verify skip branch is
+tested through a budget parameter (N-3); a file that cannot fit 2 GiB
+even at PackBits' best case is refused before a byte is written (N-4).
+The write is synchronous on the UI thread (disclosed). Measured (after review revision 2): 3,335
+tests pass, 0 failed (62 ignored), `AURORA_REQUIRE_GPU=1` on the RTX 3090.
+See the 0.177.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.176.0): a library PSD writer for flat documents,
 safe by construction, not yet wired to the UI (PSD write, round R1 of
 six).** `aurora_io::write_psd` (`crates/aurora-io/src/psd/write.rs`)
 writes root-level pixel layers as a version-1, 16-bit RGB, PackBits
@@ -72,7 +119,7 @@ of it yet. Measured: 3,302 tests pass, 0 failed (62 ignored, after the review re
 flat library writer; R2 (0.177.0) app wiring — `save_psd_file`, picker
 filters, a "Save With Changes" dialog (Save Anyway / Cancel) holding the
 pending temp file, refusals through "Couldn't Save File", and the sRGB
-ICC profile resource (1039) — moved here from R4 by the 0.176.0 review,
+ICC profile resource (1039; done in 0.177.0) — moved here from R4 by the 0.176.0 review,
 because invariant §7.3.6 (every buffer carries its colour space) means
 no PSD may be written untagged once saving is user-reachable; R3
 (0.178.0) groups (`lsct` divider/folder pairs, `norm`, never `pass`) and
@@ -31886,6 +31933,147 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.177.0) — Save As Photoshop (PSD write R2).**
+
+**Design-owner decisions (Cahya, 2026-10-10, during the 0.177.0
+review):** (5) a close or quit Save to `.psd` may finish the close when
+the PSD save is lossless (an empty report, including no carried-from-open
+items); a lossless Save As PSD likewise marks the document clean and
+sets its path and name — R4's "clean if lossless" brought forward; a
+non-empty report keeps the document open and dirty even after Save
+Anyway (decision 4 unchanged); (6) Cancel stays the default in Save
+With Changes; (7) N-1 is a report item, not a refusal, with the wording
+"Aurora can't reopen this file yet … Photoshop can open it."
+
+**Review revision (judge REVISE 0.84; save mechanics sound).** H-1
+(HIGH): a PSD opened with changes, re-saved over itself as a flat
+document, had an empty report and replaced the file at once — silently
+dropping what the open had already dropped. Fixed by carrying the open's
+report (`DocumentSession::import_losses`, in memory only, set by the PSD
+and flat-image installs, `None` for New, `.aur` opens and recovered
+documents — a disclosed gap: a `.aur` round trip or a crash recovery
+forgets them) and a `.aur` open's missing tiles into the report
+(`psd_save::carried_losses`, appended last as category C); tests
+`a_psd_opened_with_changes_always_asks_before_a_psd_save` (a real PSD,
+its clipping byte set so the reader reports a change, saved over itself:
+dialog, target untouched), `a_psd_opened_cleanly_saves_without_a_dialog`,
+`new_and_other_documents_carry_no_losses_of_their_own`. M-2:
+`aurora_color::IccProfile::is_exactly_srgb` compared raw bytes against a
+fresh serialisation, whose header lcms2 stamps with the time, so it was
+not deterministic (a PNG export could embed `iCCP` instead of `sRGB`);
+it now compares with the dateTime (24..36) and profile ID (84..100)
+masked (`icc_bytes_match_ignoring_stamps`) against
+`IccProfile::srgb_bytes()`, cached once per process and also used by the
+PSD writer; `is_exactly_srgb_ignores_a_different_creation_stamp`. L-1: the
+2 GiB lower bound counted the merged image's compression field four
+times; now once. L-2: a Save With Changes that finds the modal slot taken
+is shown once it frees (`psd_save::take_deferred_dialog`, polled in
+`about_to_wait`; `a_deferred_save_with_changes_asks_once_the_dialog_closes`).
+L-3: `finish_shutdown` drops any pending PSD save, deleting its temp file;
+a quit is **not** deferred for a pending Save With Changes (disclosed).
+Decision 5 tests: `close_save_to_lossless_psd_closes`,
+`quit_review_psd_lossless_counts_as_saved`,
+`close_save_to_lossy_psd_keeps_document_open_and_dirty`,
+`lossless_psd_save_marks_clean_and_sets_path`,
+`lossy_psd_save_anyway_keeps_dirty`; the "A Photoshop Copy Was Saved"
+note is gone. Revision mutations: carried items dropped — killed (1);
+lossy-but-closes — killed (2); lossless-stays-dirty — killed (3);
+`after_save` rejecting `.psd` — killed (3); `is_exactly_srgb` on raw
+bytes — killed (1); deferred dialog opening over another — killed (1);
+every earlier row re-run and still killed, the two preflight
+defence-in-depth rows still surviving individually (killed together).
+psd-tools re-run: `ICC profile parsed by Pillow/LittleCMS: 'sRGB built-in'`, `OK: psd-tools 1.17.4 read 3 layers and the merged image; largest pixel difference 0.001/65535`. Gate, one pass after the last code change (RTX 3090): fmt, layering, style, `check --locked`, clippy `-D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,330 passed, 0 failed, 62 ignored (3,320 + 10 new); `cargo doc` `-D warnings` clean; `cargo deny` ok; contrast passes; cross-clippy (stubbed `lcms2-sys`) `-p aurora-color -p aurora-io -p aurora-app --all-targets -D warnings` clean on `x86_64-pc-windows-gnu` and `x86_64-apple-darwin`.
+
+Changed: `aurora-app` (`psd_save.rs` and `psd_save_tests.rs` new;
+`lib.rs`: `save_file` routing, `App::save_psd_file`/`answer_psd_save`/
+`report_psd_save_failure`/`relayout_and_announce`,
+`App::pending_psd_save`, `PsdSaveOutcome`, `DialogPurpose::
+PsdSaveWithChanges`/`PsdCopySaved`, `DialogEffect::PsdSave`, picker
+filters in `SystemFileDialog::save_file`, `SAVEABLE_FORMATS` now lists
+Photoshop (.psd), the close/quit Save branch; `document_close.rs`:
+`DialogSave::Psd`); `aurora-io` (`safe_save.rs`: `VerifiedTemp`,
+`write_verified_temp`, `resolve_save_target`, `replace_verified` built
+on them; `psd/write.rs`: ICC resource 1039 written and checked by the
+raw verifier, `WriteLimits`, the minimum-size early refusal, the
+"can't reopen" item, `verify_psd_file_with_budget`); `scripts/
+verify_psd_write.py` checks the ICC resource; version 0.177.0.
+
+Tests: `psd_save_with_empty_report_persists_without_dialog`,
+`psd_save_with_items_opens_dialog_and_target_untouched_until_save_anyway`,
+`psd_save_cancel_removes_temp`, `psd_save_anyway_after_revision_change_refuses`,
+`run_dialog_action_maps_psd_save_actions`, `save_psd_message_lists_items_in_fixed_order`,
+`close_save_to_psd_keeps_document_open_and_dirty`,
+`preflight_refusal_shows_couldnt_save_with_reason`, `psb_refused_until_r5`,
+`save_picker_offers_aur_psd_and_flat_formats`,
+`save_as_psd_end_to_end_through_the_picker_reopens_with_the_same_layers`,
+`psd_save_through_a_symlink_replaces_the_real_file` (app);
+`icc_resource_is_srgb_and_reader_still_tags_srgb`,
+`a_file_aurora_cannot_reopen_is_itemised`, `verify_skips_the_reader_pass_past_its_budget`,
+`a_psd_that_cannot_fit_is_refused_before_a_byte_is_written`,
+`saving_through_a_symlink_replaces_the_real_file_and_keeps_the_link`,
+`write_verified_temp_touches_nothing_until_persist` (aurora-io).
+
+Mutations (`AURORA_REQUIRE_GPU=1`, app `psd_save` and aurora-io `psd::`
+tests, restored and sha256-checked): Save Anyway without the revision
+check — killed (1); Cancel keeps the temp file — killed (3); a lossy save
+persisted without a dialog — killed (4); no ICC resource — killed (18);
+a PSD save marks the document clean — killed (1); symlink not resolved —
+killed (2); `.psb` accepted — killed (1); Save Anyway as the dialog
+default — killed (1); (the original "a PSD save marks the document
+clean" row is retired: since decision 5 a lossless one does); the app's own preflight call removed — **survives**,
+by design: `write_psd` runs the same preflight and its refusal is mapped
+to the same message; removing that mapping alone also survives (the app
+preflight catches it first); removing both together — killed (1).
+
+psd-tools (fresh fixture, after the per-process ICC change): `ICC profile parsed by Pillow/LittleCMS: 'sRGB built-in'` and `OK: psd-tools 1.17.4 read 3 layers and the merged image; largest pixel difference 0.001/65535`; the script now checks resource 1039 (size field, `acsp`, `RGB `, names sRGB).
+
+Gate, one pass after the last code change (RTX 3090): fmt, layering, style, `check --locked`, clippy `-D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,320 passed, 0 failed, 62 ignored (3,302 + 18 new); `cargo doc` `-D warnings` clean; `cargo deny` ok; contrast passes. Cross-clippy with the stubbed `lcms2-sys` (`LCMS2_LIB_DIR`), `-p aurora-io -p aurora-app --all-targets -D warnings`: `x86_64-pc-windows-gnu` and `x86_64-apple-darwin` clean (type-check only). The mutation matrix ran before the final clippy-driven `;` fix in `App::answer_psd_save` and the doc edits; neither touches a mutated line.
+
+**Review revision 2 (re-judge REVISE 0.88, one blocker).** B-1 (High):
+`import_losses` lived in memory only, so the realistic path — open a
+lossy PSD, edit, autosave, crash, recover, Save As over the original —
+replaced the file silently (as did a deliberate `.aur` save and reopen).
+Fixed: a new optional, append-only `.aur` entry, `import-losses` (ADR
+0009 updated, following the `mask-density` precedent; old files decode
+unchanged, an older Aurora skips it), written by `App::save_aur_file`
+(`aurora_io::write_aur_with_import_losses`), by the background autosave
+(`AurSnapshot::set_import_losses`, in `snapshot_autosave`) and by the
+synchronous one (`write_aur_best_effort_with_import_losses`, in
+`write_autosave`); every autosave route (`request_autosave`, parked
+documents, the quit review's final autosave) passes the session's lines;
+`App::open_psd_file` now sets them *before* the install's own autosave.
+Read back by `read_aur` into `AurDocument::import_losses`, and from there
+by a `.aur` open, by the startup recovery and by every extra recovered
+session. Decoding treats it as untrusted: ≤ 256 lines × ≤ 1,024
+characters, control and bidi characters dropped
+(`aurora_doc::sanitize_display_name`), and anything damaged reads as one
+generic line (`aurora_io::IMPORT_LOSSES_FALLBACK`), never as none. A
+`.aur` open sets `doc.path` to the `.aur`, a recovered document has no
+path, and the save picker has no default name, so no path ever points a
+Save As at the original `.psd` by itself; the carried lines are shown
+either way. Tests: `a_lossy_psd_saved_as_aur_and_reopened_still_asks_before_a_psd_save`,
+`a_lossy_psd_recovered_after_a_crash_still_asks_before_a_psd_save`
+(through both the snapshot and the synchronous autosave, then
+`recover_document`), `an_old_aur_without_the_entry_carries_nothing`,
+`import_losses_round_trip_and_an_ordinary_save_writes_no_entry`,
+`a_damaged_or_hostile_import_losses_entry_errs_safe`. Mutations: not
+written (encoder) — killed (3); not written by the container writer —
+killed (3); not read back — killed (4); a damaged entry read as none —
+killed (1); recovery drops it — killed (1); the snapshot autosave drops it
+— killed (1); the synchronous autosave drops it — killed (1). Not covered
+by a test: the `App`-method assignments themselves (`open_aur_file`, the
+startup and extra-session recovery, `save_aur_file`'s argument) — wiring
+over the tested functions. Gate, one pass after the last code change (RTX 3090; an earlier pass failed only `cargo doc` — a doc comment displaced by the new functions and a link to a private item — fixed, then the whole gate re-run): fmt, layering, style, `check --locked`, clippy `-D warnings` clean; `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` 3,335 passed, 0 failed, 62 ignored (3,330 + 5 new); `cargo doc` `-D warnings` clean; `cargo deny` ok; contrast passes; cross-clippy (stubbed `lcms2-sys`) `-p aurora-color -p aurora-io -p aurora-app --all-targets -D warnings` clean on `x86_64-pc-windows-gnu` and `x86_64-apple-darwin`.
+
+**Not verified / weaknesses:** nobody has clicked Save As → `.psd` in
+the running app (the App methods are wiring over tested free functions);
+Photoshop has not opened a file; the write and verify run synchronously
+on the UI thread; the merged image is the whole-canvas composite in
+memory; a lossy PSD Save from the close/quit review never completes the
+close (decision 4); the embedded profile's header carries lcms2's
+creation timestamp, so two sessions' files differ in those bytes
+(`is_exactly_srgb` was fixed for this in the review revision).
 
 **Addendum 2026-10-10 (0.176.0) — flat PSD writer (PSD write R1).**
 
