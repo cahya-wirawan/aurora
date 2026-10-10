@@ -320,6 +320,90 @@ fn reduced_mask_densities(layers: &LayerTree) -> Vec<(u64, f32)> {
         .collect()
 }
 
+/// The optional entry carrying every layer's effects (0.180.0),
+/// `aurora_doc::LayerTree::effects`. Same shape and rules as
+/// [`MASK_DENSITY_ENTRY`]: the effects are `#[serde(skip)]` in the
+/// positional manifest, so they travel here; written only when some layer
+/// has effects, so every other save stays byte-identical; a file without
+/// it opens with no effects, which is what every older file means.
+///
+/// **Versioned, and a newer version refuses the file.** The payload is
+/// positional `postcard` of `aurora_core::LayerEffects`, so any change to
+/// that type's shape is a new [`LAYER_EFFECTS_VERSION`]; a reader meeting
+/// a version it does not know refuses the whole open loudly ("Couldn't
+/// Open File") rather than dropping the effects silently. An Aurora older
+/// than 0.180.0 ignores the entry, but refuses the file anyway whenever
+/// its journal holds a `SetEffects` op (an unknown ordinal) — which every
+/// document whose effects came from an edit or an open does.
+const LAYER_EFFECTS_ENTRY: &str = "layer-effects";
+
+/// [`LAYER_EFFECTS_ENTRY`]'s own schema version.
+const LAYER_EFFECTS_VERSION: u32 = 1;
+
+/// The largest [`LAYER_EFFECTS_ENTRY`] read: ample for every layer of a
+/// large document at the per-kind instance caps.
+const MAX_LAYER_EFFECTS_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`LAYER_EFFECTS_ENTRY`]'s payload: version first (frozen), then one
+/// `(raw layer id, effects)` pair per layer with effects.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerEffectsWire {
+    version: u32,
+    effects: Vec<(u64, aurora_core::LayerEffects)>,
+}
+
+/// Every layer's effects, as [`LayerEffectsWire`] pairs, in
+/// [`layer_ids`] order.
+fn layer_effects_pairs(layers: &LayerTree) -> Vec<(u64, aurora_core::LayerEffects)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| Some((id.to_raw(), layers.effects(id)?.clone())))
+        .collect()
+}
+
+/// Reads [`LAYER_EFFECTS_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, or a pair naming a missing layer, an adjustment layer,
+/// or effects that fail validation (`LayerTree::set_effects`'s checks) —
+/// refused, never half-applied silently.
+fn read_layer_effects<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_EFFECTS_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_EFFECTS_ENTRY, MAX_LAYER_EFFECTS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_EFFECTS_VERSION {
+        // Worded by direction: only a larger version can be a newer
+        // Aurora's; anything else is damage.
+        let cause = if prefix.version > LAYER_EFFECTS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-effects version {} (this build understands version \
+             {LAYER_EFFECTS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerEffectsWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, effects) in wire.effects {
+        layers
+            .set_effects(aurora_doc::LayerId::from_raw(raw), Some(effects))
+            .map_err(|err| IoError::ManifestDeserialization(format!("layer effects: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The entry holding what the document's own open changed or left out
 /// (0.177.0 review B-1): the lines of a PSD's "Opened With Changes"
 /// report, so a later Photoshop save of the document lists them even
@@ -1438,6 +1522,8 @@ struct DocumentEntries {
     manifest: Vec<u8>,
     history: Vec<u8>,
     mask_densities: Option<Vec<u8>>,
+    /// [`LAYER_EFFECTS_ENTRY`], when some layer has effects (0.180.0).
+    layer_effects: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
 }
@@ -1476,10 +1562,24 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let effects = layer_effects_pairs(layers);
+        let layer_effects = if effects.is_empty() {
+            None
+        } else {
+            let wire = LayerEffectsWire {
+                version: LAYER_EFFECTS_VERSION,
+                effects,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         Ok(Self {
             manifest,
             history,
             mask_densities,
+            layer_effects,
             import_losses: None,
         })
     }
@@ -1499,6 +1599,10 @@ impl DocumentEntries {
         zip.write_all(&self.history)?;
         if let Some(bytes) = &self.mask_densities {
             zip.start_file(MASK_DENSITY_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_effects {
+            zip.start_file(LAYER_EFFECTS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.import_losses {
@@ -1874,6 +1978,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     validate_persisted_rects(&manifest.layers)?;
     let mut layers = manifest.layers;
     read_mask_densities(&mut zip, &mut layers)?;
+    read_layer_effects(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
@@ -5881,6 +5986,226 @@ mod tests {
         canvas_height: u32,
         color_space: super::ColorSpaceTag,
         layers: LayerTree,
+    }
+
+    // -- 0.180.0: layer effects ------------------------------------------
+
+    fn effects_fixture(distance: f32) -> aurora_core::LayerEffects {
+        aurora_core::LayerEffects {
+            drop_shadows: vec![aurora_core::effects::DropShadow {
+                distance,
+                ..aurora_core::effects::DropShadow::default()
+            }],
+            strokes: vec![aurora_core::effects::Stroke::default()],
+            ..aurora_core::LayerEffects::default()
+        }
+    }
+
+    /// A pixel layer and a group with effects (the group's turned off), and
+    /// one layer without, saved through the real [`write`].
+    fn effects_document(
+        store: &mut TileStore,
+        with_effects: bool,
+    ) -> (
+        Vec<u8>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = match history.add_pixel_layer(&mut layers, "q", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if with_effects {
+            let mut off = effects_fixture(4.0);
+            off.enabled = false;
+            for (id, fx) in [(pixel, effects_fixture(12.0)), (group, off)] {
+                if let Err(err) = history.set_effects(&mut layers, id, Some(fx)) {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), pixel, plain, group)
+    }
+
+    /// `container` with entry `name` replaced by `payload` (or dropped).
+    fn with_named_entry(container: &[u8], name: &str, payload: Option<&[u8]>) -> Vec<u8> {
+        let mut archive = match zip::ZipArchive::new(Cursor::new(container)) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let file = match archive.by_index_raw(index) {
+                Ok(file) => file,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if file.name() == name {
+                continue;
+            }
+            if let Err(err) = out.raw_copy_file(file) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Some(payload) = payload {
+            if let Err(err) = out.start_file(name, zip::write::SimpleFileOptions::default()) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = std::io::Write::write_all(&mut out, payload) {
+                unreachable!("{err:?}");
+            }
+        }
+        match out.finish() {
+            Ok(cursor) => cursor.into_inner(),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn effects_entry_names(bytes: &[u8]) -> Vec<String> {
+        match zip::ZipArchive::new(Cursor::new(bytes)) {
+            Ok(archive) => archive.file_names().map(str::to_owned).collect(),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn effects_survive_aur_round_trip() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, plain, group) = effects_document(&mut store, true);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_EFFECTS_ENTRY),
+            "{:?}",
+            effects_entry_names(&bytes)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut off = effects_fixture(4.0);
+        off.enabled = false;
+        assert_eq!(document.layers.effects(pixel), Some(&effects_fixture(12.0)));
+        assert_eq!(document.layers.effects(plain), None);
+        assert_eq!(document.layers.effects(group), Some(&off));
+        let replayed = match document.history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            replayed.effects(pixel),
+            Some(&effects_fixture(12.0)),
+            "replay"
+        );
+        assert_eq!(replayed.effects(group), Some(&off), "replay");
+    }
+
+    #[test]
+    fn an_old_aur_without_effects_entry_opens_unchanged() {
+        // A document without effects writes no entry at all, so its
+        // container is what every pre-0.180.0 build wrote.
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, plain, group) = effects_document(&mut store, false);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .all(|n| n != super::LAYER_EFFECTS_ENTRY),
+            "{:?}",
+            effects_entry_names(&bytes)
+        );
+        // And a container whose entry is gone opens, with no effects.
+        let (_dir1, mut store1) = real_tile_store();
+        let (with, ..) = effects_document(&mut store1, true);
+        for container in [
+            bytes,
+            with_named_entry(&with, super::LAYER_EFFECTS_ENTRY, None),
+        ] {
+            let (_dir2, mut fresh) = real_tile_store();
+            let document = match read(Cursor::new(container), &mut fresh) {
+                Ok(document) => document,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(document.layers.len(), 3);
+            for id in [pixel, plain, group] {
+                assert_eq!(document.layers.effects(id), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_newer_effects_entry_version_refuses_loudly() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, pixel, _plain, _group) = effects_document(&mut store, true);
+        let encode =
+            |wire: &super::LayerEffectsWire| postcard::to_allocvec(wire).unwrap_or_default();
+        let adjustment_free_bad = aurora_core::LayerEffects {
+            scale: f32::NAN,
+            ..aurora_core::LayerEffects::default()
+        };
+        for (payload, needle) in [
+            (
+                encode(&super::LayerEffectsWire {
+                    version: super::LAYER_EFFECTS_VERSION + 1,
+                    effects: Vec::new(),
+                }),
+                "saved by a newer Aurora",
+            ),
+            (
+                // An older-than-known version is damage, never "newer".
+                encode(&super::LayerEffectsWire {
+                    version: 0,
+                    effects: Vec::new(),
+                }),
+                "version 0 (this build understands version 1); the entry is damaged",
+            ),
+            (
+                encode(&super::LayerEffectsWire {
+                    version: super::LAYER_EFFECTS_VERSION,
+                    effects: vec![(pixel.to_raw(), adjustment_free_bad)],
+                }),
+                "layer effects",
+            ),
+            (
+                encode(&super::LayerEffectsWire {
+                    version: super::LAYER_EFFECTS_VERSION,
+                    effects: vec![(9_999, effects_fixture(1.0))],
+                }),
+                "layer effects",
+            ),
+            (vec![1, 0xFF, 0xFF], ""),
+        ] {
+            let tampered = with_named_entry(&bytes, super::LAYER_EFFECTS_ENTRY, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(message.contains(needle), "{message}");
+                }
+                other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
     }
 }
 

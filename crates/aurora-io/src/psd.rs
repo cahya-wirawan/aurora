@@ -118,6 +118,10 @@ use half::f16;
 use crate::error::IoError;
 use crate::image::Image;
 
+mod descriptor;
+mod effects;
+#[cfg(test)]
+mod effects_tests;
 #[cfg(test)]
 mod test_writer;
 #[cfg(test)]
@@ -287,6 +291,9 @@ pub struct PsdProps {
     pub visible: bool,
     /// Clipped to the layer below — not supported, so shown unclipped.
     pub clipped: bool,
+    /// The layer's effects (0.180.0), stored on the layer as data and not
+    /// rendered yet.
+    pub effects: Option<Box<aurora_core::LayerEffects>>,
 }
 
 /// A layer's or group's user mask (channel `-2`), as stored: what
@@ -412,7 +419,15 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
+    DropShadowsNotShown,
+    ColorOverlaysNotShown,
+    StrokesNotShown,
+    OuterGlowsNotShown,
+    OtherEffectsNotShown,
     EffectsNotShown,
+    AdjustmentEffectsDropped,
+    EffectsUnreadable,
+    EffectsClamped,
     BlendIfNotApplied,
     KnockoutNotApplied,
     PassThroughFillNotApplied,
@@ -558,9 +573,44 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} clipped layer{s} {is} shown unclipped — Aurora doesn't have clipping masks \
              yet."
         ),
+        Note::DropShadowsNotShown => format!(
+            "{n} drop shadow{s} {is}n't shown yet; {} kept with the layer.",
+            if one { "it is" } else { "they are" }
+        ),
+        Note::ColorOverlaysNotShown => format!(
+            "{n} colour overlay{s} {is}n't shown yet; {} kept with the layer.",
+            if one { "it is" } else { "they are" }
+        ),
+        Note::StrokesNotShown => format!(
+            "{n} stroke effect{s} {is}n't shown yet; {} kept with the layer.",
+            if one { "it is" } else { "they are" }
+        ),
+        Note::OuterGlowsNotShown => format!(
+            "{n} outer glow{s} {is}n't shown yet; {} kept with the layer.",
+            if one { "it is" } else { "they are" }
+        ),
+        Note::OtherEffectsNotShown => format!(
+            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, gradient or pattern \
+             overlay) {is}n't shown, and {} settings aren't kept.",
+            if one { "its" } else { "their" }
+        ),
         Note::EffectsNotShown => format!(
             "{n} layer{s} with layer effects (shadows, strokes, glows): the effects aren't \
              shown."
+        ),
+        Note::AdjustmentEffectsDropped => format!(
+            "{n} adjustment layer{s} {has} layer effects, which Aurora doesn't show or keep on \
+             an adjustment layer.",
+            has = if one { "has" } else { "have" },
+        ),
+        Note::EffectsUnreadable => format!(
+            "{n} layer{s} {has} layer effects that couldn't be read; they aren't shown or kept.",
+            has = if one { "has" } else { "have" },
+        ),
+        Note::EffectsClamped => format!(
+            "{n} layer{s} {has} layer-effect settings outside Photoshop's own ranges; they were \
+             limited to the nearest allowed value.",
+            has = if one { "has" } else { "have" },
         ),
         Note::BlendIfNotApplied => format!(
             "{n} layer{s} use{} Blend If (blending ranges), which Aurora doesn't apply yet.",
@@ -1010,17 +1060,22 @@ fn read_header(r: &mut Reader<'_>) -> Result<Header, IoError> {
 /// Walks the image-resources section looking for an embedded ICC
 /// profile (resource 1039). Lenient: a damaged resource section only
 /// stops the walk — nothing in it is needed to show the pixels.
-fn scan_resources(data: &[u8], notes: &mut Notes) {
+///
+/// Also reads the global light angle (resource 1037, an `i32` in
+/// degrees, 0.180.0), which drop shadows using global light (`uglg`)
+/// follow; [`aurora_core::effects::DEFAULT_GLOBAL_ANGLE`] without one.
+fn scan_resources(data: &[u8], notes: &mut Notes) -> f32 {
+    let mut angle = aurora_core::effects::DEFAULT_GLOBAL_ANGLE;
     let mut r = Reader::new(data);
     while r.remaining() >= 12 {
         let Ok(_signature) = r.array::<4>("resource signature") else {
-            return;
+            return angle;
         };
         let Ok(id) = r.u16("resource id") else {
-            return;
+            return angle;
         };
         let Ok(name_len) = r.u8("resource name") else {
-            return;
+            return angle;
         };
         // The Pascal name, length byte included, is padded to even.
         let name_total = 1 + usize::from(name_len);
@@ -1028,21 +1083,37 @@ fn scan_resources(data: &[u8], notes: &mut Notes) {
         if r.skip(usize::from(name_len) + pad, "resource name")
             .is_err()
         {
-            return;
+            return angle;
         }
         let Ok(size) = r.length(false, "resource size") else {
-            return;
+            return angle;
         };
         let Ok(body) = r.take(size, "resource data") else {
-            return;
+            return angle;
         };
         if size % 2 == 1 && r.skip(1, "resource padding").is_err() {
-            return;
+            return angle;
         }
         if id == 1039 && !looks_like_srgb(body) {
             notes.add(Note::ColorProfileIgnored);
         }
+        if id == 1037
+            && let Some(bytes) = body.get(..4)
+        {
+            let degrees = i32::from_be_bytes([
+                bytes.first().copied().unwrap_or(0),
+                bytes.get(1).copied().unwrap_or(0),
+                bytes.get(2).copied().unwrap_or(0),
+                bytes.get(3).copied().unwrap_or(0),
+            ]);
+            // Kept within the range `LayerEffects::validate` accepts.
+            #[allow(clippy::cast_precision_loss)] // clamped to ±360 first
+            {
+                angle = degrees.clamp(-360, 360) as f32;
+            }
+        }
     }
+    angle
 }
 
 /// Whether an ICC profile's bytes name sRGB anywhere (its description
@@ -1201,6 +1272,13 @@ struct Record {
     vector: Option<Vec<u8>>,
     /// The last `curv` block, parsed (0.158.0).
     curves: Option<Result<CurvBlock, CurvRefusal>>,
+    /// The effects blocks to read (0.180.0), as `(priority, bytes)`:
+    /// `lmfx` (0), `lfx2` (1), `lfxs` (2). Tried in that order; the first
+    /// that reads wins, so a damaged `lmfx` falls back to `lfx2`.
+    effects_blocks: Vec<(u8, Vec<u8>)>,
+    /// That block, read by `decode_source` once the global light angle
+    /// is known and charged to the file's descriptor budget.
+    effects: Option<Result<effects::ReadEffects, effects::Unreadable>>,
 }
 
 impl Record {
@@ -1270,6 +1348,7 @@ fn rect_from_edges(top: i32, left: i32, bottom: i32, right: i32) -> Result<Rect,
     })
 }
 
+#[allow(clippy::too_many_lines)] // one arm per tagged block, nothing else
 fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let top = r.i32("layer rectangle")?;
     let left = r.i32("layer rectangle")?;
@@ -1325,6 +1404,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut fill_opacity = None;
     let mut vector = None;
     let mut curves = None;
+    let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut features = Features {
         blend_if: blend_if_in_use(ranges),
         ..Features::default()
@@ -1341,7 +1421,16 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"iOpa" => fill_opacity = data.first().copied(),
             b"TySh" | b"tySh" => features.text = true,
             b"SoLd" | b"PlLd" | b"SoLE" => features.smart = true,
-            b"lfx2" | b"lrFX" | b"lmfx" => features.effects = true,
+            b"lmfx" | b"lfx2" | b"lfxs" => {
+                features.effects = true;
+                let priority = match &key {
+                    b"lmfx" => 0,
+                    b"lfx2" => 1,
+                    _ => 2,
+                };
+                effects_blocks.push((priority, data.to_vec()));
+            }
+            b"lrFX" => features.effects = true,
             b"vmsk" | b"vsms" => {
                 features.vector_mask = true;
                 if vector.is_none() {
@@ -1374,6 +1463,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         features,
         vector,
         curves,
+        effects_blocks,
+        effects: None,
     })
 }
 
@@ -2464,13 +2555,52 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
         // Flags bit 1 set means *hidden*.
         visible: record.flags & 0x02 == 0,
         clipped: record.clipping != 0,
+        effects: match &record.effects {
+            Some(Ok(read)) if !read.effects.is_empty() && read.effects.validate().is_ok() => {
+                Some(Box::new(read.effects.clone()))
+            }
+            _ => None,
+        },
     }
 }
 
 /// Notes for the features a record uses that Aurora does not apply.
 fn note_unsupported(record: &Record, outcome: &MaskOutcome, notes: &mut Notes) {
-    if record.features.effects {
-        notes.add(Note::EffectsNotShown);
+    note_unsupported_kept(record, outcome, notes, true);
+}
+
+/// [`note_unsupported`], with `effects_kept` false for a record whose
+/// effects are dropped rather than stored (an adjustment layer).
+fn note_unsupported_kept(
+    record: &Record,
+    outcome: &MaskOutcome,
+    notes: &mut Notes,
+    effects_kept: bool,
+) {
+    match &record.effects {
+        Some(Ok(read)) if !effects_kept => {
+            if !read.effects.is_empty() {
+                notes.add(Note::AdjustmentEffectsDropped);
+            }
+        }
+        Some(Ok(read)) => {
+            let fx = &read.effects;
+            notes.add_n(Note::DropShadowsNotShown, fx.shown_drop_shadows() as u64);
+            notes.add_n(
+                Note::ColorOverlaysNotShown,
+                fx.shown_color_overlays() as u64,
+            );
+            notes.add_n(Note::StrokesNotShown, fx.shown_strokes() as u64);
+            notes.add_n(Note::OuterGlowsNotShown, fx.shown_outer_glows() as u64);
+            notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
+            if read.clamped {
+                notes.add(Note::EffectsClamped);
+            }
+        }
+        Some(Err(effects::Unreadable)) => notes.add(Note::EffectsUnreadable),
+        // An `lrFX`-only record: the legacy block is not parsed.
+        None if record.features.effects => notes.add(Note::EffectsNotShown),
+        None => {}
     }
     if record.clipping != 0 {
         notes.add(Note::ClippingDropped);
@@ -2621,10 +2751,13 @@ fn layer_node(
                 return None;
             }
         };
-        let props = props_for(record, notes);
+        let mut props = props_for(record, notes);
+        // Photoshop puts no effects on an adjustment layer, and Aurora's
+        // tree refuses them there; any in the file are reported anyway.
+        props.effects = None;
         // No pixels: the mask region is the canvas, as for a group.
         let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
-        note_unsupported(record, &outcome, notes);
+        note_unsupported_kept(record, &outcome, notes, false);
         return Some(PsdNode::Adjustment(PsdAdjustment {
             props,
             curves,
@@ -3217,7 +3350,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     r.advance(color_data_len, "colour mode data")?;
     let resources_len = r.length(src, false, "image resources length")?;
     let resources = r.take(src, resources_len, "image resources")?;
-    scan_resources(&resources, &mut notes);
+    let global_angle = scan_resources(&resources, &mut notes);
     drop(resources);
 
     let section_len = r.length(src, psb, "layer and mask section length")?;
@@ -3271,6 +3404,22 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         pixels: PIXEL_BUDGET.saturating_sub(total),
         work: vector_work,
     };
+    // Layer effects (0.180.0): every record's block, against one
+    // descriptor budget for the whole file.
+    let mut effects_budget = descriptor::ItemBudget::new();
+    for record in &mut info.records {
+        let mut blocks = std::mem::take(&mut record.effects_blocks);
+        // Stable: two blocks of one kind keep their file order.
+        blocks.sort_by_key(|(priority, _)| *priority);
+        for (_, block) in &blocks {
+            let read = effects::read_effects(block, global_angle, &mut effects_budget);
+            let done = read.is_ok();
+            record.effects = Some(read);
+            if done {
+                break;
+            }
+        }
+    }
     let layers = build_tree(src, &info.records, header, &mut notes, &mut vector_budget)?;
     // A read that failed inside a mask was reported as a damaged mask by
     // the tree build; the file itself is what failed, so the open does.
@@ -3745,6 +3894,10 @@ impl Builder<'_, '_, '_> {
         }
         if !props.visible {
             self.history.set_visible(self.layers, id, false)?;
+        }
+        if let Some(effects) = &props.effects {
+            self.history
+                .set_effects(self.layers, id, Some((**effects).clone()))?;
         }
         Ok(())
     }

@@ -4465,7 +4465,7 @@ fn curv(
 
 /// `curves_rgb.psd`'s `Curves 1`-like block: composite, red (moved
 /// endpoints), green, blue, in both layouts.
-fn curv_rgb_block() -> Vec<u8> {
+pub(super) fn curv_rgb_block() -> Vec<u8> {
     let c: &[(u16, u16)] = &[(0, 0), (37, 49), (118, 95), (232, 197), (255, 255)];
     let r: &[(u16, u16)] = &[(0, 11), (34, 33), (255, 238)];
     let g: &[(u16, u16)] = &[(0, 0), (72, 65), (211, 213), (255, 255)];
@@ -4480,7 +4480,7 @@ fn curv_rgb_block() -> Vec<u8> {
 
 /// A 2×2 RGB file: a pixel layer under a Curves layer carrying `block`
 /// and a 1-pixel-wide mask, both inside a Pass Through group.
-fn curves_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
+pub(super) fn curves_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
     let block = block.to_vec();
     let curves = TestLayer::empty("Curves 1").with(|l| {
         l.blocks.push((*b"curv", block));

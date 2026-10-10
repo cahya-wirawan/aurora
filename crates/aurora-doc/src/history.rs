@@ -141,6 +141,33 @@ enum LayerOp {
         id: LayerId,
         value: crate::Adjustment,
     },
+    /// Replace a layer's effects (0.180.0); `None` removes them. Appended
+    /// last for the postcard-ordinal reason above. Also the carrier for
+    /// the effects a journaled `Restore` holds in memory but cannot put
+    /// on the wire (`LayerEntry::effects` is `#[serde(skip)]`), exactly
+    /// like [`Self::SetMaskDensity`] for a mask's density. The payload is
+    /// positional `postcard` too: changing `aurora_core::LayerEffects`'s
+    /// shape needs a new variant, never an edit of this one. A build
+    /// older than 0.180.0 refuses a journal holding it.
+    SetEffects {
+        id: LayerId,
+        value: Option<Box<aurora_core::LayerEffects>>,
+    },
+}
+
+/// Every `(layer, effects)` pair a journaled `Restore` carries in a
+/// subtree entry whose effects would be lost on the wire.
+/// [`History::save_journal`]'s helper, the twin of
+/// [`reduced_mask_densities`].
+fn restored_effects(op: &LayerOp) -> Vec<(LayerId, Box<aurora_core::LayerEffects>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.effects.clone().map(|fx| (*id, fx)))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Every `(layer, density)` pair a journaled `op` carries in a mask whose
@@ -334,6 +361,13 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
                 layer_dirty_rect(tree, id),
             ))
         }
+        LayerOp::SetEffects { id, value } => {
+            let old = tree.effects(id).cloned().map(Box::new);
+            tree.set_effects(id, value.map(|fx| *fx))?;
+            // `None`: effects reach past the layer's own bounds (a shadow's
+            // offset and blur), so the whole composite is invalidated.
+            Ok((LayerOp::SetEffects { id, value: old }, None))
+        }
         LayerOp::SetBounds { id, value } => {
             let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
             tree.set_bounds(id, value)?;
@@ -466,6 +500,13 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetAdjustment { id, value } => {
             format!("Changed {} on layer #{}", value.label(), id.to_raw())
         }
+        LayerOp::SetEffects { id, value } => match value {
+            Some(fx) if !fx.enabled => {
+                format!("Turned off layer effects on layer #{}", id.to_raw())
+            }
+            Some(_) => format!("Changed layer effects on layer #{}", id.to_raw()),
+            None => format!("Removed layer effects from layer #{}", id.to_raw()),
+        },
         LayerOp::SetBounds { id, value } => {
             format!(
                 "Repositioned layer #{} to ({}, {})",
@@ -742,6 +783,14 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetMaskDensity {
                     id,
                     value,
+                }));
+            }
+            // Effects (0.180.0) travel the same way: after a `Restore` of
+            // a subtree that has some, one `SetEffects` per layer.
+            for (id, value) in restored_effects(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetEffects {
+                    id,
+                    value: Some(value),
                 }));
             }
         }
@@ -1376,6 +1425,31 @@ impl History {
         self.journal.push(LayerOp::SetAdjustment { id, value });
         self.push(LayerOp::SetAdjustment { id, value: old });
         Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// Same as [`LayerTree::set_effects`], recorded for undo as one
+    /// `LayerOp::SetEffects` step holding the previous effects (0.180.0).
+    /// Returns `None`: effects reach past the layer's bounds, so the
+    /// caller invalidates the whole composite.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_effects`]. Nothing is recorded when it
+    /// fails.
+    pub fn set_effects(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Option<aurora_core::LayerEffects>,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.effects(id).cloned().map(Box::new);
+        tree.set_effects(id, value.clone())?;
+        self.journal.push(LayerOp::SetEffects {
+            id,
+            value: value.map(Box::new),
+        });
+        self.push(LayerOp::SetEffects { id, value: old });
+        Ok(None)
     }
 
     /// Undoes the most recent step, if any. `None` both when there was
@@ -5063,5 +5137,131 @@ mod adjustment_tests {
             }),
             Some(15)
         );
+    }
+
+    // -- 0.180.0: layer effects ------------------------------------------
+
+    fn replayed_through_postcard(history: &History) -> LayerTree {
+        match History::load_journal(&history.save_journal().unwrap_or_default())
+            .and_then(|h| h.replay())
+        {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn shadow_effects(distance: f32) -> aurora_core::LayerEffects {
+        aurora_core::LayerEffects {
+            drop_shadows: vec![aurora_core::effects::DropShadow {
+                distance,
+                ..aurora_core::effects::DropShadow::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        }
+    }
+
+    #[test]
+    fn set_effects_undo_redo_and_journal_replay() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.effects(id), None);
+        for (layer, fx) in [(id, shadow_effects(7.0)), (group, shadow_effects(3.0))] {
+            match history.set_effects(&mut tree, layer, Some(fx.clone())) {
+                Ok(dirty) => assert_eq!(dirty, None, "whole composite"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert_eq!(tree.effects(layer), Some(&fx));
+        }
+        // Turning the master switch off is one more undoable step.
+        let mut off = shadow_effects(7.0);
+        off.enabled = false;
+        if let Err(err) = history.set_effects(&mut tree, id, Some(off.clone())) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(replayed_through_postcard(&history).effects(id), Some(&off));
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.effects(id), Some(&shadow_effects(7.0)));
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.effects(id), Some(&off));
+        let replayed = replayed_through_postcard(&history);
+        assert_eq!(replayed.effects(id), Some(&off));
+        assert_eq!(replayed.effects(group), Some(&shadow_effects(3.0)));
+
+        // Refused on an adjustment layer and for invalid values; nothing
+        // recorded either time.
+        let adjustment = match history.add_adjustment_layer_at(&mut tree, "c", identity(), None, 0)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let journal = history.journal.len();
+        assert!(matches!(
+            history.set_effects(&mut tree, adjustment, Some(shadow_effects(1.0))),
+            Err(DocError::EffectsOnAdjustment(_))
+        ));
+        assert!(matches!(
+            history.set_effects(&mut tree, id, Some(shadow_effects(f32::NAN))),
+            Err(DocError::InvalidEffects(_))
+        ));
+        assert_eq!(history.journal.len(), journal);
+        assert_eq!(tree.effects(id), Some(&off));
+    }
+
+    #[test]
+    fn restored_subtree_keeps_effects_through_journal() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match history.add_pixel_layer(&mut tree, "c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (layer, d) in [(group, 2.0), (child, 9.0)] {
+            if let Err(err) = history.set_effects(&mut tree, layer, Some(shadow_effects(d))) {
+                unreachable!("{err:?}");
+            }
+        }
+        // Delete the group, then undo: the journal ends in a `Restore`
+        // whose entries carry effects postcard cannot encode by itself.
+        if let Err(err) = history.remove(&mut tree, group) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(replayed_through_postcard(&history).effects(child), None);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.effects(child), Some(&shadow_effects(9.0)), "in memory");
+        let replayed = replayed_through_postcard(&history);
+        assert_eq!(replayed.effects(group), Some(&shadow_effects(2.0)));
+        assert_eq!(replayed.effects(child), Some(&shadow_effects(9.0)));
+        // Idempotent: loading and saving again writes the same bytes.
+        let first = history.save_journal().unwrap_or_default();
+        let second = History::load_journal(&first)
+            .and_then(|h| h.save_journal())
+            .unwrap_or_default();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn set_effects_is_appended_after_set_adjustment() {
+        let id = crate::LayerId::from_raw(1);
+        let bytes = postcard::to_allocvec(&LayerOp::SetEffects { id, value: None });
+        assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(16));
     }
 }

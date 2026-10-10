@@ -26,7 +26,106 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.179.0): real Pass Through groups (design-owner
+**Latest (2026-10-10, 0.180.0): layer effects, round E1 — descriptor
+parser, model and storage; no visual change.** The effects plan (planner,
+2026-10-10) is ten rounds: **E1** parser/model/storage (this one), **E2**
+Fill applied everywhere plus Color Overlay (all 27 modes; the GPU refusal is
+wired in), **E3** Drop Shadow (apron reader, offset, spread, blur,
+knockout, global light, dirty-rect inflation), **E4** Stroke, **E5** Outer
+Glow, **E6** inner effects and `infx`, **E7** writing `lfx2` back, **E8**
+effects on the GPU, **E9** effects on groups, **E10** an effects UI (needs
+Cahya). **Decision: the PSD-write rounds R4 (Curves `curv` write) and R5
+(PSB) now come after the effects rounds.** **The Fill finding, carried to
+E2:** Aurora stores, round-trips and reads Fill (`iOpa`) but never applies
+it when compositing and does not report it (only Pass Through groups say
+so); Photoshop's rule is that Fill fades only the layer's own pixels —
+effects keep their opacity at Fill 0 unless "blend interior effects as
+group" is on, drop shadow and outer glow never fade with Fill, and layer
+Opacity scales content and every effect.
+
+What landed. `aurora_core::effects` (the `CurvesParams` precedent, so
+`aurora-filters` can apply it later without `aurora-doc`): `LayerEffects`
+with typed `DropShadow`, `ColorOverlay`, `Stroke`, `OuterGlow` (an
+`EffectBlendMode` mirror of the 27 layer modes, mapped to
+`aurora_doc::BlendMode` by an exhaustive `From`), `OtherEffects` counts
+(inner shadow, inner glow, bevel, satin, gradient and pattern overlay),
+and `validate()` — at most 10 instances per kind, size ≤ 250, distance ≤
+30,000, scale ≤ 1000 %, every value finite and in range. The master switch
+(`masterFXSwitch`), `present` and `enab` are all kept as data. A new
+`aurora-io` descriptor parser (`psd/descriptor.rs`: every OSType psd-tools
+1.17.4 knows, depth ≤ 16, every count checked against the bytes left
+before allocating and pre-allocation capped at 1,024, a 1M-item per-file
+budget, key/string lengths checked; an unknown OSType or truncation fails
+that block only) and mapping (`psd/effects.rs`: `lmfx`, else `lfx2`, else
+`lfxs`; each kind from its `*Multi` list if present — even `lfx2` blocks
+carry them — else its single key). Validation is **clamp and note** for a
+finite out-of-range value or an 11th instance, **unreadable** for a
+non-finite or wrongly typed value, a non-RGB colour or an unknown blend
+mode (no nearest value exists). Image resource 1037 (global angle) is read
+and defaults to 120° (unverified: every corpus file stores one); a
+`uglg` shadow's `angle` is resolved to it at import, its own `lagl` kept.
+The doc model follows the mask-density precedent: `#[serde(skip)]
+LayerEntry::effects`, `LayerTree::effects`/`set_effects` (pixel layers and
+groups; refused on adjustments and for invalid values), `LayerOp::SetEffects`
+appended last (ordinal 16) with undo/redo, and `save_journal` emits it after
+a journaled `Restore` of a subtree carrying effects. `.aur` gains an
+optional, versioned (v1), 16 MiB-capped `layer-effects` entry, written only
+when some layer has effects; a newer version refuses the open loudly (ADR
+0009 updated). A PSD open stores the effects and reports per kind ("N drop
+shadows aren't shown yet; they are kept with the layer", colour overlays,
+strokes, outer glows, "N other effects …", plus "couldn't be read" and
+"limited to the nearest allowed value"); an `lrFX`-only layer keeps the old
+"effects aren't shown" line. A PSD save lists "N layers' effects aren't
+saved to .psd yet (they are kept in .aur)". The GPU refusal predicate
+(`layer_shows_effects` in `aurora-app`) exists and is unit-tested but is
+**not wired into `document_qualifies_for_gpu_compositing` yet** — wiring it
+before anything draws effects would only slow documents with effects for no
+visual change; E2 wires it in. A damaged `lmfx` falls back to `lfx2`, then
+`lfxs`, before the layer is reported unreadable; effects on an adjustment
+layer are dropped and reported as "not shown or kept". A `.aur`
+`layer-effects` version above 1 says "saved by a newer Aurora", any other
+unknown version "damaged or of an unknown kind". No rendering,
+no UI, no palette command (deferred). The user's Nyepi file
+(`images/flat-design-nyepi-template/6739968.psd`, never committed) parses
+**38 drop shadows and 9 colour overlays shown, 56 layers with effects**,
+matching psd-tools (`AURORA_EFFECTS_PSD=… cargo test -p aurora-io --
+--ignored nyepi`).
+
+**0.180.0 addendum: gate and mutations** (after the judge's revision:
+M1 GPU refusal predicate kept but not wired until E2; L2 `Ckmt` scale
+pinned; L4 `lmfx` → `lfx2` → `lfxs` fallback; L5 adjustment-layer effects
+reported as not kept; L6 version message worded by direction). One gate
+pass after the last code change (RTX 3090, `/home` 50G free): `cargo fmt
+--check`, layering, no-hardcoded-style, `cargo check --locked`, workspace
+clippy `-D warnings`, and `AURORA_REQUIRE_GPU=1 cargo test --workspace
+--no-fail-fast` — **3,389 passed, 0 failed, 65 ignored**; the ignored Nyepi
+test run on its own passes (38 drop shadows, 9 colour overlays); `cargo doc
+--document-private-items` with `-D warnings` clean; `cargo deny check all`
+ok; `check_contrast.py` passes; cross-clippy (`aurora-io`, `aurora-app`,
+`--all-targets`) for `x86_64-pc-windows-gnu` and `x86_64-apple-darwin`
+clean. Sixteen mutations, each backed up, applied, run under
+`AURORA_REQUIRE_GPU=1`, restored and sha256-checked — all killed:
+
+| Mutation | Killed by |
+|---|---|
+| descriptor depth check removed | `descriptor_refuses_deep_nesting_without_panic` (stack overflow at 200,000 levels) |
+| count-vs-bytes check removed | `descriptor_huge_count_does_not_allocate` (reports `Truncated`, not `CountTooLarge`; the 1,024 pre-allocation cap keeps the mutant from exhausting memory) |
+| `lmfx` ignored | `lmfx_multiple_instances_are_all_kept` |
+| `enab` ignored | `master_switch_and_enab_and_present_gate_effects` |
+| `uglg` ignored | `global_angle_resource_is_read_and_defaults_to_120` |
+| resource 1037 not read | `global_angle_resource_is_read_and_defaults_to_120` |
+| `.aur` `layer-effects` entry not written | `effects_survive_aur_round_trip` |
+| journal carrier after `Restore` dropped | `restored_subtree_keeps_effects_through_journal` |
+| PSD-save effects item missing | `psd_save_itemises_unsaved_effects` |
+| `layer_shows_effects` always false | `layer_shows_effects_gates_and_the_gpu_path_is_unchanged_in_e1` |
+| `Ckmt` ×0.01 scale dropped | `a_spread_tagged_in_pixels_is_still_a_percentage` |
+| `lmfx` fallback removed | `a_damaged_lmfx_falls_back_to_lfx2_before_unreadable` |
+| adjustment effects worded as kept | `an_adjustment_layers_effects_are_reported_as_not_kept` |
+| version direction ignored | `a_newer_effects_entry_version_refuses_loudly` |
+| `set_effects` adjustment guard removed | `set_effects_undo_redo_and_journal_replay` |
+| newer entry version accepted | `a_newer_effects_entry_version_refuses_loudly` |
+
+**Previously (2026-10-10, 0.179.0): real Pass Through groups (design-owner
 choice, Cahya).** `aurora_doc::BlendMode::PassThrough` is appended (last,
 ordinal 27, so every older `.aur` decodes unchanged; `BlendMode::ALL` is
 28 long) and valid on a group only: `LayerTree::set_blend_mode` refuses it
