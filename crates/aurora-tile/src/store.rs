@@ -4776,10 +4776,17 @@ mod insert_encoded_tests {
             }
             other => unreachable!("{other:?}"),
         }
-        assert_eq!(
-            store.snapshot_len_bound(surface, id),
-            Some(shared.len()),
-            "and its budget estimate counts them"
+        // The bound is the pending write's exact length while the write
+        // is still in flight, and `MAX_ENCODED_LEN` once the store's
+        // writer has landed it and `snapshot_tile` above reconciled that
+        // — on a fast runner the writer can finish between the two calls
+        // (a CI race, 0.165.1). Either way it must cover the bytes; that
+        // upper bound is all the autosave budget relies on.
+        let bound = store.snapshot_len_bound(surface, id);
+        assert!(
+            bound.is_some_and(|b| b >= shared.len() && b <= crate::codec::MAX_ENCODED_LEN),
+            "and its budget estimate covers them: {bound:?} for {} bytes",
+            shared.len()
         );
         assert_eq!(
             store.take_dirty(surface, id),
