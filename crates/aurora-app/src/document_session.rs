@@ -34,9 +34,16 @@ pub(crate) struct DocumentId(u64);
 
 impl DocumentId {
     /// The next id from one process-wide counter, starting at 1.
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The id's value — what names the session's autosave file
+    /// (`crate::autosave_files::session_file_name`) and keys its slot in
+    /// the autosave worker (0.171.0).
+    pub(crate) fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -55,13 +62,11 @@ pub(crate) struct DocumentContents {
 
 /// The open document (0.170.0) — see this module's own doc comment.
 pub(crate) struct DocumentSession {
-    /// This session's identity, fixed for its lifetime. Nothing reads it
-    /// yet outside tests; an open still replaces the session's contents
-    /// in place, so it keeps its id across an open in this round.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by later document-tab rounds")
-    )]
+    /// This session's identity, fixed for its lifetime. Since 0.171.0 it
+    /// names the session's autosave file and its autosave worker slot.
+    /// An open replaces the session's contents in place and keeps the
+    /// id, so the opened document's autosave lands on the same file by
+    /// one atomic rename (the session is the slot, not the document).
     pub(crate) id: DocumentId,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
@@ -252,6 +257,12 @@ impl DocumentSession {
     /// values [`crate::App`]'s startup assigned field by field before
     /// 0.170.0.
     pub(crate) fn new(contents: DocumentContents) -> Self {
+        Self::with_id(DocumentId::next(), contents)
+    }
+
+    /// [`Self::new`] with an id taken earlier — `App::new` needs it to
+    /// name the startup autosave before the session exists (0.171.0).
+    pub(crate) fn with_id(id: DocumentId, contents: DocumentContents) -> Self {
         let DocumentContents {
             layers,
             history,
@@ -262,7 +273,7 @@ impl DocumentSession {
             tile_store,
         } = contents;
         Self {
-            id: DocumentId::next(),
+            id,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),
             layers,

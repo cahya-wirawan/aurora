@@ -26,7 +26,59 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.170.0): the open document is one
+**Latest (2026-10-10, 0.171.0): per-session crash-recovery autosave
+plus an index (document tabs, round R2 of six — still one document).**
+Each document session now autosaves to its own file,
+`aurora-autosave-<pid>-<docid>.aur`, in the same temp directory as
+before, and each run keeps an index, `aurora-autosave-<pid>.index`
+(magic, version, the active id and the sessions in tab order with their
+file names, closed by an `end` line so a truncated file is detected).
+The index is written to a unique temp file, synced and renamed, and it
+**only ever names a file that has already landed**: the autosave worker
+tells its `IndexBook` about each landing under the same lock as the
+rename, and the index is rewritten only when what it lists changes (a
+session created, closed, landing for the first time, or the active one
+changing), never on an autosave that just replaces a listed file. The
+worker (`background_autosave`) keeps **one newest-wins slot per document
+id** (still one thread; waiting jobs are written oldest-first; the
+generation check, the over-budget synchronous fallback — now
+`supersede(document)` — and cancel-on-quit are per document). The crashed
+run had another pid, so the **marker now records pids**: this run's
+first, then the crashed (or still-running) runs it knows about; an empty
+pre-0.171.0 marker still means "crashed", recovered from the **legacy
+`aurora-autosave.aur`**. Each run holds an exclusive OS lock on
+`aurora-autosave-<pid>.lock` (`std::fs::File::try_lock`), so a starting
+run can tell a crashed run (lock free) from a **second live Aurora (lock
+held), whose files it never reads, adopts or deletes** — and a marker that
+names only live runs no longer shows a false crash dialog. Recovery
+(`autosave_files::plan_recovery`) reads each crashed run's index, falls
+back to scanning `aurora-autosave-<pid>-*.aur` when the index is missing
+or damaged, and to the legacy file when nothing else names anything; it
+tries the candidates in order (active first), reports every missing or
+damaged one in the crash-recovery dialog (the old wording, plus "One
+autosaved document was missing or damaged…" when there are any), and
+keeps the untried rest on disk — the crashed run's index rewritten to
+list only them, its key kept in the marker even across this run's clean
+quit — for R3 to open (in R2 one is recovered per start). The recovered file is **adopted by one
+atomic rename** into this run's namespace, this run's index is written,
+and only then is the crashed run retired (its leftovers, index and lock
+deleted). **An open keeps the session's id** (the session is the slot,
+not the document), so the opened document's autosave replaces the old
+one on the same path by one rename — no window in which a crash finds
+neither. A clean quit removes this run's whole namespace (session files,
+index, lock) and nothing else, then rewrites the marker keeping any other
+run that still has files (deleting it only when none do); an aborted
+startup keeps all of it. **Review revision**: only candidates recovery
+actually tried are ever deleted (no store, no marker, or a failed store
+reopen deletes nothing untried, the legacy file included); a reused pid
+takes a fresh namespace generation (`<pid>.<n>`) instead of sharing the
+crashed run's; an index may name only its own run's files; the marker
+read is bounded. **Review revision 2**: the marker is written
+atomically (temp, sync, rename), and an empty, zero-filled or
+unparseable marker falls back to scanning the directory for runs with
+files. 3,205 tests (46 new). See the 0.171.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.170.0): the open document is one
 `DocumentSession` (document tabs, round R1 of six — a refactor, no
 behaviour change).** `aurora-app`'s new `document_session` module holds
 `pub(crate) struct DocumentSession`, and `App` holds exactly one in
@@ -31371,6 +31423,200 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.171.0) — per-session autosave plus an index (R2).**
+
+Design: new `aurora-app` module `autosave_files` (naming, index
+encode/decode/read/write, namespace scan, marker pids, liveness locks,
+recovery plan, adoption, retirement, `IndexBook`); `background_autosave`
+keyed per document and owning the `IndexBook`; `lib.rs`'s
+`startup_document_from` (N candidates) and `settle_startup_autosave`
+(adopt → index → retire), wired through `run()` and `App::new`.
+
+- **Index only on set change** (justified): rewriting it on every
+  autosave would add a sync and a rename to every write for no recovery
+  gain, since an already-listed file is replaced atomically on its own
+  path. The cost: a session is unprotected by the index until its first
+  file lands — the same window the single file had (a fresh session's
+  first autosave was already asynchronous since 0.152.0).
+- **The id is kept across an open** (justified with R3 in mind): R3's
+  Open creates a new session with a new id, so the only in-place
+  replacement left is this one, and keeping the id makes it one rename
+  over the same path; a fresh id would need "new file, then index, then
+  delete old" for no benefit.
+- **The pid problem**: the index name carries the run's key (its pid,
+  plus a generation when a crashed run with the same pid still has files:
+  `<pid>.<n>`) and the marker records keys, writer first, then inherited
+  runs that still have anything on disk (a crash *during* recovery still
+  finds the older files; a retired run drops out at the next start). A
+  reused pid therefore never shares, overwrites or deletes a crashed
+  same-pid run's namespace (review revision M1).
+- **Second instance**: before 0.171.0 a second Aurora saw the first's
+  marker, showed a false crash dialog, read the first's live autosave,
+  and its clean quit deleted the first's autosave file. Now the lock
+  shows the first is alive: no dialog, nothing read, nothing deleted;
+  clean quit touches only its own pid's names. Still shared: the marker
+  file itself — a clean quit of either clears it, so a later crash of
+  the other is not detected (unchanged from before).
+
+Tests (29 new): `autosave_files::tests::*` (14: names, index round trip,
+every truncated prefix and garbage index damaged, oversized/non-UTF-8
+read, recovery order, scan, plan ignores unlisted files, damaged/missing
+index scan fallback, legacy only when nothing else, multi-source merge,
+marker, live lock skipped, clean quit only own pid, `IndexBook` writes);
+`background_autosave::tests::{each_document_keeps_its_own_newest_wins_slot,
+superseding_one_document_leaves_another_documents_write_alone,
+the_index_never_names_a_session_before_its_file_has_landed,
+replacing_the_document_never_leaves_a_window_without_one}`;
+`tests::session_autosave::*` (11: recover/adopt/retire, crash after
+adoption before the index, failed adoption keeps the crashed run, damaged
+session reported and next recovered, listed-but-missing reported, untried
+kept, garbage index scan, legacy recovered and retired, fresh start
+indexed only after landing, over-budget synchronous write indexed, clean
+quit removes all and abort keeps all, other pid untouched). Existing tests
+changed: `request_autosave`/`request_autosave_within` callers in two
+`background_autosave` tests gained the document argument (`0`, the one
+shared slot their single-document premise means); the shutdown test
+double gained a `namespace: None` field. No assertion changed.
+
+Mutations (each run with `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app
+--lib`, sources restored from a backup and sha256-checked identical):
+
+| Mutation | Result |
+|---|---|
+| M1 index lists sessions before their file lands | killed (3) |
+| M2 worker back to one global slot | killed (1: `each_document_keeps_its_own_newest_wins_slot`) |
+| M3 missing index not scanned | killed (4) |
+| M3b damaged index not scanned | killed (2) |
+| M4 legacy-file recovery dropped | killed (2) |
+| M5 clean quit skips the index | killed (2) |
+| M6 cleanup deletes any pid's files | killed (3) |
+| M7 a held lock treated as dead | killed (1) |
+| M8 crashed run retired with untried sessions | killed (1) |
+| M9 crashed run retired although adoption failed | survived at first; killed (1) after `a_failed_adoption_keeps_the_crashed_runs_files` was added |
+
+Stress: the autosave, recovery, shutdown and startup tests (68) ran 20
+times with 12 `yes` processes loading the CPU: 20/20 passed, slowest
+2.03 s. Gate (one pass after the last code change, RTX 3090,
+`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`, after
+review revision 2): 3,205 passed, 0 failed, 61 ignored; fmt, layering, hardcoded-style, `check
+--locked`, clippy `-D warnings`, rustdoc `-D warnings`, `cargo deny` and
+the contrast check all green.
+
+Not verified: no real crash on real hardware (every crash is simulated by
+leaving files as a crash would); Windows file semantics (rename over a
+file another process has open, deleting an open lock file — std opens
+with `FILE_SHARE_DELETE`, but untested here) and Windows/macOS `try_lock`
+behaviour; `aurora-app` cannot be cross-checked for Windows here (no
+mingw). Known weaknesses: the index is written under the worker's state
+lock, so a UI-thread submit can wait out one small fsync (review L3,
+left for before R3: compute the listing under the lock and write it
+outside with a sequence check); damaged files are deleted when their
+run is retired; R2 recovers one document per start, so a crashed run
+with several documents needs several starts until R3 opens them all.
+
+**Review revision (0.171.0, judge REVISE 0.81).**
+
+- **H1 (data loss, fixed)**: `settle_startup_autosave` treated every
+  candidate as tried when nothing was recovered, so a run with no tile
+  store, or whose store reopen failed after a damaged candidate, deleted
+  good autosaves unread, and a run without a previous marker deleted a
+  present legacy file. `startup_document_from` now returns `attempted:
+  Option<usize>` (`None` = recovery not attempted; `Some(n)` = the first
+  `n` candidates were tried, its store reopen injectable for tests), and
+  settle deletes nothing when `None`, retires a run only when all its
+  candidates were tried, keeps (and re-indexes) a run with untried ones,
+  and retires the legacy file only if it was tried.
+- **M1 (fixed)**: a clean quit no longer deletes the marker outright: it
+  removes this run's namespace, then rewrites the marker with every other
+  listed run that still has files (`autosave_files::marker_after_quit`).
+  A reused pid takes the next free generation (`RunKey`, `<pid>.<n>`), so
+  its `remove_all` and its index can never touch the crashed run's.
+  After an adoption, the crashed run's index is rewritten to list only
+  its untried sessions.
+- **M2**: pid-reuse tests with a good, a damaged and an extra scan-found
+  file (which survives this run's clean quit and is recovered next).
+- **L1 (fixed)**: `decode_index` takes the run's key and rejects an entry
+  naming another run's file. **L2 (fixed)**: the marker read is capped at
+  64 KiB and 64 keys, deduplicated with a set. **L3**: disclosed above,
+  not changed.
+
+Tests added (11): `autosave_files::tests::{run_keys_have_exactly_one_spelling,
+an_index_naming_another_runs_file_is_damaged,
+a_huge_hostile_marker_is_read_bounded,
+a_reused_pid_gets_a_namespace_of_its_own,
+the_marker_after_a_quit_keeps_only_runs_that_still_have_files}`;
+`tests::session_autosave::{no_tile_store_retires_nothing,
+a_failed_store_reopen_keeps_every_untried_candidate,
+without_a_previous_marker_a_legacy_file_is_left_alone,
+a_reused_pid_recovers_the_crashed_runs_good_file,
+a_reused_pid_reports_the_crashed_runs_damaged_file,
+a_reused_pids_untried_file_survives_a_clean_quit_and_is_recovered_next}`.
+Changed: `untried_sessions_are_kept_for_the_next_round` now also checks
+the rewritten index; the clean-quit test checks the marker; the
+failed-adoption test blocks the adoption target after the namespace is
+chosen (a pre-existing file there now moves the run to another
+generation).
+
+| Revision mutation | Result |
+|---|---|
+| R1 settle back to the old untried computation (H1) | killed (3: no store, failed reopen, no marker + legacy) |
+| R2 clean quit always deletes the marker | killed (1) |
+| R3 no generation for a reused pid | killed (4) |
+| R4 crashed run's index not rewritten after adoption | killed (1) |
+| R5 index entries not checked against the run's key | killed (1) |
+| R6 marker key cap removed | killed (1) |
+
+The first-round mutations M1–M7 and M9 were re-run against the revised
+code (anchors updated): all killed (4, 1, 8, 2, 2, 2, 7, 1, 1 failures).
+Stress after the revision: the 80 autosave, recovery, shutdown and
+startup tests, 20 runs under 12 `yes` processes: 20/20 passed, slowest
+2.02 s.
+
+**Review revision 2 (0.171.0, judge REVISE 0.888).**
+
+- **N1 (fixed)**: the marker's content decides what is recovered, but it
+  was written with a plain `std::fs::write` (truncate, write, no sync), so
+  a power loss could leave it empty or zero-filled, which decodes as "no
+  keys" and stranded every crashed run. (a) `autosave_files::write_marker`
+  now writes it like the index: unique owner-only temp
+  (`create_autosave_temp`), `sync_all`, rename; it also replaces a
+  symlink planted at the marker path instead of writing through it. (b)
+  `autosave_files::recovery_keys`: an empty or unparseable marker falls
+  back to scanning the directory for every run key with an index or
+  session files (live ones are then skipped by `claim_sources`), and the
+  rewritten marker inherits them.
+- **N2 (fixed)**: the cap is now 1024 keys (16 Ki parsed from at most
+  64 KiB), and when truncating, keys with an index or session files are
+  kept ahead of lock-only ones, both for recovery and for the inherited
+  keys a marker writes back.
+- **N3 (fixed)**: index temp files (`aurora-autosave-<key>.index.*.tmp`)
+  count as the run's files (generation choice, inheritance, the scan) and
+  are deleted when the run is retired or quits cleanly.
+
+Tests added (6): `autosave_files::tests::{an_empty_or_zero_filled_marker_never_strands_a_crashed_run,
+the_marker_cap_keeps_runs_with_files_ahead_of_lock_only_ones,
+an_index_temp_file_counts_as_files_and_is_retired,
+the_marker_is_written_atomically_and_leaves_no_temp_file (including a
+failed rename onto an occupied directory, as 0.168.0's
+a_failed_save_leaves_no_temporary_file did),
+the_marker_write_replaces_a_planted_symlink (Unix)}` and
+`tests::session_autosave::a_zeroed_marker_never_strands_a_crashed_runs_document`
+(end to end). Changed: `a_huge_hostile_marker_is_read_bounded` asserts
+the new caps.
+
+| Revision-2 mutation | Result |
+|---|---|
+| S1 marker written with a plain `std::fs::write` (N1a) | killed (1: the planted-symlink test; a torn write itself needs a power loss and is not testable here) |
+| S2 scan fallback removed (N1b) | killed (3) |
+| S3 cap without the files-first priority (N2) | killed (1) |
+| S4 index temp files not counted (N3) | killed (1) |
+
+Stress after revision 2: the 90 autosave, recovery, marker, shutdown and
+startup tests, 20 runs under 12 `yes` processes: 20/20 passed, slowest
+2.23 s. Not verified: the marker's atomicity under a real power loss
+(the rename's durability also needs a directory fsync, not done — the
+same limit the index and every autosave have).
 
 **Addendum 2026-10-10 (0.170.0) — `DocumentSession` extracted (R1).**
 Branch `008-document_session`. A refactor round: no behaviour change was
