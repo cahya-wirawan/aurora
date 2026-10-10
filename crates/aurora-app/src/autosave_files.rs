@@ -921,6 +921,8 @@ pub(crate) struct Liveness {
     /// Set once by [`Self::release`] (a clean quit), under `lock`, so no
     /// refresh can re-create the lock file after it is deleted.
     released: AtomicBool,
+    /// The session marker, refreshed with the rest (0.172.0).
+    marker: Mutex<Option<PathBuf>>,
 }
 
 impl Liveness {
@@ -959,7 +961,30 @@ impl Liveness {
         {
             tracing::debug!(?err, "could not refresh the autosave index's time");
         }
+        // 0.172.0: this run's own session files and the marker too, so a
+        // temp cleaner cannot age out an idle (parked) document's autosave.
+        for name in dir_names(&self.dir) {
+            if parse_session_file_name(&name).is_some_and(|(key, _, _)| key == self.key) {
+                touch(&self.dir.join(&name), now);
+            }
+        }
+        let marker = self
+            .marker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(marker) = marker {
+            touch(&marker, now);
+        }
         held.is_some()
+    }
+
+    /// Names the session marker [`Self::refresh`] keeps fresh (0.172.0).
+    pub(crate) fn watch_marker(&self, path: PathBuf) {
+        *self
+            .marker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
     }
 
     /// Releases the lock for good (a clean quit): no later refresh does
@@ -968,6 +993,15 @@ impl Liveness {
         let mut held = self.held();
         self.released.store(true, Ordering::SeqCst);
         drop(held.take());
+    }
+}
+
+/// Bumps a file's modification time without changing it (0.172.0).
+fn touch(path: &Path, now: SystemTime) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+        && let Err(err) = file.set_modified(now)
+    {
+        tracing::debug!(?err, path = %path.display(), "could not refresh a file's time");
     }
 }
 
@@ -1007,6 +1041,7 @@ impl AutosaveNamespace {
             key,
             lock: Mutex::new(lock),
             released: AtomicBool::new(false),
+            marker: Mutex::new(None),
         });
         Self { dir, key, liveness }
     }

@@ -47,6 +47,127 @@ impl DocumentId {
     }
 }
 
+/// The startup document's name (0.172.0).
+pub(crate) const UNTITLED: &str = "Untitled";
+
+/// The open documents that are not active (0.172.0, document tabs R3).
+///
+/// `App::doc` stays the active session, so every existing path that edits
+/// "the document" still edits exactly one; the others wait here, intact, in
+/// tab order. `active_position` is where the active session sits in the
+/// full tab order (`0..=parked.len()`), so the full order is `parked` with
+/// the active one inserted there. No indexing: every move is a checked
+/// `position`/`remove`/`insert`.
+#[derive(Default)]
+pub(crate) struct DocumentShelf {
+    pub(crate) parked: Vec<DocumentSession>,
+    pub(crate) active_position: usize,
+}
+
+impl DocumentShelf {
+    /// How many documents are open, the active one included.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.parked.len() + 1
+    }
+
+    /// Every open document's id in tab order, `active` at its position.
+    pub(crate) fn tab_order(&self, active: &DocumentSession) -> Vec<DocumentId> {
+        let mut order: Vec<DocumentId> = self.parked.iter().map(|session| session.id).collect();
+        let position = self.active_position.min(order.len());
+        order.insert(position, active.id);
+        order
+    }
+
+    /// Whether a parked document has this id.
+    pub(crate) fn holds(&self, id: DocumentId) -> bool {
+        self.parked.iter().any(|session| session.id == id)
+    }
+
+    /// The id `step` tabs away from the active one, wrapping (`None` with
+    /// one document open).
+    pub(crate) fn cycled(&self, active: &DocumentSession, forward: bool) -> Option<DocumentId> {
+        let order = self.tab_order(active);
+        let count = order.len();
+        if count < 2 {
+            return None;
+        }
+        let here = order.iter().position(|&id| id == active.id)?;
+        let next = if forward {
+            (here + 1) % count
+        } else {
+            (here + count - 1) % count
+        };
+        order.get(next).copied()
+    }
+
+    /// Makes the parked `target` active and parks the outgoing `active` at
+    /// its own tab position. `false` (nothing moved) when no parked session
+    /// has that id.
+    pub(crate) fn swap_in(&mut self, active: &mut DocumentSession, target: DocumentId) -> bool {
+        let Some(index) = self.parked.iter().position(|session| session.id == target) else {
+            return false;
+        };
+        let outgoing_position = self.active_position.min(self.parked.len());
+        // The target's position in the full order.
+        let target_position = if index < outgoing_position {
+            index
+        } else {
+            index + 1
+        };
+        let incoming = self.parked.remove(index);
+        let outgoing = std::mem::replace(active, incoming);
+        // Back to where it was in the full order, which the target's
+        // removal shifted by one when the target sat before it.
+        let park_at = if target_position < outgoing_position {
+            outgoing_position - 1
+        } else {
+            outgoing_position
+        };
+        self.parked.insert(park_at.min(self.parked.len()), outgoing);
+        self.active_position = target_position;
+        true
+    }
+
+    /// Makes a new session active, appended at the end of the tab order,
+    /// and parks the outgoing one at its own position. Returns where the
+    /// outgoing one was parked, for [`Self::revert_push`].
+    pub(crate) fn push_active(
+        &mut self,
+        active: &mut DocumentSession,
+        incoming: DocumentSession,
+    ) -> usize {
+        let outgoing = std::mem::replace(active, incoming);
+        let park_at = self.active_position.min(self.parked.len());
+        self.parked.insert(park_at, outgoing);
+        self.active_position = self.parked.len();
+        park_at
+    }
+
+    /// Undoes [`Self::push_active`] (an open that failed after its session
+    /// was created): the session parked at `parked_at` is active again and
+    /// the new one is handed back to be dropped. `None` (nothing moved)
+    /// when `parked_at` names no parked session.
+    pub(crate) fn revert_push(
+        &mut self,
+        active: &mut DocumentSession,
+        parked_at: usize,
+    ) -> Option<DocumentSession> {
+        if parked_at >= self.parked.len() {
+            return None;
+        }
+        let previous = self.parked.remove(parked_at);
+        let abandoned = std::mem::replace(active, previous);
+        self.active_position = parked_at;
+        Some(abandoned)
+    }
+
+    /// The parked session with this id, to read (tests, palette names).
+    pub(crate) fn get(&self, id: DocumentId) -> Option<&DocumentSession> {
+        self.parked.iter().find(|session| session.id == id)
+    }
+}
+
 /// What a session is built from: the document's own contents and the
 /// three values derived from them before the first frame (see
 /// [`DocumentSession::new`]).
@@ -68,6 +189,11 @@ pub(crate) struct DocumentSession {
     /// id, so the opened document's autosave lands on the same file by
     /// one atomic rename (the session is the slot, not the document).
     pub(crate) id: DocumentId,
+    /// What the window title and the palette's "Document: `name`" entry
+    /// call this document (0.172.0): the opened file's name, "Untitled"
+    /// for the startup document, "Untitled N" for a New Document and
+    /// "Recovered N" for a crash-recovered one. Not a path (R5).
+    pub(crate) name: String,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -274,6 +400,7 @@ impl DocumentSession {
         } = contents;
         Self {
             id,
+            name: UNTITLED.to_owned(),
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),
             layers,
@@ -404,6 +531,81 @@ mod tests {
             "no composite tile is current before the first frame"
         );
         assert!(session.tile_store.is_none(), "no store was opened here");
+    }
+
+    fn named(name: &str) -> DocumentSession {
+        let mut session = DocumentSession::new(DocumentContents {
+            layers: aurora_doc::LayerTree::new(),
+            history: aurora_doc::History::new(),
+            canvas_size: (1, 1),
+            skipped_tiles: aurora_io::SkippedTiles::new(),
+            active_layer: None,
+            canvas_view: aurora_ui::CanvasView::default(),
+            tile_store: None,
+        });
+        name.clone_into(&mut session.name);
+        session
+    }
+
+    fn names_in_order(shelf: &super::DocumentShelf, active: &DocumentSession) -> Vec<String> {
+        shelf
+            .tab_order(active)
+            .into_iter()
+            .map(|id| {
+                if id == active.id {
+                    format!("*{}", active.name)
+                } else {
+                    shelf
+                        .get(id)
+                        .map_or_else(String::new, |session| session.name.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// 0.172.0: pushing, swapping and reverting keep the tab order, and
+    /// every document is held exactly once.
+    #[test]
+    fn the_shelf_keeps_tab_order_through_push_swap_and_revert() {
+        let mut shelf = super::DocumentShelf::default();
+        let mut active = named("a");
+        assert_eq!(shelf.len(), 1);
+        assert_eq!(shelf.cycled(&active, true), None);
+        let _ = shelf.push_active(&mut active, named("b"));
+        let parked_c = shelf.push_active(&mut active, named("c"));
+        assert_eq!(names_in_order(&shelf, &active), ["a", "b", "*c"]);
+        let a = shelf.tab_order(&active).first().copied();
+        let Some(a) = a else {
+            unreachable!("three documents are open")
+        };
+        assert!(shelf.swap_in(&mut active, a));
+        assert_eq!(names_in_order(&shelf, &active), ["*a", "b", "c"]);
+        assert_eq!(
+            shelf
+                .cycled(&active, false)
+                .and_then(|id| shelf.get(id))
+                .map(|s| s.name.as_str()),
+            Some("c")
+        );
+        let Some(b) = shelf.cycled(&active, true) else {
+            unreachable!("b follows a")
+        };
+        assert!(shelf.swap_in(&mut active, b));
+        assert_eq!(names_in_order(&shelf, &active), ["a", "*b", "c"]);
+        let own = active.id;
+        assert!(
+            !shelf.swap_in(&mut active, own),
+            "the active one is not parked"
+        );
+        // A push from the middle appends and parks the outgoing in place;
+        // its revert restores exactly the previous arrangement.
+        let parked_at = shelf.push_active(&mut active, named("d"));
+        assert_eq!(names_in_order(&shelf, &active), ["a", "b", "c", "*d"]);
+        let abandoned = shelf.revert_push(&mut active, parked_at);
+        assert_eq!(abandoned.map(|s| s.name), Some("d".to_owned()));
+        assert_eq!(names_in_order(&shelf, &active), ["a", "*b", "c"]);
+        assert!(shelf.revert_push(&mut active, 99).is_none());
+        let _ = parked_c;
     }
 
     #[test]

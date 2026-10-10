@@ -331,10 +331,6 @@ impl AutosaveWorker {
     /// Replaces the index's session set and active session (a later
     /// round's tabs); `true` when the index on disk matches. A no-op
     /// `true` without an index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "sessions are created and closed from 0.172.0")
-    )]
     pub(crate) fn set_sessions(&mut self, order: Vec<IndexEntry>, active: Option<u64>) -> bool {
         let write = self
             .shared

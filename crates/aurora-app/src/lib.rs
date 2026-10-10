@@ -543,13 +543,16 @@ mod autosave_files;
 mod background_autosave;
 mod background_open;
 mod document_session;
+mod document_tabs;
+#[cfg(test)]
+mod document_tabs_tests;
 mod prepared_pixels;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
     background_open_step,
 };
-use document_session::{DocumentContents, DocumentSession};
+use document_session::{DocumentContents, DocumentSession, DocumentShelf};
 use prepared_pixels::{PreparedImage, PreparedLayer, PreparedMask, PreparedPsd};
 
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
@@ -1022,9 +1025,9 @@ fn opening_status_text(path: &Path) -> String {
 
 /// The window title for `opening`, the file still decoding if any
 /// (0.151.0): `"Opening photo.psd… — Aurora"`, else plain `"Aurora"`.
-fn window_title(opening: Option<&Path>) -> String {
+fn window_title(opening: Option<&Path>, document: &str) -> String {
     opening.map_or_else(
-        || WINDOW_TITLE.to_owned(),
+        || format!("{document} \u{2014} {WINDOW_TITLE}"),
         |path| format!("{} \u{2014} {WINDOW_TITLE}", opening_status_text(path)),
     )
 }
@@ -2633,6 +2636,108 @@ fn startup_document(
 /// [`StartupDocument::failed`] — the rest are kept for a later round,
 /// which opens them as more documents. A fresh document's snapshot is
 /// taken for `own_path`, this session's own autosave file.
+/// The tile store a finished open installs into (0.172.0): the one its
+/// open started with, or [`OpenFailure::LostStorage`] when none is pending
+/// for that generation (J-3: a fresh store could not adopt tiles staged
+/// under another store's root).
+fn pending_store_for(
+    pending: &mut document_tabs::PendingOpenStores,
+    generation: u64,
+) -> Result<Option<aurora_tile::TileStore>, OpenFailure> {
+    pending.take(generation).ok_or(OpenFailure::LostStorage)
+}
+
+/// One more recovered document for its own session (0.172.0).
+struct RecoveredSession {
+    id: document_session::DocumentId,
+    /// Its position among the recovery candidates.
+    position: usize,
+    document: RecoveredDocument,
+    store: Option<aurora_tile::TileStore>,
+}
+
+/// Recovers every candidate from `from` on, each into a fresh store from
+/// `reopen` (0.172.0). Returns the recovered ones with their positions,
+/// the paths that failed, and how many candidates were tried in all
+/// (`from` plus those tried here), so the caller retires only those.
+#[allow(clippy::type_complexity)]
+fn recover_remaining_candidates(
+    candidates: &[PathBuf],
+    from: usize,
+    reopen: &mut dyn FnMut() -> Option<aurora_tile::TileStore>,
+) -> (
+    Vec<(usize, RecoveredDocument, Option<aurora_tile::TileStore>)>,
+    Vec<PathBuf>,
+    usize,
+) {
+    let mut recovered = Vec::new();
+    let mut failed = Vec::new();
+    let mut tried = from.min(candidates.len());
+    for (position, path) in candidates.iter().enumerate().skip(from) {
+        let mut slot = reopen();
+        let Some(store) = slot.as_mut() else {
+            tracing::warn!("no tile store for a further recovered document; the rest are kept");
+            break;
+        };
+        tried = position + 1;
+        let mut document = recover_document(path, store);
+        if document.is_none() && path.exists() {
+            document = recover_partial_after_a_failed_read(path, &mut slot);
+        }
+        if let Some(document) = document {
+            recovered.push((position, document, slot));
+        } else {
+            tracing::warn!(path = %path.display(), "an autosaved document could not be recovered");
+            failed.push(path.clone());
+        }
+    }
+    (recovered, failed, tried)
+}
+
+/// The parked sessions for the documents recovered after the first
+/// (0.172.0), in candidate order after the active one.
+fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
+    let mut shelf = DocumentShelf::default();
+    for (number, recovered) in sessions.into_iter().enumerate() {
+        let RecoveredSession {
+            id,
+            document,
+            store,
+            ..
+        } = recovered;
+        let RecoveredDocument {
+            layers,
+            history,
+            canvas_size,
+            skipped_tiles,
+        } = document;
+        let active_layer = topmost_pixel_layer(&layers);
+        let canvas_view = load_document_view(
+            &aurora_ui::CanvasView::default(),
+            &layers,
+            active_layer,
+            None,
+            None,
+            1.0,
+        );
+        let mut session = DocumentSession::with_id(
+            id,
+            DocumentContents {
+                layers,
+                history,
+                canvas_size,
+                skipped_tiles,
+                active_layer,
+                canvas_view,
+                tile_store: store,
+            },
+        );
+        session.name = format!("Recovered {}", number + 2);
+        shelf.parked.push(session);
+    }
+    shelf
+}
+
 fn startup_document_from(
     had_previous_marker: bool,
     candidates: &[PathBuf],
@@ -2816,6 +2921,13 @@ struct SettledAutosave {
 /// lists, [`run`]); after it, in this run's namespace (the marker lists
 /// this run first; a missing index falls back to scanning it); and the
 /// crashed run's index goes only once this run's has landed.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded by settle_startup_autosaves in 0.172.0; kept for its tests"
+    )
+)]
 fn settle_startup_autosave(
     worker: &mut background_autosave::AutosaveWorker,
     namespace: &autosave_files::AutosaveNamespace,
@@ -2825,30 +2937,68 @@ fn settle_startup_autosave(
     recovered_from: Option<usize>,
     attempted: Option<usize>,
 ) -> SettledAutosave {
-    let own_path = namespace.session_path(document);
-    let recovered = recovered_from.and_then(|position| candidates.get(position));
-    let adopted = recovered.is_some_and(|candidate| {
-        candidate.path == own_path || autosave_files::adopt(&candidate.path, &own_path)
-    });
-    let complete = adopted
-        || (recovered.is_none()
-            && (own_path.exists() || partial_autosave_path(&own_path).exists()));
-    let entry = autosave_files::IndexEntry {
-        id: document,
-        file: autosave_files::session_file_name(namespace.key, document),
-    };
+    settle_startup_autosaves(
+        worker,
+        namespace,
+        &[(document, recovered_from)],
+        sources,
+        candidates,
+        attempted,
+    )
+}
+
+/// [`settle_startup_autosave`] for every startup session (0.172.0):
+/// `documents` is `(session id, recovered candidate position)` in tab
+/// order, the active one first. Every recovered file is adopted into its
+/// own session's path, the index lists them all, and the crashed runs are
+/// retired only when every adoption and the index write succeeded — and
+/// then only what was tried.
+fn settle_startup_autosaves(
+    worker: &mut background_autosave::AutosaveWorker,
+    namespace: &autosave_files::AutosaveNamespace,
+    documents: &[(u64, Option<usize>)],
+    sources: &[autosave_files::RunKey],
+    candidates: &[autosave_files::Candidate],
+    attempted: Option<usize>,
+) -> SettledAutosave {
+    let mut any_recovered = false;
+    let mut all_adopted = true;
+    let mut complete = Vec::new();
+    let mut entries = Vec::new();
+    for &(document, recovered_from) in documents {
+        let own_path = namespace.session_path(document);
+        let recovered = recovered_from.and_then(|position| candidates.get(position));
+        let landed = match recovered {
+            Some(candidate) => {
+                any_recovered = true;
+                let adopted =
+                    candidate.path == own_path || autosave_files::adopt(&candidate.path, &own_path);
+                all_adopted &= adopted;
+                adopted
+            }
+            None => own_path.exists() || partial_autosave_path(&own_path).exists(),
+        };
+        if landed {
+            complete.push(document);
+        }
+        entries.push(autosave_files::IndexEntry {
+            id: document,
+            file: autosave_files::session_file_name(namespace.key, document),
+        });
+    }
+    let adopted = any_recovered && all_adopted;
     let index_written = worker.configure_index(autosave_files::IndexBook::new(
         namespace.index_path(),
-        vec![entry],
-        Some(document),
-        complete.then_some(document),
+        entries,
+        documents.first().map(|&(document, _)| document),
+        complete,
     ));
     let mut settled = SettledAutosave {
         adopted,
         index_written,
         ..SettledAutosave::default()
     };
-    if recovered.is_some() && !(adopted && index_written) {
+    if any_recovered && !(adopted && index_written) {
         tracing::warn!(
             "the recovered autosave could not be adopted; the crashed run's files are kept"
         );
@@ -3706,6 +3856,9 @@ enum OpenFailure {
     /// There is nowhere to read a `.aur` document's tiles into: no live
     /// tile store this session, or no scratch store for the pre-check.
     NoTileStorage,
+    /// A finished open had no tile store waiting for it (0.172.0): its
+    /// staged tiles belong to a store that is gone.
+    LostStorage,
     /// The background decode itself failed rather than the file
     /// (0.151.0): its thread could not be started, or the decode
     /// panicked and the panic was caught ([`background_open`]).
@@ -3885,6 +4038,10 @@ fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure)
                 display_error_detail(err)
             );
         }
+        OpenFailure::LostStorage => format!(
+            "Aurora couldn't open \"{file_name}\" because the storage prepared for it was \
+             released before it finished. Try opening it again."
+        ),
         OpenFailure::NoTileStorage => format!(
             "Aurora couldn't open \"{file_name}\" because this session has no storage for image \
              data available."
@@ -4937,6 +5094,9 @@ enum AppCommand {
     /// shortcut (see [`default_shortcuts`]); reachable from the command
     /// palette and the macOS `Layer` menu.
     DeleteLayer,
+    /// Next/Previous Document (0.172.0), `Ctrl+Tab`/`Ctrl+Shift+Tab`.
+    NextDocument,
+    PreviousDocument,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -4963,6 +5123,11 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         // bare `Delete`/`Backspace` would collide with a focused text
         // field's own editing and with a future "clear selection".
         ("Ctrl+Shift+N", AppCommand::NewLayer),
+        // 0.172.0: the browser and editor convention for cycling open
+        // documents. The registry matches whole chords exactly, so these
+        // never collide with plain `Tab`/`Shift+Tab` focus traversal.
+        ("Ctrl+Tab", AppCommand::NextDocument),
+        ("Ctrl+Shift+Tab", AppCommand::PreviousDocument),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
         // users already carry in muscle memory. Every tool here does
@@ -5131,6 +5296,8 @@ enum ActivatedCommand {
     /// reset the active one, save as, or delete — run by
     /// `App::run_workspace_command`.
     Workspace(workspace_presets::WorkspaceCommand),
+    /// New, Next/Previous or a named document (0.172.0).
+    Document(document_tabs::DocumentCommand),
     /// A dialog action was chosen by a key (0.169.0) — run by
     /// `App::run_dialog_result`, as a pointer's or an assistive
     /// technology's choice of the same action is.
@@ -5306,7 +5473,13 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
         CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
+        CommandEntry::new(document_tabs::COMMAND_FILE_NEW, "New Document"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
+        CommandEntry::new(document_tabs::COMMAND_DOCUMENT_NEXT, "Next Document"),
+        CommandEntry::new(
+            document_tabs::COMMAND_DOCUMENT_PREVIOUS,
+            "Previous Document",
+        ),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
         CommandEntry::new(COMMAND_REDO, "Redo"),
@@ -5468,6 +5641,9 @@ fn activate_command(
     }
     if let Some(command) = workspace_presets::workspace_command_for(id) {
         return Some(ActivatedCommand::Workspace(command));
+    }
+    if let Some(command) = document_tabs::document_command_for(id) {
+        return Some(ActivatedCommand::Document(command));
     }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
@@ -8876,6 +9052,9 @@ fn run_command(
         // Never run here (`handle_key` hands both back; `perform_layer_command`
         // runs them). `Everything`, never `None`, per the trap named above.
         AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
+        // Handed back as `ActivatedCommand::Document` by `handle_key`, so
+        // never run here; nothing in this document changes either way.
+        AppCommand::NextDocument | AppCommand::PreviousDocument => CompositeInvalidation::None,
     }
 }
 
@@ -9394,6 +9573,13 @@ fn handle_key(
         }
         if command == AppCommand::DeleteLayer {
             return Some(ActivatedCommand::DeleteLayer);
+        }
+        if let AppCommand::NextDocument | AppCommand::PreviousDocument = command {
+            return Some(ActivatedCommand::Document(
+                document_tabs::DocumentCommand::Cycle {
+                    forward: command == AppCommand::NextDocument,
+                },
+            ));
         }
         // Spelled out rather than discarded bare, and annotated so the
         // type is visible at the call site: every command that can reach
@@ -20870,6 +21056,10 @@ struct App {
     /// `App` so a later round can hold more than one; borrowing
     /// `self.doc.layers` still splits from `self.workspace`.
     doc: DocumentSession,
+    /// The open documents that are not active, in tab order (0.172.0).
+    shelf: DocumentShelf,
+    /// The tile store the pending background open installs into (0.172.0).
+    pending_open: document_tabs::PendingOpenStores,
     /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
     /// Eyedropper tool samples a real pixel and changes it
     /// ([`Self::sample_eyedropper`]). No colour-picker UI exists yet to
@@ -21075,6 +21265,11 @@ impl ShutdownState for App {
     }
 
     fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
+        // 0.172.0: every store goes before the scratch directory does.
+        self.pending_open.clear();
+        for session in &mut self.shelf.parked {
+            drop(session.tile_store.take());
+        }
         self.doc.tile_store.take()
     }
 
@@ -21181,16 +21376,49 @@ impl App {
             &mut tile_store,
             &mut open_tile_store,
         );
+        // 0.172.0: every candidate after the recovered one is recovered
+        // too, each into its own session and store, so a crashed run with
+        // N documents comes back as N documents.
+        let (extra_recovered, extra_failed, attempted) = match recovered_from {
+            Some(position) => {
+                let (extra, extra_failed, tried) = recover_remaining_candidates(
+                    &candidate_paths,
+                    position + 1,
+                    &mut open_tile_store,
+                );
+                (extra, extra_failed, Some(tried.max(attempted.unwrap_or(0))))
+            }
+            None => (Vec::new(), Vec::new(), attempted),
+        };
+        let mut failed = failed;
+        failed.extend(extra_failed);
+        let extra_sessions: Vec<RecoveredSession> = extra_recovered
+            .into_iter()
+            .map(|(position, document, store)| RecoveredSession {
+                id: document_session::DocumentId::next(),
+                position,
+                document,
+                store,
+            })
+            .collect();
+        let mut settle_documents = vec![(document_id.get(), recovered_from)];
+        settle_documents.extend(
+            extra_sessions
+                .iter()
+                .map(|session| (session.id.get(), Some(session.position))),
+        );
         let mut autosave_worker = background_autosave::AutosaveWorker::default();
-        // 0.171.1 (L-a): keep this run's lock and index visibly alive.
-        autosave_worker.set_liveness(autosave.liveness(), autosave_files::LIVENESS_REFRESH);
-        let settled = settle_startup_autosave(
+        // 0.171.1 (L-a): keep this run's lock and index visibly alive;
+        // 0.172.0: its session files and the marker too.
+        let liveness = autosave.liveness();
+        liveness.watch_marker(marker_path.clone());
+        autosave_worker.set_liveness(liveness, autosave_files::LIVENESS_REFRESH);
+        let settled = settle_startup_autosaves(
             &mut autosave_worker,
             &autosave,
-            document_id.get(),
+            &settle_documents,
             sources,
             &plan.candidates,
-            recovered_from,
             attempted,
         );
         tracing::debug!(?settled, "settled this run's autosave namespace");
@@ -21297,15 +21525,22 @@ impl App {
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             tool: aurora_ui::Tool::default(),
-            doc: DocumentSession::new(DocumentContents {
-                layers,
-                history,
-                canvas_size,
-                skipped_tiles,
-                active_layer,
-                canvas_view,
-                tile_store,
-            }),
+            // `with_id`, not `new` (0.172.0 fix): the startup autosave and
+            // the index already name `document_id`.
+            doc: DocumentSession::with_id(
+                document_id,
+                DocumentContents {
+                    layers,
+                    history,
+                    canvas_size,
+                    skipped_tiles,
+                    active_layer,
+                    canvas_view,
+                    tile_store,
+                },
+            ),
+            shelf: recovered_shelf(extra_sessions),
+            pending_open: document_tabs::PendingOpenStores::default(),
             current_colour: DEFAULT_COLOUR,
             layer_rows,
             scroll_follow: ScrollFollow::default(),
@@ -21538,6 +21773,12 @@ impl App {
             self.command_palette,
             &self.presets,
         );
+        document_tabs::add_document_entries_if_opened(
+            &mut self.workspace,
+            palette_was_open,
+            self.command_palette,
+            document_tabs::document_palette_entries(&self.shelf, &self.doc),
+        );
         // Review RT136-2: a radius drag cannot carry over onto the tool
         // this key just switched to.
         let _ = end_radius_drag_on_tool_change(
@@ -21563,6 +21804,7 @@ impl App {
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
+            Some(ActivatedCommand::Document(command)) => self.run_document_command(command),
             Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
             None => {}
         }
@@ -21771,6 +22013,139 @@ impl App {
     /// [`Self::open_file`] the palette's "Open File…" command uses, since
     /// a dropped file and a chosen one are the same kind of "the user
     /// wants to open this" signal, whichever route it arrived by.
+    /// The borrowed state a document switch works on (0.172.0).
+    fn switch_context(&mut self) -> document_tabs::SwitchContext<'_> {
+        document_tabs::SwitchContext {
+            canvas_area: canvas_area_logical_size(&self.workspace),
+            workspace: &mut self.workspace,
+            focus: &mut self.focus,
+            scales: &self.scales,
+            doc: &mut self.doc,
+            shelf: &mut self.shelf,
+            layer_rows: &mut self.layer_rows,
+            scroll_follow: &mut self.scroll_follow,
+            drag: &mut self.drag,
+            layer_controls: &mut self.layer_controls,
+            curves_ui: &mut self.curves_ui,
+            tool_controls: self.tool_controls,
+            click: &mut self.gallery_click,
+            residency: self.residency.as_mut(),
+            autosave: Some(document_tabs::ParkAutosave {
+                worker: &mut self.autosave_worker,
+                namespace: &self.autosave,
+            }),
+            scale_factor: self.scale_factor,
+            blocked: self.dialog.is_some()
+                || self.command_palette.is_some()
+                || self.panel_drag.is_some()
+                || self.rail_resize.is_some(),
+        }
+    }
+
+    /// After the set of documents or the active one changed (0.172.0):
+    /// the autosave index lists every session in tab order with the active
+    /// id, and the title, layout, accessibility and frame follow.
+    fn after_document_change(&mut self) {
+        let _ = document_tabs::sync_autosave_sessions(
+            &mut self.autosave_worker,
+            &self.shelf,
+            &self.doc,
+            self.autosave.key,
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.show_open_state();
+    }
+
+    /// Makes the open document with this raw id active (0.172.0) — the
+    /// palette's "Document: `name`" and Next/Previous Document.
+    fn activate_document(&mut self, raw: u64) {
+        let target = self
+            .shelf
+            .tab_order(&self.doc)
+            .into_iter()
+            .find(|id| id.get() == raw);
+        let Some(target) = target else {
+            tracing::debug!(raw, "no open document has this id");
+            return;
+        };
+        let outcome = {
+            let mut cx = self.switch_context();
+            document_tabs::switch_document(&mut cx, target)
+        };
+        tracing::debug!(?outcome, raw, "document switch");
+        if outcome == document_tabs::SwitchOutcome::Switched {
+            self.after_document_change();
+        }
+    }
+
+    fn cycle_document(&mut self, forward: bool) {
+        if let Some(target) = self.shelf.cycled(&self.doc, forward) {
+            self.activate_document(target.get());
+        }
+    }
+
+    /// New Document (0.172.0): an empty single-layer document the size of
+    /// the active one, in its own new session and store, made active and
+    /// autosaved under its own id. (No size dialog yet.)
+    fn new_document(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let canvas_size = self.doc.canvas_size;
+        let (layers, mut history, _layer) = document_from_size("Layer 1", canvas_size);
+        history.clear_undo();
+        let active_layer = topmost_pixel_layer(&layers);
+        let canvas_view = load_document_view(
+            &self.doc.canvas_view,
+            &layers,
+            active_layer,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
+            self.scale_factor,
+        );
+        let mut session = DocumentSession::new(DocumentContents {
+            layers,
+            history,
+            canvas_size,
+            skipped_tiles: aurora_io::SkippedTiles::new(),
+            active_layer,
+            canvas_view,
+            tile_store: open_tile_store(),
+        });
+        session.name = document_tabs::next_untitled_name();
+        {
+            let mut cx = self.switch_context();
+            let _parked_at = document_tabs::activate_new_document(&mut cx, session);
+        }
+        let own_autosave = self.autosave.session_path(self.doc.id.get());
+        if let Some(store) = self.doc.tile_store.as_mut() {
+            request_autosave(
+                &mut self.autosave_worker,
+                &own_autosave,
+                self.doc.id.get(),
+                &self.doc.layers,
+                &self.doc.history,
+                self.doc.canvas_size,
+                &mut self.doc.skipped_tiles,
+                store,
+            );
+        } else {
+            tracing::warn!("no live tile store; the new document is not autosaved");
+        }
+        self.after_document_change();
+    }
+
+    fn run_document_command(&mut self, command: document_tabs::DocumentCommand) {
+        match command {
+            document_tabs::DocumentCommand::New => self.new_document(),
+            document_tabs::DocumentCommand::Cycle { forward } => self.cycle_document(forward),
+            document_tabs::DocumentCommand::Activate(raw) => self.activate_document(raw),
+        }
+    }
+
     fn handle_dropped_file(&mut self, path: &Path) {
         // The same gate `handle_menu_event` applies, for the same
         // reason: the modal dialog is a `Role::AlertDialog` with
@@ -21804,14 +22179,23 @@ impl App {
     /// and the loop installs the result when the thread wakes it
     /// ([`AppEvent::OpenFinished`], [`Self::poll_background_open`]). A
     /// second open while one is pending supersedes it (newest wins); the
-    /// current document stays editable meanwhile, and those edits are
-    /// discarded when the new document replaces it. Everything below
-    /// describes the install, which is unchanged.
+    /// current document stays editable meanwhile.
+    ///
+    /// **Since 0.172.0 an open never replaces the current document.** The
+    /// open creates a new tile store here, before the decode starts (the
+    /// decode thread stages tiles into that store's own staging root), and
+    /// holds it in `pending_open` by generation; a superseding open drops
+    /// the older store. The install ([`Self::install_finished_open`])
+    /// commits the current document's live gestures into its own history,
+    /// autosaves it under its own id and parks it intact, then installs
+    /// the file into a new `DocumentSession` holding that store
+    /// ([`document_tabs::activate_new_document`]). The paragraphs below
+    /// describe that install into the new session.
     ///
     /// Opens `path` as a real document — a real, multi-layer `.aur` file
     /// ([`Self::open_aur_file`]) if the extension names one, otherwise a
-    /// flat image ([`open_image`]) replacing the current document with a
-    /// fresh, single-layer one sized to it ([`replace_document`]),
+    /// flat image ([`open_image`]) as a fresh, single-layer document sized
+    /// to it in the new session ([`replace_document`] rebuilds the panels),
     /// writing the image's own pixels into the live tile store
     /// (`aurora_io::write_into_store`) so the canvas actually shows it.
     /// A read/decode failure (bad file, unrecognised extension) is
@@ -21827,19 +22211,14 @@ impl App {
     /// ([`open_failure_message`]) and dialog
     /// ([`open_open_failed_dialog`]) halves are unit-tested.
     ///
-    /// Resets `canvas_view`/`selection`/`drag` to their own fresh-
-    /// session defaults — a newly opened document has no relationship
-    /// to whatever pan/zoom/selection/in-progress-drag the *previous*
-    /// one had.
+    /// The new session starts with its own view, an empty selection and
+    /// no drag; the parked document keeps its own.
     ///
-    /// The *previous* document's tiles are freed from the shared store
-    /// before the new one's pixels are written, in that order and not
-    /// the other ([`replace_document_pixels_prepared`], which owns the full
-    /// argument): both documents' surface ids derive from `LayerId`s
-    /// that restart at zero, so they alias — sweeping afterwards would
-    /// delete the document just opened, and not sweeping at all left
-    /// the previous document's pixels to be composited onto a smaller
-    /// new one and persisted into this very call's own autosave.
+    /// Each document has its own store (ADR 0010), so nothing of the
+    /// parked document is swept or overwritten. Within the new store the
+    /// install still frees the placeholder session's (empty) surfaces
+    /// before writing ([`replace_document_pixels_prepared`]), the order
+    /// that function requires.
     fn open_file(&mut self, path: &Path) {
         let proxy = self.proxy.clone();
         let wake = move || {
@@ -21849,15 +22228,16 @@ impl App {
         };
         // The decode thread stages the opened tiles straight into the
         // store's scratch directory (0.154.0); the install adopts them.
-        let staging = self
-            .doc
-            .tile_store
-            .as_ref()
-            .map(aurora_tile::TileStore::staging_root);
+        // 0.172.0: the open decodes into a new session's own store.
+        let store = open_tile_store();
+        let staging = store.as_ref().map(aurora_tile::TileStore::staging_root);
         let decode = move |path: &Path| decode_chosen_file_with(path, staging.as_ref());
         match self.open_worker.start(path.to_path_buf(), decode, wake) {
             Ok(generation) => {
                 tracing::info!(path = %path.display(), generation, "opening a file in the background");
+                if let Some(dropped) = self.pending_open.start(generation, store) {
+                    tracing::debug!(dropped, "dropped a superseded open's tile store");
+                }
             }
             Err(failure) => self.report_open_failure(path, &failure),
         }
@@ -21872,7 +22252,10 @@ impl App {
     /// every outcome — success, failure, or a caught panic.
     fn show_open_state(&mut self) {
         if let Some(window) = self.window.as_ref() {
-            window.set_title(&window_title(self.open_worker.pending_path()));
+            window.set_title(&window_title(
+                self.open_worker.pending_path(),
+                &self.doc.name,
+            ));
         }
         self.push_accessibility();
         self.needs_redraw = true;
@@ -21895,9 +22278,12 @@ impl App {
     /// ([`Self::report_open_failure`], the same messages as before), or
     /// installs the decoded file the way the synchronous path did —
     /// [`Self::open_image_file`], [`Self::open_psd_file`] or
-    /// [`Self::open_aur_file`]. Edits made to the current document while
-    /// the decode ran are discarded with it, exactly as an open always
-    /// replaced the document.
+    /// [`Self::open_aur_file`] — into a **new session** (0.172.0) holding
+    /// the store this open was started with. The current document, edits
+    /// made while the decode ran included, is committed, autosaved under
+    /// its own id and parked intact. A failed install reverts to it. A
+    /// finished open with no pending store (which cannot adopt tiles
+    /// staged under another store's root) is reported as a failed open.
     fn install_finished_open(&mut self, finished: FinishedOpen) {
         let FinishedOpen {
             generation,
@@ -21905,6 +22291,16 @@ impl App {
             result,
             decode_time,
         } = finished;
+        // J-3 (review): a miss is a failed open, never a fresh store,
+        // which could not adopt tiles staged under another store's root.
+        let store = match pending_store_for(&mut self.pending_open, generation) {
+            Ok(store) => store,
+            Err(failure) => {
+                tracing::warn!(generation, "no pending store for a finished open");
+                self.report_open_failure(&path, &failure);
+                return;
+            }
+        };
         let decoded = match result {
             Ok(decoded) => decoded,
             Err(failure) => {
@@ -21913,28 +22309,36 @@ impl App {
             }
         };
         let started = std::time::Instant::now();
-        // A live opacity drag belongs to the document being replaced.
-        self.commit_layer_controls_drag();
-        // So does a live Curves drag, its histogram and its channel.
-        let _ = end_curves_gestures(
-            &mut CurvesEdit {
-                workspace: &mut self.workspace,
-                layers: &mut self.doc.layers,
-                history: &mut self.doc.history,
-                pixel_history: &mut self.doc.pixel_history,
-                undo_order: &mut self.doc.undo_order,
-                layer_rows: &self.layer_rows,
-                active_layer: self.doc.active_layer,
-                controls: self.tool_controls.map(|controls| controls.curves),
-                state: &mut self.curves_ui,
-            },
-            &mut self.gallery_click,
-        );
-        match decoded {
+        // 0.172.0: the open lands in a new session; the outgoing one has
+        // its live gestures committed into its own history and is parked
+        // intact.
+        let mut session = DocumentSession::new(DocumentContents {
+            layers: aurora_doc::LayerTree::new(),
+            history: aurora_doc::History::new(),
+            canvas_size: self.doc.canvas_size,
+            skipped_tiles: aurora_io::SkippedTiles::new(),
+            active_layer: None,
+            canvas_view: self.doc.canvas_view,
+            tile_store: store,
+        });
+        session.name = display_file_name(&path);
+        let parked_at = {
+            let mut cx = self.switch_context();
+            document_tabs::activate_new_document(&mut cx, session)
+        };
+        let installed = match decoded {
             DecodedFile::Image(image) => self.open_image_file(&path, image),
             DecodedFile::Psd(document) => self.open_psd_file(&path, document),
             DecodedFile::Aur(bytes) => self.open_aur_file(&path, &bytes),
+        };
+        if !installed {
+            // Nothing was installed: the new session goes, and the previous
+            // one comes back exactly as it was parked.
+            drop(self.shelf.revert_push(&mut self.doc, parked_at));
+            let mut cx = self.switch_context();
+            document_tabs::bind_active_document(&mut cx);
         }
+        self.after_document_change();
         tracing::info!(
             path = %path.display(),
             generation,
@@ -21949,7 +22353,7 @@ impl App {
     /// single-layer document sized to it.
     ///
     /// Since 0.153.0 its tiles arrive already encoded ([`PreparedImage`]).
-    fn open_image_file(&mut self, path: &Path, image: PreparedImage) {
+    fn open_image_file(&mut self, path: &Path, image: PreparedImage) -> bool {
         let name = path
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
@@ -21970,7 +22374,7 @@ impl App {
             Vec::new(),
             canvas_size,
         ) else {
-            return;
+            return false;
         };
         if let Some(item) = unwritten_layers_item(unwritten) {
             let report = aurora_io::PsdImportReport { items: vec![item] };
@@ -21980,6 +22384,7 @@ impl App {
                 tracing::warn!(%message, "the open report could not be shown");
             }
         }
+        true
     }
 
     /// Opens a Photoshop file (0.144.0): reads and decodes it whole
@@ -22004,7 +22409,7 @@ impl App {
     /// and does only the install, on the UI thread.
     ///
     /// Since 0.153.0 its tiles arrive already encoded ([`PreparedPsd`]).
-    fn open_psd_file(&mut self, path: &Path, document: PreparedPsd) {
+    fn open_psd_file(&mut self, path: &Path, document: PreparedPsd) -> bool {
         let PreparedPsd {
             layers,
             history,
@@ -22017,7 +22422,7 @@ impl App {
         let Some(unwritten) =
             self.install_opened_document(layers, history, pixels, masks, canvas_size)
         else {
-            return;
+            return false;
         };
         report.items.extend(unwritten_layers_item(unwritten));
         if let Some(message) = psd_report_message(&display_file_name(path), &report) {
@@ -22030,6 +22435,7 @@ impl App {
                 );
             }
         }
+        true
     }
 
     /// Opens the [`PSD_REPORT_TITLE`] dialog with `message`, relaid out
@@ -22061,10 +22467,12 @@ impl App {
         opened
     }
 
-    /// Makes a freshly decoded document (a flat image's one layer, or a
-    /// PSD's whole tree) *the* document: rebuilds the panels
-    /// ([`replace_document`]), swaps the tree and history in, sweeps the
-    /// outgoing document's tiles and only then inserts every `pixels` and
+    /// Fills the new, still-empty active session (0.172.0: the previous
+    /// document is already parked, see [`Self::install_finished_open`])
+    /// with a freshly decoded document (a flat image's one layer, or a
+    /// PSD's whole tree): rebuilds the panels ([`replace_document`]),
+    /// swaps the tree and history in, sweeps the placeholder session's
+    /// (empty) surfaces in this session's own store and only then inserts every `pixels` and
     /// `masks` entry's already-encoded tiles
     /// ([`replace_document_pixels_prepared`] — the order is forced, see
     /// there; no per-texel work is left on this thread since 0.153.0),
@@ -22242,6 +22650,11 @@ impl App {
     /// into the live store could erase tiles of the document it left
     /// open (see that function).
     ///
+    /// Since 0.172.0 this reads into the new session's own store (the
+    /// previous document is parked with its own store), so the paragraph
+    /// below about leaked outgoing tiles now concerns only the placeholder
+    /// session, which has none.
+    ///
     /// **Unlike [`Self::open_file`], this deliberately does not sweep
     /// the outgoing document** — no [`replace_document_pixels_prepared`], no
     /// `aurora_doc::forget_document_surfaces` — because `read_aur` has
@@ -22259,7 +22672,7 @@ impl App {
     /// the checked `bytes`, and its live read ([`read_prechecked_aur`])
     /// still runs here, on the UI thread, because the live store is the
     /// UI thread's.
-    fn open_aur_file(&mut self, path: &Path, bytes: &[u8]) {
+    fn open_aur_file(&mut self, path: &Path, bytes: &[u8]) -> bool {
         // Before the read, not after it as until 0.143.1: once the live
         // read has succeeded the current document's aliased tiles are
         // already overwritten, so every refusal that can still happen
@@ -22268,11 +22681,11 @@ impl App {
             Ok(scales) => scales,
             Err(err) => {
                 tracing::error!(%err, "failed to load design scales; cannot open a document");
-                return;
+                return false;
             }
         };
         let Some(document) = self.read_chosen_aur(path, bytes) else {
-            return;
+            return false;
         };
         // The profile (`_profile`) is a real, checked value now
         // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
@@ -22302,7 +22715,7 @@ impl App {
                     ?err,
                     "failed to rebuild the workspace panels for the opened document"
                 );
-                return;
+                return false;
             }
         };
         // Before the autosave below, and that ordering is load-bearing
@@ -22398,6 +22811,7 @@ impl App {
                 );
             }
         }
+        true
     }
 
     /// [`Self::open_aur_file`]'s read step: the chosen file's bytes,
@@ -23601,6 +24015,7 @@ impl App {
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
+            Some(ActivatedCommand::Document(command)) => self.run_document_command(command),
             Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
             None => {}
         }
@@ -24232,22 +24647,6 @@ impl App {
         if self.curves_ui.job.is_some() {
             self.needs_redraw = true;
         }
-    }
-
-    /// Ends every Layers-panel control gesture outright before the
-    /// document is replaced ([`end_layer_control_gestures`]).
-    fn commit_layer_controls_drag(&mut self) {
-        let mut edit = LayerControlEdit {
-            workspace: &mut self.workspace,
-            layers: &mut self.doc.layers,
-            history: &mut self.doc.history,
-            pixel_history: &mut self.doc.pixel_history,
-            undo_order: &mut self.doc.undo_order,
-            layer_rows: &self.layer_rows,
-            active_layer: self.doc.active_layer,
-            state: &mut self.layer_controls,
-        };
-        let _ = end_layer_control_gestures(&mut edit, &mut self.gallery_click);
     }
 
     /// The catch-all reactive sync ([`sync_layer_controls`]), run once per
@@ -24924,7 +25323,10 @@ impl ApplicationHandler<AppEvent> for App {
         // (`spike/a11y-ime/FINDINGS.md` finding #1) — this is that
         // ordering, as real production code, not a spike anymore.
         let attrs = Window::default_attributes()
-            .with_title(window_title(self.open_worker.pending_path()))
+            .with_title(window_title(
+                self.open_worker.pending_path(),
+                &self.doc.name,
+            ))
             .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(
@@ -35097,7 +35499,7 @@ mod tests {
     /// this process too.
     static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct GpuTestContext {
+    pub(crate) struct GpuTestContext {
         _guard: std::sync::MutexGuard<'static, ()>,
         context: aurora_gpu::GpuContext,
     }
@@ -35120,7 +35522,7 @@ mod tests {
     /// this crate's `test-support` dev-dependency feature); only the
     /// lock and the guard-bundling wrapper stay local, since this
     /// crate's tests are their own binary.
-    fn real_gpu_context() -> Option<GpuTestContext> {
+    pub(crate) fn real_gpu_context() -> Option<GpuTestContext> {
         let guard = GPU_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -35298,7 +35700,7 @@ mod tests {
     /// Writes `rgba` into every texel of `tile` on `surface`, marking it
     /// dirty — the same shape `aurora-gpu`'s own `residency::tests::paint`
     /// helper already uses.
-    fn fill_solid(
+    pub(crate) fn fill_solid(
         store: &mut aurora_tile::TileStore,
         surface: aurora_tile::SurfaceId,
         tile: aurora_tile::TileId,
@@ -35344,7 +35746,7 @@ mod tests {
 
     /// [`read_first_texel`]'s whole-tile counterpart — every sample of
     /// the tile, in storage order, converted to `f32`.
-    fn read_all_texels(
+    pub(crate) fn read_all_texels(
         store: &mut aurora_tile::TileStore,
         surface: aurora_tile::SurfaceId,
         tile: aurora_tile::TileId,
@@ -35363,7 +35765,7 @@ mod tests {
     /// to that crate's own test binary and this crate's tests are a
     /// separate binary).
     #[allow(clippy::too_many_arguments)]
-    fn render_and_sample_pixel(
+    pub(crate) fn render_and_sample_pixel(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         canvas: &mut aurora_gpu::CanvasPipeline,
@@ -67635,9 +68037,9 @@ mod tests {
         let tree = &workspace.tree;
         let root = tree.root();
         let path = std::path::Path::new("/pictures/big\u{202e} photo.psd");
-        assert_eq!(window_title(None), "Aurora");
+        assert_eq!(window_title(None, "Untitled"), "Untitled \u{2014} Aurora");
         assert_eq!(
-            window_title(Some(path)),
+            window_title(Some(path), "Untitled"),
             "Opening big photo.psd\u{2026} \u{2014} Aurora",
             "the file name is sanitised as every dialog's is"
         );
@@ -67673,7 +68075,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            window_title(worker.pending_path()),
+            window_title(worker.pending_path(), "Untitled"),
             "Opening big photo.psd\u{2026} \u{2014} Aurora"
         );
 
@@ -67690,7 +68092,10 @@ mod tests {
         let cleared =
             with_opening_status(tree.accessibility_update(root), root, worker.pending_path());
         assert_eq!(opening_status(&cleared, root), None);
-        assert_eq!(window_title(worker.pending_path()), "Aurora");
+        assert_eq!(
+            window_title(worker.pending_path(), "Untitled"),
+            "Untitled \u{2014} Aurora"
+        );
         assert_eq!(
             cleared.nodes.len(),
             tree.accessibility_update(root).nodes.len(),

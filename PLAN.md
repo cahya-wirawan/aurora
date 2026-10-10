@@ -26,7 +26,62 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.171.1): autosave hardening before R3 (patch).**
+**Latest (2026-10-10, 0.172.0): several open documents and switching
+between them (document tabs, round R3 of six — no tab bar yet, that is
+R4).** `App::doc` stays the active `DocumentSession`; the others wait,
+intact, on a `DocumentShelf` (`parked: Vec<DocumentSession>` in tab order
+plus `active_position`; checked `position`/`remove`/`insert`, no indexing).
+**Open (every format) and the new "New Document" palette command create a
+new session** with a new `DocumentId` and its **own** `TileStore` (all
+stores share the scratch directory; each store's instance token keeps
+their files apart); the new session is appended to the tab order and
+becomes active, the previous one is parked intact. A background open
+creates its store when it *starts* (the decode thread stages tiles into
+that store's staging root) and carries it as `PendingOpenStores` keyed by
+the open's generation; a superseding open drops the older store, and a
+finished open installs into exactly its own store. A failed install
+reverts to the previous document. The startup document is unchanged.
+**Switching** (`document_tabs::switch_document`, `App::activate_document`)
+runs in a fixed order: commit live gestures into the *outgoing* document's
+own history (the stroke or Move through the existing commit path, a
+Layers-panel opacity drag, the Curves gestures) → park it and activate the
+target → rebuild Layers and History from the incoming session's own layers,
+`undo_order` and `active_layer` (`rebuild_layer_rows` with the session's
+own layer preferred; focus left on a removed row moves to the incoming
+active row) → re-clamp the incoming view (kept, not reset) → bump the
+composite cache **and make the GPU atlas forget its slots**
+(`aurora_gpu::TileResidency::forget_slots`, F1: two documents' composite
+tiles share ids, and a clean, resident tile would otherwise keep showing
+the previous document) → status bar → title ("name — Aurora", "Opening …"
+kept while an open is pending), accessibility, redraw. A switch is refused
+while a dialog or the palette is open or a panel drag or rail resize is
+live; the outgoing document is autosaved under its own id as it is
+parked (review J-1). **Commands**: "Next Document"/"Previous Document" on
+`Ctrl+Tab`/`Ctrl+Shift+Tab` (the shortcut registry matches whole chords
+exactly, so these never collide with plain `Tab` focus traversal; checked
+by test), "New Document", and a dynamic "Document: `name`" palette entry per
+open document (0.168.0's pattern). **Autosave for N documents**: every
+session autosaves under its own id (startup, each open, each New Document;
+a parked document does not change, so its last file stands), and
+`AutosaveWorker::set_sessions` (no longer `expect(dead_code)`) is called
+with the tab order and active id on every open, new document and switch.
+**Carry-overs closed**: `Liveness::refresh` now also bumps this run's own
+session files and the marker (`Liveness::watch_marker`), so a `/tmp`
+cleaner cannot age out an idle parked document's autosave; and crash
+recovery restores **every** recovered candidate into its own session and
+store, active one first (`recover_remaining_candidates`,
+`recovered_shelf`, `settle_startup_autosaves`), so a crashed run with N
+documents comes back as N documents — each adopted into this run's
+namespace and indexed before anything is retired, and only what was tried
+retired. **Fixed on the way**: `App::new` built the startup session with
+`DocumentSession::new`, which took a *second* id, so the session's id
+differed from the id its startup autosave and index entry were written
+under (0.171.0); it now uses `with_id`. Quit is unchanged: the clean-quit
+cleanup drops every store (active, parked, pending) before removing the
+scratch directory and removes this run's whole autosave namespace. See the
+0.172.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.171.1): autosave hardening before R3 (patch).**
 Closes the four follow-ups the 0.171.0 judge listed as due before
 multiple documents arrive. **L-c, a stale marker is trusted**: recovery
 now always adds every run key the directory scan finds with an index or
@@ -31555,6 +31610,135 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.172.0) — several open documents and switching (R3).**
+
+New code: `aurora-app/src/document_tabs.rs` (`SwitchContext`,
+`switch_document`, `commit_live_gestures`, `bind_active_document`,
+`activate_new_document`, `PendingOpenStores`, the document palette
+entries and `sync_autosave_sessions`), `DocumentShelf` and
+`DocumentSession::name` in `document_session.rs`,
+`aurora_gpu::TileResidency::forget_slots`, `Liveness::watch_marker` and the
+session-file/marker refresh in `autosave_files.rs`, and in `lib.rs`
+`recover_remaining_candidates`, `recovered_shelf`,
+`settle_startup_autosaves`, `AppCommand::{NextDocument, PreviousDocument}`,
+`ActivatedCommand::Document`, `App::{switch_context, after_document_change,
+activate_document, cycle_document, new_document}`, and `window_title` now
+takes the document name. Tests (13 new, `document_tabs_tests.rs` unless
+noted): AC-1 `opening_creates_a_second_session_and_leaves_the_first_byte_identical`;
+AC-2 `undo_after_a_switch_reaches_only_the_active_document`; AC-3
+`live_gestures_during_a_switch_are_committed_to_the_outgoing_document`
+(stroke, opacity drag and Curves drag together); AC-4
+`a_switch_rebuilds_the_panels_from_the_incoming_session` (row count,
+active row, History rows, view, focus off the stale row, status bar) and
+`a_switch_is_refused_while_blocked`; AC-5
+`an_open_after_a_switch_lands_in_a_new_session_and_a_superseded_store_drops`;
+AC-6 (real GPU) `after_a_switch_the_atlas_shows_the_incoming_document`
+(red and blue documents, back and forth, sampled through the real canvas
+pipeline); AC-7
+`every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order`,
+`a_crashed_two_document_run_is_recovered_as_two_sessions`,
+`liveness_refresh_keeps_this_runs_session_files_and_the_marker_fresh`;
+AC-8 `ctrl_tab_cycles_documents_and_plain_tab_still_moves_focus`,
+`palette_document_entries_cycle_order_and_title_name_the_documents`; and
+`document_session::tests::the_shelf_keeps_tab_order_through_push_swap_and_revert`.
+Changed: the `window_title` tests now pass a document name.
+
+| Mutation (RTX 3090, `AURORA_REQUIRE_GPU=1`, `cargo test -p aurora-app`) | Result |
+|---|---|
+| M1 F1 residency reset removed (`forget_slots` not called) | killed (1: the GPU atlas test, on the return to the first document) |
+| M2 the switch leaves the outgoing session active (undo reaches the parked one) | killed (6) |
+| M3 a live stroke dropped on switch | killed (4) |
+| M4 panels rebuilt from defaults (topmost layer, empty history) | killed (2) |
+| M5 an open lands in the active session (replaces it) | killed (9) |
+| M6 `set_sessions` not called | killed (1) |
+| M7 recovery restores only the first candidate | killed (1) |
+| M8 liveness does not refresh session files | killed (1) |
+| M9 liveness does not refresh the marker | killed (1) |
+
+Gate (one pass after the last code change, RTX 3090, Vulkan,
+`AURORA_REQUIRE_GPU=1`): fmt, layering, hardcoded-style, `check --locked`,
+clippy, **3,232 passed, 0 failed, 61 ignored** (13 new), rustdoc with
+`-D warnings`, `cargo deny` and contrast green. Stress: the 124 autosave,
+recovery, marker, shutdown, startup, liveness and document-tab tests
+(the GPU atlas test included), 20 runs under 12 `yes` processes: 20/20
+passed, slowest 2.03 s. The mutations were run before the last,
+clippy-only edits (an `if let` for a `match`, a dropped `.clone()` on a
+`Copy` view, test-side lint fixes), which change no behaviour.
+
+**Review revision (0.172.0, judge REVISE 0.86).** **J-1 (required,
+fixed): the outgoing document was not autosaved when parked** — autosave
+ran only at startup, New and an install, so editing A, opening or
+switching to B and crashing lost A's edits though A was still open. Now
+`switch_document` and `activate_new_document` (which the open-install
+path goes through) call `document_tabs::autosave_outgoing` right after
+`commit_live_gestures`: a snapshot of the outgoing session under its own
+id and store, taken on the UI thread and written by the worker in that
+document's own slot, so the incoming document's autosave (another id)
+never supersedes it. Cost: one snapshot per switch or open, with no
+dirty check yet (R5), and over the snapshot budget the existing
+synchronous fallback runs on the UI thread. **J-2 (fixed)**: the
+`open_file`, `install_finished_open`, `install_opened_document` and
+`open_aur_file` doc comments no longer say an open replaces or discards
+the current document or sweeps it from a shared store; they describe the
+park-and-new-session install. **J-3 (fixed)**: a finished open whose
+pending store is missing is now a failed open
+(`pending_store_for` → `OpenFailure::LostStorage`, "Couldn't Open File")
+instead of a fresh store that could not adopt tiles staged under another
+store's root. **J-4 (confirmed, tested)**: choosing "Document: `name`"
+closes the palette before the command comes back, so the switch is not
+refused as blocked; and `Ctrl+Tab` in a focused text field inserts
+nothing and falls through to Next Document. Tests added (4,
+`document_tabs_tests`): `a_parked_document_is_autosaved_with_its_edits`
+(edit A, open B, edit B, switch back; each session file decoded and its
+tile compared), `a_finished_open_without_its_pending_store_is_a_failed_open`,
+`a_palette_document_entry_closes_the_palette_before_the_switch`,
+`ctrl_tab_in_a_focused_text_field_inserts_nothing_and_switches`.
+
+| Revision mutation | Result |
+|---|---|
+| M1 F1 residency reset removed (re-run) | killed (1) |
+| J1 park autosave dropped (both paths) | killed (1) |
+| J1b park autosave dropped on switch only | killed (1) |
+| J3 a missing pending store becomes a fresh one | killed (1) |
+
+Gate after the review revision (one pass after the last code change, RTX
+3090, `AURORA_REQUIRE_GPU=1`): fmt, layering, hardcoded-style,
+`check --locked`, clippy, **3,236 passed, 0 failed, 61 ignored** (17 new
+this round), rustdoc `-D warnings`, `cargo deny` and contrast green.
+Stress: the 128 autosave, recovery, marker, shutdown, startup, liveness
+and document-tab tests, 20 runs under 12 `yes` processes: 20/20 passed,
+slowest 2.25 s.
+
+**Re-judge: PASS, 0.90.** The judge raised one non-blocking follow-up.
+**R-1 (MEDIUM, open):** every switch and every open snapshots the outgoing
+document for its autosave, whether or not it has changed. A snapshot is
+about 7.5 ms for a 4096² four-layer PSD and about 0.1–0.2 s for 512 MiB of
+incompressible paged-out tiles. Above the 2 GiB budget it falls back to a
+synchronous write on the UI thread. Rapid Ctrl+Tab cannot flood the
+worker: each document keeps one newest-wins slot. But cycling through N
+large documents can hold one snapshot per document in memory at the same
+time. Fix, due with R5's dirty fingerprint (undo_order length and cursor
+plus journal length): skip the autosave when the outgoing document is
+unchanged since its last one.
+
+**Memory.** Every open document has its own `TileStore` with the same
+`TILE_BUDGET` (256 tiles of 256² half-float RGBA, 512 KiB each), so up to
+**N × 128 MiB** of resident tiles with N documents open; parked stores are
+not evicted (`TileStore` has no cheap evict-all; R6). **Not done here**:
+no tab bar (R4), no close, no dirty tracking or quit prompt (R5) — a clean
+quit still discards unsaved work in *every* open document without asking,
+parked ones included, exactly as it did for the one document before; no
+macOS menu items for the new commands (the menu code is not compiled on
+this Linux gate, so none was added rather than adding code no gate
+builds); a New Document has the active document's size (no size dialog);
+per-document panel scroll is reset on every switch (R6). **Not verified**:
+real hardware interaction and feel of switching, the F1 fix on Metal/DX12
+(the residency test ran on Vulkan/NVIDIA only), a real crash with several
+documents open, a real temp cleaner, and the App-level wiring itself (the
+`App` methods that call these free functions — `activate_document`,
+`new_document`, `install_finished_open`, `after_document_change` — need a
+window and are covered only through the functions they call).
 
 **Addendum 2026-10-10 (0.171.0) — per-session autosave plus an index (R2).**
 
