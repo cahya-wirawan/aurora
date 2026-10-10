@@ -185,7 +185,8 @@ pub use color_swatch::{
 };
 pub use command_palette::{
     CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
-    move_command_palette_selection, set_command_palette_query,
+    insert_command_prompt, move_command_palette_selection, set_command_palette_commands,
+    set_command_palette_message, set_command_palette_query,
 };
 pub use curve_editor::{
     CurveEditorKey, CurveEditorOutcome, CurveEditorPointState, CurveEditorState,
