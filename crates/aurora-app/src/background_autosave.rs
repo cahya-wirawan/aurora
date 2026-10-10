@@ -13,11 +13,20 @@
 //!
 //! The rules this module owns, each pinned by a test below:
 //!
-//! - **One writer, newest wins.** There is one worker thread and one
-//!   queue slot. A request made while a write is in flight waits in the
-//!   slot, and a newer request replaces a waiting one (it is dropped,
-//!   never written). So at most one write is in flight and writes land
-//!   in request order.
+//! - **One writer, newest wins per document.** There is one worker
+//!   thread and one queue slot *per document session* (0.171.0, keyed by
+//!   [`AutosaveJob::document`]). A request made while a write is in
+//!   flight waits in its document's slot, and a newer request for the
+//!   same document replaces a waiting one (it is dropped, never written);
+//!   a request for another document never touches it. Waiting jobs are
+//!   written oldest request first, at most one write is in flight, and
+//!   each document's writes land in request order.
+//! - **The index follows the files** (0.171.0). When a worker is given
+//!   an [`IndexBook`] ([`AutosaveWorker::configure_index`]), each landing
+//!   tells it the session's file is complete, under the same state lock
+//!   as the rename, and the book rewrites the run's index only if that
+//!   changes what it lists. So the index never names a file before it
+//!   has landed (`crate::autosave_files`).
 //! - **A stale write never lands.** Every request carries a
 //!   [`Generation`], and the rename that publishes a write happens under
 //!   the state lock and only if no newer generation has landed
@@ -52,7 +61,10 @@
 //!   leaves the previous autosave in place, which is what a failed
 //!   UI-thread autosave did before; neither is shown to the user.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use crate::autosave_files::{IndexBook, IndexEntry};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -70,6 +82,9 @@ pub(crate) const SHUTDOWN_WAIT_BOUND: Duration = Duration::from_millis(500);
 /// One autosave to write: where it goes, and what.
 #[derive(Debug)]
 pub(crate) struct AutosaveJob {
+    /// The document session this belongs to ([`crate::document_session::DocumentId`]'s
+    /// value): its queue slot and its landed generation.
+    pub(crate) document: u64,
     /// The canonical autosave path (`crate::autosave_path`).
     pub(crate) path: PathBuf,
     /// Where this write lands: `path`, or its partial sibling when the
@@ -107,10 +122,14 @@ pub(crate) enum Landing {
 
 #[derive(Debug, Default)]
 struct State {
-    queued: Option<(Generation, AutosaveJob)>,
+    /// One waiting job per document.
+    queued: BTreeMap<u64, (Generation, AutosaveJob)>,
     in_flight: Option<Generation>,
-    landed: Generation,
+    /// The newest generation landed (or superseded) per document.
+    landed: BTreeMap<u64, Generation>,
     cancelled: bool,
+    /// The run's index, when this worker keeps one.
+    index: Option<IndexBook>,
     /// Every [`Landing`] in order, for tests and the shutdown report.
     landings: Vec<(Generation, Landing)>,
 }
@@ -202,7 +221,7 @@ impl AutosaveWorker {
                 tracing::info!("autosave requested after shutdown; dropped");
                 return None;
             }
-            if let Some((superseded, _)) = state.queued.replace((generation, job)) {
+            if let Some((superseded, _)) = state.queued.insert(job.document, (generation, job)) {
                 tracing::debug!(
                     superseded,
                     generation,
@@ -223,8 +242,8 @@ impl AutosaveWorker {
                         ?err,
                         "could not start the autosave thread; writing on this one"
                     );
-                    let queued = self.shared.lock().queued.take();
-                    if let Some((generation, job)) = queued {
+                    let queued = std::mem::take(&mut self.shared.lock().queued);
+                    for (generation, job) in queued.into_values() {
                         write_and_land(&self.shared, generation, &job);
                     }
                 }
@@ -243,19 +262,66 @@ impl AutosaveWorker {
     /// write can replace the caller's. The write in flight is not
     /// interrupted (its result is refused at the rename); a later
     /// [`Self::submit`] gets a newer generation and lands normally.
-    pub(crate) fn supersede(&mut self) -> Generation {
+    ///
+    /// Per document (0.171.0): only `document`'s waiting and in-flight
+    /// writes are superseded; other documents' are untouched.
+    pub(crate) fn supersede(&mut self, document: u64) -> Generation {
         self.last_generation += 1;
         let generation = self.last_generation;
         let mut state = self.shared.lock();
-        if let Some((dropped, _)) = state.queued.take() {
+        if let Some((dropped, _)) = state.queued.remove(&document) {
             tracing::debug!(
                 dropped,
                 generation,
                 "a synchronous autosave superseded a waiting one"
             );
         }
-        state.landed = state.landed.max(generation);
+        let landed = state.landed.entry(document).or_default();
+        *landed = (*landed).max(generation);
         generation
+    }
+
+    /// Gives this worker the run's index to keep (0.171.0) and writes it
+    /// if it already has something to list; `true` when the index on
+    /// disk matches.
+    pub(crate) fn configure_index(&mut self, book: IndexBook) -> bool {
+        let mut state = self.shared.lock();
+        state.index.insert(book).sync()
+    }
+
+    /// Replaces the index's session set and active session (a later
+    /// round's tabs); `true` when the index on disk matches. A no-op
+    /// `true` without an index.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "sessions are created and closed from 0.172.0")
+    )]
+    pub(crate) fn set_sessions(&mut self, order: Vec<IndexEntry>, active: Option<u64>) -> bool {
+        self.shared
+            .lock()
+            .index
+            .as_mut()
+            .is_none_or(|book| book.set_sessions(order, active))
+    }
+
+    /// `document`'s file was written on the calling thread (the
+    /// over-budget fallback): it is complete, so the index may list it.
+    pub(crate) fn note_written(&mut self, document: u64) -> bool {
+        self.shared
+            .lock()
+            .index
+            .as_mut()
+            .is_none_or(|book| book.mark_complete(document))
+    }
+
+    /// How many times the index was written.
+    #[cfg(test)]
+    pub(crate) fn index_writes(&self) -> usize {
+        self.shared
+            .lock()
+            .index
+            .as_ref()
+            .map_or(0, IndexBook::writes)
     }
 
     /// Waits up to `bound` for every submitted job to be written (or
@@ -265,7 +331,7 @@ impl AutosaveWorker {
         let deadline = Instant::now() + bound;
         let mut state = self.shared.lock();
         loop {
-            if state.queued.is_none() && state.in_flight.is_none() {
+            if state.queued.is_empty() && state.in_flight.is_none() {
                 return true;
             }
             let now = Instant::now();
@@ -298,7 +364,9 @@ impl AutosaveWorker {
             let mut state = self.shared.lock();
             state.cancelled = true;
             self.shared.cancel.store(true, Ordering::SeqCst);
-            (state.queued.take().is_some(), state.in_flight.is_some())
+            let dropped = !state.queued.is_empty();
+            state.queued.clear();
+            (dropped, state.in_flight.is_some())
         };
         self.shared.changed.notify_all();
         let mut joined = false;
@@ -333,7 +401,13 @@ fn run(shared: &Shared) {
                 if state.cancelled {
                     return;
                 }
-                if let Some(queued) = state.queued.take() {
+                // The oldest request first, whichever document it is for.
+                let oldest = state
+                    .queued
+                    .iter()
+                    .min_by_key(|(_, (generation, _))| *generation)
+                    .map(|(document, _)| *document);
+                if let Some(queued) = oldest.and_then(|document| state.queued.remove(&document)) {
                     state.in_flight = Some(queued.0);
                     break queued;
                 }
@@ -388,11 +462,16 @@ fn land(
     let landing = if state.cancelled || (shared.session_ending)() {
         crate::remove_autosave_temp(&written.temp);
         Landing::Cancelled
-    } else if generation <= state.landed {
+    } else if generation <= state.landed.get(&job.document).copied().unwrap_or(0) {
         crate::remove_autosave_temp(&written.temp);
         Landing::Stale
     } else if crate::land_autosave_temp(&written.temp, &written.destination, &job.path) {
-        state.landed = generation;
+        state.landed.insert(job.document, generation);
+        // After the rename, under the same lock: the index can only name
+        // a file that has landed.
+        if let Some(book) = state.index.as_mut() {
+            let _written = book.mark_complete(job.document);
+        }
         Landing::Landed
     } else {
         Landing::RenameFailed
@@ -637,6 +716,170 @@ mod tests {
         (write, started, release)
     }
 
+    /// `doc`'s job for session `document` at `path`.
+    fn job_for(doc: &mut Doc, path: &Path, document: u64) -> AutosaveJob {
+        let mut job = doc.job(path);
+        job.document = document;
+        job
+    }
+
+    fn index_entry(pid: u32, id: u64) -> crate::autosave_files::IndexEntry {
+        crate::autosave_files::IndexEntry {
+            id,
+            file: crate::autosave_files::session_file_name(pid, id),
+        }
+    }
+
+    /// AC-2 (0.171.0): a request for one document never discards another
+    /// document's waiting request, and a newer request for the same
+    /// document still replaces its older waiting one.
+    #[test]
+    fn each_document_keeps_its_own_newest_wins_slot() {
+        let dir = tempdir();
+        let path_x = dir.path().join("x.aur");
+        let path_a = dir.path().join("a.aur");
+        let path_b = dir.path().join("b.aur");
+        let (write, started, release) = gated_writer();
+        let mut worker = AutosaveWorker::new(write, never);
+        let mut x = Doc::new("x", 0.125);
+        let mut a1 = Doc::new("a1", 0.25);
+        let mut b1 = Doc::new("b1", 0.5);
+        let mut a2 = Doc::new("a2", 0.75);
+        assert_eq!(worker.submit(job_for(&mut x, &path_x, 9)), Some(1));
+        assert!(
+            started.recv_timeout(WAIT).is_ok(),
+            "the first write is in flight"
+        );
+        assert_eq!(worker.submit(job_for(&mut a1, &path_a, 1)), Some(2));
+        assert_eq!(worker.submit(job_for(&mut b1, &path_b, 2)), Some(3));
+        assert_eq!(worker.submit(job_for(&mut a2, &path_a, 1)), Some(4));
+        assert!(release.send(()).is_ok());
+        assert!(worker.wait_idle(WAIT));
+        // A1 was replaced while waiting; B1 was not; oldest first.
+        assert_eq!(
+            worker.landings(),
+            vec![
+                (1, Landing::Landed),
+                (3, Landing::Landed),
+                (4, Landing::Landed)
+            ]
+        );
+        assert_eq!(recovered(&path_a), Some(vec![("a2".to_owned(), 0.75)]));
+        assert_eq!(recovered(&path_b), Some(vec![("b1".to_owned(), 0.5)]));
+        assert_eq!(recovered(&path_x), Some(vec![("x".to_owned(), 0.125)]));
+    }
+
+    /// A synchronous over-budget write for one document supersedes only
+    /// that document's writes (0.171.0).
+    #[test]
+    fn superseding_one_document_leaves_another_documents_write_alone() {
+        let dir = tempdir();
+        let path_a = dir.path().join("a.aur");
+        let path_b = dir.path().join("b.aur");
+        let (write, started, release) = gated_writer();
+        let mut worker = AutosaveWorker::new(write, never);
+        let mut a = Doc::new("a", 0.25);
+        let mut b = Doc::new("b", 0.5);
+        assert_eq!(worker.submit(job_for(&mut a, &path_a, 1)), Some(1));
+        assert!(started.recv_timeout(WAIT).is_ok());
+        assert_eq!(worker.submit(job_for(&mut b, &path_b, 2)), Some(2));
+        let _superseding = worker.supersede(1);
+        assert!(release.send(()).is_ok());
+        assert!(worker.wait_idle(WAIT));
+        assert_eq!(
+            worker.landings(),
+            vec![(1, Landing::Stale), (2, Landing::Landed)]
+        );
+        assert_eq!(recovered(&path_b), Some(vec![("b".to_owned(), 0.5)]));
+    }
+
+    /// AC-1 (0.171.0): the index names a session only once its file has
+    /// landed, so a crash while a new session's file is still being
+    /// written recovers from the previous index, which names only files
+    /// that are complete.
+    #[test]
+    fn the_index_never_names_a_session_before_its_file_has_landed() {
+        let dir = tempdir();
+        let pid = 4_100_001;
+        let path_a = dir
+            .path()
+            .join(crate::autosave_files::session_file_name(pid, 1));
+        let path_b = dir
+            .path()
+            .join(crate::autosave_files::session_file_name(pid, 2));
+        let index = crate::autosave_files::index_path(dir.path(), pid);
+        let (write, started, release) = gated_writer();
+        let mut worker = AutosaveWorker::new(write, never);
+        assert!(
+            worker.configure_index(crate::autosave_files::IndexBook::new(
+                index.clone(),
+                vec![index_entry(pid, 1)],
+                Some(1),
+                [],
+            ))
+        );
+        assert!(!index.exists(), "nothing complete yet, so no index");
+        let mut a = Doc::new("a", 0.25);
+        let mut b = Doc::new("b", 0.5);
+        // A lands first, through the gate's first call.
+        assert_eq!(worker.submit(job_for(&mut a, &path_a, 1)), Some(1));
+        assert!(started.recv_timeout(WAIT).is_ok());
+        assert!(!index.exists(), "A is still being written");
+        assert!(release.send(()).is_ok());
+        assert!(worker.wait_idle(WAIT));
+        assert_eq!(worker.index_writes(), 1);
+        // B is created: the set changes, but B is not complete yet, so
+        // the index is not rewritten to name it.
+        assert!(worker.set_sessions(vec![index_entry(pid, 1), index_entry(pid, 2)], Some(2)));
+        assert_eq!(worker.index_writes(), 1);
+        // Simulate the crash between B's file and the index: B's write
+        // has not landed, so the plan is exactly what the index says.
+        let plan = crate::autosave_files::plan_recovery(dir.path(), &[pid.into()]);
+        let planned: Vec<PathBuf> = plan.candidates.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(planned, vec![path_a.clone()]);
+        assert_eq!(recovered(&path_a), Some(vec![("a".to_owned(), 0.25)]));
+        // Once B lands, the index names both, active B.
+        assert_eq!(worker.submit(job_for(&mut b, &path_b, 2)), Some(2));
+        assert!(worker.wait_idle(WAIT));
+        assert_eq!(worker.index_writes(), 2);
+        assert_eq!(
+            crate::autosave_files::read_index(&index, pid.into()),
+            Ok(crate::autosave_files::AutosaveIndex {
+                active: Some(2),
+                entries: vec![index_entry(pid, 1), index_entry(pid, 2)],
+            })
+        );
+        // Another autosave of A replaces its file and leaves the index.
+        assert_eq!(worker.submit(job_for(&mut a, &path_a, 1)), Some(3));
+        assert!(worker.wait_idle(WAIT));
+        assert_eq!(worker.index_writes(), 2);
+    }
+
+    /// AC-4 (0.171.0): replacing the document keeps the session's id, so
+    /// the opened document's autosave lands on the same path by one
+    /// rename; until it does, the file still holds the old document.
+    #[test]
+    fn replacing_the_document_never_leaves_a_window_without_one() {
+        let dir = tempdir();
+        let path = dir
+            .path()
+            .join(crate::autosave_files::session_file_name(4_100_011, 1));
+        let mut worker = real_worker();
+        let mut old = Doc::new("old", 0.25);
+        assert_eq!(worker.submit(job_for(&mut old, &path, 1)), Some(1));
+        assert!(worker.wait_idle(WAIT));
+        let (write, started, release) = gated_writer();
+        let mut gated = AutosaveWorker::new(write, never);
+        let mut new = Doc::new("new", 0.75);
+        assert_eq!(gated.submit(job_for(&mut new, &path, 1)), Some(1));
+        assert!(started.recv_timeout(WAIT).is_ok());
+        // Mid-write: a crash here recovers the old document whole.
+        assert_eq!(recovered(&path), Some(vec![("old".to_owned(), 0.25)]));
+        assert!(release.send(()).is_ok());
+        assert!(gated.wait_idle(WAIT));
+        assert_eq!(recovered(&path), Some(vec![("new".to_owned(), 0.75)]));
+    }
+
     #[test]
     fn a_background_autosave_recovers_to_the_snapshotted_document() {
         let dir = tempdir();
@@ -860,6 +1103,7 @@ mod tests {
         crate::request_autosave(
             &mut worker,
             &path,
+            0,
             &doc.layers,
             &doc.history,
             (10, 10),
@@ -1059,6 +1303,7 @@ mod tests {
             &mut worker,
             1,
             &path,
+            0,
             &second.layers,
             &second.history,
             (10, 10),

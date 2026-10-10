@@ -539,6 +539,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+mod autosave_files;
 mod background_autosave;
 mod background_open;
 mod document_session;
@@ -1789,6 +1790,13 @@ fn marker_path() -> PathBuf {
 /// True if a marker from a *previous* run is still present at `path` —
 /// meaning that run never reached [`clear_session_marker`], i.e. it
 /// didn't shut down cleanly (a crash, a force-quit, a killed process).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded in 0.171.0; kept for its tests and doc links"
+    )
+)]
 #[must_use]
 fn previous_session_left_a_marker(path: &Path) -> bool {
     path.exists()
@@ -1798,10 +1806,27 @@ fn previous_session_left_a_marker(path: &Path) -> bool {
 /// [`previous_session_left_a_marker`] would see it as a *previous*
 /// run's. Errors are logged, not fatal: failing to write a marker file
 /// must never stop the application starting.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded in 0.171.0; kept for its tests and doc links"
+    )
+)]
 fn write_session_marker(path: &Path) {
-    if let Err(err) = std::fs::write(path, []) {
-        tracing::warn!(?err, path = %path.display(), "failed to write the crash-recovery session marker");
-    }
+    write_session_marker_contents(path, "");
+}
+
+/// [`write_session_marker`] with the pids it records (0.171.0,
+/// [`autosave_files::encode_marker`]): this run's, then the crashed and
+/// still-running runs it knows about, so recovery can find a crashed
+/// run's autosave index although the recovering run has another pid.
+///
+/// Atomic since 0.171.0 review N1 ([`autosave_files::write_marker`]):
+/// the marker's content now decides what is recovered, so a power loss
+/// mid-write must leave the previous marker, never an empty one.
+fn write_session_marker_contents(path: &Path, contents: &str) {
+    let _written = autosave_files::write_marker(path, contents);
 }
 
 /// Removes this run's own marker at `path` — call on a clean shutdown.
@@ -1817,11 +1842,20 @@ fn clear_session_marker(path: &Path) {
     }
 }
 
-/// Where this run's own autosave document lives — analogous to
-/// [`marker_path`], and for the same reason not a proper per-platform
-/// app-support directory yet. A real `.aur` container (ADR 0009), not
-/// the raw `postcard` journal this used to be — see this section's own
-/// doc comment.
+/// The pre-0.171.0 single autosave file — still recovered from after an
+/// older build's crash ([`autosave_files::plan_recovery`]), never written.
+/// Since 0.171.0 each document session has its own file and the run an
+/// index ([`autosave_files`]), in the same directory and for the same
+/// reason not a proper per-platform app-support directory yet. A real
+/// `.aur` container (ADR 0009), not the raw `postcard` journal this used
+/// to be — see this section's own doc comment.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded in 0.171.0; kept for its tests and doc links"
+    )
+)]
 fn autosave_path() -> PathBuf {
     std::env::temp_dir().join("aurora-autosave.aur")
 }
@@ -2014,9 +2048,11 @@ const AUTOSAVE_SNAPSHOT_BUDGET_BYTES: usize = 2 << 30;
 /// A document whose tiles would not fit [`AUTOSAVE_SNAPSHOT_BUDGET_BYTES`]
 /// falls back to [`write_autosave`] on this thread — the pre-0.152.0
 /// behaviour, streamed, never holding the document twice.
+#[allow(clippy::too_many_arguments)]
 fn request_autosave(
     worker: &mut background_autosave::AutosaveWorker,
     path: &Path,
+    document: u64,
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
     canvas_size: (u32, u32),
@@ -2027,6 +2063,7 @@ fn request_autosave(
         worker,
         AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
         path,
+        document,
         layers,
         history,
         canvas_size,
@@ -2047,6 +2084,7 @@ fn request_autosave_within(
     worker: &mut background_autosave::AutosaveWorker,
     budget: usize,
     path: &Path,
+    document: u64,
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
     canvas_size: (u32, u32),
@@ -2054,19 +2092,29 @@ fn request_autosave_within(
     store: &mut aurora_tile::TileStore,
 ) {
     match snapshot_autosave(path, layers, history, canvas_size, skipped, budget, store) {
-        SnapshotOutcome::Taken(job) => {
+        SnapshotOutcome::Taken(mut job) => {
+            job.document = document;
             let _generation = worker.submit(job);
         }
         SnapshotOutcome::OverBudget => {
             tracing::info!("the document is too large to snapshot; autosaving on the UI thread");
-            let _generation = worker.supersede();
+            let _generation = worker.supersede(document);
             write_autosave(path, layers, history, canvas_size, skipped, store);
+            // Written (complete or partial) on this thread, so the index
+            // may name it now (0.171.0).
+            if path.exists() || partial_autosave_path(path).exists() {
+                let _indexed = worker.note_written(document);
+            }
         }
         SnapshotOutcome::Failed => {}
     }
 }
 
 /// What [`snapshot_autosave`] produced.
+// One per autosave request, moved straight into the worker: boxing the
+// job would buy nothing (0.171.0 added `AutosaveJob::document`, which
+// tipped clippy's threshold).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum SnapshotOutcome {
     Taken(background_autosave::AutosaveJob),
@@ -2123,6 +2171,10 @@ fn snapshot_autosave(
         destination
     };
     SnapshotOutcome::Taken(background_autosave::AutosaveJob {
+        // The caller that knows the session sets it
+        // ([`request_autosave_within`], `App::new`); `0` is one shared
+        // slot, which is what a bare snapshot in a test means.
+        document: 0,
         path: path.to_path_buf(),
         destination,
         snapshot,
@@ -2518,6 +2570,18 @@ struct StartupDocument {
     /// when recovery succeeded (the file already holds this document),
     /// with no store, or when it fell back to a synchronous write.
     autosave: Option<background_autosave::AutosaveJob>,
+    /// Which candidate the recovered document came from (0.171.0) — an
+    /// index into the `candidates` [`startup_document_from`] was given.
+    recovered_from: Option<usize>,
+    /// Every candidate tried before that one (or all of them) that was
+    /// missing or would not read — reported in the crash-recovery
+    /// dialog; the rest are kept.
+    failed: Vec<PathBuf>,
+    /// How many candidates, from the first, were actually tried
+    /// (recovered or found missing or damaged) — `None` when recovery was
+    /// not attempted at all (no previous marker, or no tile store). Only
+    /// tried candidates may ever be retired (0.171.0 review H1).
+    attempted: Option<usize>,
 }
 
 /// Resolves the document [`App::new`] opens with: a crash-recovered one
@@ -2541,10 +2605,40 @@ struct StartupDocument {
 /// `&mut Option<_>` rather than `Option<&mut _>` so a *failed* recovery
 /// can replace the store outright — see the reopen below for why that
 /// matters.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded in 0.171.0; kept for its tests and doc links"
+    )
+)]
 fn startup_document(
     had_previous_marker: bool,
     autosave_path: &Path,
     store_slot: &mut Option<aurora_tile::TileStore>,
+) -> StartupDocument {
+    startup_document_from(
+        had_previous_marker,
+        &[autosave_path.to_path_buf()],
+        autosave_path,
+        store_slot,
+        &mut open_tile_store,
+    )
+}
+
+/// [`startup_document`] over several candidate autosaves (0.171.0, from
+/// [`autosave_files::plan_recovery`]): they are tried in order, the
+/// first that reads back is the recovered document, and every one tried
+/// before it that was missing or would not read is reported in
+/// [`StartupDocument::failed`] — the rest are kept for a later round,
+/// which opens them as more documents. A fresh document's snapshot is
+/// taken for `own_path`, this session's own autosave file.
+fn startup_document_from(
+    had_previous_marker: bool,
+    candidates: &[PathBuf],
+    own_path: &Path,
+    store_slot: &mut Option<aurora_tile::TileStore>,
+    reopen: &mut dyn FnMut() -> Option<aurora_tile::TileStore>,
 ) -> StartupDocument {
     let fresh = || {
         let (layers, history) = demo_document();
@@ -2561,73 +2655,80 @@ fn startup_document(
             skipped_tiles: aurora_io::SkippedTiles::new(),
             was_recovered: false,
             autosave: None,
+            recovered_from: None,
+            failed: Vec::new(),
+            attempted: None,
         };
     }
-    let recovered = match (had_previous_marker, store_slot.as_mut()) {
-        (true, Some(store)) => recover_document(autosave_path, store),
-        _ => None,
-    };
-    // A canonical container that *exists* but does not read back is
-    // exactly the case a partial snapshot is kept for -- corruption --
-    // and [`recover_document`] cannot try it on its own, because
-    // recovering from the partial needs the store replaced first and only
-    // this function owns the slot to replace. When the canonical file is
-    // simply absent, `recover_document` has already tried the partial and
-    // this must not re-read it.
-    let recovered = match recovered {
-        Some(document) => Some(document),
-        None if had_previous_marker && autosave_path.exists() => {
-            recover_partial_after_a_failed_read(autosave_path, store_slot)
-        }
-        None => None,
-    };
-    if let Some(RecoveredDocument {
-        layers,
-        history,
-        canvas_size,
-        skipped_tiles,
-    }) = recovered
-    {
-        // Nothing written back out: the file on disk *is* this
-        // document, read back a few lines ago and not touched since.
-        // Rewriting it here would be a full container rebuild (see
-        // [`write_autosave`]'s own measured cost) for a byte-identical
-        // result, on the pre-window startup path, against a <3 s startup
-        // budget (PRD §6). The fresh-document case below still writes,
-        // because there the file either doesn't exist or describes some
-        // older session's document. Even that one could move off the
-        // pre-window path in later work if startup measurement ever says
-        // it needs to; it isn't turned into a background task now on
-        // speculation.
-        return StartupDocument {
-            layers,
-            history,
-            canvas_size,
-            skipped_tiles,
-            was_recovered: true,
-            autosave: None,
-        };
-    }
+    let mut failed = Vec::new();
+    let mut attempted = None;
     if had_previous_marker {
-        // A recovery attempt that failed could still have committed
-        // real pixels: `aurora_io::read_aur` writes each tile into the
-        // store as it goes, so a container whose central directory is
-        // intact but whose *last* tile entry is corrupt left earlier
-        // surfaces already populated before it returned `Err` -- until
-        // 0.71.2, which made that read roll its own committed tiles
-        // back. This reopen is kept as defence in depth: it costs a
-        // fresh temp directory once per failed recovery, and it is the
-        // only guard here that does not rest on another crate's
-        // rollback being right. Those surfaces are
-        // the same `SurfaceId`s [`demo_document`]'s own fresh layers are
-        // about to claim, so keeping the store would show the user
-        // fragments of the document that failed to recover, painted
-        // into a document that has nothing to do with it. A fresh store
-        // starts with no resident and no paged-out tiles, which is the
-        // whole fix; if reopening itself fails, the session simply
-        // continues without painting, exactly as
-        // [`open_tile_store`]'s own `None` already means.
-        *store_slot = open_tile_store();
+        attempted = Some(0);
+        for (position, path) in candidates.iter().enumerate() {
+            let Some(store) = store_slot.as_mut() else {
+                break;
+            };
+            attempted = Some(position + 1);
+            let mut recovered = recover_document(path, store);
+            // A canonical container that *exists* but does not read back
+            // is exactly the case a partial snapshot is kept for --
+            // corruption -- and [`recover_document`] cannot try it on its
+            // own, because recovering from the partial needs the store
+            // replaced first and only this function owns the slot to
+            // replace. When the canonical file is simply absent,
+            // `recover_document` has already tried the partial and this
+            // must not re-read it.
+            if recovered.is_none() && path.exists() {
+                recovered = recover_partial_after_a_failed_read(path, store_slot);
+            }
+            if let Some(RecoveredDocument {
+                layers,
+                history,
+                canvas_size,
+                skipped_tiles,
+            }) = recovered
+            {
+                // Nothing written back out: the file on disk *is* this
+                // document, read back a few lines ago and not touched
+                // since. Rewriting it here would be a full container
+                // rebuild (see [`write_autosave`]'s own measured cost)
+                // for a byte-identical result, on the pre-window startup
+                // path, against a <3 s startup budget (PRD §6). Since
+                // 0.171.0 `App::new` adopts the file into this run's own
+                // namespace by renaming it instead
+                // ([`settle_startup_autosave`]).
+                return StartupDocument {
+                    layers,
+                    history,
+                    canvas_size,
+                    skipped_tiles,
+                    was_recovered: true,
+                    autosave: None,
+                    recovered_from: Some(position),
+                    failed,
+                    attempted,
+                };
+            }
+            tracing::warn!(path = %path.display(), "an autosaved document could not be recovered");
+            failed.push(path.clone());
+            // A recovery attempt that failed could still have committed
+            // real pixels: `aurora_io::read_aur` writes each tile into the
+            // store as it goes, so a container whose central directory is
+            // intact but whose *last* tile entry is corrupt left earlier
+            // surfaces already populated before it returned `Err` -- until
+            // 0.71.2, which made that read roll its own committed tiles
+            // back. This reopen is kept as defence in depth: it costs a
+            // fresh temp directory once per failed recovery, and it is the
+            // only guard here that does not rest on another crate's
+            // rollback being right. Those surfaces are the same
+            // `SurfaceId`s the next candidate's (or [`demo_document`]'s)
+            // own layers are about to claim, so keeping the store would
+            // show the user fragments of the document that failed to
+            // recover. If reopening itself fails, the session simply
+            // continues without painting, exactly as
+            // [`open_tile_store`]'s own `None` already means.
+            *store_slot = reopen();
+        }
     }
     let (layers, history, canvas_size) = fresh();
     // A brand-new document has lost nothing, so this starts empty --
@@ -2639,7 +2740,7 @@ fn startup_document(
     if let Some(store) = store_slot.as_mut() {
         // Snapshotted here, written by `App::new`'s worker (0.152.0).
         match snapshot_autosave(
-            autosave_path,
+            own_path,
             &layers,
             &history,
             canvas_size,
@@ -2649,7 +2750,7 @@ fn startup_document(
         ) {
             SnapshotOutcome::Taken(job) => autosave = Some(job),
             SnapshotOutcome::OverBudget => write_autosave(
-                autosave_path,
+                own_path,
                 &layers,
                 &history,
                 canvas_size,
@@ -2668,7 +2769,116 @@ fn startup_document(
         skipped_tiles,
         was_recovered: false,
         autosave,
+        recovered_from: None,
+        failed,
+        attempted,
     }
+}
+
+/// What [`settle_startup_autosave`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SettledAutosave {
+    /// The recovered file was moved into this run's namespace.
+    adopted: bool,
+    /// This run's index lists the session (or had nothing to list yet).
+    index_written: bool,
+    /// The crashed runs whose leftovers were deleted.
+    retired: Vec<autosave_files::RunKey>,
+    /// The crashed runs kept, their index rewritten to list only the
+    /// sessions not tried yet (for a later round's extra documents).
+    kept: Vec<autosave_files::RunKey>,
+    /// Whether the legacy single file was retired.
+    retired_legacy: bool,
+}
+
+/// The startup half of per-session autosave (0.171.0), run by `App::new`
+/// once [`startup_document_from`] has chosen the document and before any
+/// autosave of this run is submitted:
+///
+/// 1. A recovered document's file is **adopted**: renamed (one atomic
+///    rename, same directory) to this session's own name
+///    ([`autosave_files::adopt`]), so the run owns it under its own key
+///    and id without rewriting it.
+/// 2. `worker` is given this run's [`autosave_files::IndexBook`], which
+///    writes the index at once when the session's file is already
+///    complete (adopted, or written synchronously over budget), and
+///    otherwise when the fresh document's first autosave lands.
+/// 3. Only then, and **only for candidates recovery actually tried**
+///    (`attempted`, 0.171.0 review H1), is anything deleted. Nothing at
+///    all when recovery was not attempted (no previous marker, no tile
+///    store) or the adoption or index did not land. A crashed run all of
+///    whose candidates were tried is retired (files, index, lock); one
+///    with untried candidates is kept, its index rewritten to list just
+///    those. The legacy file goes only if it was tried.
+///
+/// So at every instant a crash leaves the document findable: before the
+/// rename it is in the crashed run's namespace (which the marker still
+/// lists, [`run`]); after it, in this run's namespace (the marker lists
+/// this run first; a missing index falls back to scanning it); and the
+/// crashed run's index goes only once this run's has landed.
+fn settle_startup_autosave(
+    worker: &mut background_autosave::AutosaveWorker,
+    namespace: &autosave_files::AutosaveNamespace,
+    document: u64,
+    sources: &[autosave_files::RunKey],
+    candidates: &[autosave_files::Candidate],
+    recovered_from: Option<usize>,
+    attempted: Option<usize>,
+) -> SettledAutosave {
+    let own_path = namespace.session_path(document);
+    let recovered = recovered_from.and_then(|position| candidates.get(position));
+    let adopted = recovered.is_some_and(|candidate| {
+        candidate.path == own_path || autosave_files::adopt(&candidate.path, &own_path)
+    });
+    let complete = adopted
+        || (recovered.is_none()
+            && (own_path.exists() || partial_autosave_path(&own_path).exists()));
+    let entry = autosave_files::IndexEntry {
+        id: document,
+        file: autosave_files::session_file_name(namespace.key, document),
+    };
+    let index_written = worker.configure_index(autosave_files::IndexBook::new(
+        namespace.index_path(),
+        vec![entry],
+        Some(document),
+        complete.then_some(document),
+    ));
+    let mut settled = SettledAutosave {
+        adopted,
+        index_written,
+        ..SettledAutosave::default()
+    };
+    if recovered.is_some() && !(adopted && index_written) {
+        tracing::warn!(
+            "the recovered autosave could not be adopted; the crashed run's files are kept"
+        );
+        return settled;
+    }
+    let Some(attempted) = attempted else {
+        return settled;
+    };
+    let (tried, untried) = candidates.split_at(attempted.min(candidates.len()));
+    for &key in sources {
+        let remaining: Vec<u64> = untried
+            .iter()
+            .filter(|candidate| candidate.source == Some(key))
+            .map(|candidate| candidate.id)
+            .collect();
+        if remaining.is_empty() {
+            autosave_files::retire_namespace(&namespace.dir, key);
+            settled.retired.push(key);
+        } else {
+            if tried.iter().any(|candidate| candidate.source == Some(key)) {
+                let _rewritten = autosave_files::rewrite_remaining(&namespace.dir, key, &remaining);
+            }
+            settled.kept.push(key);
+        }
+    }
+    if tried.iter().any(|candidate| candidate.source.is_none()) {
+        autosave_files::retire_legacy(&namespace.dir);
+        settled.retired_legacy = true;
+    }
+    settled
 }
 
 // -- Persisted workspace layout (rail width, panel collapsed state) --
@@ -3293,6 +3503,25 @@ fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
     }
 }
 
+/// [`crash_recovery_dialog_message`], extended (0.171.0) with how many
+/// autosaved documents were missing or would not read — every other one
+/// was kept. The same wording as before when there were none.
+fn crash_recovery_message(recovered: bool, failed: usize) -> String {
+    let mut message = crash_recovery_dialog_message(recovered).to_owned();
+    match failed {
+        0 => {}
+        1 => message
+            .push_str(" One autosaved document was missing or damaged and could not be recovered."),
+        n => {
+            let sentence = format!(
+                " {n} autosaved documents were missing or damaged and could not be recovered."
+            );
+            message.push_str(&sentence);
+        }
+    }
+    message
+}
+
 /// Opens a modal dialog (a no-op if one is already open): inserts it
 /// into `workspace.tree` under `workspace.root` and moves keyboard focus
 /// to its first action.
@@ -3372,6 +3601,13 @@ fn open_dialog(
 /// own title, message ([`crash_recovery_dialog_message`]) and actions
 /// ([`crash_recovery_dialog_actions`]), and therefore a no-op if a
 /// dialog is already open.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded in 0.171.0; kept for its tests and doc links"
+    )
+)]
 fn open_crash_recovery_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -3379,13 +3615,26 @@ fn open_crash_recovery_dialog(
     scales: &Scales,
     recovered: bool,
 ) -> bool {
+    open_crash_recovery_dialog_reporting(workspace, focus, dialog, scales, recovered, 0)
+}
+
+/// [`open_crash_recovery_dialog`] that also reports `failed` autosaved
+/// documents ([`crash_recovery_message`], 0.171.0).
+fn open_crash_recovery_dialog_reporting(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<OpenDialog>,
+    scales: &Scales,
+    recovered: bool,
+    failed: usize,
+) -> bool {
     open_dialog(
         workspace,
         focus,
         dialog,
         scales,
         "Aurora Didn't Close Properly",
-        crash_recovery_dialog_message(recovered),
+        &crash_recovery_message(recovered, failed),
         crash_recovery_dialog_actions(),
         DialogPurpose::CrashRecovery,
     )
@@ -19498,8 +19747,31 @@ fn ensure_session_scratch_lock(session: &Path) {
 /// those, and a crashed run's marker is load-bearing anyway (it is what
 /// makes the *next* run offer recovery).
 fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
-    clear_session_marker(state.marker_path());
     remove_autosave(&state.autosave_path());
+    // 0.171.0: every session file, the index and the lock — this run's
+    // key only, never another Aurora's or a crashed run's. Then the
+    // marker is rewritten without this run, keeping any other run that
+    // still has files (a crashed run whose other documents wait for a
+    // later round, a second Aurora still running; review M1), and is
+    // deleted only when none is left.
+    let own = state.autosave_namespace().map(|namespace| {
+        namespace.remove_all();
+        (namespace.dir.clone(), namespace.key)
+    });
+    match own {
+        Some((dir, key)) => {
+            let marker = state.marker_path().to_path_buf();
+            let remaining = autosave_files::read_marker(&marker)
+                .map(|keys| autosave_files::marker_after_quit(&dir, key, &keys))
+                .unwrap_or_default();
+            if remaining.is_empty() {
+                clear_session_marker(&marker);
+            } else {
+                write_session_marker_contents(&marker, &autosave_files::encode_marker(&remaining));
+            }
+        }
+        None => clear_session_marker(state.marker_path()),
+    }
     remove_session_scratch(state);
 }
 
@@ -19619,6 +19891,12 @@ trait ShutdownState {
     fn marker_path(&self) -> &Path;
     /// Where the autosave this run has been writing lives.
     fn autosave_path(&self) -> PathBuf;
+    /// This run's autosave namespace (0.171.0): every session file, the
+    /// index and the liveness lock a clean quit removes. `None` when the
+    /// state has none (most test doubles).
+    fn autosave_namespace(&mut self) -> Option<&mut autosave_files::AutosaveNamespace> {
+        None
+    }
     /// Takes the live tile store out of the application, so dropping it
     /// joins its writer thread. Leaves nothing behind.
     fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore>;
@@ -20503,6 +20781,9 @@ struct App {
     /// Writes the crash-recovery autosave off the UI thread (0.152.0,
     /// [`background_autosave`]).
     autosave_worker: background_autosave::AutosaveWorker,
+    /// This run's autosave namespace and liveness lock (0.171.0,
+    /// [`autosave_files`]).
+    autosave: autosave_files::AutosaveNamespace,
     /// The real workspace layout (`aurora_ui::build_workspace` — canvas
     /// area + the Layers/Properties/History dock, matching the
     /// owner-approved workspace mockup) — a static structure for now,
@@ -20786,7 +21067,11 @@ impl ShutdownState for App {
     }
 
     fn autosave_path(&self) -> PathBuf {
-        autosave_path()
+        self.autosave.session_path(self.doc.id.get())
+    }
+
+    fn autosave_namespace(&mut self) -> Option<&mut autosave_files::AutosaveNamespace> {
+        Some(&mut self.autosave)
     }
 
     fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
@@ -20849,7 +21134,8 @@ impl App {
         scales: Scales,
         marker_path: PathBuf,
         had_previous_marker: bool,
-        autosave_path: &Path,
+        autosave: autosave_files::AutosaveNamespace,
+        sources: &[autosave_files::RunKey],
         layout_path: Option<PathBuf>,
         reduced_motion: bool,
     ) -> Self {
@@ -20868,17 +21154,48 @@ impl App {
         // the autosave's own tiles straight into a live store, so the
         // store has to exist first.
         let mut tile_store = open_tile_store();
+        // 0.171.0: the session's id first, so its autosave file is named
+        // before the session exists; then the crashed runs' documents.
+        let document_id = document_session::DocumentId::next();
+        let own_autosave = autosave.session_path(document_id.get());
+        let plan = autosave_files::plan_recovery(&autosave.dir, sources);
+        let candidate_paths: Vec<PathBuf> = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect();
         let StartupDocument {
             layers,
             history,
             canvas_size,
             skipped_tiles,
             was_recovered,
-            autosave,
-        } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
-        // The startup autosave's write, off this thread (0.152.0).
+            autosave: startup_autosave,
+            recovered_from,
+            failed,
+            attempted,
+        } = startup_document_from(
+            had_previous_marker,
+            &candidate_paths,
+            &own_autosave,
+            &mut tile_store,
+            &mut open_tile_store,
+        );
         let mut autosave_worker = background_autosave::AutosaveWorker::default();
-        if let Some(job) = autosave {
+        let settled = settle_startup_autosave(
+            &mut autosave_worker,
+            &autosave,
+            document_id.get(),
+            sources,
+            &plan.candidates,
+            recovered_from,
+            attempted,
+        );
+        tracing::debug!(?settled, "settled this run's autosave namespace");
+        // The startup autosave's write, off this thread (0.152.0), after
+        // the namespace is settled so no retirement can race it.
+        if let Some(mut job) = startup_autosave {
+            job.document = document_id.get();
             let _generation = autosave_worker.submit(job);
         }
         // Every startup panel step lives in [`install_startup_panels`]
@@ -20940,12 +21257,13 @@ impl App {
         let mut focus = FocusManager::default();
         let mut dialog = None;
         if had_previous_marker {
-            open_crash_recovery_dialog(
+            open_crash_recovery_dialog_reporting(
                 &mut workspace,
                 &mut focus,
                 &mut dialog,
                 &scales,
                 was_recovered,
+                failed.len(),
             );
         }
         // 0.162.0: the status bar shows the startup document from the
@@ -20962,6 +21280,7 @@ impl App {
             proxy,
             open_worker: OpenWorker::default(),
             autosave_worker,
+            autosave,
             workspace,
             focus,
             shortcuts: default_shortcuts(),
@@ -21830,9 +22149,11 @@ impl App {
             // own before its write.
             self.doc.skipped_tiles = aurora_io::SkippedTiles::new();
             // A snapshot here, the write on the autosave worker (0.152.0).
+            let own_autosave = self.autosave.session_path(self.doc.id.get());
             request_autosave(
                 &mut self.autosave_worker,
-                &autosave_path(),
+                &own_autosave,
+                self.doc.id.get(),
                 &self.doc.layers,
                 &self.doc.history,
                 canvas_size,
@@ -21996,9 +22317,11 @@ impl App {
         // populated the store by now, so the container this writes
         // carries the opened document's real tiles.
         if let Some(store) = self.doc.tile_store.as_mut() {
+            let own_autosave = self.autosave.session_path(self.doc.id.get());
             request_autosave(
                 &mut self.autosave_worker,
-                &autosave_path(),
+                &own_autosave,
+                self.doc.id.get(),
                 &layers,
                 &history,
                 canvas_size,
@@ -25013,8 +25336,37 @@ pub fn run() -> anyhow::Result<()> {
     // Checked *before* writing this run's own marker below -- otherwise
     // every run would see its own, brand-new marker and think the
     // *previous* run crashed.
-    let had_previous_marker = previous_session_left_a_marker(&marker_path);
-    write_session_marker(&marker_path);
+    //
+    // 0.171.0: this run's autosave lock is taken first, so a second
+    // Aurora starting now already sees this one as alive; then the
+    // previous marker's runs that are really gone become the sources to
+    // recover from (`autosave_files::claim_sources` skips a run whose
+    // lock is still held -- a second Aurora, whose files are never read,
+    // adopted or deleted). A marker that names only live runs is not a
+    // crash, so it no longer shows the crash dialog; an empty (pre-0.171.0)
+    // marker still is one, recovered from the legacy single file.
+    let own_pid = std::process::id();
+    let autosave = autosave_files::AutosaveNamespace::acquire(std::env::temp_dir(), own_pid);
+    let previous_marker = autosave_files::read_marker(&marker_path);
+    // 0.171.0 review N1/N2: an empty or damaged marker falls back to a
+    // scan of the directory; otherwise its keys, those with files first.
+    let marker_runs = previous_marker
+        .as_deref()
+        .map(|keys| autosave_files::recovery_keys(&autosave.dir, keys));
+    let claimed = marker_runs.as_deref().map_or_else(Vec::new, |keys| {
+        autosave_files::claim_sources(&autosave.dir, autosave.key, keys)
+    });
+    let sources: Vec<autosave_files::RunKey> = claimed.iter().map(|source| source.key).collect();
+    let had_previous_marker = previous_marker
+        .as_deref()
+        .is_some_and(|keys| keys.is_empty() || !sources.is_empty());
+    let mut marker_keys = vec![autosave.key];
+    marker_keys.extend(autosave_files::inherited_marker_keys(
+        &autosave.dir,
+        autosave.key,
+        marker_runs.as_deref().unwrap_or_default(),
+    ));
+    write_session_marker_contents(&marker_path, &autosave_files::encode_marker(&marker_keys));
     // Strictly before this session's own scratch directory is first
     // created (`tile_store_scratch_dir` is lazy, and `App::new` below is
     // the earliest thing that reaches it): "never delete the current
@@ -25027,7 +25379,6 @@ pub fn run() -> anyhow::Result<()> {
         skipped = sweep.skipped,
         "swept scratch directories left by sessions that are no longer running"
     );
-    let autosave_path = autosave_path();
     let layout_path = layout_path();
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
@@ -25043,10 +25394,13 @@ pub fn run() -> anyhow::Result<()> {
         scales,
         marker_path,
         had_previous_marker,
-        &autosave_path,
+        autosave,
+        &sources,
         layout_path,
         preferences.reduced_motion,
     );
+    // The crashed runs' locks were held through recovery and adoption.
+    drop(claimed);
     event_loop
         .run_app(&mut app)
         .map_err(|err| anyhow::anyhow!("event loop run failed: {err}"))?;
@@ -34392,6 +34746,7 @@ mod tests {
 
         let state = FakeShutdownState {
             autosave_worker: None,
+            namespace: None,
             marker: marker.clone(),
             autosave: autosave.clone(),
             store: Some(store),
@@ -34418,6 +34773,7 @@ mod tests {
     /// of the live session's.
     struct FakeShutdownState {
         autosave_worker: Option<crate::background_autosave::AutosaveWorker>,
+        namespace: Option<crate::autosave_files::AutosaveNamespace>,
         marker: PathBuf,
         autosave: PathBuf,
         store: Option<aurora_tile::TileStore>,
@@ -34446,6 +34802,10 @@ mod tests {
 
         fn autosave_path(&self) -> PathBuf {
             self.autosave.clone()
+        }
+
+        fn autosave_namespace(&mut self) -> Option<&mut crate::autosave_files::AutosaveNamespace> {
+            self.namespace.as_mut()
         }
 
         fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
@@ -34696,6 +35056,7 @@ mod tests {
         let autosave = dir.path().join("never-written.aur");
         let mut state = FakeShutdownState {
             autosave_worker: None,
+            namespace: None,
             marker: marker.clone(),
             autosave: autosave.clone(),
             store: None,
@@ -55015,6 +55376,661 @@ mod tests {
             (37, 21),
             "the recovered document must be the partial container's own, not a fresh one"
         );
+    }
+
+    /// Per-session autosave recovery, adoption, retirement and clean-quit
+    /// cleanup against real `.aur` containers (0.171.0).
+    mod session_autosave {
+        use std::path::{Path, PathBuf};
+
+        use super::{
+            Aborted, paint_one_texel, real_tile_store, shutdown_fixture, small_autosave_document,
+        };
+        use crate::autosave_files::{
+            self, AutosaveIndex, AutosaveNamespace, IndexEntry, RunKey, index_path, legacy_path,
+            session_file_name, write_index,
+        };
+        use crate::background_autosave::AutosaveWorker;
+        use crate::background_autosave::test_support::never;
+
+        fn tempdir() -> tempfile::TempDir {
+            match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(err) => unreachable!("{err}"),
+            }
+        }
+
+        /// A real autosave container at `path` whose canvas size is
+        /// `size` — the size is what tells recovered documents apart.
+        fn write_document(path: &Path, size: (u32, u32)) {
+            let (layers, history, id) = small_autosave_document();
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            crate::write_autosave(
+                path,
+                &layers,
+                &history,
+                size,
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
+            assert!(path.exists(), "the fixture container was written");
+        }
+
+        fn entry(pid: u32, id: u64) -> IndexEntry {
+            IndexEntry {
+                id,
+                file: session_file_name(pid, id),
+            }
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        }
+
+        /// Recovery as `App::new` runs it, minus the window: plan,
+        /// startup document, settle.
+        fn recover(
+            dir: &Path,
+            own_pid: u32,
+            document: u64,
+            sources: &[u32],
+        ) -> (
+            crate::StartupDocument,
+            crate::SettledAutosave,
+            AutosaveWorker,
+            AutosaveNamespace,
+        ) {
+            recover_with(dir, own_pid, document, sources, true, &mut || {
+                Some(real_tile_store().1)
+            })
+        }
+
+        /// [`recover`] with the marker's presence and the store's reopen
+        /// chosen by the test (a `None` reopen is a failed reopen).
+        fn recover_with(
+            dir: &Path,
+            own_pid: u32,
+            document: u64,
+            sources: &[u32],
+            had_previous_marker: bool,
+            reopen: &mut dyn FnMut() -> Option<aurora_tile::TileStore>,
+        ) -> (
+            crate::StartupDocument,
+            crate::SettledAutosave,
+            AutosaveWorker,
+            AutosaveNamespace,
+        ) {
+            let (_store_dir, store) = real_tile_store();
+            recover_into(
+                dir,
+                own_pid,
+                document,
+                sources,
+                had_previous_marker,
+                Some(store),
+                reopen,
+            )
+        }
+
+        fn recover_into(
+            dir: &Path,
+            own_pid: u32,
+            document: u64,
+            sources: &[u32],
+            had_previous_marker: bool,
+            store: Option<aurora_tile::TileStore>,
+            reopen: &mut dyn FnMut() -> Option<aurora_tile::TileStore>,
+        ) -> (
+            crate::StartupDocument,
+            crate::SettledAutosave,
+            AutosaveWorker,
+            AutosaveNamespace,
+        ) {
+            let sources: Vec<RunKey> = sources.iter().map(|&pid| RunKey::from(pid)).collect();
+            let namespace = AutosaveNamespace::acquire(dir.to_path_buf(), own_pid);
+            let plan = autosave_files::plan_recovery(dir, &sources);
+            let paths: Vec<PathBuf> = plan.candidates.iter().map(|c| c.path.clone()).collect();
+            let mut slot = store;
+            let own = namespace.session_path(document);
+            let startup =
+                crate::startup_document_from(had_previous_marker, &paths, &own, &mut slot, reopen);
+            let mut worker = AutosaveWorker::new(crate::write_autosave_temp, never);
+            let settled = crate::settle_startup_autosave(
+                &mut worker,
+                &namespace,
+                document,
+                &sources,
+                &plan.candidates,
+                startup.recovered_from,
+                startup.attempted,
+            );
+            (startup, settled, worker, namespace)
+        }
+
+        #[test]
+        fn a_crashed_runs_index_is_recovered_adopted_and_retired() {
+            let dir = tempdir();
+            let crashed = 4_000_001;
+            write_document(&dir.path().join(session_file_name(crashed, 3)), (31, 17));
+            assert!(write_index(
+                &index_path(dir.path(), crashed),
+                &AutosaveIndex {
+                    active: Some(3),
+                    entries: vec![entry(crashed, 3)],
+                },
+            ));
+            let (startup, settled, _worker, _ns) = recover(dir.path(), 4_000_002, 1, &[crashed]);
+            assert!(startup.was_recovered);
+            assert_eq!(startup.canvas_size, (31, 17));
+            assert!(startup.failed.is_empty());
+            assert!(settled.adopted && settled.index_written);
+            assert_eq!(settled.retired, vec![RunKey::from(crashed)]);
+            // Only this run's file, index and lock are left: the crashed
+            // run's file was moved, not copied, and its index is gone.
+            assert_eq!(
+                names(dir.path()),
+                vec![
+                    "aurora-autosave-4000002-1.aur".to_owned(),
+                    "aurora-autosave-4000002.index".to_owned(),
+                    "aurora-autosave-4000002.lock".to_owned(),
+                ]
+            );
+            // And a second crash now recovers the same document from this
+            // run's index.
+            let (again, _, _, _) = recover(dir.path(), 4_000_003, 1, &[4_000_002]);
+            assert!(again.was_recovered);
+            assert_eq!(again.canvas_size, (31, 17));
+        }
+
+        #[test]
+        fn a_crash_after_adoption_but_before_the_index_still_recovers() {
+            let dir = tempdir();
+            // The rename landed, this run's index did not: the marker
+            // lists this run first, then the crashed one.
+            write_document(&dir.path().join(session_file_name(4_000_012, 1)), (23, 9));
+            assert!(write_index(
+                &index_path(dir.path(), 4_000_011),
+                &AutosaveIndex {
+                    active: Some(5),
+                    entries: vec![entry(4_000_011, 5)],
+                },
+            ));
+            let (startup, _, _, _) = recover(dir.path(), 4_000_013, 1, &[4_000_012, 4_000_011]);
+            assert!(
+                startup.was_recovered,
+                "the scan of the adopting run found the file"
+            );
+            assert_eq!(startup.canvas_size, (23, 9));
+            // The crashed run's index named a file that moved away.
+            assert_eq!(
+                startup.failed.len(),
+                0,
+                "the adopting run's file is tried first"
+            );
+        }
+
+        #[test]
+        fn a_failed_adoption_keeps_the_crashed_runs_files() {
+            let dir = tempdir();
+            let crashed = 4_000_101;
+            let file = dir.path().join(session_file_name(crashed, 3));
+            write_document(&file, (17, 4));
+            assert!(write_index(
+                &index_path(dir.path(), crashed),
+                &AutosaveIndex {
+                    active: Some(3),
+                    entries: vec![entry(crashed, 3)],
+                },
+            ));
+            let sources = [RunKey::from(crashed)];
+            let namespace = AutosaveNamespace::acquire(dir.path().to_path_buf(), 4_000_102);
+            // A directory where this run's file must go: the rename fails.
+            if let Err(err) = std::fs::create_dir(namespace.session_path(1)) {
+                unreachable!("{err}");
+            }
+            let plan = autosave_files::plan_recovery(dir.path(), &sources);
+            let paths: Vec<PathBuf> = plan.candidates.iter().map(|c| c.path.clone()).collect();
+            let mut slot = Some(real_tile_store().1);
+            let startup = crate::startup_document_from(
+                true,
+                &paths,
+                &namespace.session_path(1),
+                &mut slot,
+                &mut || None,
+            );
+            let mut worker = AutosaveWorker::new(crate::write_autosave_temp, never);
+            let settled = crate::settle_startup_autosave(
+                &mut worker,
+                &namespace,
+                1,
+                &sources,
+                &plan.candidates,
+                startup.recovered_from,
+                startup.attempted,
+            );
+            assert!(startup.was_recovered);
+            assert!(!settled.adopted);
+            assert!(
+                settled.retired.is_empty(),
+                "nothing is retired while the document lives only there"
+            );
+            assert!(file.exists());
+            assert!(index_path(dir.path(), crashed).exists());
+        }
+
+        #[test]
+        fn a_damaged_session_is_reported_and_the_next_one_recovered() {
+            let dir = tempdir();
+            let crashed = 4_000_021;
+            write_document(&dir.path().join(session_file_name(crashed, 2)), (19, 11));
+            if let Err(err) = std::fs::write(
+                dir.path().join(session_file_name(crashed, 4)),
+                b"PK\x03\x04junk",
+            ) {
+                unreachable!("{err}");
+            }
+            assert!(write_index(
+                &index_path(dir.path(), crashed),
+                &AutosaveIndex {
+                    active: Some(4),
+                    entries: vec![entry(crashed, 2), entry(crashed, 4)],
+                },
+            ));
+            let (startup, settled, _, _) = recover(dir.path(), 4_000_022, 1, &[crashed]);
+            assert!(startup.was_recovered);
+            assert_eq!(startup.canvas_size, (19, 11));
+            assert_eq!(
+                startup.failed,
+                vec![dir.path().join(session_file_name(crashed, 4))]
+            );
+            assert_eq!(startup.recovered_from, Some(1));
+            assert!(settled.adopted);
+            let message = crate::crash_recovery_message(true, startup.failed.len());
+            assert!(message.starts_with(crate::crash_recovery_dialog_message(true)));
+            assert!(message.contains("One autosaved document was missing or damaged"));
+        }
+
+        #[test]
+        fn a_listed_but_missing_session_file_is_reported() {
+            let dir = tempdir();
+            let crashed = 4_000_031;
+            assert!(write_index(
+                &index_path(dir.path(), crashed),
+                &AutosaveIndex {
+                    active: Some(1),
+                    entries: vec![entry(crashed, 1)],
+                },
+            ));
+            let (startup, settled, _, _) = recover(dir.path(), 4_000_032, 1, &[crashed]);
+            assert!(!startup.was_recovered);
+            assert_eq!(startup.failed.len(), 1);
+            assert_eq!(
+                crate::crash_recovery_message(false, 0),
+                crate::crash_recovery_dialog_message(false),
+                "no failures: the wording is unchanged"
+            );
+            assert!(crate::crash_recovery_message(false, 2).contains("2 autosaved documents"));
+            // Nothing was recoverable, so the crashed run is retired.
+            assert_eq!(settled.retired, vec![RunKey::from(crashed)]);
+        }
+
+        #[test]
+        fn untried_sessions_are_kept_for_the_next_round() {
+            let dir = tempdir();
+            let crashed = 4_000_041;
+            let other = dir.path().join(session_file_name(crashed, 2));
+            write_document(&dir.path().join(session_file_name(crashed, 1)), (13, 7));
+            write_document(&other, (14, 8));
+            assert!(write_index(
+                &index_path(dir.path(), crashed),
+                &AutosaveIndex {
+                    active: Some(1),
+                    entries: vec![entry(crashed, 1), entry(crashed, 2)],
+                },
+            ));
+            let (startup, settled, _, _) = recover(dir.path(), 4_000_042, 1, &[crashed]);
+            assert_eq!(startup.canvas_size, (13, 7));
+            assert!(settled.adopted);
+            // The second document is neither read nor deleted, and its
+            // run is not retired (R3 opens it as another document).
+            assert!(settled.retired.is_empty());
+            assert_eq!(settled.kept, vec![RunKey::from(crashed)]);
+            assert!(other.exists());
+            // Its index now lists only the untried session, so the next
+            // run neither reports the moved file missing nor loses it.
+            assert_eq!(
+                autosave_files::read_index(&index_path(dir.path(), crashed), crashed.into())
+                    .map(|index| index.entries),
+                Ok(vec![entry(crashed, 2)])
+            );
+        }
+
+        #[test]
+        fn a_garbage_index_falls_back_to_scanning_the_crashed_run() {
+            for garbage in [
+                &b"aurora-autosave-index 1\nactive 7\nsession 7 aurora-au"[..],
+                &b"\xff\xfe\x00garbage"[..],
+            ] {
+                let dir = tempdir();
+                let crashed = 4_000_051;
+                write_document(&dir.path().join(session_file_name(crashed, 7)), (29, 5));
+                if let Err(err) = std::fs::write(index_path(dir.path(), crashed), garbage) {
+                    unreachable!("{err}");
+                }
+                let (startup, settled, _, _) = recover(dir.path(), 4_000_052, 1, &[crashed]);
+                assert!(startup.was_recovered, "{garbage:?}");
+                assert_eq!(startup.canvas_size, (29, 5));
+                assert_eq!(settled.retired, vec![RunKey::from(crashed)]);
+                assert!(!index_path(dir.path(), crashed).exists());
+            }
+        }
+
+        #[test]
+        fn a_pre_0_171_legacy_autosave_is_recovered_and_retired() {
+            let dir = tempdir();
+            write_document(&legacy_path(dir.path()), (41, 3));
+            // A legacy (empty) marker: no pid, no sources.
+            let (startup, settled, _, _) = recover(dir.path(), 4_000_062, 1, &[]);
+            assert!(startup.was_recovered);
+            assert_eq!(startup.canvas_size, (41, 3));
+            assert!(settled.adopted && settled.retired_legacy);
+            assert!(!legacy_path(dir.path()).exists());
+            assert!(dir.path().join(session_file_name(4_000_062, 1)).exists());
+        }
+
+        #[test]
+        fn a_fresh_start_is_indexed_only_once_its_file_lands() {
+            let dir = tempdir();
+            let (_store_dir, store) = real_tile_store();
+            let mut slot = Some(store);
+            let namespace = AutosaveNamespace::acquire(dir.path().to_path_buf(), 4_000_071);
+            let own = namespace.session_path(1);
+            let startup = crate::startup_document_from(false, &[], &own, &mut slot, &mut || None);
+            let mut worker = AutosaveWorker::new(crate::write_autosave_temp, never);
+            let settled =
+                crate::settle_startup_autosave(&mut worker, &namespace, 1, &[], &[], None, None);
+            assert!(settled.index_written && !settled.adopted);
+            assert!(
+                !namespace.index_path().exists(),
+                "nothing complete to list yet"
+            );
+            let Some(mut job) = startup.autosave else {
+                unreachable!("a fresh document is snapshotted");
+            };
+            job.document = 1;
+            assert!(worker.submit(job).is_some());
+            assert!(worker.wait_idle(std::time::Duration::from_secs(30)));
+            assert_eq!(
+                autosave_files::read_index(&namespace.index_path(), namespace.key)
+                    .map(|index| index.entries),
+                Ok(vec![entry(4_000_071, 1)])
+            );
+            assert_eq!(worker.index_writes(), 1);
+        }
+
+        #[test]
+        fn an_over_budget_synchronous_autosave_is_indexed_once_written() {
+            let dir = tempdir();
+            let namespace = AutosaveNamespace::acquire(dir.path().to_path_buf(), 4_000_091);
+            let mut worker = AutosaveWorker::new(crate::write_autosave_temp, never);
+            assert!(worker.configure_index(autosave_files::IndexBook::new(
+                namespace.index_path(),
+                vec![entry(4_000_091, 1)],
+                Some(1),
+                [],
+            )));
+            let (layers, history, id) = small_autosave_document();
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            let own = namespace.session_path(1);
+            crate::request_autosave_within(
+                &mut worker,
+                1,
+                &own,
+                1,
+                &layers,
+                &history,
+                (12, 6),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
+            assert!(own.exists());
+            assert_eq!(
+                autosave_files::read_index(&namespace.index_path(), namespace.key)
+                    .map(|index| index.entries),
+                Ok(vec![entry(4_000_091, 1)])
+            );
+        }
+
+        #[test]
+        fn a_clean_quit_removes_every_session_file_and_the_index_and_an_abort_keeps_them() {
+            for aborted in [Aborted::No, Aborted::Yes] {
+                let mut fixture = shutdown_fixture(aborted, None);
+                let dir = tempdir();
+                let namespace = AutosaveNamespace::acquire(dir.path().to_path_buf(), 4_000_081);
+                let ours = [
+                    namespace.session_path(1),
+                    namespace.session_path(2),
+                    namespace.index_path(),
+                ];
+                let theirs = [
+                    dir.path().join(session_file_name(4_000_082, 1)),
+                    index_path(dir.path(), 4_000_082),
+                    legacy_path(dir.path()),
+                ];
+                for path in ours.iter().chain(theirs.iter()) {
+                    if let Err(err) = std::fs::write(path, b"x") {
+                        unreachable!("{err}");
+                    }
+                }
+                fixture.state.namespace = Some(namespace);
+                assert!(fixture.marker.exists(), "the fixture starts with a marker");
+                crate::run_shutdown_cleanup(&mut fixture.state);
+                assert_eq!(fixture.marker.exists(), aborted == Aborted::Yes);
+                for path in &ours {
+                    assert_eq!(path.exists(), aborted == Aborted::Yes, "{}", path.display());
+                }
+                assert_eq!(
+                    autosave_files::lock_path(dir.path(), 4_000_081).exists(),
+                    aborted == Aborted::Yes
+                );
+                for path in &theirs {
+                    assert!(path.exists(), "another run's {} survived", path.display());
+                }
+            }
+        }
+
+        #[test]
+        fn a_zeroed_marker_never_strands_a_crashed_runs_document() {
+            // 0.171.0 review N1, end to end: the marker as a power loss
+            // can leave it, then `run`'s source selection, then recovery.
+            let dir = tempdir();
+            let crashed = 4_000_171;
+            write_document(&dir.path().join(session_file_name(crashed, 1)), (27, 8));
+            let marker = dir.path().join("aurora-session.marker");
+            if let Err(err) = std::fs::write(&marker, [0_u8; 512]) {
+                unreachable!("{err}");
+            }
+            let previous = autosave_files::read_marker(&marker).unwrap_or_default();
+            let keys = autosave_files::recovery_keys(dir.path(), &previous);
+            let sources: Vec<u32> =
+                autosave_files::claim_sources(dir.path(), RunKey::from(4_000_172), &keys)
+                    .iter()
+                    .map(|source| source.key.pid)
+                    .collect();
+            assert_eq!(sources, vec![crashed]);
+            let (startup, settled, _, _) = recover(dir.path(), 4_000_172, 1, &sources);
+            assert!(startup.was_recovered);
+            assert_eq!(startup.canvas_size, (27, 8));
+            assert!(settled.adopted);
+        }
+
+        #[test]
+        fn no_tile_store_retires_nothing() {
+            // 0.171.0 review H1: with no store nothing is read, so
+            // nothing may be deleted -- not the crashed run, not legacy.
+            let dir = tempdir();
+            let crashed = 4_000_111;
+            let file = dir.path().join(session_file_name(crashed, 1));
+            write_document(&file, (11, 3));
+            write_document(&legacy_path(dir.path()), (12, 3));
+            let (startup, settled, _, _) = recover_into(
+                dir.path(),
+                4_000_112,
+                1,
+                &[crashed],
+                true,
+                None,
+                &mut || None,
+            );
+            assert_eq!(startup.attempted, None);
+            assert!(!startup.was_recovered);
+            assert!(settled.retired.is_empty() && settled.kept.is_empty());
+            assert!(!settled.retired_legacy);
+            assert!(file.exists());
+            assert!(legacy_path(dir.path()).exists());
+        }
+
+        #[test]
+        fn a_failed_store_reopen_keeps_every_untried_candidate() {
+            let dir = tempdir();
+            let damaged_run = 4_000_121;
+            let good_run = 4_000_122;
+            if let Err(err) = std::fs::write(
+                dir.path().join(session_file_name(damaged_run, 1)),
+                b"PK\x03\x04junk",
+            ) {
+                unreachable!("{err}");
+            }
+            let good = dir.path().join(session_file_name(good_run, 1));
+            write_document(&good, (15, 2));
+            let (startup, settled, _, _) = recover_with(
+                dir.path(),
+                4_000_123,
+                1,
+                &[damaged_run, good_run],
+                true,
+                &mut || None,
+            );
+            assert_eq!(startup.attempted, Some(1));
+            assert!(!startup.was_recovered);
+            assert_eq!(startup.failed.len(), 1);
+            assert_eq!(settled.retired, vec![RunKey::from(damaged_run)]);
+            assert_eq!(settled.kept, vec![RunKey::from(good_run)]);
+            assert!(good.exists(), "an untried good autosave is never deleted");
+        }
+
+        #[test]
+        fn without_a_previous_marker_a_legacy_file_is_left_alone() {
+            // 0.171.0 review H1/L4.
+            let dir = tempdir();
+            write_document(&legacy_path(dir.path()), (9, 9));
+            let (startup, settled, _, _) =
+                recover_with(dir.path(), 4_000_131, 1, &[], false, &mut || None);
+            assert_eq!(startup.attempted, None);
+            assert!(!settled.retired_legacy);
+            assert!(legacy_path(dir.path()).exists());
+        }
+
+        fn reused_key(pid: u32) -> RunKey {
+            RunKey { pid, generation: 1 }
+        }
+
+        #[test]
+        fn a_reused_pid_recovers_the_crashed_runs_good_file() {
+            let dir = tempdir();
+            let pid = 4_000_141;
+            write_document(&dir.path().join(session_file_name(pid, 1)), (21, 4));
+            if let Err(err) = std::fs::write(autosave_files::lock_path(dir.path(), pid), b"") {
+                unreachable!("{err}");
+            }
+            let (startup, settled, _, namespace) = recover(dir.path(), pid, 1, &[pid]);
+            assert_eq!(namespace.key, reused_key(pid));
+            assert!(startup.was_recovered);
+            assert_eq!(startup.canvas_size, (21, 4));
+            assert!(settled.adopted);
+            assert_eq!(settled.retired, vec![RunKey::from(pid)]);
+            assert!(
+                dir.path()
+                    .join(session_file_name(reused_key(pid), 1))
+                    .exists()
+            );
+            assert!(!dir.path().join(session_file_name(pid, 1)).exists());
+        }
+
+        #[test]
+        fn a_reused_pid_reports_the_crashed_runs_damaged_file() {
+            let dir = tempdir();
+            let pid = 4_000_151;
+            if let Err(err) = std::fs::write(
+                dir.path().join(session_file_name(pid, 1)),
+                b"PK\x03\x04junk",
+            ) {
+                unreachable!("{err}");
+            }
+            let (startup, settled, _, namespace) = recover(dir.path(), pid, 1, &[pid]);
+            assert_eq!(namespace.key, reused_key(pid));
+            assert!(!startup.was_recovered);
+            assert_eq!(startup.failed.len(), 1);
+            assert_eq!(settled.retired, vec![RunKey::from(pid)]);
+            assert!(
+                !namespace.index_path().exists(),
+                "the fresh document has not landed yet"
+            );
+        }
+
+        #[test]
+        fn a_reused_pids_untried_file_survives_a_clean_quit_and_is_recovered_next() {
+            // 0.171.0 review M1/M2: the crashed run (this pid) left P-1
+            // (good) and P-2 (scan-found). This run recovers P-1; P-2
+            // must survive this run's clean quit and reach the next run.
+            let dir = tempdir();
+            let pid = 4_000_161;
+            write_document(&dir.path().join(session_file_name(pid, 1)), (25, 6));
+            let second = dir.path().join(session_file_name(pid, 2));
+            write_document(&second, (26, 7));
+            let (startup, settled, _, namespace) = recover(dir.path(), pid, 1, &[pid]);
+            assert_eq!(startup.canvas_size, (25, 6));
+            assert_eq!(settled.kept, vec![RunKey::from(pid)]);
+            // The marker as `run` wrote it: this run, then the crashed one.
+            let mut fixture = shutdown_fixture(Aborted::No, None);
+            if let Err(err) = std::fs::write(
+                &fixture.marker,
+                autosave_files::encode_marker(&[namespace.key, RunKey::from(pid)]),
+            ) {
+                unreachable!("{err}");
+            }
+            fixture.state.namespace = Some(namespace);
+            crate::run_shutdown_cleanup(&mut fixture.state);
+            assert!(
+                second.exists(),
+                "a clean quit never deletes a crashed run's file"
+            );
+            assert_eq!(
+                autosave_files::read_marker(&fixture.marker),
+                Some(vec![RunKey::from(pid)]),
+                "the marker keeps the crashed run that still has files"
+            );
+            // The next run, another pid, recovers P-2.
+            let (next, next_settled, _, _) = recover(dir.path(), 4_000_162, 1, &[pid]);
+            assert!(next.was_recovered);
+            assert_eq!(next.canvas_size, (26, 7));
+            assert!(
+                next.failed.is_empty(),
+                "the adopted P-1 is no longer listed"
+            );
+            assert_eq!(next_settled.retired, vec![RunKey::from(pid)]);
+        }
     }
 
     #[test]
