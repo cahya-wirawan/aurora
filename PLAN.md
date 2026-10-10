@@ -26,7 +26,41 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.169.0): dialog actions reach the App as typed
+**Latest (2026-10-10, 0.170.0): the open document is one
+`DocumentSession` (document tabs, round R1 of six — a refactor, no
+behaviour change).** `aurora-app`'s new `document_session` module holds
+`pub(crate) struct DocumentSession`, and `App` holds exactly one in
+`App::doc`. The eleven per-document fields moved out of `App` into it,
+unchanged: `canvas_view`, `selection`, `layers`, `canvas_size`,
+`skipped_tiles`, `history`, `pixel_history`, `undo_order`,
+`composite_cache`, `active_layer`, `tile_store` (one store per document,
+ADR 0010). Every `self.<field>` in `App`'s impls became
+`self.doc.<field>` (213 sites; `self.workspace.history`, the History
+*panel*, untouched), and `App::new` builds the session through
+`DocumentSession::new(DocumentContents { .. })`, which assigns exactly
+what the old struct literal did (empty selection and pixel history,
+`UndoOrder::new_document()`, a default `CompositeCache`). A session also
+carries a `DocumentId`, a process-unique monotonic `u64` read by nothing
+but tests yet. Panel-side state rebuilt from a document (`layer_rows`,
+`scroll_follow`), the live `drag`, and the GPU residency atlas stay on
+`App`. **The tabs plan, R1–R6**: R1 (this) the extraction; **R2
+(0.171.0) per-session autosave plus an index, still one document**; R3
+(0.172.0) more than one document, switching, Open/New creating a tab;
+R4 (0.173.0) the tab bar widget; R5 (0.174.0) path and dirty tracking,
+then close and quit with Save / Don't Save / Cancel; R6 (0.175.0)
+polish (per-tab close, per-document panel scroll, parked-memory
+reduction). **The key ordering decision is R2 before R3**: today there
+is one autosave file, and a second open document would either
+overwrite the first's crash-recovery copy or go without one — a
+professional's unsaved work lost on a crash, the worst failure this
+project can have. Giving each session its own autosave file and an
+atomically written index first means the round that adds a second
+document never has a window in which one of them is unprotected. Not
+done here: no second document, no tabs, no dirty state, no autosave
+change; an open still replaces the one session's contents in place
+(keeping its id). See the 0.170.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.169.0): dialog actions reach the App as typed
 results.** A prerequisite for document tabs (closing an unsaved tab needs
 a real Save / Don't Save / Cancel), not tabs itself. **Until now no
 dialog choice reached the App at all**: `run_dialog_action` closed the
@@ -31337,6 +31371,46 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.170.0) — `DocumentSession` extracted (R1).**
+Branch `008-document_session`. A refactor round: no behaviour change was
+intended and none is tested for. Field inventory and reasons are in the
+module's own doc comment (`crates/aurora-app/src/document_session.rs`).
+Three tests added there: ids are unique and increase in creation order;
+two startup sessions get different ids; and the startup session (built
+through the same `startup_document`, `install_startup_panels` and
+`load_document_view` calls `App::new` makes, with no tile store) holds
+what the old startup fields held — the demo document's layer count,
+canvas size, journal and undo state (the `History` is *not* empty: the
+demo document's building steps are on its undo stack, as before; the
+user-reachable `undo_order` is), the topmost pixel layer active, the
+same view, no selection, empty pixel history, the "New Document" origin
+row, no current composite tile. No existing test was edited. Strict
+rustdoc found 14 intra-doc links to the moved fields
+(`[`App::active_layer`]` and the like), repointed at
+`DocumentSession::<field>`. **macOS**: the `#[cfg(target_os = "macos")]`
+code (11 sites) references none of the moved fields — checked by a
+script over every gated block — so nothing uncompiled on Linux was
+edited; still not compiled here. **Mutations** (run, each restored from
+a scratchpad backup and sha256-checked): `DocumentId::next` not
+incrementing — killed by both id tests; ids decreasing — killed by
+both; the session's `undo_order` built as `UndoOrder::default()`
+("Open" origin) — killed by the startup test; `canvas_size` transposed
+— killed; `active_layer` dropped to `None` — killed. Not covered: the
+startup test mirrors `App::new`'s calls rather than calling `App::new`
+(which needs an event loop), so a change to `App::new` alone that
+bypassed `DocumentSession::new` would not be caught by it. **Gate**, one
+pass after the last code change (`df -h /home`: 36G free): `cargo fmt
+--check`, layering, no-hardcoded-style, `cargo check --workspace
+--locked`, clippy `-D warnings`, and `AURORA_REQUIRE_GPU=1 cargo test
+--workspace --no-fail-fast` all green — 3,159 passed (3,156 + the 3 new),
+0 failed, 61 ignored, 0 `SKIPPED`; strict `cargo doc
+--document-private-items --keep-going` green; `cargo deny check all`
+green; `design/check_contrast.py` green. The Windows cross-check
+(`cargo check --target x86_64-pc-windows-gnu -p aurora-app`) could not
+run here: a C dependency's build script needs `x86_64-w64-mingw32-gcc`,
+which this box does not have, so Windows is unchecked locally (the
+change touches no `cfg(windows)` code).
 
 **Addendum 2026-10-10 (0.169.0) — dialog actions reach the App.** Branch
 `007-dialog_actions` (from `main` at 476dff2, 0.168.0). Files:

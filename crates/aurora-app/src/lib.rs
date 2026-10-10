@@ -61,7 +61,7 @@
 //! the real document extent (`composite_document`, reusing
 //! `recomposite_visible_tiles`'s own per-tile, per-layer-blend-mode-aware
 //! and moved-layer origin-conversion logic against the whole
-//! `self.canvas_size` rect rather than just the on-screen viewport),
+//! `self.doc.canvas_size` rect rather than just the on-screen viewport),
 //! encoded by the chosen path's own extension
 //! (`aurora_io::encode_by_extension`), and written to disk via
 //! `write_verified` — a sibling temp file, verified by reading it back
@@ -541,12 +541,14 @@ use winit::window::{Window, WindowId};
 
 mod background_autosave;
 mod background_open;
+mod document_session;
 mod prepared_pixels;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
     background_open_step,
 };
+use document_session::{DocumentContents, DocumentSession};
 use prepared_pixels::{PreparedImage, PreparedLayer, PreparedMask, PreparedPsd};
 
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
@@ -1107,7 +1109,7 @@ fn psd_report_message(file_name: &str, report: &aurora_io::PsdImportReport) -> O
 }
 
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
-/// `(0, 0)` if there isn't one — the *fallback* [`App::canvas_size`] is
+/// `(0, 0)` if there isn't one — the *fallback* [`DocumentSession::canvas_size`] is
 /// seeded from when nothing else names a real, independent canvas size
 /// for a document (a freshly built [`demo_document`]; a recovered
 /// autosave no longer needs it, since its `.aur` manifest carries a
@@ -1888,7 +1890,7 @@ fn autosave_path() -> PathBuf {
 /// aborted every autosave for the rest of the session — every other
 /// layer, every subsequent edit, silently unprotected.
 /// `skipped` is the document's own carried record of what it is already
-/// missing ([`App::skipped_tiles`]), **in and out**: it is handed to the
+/// missing ([`DocumentSession::skipped_tiles`]), **in and out**: it is handed to the
 /// writer so previously-known losses land in this container too, and any
 /// tile *this* write has to drop is folded back into it
 /// (`aurora_io::SkippedTiles::record`) so the next write carries that as
@@ -2487,7 +2489,7 @@ struct RecoveredDocument {
     history: aurora_doc::History,
     canvas_size: (u32, u32),
     /// What this recovered document is already known to be missing —
-    /// carried into [`App::skipped_tiles`], not warned about yet; see
+    /// carried into [`DocumentSession::skipped_tiles`], not warned about yet; see
     /// [`read_autosave_container`]'s own comment.
     skipped_tiles: aurora_io::SkippedTiles,
 }
@@ -2504,7 +2506,7 @@ struct StartupDocument {
     /// What the recovered document is already known to be missing
     /// (`aurora_io::SkippedTiles`) — empty for a [`demo_document`],
     /// which has never been written at all, and carried straight into
-    /// [`App::skipped_tiles`] so this session's own writes keep the
+    /// [`DocumentSession::skipped_tiles`] so this session's own writes keep the
     /// record instead of erasing it.
     skipped_tiles: aurora_io::SkippedTiles,
     /// Whether this really came from an autosave — what the
@@ -6758,7 +6760,7 @@ fn sync_tool_controls(
 /// design-owner decision: 100% is one document pixel per *physical*
 /// pixel; folded through [`guarded_scale_factor`], the same number the
 /// atlas renders at), the document's own canvas size
-/// ([`App::canvas_size`], the size a save writes), and the sample format
+/// ([`DocumentSession::canvas_size`], the size a save writes), and the sample format
 /// every document's pixels are stored in ([`aurora_tile::SAMPLE_FORMAT`]
 /// — the tile store is the one place pixels live, invariant §7.3.1). No
 /// colour space: the document model records none yet (an opened file's
@@ -9572,7 +9574,7 @@ enum Drag {
 /// at all.
 ///
 /// A free function over `&mut Option<Drag>` rather than an `&mut self`
-/// method on purpose: [`App::paint_dab`] needs this *and* `self.tile_store`
+/// method on purpose: [`App::paint_dab`] needs this *and* `self.doc.tile_store`
 /// borrowed at the same time, and a `&mut self` helper would borrow all
 /// of `App`. Extracted in 0.56.0 so the variant-matching itself is
 /// testable headlessly, with no `App` (and therefore no GPU) to build.
@@ -10494,7 +10496,7 @@ fn handle_zoom_tool_click(
 // renders in its new place, not just in the document model. Undo-as-
 // you-drag remains separate, still-open follow-on work.
 
-/// The topmost pixel layer in `layers`, at any depth — [`App::active_layer`]'s
+/// The topmost pixel layer in `layers`, at any depth — [`DocumentSession::active_layer`]'s
 /// own initial value. Every level is ordered top-to-bottom (index 0
 /// topmost, matching every panel in this workspace), so a depth-first,
 /// top-first walk meets the visually topmost pixel layer first: a group
@@ -10592,7 +10594,7 @@ fn composite_reference_origin(
 /// pan-bound-moving event in its own right, which is why
 /// [`apply_canvas_min_zoom`] re-applies [`PanBounds`] and not only the
 /// zoom floor. Any new code path that changes any of the three must
-/// re-clamp — see [`App::active_layer`]'s own doc comment for the full
+/// re-clamp — see [`DocumentSession::active_layer`]'s own doc comment for the full
 /// list of the ones that already do.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -10770,7 +10772,7 @@ impl PanBounds {
 /// The active layer's own origin is not the only way this breaks:
 /// *that layer's own `bounds` changing* moves the same boundary without
 /// the active layer changing at all (the Move tool, and an undo/redo of
-/// one). See [`App::active_layer`]'s own doc comment for the full list
+/// one). See [`DocumentSession::active_layer`]'s own doc comment for the full list
 /// of paths that have to re-clamp and where each does it.
 ///
 /// **Ordering matters**: this must run *after* any
@@ -10798,7 +10800,7 @@ fn clamp_pan_to_active_layer(
 /// Both halves are here for the same reason: either command can
 /// revert/reapply a `LayerOp::SetBounds` (`aurora_doc::History::undo`
 /// and `::redo` both return the dirtied `Rect`), so the active layer's
-/// own origin can move without [`App::active_layer`] itself changing.
+/// own origin can move without [`DocumentSession::active_layer`] itself changing.
 /// That invalidates the composite cache (a moved layer's content lands
 /// at different composite tiles) *and* the pan bound (which is measured
 /// against exactly that origin — [`clamp_pan_to_active_layer`]). The
@@ -20582,180 +20584,11 @@ struct App {
     /// something real once selected; see `aurora_ui::tool`'s own doc
     /// comment for the detail.
     tool: aurora_ui::Tool,
-    /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]) —
-    /// deliberately not tied to `layers` (see that field's own doc
-    /// comment) since the view itself is a property of the *window*, the
-    /// same way Photoshop remembers a document's own zoom/scroll
-    /// independent of its pixel content.
-    canvas_view: aurora_ui::CanvasView,
-    /// The document-level selection ([`aurora_doc::SelectionSet`]) the
-    /// Marquee Select tool drags out — a document-level concept in its
-    /// own right (see that type's own doc comment), not something that
-    /// needs a live `LayerTree` alongside it to exist.
-    selection: aurora_doc::SelectionSet,
-    /// The live document's own layer structure — built once in
-    /// [`App::new`] (from [`demo_document`] or a recovered autosave) and
-    /// kept alive from then on. This is what [`Self::active_layer`]/
-    /// [`aurora_doc::LayerTree::surface_id`] read to find somewhere for
-    /// the Brush tool to actually paint.
-    layers: aurora_doc::LayerTree,
-    /// The document's own real, independent canvas size — `(width,
-    /// height)`, in document-space pixels. **Not** derived from any
-    /// one layer's own `bounds` on every read ([`document_canvas_size`]
-    /// used to be the only source, silently following whichever layer
-    /// happened to be on top or shrinking to nothing if that layer was
-    /// deleted or resized) — a real editor's canvas can be larger,
-    /// smaller, or offset from any single layer it contains. Set once
-    /// from [`document_canvas_size`] for a document built without a
-    /// real, independent canvas size of its own ([`demo_document`] —
-    /// a recovered autosave used to be in that same boat, since the
-    /// raw crash-recovery journal persisted no canvas size, but the
-    /// autosave file is a real `.aur` container now and its manifest
-    /// carries one), from a decoded image's own real dimensions
-    /// ([`Self::open_file`]), or from a `.aur` file's own manifest
-    /// (`aurora_io::read_aur`'s own third return value,
-    /// [`Self::open_aur_file`] and [`recover_document`]) — the one case
-    /// this was actually wrong
-    /// before: re-saving a `.aur` file whose real canvas size differed
-    /// from its topmost layer's own bounds used to silently shrink (or
-    /// grow) the canvas to match that layer instead of preserving it.
-    canvas_size: (u32, u32),
-    /// What this document is already known to be **missing** — the
-    /// tiles some earlier best-effort write could not read
-    /// (`aurora_io::SkippedTiles`).
-    ///
-    /// **State, not a one-shot notification** (0.74.1). It is populated
-    /// from a `.aur` file's own `skipped-tiles` entry when one is opened
-    /// ([`Self::open_aur_file`]) and handed to *every* subsequent write
-    /// of that document ([`write_autosave`], [`Self::save_aur_file`]),
-    /// because nothing else can carry it: a tile a previous writer
-    /// dropped is not in the tile store at all, so a later write walks
-    /// past it as "never painted" and rediscovers nothing. 0.74.0 read
-    /// the list, built one dialog line out of it and discarded it, so
-    /// the very next save — including the autosave `open_aur_file`
-    /// itself performs, before the warning has even appeared on
-    /// screen — wrote a file that no longer recorded the loss at all.
-    /// Open, Save, reopen, and the file said nothing; open and crash,
-    /// and crash recovery restored a document with no record either.
-    ///
-    /// Reset to empty wherever the document is *replaced* by one with
-    /// no such history ([`Self::open_file`]'s flat-image path), for the
-    /// same reason `pixel_history` and `undo_order` are: it describes
-    /// the document that is open, not the session.
-    skipped_tiles: aurora_io::SkippedTiles,
-    /// `layers`' own undo/redo history — built alongside it (same
-    /// source: [`demo_document`] or a recovered autosave) and, since
-    /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
-    /// alive alongside it, not dropped after startup the way it used to
-    /// be. `Self::apply_move` is the one live-editing path that records
-    /// through this — raw pixel edits (`Self::paint_dab`/
-    /// `Self::erase_dab`) still bypass it entirely, since they have no
-    /// `aurora_doc::LayerOp` equivalent to record; see
-    /// [`Self::pixel_history`] for their own, separate undo instead.
-    history: aurora_doc::History,
-    /// Undo/redo for completed Brush/Eraser strokes
-    /// (`aurora_brush::PixelHistory`) — the pixel-edit half `history`
-    /// structurally can't cover (a stroke is raw pixel data, not a
-    /// `LayerOp`). Still a separate stack internally (neither type knows
-    /// about the other), but `Ctrl+Z`/`Ctrl+Shift+Z` walk it and
-    /// `history` as one true chronological sequence via
-    /// [`Self::undo_order`]. Populated by `Self::handle_pointer_released`
-    /// once a `Drag::Brush`/`Drag::Eraser`'s own accumulated
-    /// `StrokeSnapshot` completes.
-    pixel_history: aurora_brush::PixelHistory,
-    /// The real interleaving order `Ctrl+Z`/`Ctrl+Shift+Z` walk across
-    /// `history`'s own structural entries and `pixel_history`'s own
-    /// stroke entries — see [`UndoOrder`]'s own doc comment for why this
-    /// exists at all (`aurora-brush` and `aurora-doc` are sibling
-    /// crates, neither depending on the other, so neither can know about
-    /// the other's own activity). `Self::apply_move`/
-    /// `Self::handle_pointer_released` record into it; `run_command`
-    /// consults it to decide which backing store `Ctrl+Z`/
-    /// `Ctrl+Shift+Z` should actually reach into next.
-    undo_order: UndoOrder,
-    /// Which composite tiles [`recomposite_visible_tiles`] can skip
-    /// recomputing this redraw — see [`CompositeCache`]'s own doc
-    /// comment. Bumped by every operation that could change what a
-    /// composite tile now shows.
-    composite_cache: CompositeCache,
-    /// The layer the Brush/Eraser tools paint/erase into and the Move
-    /// tool repositions, if any — the topmost pixel layer of `layers`
-    /// at construction time ([`topmost_pixel_layer`]), real-time-
-    /// changeable now by clicking a row in the Layers panel
-    /// ([`Self::layer_rows`], [`Self::handle_pointer_pressed`]). `None`
-    /// for a document with no pixel layer at all.
-    ///
-    /// **This can hold a group's `LayerId`, not just a pixel layer's.**
-    /// `layer_rows` maps every row `populate_layers_panel` inserts,
-    /// group rows included (`aurora_ui::layers_panel::insert_layer_row`
-    /// inserts unconditionally), and [`select_layer`] sets `*active_layer`
-    /// from whichever row was clicked with no `LayerKind` check. A caller
-    /// reading this field for anything pixel-specific (paint/erase
-    /// targets, the Move tool) must itself confirm the kind rather than
-    /// assume it, the same way [`topmost_pixel_layer`] already does at
-    /// construction time.
-    ///
-    /// **The canvas pan boundary is a function of this field, of this
-    /// layer's own `bounds`, and of the canvas area's own size.** The
-    /// bound ([`PanBounds`]) is measured against the active layer's
-    /// document-space origin ([`active_layer_origin`], what
-    /// [`canvas_local_origin`] subtracts) on the near edge, and against
-    /// that origin plus the document ceiling
-    /// ([`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`]) on the far
-    /// one — so it moves when *any* of the three inputs moves, and a pan
-    /// that never moved is then outside it, reopening the render/paint
-    /// divergence the clamps exist to close. Writing this field is
-    /// therefore only one third of what has to re-clamp.
-    ///
-    /// All three, and where each re-establishes the bound:
-    ///
-    /// - *Which layer is active.* [`Self::new`], [`Self::open_file`] and
-    ///   [`Self::open_aur_file`] set it and then build the view through
-    ///   [`load_document_view`], which clamps as part of the same step.
-    ///   [`select_layer`] takes the view and clamps itself.
-    /// - *That layer's own bounds.* [`Self::apply_move`] rewrites them
-    ///   live, per pointer-move event, and deliberately does **not**
-    ///   clamp there (it would feed back into `continue_drag`'s own
-    ///   fixed `start_doc` — see [`commit_ending_drag`]); the clamp
-    ///   happens once, at the commit, in [`commit_ending_drag`]'s own
-    ///   `Drag::Move` arm. [`Self::run_undo_redo`] can revert or reapply
-    ///   a recorded bounds change without this field changing at all,
-    ///   and clamps via [`perform_undo_redo`]'s own [`after_undo_redo`]
-    ///   step.
-    /// - *The canvas area's own size* (0.57.10), which only the **far**
-    ///   half of the bound depends on: the document position at the
-    ///   canvas area's bottom-right corner moves when that area grows,
-    ///   with neither this field nor any layer's `bounds` changing.
-    ///   [`App::apply_resize`] and [`App::redraw`] both re-apply
-    ///   [`PanBounds`] through [`apply_canvas_min_zoom`], which is why
-    ///   that function takes one at all. The near half is provably
-    ///   unaffected by a resize — see its doc comment.
-    ///
-    /// A new writer of any of the three that skips the clamp is a bug
-    /// with no visible symptom until someone paints.
-    ///
-    /// **And a clamp that runs while a drag is still live is its own
-    /// bug** (0.57.7), in the opposite direction: the drag holds a
-    /// document-space reference point fixed from the moment it began,
-    /// so a view that moves under it makes the next pointer-move event
-    /// measure against a view the drag knows nothing about — for a
-    /// `Drag::Brush`, a line of dabs the user never drew. Every path
-    /// that moves the view has to say which it does: end the drag first
-    /// ([`press_layer_row`], [`perform_undo_redo`], and the Zoom-tool
-    /// click branch of [`Self::handle_pointer_pressed`], all through
-    /// [`commit_ending_drag`]), or re-anchor it
-    /// ([`shift_drag_reference`], for [`apply_scroll_zoom`] and
-    /// [`apply_canvas_min_zoom`], where the gesture is not "I am done
-    /// dragging").
-    ///
-    /// The second of those two was the rule's own first exception, and
-    /// is worth knowing about as a shape rather than a one-off:
-    /// `aurora_ui::CanvasView::set_min_zoom` moves the view without
-    /// reading like it does (0.57.8), so `App::apply_resize`/
-    /// `App::redraw` broke the rule for a whole round while stating it.
-    /// A "setter" that ends up in `zoom_at` or `pan_by` is a path that
-    /// moves the view.
-    active_layer: Option<aurora_doc::LayerId>,
+    /// The open document: its layers, history, view, selection and
+    /// tile store ([`DocumentSession`], 0.170.0). Split from the rest of
+    /// `App` so a later round can hold more than one; borrowing
+    /// `self.doc.layers` still splits from `self.workspace`.
+    doc: DocumentSession,
     /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
     /// Eyedropper tool samples a real pixel and changes it
     /// ([`Self::sample_eyedropper`]). No colour-picker UI exists yet to
@@ -20772,13 +20605,6 @@ struct App {
     /// widget or newly active layer's row into view (0.145.0). Reset to
     /// empty when a document is opened, since layer ids restart there.
     scroll_follow: ScrollFollow,
-    /// This document's own shared tile store (ADR 0010) — `None` if it
-    /// failed to open (e.g. an unwritable scratch directory), logged as
-    /// a warning rather than treated as fatal, the same "must never stop
-    /// the application starting" shape [`write_session_marker`] already
-    /// uses for its own I/O. Painting is silently disabled for the
-    /// session when this is `None`.
-    tile_store: Option<aurora_tile::TileStore>,
     /// The GPU-resident atlas over `tile_store`'s active-layer surface —
     /// `None` until `resumed` has a real device and a computed canvas
     /// area to size it to (real GPU resources can't exist before then).
@@ -20964,7 +20790,7 @@ impl ShutdownState for App {
     }
 
     fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
-        self.tile_store.take()
+        self.doc.tile_store.take()
     }
 
     fn scratch_dir(&self) -> Option<&Path> {
@@ -21146,24 +20972,22 @@ impl App {
             layout_path,
             presets_path,
             presets,
-            skipped_tiles,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             tool: aurora_ui::Tool::default(),
-            canvas_view,
-            selection: aurora_doc::SelectionSet::new(),
-            layers,
-            canvas_size,
-            history,
-            pixel_history: aurora_brush::PixelHistory::new(),
-            undo_order: UndoOrder::new_document(),
-            composite_cache: CompositeCache::default(),
-            active_layer,
+            doc: DocumentSession::new(DocumentContents {
+                layers,
+                history,
+                canvas_size,
+                skipped_tiles,
+                active_layer,
+                canvas_view,
+                tile_store,
+            }),
             current_colour: DEFAULT_COLOUR,
             layer_rows,
             scroll_follow: ScrollFollow::default(),
-            tile_store,
             residency: None,
             canvas_pipeline: None,
             compositor: None,
@@ -21241,15 +21065,15 @@ impl App {
                 dialog: &mut self.dialog,
                 palette: self.command_palette,
                 scales: &self.scales,
-                layers: &mut self.layers,
+                layers: &mut self.doc.layers,
                 layer_rows: &mut self.layer_rows,
-                active_layer: &mut self.active_layer,
-                view: &mut self.canvas_view,
-                history: &mut self.history,
-                pixel_history: &mut self.pixel_history,
-                store: self.tile_store.as_mut(),
-                undo_order: &mut self.undo_order,
-                composite_cache: &mut self.composite_cache,
+                active_layer: &mut self.doc.active_layer,
+                view: &mut self.doc.canvas_view,
+                history: &mut self.doc.history,
+                pixel_history: &mut self.doc.pixel_history,
+                store: self.doc.tile_store.as_mut(),
+                undo_order: &mut self.doc.undo_order,
+                composite_cache: &mut self.doc.composite_cache,
                 drag: &mut self.drag,
                 layer_controls: &mut self.layer_controls,
                 click: &mut self.gallery_click,
@@ -21374,11 +21198,11 @@ impl App {
             &mut self.command_palette,
             &mut self.tool,
             &self.tool_settings,
-            &mut self.layers,
-            &mut self.history,
-            &mut self.pixel_history,
-            self.tile_store.as_mut(),
-            &mut self.undo_order,
+            &mut self.doc.layers,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            self.doc.tile_store.as_mut(),
+            &mut self.doc.undo_order,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -21476,7 +21300,7 @@ impl App {
         }
         // Taken before the command: an undone New Layer or redone Delete
         // changes the layer set, and the rows must follow (0.143.0).
-        let layers_before = LayerSetSnapshot::capture(&self.layers, self.active_layer);
+        let layers_before = LayerSetSnapshot::capture(&self.doc.layers, self.doc.active_layer);
         // Annotated rather than discarded bare, for the reason
         // `CompositeInvalidation`'s own `#[must_use]` exists: the report
         // has already been acted on *inside* `perform_undo_redo`, which
@@ -21487,14 +21311,14 @@ impl App {
             &mut self.command_palette,
             &mut self.tool,
             &self.tool_settings,
-            &mut self.layers,
-            &mut self.history,
-            &mut self.pixel_history,
-            self.tile_store.as_mut(),
-            &mut self.undo_order,
-            &mut self.composite_cache,
-            &mut self.canvas_view,
-            self.active_layer,
+            &mut self.doc.layers,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            self.doc.tile_store.as_mut(),
+            &mut self.doc.undo_order,
+            &mut self.doc.composite_cache,
+            &mut self.doc.canvas_view,
+            self.doc.active_layer,
             &mut self.drag,
             &mut self.layer_controls,
             command,
@@ -21503,15 +21327,15 @@ impl App {
             &mut self.workspace,
             &mut self.focus,
             &self.scales,
-            &self.layers,
+            &self.doc.layers,
             &mut self.layer_rows,
-            &mut self.active_layer,
-            &mut self.canvas_view,
-            &mut self.composite_cache,
+            &mut self.doc.active_layer,
+            &mut self.doc.canvas_view,
+            &mut self.doc.composite_cache,
             &self.layer_controls,
             &layers_before,
         );
-        refresh_layer_row_descriptions(&mut self.workspace, &self.layer_rows, &self.layers);
+        refresh_layer_row_descriptions(&mut self.workspace, &self.layer_rows, &self.doc.layers);
         if rebuilt {
             // Fresh rows have no layout yet.
             let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -21564,15 +21388,15 @@ impl App {
                 workspace: &mut self.workspace,
                 focus: &mut self.focus,
                 scales: &self.scales,
-                layers: &mut self.layers,
-                history: &mut self.history,
-                pixel_history: &mut self.pixel_history,
-                store: self.tile_store.as_mut(),
-                undo_order: &mut self.undo_order,
-                composite_cache: &mut self.composite_cache,
-                view: &mut self.canvas_view,
+                layers: &mut self.doc.layers,
+                history: &mut self.doc.history,
+                pixel_history: &mut self.doc.pixel_history,
+                store: self.doc.tile_store.as_mut(),
+                undo_order: &mut self.doc.undo_order,
+                composite_cache: &mut self.doc.composite_cache,
+                view: &mut self.doc.canvas_view,
                 layer_rows: &mut self.layer_rows,
-                active_layer: &mut self.active_layer,
+                active_layer: &mut self.doc.active_layer,
                 drag: &mut self.drag,
                 layer_controls: &mut self.layer_controls,
             },
@@ -21599,18 +21423,18 @@ impl App {
                 workspace: &mut self.workspace,
                 focus: &mut self.focus,
                 scales: &self.scales,
-                layers: &mut self.layers,
-                history: &mut self.history,
-                pixel_history: &mut self.pixel_history,
-                undo_order: &mut self.undo_order,
+                layers: &mut self.doc.layers,
+                history: &mut self.doc.history,
+                pixel_history: &mut self.doc.pixel_history,
+                undo_order: &mut self.doc.undo_order,
                 layer_rows: &mut self.layer_rows,
-                active_layer: &mut self.active_layer,
-                view: &mut self.canvas_view,
-                composite_cache: &mut self.composite_cache,
+                active_layer: &mut self.doc.active_layer,
+                view: &mut self.doc.canvas_view,
+                composite_cache: &mut self.doc.composite_cache,
                 drag: &mut self.drag,
                 layer_controls: &mut self.layer_controls,
                 click: &mut self.gallery_click,
-                canvas_size: self.canvas_size,
+                canvas_size: self.doc.canvas_size,
             },
             command,
         );
@@ -21705,6 +21529,7 @@ impl App {
         // The decode thread stages the opened tiles straight into the
         // store's scratch directory (0.154.0); the install adopts them.
         let staging = self
+            .doc
             .tile_store
             .as_ref()
             .map(aurora_tile::TileStore::staging_root);
@@ -21773,12 +21598,12 @@ impl App {
         let _ = end_curves_gestures(
             &mut CurvesEdit {
                 workspace: &mut self.workspace,
-                layers: &mut self.layers,
-                history: &mut self.history,
-                pixel_history: &mut self.pixel_history,
-                undo_order: &mut self.undo_order,
+                layers: &mut self.doc.layers,
+                history: &mut self.doc.history,
+                pixel_history: &mut self.doc.pixel_history,
+                undo_order: &mut self.doc.undo_order,
                 layer_rows: &self.layer_rows,
-                active_layer: self.active_layer,
+                active_layer: self.doc.active_layer,
                 controls: self.tool_controls.map(|controls| controls.curves),
                 state: &mut self.curves_ui,
             },
@@ -21973,18 +21798,18 @@ impl App {
         // new ones is what makes it impossible to sweep a document that
         // is still live. Do not introduce a fallible step between here
         // and the sweep/write below.
-        let outgoing_layers = std::mem::replace(&mut self.layers, layers);
-        let outgoing_history = std::mem::replace(&mut self.history, history);
+        let outgoing_layers = std::mem::replace(&mut self.doc.layers, layers);
+        let outgoing_history = std::mem::replace(&mut self.doc.history, history);
         let mut unwritten_layers = 0_usize;
 
-        if let Some(store) = self.tile_store.as_mut() {
+        if let Some(store) = self.doc.tile_store.as_mut() {
             // Sweep, *then* write -- see `replace_document_pixels` for
             // why that order is forced and what the other one costs.
             let (freed, failed) = replace_document_pixels_prepared(
                 store,
                 outgoing_layers,
                 outgoing_history,
-                &self.layers,
+                &self.doc.layers,
                 pixels,
                 masks,
             );
@@ -22003,15 +21828,15 @@ impl App {
             // file's losses to another file entirely. Assigned before
             // the write for the same reason `open_aur_file` assigns its
             // own before its write.
-            self.skipped_tiles = aurora_io::SkippedTiles::new();
+            self.doc.skipped_tiles = aurora_io::SkippedTiles::new();
             // A snapshot here, the write on the autosave worker (0.152.0).
             request_autosave(
                 &mut self.autosave_worker,
                 &autosave_path(),
-                &self.layers,
-                &self.history,
+                &self.doc.layers,
+                &self.doc.history,
                 canvas_size,
-                &mut self.skipped_tiles,
+                &mut self.doc.skipped_tiles,
                 store,
             );
         } else {
@@ -22021,14 +21846,14 @@ impl App {
             // outgoing tree/history here *is* the whole cleanup.
             drop((outgoing_layers, outgoing_history));
             tracing::warn!("no live tile store; skipping the opened document's autosave");
-            // `self.skipped_tiles` keeps whatever the *previous* document
+            // `self.doc.skipped_tiles` keeps whatever the *previous* document
             // carried -- harmlessly stale, not wrong: with no live store,
             // `save_aur_file` refuses before it would ever read this field
             // (its own early return), so a record that describes a
             // different document can never reach a file on disk.
         }
 
-        self.canvas_size = canvas_size;
+        self.doc.canvas_size = canvas_size;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- the `std::mem::replace` above
         // installed the incoming `History` (not merged with the old one,
@@ -22043,10 +21868,10 @@ impl App {
         // on the way in (`History::clear_undo`, 0.144.0 review), so a
         // fresh `undo_order` agrees with it: the opened file is the
         // baseline, and Ctrl+Z cannot take the import apart.
-        self.pixel_history = aurora_brush::PixelHistory::new();
-        self.undo_order = UndoOrder::default();
-        self.composite_cache.bump();
-        self.active_layer = active_layer;
+        self.doc.pixel_history = aurora_brush::PixelHistory::new();
+        self.doc.undo_order = UndoOrder::default();
+        self.doc.composite_cache.bump();
+        self.doc.active_layer = active_layer;
         self.layer_rows = layer_rows;
         // Layer ids restart in a fresh document, so the incoming active
         // layer may share the outgoing one's id: forget what was last
@@ -22057,16 +21882,16 @@ impl App {
         // atlas's zoom floor, and the reset on its own drops the pan
         // bound. `load_document_view` is both, in the one order that is
         // correct -- see its own doc comment. Assigned after
-        // `self.active_layer`/`self.layers` above, since it reads them.
-        self.canvas_view = load_document_view(
-            &self.canvas_view,
-            &self.layers,
-            self.active_layer,
+        // `self.doc.active_layer`/`self.doc.layers` above, since it reads them.
+        self.doc.canvas_view = load_document_view(
+            &self.doc.canvas_view,
+            &self.doc.layers,
+            self.doc.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
             canvas_area_logical_size(&self.workspace),
             self.scale_factor,
         );
-        self.selection = aurora_doc::SelectionSet::new();
+        self.doc.selection = aurora_doc::SelectionSet::new();
         // Dropped, deliberately not committed through `commit_drag`:
         // `pixel_history` was replaced wholesale a few lines up, so an
         // entry pushed here would be discarded immediately -- and it
@@ -22164,36 +21989,36 @@ impl App {
         // opened file's own record of what it lost. Set here, it also
         // means a crash between opening a lossy file and acting on the
         // dialog leaves crash recovery a document that still knows.
-        self.skipped_tiles = skipped_tiles;
+        self.doc.skipped_tiles = skipped_tiles;
         // Re-borrowed rather than kept from the read above: that borrow
-        // of `self.tile_store` has to end before `report_open_failure`/
+        // of `self.doc.tile_store` has to end before `report_open_failure`/
         // `replace_document` borrow `self`, and `read_aur` has already
         // populated the store by now, so the container this writes
         // carries the opened document's real tiles.
-        if let Some(store) = self.tile_store.as_mut() {
+        if let Some(store) = self.doc.tile_store.as_mut() {
             request_autosave(
                 &mut self.autosave_worker,
                 &autosave_path(),
                 &layers,
                 &history,
                 canvas_size,
-                &mut self.skipped_tiles,
+                &mut self.doc.skipped_tiles,
                 store,
             );
         }
 
-        self.layers = layers;
+        self.doc.layers = layers;
         // The file's own real, saved canvas size -- restored directly,
         // not re-derived from whichever layer it contains (the bug this
         // field exists to fix; see `Self::canvas_size`'s own doc
         // comment).
-        self.canvas_size = canvas_size;
-        self.history = history;
+        self.doc.canvas_size = canvas_size;
+        self.doc.history = history;
         // See the same reset in `Self::open_file`'s own flat-image path.
-        self.pixel_history = aurora_brush::PixelHistory::new();
-        self.undo_order = UndoOrder::default();
-        self.composite_cache.bump();
-        self.active_layer = active_layer;
+        self.doc.pixel_history = aurora_brush::PixelHistory::new();
+        self.doc.undo_order = UndoOrder::default();
+        self.doc.composite_cache.bump();
+        self.doc.active_layer = active_layer;
         self.layer_rows = layer_rows;
         // Layer ids restart in a fresh document, so the incoming active
         // layer may share the outgoing one's id: forget what was last
@@ -22204,16 +22029,16 @@ impl App {
         // atlas's zoom floor, and the reset on its own drops the pan
         // bound. `load_document_view` is both, in the one order that is
         // correct -- see its own doc comment. Assigned after
-        // `self.active_layer`/`self.layers` above, since it reads them.
-        self.canvas_view = load_document_view(
-            &self.canvas_view,
-            &self.layers,
-            self.active_layer,
+        // `self.doc.active_layer`/`self.doc.layers` above, since it reads them.
+        self.doc.canvas_view = load_document_view(
+            &self.doc.canvas_view,
+            &self.doc.layers,
+            self.doc.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
             canvas_area_logical_size(&self.workspace),
             self.scale_factor,
         );
-        self.selection = aurora_doc::SelectionSet::new();
+        self.doc.selection = aurora_doc::SelectionSet::new();
         // Dropped, deliberately not committed through `commit_drag`:
         // `pixel_history` was replaced wholesale a few lines up, so an
         // entry pushed here would be discarded immediately -- and it
@@ -22226,10 +22051,10 @@ impl App {
         // against the already-rebuilt workspace, and
         // `open_skipped_tiles_dialog` pushes accessibility again itself
         // so the alert is announced.
-        if let Some(message) = skipped_tiles_warning(&self.skipped_tiles) {
+        if let Some(message) = skipped_tiles_warning(&self.doc.skipped_tiles) {
             tracing::warn!(
-                skipped = self.skipped_tiles.total(),
-                listed = self.skipped_tiles.records().len(),
+                skipped = self.doc.skipped_tiles.total(),
+                listed = self.doc.skipped_tiles.records().len(),
                 path = %path.display(),
                 "opened a .aur file that was written with tiles missing"
             );
@@ -22256,7 +22081,7 @@ impl App {
     /// an unreadable file, a damaged or unsupported container — has been
     /// logged and shown ([`Self::report_open_failure`]).
     fn read_chosen_aur(&mut self, path: &Path, bytes: &[u8]) -> Option<aurora_io::AurDocument> {
-        let read = match self.tile_store.as_mut() {
+        let read = match self.doc.tile_store.as_mut() {
             None => Err(OpenFailure::NoTileStorage),
             Some(store) => read_prechecked_aur(bytes, store),
         };
@@ -22448,7 +22273,7 @@ impl App {
     /// otherwise a flat, composited export of the real document, built
     /// by [`composite_document`] (every visible pixel layer, each
     /// composited with its own real, translated blend mode — see below
-    /// — walking `self.canvas_size` — see that field's own doc comment
+    /// — walking `self.doc.canvas_size` — see that field's own doc comment
     /// for why it, not any one layer's own `bounds`, is the real
     /// document extent), encoding via whichever format `path`'s own
     /// extension names (`aurora_io::encode_by_extension`), and writing
@@ -22539,13 +22364,13 @@ impl App {
             self.save_aur_file(path);
             return;
         }
-        let Some(store) = self.tile_store.as_mut() else {
+        let Some(store) = self.doc.tile_store.as_mut() else {
             tracing::error!(path = %path.display(), "refusing to export: no live tile store");
             self.report_save_failure(path, &SaveFailure::NoTileStorage);
             return;
         };
-        let (width, height) = self.canvas_size;
-        let image = match composite_document(&self.layers, store, width, height) {
+        let (width, height) = self.doc.canvas_size;
+        let image = match composite_document(&self.doc.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
                 // The *file* is safe either way: nothing is written, and
@@ -22606,15 +22431,15 @@ impl App {
     /// single "does this decode to the right width/height" check the way a flat image
     /// does).
     ///
-    /// **Scope, stated honestly**: `canvas_size` is `self.canvas_size`,
+    /// **Scope, stated honestly**: `canvas_size` is `self.doc.canvas_size`,
     /// the document's own real, independent canvas size — no longer
     /// re-derived from the topmost pixel layer's own bounds on every
-    /// save (see [`Self::canvas_size`]'s own doc comment for the bug
+    /// save (see [`DocumentSession::canvas_size`]'s own doc comment for the bug
     /// that used to cause). No colour profile is passed
     /// (`aurora_io::write_aur`'s own `profile: None`) — this crate has
     /// no colour-management UI yet to have set a non-sRGB one with, even
     /// though the format itself round-trips a real one now (`aurora-io`).
-    /// `history` is `self.history`, the real live journal — Move
+    /// `history` is `self.doc.history`, the real live journal — Move
     /// (`Self::apply_move`) records through it, so a `.aur` file this
     /// session writes carries a real, if partial, undo journal;
     /// `Self::paint_dab`/`Self::erase_dab` still bypass it entirely (see
@@ -22623,7 +22448,7 @@ impl App {
     /// real, named gap, not the previous "always completely empty" one.
     /// A silent no-op if there's no live tile store.
     fn save_aur_file(&mut self, path: &Path) {
-        let Some(store) = self.tile_store.as_mut() else {
+        let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
 
@@ -22640,9 +22465,9 @@ impl App {
             let file = std::fs::File::create(&temp_path)?;
             aurora_io::write_aur(
                 file,
-                &self.layers,
-                &self.history,
-                self.canvas_size,
+                &self.doc.layers,
+                &self.doc.history,
+                self.doc.canvas_size,
                 None,
                 // What this document already knows it is missing, so an
                 // explicit Save of a file opened with tiles gone writes
@@ -22650,7 +22475,7 @@ impl App {
                 // still *refuses* rather than degrades -- a carried
                 // record names tiles that are not in the store at all,
                 // so it can never turn into a fresh skip here.
-                &self.skipped_tiles,
+                &self.doc.skipped_tiles,
                 store,
             )
         })();
@@ -22749,12 +22574,12 @@ impl App {
             let dabs = continue_drag(
                 drag,
                 canvas_point,
-                &mut self.canvas_view,
-                &mut self.selection,
+                &mut self.doc.canvas_view,
+                &mut self.doc.selection,
                 &self.tool_settings,
                 pan_bounds(
-                    &self.layers,
-                    self.active_layer,
+                    &self.doc.layers,
+                    self.doc.active_layer,
                     canvas_area_logical_size(&self.workspace),
                 ),
             );
@@ -22776,7 +22601,7 @@ impl App {
                 self.apply_move(layer_id, current_bounds);
             }
             Some(Drag::Eyedropper) => {
-                let doc_point = self.canvas_view.to_document(canvas_point);
+                let doc_point = self.doc.canvas_view.to_document(canvas_point);
                 self.sample_eyedropper(doc_point);
             }
             _ => {}
@@ -22801,7 +22626,7 @@ impl App {
     /// press is a second gesture, and the two things it would otherwise
     /// do to a live drag — drop its undo entry, and move the view out
     /// from under its fixed reference point — are exactly the pair
-    /// [`commit_ending_drag`] and [`Self::active_layer`]'s own doc
+    /// [`commit_ending_drag`] and [`DocumentSession::active_layer`]'s own doc
     /// comment describe.
     #[allow(clippy::too_many_lines)]
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
@@ -22870,13 +22695,13 @@ impl App {
             press_layer_row(
                 &mut self.workspace,
                 &self.layer_rows,
-                &mut self.active_layer,
-                &mut self.canvas_view,
-                &self.layers,
-                &mut self.history,
-                &mut self.pixel_history,
-                &mut self.undo_order,
-                &mut self.composite_cache,
+                &mut self.doc.active_layer,
+                &mut self.doc.canvas_view,
+                &self.doc.layers,
+                &mut self.doc.history,
+                &mut self.doc.pixel_history,
+                &mut self.doc.undo_order,
+                &mut self.doc.composite_cache,
                 &mut self.drag,
                 layer_id,
             );
@@ -22932,12 +22757,12 @@ impl App {
 
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
             handle_zoom_tool_click(
-                &mut self.canvas_view,
+                &mut self.doc.canvas_view,
                 canvas_point,
                 self.modifiers,
                 pan_bounds(
-                    &self.layers,
-                    self.active_layer,
+                    &self.doc.layers,
+                    self.doc.active_layer,
                     canvas_area_logical_size(&self.workspace),
                 ),
             );
@@ -22947,8 +22772,8 @@ impl App {
             self.tool,
             button,
             canvas_point,
-            &self.canvas_view,
-            active_pixel_layer(&self.layers, self.active_layer),
+            &self.doc.canvas_view,
+            active_pixel_layer(&self.doc.layers, self.doc.active_layer),
         );
         match self.drag.as_ref() {
             Some(Drag::Brush { last_doc, .. }) => {
@@ -22960,7 +22785,7 @@ impl App {
                 self.erase_dab(last_doc);
             }
             Some(Drag::Eyedropper) => {
-                let doc_point = self.canvas_view.to_document(canvas_point);
+                let doc_point = self.doc.canvas_view.to_document(canvas_point);
                 self.sample_eyedropper(doc_point);
             }
             _ => {}
@@ -22972,8 +22797,8 @@ impl App {
     /// [`aurora_brush::stamp_dab`], via [`layer_local_point`] for the
     /// document-space -> layer-local conversion `aurora_tile::TileStore`
     /// needs. A silent no-op if there's no live store
-    /// ([`Self::tile_store`] failed to open), no active layer
-    /// ([`Self::active_layer`] is `None`), or that layer isn't (or is no
+    /// ([`DocumentSession::tile_store`] failed to open), no active layer
+    /// ([`DocumentSession::active_layer`] is `None`), or that layer isn't (or is no
     /// longer) a pixel layer — a real, absent precondition, not an
     /// error worth logging on its own. A real, logged failure ([`aurora_tile::TileError`],
     /// e.g. the scratch disk failing mid-session) is worth a warning,
@@ -23011,17 +22836,17 @@ impl App {
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
-        let Some(layer_id) = self.active_layer else {
+        let Some(layer_id) = self.doc.active_layer else {
             return;
         };
-        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
         else {
             return;
         };
-        let Some(surface) = self.layers.surface_id(layer_id) else {
+        let Some(surface) = self.doc.layers.surface_id(layer_id) else {
             return;
         };
-        let Some(store) = self.tile_store.as_mut() else {
+        let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
@@ -23029,7 +22854,7 @@ impl App {
         // This is why the stamp (and the stroke accessor inside it) is a
         // free function over `&mut Option<Drag>` and not a `&mut self`
         // helper method: that would borrow all of `self` and conflict
-        // with `self.tile_store` above.
+        // with `self.doc.tile_store` above.
         let outcome = stamp_tool_dab(
             DabTool::Brush,
             store,
@@ -23040,7 +22865,7 @@ impl App {
             &mut self.drag,
         );
         for &tile in outcome.painted() {
-            self.composite_cache.invalidate(tile);
+            self.doc.composite_cache.invalidate(tile);
         }
         // One line per broken tile per *stroke*, not per dab and not per
         // tile per dab -- see `unwarned_failures`. Every fresh failure
@@ -23071,17 +22896,17 @@ impl App {
     /// capture (against `Drag::Eraser`'s own `stroke` field instead,
     /// via [`eraser_stroke_mut`]).
     fn erase_dab(&mut self, doc_point: (f32, f32)) {
-        let Some(layer_id) = self.active_layer else {
+        let Some(layer_id) = self.doc.active_layer else {
             return;
         };
-        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
         else {
             return;
         };
-        let Some(surface) = self.layers.surface_id(layer_id) else {
+        let Some(surface) = self.doc.layers.surface_id(layer_id) else {
             return;
         };
-        let Some(store) = self.tile_store.as_mut() else {
+        let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
@@ -23097,7 +22922,7 @@ impl App {
             &mut self.drag,
         );
         for &tile in outcome.painted() {
-            self.composite_cache.invalidate(tile);
+            self.doc.composite_cache.invalidate(tile);
         }
         // One line per broken tile per stroke, every one of them --
         // `Self::paint_dab`'s own reasoning, mirrored.
@@ -23119,7 +22944,7 @@ impl App {
     /// `Drag::Move` needs, called every pointer-move event while one is
     /// active with that drag's own live `current_bounds`
     /// ([`Self::handle_pointer_moved`]), for live visual feedback only.
-    /// Deliberately bypasses `self.history`/`self.undo_order` — the
+    /// Deliberately bypasses `self.doc.history`/`self.doc.undo_order` — the
     /// whole point of coalescing a drag into one undo step
     /// ([`finish_move`]) is *not* recording an entry for every
     /// intermediate position a fast drag passes through. A real, logged
@@ -23128,7 +22953,7 @@ impl App {
     /// from a real active pixel layer when the drag began — but this
     /// reports rather than assumes it, the same discipline every other
     /// fallible call in this crate already applies. Bumps
-    /// `self.composite_cache` unconditionally — a moved layer's own
+    /// `self.doc.composite_cache` unconditionally — a moved layer's own
     /// content lands at different composite tiles now, whether or not
     /// `set_bounds` itself succeeded.
     ///
@@ -23148,7 +22973,7 @@ impl App {
     /// crate rather than something the user did, and a modal alert is the
     /// wrong response to it.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
-        if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
+        if let Err(err) = self.doc.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
             // Ask, open, and only then latch. The latch must not happen
             // when `open_move_refused_dialog` was a no-op because another
@@ -23162,7 +22987,7 @@ impl App {
                 mark_move_refusal_reported(&mut self.drag);
             }
         }
-        self.composite_cache.bump();
+        self.doc.composite_cache.bump();
     }
 
     /// Opens the move-refused dialog, on exactly the terms
@@ -23212,12 +23037,12 @@ impl App {
         commit_drag_into_history(
             &mut self.workspace,
             drag,
-            &self.layers,
-            &mut self.history,
-            &mut self.pixel_history,
-            &mut self.undo_order,
-            &mut self.canvas_view,
-            self.active_layer,
+            &self.doc.layers,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            &mut self.doc.undo_order,
+            &mut self.doc.canvas_view,
+            self.doc.active_layer,
             canvas_size,
         );
     }
@@ -23243,7 +23068,7 @@ impl App {
     ///
     /// The document-space -> composite-surface-local conversion uses
     /// [`active_layer_origin`], **not** a `None`-returns-early guard on
-    /// [`Self::active_layer`]: [`recomposite_visible_tiles`]'s own
+    /// [`DocumentSession::active_layer`]: [`recomposite_visible_tiles`]'s own
     /// `reference_origin` (the document-space point composite `TileId
     /// (0, 0)` corresponds to) is exactly the active layer's own
     /// `bounds.(x, y)`, falling back to `(0, 0)` — the document's own
@@ -23269,10 +23094,10 @@ impl App {
     /// and so can't be built directly in a unit test; `eyedropper_sample`
     /// can, and that's what this crate's own tests exercise.
     fn sample_eyedropper(&mut self, doc_point: (f32, f32)) {
-        let Some(store) = self.tile_store.as_mut() else {
+        let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
-        let origin = active_layer_origin(&self.layers, self.active_layer);
+        let origin = active_layer_origin(&self.doc.layers, self.doc.active_layer);
         if let Some(colour) = eyedropper_sample(store, origin, doc_point) {
             self.current_colour = colour;
         }
@@ -23359,13 +23184,13 @@ impl App {
             pointer_owned,
         ) {
             WheelTarget::Canvas(canvas_point) => apply_scroll_zoom(
-                &mut self.canvas_view,
+                &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 canvas_point,
                 delta,
                 pan_bounds(
-                    &self.layers,
-                    self.active_layer,
+                    &self.doc.layers,
+                    self.doc.active_layer,
                     canvas_area_logical_size(&self.workspace),
                 ),
             ),
@@ -23816,14 +23641,14 @@ impl App {
                 &self.scales,
                 &reopened,
                 &RefillDocument {
-                    layers: &self.layers,
-                    undo_order: &self.undo_order,
+                    layers: &self.doc.layers,
+                    undo_order: &self.doc.undo_order,
                     tool: self.tool,
                     tool_settings: &self.tool_settings,
                 },
                 &mut self.layer_rows,
-                &mut self.active_layer,
-                &mut self.canvas_view,
+                &mut self.doc.active_layer,
+                &mut self.doc.canvas_view,
             );
         }
         self.relayout_after_gallery();
@@ -23876,12 +23701,12 @@ impl App {
     fn layer_control_edit(&mut self) -> LayerControlEdit<'_> {
         LayerControlEdit {
             workspace: &mut self.workspace,
-            layers: &mut self.layers,
-            history: &mut self.history,
-            pixel_history: &mut self.pixel_history,
-            undo_order: &mut self.undo_order,
+            layers: &mut self.doc.layers,
+            history: &mut self.doc.history,
+            pixel_history: &mut self.doc.pixel_history,
+            undo_order: &mut self.doc.undo_order,
             layer_rows: &self.layer_rows,
-            active_layer: self.active_layer,
+            active_layer: self.doc.active_layer,
             state: &mut self.layer_controls,
         }
     }
@@ -23892,7 +23717,7 @@ impl App {
         let captured = self.gallery_click.captured();
         let invalidation =
             apply_layer_control_outcome(&mut self.layer_control_edit(), outcome, captured);
-        apply_layer_control_invalidation(&mut self.composite_cache, &invalidation);
+        apply_layer_control_invalidation(&mut self.doc.composite_cache, &invalidation);
         self.needs_redraw = true;
     }
 
@@ -23934,11 +23759,11 @@ impl App {
             &mut self.command_palette,
             &mut self.tool,
             &self.tool_settings,
-            &mut self.layers,
-            &mut self.history,
-            &mut self.pixel_history,
-            self.tile_store.as_mut(),
-            &mut self.undo_order,
+            &mut self.doc.layers,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            self.doc.tile_store.as_mut(),
+            &mut self.doc.undo_order,
             AppCommand::SelectTool(tool),
         );
         let _ = end_radius_drag_on_tool_change(
@@ -23980,7 +23805,7 @@ impl App {
             self.needs_redraw = true;
         }
         if settle_pending_curves(&mut self.curves_edit(), captured) {
-            self.composite_cache.bump();
+            self.doc.composite_cache.bump();
             self.needs_redraw = true;
         }
     }
@@ -23991,31 +23816,31 @@ impl App {
         let committed = end_curves_gesture_before_key(
             &mut CurvesEdit {
                 workspace: &mut self.workspace,
-                layers: &mut self.layers,
-                history: &mut self.history,
-                pixel_history: &mut self.pixel_history,
-                undo_order: &mut self.undo_order,
+                layers: &mut self.doc.layers,
+                history: &mut self.doc.history,
+                pixel_history: &mut self.doc.pixel_history,
+                undo_order: &mut self.doc.undo_order,
                 layer_rows: &self.layer_rows,
-                active_layer: self.active_layer,
+                active_layer: self.doc.active_layer,
                 controls: self.tool_controls.map(|controls| controls.curves),
                 state: &mut self.curves_ui,
             },
             &mut self.gallery_click,
         );
         if committed {
-            self.composite_cache.bump();
+            self.doc.composite_cache.bump();
         }
     }
 
     fn curves_edit(&mut self) -> CurvesEdit<'_> {
         CurvesEdit {
             workspace: &mut self.workspace,
-            layers: &mut self.layers,
-            history: &mut self.history,
-            pixel_history: &mut self.pixel_history,
-            undo_order: &mut self.undo_order,
+            layers: &mut self.doc.layers,
+            history: &mut self.doc.history,
+            pixel_history: &mut self.doc.pixel_history,
+            undo_order: &mut self.doc.undo_order,
             layer_rows: &self.layer_rows,
-            active_layer: self.active_layer,
+            active_layer: self.doc.active_layer,
             controls: self.tool_controls.map(|controls| controls.curves),
             state: &mut self.curves_ui,
         }
@@ -24028,7 +23853,7 @@ impl App {
     fn apply_curves_control(&mut self, outcome: &PointerOutcome) {
         let captured = self.gallery_click.captured();
         let invalidation = apply_curves_outcome(&mut self.curves_edit(), outcome, captured);
-        apply_layer_control_invalidation(&mut self.composite_cache, &invalidation);
+        apply_layer_control_invalidation(&mut self.doc.composite_cache, &invalidation);
         self.sync_curves_controls_now();
         self.needs_redraw = true;
     }
@@ -24042,8 +23867,8 @@ impl App {
     fn sync_status_bar_now(&mut self) {
         if sync_status_bar(
             &mut self.workspace,
-            &self.canvas_view,
-            self.canvas_size,
+            &self.doc.canvas_view,
+            self.doc.canvas_size,
             self.scale_factor,
         ) {
             self.push_accessibility();
@@ -24059,20 +23884,20 @@ impl App {
         let captured = self.gallery_click.captured();
         let mut cx = CurvesEdit {
             workspace: &mut self.workspace,
-            layers: &mut self.layers,
-            history: &mut self.history,
-            pixel_history: &mut self.pixel_history,
-            undo_order: &mut self.undo_order,
+            layers: &mut self.doc.layers,
+            history: &mut self.doc.history,
+            pixel_history: &mut self.doc.pixel_history,
+            undo_order: &mut self.doc.undo_order,
             layer_rows: &self.layer_rows,
-            active_layer: self.active_layer,
+            active_layer: self.doc.active_layer,
             controls: self.tool_controls.map(|controls| controls.curves),
             state: &mut self.curves_ui,
         };
         if sync_curves_ui(
             &mut cx,
-            &mut self.composite_cache,
-            self.tile_store.as_mut(),
-            self.canvas_size,
+            &mut self.doc.composite_cache,
+            self.doc.tile_store.as_mut(),
+            self.doc.canvas_size,
             captured,
         ) {
             self.relayout_after_gallery();
@@ -24089,12 +23914,12 @@ impl App {
     fn commit_layer_controls_drag(&mut self) {
         let mut edit = LayerControlEdit {
             workspace: &mut self.workspace,
-            layers: &mut self.layers,
-            history: &mut self.history,
-            pixel_history: &mut self.pixel_history,
-            undo_order: &mut self.undo_order,
+            layers: &mut self.doc.layers,
+            history: &mut self.doc.history,
+            pixel_history: &mut self.doc.pixel_history,
+            undo_order: &mut self.doc.undo_order,
             layer_rows: &self.layer_rows,
-            active_layer: self.active_layer,
+            active_layer: self.doc.active_layer,
             state: &mut self.layer_controls,
         };
         let _ = end_layer_control_gestures(&mut edit, &mut self.gallery_click);
@@ -24111,8 +23936,8 @@ impl App {
         if sync_layer_controls(
             &mut self.workspace,
             &self.layer_controls,
-            &self.layers,
-            self.active_layer,
+            &self.doc.layers,
+            self.doc.active_layer,
             captured,
         ) {
             self.push_accessibility();
@@ -24168,7 +23993,7 @@ impl App {
             &self.layer_rows,
             &mut self.scroll_follow,
             self.focus.focused(),
-            self.active_layer,
+            self.doc.active_layer,
         );
         let history_current = self.workspace.history_current;
         if follow_history_row(
@@ -24248,12 +24073,12 @@ impl App {
             // behind, which is the same shape of staleness the atlas
             // resize just below already guards against.
             let bounds = pan_bounds(
-                &self.layers,
-                self.active_layer,
+                &self.doc.layers,
+                self.doc.active_layer,
                 canvas_area_logical_size(&self.workspace),
             );
             apply_canvas_min_zoom(
-                &mut self.canvas_view,
+                &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
                 canvas_min_zoom(canvas_size, self.scale_factor),
@@ -24338,12 +24163,12 @@ impl App {
                 .pointer_position
                 .and_then(|position| pointer_in_canvas(&self.workspace, position));
             let bounds = pan_bounds(
-                &self.layers,
-                self.active_layer,
+                &self.doc.layers,
+                self.doc.active_layer,
                 canvas_area_logical_size(&self.workspace),
             );
             apply_canvas_min_zoom(
-                &mut self.canvas_view,
+                &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
                 canvas_min_zoom(canvas_size, self.scale_factor),
@@ -24355,8 +24180,8 @@ impl App {
         // Its text is fixed-width items, so no relayout is needed.
         if sync_status_bar(
             &mut self.workspace,
-            &self.canvas_view,
-            self.canvas_size,
+            &self.doc.canvas_view,
+            self.doc.canvas_size,
             self.scale_factor,
         ) {
             self.push_accessibility();
@@ -24421,20 +24246,23 @@ impl App {
                         residency.set_origin(
                             gpu.queue(),
                             canvas_local_origin(
-                                &self.canvas_view,
-                                active_layer_origin(&self.layers, self.active_layer),
+                                &self.doc.canvas_view,
+                                active_layer_origin(&self.doc.layers, self.doc.active_layer),
                             ),
                             canvas_size,
-                            effective_residency_zoom(self.canvas_view.zoom(), self.scale_factor),
+                            effective_residency_zoom(
+                                self.doc.canvas_view.zoom(),
+                                self.scale_factor,
+                            ),
                         );
                     }
-                    if let Some(store) = self.tile_store.as_mut() {
+                    if let Some(store) = self.doc.tile_store.as_mut() {
                         recomposite_visible_tiles(
                             residency,
-                            &self.layers,
-                            self.active_layer,
+                            &self.doc.layers,
+                            self.doc.active_layer,
                             store,
-                            &mut self.composite_cache,
+                            &mut self.doc.composite_cache,
                             Some(gpu),
                             self.compositor.as_mut(),
                         );
