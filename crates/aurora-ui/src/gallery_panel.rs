@@ -100,6 +100,9 @@ pub struct GalleryPanel {
     pub swatch: WidgetId,
     pub dropdown: WidgetId,
     pub tab_bar: WidgetId,
+    /// 0.175.0: a closable tab bar, each tab with its "×" close button
+    /// (a gallery click on one closes nothing).
+    pub closable_tab_bar: WidgetId,
     pub menu_button: WidgetId,
     pub tree_view: WidgetId,
     /// Parent, first child, second child. **The two child handles are
@@ -314,6 +317,15 @@ fn build(
         vec!["One".into(), "Two".into(), "Three".into()],
         0,
     )?;
+    let closable_tab_bar = widgets::insert_tab_bar(
+        tree,
+        left,
+        scales,
+        "Closable tabs",
+        vec!["photo.aur".into(), "Untitled 2".into()],
+        0,
+    )?;
+    let _ = widgets::set_tab_bar_closable(tree, closable_tab_bar, true)?;
     let menu_button = widgets::insert_button(tree, left, scales, "Open menu")?;
     let holder = widgets::insert_container(tree, left, tree_holder_style(scales))?;
     let tree_view = widgets::insert_tree_view(tree, holder, Some("Tree view"))?;
@@ -359,6 +371,7 @@ fn build(
         swatch,
         dropdown,
         tab_bar,
+        closable_tab_bar,
         menu_button,
         tree_view,
         tree_rows: [parent_row, first_row, second_row],
@@ -854,6 +867,7 @@ mod tests {
             (g.scrollbar, Role::ScrollBar),
             (g.dropdown, Role::ComboBox),
             (g.tab_bar, Role::TabList),
+            (g.closable_tab_bar, Role::TabList),
             (g.menu_button, Role::Button),
             (g.tree_view, Role::Tree),
             (g.tree_rows[0], Role::TreeItem),

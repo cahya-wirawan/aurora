@@ -26,7 +26,66 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.174.0): unsaved changes, Close Document and the
+**Latest (2026-10-10, 0.175.0): document-tabs polish — macOS Quit
+through the quit review, Cmd chords, a "×" on every document tab, and
+the autosave follow-ups (document tabs, round R6 of six).** **macOS
+Quit:** the application menu's `PredefinedMenuItem::quit` (which
+terminated at once) is now a custom "Quit Aurora" item with a `Cmd+Q`
+accelerator (`quit_menu_item`), whose id `COMMAND_APP_QUIT` maps through
+the platform-neutral `activate_command` to `ActivatedCommand::Quit` →
+`App::request_quit` — the same quit review a window close runs — and is
+the one menu command let past an open dialog
+(`menu_command_allowed_with_dialog`; the review then waits for it).
+`terminate:` from elsewhere (the Dock's Quit, logout) still reaches
+winit 0.30.13's `applicationWillTerminate:` directly — winit implements
+no `applicationShouldTerminate:` — so that path keeps 0.174.0's safety
+net (unsaved work autosaved and recoverable, not asked). **Cmd chords:**
+the shortcut table is built by `default_shortcuts_for(primary_is_meta)`
+with `Primary+…` bindings resolved by `primary_modifier` (`Cmd` on
+macOS — the same `PRIMARY_IS_META` the text field's editing chords use —
+`Ctrl` elsewhere): Close Document `Cmd+W`, Undo/Redo `Cmd+Z`/`Cmd+Shift+Z`,
+New Layer `Cmd+Shift+N`, the palette `Cmd+Shift+P`; `Ctrl+Tab`/
+`Ctrl+Shift+Tab` stay literal (`Cmd+Tab` is the app switcher). **"×"
+close buttons:** `aurora_widgets::widgets::set_tab_bar_closable` gives
+every tab a close button — a `Role::Button` named "Close `label`" that
+declares `Click` but not `Focus` (no extra Tab stop: the tab list keeps
+its one roving stop, and the keyboard closes with `Cmd/Ctrl+W`), pinned
+to the tab's right edge, one control row wide (`tab_close_width`, the
+row-height token), its "×" (U+00D7, in Inter's cmap) drawn by the tab's
+own paint in the tab's text colour, the label ellipsized short of it; no
+new token. The document strip is closable; a pointer press on a "×"
+(`aurora_ui::document_tab_close_at`) or an AT `Click`
+(`AccessibilityReaction::CloseDocumentTab`) closes that tab's document
+by id (`document_close::tab_document`) through Close Document's own
+path, so an unsaved one asks, and never selects the tab first. The
+Widget Gallery and `design/gallery/index.html` show a closable bar
+(active, unsaved, disabled). **Follow-ups:** F-1 the final autosave is
+counted, recorded as landed and indexed only when its canonical file's
+mtime moved; F-3 a waiting quit is taken — and cleared — by a per-loop
+poll the first iteration no dialog is open (`take_pending_quit`), so it
+cannot fire on a later dialog's close; 0.173.0 L-1 `supersede` raises a
+separate stale floor and `landed` now means on disk (a written
+synchronous autosave records itself with `mark_landed`); L-2 a park at an
+unchanged revision is skipped while its write is queued or in flight
+(`AutosaveWorker::outstanding`). **The document-tabs plan R1–R6 is
+complete except** per-document panel scroll and parked-store eviction
+(deferred). **Review fixes (judge PASS 0.90):** P-1 the tabs' and the
+close buttons' accessible names are the plain document names
+(`set_tab_accessible_names`; the bullet is drawn only, "unsaved" is the
+description); P-2 a disabled bar's close buttons map to nothing
+(`tab_close_index`), so neither route closes through them; P-4 the
+`landed`/`configure_index` doc comments untangled and corrected; P-5
+`build_menu`'s `unreachable!`s predate this round (all on `a3d051c`),
+are allowed (the workspace denies `clippy::panic`, not
+`clippy::unreachable`), and cannot fire with muda 0.19.3 on macOS, whose
+`add_menu_item`/`create_ns_item_for_*` never return `Err`; left as is.
+Measured: 3,272 tests pass, 0 failed (61 ignored),
+`AURORA_REQUIRE_GPU=1` on the RTX 3090, plus `cargo clippy --target
+x86_64-apple-darwin -p aurora-app --all-targets -D warnings` clean (with
+`lcms2-sys`'s C build stubbed; type-check only, nothing linked or run).
+See the 0.175.0 addendum under "Next action".
+
+**Previously (2026-10-10, 0.174.0): unsaved changes, Close Document and the
 quit review (document tabs, round R5 of six).** Each `DocumentSession`
 now has a `path` (the file it was opened from, or last saved to as
 `.aur`; for display only — Save is still "Save As…" and always asks
@@ -31710,6 +31769,86 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.175.0) — document-tabs polish (R6).**
+
+Changed: `aurora-app` (`lib.rs`: `COMMAND_APP_QUIT`, `quit_menu_item`,
+`menu_command_allowed_with_dialog`, `ActivatedCommand::Quit`,
+`primary_modifier`/`default_shortcuts_for`, the "×" pointer and AT
+routes, `close_document_tab`, the per-loop pending-quit poll;
+`document_close.rs`: `tab_document`, `take_pending_quit`, F-1 in
+`final_autosave_unsaved`; `background_autosave.rs`: the stale floor,
+`mark_landed`, `outstanding`; `document_tabs.rs`: the L-2 skip),
+`aurora-widgets` (`tab_bar.rs` closable tabs, `text.rs` the tab's "×"),
+`aurora-ui` (`document_tabs.rs` closable strip and close lookups,
+`gallery_panel.rs`), `design/gallery/index.html`.
+
+Tests per AC: AC-1 `the_quit_menu_command_routes_to_the_quit_review`,
+`the_shortcut_table_uses_cmd_on_macos_and_ctrl_elsewhere`; AC-2
+`a_closable_bar_gives_every_tab_a_named_close_button`,
+`close_buttons_follow_relabels_disable_and_unclose`,
+`a_closable_tab_draws_its_label_and_a_close_glyph`,
+`a_tabs_close_button_names_its_document_and_closes_through_close_document`
+(pointer), `an_at_click_on_a_document_tabs_close_button_closes_that_tab`
+(AT); AC-3 `a_final_autosave_that_does_not_land_is_not_counted_or_indexed`
+(F-1), `a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes`
+(F-3), `superseding_raises_the_floor_and_landed_stays_on_disk` (L-1),
+`a_park_while_its_write_is_in_flight_is_skipped` (L-2).
+
+Mutation matrix (applied, `AURORA_REQUIRE_GPU=1 cargo test -p <crate>`,
+restored from a scratchpad backup, touched, sha256 checked):
+
+| Mutation | Result |
+|---|---|
+| Quit menu id not routed to the quit review | killed: the_quit_menu_command_routes_to_the_quit_review |
+| Quit not allowed past an open dialog | killed: the_quit_menu_command_routes_to_the_quit_review |
+| macOS table uses Ctrl | killed: the_shortcut_table_uses_cmd_on_macos_and_ctrl_elsewhere |
+| x AT click not routed (falls to the widget layer) | killed: an_at_click_on_a_document_tabs_close_button_closes_that_tab |
+| x maps to the wrong document (active) | killed: a_tabs_close_button_names_its_document_and_closes_through_close_document |
+| x hit test ignores the button | killed: a_tabs_close_button_names_its_document_and_closes_through_close_document |
+| close button declares Focus (a Tab stop) | killed: a_closable_bar_gives_every_tab_a_named_close_button |
+| close button keeps a stale name | killed: close_buttons_follow_relabels_disable_and_unclose |
+| F-1 count without landing | killed: a_final_autosave_that_does_not_land_is_not_counted_or_indexed |
+| F-3 pending quit not cleared | killed: a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes |
+| L-1 supersede also bumps landed | killed: a_final_autosave_that_does_not_land_is_not_counted_or_indexed, superseding_raises_the_floor_and_landed_stays_on_disk |
+| L-1 floor ignored at landing | killed: superseding_one_document_leaves_another_documents_write_alone |
+| L-2 outstanding check dropped | killed: a_park_while_its_write_is_in_flight_is_skipped |
+
+
+Review-fix mutations, same procedure:
+
+| Mutation | Result |
+|---|---|
+| P-1 drawn (bulleted) labels used as the AT names | killed: a_tabs_close_button_names_its_document_and_closes_through_close_document, accessible_names_never_announce_the_unsaved_bullet |
+| P-1 widget ignores the set names | killed: a_tabs_close_button_names_its_document_and_closes_through_close_document, accessible_names_never_announce_the_unsaved_bullet |
+| P-2 disabled bar's close still maps | killed: a_disabled_strips_close_buttons_close_nothing |
+
+Review-fix tests: `accessible_names_never_announce_the_unsaved_bullet`,
+`a_disabled_strips_close_buttons_close_nothing`.
+
+**What is compiled-and-tested vs inspection-only on macOS.** Tested on
+Linux: the menu-id → command mapping, the dialog gate's exception, both
+shortcut tables. Type-checked for `x86_64-apple-darwin` (clippy `-D
+warnings`, `lcms2-sys` C build stubbed, nothing linked): `quit_menu_item`,
+`build_menu`, `handle_menu_event`. Inspection-only: that Cocoa delivers
+the item's `Cmd+Q` as a menu event, that `Cmd+W` and the other `Cmd`
+chords reach winit as key events, and that the Dock's Quit and logout
+reach `exiting` (read from winit 0.30.13's `app_state.rs`: only
+`applicationWillTerminate:` is implemented). Found while cross-checking,
+pre-existing: `build_menu` was already over clippy's 100-line limit on
+macOS since at least 0.171.1 (`fa49d57`, `2265307`, `a3d051c` all fail
+`cargo clippy --target x86_64-apple-darwin -p aurora-app -- -D warnings`);
+CI's clippy job runs on Linux only, so it never saw it. Now an explicit
+`#[allow(clippy::too_many_lines)]` on the declarative table.
+
+Deferred: per-document panel scroll (save on park, restore on activate)
+and evicting a parked store's resident tiles — the plan's items 3 and 4.
+Design questions for Cahya: the "×" glyph and its colour (the tab's text
+colour, no hover state — `ButtonState` has none); `Cmd+Shift+P` for the palette on
+macOS. Known weaknesses: the close button is drawn as part of the tab
+(no pressed/hover feedback); nothing ran on real macOS or with a screen
+reader; the App glue (`close_document_tab`, the `about_to_wait` poll,
+`ActivatedCommand::Quit` → `request_quit`) is not run by a test.
 
 **Addendum 2026-10-10 (0.174.0) — unsaved changes, close and quit (R5).**
 

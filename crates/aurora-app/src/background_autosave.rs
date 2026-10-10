@@ -132,9 +132,15 @@ pub(crate) enum Landing {
 struct State {
     /// One waiting job per document.
     queued: BTreeMap<u64, (Generation, AutosaveJob)>,
-    in_flight: Option<Generation>,
-    /// The newest generation landed (or superseded) per document.
+    /// The write in flight: its document and generation (0.175.0, L-2).
+    in_flight: Option<(u64, Generation)>,
+    /// The newest generation on disk per document (0.175.0, L-1: only
+    /// what really landed, a worker rename or a written synchronous
+    /// autosave — no longer a superseded one).
     landed: BTreeMap<u64, Generation>,
+    /// The stale floor per document (0.175.0, L-1): a write at or below
+    /// it never lands. Raised by [`AutosaveWorker::supersede`].
+    floor: BTreeMap<u64, Generation>,
     cancelled: bool,
     /// The run's index, when this worker keeps one.
     index: Option<IndexBook>,
@@ -315,22 +321,44 @@ impl AutosaveWorker {
                 "a synchronous autosave superseded a waiting one"
             );
         }
-        let landed = state.landed.entry(document).or_default();
-        *landed = (*landed).max(generation);
+        // L-1 (0.175.0): the floor, not `landed` — nothing is on disk yet.
+        let floor = state.floor.entry(document).or_default();
+        *floor = (*floor).max(generation);
         generation
     }
 
-    /// Gives this worker the run's index to keep (0.171.0) and writes it
-    /// if it already has something to list; `true` when the index on
-    /// disk matches.
-    /// The newest generation landed (or superseded by a synchronous
-    /// write) for `document` (0.173.0 review R-1): a job of generation `g`
-    /// is on disk once this is `>= g`. A failed write never advances it.
+    /// Records that `generation` of `document` is on disk, written on the
+    /// calling thread (0.175.0, L-1: the over-budget synchronous autosave).
+    pub(crate) fn mark_landed(&mut self, document: u64, generation: Generation) {
+        let mut state = self.shared.lock();
+        let landed = state.landed.entry(document).or_default();
+        *landed = (*landed).max(generation);
+    }
+
+    /// Whether `generation` of `document` is still waiting or being
+    /// written (0.175.0, L-2): a park at an unchanged revision then has
+    /// nothing new to submit.
+    pub(crate) fn outstanding(&self, document: u64, generation: Generation) -> bool {
+        let state = self.shared.lock();
+        state
+            .queued
+            .get(&document)
+            .is_some_and(|(queued, _)| *queued == generation)
+            || state.in_flight == Some((document, generation))
+    }
+
+    /// The newest generation on disk for `document` (0.173.0 review R-1;
+    /// since 0.175.0, L-1, only a worker landing or a written synchronous
+    /// autosave, [`Self::mark_landed`] — a [`Self::supersede`] raises the
+    /// stale floor instead): a job of generation `g` is on disk once this
+    /// is `>= g`. A failed write never advances it.
     pub(crate) fn landed(&self, document: u64) -> Option<Generation> {
         self.shared.lock().landed.get(&document).copied()
     }
 
-    /// Installs the index book (see [`IndexBook`]).
+    /// Gives this worker the run's index to keep (0.171.0) and writes it
+    /// if it already has something to list; `true` when the index on
+    /// disk matches. Installs the index book (see [`IndexBook`]).
     pub(crate) fn configure_index(&mut self, book: IndexBook) -> bool {
         let write = self.shared.lock().index.insert(book).prepare();
         finish_index_write(&self.shared, write)
@@ -490,7 +518,7 @@ fn run(shared: &Shared) {
                     .min_by_key(|(_, (generation, _))| *generation)
                     .map(|(document, _)| *document);
                 if let Some(queued) = oldest.and_then(|document| state.queued.remove(&document)) {
-                    state.in_flight = Some(queued.0);
+                    state.in_flight = Some((queued.1.document, queued.0));
                     break queued;
                 }
                 let Some((liveness, every)) = state.liveness.clone() else {
@@ -640,7 +668,14 @@ fn land(
     let landing = if state.cancelled || (shared.session_ending)() {
         crate::remove_autosave_temp(&written.temp);
         Landing::Cancelled
-    } else if generation <= state.landed.get(&job.document).copied().unwrap_or(0) {
+    } else if generation
+        <= state
+            .landed
+            .get(&job.document)
+            .copied()
+            .unwrap_or(0)
+            .max(state.floor.get(&job.document).copied().unwrap_or(0))
+    {
         crate::remove_autosave_temp(&written.temp);
         Landing::Stale
     } else if crate::land_autosave_temp(&written.temp, &written.destination, &job.path) {

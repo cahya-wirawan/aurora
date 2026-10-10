@@ -65,7 +65,47 @@ pub fn insert_document_tabs(
         .ok_or(WidgetError::UnknownWidget(bar))?;
     style.min_size.height = taffy::Dimension::ZERO;
     tree.set_style(bar, style)?;
+    // 0.175.0: every document tab has a "×" close button.
+    let _ = widgets::set_tab_bar_closable(tree, bar, true)?;
     Ok(bar)
+}
+
+/// Sets each document tab's accessible name (0.175.0 review P-1): the
+/// document's own name, without the unsaved marker the drawn label
+/// carries (the "unsaved" description says it). `Ok(false)` when unchanged.
+///
+/// # Errors
+///
+/// [`WidgetError`] if `bar` is not a tab bar.
+pub fn set_document_tab_names(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    names: Vec<String>,
+) -> Result<bool, WidgetError> {
+    widgets::set_tab_accessible_names(tree, bar, names)
+}
+
+/// Which document tab's close button `id` is (0.175.0), if any — the
+/// assistive-technology `Click` route.
+#[must_use]
+pub fn document_tab_close_index(
+    tree: &WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    id: WidgetId,
+) -> Option<usize> {
+    widgets::tab_close_index(tree, bar, id)
+}
+
+/// Which document tab's close button is under `point` (logical px), if
+/// any — the pointer route (0.175.0).
+#[must_use]
+pub fn document_tab_close_at(
+    tree: &WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    point: (f32, f32),
+) -> Option<usize> {
+    tree.hit_test(point)
+        .and_then(|hit| widgets::tab_close_index(tree, bar, hit))
 }
 
 /// Makes `panel` (the canvas area) the strip's `Role::TabPanel`, labelled

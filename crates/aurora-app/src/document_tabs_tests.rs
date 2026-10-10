@@ -2260,14 +2260,354 @@ fn a_dialog_save_to_a_non_aur_name_is_reported_and_a_waiting_quit_resumes() {
         close::exported_not_saved_title("a"),
         "\u{201c}a\u{201d} Was Exported, Not Saved"
     );
-    assert!(close::pending_quit_ready(true, false, false));
-    assert!(!close::pending_quit_ready(false, false, false));
+    // F-3 (0.175.0): taken once no dialog is open, and cleared then.
+    let mut pending = true;
     assert!(
-        !close::pending_quit_ready(true, true, false),
-        "still waits for the dialog"
+        !close::take_pending_quit(&mut pending, true, false),
+        "waits for the dialog"
     );
+    assert!(pending);
+    assert!(close::take_pending_quit(&mut pending, false, false));
     assert!(
-        !close::pending_quit_ready(true, false, true),
+        !pending,
+        "cleared: it cannot fire on a later dialog's close"
+    );
+    assert!(!close::take_pending_quit(&mut pending, false, false));
+    let mut pending = true;
+    assert!(
+        !close::take_pending_quit(&mut pending, false, true),
         "a review already runs"
     );
+    assert!(!pending, "and the request is dropped");
+}
+
+// -- 0.175.0 (R6) --
+
+/// AC-1: the platform's primary modifier binds the document chords —
+/// `Cmd` on macOS, `Ctrl` elsewhere — while `Ctrl+Tab` stays literal.
+#[test]
+fn the_shortcut_table_uses_cmd_on_macos_and_ctrl_elsewhere() {
+    let chord = |source: &str| match KeyChord::parse(source) {
+        Ok(chord) => chord,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert_eq!(crate::primary_modifier(true), "Cmd");
+    assert_eq!(crate::primary_modifier(false), "Ctrl");
+    let mac = crate::default_shortcuts_for(true);
+    let other = crate::default_shortcuts_for(false);
+    for (source, command) in [
+        ("W", AppCommand::CloseDocument),
+        ("Z", AppCommand::Undo),
+        ("Shift+Z", AppCommand::Redo),
+        ("Shift+N", AppCommand::NewLayer),
+        ("Shift+P", AppCommand::ToggleCommandPalette),
+    ] {
+        assert_eq!(
+            mac.resolve(chord(&format!("Cmd+{source}"))),
+            Some(&command),
+            "{source}"
+        );
+        assert_eq!(
+            mac.resolve(chord(&format!("Ctrl+{source}"))),
+            None,
+            "{source}"
+        );
+        assert_eq!(
+            other.resolve(chord(&format!("Ctrl+{source}"))),
+            Some(&command),
+            "{source}"
+        );
+        assert_eq!(
+            other.resolve(chord(&format!("Cmd+{source}"))),
+            None,
+            "{source}"
+        );
+    }
+    for table in [&mac, &other] {
+        assert_eq!(
+            table.resolve(chord("Ctrl+Tab")),
+            Some(&AppCommand::NextDocument)
+        );
+        assert_eq!(
+            table.resolve(chord("Ctrl+Shift+Tab")),
+            Some(&AppCommand::PreviousDocument)
+        );
+    }
+    assert_eq!(mac.len(), other.len());
+}
+
+/// AC-1: the macOS application menu's "Quit Aurora" item maps to the quit
+/// review's command — the same `App::request_quit` a window close runs —
+/// and is the one menu command allowed past an open dialog.
+#[test]
+fn the_quit_menu_command_routes_to_the_quit_review() {
+    let dir = tempdir();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let picked = crate::activate_command(
+        &mut rig.workspace,
+        &mut rig.focus,
+        crate::COMMAND_APP_QUIT,
+        &mut FakeFileDialog::default(),
+    );
+    assert_eq!(picked, Some(ActivatedCommand::Quit));
+    assert!(crate::menu_command_allowed_with_dialog(
+        crate::COMMAND_APP_QUIT
+    ));
+    assert!(!crate::menu_command_allowed_with_dialog(
+        crate::COMMAND_FILE_SAVE
+    ));
+    assert!(!crate::menu_command_allowed_with_dialog(
+        close::COMMAND_FILE_CLOSE
+    ));
+}
+
+/// L-1 (0.175.0): superseding raises the stale floor, not `landed` —
+/// `landed` is what is on disk.
+#[test]
+fn superseding_raises_the_floor_and_landed_stays_on_disk() {
+    let (dir_a, autosaves) = (tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4253);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let mut rig = Rig::new(a);
+    let id = rig.doc.id.get();
+    let _superseded = worker.supersede(id);
+    assert_eq!(worker.landed(id), None, "nothing is on disk");
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    let landed = worker.landed(id);
+    assert!(landed.is_some(), "a newer write lands above the floor");
+    let floor = worker.supersede(id);
+    assert_eq!(worker.landed(id), landed, "a supersede is not a landing");
+    worker.mark_landed(id, floor);
+    assert_eq!(
+        worker.landed(id),
+        Some(floor),
+        "a written synchronous autosave is"
+    );
+}
+
+/// L-2 (0.175.0): a park at an unchanged revision while its write is
+/// still in flight submits nothing new.
+#[test]
+fn a_park_while_its_write_is_in_flight_is_skipped() {
+    let (dir_a, autosaves) = (tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4254);
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new((started_tx, release_rx, true));
+    let mut worker = background_autosave::AutosaveWorker::new(
+        move |job, cancel| {
+            if let Ok(mut gate) = gate.lock()
+                && gate.2
+            {
+                gate.2 = false;
+                let _ = gate.0.send(());
+                let _ = gate.1.recv_timeout(std::time::Duration::from_secs(20));
+            }
+            crate::write_autosave_temp(job, cancel)
+        },
+        || false,
+    );
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let mut rig = Rig::new(a);
+    let id = rig.doc.id.get();
+    assert!(
+        park_now(&mut rig, &mut worker, &namespace),
+        "the first park submits"
+    );
+    assert!(
+        started
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .is_ok()
+    );
+    let Some((_, generation)) = rig.doc.park_autosave else {
+        unreachable!("a complete snapshot was submitted")
+    };
+    assert!(worker.outstanding(id, generation), "in flight");
+    assert!(
+        !park_now(&mut rig, &mut worker, &namespace),
+        "same revision, write in flight: skipped"
+    );
+    let _ = release.send(());
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(!worker.outstanding(id, generation));
+    assert!(worker.landed(id).is_some_and(|landed| landed >= generation));
+    assert!(
+        !park_now(&mut rig, &mut worker, &namespace),
+        "landed: skipped"
+    );
+}
+
+/// F-1 (0.175.0): a final autosave that did not land is neither counted
+/// nor named in the index.
+#[test]
+fn a_final_autosave_that_does_not_land_is_not_counted_or_indexed() {
+    let (dir_a, root) = (tempdir(), tempdir());
+    let autosaves = root.path().join("autosaves");
+    if let Err(err) = std::fs::create_dir(&autosaves) {
+        unreachable!("{err:?}");
+    }
+    let namespace = autosave_files::AutosaveNamespace::acquire(autosaves.clone(), 4255);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let mut rig = Rig::new(a);
+    let id = rig.doc.id;
+    edit(&mut rig.doc);
+    // The autosave directory is gone: the write cannot land.
+    if let Err(err) = std::fs::remove_dir_all(&autosaves) {
+        unreachable!("{err:?}");
+    }
+    let written =
+        close::final_autosave_unsaved(&mut worker, &namespace, &mut rig.shelf, &mut rig.doc);
+    assert_eq!(written, 0, "not counted");
+    assert_eq!(worker.landed(id.get()), None, "not recorded as landed");
+    assert!(!namespace.session_path(id.get()).exists());
+}
+
+/// AC-2 (0.175.0): a document tab's "×" is hit by the pointer at its own
+/// box, maps to that tab's document by id, and closes it through Close
+/// Document's own path — a clean one at once, an unsaved one asks.
+#[test]
+fn a_tabs_close_button_names_its_document_and_closes_through_close_document() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    edit(&mut rig.doc);
+    let _ = refresh(&mut rig);
+    rig.workspace.tree.compute_layout(1280.0, 800.0);
+    let bar = rig.workspace.document_tabs;
+    for (index, id, step) in [
+        (0, a_id, CloseStep::Close(a_id)),
+        (1, b_id, CloseStep::Ask(b_id)),
+    ] {
+        let Some(button) =
+            aurora_widgets::widgets::tab_close_button(&rig.workspace.tree, bar, index)
+        else {
+            unreachable!("tab {index} is closable")
+        };
+        let Some(bounds) = rig.workspace.tree.bounds(button) else {
+            unreachable!("laid out")
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+        assert_eq!(
+            aurora_ui::document_tab_close_at(&rig.workspace.tree, bar, center),
+            Some(index)
+        );
+        let name = rig
+            .workspace
+            .tree
+            .accessibility(button)
+            .and_then(|node| node.label().map(str::to_owned));
+        let expected = if index == 0 { "Close a" } else { "Close b" };
+        assert_eq!(name.as_deref(), Some(expected));
+        assert_eq!(close::tab_document(&rig.shelf, &rig.doc, index), Some(id));
+        assert_eq!(close::begin_close(&mut rig.cx(None), id), step);
+    }
+    // A press on the tab's label is not a close.
+    let Some(tab) = strip(&rig).2.first().copied() else {
+        unreachable!("a tab")
+    };
+    let Some(bounds) = rig.workspace.tree.bounds(tab) else {
+        unreachable!("laid out")
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let left = (
+        bounds.x as f32 + 2.0,
+        bounds.y as f32 + bounds.height as f32 / 2.0,
+    );
+    assert_eq!(
+        aurora_ui::document_tab_close_at(&rig.workspace.tree, bar, left),
+        None
+    );
+    assert_eq!(close::tab_document(&rig.shelf, &rig.doc, 9), None);
+}
+
+/// Review P-1 (0.175.0): the drawn label carries the unsaved bullet, but
+/// neither the tab's accessible name nor its close button's does — the
+/// "unsaved" description says it.
+#[test]
+fn accessible_names_never_announce_the_unsaved_bullet() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let _ = rig.open(b);
+    edit(&mut rig.doc);
+    assert!(refresh(&mut rig));
+    assert_eq!(strip(&rig).0, tab_names(&["a", "\u{2022} b"]), "drawn");
+    let bar = rig.workspace.document_tabs;
+    let Some(&b_tab) = strip(&rig).2.get(1) else {
+        unreachable!("two tabs")
+    };
+    let node = rig.workspace.tree.accessibility(b_tab);
+    assert_eq!(
+        node.and_then(|node| node.label()),
+        Some("b"),
+        "the tab's name"
+    );
+    assert_eq!(node.and_then(|node| node.description()), Some("unsaved"));
+    let close = aurora_widgets::widgets::tab_close_button(&rig.workspace.tree, bar, 1)
+        .and_then(|button| rig.workspace.tree.accessibility(button))
+        .and_then(|node| node.label().map(str::to_owned));
+    assert_eq!(close.as_deref(), Some("Close b"));
+    // A rename follows (the names are re-set on every sync).
+    "c.aur".clone_into(&mut rig.doc.name);
+    assert!(refresh(&mut rig));
+    let node = rig.workspace.tree.accessibility(b_tab);
+    assert_eq!(node.and_then(|node| node.label()), Some("c.aur"));
+}
+
+/// Review P-2 (0.175.0): a disabled bar's close buttons close nothing, by
+/// pointer or assistive technology (both routes go through
+/// `tab_close_index`).
+#[test]
+fn a_disabled_strips_close_buttons_close_nothing() {
+    let dir = tempdir();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    rig.workspace.tree.compute_layout(1280.0, 800.0);
+    let bar = rig.workspace.document_tabs;
+    let Some(button) = aurora_widgets::widgets::tab_close_button(&rig.workspace.tree, bar, 0)
+    else {
+        unreachable!("closable")
+    };
+    let Some(bounds) = rig.workspace.tree.bounds(button) else {
+        unreachable!("laid out")
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let center = (
+        bounds.x as f32 + bounds.width as f32 / 2.0,
+        bounds.y as f32 + bounds.height as f32 / 2.0,
+    );
+    assert_eq!(
+        aurora_ui::document_tab_close_at(&rig.workspace.tree, bar, center),
+        Some(0)
+    );
+    assert!(
+        aurora_widgets::widgets::set_tab_bar_disabled(&mut rig.workspace.tree, bar, true).is_ok()
+    );
+    assert_eq!(
+        aurora_ui::document_tab_close_at(&rig.workspace.tree, bar, center),
+        None,
+        "pointer"
+    );
+    assert_eq!(
+        aurora_ui::document_tab_close_index(&rig.workspace.tree, bar, button),
+        None,
+        "assistive technology"
+    );
+    let node = rig.workspace.tree.accessibility(button);
+    assert!(node.is_some_and(|node| !node.supports_action(accesskit::Action::Click)));
 }
