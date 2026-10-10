@@ -527,9 +527,12 @@ pub(crate) fn is_group_root(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool
     matches!(tree.payload(id), Some(WidgetKind::Container))
         && matches!(tree.payload(first), Some(WidgetKind::TabBar(_)))
         && !rest.is_empty()
-        && rest
-            .iter()
-            .all(|&child| matches!(tree.payload(child), Some(WidgetKind::Panel)))
+        && rest.iter().all(|&child| {
+            matches!(
+                tree.payload(child),
+                Some(WidgetKind::Panel | WidgetKind::RaisedPanel)
+            )
+        })
 }
 
 /// Re-derives a group root's own style from its shown member (see this

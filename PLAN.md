@@ -26,7 +26,61 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.166.0): drag-to-redock docked panels, the
+**Latest (2026-10-10, 0.167.0): floating panels, inside the main
+window.** Workspace round 5, second half. A panel or tab dragged past
+`PANEL_DRAG_THRESHOLD` and dropped anywhere over the canvas area (not
+the rail, status bar, tools panel or options bar) floats there, the
+grabbed point kept under the pointer; while dragging, an
+`accent.primary` `Target` outline (`size.indicator_width`) shows where
+it will appear; Escape still cancels with the tree byte-identical. A
+floating slot (a lone panel or a whole tab group) is an absolutely
+placed child of the canvas area — same frame, same widget tree
+(invariant 8) — drawn under every later root child (drop indicator,
+dialogs, palette) and every popover: a frame of the new generic
+`aurora_widgets::WidgetKind::RaisedPanel` (`surface.raised`, Elevation 1,
+`radius.sm`, `border.default`; in Dark the lighter surface the
+`elevation.*` comment asks for; no shadow is drawn, nothing draws
+shadows), its panel roots switched to `RaisedPanel` too. Default and
+only width: the rail's (capped at the canvas area's); height from its
+content (every floating panel is `PanelSizing::Content`, capped at
+`size.content_panel_max_rows` body rows and at the canvas height), body
+scrolling. A floating title row drags it (a floating group by a new
+`spacing.sm`-tall grip above its tabs — its tabs fill the whole strip);
+the same drag re-docks it into a rail gap or joins a rail or floating
+group; a floating group's tab drags that panel out to dock or float.
+`aurora_ui::sync_floating_frames` clamps every float wholly inside the
+canvas area after every layout (`aurora-app`'s `layout_workspace`, the
+one layout path: window resize, rail resize/collapse, scale change,
+first layout after load). Input: `pointer_in_canvas` is `None` over a
+float (no stroke starts or continues, the wheel scrolls it), and any
+press on one raises it (`aurora_ui::raise_floating`, a `move_child`, no
+rebuild). Keyboard: six palette commands, "Float/Dock <Layers|
+Properties|History> Panel" (two commands, not a toggle: static labels
+must say what they do); Float cascades it and focuses it, Dock puts it
+at the rail's end, expanding a collapsed rail, and focuses it; Reset
+Panel Layout docks everything. A floating panel is a `Tab` stop (its
+frame sits between the options bar and the rail), a non-modal
+`Region` named by its title and described "Floating". Collapsed rail:
+floats stay visible and draggable, and have **no** strip button
+(hidden, AT-hidden). Model: `DockPlacement::Floating { x, y }`,
+`FloatSlot`, `SlotRef`, `DropTarget::{JoinFloating, Float}`,
+`DockArrangement::{floating, locate, moved_slot, raised,
+repaired_placed}`. Persistence: a fifth `WorkspaceLayout` version —
+`SavedPlacement::Floating { x, y }` plus an appended `float_stack`; the
+0.166.0 shape is `WorkspaceLayoutV4` (current → V4 → V3 → V2 → V1);
+damaged floats repair (non-finite → docked, negative → 0, out of bounds
+→ clamped by the first layout, bad stack rebuilt). Layout changes never
+reach `History`. Full gate with `AURORA_REQUIRE_GPU=1` (a CPU or missing
+adapter fails; the adapter's name is not in this run's captured log —
+this box's GPU is the RTX 3090 of earlier rounds), one pass: fmt, layering, style lint, `check --locked`, clippy `-D warnings`, **3,124 passed, 0 failed, 61 ignored, 0 skipped** (3,128 after the review revision, below), strict rustdoc, `cargo deny`, contrast exit 0 (a first gate attempt failed only at rustdoc — `<Panel>` read as HTML in four doc comments and one private intra-doc link — fixed, then the whole gate re-run from the top). Branch `005-floating_panels_overlay`.
+Review revision: a closed floating panel's frame now hides (no invisible
+band over the canvas), raises saturate, and the Curves rule no longer
+expands a collapsed rail for a floating Properties panel.
+**Not verified:** interactive drag/raise feel on real hardware,
+VoiceOver, the macOS menu dispatch arm (not compiled here, Linux only).
+Details: "Next action", addendum 0.167.0.
+
+**Previous (2026-10-10, 0.166.0): drag-to-redock docked panels, the
 arrangement persisted.** Workspace round 5, first half (floating panels
 are 0.167.0). A press on a lone panel's title row or on a group's tab
 that travels more than `aurora_ui::PANEL_DRAG_THRESHOLD` (4 logical px,
@@ -7455,9 +7509,13 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03 (**update 0.166.0:** drag-to-redock — reorder, join as a
+  2026-08-03 (**update 0.167.0:** floating panels inside the main window
+  — tear off over the canvas, move, raise, re-dock, join/split floating
+  groups, clamp, Float/Dock commands, persisted as a fifth layout
+  version; separate OS windows out of scope — "Next action", addendum
+  0.167.0; **update 0.166.0:** drag-to-redock — reorder, join as a
   tab, tab out; a keyboard/palette path; the arrangement persisted and
-  repaired on load; floating panels still open (0.167.0) — "Next action",
+  repaired on load — "Next action",
   addendum 0.166.0; **update 0.161.0:** the rail shares height by content —
   Layers and Properties content-sized and capped, History fills, every
   panel floored at one body row — and Properties auto-expands on the
@@ -31162,6 +31220,142 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.167.0) — floating panels inside the main
+window.** Branch `005-floating_panels_overlay` (from `main` at 1d143e0,
+0.166.0). Files: `aurora-widgets` `widgets/mod.rs`
+(`WidgetKind::RaisedPanel`), `paint.rs` (`paint_raised_panel`, one test),
+`text.rs` (a `RaisedPanel` region still draws its title), `action.rs`/
+`widgets/tooltip.rs` (every-kind guards extended); `aurora-ui` `dock.rs`
+(floating model; three tests), `redock.rs` (apply with frames, drag
+sources and targets, Float/Dock, slot moves; seven tests, two 0.166.0
+tests adapted — the canvas is now a float target, the status bar and
+tools panel still are not), `workspace.rs` (`Workspace::floating`,
+`FloatFrame`, `all_slots`, `docked_sizing`, `sync_floating_frames`,
+`floating_index_at`, `raise_floating`), `panel.rs` (`set_panel_raised`,
+`FLOATING_DESCRIPTION`), `panel_group.rs` (a group root may hold
+`RaisedPanel`s), `lib.rs`; `aurora-app` `lib.rs` (`layout_workspace`'s
+clamp loop, `pointer_in_canvas`, raise in `panel_pointer_pressed`,
+`WorkspaceLayout.float_stack` + `WorkspaceLayoutV4`,
+`SavedPlacement::Floating`, `PANEL_FLOAT_COMMANDS`,
+`ActivatedCommand::SetPanelFloating` at both dispatch sites,
+`run_panel_float`, seven tests in `panel_tab_groups::floating_panels`,
+one palette-count test updated). 3,106 + 18 = **3,124 tests**, measured (1 `aurora-widgets`, 3 `dock`, 7 `redock`, 7 `aurora-app`).
+
+Evidence per criterion: AC-1 `a_drop_over_the_canvas_floats_and_escape_
+cancels`, `the_app_pointer_order_floats_moves_joins_and_redocks`; AC-2
+`a_floating_title_drag_moves_clamped_and_redocks`, `floating_and_docked_
+groups_join_and_split`, `floating_moves_join_split_raise_and_redock`,
+`no_floating_move_ever_leaves_an_empty_slot`, the App-order test; AC-3
+`input_over_a_floating_panel_never_reaches_the_canvas` (no canvas point,
+wheel scrolls the body, a dropdown list stays above a float on top, a
+modal wins and blocks the raise, a press raises), `raising_a_floating_
+panel_puts_it_on_top`; AC-4 `floating_panels_clamp_at_scale_one_and_two`
+(load, window shrink, rail widen, rail collapse, scale change, at 1 and
+2), `floating_panels_clamp_on_resize_rail_width_and_collapse`; AC-5
+`the_float_and_dock_commands_and_reset_work_with_focus`, `floating_
+panels_are_tab_stops_and_float_and_dock_move_focus`; AC-6 `floats_round_
+trip_and_older_layouts_still_decode`, `damaged_floats_repair_and_
+truncated_or_garbage_bytes_are_safe` (every prefix length of a current
+file, `0xff` garbage), `a_damaged_float_repairs_by_clamping_or_docking`;
+AC-7 `a_collapsed_rail_keeps_floating_panels_usable_without_a_strip_
+button`, `a_collapsed_rail_leaves_floating_panels_focused_and_usable`;
+paint `a_raised_panel_paints_surface_raised_and_nothing_when_empty`.
+
+Mutations (each file backed up to the scratchpad, mutated, the named
+crate's tests run with `AURORA_REQUIRE_GPU=1`, restored, `touch`ed,
+sha256 checked — all restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| F1 | the canvas area is no float target | killed: 4 `aurora-ui` tests incl. `a_drop_over_the_canvas_floats_and_escape_cancels` |
+| F2 | `pointer_in_canvas` ignores floats | killed: `input_over_a_floating_panel_never_reaches_the_canvas`, `a_collapsed_rail_leaves_floating_panels_focused_and_usable` |
+| F3 | `sync_floating_frames` does not clamp | killed: `floating_panels_clamp_on_resize_rail_width_and_collapse`; app: `floating_panels_clamp_at_scale_one_and_two`, the damaged-floats test |
+| F4 | no raise on press (app) | killed: `input_over_a_floating_panel_never_reaches_the_canvas` |
+| F4b | `raise_floating` leaves the tree order | killed: `raising_a_floating_panel_puts_it_on_top` |
+| F5 | no V4 (0.166.0) fallback decode | killed: `floats_round_trip_and_older_layouts_still_decode` |
+| F6 | a non-finite float is kept, not docked | killed: `a_damaged_float_repairs_by_clamping_or_docking`; app: the damaged-floats test |
+| F7 | the stack repair keeps bad/duplicate entries | **survived** — redundant: `repaired_placed` drops the duplicates it lets through, and `filter_map` the out-of-range ones |
+| F8 | a floating panel keeps its strip button | killed: 2 `aurora-ui` tests |
+| F9 | a float keeps its docked sizing | **survived** at first; two assertions added (sizing read off the tree; a floating History's viewport taller than three rows), then killed: `floating_panels_are_tab_stops_and_float_and_dock_move_focus`, `input_over_a_floating_panel_never_reaches_the_canvas` |
+| F10 | a floating group's grip is no drag handle | killed: `floating_and_docked_groups_join_and_split` |
+| F11 | the float outline is never shown | killed: `a_drop_over_the_canvas_floats_and_escape_cancels` |
+
+Disclosures: (1) **interactive feel is not verified** — all headless; no
+human has dragged, raised or scrolled a floating panel, nor heard one
+with VoiceOver. (2) **No keyboard way to move a floating panel**
+(only Float, Dock, Reset); the move commands are no-ops on a floating
+panel. (3) Raising reorders the canvas area's children, so the `Tab`
+and AccessKit order among floating panels follows their stacking
+(bottom first). (4) The clamp is stored: a float pushed in by a smaller
+window stays where it was pushed when the window grows back (and the
+first layout after load clamps against whatever size it runs at). (5) A
+float's width is the rail's, live; floats cannot be resized on their
+own. (6) The drag outline's height is the dragged panel's current
+height, an approximation of the floated height. (7) A floating group's
+grip (`spacing.sm` tall) is new chrome, painted only by the frame's
+`surface.raised`; whether it should exist, its height, and whether it
+should draw anything is a design-owner question. (8) `surface.raised`
+for floats is the same fill a dropdown list on them uses — told apart by
+the border only (design-owner question); the `elevation.1` shadow is not
+drawn. (9) The Float/Dock commands are palette-only (not in the macOS
+menus); the macOS dispatch arm was edited by inspection and not
+compiled here (Linux only, no Apple target installed). (10) A stroke
+dragged across a floating panel gets no dabs while over it (moves there
+are the panel's); on leaving, `continue_drag` interpolates from the last
+point before the float, so dabs land in a straight line *under* the
+panel. A middle-button or Space pan pauses while the pointer is over a
+float. Both match the rail's behaviour (review J-2/J-4). (11) Any press on
+a float raises it, including one that then starts a drag. (12) The
+`App` methods themselves are not run headlessly; the free functions
+they call in order are. (13) No new design token; no ADR.
+
+**Review revision (same round, judge REVISE at 0.886).** J-1 (medium)
+— *fixed*: closing a floating panel left its `RaisedPanel` frame in the
+tree; a fully closed floating group kept its grip, an invisible band
+that blocked strokes and the wheel and could still start a drag. New
+`aurora_ui::sync_floating_shown` hides a frame (`Display::None`,
+AT-hidden) whenever nothing in it is open and shows it again, at its
+old position, on reopen; the close, toggle, tab-select and
+re-arrangement paths call it, and `sync_floating_frames` runs it as a
+backstop after every layout (and leaves a hidden frame's position
+alone). `floating_index_at`, the drag sources and the float targets
+skip hidden frames. Tests `closing_a_floating_panel_hides_its_frame_
+and_reopening_restores_it` (lone panel and group; one open tab keeps the
+frame; focus leaves the hidden panel; reopen in place) and `a_closed_
+floating_panel_gives_the_canvas_back` (palette Close/Toggle;
+`pointer_in_canvas` and the wheel get the canvas back under the old
+rect and the grip band). J-3 (low) — *fixed*: `raise_floating` and
+`DockArrangement::raised` use `saturating_add`; the raise test calls
+`raise_floating(usize::MAX)`. J-2/J-4 (low) — *disclosed, not changed*
+(the rail behaves the same): a live stroke whose pointer crosses a
+floating panel gets no dabs while over it, and when it leaves,
+`continue_drag` interpolates from the last point before the float, so
+dabs land in a straight line *under* the panel; a middle-button or
+Space pan likewise pauses while the pointer is over a float. Self-checks:
+(a) *fixed* — the Curves rule expanded a collapsed rail even with
+Properties floating; now it raises Properties' float instead and leaves
+the rail alone, and `expand_rail_showing` never expands the rail for a
+floating panel (tests `the_curves_rule_shows_a_floating_properties_
+without_expanding_the_rail`, `showing_a_floating_panel_leaves_a_
+collapsed_rail_collapsed`); (b) *tested* — after a raise the AccessKit
+tree lists the frames under the canvas area in stacking order and every
+panel root is exactly one node's child (added to `raising_a_floating_
+panel_puts_it_on_top`); (c) *checked* — the `aurora-widgets` change is
+one kind, its paint and its title rule, with no document, layer or
+panel knowledge. Revision mutations:
+
+| # | Mutation | Result |
+|---|---|---|
+| R1 | a fully closed float's frame is never hidden | killed: `closing_a_floating_panel_hides_its_frame_and_reopening_restores_it`; app: `a_closed_floating_panel_gives_the_canvas_back` |
+| R2 | `floating_index_at` counts hidden frames | **survived** — redundant: a hidden frame lays out zero-sized, so the hit test never reaches it |
+| R3 | drag sources include hidden frames | **survived** — redundant, the same reason (`contains` refuses a zero-area rect) |
+| R4 | the Curves rule expands the rail for a floating Properties | killed: `the_curves_rule_shows_a_floating_properties_without_expanding_the_rail` |
+| R5 | `expand_rail_showing` expands the rail for a float | killed: `showing_a_floating_panel_leaves_a_collapsed_rail_collapsed` |
+| R6 | the layout clamp moves hidden frames | killed: the closing test (a reopened panel came back elsewhere) |
+| R7 | `wrapping_add` in `raise_floating` | killed: `raising_a_floating_panel_puts_it_on_top` |
+
+Revision gate, one pass after the last code change (`AURORA_REQUIRE_GPU=1`): fmt, layering, style lint, `check --locked`, clippy `-D warnings`, **3,128 passed, 0 failed, 61 ignored, 0 skipped** (3,124 + 4: two `redock`, two `aurora-app`), strict rustdoc, `cargo deny`, contrast exit 0.
 
 **Addendum 2026-10-10 (0.166.0) — drag-to-redock, the arrangement
 persisted.** Branch `004-floating_panels` (from `main` at baef68f,

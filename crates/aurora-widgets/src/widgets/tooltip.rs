@@ -481,6 +481,7 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::ListRow(_)
         | WidgetKind::TreeItem(_)
         | WidgetKind::Panel
+        | WidgetKind::RaisedPanel
         | WidgetKind::Dialog
         | WidgetKind::Dropdown(_)
         | WidgetKind::DropdownList
@@ -1250,6 +1251,7 @@ mod tests {
             WidgetKind::CurveEditorPoint(_) => 22,
             WidgetKind::Label(_) => 23,
             WidgetKind::DropIndicator(_) => 24,
+            WidgetKind::RaisedPanel => 25,
         }
     }
 
@@ -1332,6 +1334,12 @@ mod tests {
             Style::default(),
             accesskit::Node::new(Role::Pane),
             WidgetKind::Panel,
+        ));
+        ok(tree.insert(
+            root,
+            Style::default(),
+            accesskit::Node::new(Role::Pane),
+            WidgetKind::RaisedPanel,
         ));
         ok(insert_dialog(
             &mut tree,

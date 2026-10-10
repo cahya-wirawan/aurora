@@ -2724,6 +2724,23 @@ fn startup_document(
 /// whichever group holds Properties and History both, else `0` — so a
 /// 0.165.0 build reading this file (which ignores the trailing `dock`)
 /// gets a sensible tab.
+///
+/// **0.167.0: floating panels, a fifth version.** A slot's placement can
+/// now be [`SavedPlacement::Floating`] — its position in logical px from
+/// the canvas area's top-left — and `float_stack`, the floating slots'
+/// stacking order bottom to top (indices into `dock`), is appended; the
+/// 0.166.0 shape is [`WorkspaceLayoutV4`], so the chain is current → V4 →
+/// V3 → V2 → V1. The appended field is what keeps a 0.166.0 file from
+/// decoding as the current shape (its bytes run out before it), so the
+/// fallback is real rather than a variant that merely happens to decode.
+/// A 0.166.0 build reading a 0.167.0 file fails on the new placement tag
+/// and falls back to its own V3 (the default arrangement) — floats are
+/// lost to an older build, nothing else. Damaged floats are repaired on
+/// load: a stack naming no floating slot, a duplicate or a missing one
+/// is rebuilt from `dock`'s own order; a non-finite position docks the
+/// slot; a negative one is pulled to `0`
+/// ([`aurora_ui::DockArrangement::repaired_placed`]); an out-of-bounds one
+/// is clamped by the first layout ([`aurora_ui::sync_floating_frames`]).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WorkspaceLayout {
@@ -2734,10 +2751,11 @@ struct WorkspaceLayout {
     panel_group_tab: u32,
     rail_collapsed: bool,
     dock: Vec<SavedDockSlot>,
+    float_stack: Vec<u32>,
 }
 
 /// One saved dock slot (0.166.0).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SavedDockSlot {
     placement: SavedPlacement,
     panels: Vec<String>,
@@ -2745,11 +2763,27 @@ struct SavedDockSlot {
 }
 
 /// Where a saved slot lives — see [`aurora_ui::DockPlacement`]. An enum
-/// on the wire (a `postcard` varint tag), so a later variant decodes
-/// alongside this one without a new layout version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// on the wire (a `postcard` varint tag). `Floating` (0.167.0) is
+/// appended, so a 0.166.0 `Rail` slot decodes unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum SavedPlacement {
     Rail,
+    Floating { x: f32, y: f32 },
+}
+
+/// The layout as saved by 0.166.0 — a dock arrangement, no float stack.
+/// Its slots decode with [`SavedDockSlot`] (whose `Rail` tag is the one
+/// 0.166.0 wrote; a 0.166.0 file never holds a `Floating` one).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayoutV4 {
+    rail_width: f32,
+    layers_collapsed: bool,
+    properties_collapsed: bool,
+    history_collapsed: bool,
+    panel_group_tab: u32,
+    rail_collapsed: bool,
+    dock: Vec<SavedDockSlot>,
 }
 
 // Four independent on/off preferences in a fixed wire format: an enum
@@ -2797,18 +2831,39 @@ fn default_saved_dock(panel_group_tab: u32) -> Vec<SavedDockSlot> {
 
 /// An arrangement as saved slots.
 fn saved_dock(arrangement: &aurora_ui::DockArrangement) -> Vec<SavedDockSlot> {
+    let saved = |placement, slot: &aurora_ui::DockSlot| SavedDockSlot {
+        placement,
+        panels: slot
+            .panels
+            .iter()
+            .map(|panel| panel.key().to_owned())
+            .collect(),
+        selected: u32::try_from(slot.selected).unwrap_or(0),
+    };
     arrangement
         .slots()
         .iter()
-        .map(|slot| SavedDockSlot {
-            placement: SavedPlacement::Rail,
-            panels: slot
-                .panels
-                .iter()
-                .map(|panel| panel.key().to_owned())
-                .collect(),
-            selected: u32::try_from(slot.selected).unwrap_or(0),
-        })
+        .map(|slot| saved(SavedPlacement::Rail, slot))
+        .chain(arrangement.floating().iter().map(|float| {
+            saved(
+                SavedPlacement::Floating {
+                    x: float.x,
+                    y: float.y,
+                },
+                &float.slot,
+            )
+        }))
+        .collect()
+}
+
+/// The floating slots' stacking order for [`saved_dock`]'s output: their
+/// indices in it, bottom to top (0.167.0). `saved_dock` lists the rail
+/// first and the floats in stacking order, so this is the floats' own
+/// indices in turn.
+fn saved_float_stack(arrangement: &aurora_ui::DockArrangement) -> Vec<u32> {
+    let rail = arrangement.slots().len();
+    (rail..rail + arrangement.floating().len())
+        .filter_map(|index| u32::try_from(index).ok())
         .collect()
 }
 
@@ -2816,24 +2871,57 @@ fn saved_dock(arrangement: &aurora_ui::DockArrangement) -> Vec<SavedDockSlot> {
 /// missing panels, empty slots, out-of-range tabs —
 /// [`aurora_ui::DockArrangement::repaired`]). Returns whether anything
 /// was repaired.
-fn arrangement_from_saved(dock: &[SavedDockSlot]) -> (aurora_ui::DockArrangement, bool) {
+fn arrangement_from_saved(
+    dock: &[SavedDockSlot],
+    float_stack: &[u32],
+) -> (aurora_ui::DockArrangement, bool) {
+    let entry = |slot: &SavedDockSlot| {
+        let placement = match slot.placement {
+            SavedPlacement::Rail => aurora_ui::DockPlacement::Rail,
+            SavedPlacement::Floating { x, y } => aurora_ui::DockPlacement::Floating { x, y },
+        };
+        (
+            placement,
+            slot.panels
+                .iter()
+                .map(|key| aurora_ui::DockPanel::from_key(key))
+                .collect(),
+            usize::try_from(slot.selected).unwrap_or(usize::MAX),
+        )
+    };
+    let is_floating = |index: usize| {
+        dock.get(index)
+            .is_some_and(|slot| matches!(slot.placement, SavedPlacement::Floating { .. }))
+    };
+    // The stacking order (0.167.0), repaired: entries naming no floating
+    // slot and repeats dropped, floating slots it leaves out appended in
+    // `dock` order.
+    let mut order: Vec<usize> = Vec::new();
+    let mut stack_repaired = false;
+    for &index in float_stack {
+        match usize::try_from(index) {
+            Ok(index) if is_floating(index) && !order.contains(&index) => order.push(index),
+            _ => stack_repaired = true,
+        }
+    }
+    for index in (0..dock.len()).filter(|&index| is_floating(index)) {
+        if !order.contains(&index) {
+            stack_repaired = true;
+            order.push(index);
+        }
+    }
     let raw = dock
         .iter()
-        .map(|slot| {
-            let SavedPlacement::Rail = slot.placement;
-            (
-                slot.panels
-                    .iter()
-                    .map(|key| aurora_ui::DockPanel::from_key(key))
-                    .collect(),
-                usize::try_from(slot.selected).unwrap_or(usize::MAX),
-            )
-        })
+        .filter(|slot| matches!(slot.placement, SavedPlacement::Rail))
+        .map(entry)
+        .chain(order.iter().filter_map(|&index| dock.get(index)).map(entry))
         .collect();
-    aurora_ui::DockArrangement::repaired(raw)
+    let (arrangement, repaired) = aurora_ui::DockArrangement::repaired_placed(raw);
+    (arrangement, repaired || stack_repaired)
 }
 
-/// Decodes a saved layout: the current shape first, then the 0.165.0 one
+/// Decodes a saved layout: the current shape first, then the 0.166.0 one
+/// (no float stack), then the 0.165.0 one
 /// (the default arrangement), the 0.164.0 one (the rail also loads
 /// expanded), then the pre-0.164.0 one (whose missing tab also becomes
 /// the default tab). The error reported is the current shape's.
@@ -2842,6 +2930,20 @@ fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Er
         Ok(layout) => return Ok(layout),
         Err(err) => err,
     };
+    // 0.166.0: the arrangement as saved; its floats' stack (it had none)
+    // is rebuilt from `dock`'s order.
+    if let Ok(v4) = postcard::from_bytes::<WorkspaceLayoutV4>(bytes) {
+        return Ok(WorkspaceLayout {
+            rail_width: v4.rail_width,
+            layers_collapsed: v4.layers_collapsed,
+            properties_collapsed: v4.properties_collapsed,
+            history_collapsed: v4.history_collapsed,
+            panel_group_tab: v4.panel_group_tab,
+            rail_collapsed: v4.rail_collapsed,
+            dock: v4.dock,
+            float_stack: Vec::new(),
+        });
+    }
     if let Ok(v3) = postcard::from_bytes::<WorkspaceLayoutV3>(bytes) {
         return Ok(WorkspaceLayout {
             rail_width: v3.rail_width,
@@ -2851,6 +2953,7 @@ fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Er
             panel_group_tab: v3.panel_group_tab,
             rail_collapsed: v3.rail_collapsed,
             dock: default_saved_dock(v3.panel_group_tab),
+            float_stack: Vec::new(),
         });
     }
     if let Ok(v2) = postcard::from_bytes::<WorkspaceLayoutV2>(bytes) {
@@ -2862,6 +2965,7 @@ fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Er
             panel_group_tab: v2.panel_group_tab,
             rail_collapsed: false,
             dock: default_saved_dock(v2.panel_group_tab),
+            float_stack: Vec::new(),
         });
     }
     match postcard::from_bytes::<WorkspaceLayoutV1>(bytes) {
@@ -2875,6 +2979,7 @@ fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Er
                 panel_group_tab: tab,
                 rail_collapsed: false,
                 dock: default_saved_dock(tab),
+                float_stack: Vec::new(),
             })
         }
         Err(_) => Err(current),
@@ -2917,6 +3022,7 @@ fn workspace_layout(workspace: &aurora_ui::Workspace, rail_width: f32) -> Worksp
         panel_group_tab,
         rail_collapsed: aurora_ui::rail_collapsed(workspace),
         dock: saved_dock(&arrangement),
+        float_stack: saved_float_stack(&arrangement),
     }
 }
 
@@ -3002,7 +3108,7 @@ fn apply_workspace_layout(
     ) {
         tracing::warn!(?err, "failed to apply the saved rail width");
     }
-    let (arrangement, repaired) = arrangement_from_saved(&layout.dock);
+    let (arrangement, repaired) = arrangement_from_saved(&layout.dock, &layout.float_stack);
     if repaired {
         tracing::warn!("the saved panel arrangement was damaged; repaired");
     }
@@ -3014,7 +3120,10 @@ fn apply_workspace_layout(
         aurora_ui::DockPanel::Properties => layout.properties_collapsed,
         aurora_ui::DockPanel::History => layout.history_collapsed,
     };
-    for slot in workspace.slots.clone() {
+    // Floating slots too (0.167.0): a floating panel's collapse is saved
+    // and restored like a docked one's.
+    let every_slot: Vec<aurora_ui::RailSlot> = workspace.all_slots().cloned().collect();
+    for slot in every_slot {
         let result = match slot {
             aurora_ui::RailSlot::Panel(panel) => match workspace.dock_panel(panel) {
                 Some(id) => {
@@ -4585,6 +4694,9 @@ enum ActivatedCommand {
     /// Reset Panel Layout (0.166.0): the default arrangement back
     /// ([`reset_panel_arrangement`]); needs `Scales` too.
     ResetPanels,
+    /// "Float PANEL Panel" (`true`) / "Dock PANEL Panel" (`false`),
+    /// 0.167.0 ([`PANEL_FLOAT_COMMANDS`], run by [`run_panel_float`]).
+    SetPanelFloating(aurora_ui::DockPanel, bool),
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -4664,8 +4776,41 @@ const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &
         ),
     ]
 };
-/// Restores the default panel arrangement (0.166.0).
+/// Restores the default panel arrangement (0.166.0) — since 0.167.0 that
+/// also docks every floating panel.
 const COMMAND_RESET_PANELS: &str = "window.reset_panels";
+/// The keyboard path to floating panels (0.167.0; invariant 9): per panel,
+/// "Float PANEL Panel" and "Dock PANEL Panel". **Two commands, not
+/// one toggle**, deliberately: a palette entry's label is static (see
+/// [`palette_commands`]), and "Float or Dock Layers Panel" would not say
+/// what pressing it does next; each of these says exactly what it does,
+/// and is a no-op when the panel already is so — the same shape as the
+/// move commands at an end. Float cascades the panel over the canvas
+/// area's top-left and lands focus on it; Dock puts it at the rail's end,
+/// expanding a collapsed rail, and lands focus on it
+/// (`aurora_ui::float_workspace_panel`/`dock_workspace_panel`). There is
+/// no keyboard way to *move* a floating panel yet (disclosed).
+const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 6] = {
+    use aurora_ui::DockPanel::{History, Layers, Properties};
+    [
+        ("view.float_layers", Layers, true, "Float Layers Panel"),
+        ("view.dock_layers", Layers, false, "Dock Layers Panel"),
+        (
+            "view.float_properties",
+            Properties,
+            true,
+            "Float Properties Panel",
+        ),
+        (
+            "view.dock_properties",
+            Properties,
+            false,
+            "Dock Properties Panel",
+        ),
+        ("view.float_history", History, true, "Float History Panel"),
+        ("view.dock_history", History, false, "Dock History Panel"),
+    ]
+};
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
@@ -4734,6 +4879,11 @@ fn palette_commands() -> Vec<CommandEntry> {
     ];
     commands.extend(
         PANEL_MOVE_COMMANDS
+            .iter()
+            .map(|(id, _, _, label)| CommandEntry::new(*id, *label)),
+    );
+    commands.extend(
+        PANEL_FLOAT_COMMANDS
             .iter()
             .map(|(id, _, _, label)| CommandEntry::new(*id, *label)),
     );
@@ -4871,6 +5021,12 @@ fn activate_command(
     }
     if id == COMMAND_RESET_PANELS {
         return Some(ActivatedCommand::ResetPanels);
+    }
+    if let Some(&(_, panel, floating, _)) = PANEL_FLOAT_COMMANDS
+        .iter()
+        .find(|(command, _, _, _)| *command == id)
+    {
+        return Some(ActivatedCommand::SetPanelFloating(panel, floating));
     }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
@@ -5033,6 +5189,32 @@ fn run_panel_move(
     }
 }
 
+/// Float or Dock a panel (0.167.0, [`ActivatedCommand::SetPanelFloating`]):
+/// `aurora_ui::float_workspace_panel` / `dock_workspace_panel`, both of
+/// which land focus on the panel. Returns whether anything changed
+/// (`false` for a panel already floating, or already docked). Not document
+/// state: nothing here reaches `History`.
+fn run_panel_float(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    panel: aurora_ui::DockPanel,
+    floating: bool,
+) -> bool {
+    let result = if floating {
+        aurora_ui::float_workspace_panel(workspace, focus, panel, scales)
+    } else {
+        aurora_ui::dock_workspace_panel(workspace, focus, panel, scales)
+    };
+    match result {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to float or dock a panel");
+            false
+        }
+    }
+}
+
 /// Reset Panel Layout (0.166.0): the default arrangement
 /// (`aurora_ui::DockArrangement::default`) back, then the hidden-focus
 /// repair. Collapsed, closed and rail-collapsed states are left as they
@@ -5072,10 +5254,13 @@ fn reset_panel_arrangement(
 // window-logical ([`logical_point`]), so the drag threshold is logical.
 
 /// The panel half of a press: a second press ends a panel press or drag
-/// (cancelled, the layout untouched); a primary press on a docked panel's
-/// title or tab — with no modal open — may start one
-/// (`aurora_ui::PanelDrag::press`). Returns whether a live drag was
-/// cancelled (the caller re-lays out).
+/// (cancelled, the layout untouched); with no modal open, any press on a
+/// floating panel raises it above the other floating panels (0.167.0,
+/// `aurora_ui::raise_floating` — nothing is rebuilt, so the press still
+/// reaches the widget it was aimed at), and a primary press on a panel's
+/// title or tab may start a drag (`aurora_ui::PanelDrag::press`). Returns
+/// whether a live drag was cancelled or a panel raised (the caller
+/// re-lays out).
 fn panel_pointer_pressed(
     workspace: &mut aurora_ui::Workspace,
     panel_drag: &mut Option<aurora_ui::PanelDrag>,
@@ -5084,10 +5269,20 @@ fn panel_pointer_pressed(
     position: (f32, f32),
 ) -> bool {
     let cancelled = cancel_panel_drag(workspace, panel_drag);
+    let mut raised = false;
+    if !modal_open && let Some(index) = aurora_ui::floating_index_at(workspace, position) {
+        raised = match aurora_ui::raise_floating(workspace, index) {
+            Ok(raised) => raised,
+            Err(err) => {
+                tracing::warn!(?err, "failed to raise a floating panel");
+                false
+            }
+        };
+    }
     if button == PointerButton::Primary && !modal_open {
         *panel_drag = aurora_ui::PanelDrag::press(workspace, position);
     }
-    cancelled
+    cancelled || raised
 }
 
 /// The panel half of a move: `None` when there is no panel press (the
@@ -7091,14 +7286,26 @@ fn expand_properties_for_curves(
     // transition only, like the expand itself.
     // 0.165.0: a rail collapsed to its label strip is expanded too, so the
     // editor is really visible — on this transition only, like the rest.
-    let expanded = match aurora_ui::set_rail_collapsed(workspace, false) {
-        Ok(changed) => changed,
-        Err(err) => {
-            tracing::warn!(?err, "failed to expand the rail for a Curves layer");
-            false
+    // 0.167.0: a floating Properties panel is not in the rail — its float
+    // is raised instead, and a collapsed rail stays collapsed.
+    let properties = workspace.properties;
+    let expanded = if let Some(index) = workspace.floating_index_of(properties) {
+        match aurora_ui::raise_floating(workspace, index) {
+            Ok(raised) => raised,
+            Err(err) => {
+                tracing::warn!(?err, "failed to raise the floating Properties panel");
+                false
+            }
+        }
+    } else {
+        match aurora_ui::set_rail_collapsed(workspace, false) {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(?err, "failed to expand the rail for a Curves layer");
+                false
+            }
         }
     };
-    let properties = workspace.properties;
     match aurora_ui::show_workspace_panel(workspace, properties) {
         Ok(changed) => changed || expanded,
         Err(err) => {
@@ -8790,16 +8997,38 @@ fn layout_workspace(
 ) {
     #[allow(clippy::cast_possible_truncation)]
     let scale_factor = scale_factor as f32;
-    aurora_widgets::compute_text_layout(
-        &mut workspace.tree,
-        width,
-        height,
-        engine.map(|engine| aurora_widgets::TextMeasure {
-            engine,
-            scales,
-            scale_factor,
-        }),
-    );
+    let mut engine = engine;
+    let mut pass = |workspace: &mut aurora_ui::Workspace| {
+        aurora_widgets::compute_text_layout(
+            &mut workspace.tree,
+            width,
+            height,
+            engine
+                .as_deref_mut()
+                .map(|engine| aurora_widgets::TextMeasure {
+                    engine,
+                    scales,
+                    scale_factor,
+                }),
+        );
+    };
+    pass(workspace);
+    // 0.167.0: floating panels are kept inside the canvas area after
+    // every layout — a window resize, a rail resize or collapse, a scale
+    // change and the first layout after a load all come through here
+    // (`aurora_ui::sync_floating_frames`). A clamp that moved a frame lays
+    // out again; a frame first laid out by that pass (a fresh float) gets
+    // one more clamp against its real height. Bounded: three passes.
+    for _ in 0..3 {
+        match aurora_ui::sync_floating_frames(workspace) {
+            Ok(true) => pass(workspace),
+            Ok(false) => break,
+            Err(err) => {
+                tracing::warn!(?err, "failed to keep the floating panels in view");
+                break;
+            }
+        }
+    }
 }
 
 /// Converts a real, physical-pixel window size into the logical pixels
@@ -8891,8 +9120,8 @@ fn logical_point(physical: (f64, f64), scale_factor: f64) -> (f32, f32) {
 
 /// Converts a pointer position in the *window's* own logical space into
 /// a canvas-area-relative logical position, if the pointer is actually
-/// over the canvas area — `None` if it's over a dock panel, outside the
-/// window, or before the first layout has run (`workspace.tree.bounds`
+/// over the canvas area — `None` if it's over a dock panel or (0.167.0) a
+/// floating panel, outside the window, or before the first layout has run (`workspace.tree.bounds`
 /// returns `None` either way, so this doesn't need to tell those cases
 /// apart).
 #[must_use]
@@ -8910,6 +9139,12 @@ fn pointer_in_canvas(
     );
     let (x, y) = window_position;
     if x < bx || y < by || x >= bx + bw || y >= by + bh {
+        return None;
+    }
+    // 0.167.0: a floating panel is drawn over the canvas, and owns every
+    // press, move and wheel over it — no stroke starts or continues under
+    // it, and the wheel scrolls it instead of zooming.
+    if aurora_ui::floating_index_at(workspace, window_position).is_some() {
         return None;
     }
     Some((x - bx, y - by))
@@ -20903,6 +21138,7 @@ impl App {
                 self.move_panel(panel, direction);
             }
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
+            Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -22919,6 +23155,7 @@ impl App {
                 self.move_panel(panel, direction);
             }
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
+            Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             None => {}
         }
         self.push_accessibility();
@@ -23210,6 +23447,20 @@ impl App {
             &self.scales,
             panel,
             direction,
+        );
+        self.relayout_after_gallery();
+    }
+
+    /// Float or Dock a panel ([`run_panel_float`], 0.167.0): ends a live
+    /// panel drag first, then re-lays out and re-announces.
+    fn float_panel(&mut self, panel: aurora_ui::DockPanel, floating: bool) {
+        self.cancel_panel_drag();
+        run_panel_float(
+            &mut self.workspace,
+            &mut self.focus,
+            &self.scales,
+            panel,
+            floating,
         );
         self.relayout_after_gallery();
     }
@@ -31829,10 +32080,11 @@ mod tests {
         // "Focus Layers Panel", "Toggle Layers Panel", "Close Layers
         // Panel", (0.143.0) "New Layer" and "Delete Layer", and
         // (0.155.0) "New Curves Layer" all match, and (0.166.0) "Reset
-        // Panel Layout" and the three "Move Layers Panel ..." commands --
+        // Panel Layout" and the three "Move Layers Panel ..." commands,
+        // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
         // up selected.
-        assert_eq!(state.results().len(), 10);
+        assert_eq!(state.results().len(), 12);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -71060,6 +71312,7 @@ mod panel_scroll_tests {
                 panel_group_tab: 7,
                 rail_collapsed: false,
                 dock: crate::test_saved_dock(7),
+                float_stack: Vec::new(),
             };
             let bytes = match postcard::to_allocvec(&damaged) {
                 Ok(bytes) => bytes,
@@ -71373,6 +71626,7 @@ mod panel_scroll_tests {
                         slot(&[], 0),
                         slot(&["history", "layers"], 99),
                     ],
+                    float_stack: Vec::new(),
                 };
                 let bytes = encode(&damaged);
                 let decoded = match decode_workspace_layout(&bytes) {
@@ -71653,6 +71907,1056 @@ mod panel_scroll_tests {
                         "{id}"
                     );
                 }
+            }
+        }
+
+        /// 0.167.0: floating panels at the app level — the press/move/
+        /// release free functions in `App`'s own order, the canvas-input
+        /// exclusion, the wheel, modals and popovers above, raise on
+        /// press, the layout clamp at scale 1 and 2, the Float/Dock
+        /// commands and the persisted floats. The drag state machine and
+        /// the model are tested in `aurora_ui::redock`/`aurora_ui::dock`.
+        mod floating_panels {
+            use super::centre;
+            use crate::tests::FakeFileDialog;
+            use crate::{
+                ActivatedCommand, COMMAND_RESET_PANELS, FocusManager, PANEL_FLOAT_COMMANDS,
+                SavedDockSlot, SavedPlacement, WheelTarget, WidgetId, WorkspaceLayout,
+                WorkspaceLayoutV1, WorkspaceLayoutV2, WorkspaceLayoutV3, WorkspaceLayoutV4,
+                activate_command, apply_workspace_layout, decode_workspace_layout,
+                palette_commands, pointer_in_canvas, reset_panel_arrangement, run_panel_float,
+                wheel_target,
+            };
+            use aurora_ui::DockPanel;
+
+            const WINDOW: (f32, f32) = (1000.0, 800.0);
+
+            fn lay(ws: &mut aurora_ui::Workspace, scale: f64, size: (f32, f32)) {
+                crate::layout_workspace(
+                    ws,
+                    None,
+                    &crate::test_layout_scales(),
+                    scale,
+                    size.0,
+                    size.1,
+                );
+            }
+
+            fn workspace() -> aurora_ui::Workspace {
+                let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                lay(&mut ws, 1.0, WINDOW);
+                ws
+            }
+
+            fn bounds(ws: &aurora_ui::Workspace, id: WidgetId) -> aurora_core::Rect {
+                match ws.tree.bounds(id) {
+                    Some(bounds) => bounds,
+                    None => unreachable!("laid out"),
+                }
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            fn at(rect: aurora_core::Rect, dx: f32, dy: f32) -> (f32, f32) {
+                (rect.x as f32 + dx, rect.y as f32 + dy)
+            }
+
+            fn float(ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, panel: DockPanel) {
+                assert!(run_panel_float(
+                    ws,
+                    focus,
+                    &crate::test_layout_scales(),
+                    panel,
+                    true
+                ));
+                lay(ws, 1.0, WINDOW);
+            }
+
+            fn frame(ws: &aurora_ui::Workspace, panel: DockPanel) -> WidgetId {
+                match ws
+                    .floating_index_of(ws.panel(panel))
+                    .and_then(|i| ws.floating.get(i))
+                {
+                    Some(float) => float.frame,
+                    None => unreachable!("{panel:?} floats"),
+                }
+            }
+
+            fn floats(ws: &aurora_ui::Workspace) -> Vec<(Vec<DockPanel>, f32, f32)> {
+                ws.dock_arrangement()
+                    .floating()
+                    .iter()
+                    .map(|f| (f.slot.panels.clone(), f.x, f.y))
+                    .collect()
+            }
+
+            fn every_panel_once(ws: &aurora_ui::Workspace) {
+                for panel in DockPanel::ALL {
+                    let root = ws.panel(panel).root;
+                    let homes = ws
+                        .all_slots()
+                        .filter(|slot| slot.panels().iter().any(|h| h.root == root))
+                        .count();
+                    assert_eq!(homes, 1, "{panel:?} appears exactly once");
+                    assert!(ws.tree.contains(root));
+                }
+                let frames: Vec<WidgetId> = ws.floating.iter().map(|f| f.frame).collect();
+                assert_eq!(
+                    ws.tree
+                        .children(ws.canvas_area)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default(),
+                    frames
+                );
+            }
+
+            /// One pointer event in `App`'s order, laid out as `App` does
+            /// (the floating clamp included).
+            fn pointer(
+                ws: &mut aurora_ui::Workspace,
+                focus: &mut FocusManager,
+                click: &mut crate::ClickTracker,
+                drag: &mut Option<aurora_ui::PanelDrag>,
+                phase: crate::PointerPhase,
+                position: (f32, f32),
+            ) {
+                let scales = crate::test_layout_scales();
+                let widget = |ws: &mut aurora_ui::Workspace,
+                              focus: &mut FocusManager,
+                              click: &mut crate::ClickTracker| {
+                    let _ = crate::route_widget_pointer(
+                        ws,
+                        focus,
+                        &mut None,
+                        None,
+                        None,
+                        click,
+                        &scales,
+                        false,
+                        phase,
+                        position,
+                        crate::Modifiers::none(),
+                        &mut crate::NoTextHit,
+                    );
+                };
+                match phase {
+                    crate::PointerPhase::Down => {
+                        crate::panel_pointer_pressed(
+                            ws,
+                            drag,
+                            false,
+                            crate::PointerButton::Primary,
+                            position,
+                        );
+                        widget(ws, focus, click);
+                    }
+                    crate::PointerPhase::Move => {
+                        if crate::panel_pointer_moved(ws, drag, position, &scales).is_none() {
+                            widget(ws, focus, click);
+                        }
+                    }
+                    crate::PointerPhase::Up => {
+                        widget(ws, focus, click);
+                        crate::panel_pointer_released(ws, focus, drag, &scales);
+                    }
+                }
+                lay(ws, 1.0, WINDOW);
+            }
+
+            fn gesture(
+                ws: &mut aurora_ui::Workspace,
+                focus: &mut FocusManager,
+                path: &[(f32, f32)],
+            ) {
+                use crate::PointerPhase::{Down, Move, Up};
+                let mut click = crate::ClickTracker::default();
+                let mut drag = None;
+                let last = path.len().saturating_sub(1);
+                for (index, &point) in path.iter().enumerate() {
+                    let phase = if index == 0 { Down } else { Move };
+                    pointer(ws, focus, &mut click, &mut drag, phase, point);
+                    if index == last {
+                        pointer(ws, focus, &mut click, &mut drag, Up, point);
+                    }
+                }
+                assert!(drag.is_none(), "the release ended it");
+            }
+
+            /// AC-1/AC-2 through the App-order free functions: the Layers
+            /// title dropped over the canvas floats it there; Escape (a
+            /// cancel) mid-drag changes nothing; its title dragged again
+            /// moves it; History's tab dropped on its title joins it into a
+            /// floating group; the group's tab dragged into the rail docks
+            /// that panel; the float's title dropped in the rail re-docks it.
+            #[test]
+            fn the_app_pointer_order_floats_moves_joins_and_redocks() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let canvas = bounds(&ws, ws.canvas_area);
+                let title = at(bounds(&ws, ws.layers.header), 10.0, 5.0);
+                let target = at(canvas, 200.0, 150.0);
+
+                // Escape mid-drag: cancelled, nothing changed.
+                let before = format!("{:?}", ws.dock_arrangement());
+                let mut click = crate::ClickTracker::default();
+                let mut drag = None;
+                pointer(
+                    &mut ws,
+                    &mut focus,
+                    &mut click,
+                    &mut drag,
+                    crate::PointerPhase::Down,
+                    title,
+                );
+                pointer(
+                    &mut ws,
+                    &mut focus,
+                    &mut click,
+                    &mut drag,
+                    crate::PointerPhase::Move,
+                    target,
+                );
+                assert!(drag.is_some_and(|d| d.target().is_some()));
+                assert!(crate::cancel_panel_drag(&mut ws, &mut drag));
+                lay(&mut ws, 1.0, WINDOW);
+                assert_eq!(format!("{:?}", ws.dock_arrangement()), before, "Escape");
+                assert!(ws.floating.is_empty());
+
+                gesture(&mut ws, &mut focus, &[title, target]);
+                assert_eq!(floats(&ws), vec![(vec![DockPanel::Layers], 190.0, 145.0)]);
+                assert_eq!(
+                    ws.tree.parent(frame(&ws, DockPanel::Layers)),
+                    Some(ws.canvas_area)
+                );
+
+                let grip = at(bounds(&ws, ws.layers.header), 10.0, 5.0);
+                gesture(&mut ws, &mut focus, &[grip, (grip.0 + 60.0, grip.1 + 40.0)]);
+                assert_eq!(floats(&ws), vec![(vec![DockPanel::Layers], 250.0, 185.0)]);
+
+                let Some(history_tab) = ws.group_of(ws.history).and_then(|group| {
+                    aurora_widgets::widgets::tab_bar_state(&ws.tree, group.bar)
+                        .ok()
+                        .and_then(|state| state.tabs().get(1).copied())
+                }) else {
+                    unreachable!("History is a tab");
+                };
+                let tab = centre(bounds(&ws, history_tab));
+                let onto = centre(bounds(&ws, ws.layers.header));
+                gesture(&mut ws, &mut focus, &[tab, (tab.0, tab.1 + 30.0), onto]);
+                assert_eq!(
+                    floats(&ws).first().map(|f| f.0.clone()),
+                    Some(vec![DockPanel::Layers, DockPanel::History])
+                );
+                every_panel_once(&ws);
+
+                // History's (floating) tab into the rail: docked there.
+                let Some(floating_tab) = ws.group_of(ws.history).and_then(|group| {
+                    aurora_widgets::widgets::tab_bar_state(&ws.tree, group.bar)
+                        .ok()
+                        .and_then(|state| state.tabs().get(1).copied())
+                }) else {
+                    unreachable!("History is a floating tab");
+                };
+                let tab = centre(bounds(&ws, floating_tab));
+                let rail = bounds(&ws, ws.rail);
+                let rail_foot = at(rail, rail.width as f32 / 2.0, rail.height as f32 - 2.0);
+                gesture(
+                    &mut ws,
+                    &mut focus,
+                    &[tab, (tab.0, tab.1 + 30.0), rail_foot],
+                );
+                assert!(!ws.dock_arrangement().is_floating(DockPanel::History));
+                assert_eq!(
+                    floats(&ws).first().map(|f| f.0.clone()),
+                    Some(vec![DockPanel::Layers])
+                );
+
+                // The lone float's title into the rail: re-docked.
+                let grip = at(bounds(&ws, ws.layers.header), 10.0, 5.0);
+                let rail = bounds(&ws, ws.rail);
+                let rail_foot = at(rail, rail.width as f32 / 2.0, rail.height as f32 - 2.0);
+                gesture(
+                    &mut ws,
+                    &mut focus,
+                    &[grip, (grip.0 + 20.0, grip.1), rail_foot],
+                );
+                assert!(ws.floating.is_empty());
+                every_panel_once(&ws);
+            }
+
+            /// AC-3: over a floating panel the pointer is not on the
+            /// canvas (no stroke can start or continue there) while beside
+            /// it it is; the wheel over it scrolls its body, never zooms;
+            /// a modal dialog over it wins the hit test and the press (no
+            /// raise); a dropdown list opened on one floating panel stays
+            /// above another; a press on a lower float raises it.
+            #[test]
+            #[allow(clippy::too_many_lines)]
+            fn input_over_a_floating_panel_never_reaches_the_canvas() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let scales = crate::test_layout_scales();
+                for index in 0..30 {
+                    let body = ws.history.body;
+                    if let Err(err) = aurora_widgets::widgets::insert_label(
+                        &mut ws.tree,
+                        body,
+                        &scales,
+                        format!("Row {index}"),
+                    ) {
+                        unreachable!("{err:?}");
+                    }
+                }
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                float(&mut ws, &mut focus, DockPanel::History);
+                let history = bounds(&ws, frame(&ws, DockPanel::History));
+                let over = centre(history);
+                assert_eq!(
+                    pointer_in_canvas(&ws, over),
+                    None,
+                    "no stroke under a float"
+                );
+                let row = aurora_widgets::widgets::row_height(&scales);
+                #[allow(clippy::cast_precision_loss)]
+                let viewport = bounds(&ws, ws.history.viewport).height as f32;
+                assert!(
+                    viewport > 3.0 * row,
+                    "a floating History shows its rows: {viewport}"
+                );
+                let beside = at(history, history.width as f32 + 20.0, 10.0);
+                assert!(
+                    pointer_in_canvas(&ws, beside).is_some(),
+                    "the canvas beside it"
+                );
+                let body_point = centre(bounds(&ws, ws.history.body));
+                assert_eq!(
+                    wheel_target(&ws, body_point, false, false),
+                    WheelTarget::Panel(ws.history.body),
+                    "the wheel scrolls the floating panel"
+                );
+                assert!(matches!(
+                    wheel_target(&ws, beside, false, false),
+                    WheelTarget::Canvas(_)
+                ));
+                let header = centre(bounds(&ws, ws.layers.header));
+                assert!(
+                    !matches!(
+                        wheel_target(&ws, header, false, false),
+                        WheelTarget::Canvas(_)
+                    ),
+                    "never a zoom over a float"
+                );
+
+                // A dropdown opened on the History float stays above the
+                // Layers float (popovers paint and hit-test first).
+                let dropdown = match aurora_widgets::widgets::insert_dropdown(
+                    &mut ws.tree,
+                    ws.history.body,
+                    &scales,
+                    "Mode",
+                    (0..8).map(|i| format!("Option {i}")).collect(),
+                    Some(0),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                // First in the body, so it is scrolled into view.
+                if let Err(err) = ws.tree.move_child(dropdown, ws.history.body, 0) {
+                    unreachable!("{err:?}");
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                let _ = aurora_widgets::widgets::set_dropdown_open(&mut ws.tree, dropdown, true);
+                lay(&mut ws, 1.0, WINDOW);
+                let list = ws.tree.children(dropdown).and_then(|c| {
+                    c.iter().copied().find(|&id| {
+                        matches!(
+                            ws.tree.payload(id),
+                            Some(aurora_widgets::widgets::WidgetKind::DropdownList)
+                        )
+                    })
+                });
+                let Some(list) = list else {
+                    unreachable!("the dropdown opened its list");
+                };
+                let list_box = bounds(&ws, list);
+                assert!(list_box.height > 0);
+                // The Layers float moved (on top) right under the open list.
+                let canvas = bounds(&ws, ws.canvas_area);
+                #[allow(clippy::cast_precision_loss)]
+                let under_list = aurora_ui::DropTarget::Float {
+                    x: (list_box.x - canvas.x) as f32,
+                    y: (list_box.y - canvas.y) as f32 + 4.0,
+                };
+                match aurora_ui::move_workspace_slot(
+                    &mut ws,
+                    &mut focus,
+                    DockPanel::Layers,
+                    under_list,
+                    &scales,
+                ) {
+                    Ok(true) => {}
+                    other => unreachable!("{other:?}"),
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                let list_box = bounds(&ws, list);
+                let in_list = at(list_box, 6.0, 10.0);
+                let layers_now = bounds(&ws, frame(&ws, DockPanel::Layers));
+                assert!(
+                    in_list.0 >= layers_now.x as f32
+                        && in_list.1 >= layers_now.y as f32
+                        && in_list.0 < (layers_now.x + i64::from(layers_now.width)) as f32
+                        && in_list.1 < (layers_now.y + i64::from(layers_now.height)) as f32,
+                    "the top floating panel lies under the list there"
+                );
+                assert!(
+                    ws.tree
+                        .hit_test(in_list)
+                        .is_some_and(|hit| ws.tree.is_within(list, hit)),
+                    "the list is above every floating panel"
+                );
+                let _ = aurora_widgets::widgets::set_dropdown_open(&mut ws.tree, dropdown, false);
+
+                // A press on the lower (History) float's uncovered corner
+                // raises it.
+                let history = bounds(&ws, frame(&ws, DockPanel::History));
+                let corner = at(history, 2.0, 2.0);
+                assert_eq!(aurora_ui::floating_index_at(&ws, corner), Some(0));
+                let mut drag = None;
+                assert!(crate::panel_pointer_pressed(
+                    &mut ws,
+                    &mut drag,
+                    false,
+                    crate::PointerButton::Primary,
+                    corner
+                ));
+                assert_eq!(
+                    ws.tree
+                        .children(ws.canvas_area)
+                        .and_then(|c| c.last().copied()),
+                    Some(frame(&ws, DockPanel::History)),
+                    "raised on press"
+                );
+                let _ = crate::cancel_panel_drag(&mut ws, &mut drag);
+
+                // A modal dialog over the floats wins, and a press with it
+                // open raises nothing.
+                let mut dialog = None;
+                assert!(crate::open_dialog(
+                    &mut ws,
+                    &mut focus,
+                    &mut dialog,
+                    &scales,
+                    "Title",
+                    "Message",
+                    vec![aurora_widgets::widgets::DialogAction::new("ok", "OK")],
+                ));
+                lay(&mut ws, 1.0, WINDOW);
+                let Some(handle) = dialog.as_ref() else {
+                    unreachable!("open");
+                };
+                let dialog_box = bounds(&ws, handle.root);
+                let inside = centre(dialog_box);
+                assert!(
+                    ws.tree
+                        .hit_test(inside)
+                        .is_some_and(|hit| ws.tree.is_within(handle.root, hit)),
+                    "the modal is above the floating panels"
+                );
+                let order = ws.tree.children(ws.canvas_area).map(<[_]>::to_vec);
+                let under = at(history, 2.0, 2.0);
+                assert!(!crate::panel_pointer_pressed(
+                    &mut ws,
+                    &mut drag,
+                    true,
+                    crate::PointerButton::Primary,
+                    under
+                ));
+                assert!(drag.is_none());
+                assert_eq!(ws.tree.children(ws.canvas_area).map(<[_]>::to_vec), order);
+            }
+
+            /// AC-4: at scale 1 and 2, a float clamps back inside the
+            /// canvas area through the app's one layout path on a window
+            /// shrink, a rail widening, a rail collapse, a scale-factor
+            /// change (the same physical window, a different logical size),
+            /// and on load of a layout saved far out of bounds.
+            #[test]
+            fn floating_panels_clamp_at_scale_one_and_two() {
+                for scale in [1.0_f64, 2.0] {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let logical = |physical: (f32, f32)| {
+                        (physical.0 / scale as f32, physical.1 / scale as f32)
+                    };
+                    let physical = (2000.0, 1600.0);
+                    let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                    lay(&mut ws, scale, logical(physical));
+                    let mut focus = FocusManager::default();
+                    assert!(run_panel_float(
+                        &mut ws,
+                        &mut focus,
+                        &crate::test_layout_scales(),
+                        DockPanel::Layers,
+                        true
+                    ));
+                    lay(&mut ws, scale, logical(physical));
+                    let inside = |ws: &aurora_ui::Workspace| {
+                        let canvas = bounds(ws, ws.canvas_area);
+                        let frame = bounds(ws, frame(ws, DockPanel::Layers));
+                        let header = bounds(ws, ws.layers.header);
+                        frame.x >= canvas.x
+                            && frame.y >= canvas.y
+                            && frame.x + i64::from(frame.width)
+                                <= canvas.x + i64::from(canvas.width)
+                            && frame.y + i64::from(frame.height)
+                                <= canvas.y + i64::from(canvas.height)
+                            && header.y + i64::from(header.height)
+                                <= canvas.y + i64::from(canvas.height)
+                    };
+                    // Pushed to the far corner by a load-like apply.
+                    let mut saved = crate::workspace_layout(&ws, 250.0);
+                    for slot in &mut saved.dock {
+                        if let SavedPlacement::Floating { x, y } = &mut slot.placement {
+                            *x = 1.0e6;
+                            *y = 1.0e6;
+                        }
+                    }
+                    apply_workspace_layout(&mut ws, &saved, &crate::test_layout_scales());
+                    lay(&mut ws, scale, logical(physical));
+                    assert!(inside(&ws), "scale {scale}: on load");
+                    lay(&mut ws, scale, logical((1200.0, 900.0)));
+                    assert!(inside(&ws), "scale {scale}: window shrink");
+                    if let Err(err) =
+                        aurora_ui::set_rail_width(&mut ws.tree, ws.rail, ws.divider, 450.0)
+                    {
+                        unreachable!("{err:?}");
+                    }
+                    lay(&mut ws, scale, logical((1200.0, 900.0)));
+                    assert!(inside(&ws), "scale {scale}: rail widened");
+                    if let Err(err) = aurora_ui::set_rail_collapsed(&mut ws, true) {
+                        unreachable!("{err:?}");
+                    }
+                    lay(&mut ws, scale, logical((1200.0, 900.0)));
+                    assert!(inside(&ws), "scale {scale}: rail collapsed");
+                    // The window moves to a screen with the other scale.
+                    let other = if (scale - 1.0).abs() < f64::EPSILON {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    #[allow(clippy::cast_possible_truncation)]
+                    let moved = (1200.0 / other as f32, 900.0 / other as f32);
+                    lay(&mut ws, other, moved);
+                    assert!(inside(&ws), "scale {scale} -> {other}");
+                }
+            }
+
+            /// AC-5: the Float/Dock commands are in the palette, resolve,
+            /// float and dock with focus on the panel and the Tab order
+            /// reaching it; Reset Panel Layout docks every float.
+            #[test]
+            fn the_float_and_dock_commands_and_reset_work_with_focus() {
+                let ids: Vec<String> = palette_commands().into_iter().map(|e| e.id).collect();
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                for (id, panel, floating, _) in PANEL_FLOAT_COMMANDS {
+                    assert!(ids.iter().any(|known| known == id), "{id} in the palette");
+                    assert_eq!(
+                        activate_command(&mut ws, &mut focus, id, &mut FakeFileDialog::default()),
+                        Some(ActivatedCommand::SetPanelFloating(panel, floating))
+                    );
+                    assert!(
+                        !id.starts_with("edit.") && !id.starts_with("layer."),
+                        "not document commands"
+                    );
+                }
+                let scales = crate::test_layout_scales();
+                for panel in [DockPanel::Properties, DockPanel::Layers] {
+                    assert!(run_panel_float(&mut ws, &mut focus, &scales, panel, true));
+                    lay(&mut ws, 1.0, WINDOW);
+                    assert_eq!(focus.focused(), Some(ws.panel(panel).root), "focus follows");
+                    assert!(
+                        !run_panel_float(&mut ws, &mut focus, &scales, panel, true),
+                        "no-op"
+                    );
+                }
+                // Tab reaches both floats.
+                let mut probe = FocusManager::default();
+                let mut order = Vec::new();
+                for _ in 0..300 {
+                    match probe.focus_next(&mut ws.tree) {
+                        Some(id) if !order.contains(&id) => order.push(id),
+                        _ => break,
+                    }
+                }
+                assert!(order.contains(&ws.layers.root) && order.contains(&ws.properties.root));
+                assert!(run_panel_float(
+                    &mut ws,
+                    &mut focus,
+                    &scales,
+                    DockPanel::Properties,
+                    false
+                ));
+                lay(&mut ws, 1.0, WINDOW);
+                assert_eq!(focus.focused(), panel_target(&ws, DockPanel::Properties));
+                let _ = focus.focus(&mut ws.tree, ws.layers.root);
+                assert!(reset_panel_arrangement(&mut ws, &mut focus, &scales));
+                lay(&mut ws, 1.0, WINDOW);
+                assert!(ws.floating.is_empty(), "Reset docks every float");
+                assert_eq!(ws.dock_arrangement(), aurora_ui::DockArrangement::default());
+                assert_eq!(
+                    focus.focused(),
+                    Some(ws.layers.root),
+                    "focus kept on Layers"
+                );
+                assert!(ids.iter().any(|known| known == COMMAND_RESET_PANELS));
+                every_panel_once(&ws);
+            }
+
+            fn panel_target(ws: &aurora_ui::Workspace, panel: DockPanel) -> Option<WidgetId> {
+                aurora_ui::panel_focus_target(ws, ws.panel(panel))
+            }
+
+            fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+                match postcard::to_allocvec(value) {
+                    Ok(bytes) => bytes,
+                    Err(err) => unreachable!("{err}"),
+                }
+            }
+
+            fn load(bytes: &[u8]) -> aurora_ui::Workspace {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let path = dir.path().join("workspace-layout.postcard");
+                if let Err(err) = std::fs::write(&path, bytes) {
+                    unreachable!("{err}");
+                }
+                let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                crate::load_workspace_layout(&path, &mut ws, &crate::test_layout_scales());
+                lay(&mut ws, 1.0, WINDOW);
+                ws
+            }
+
+            /// AC-6: floats (a group among them), their stacking order and
+            /// a floating panel's collapse survive a save and a load; the
+            /// 0.166.0 (V4) shape and the V3/V2/V1 ones still decode.
+            #[test]
+            #[allow(clippy::too_many_lines)]
+            fn floats_round_trip_and_older_layouts_still_decode() {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let path = dir.path().join("workspace-layout.postcard");
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                float(&mut ws, &mut focus, DockPanel::History);
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                // Properties joins the History float; then History's
+                // float is raised above Layers'.
+                let scales = crate::test_layout_scales();
+                let target = aurora_ui::DropTarget::JoinFloating(0);
+                if let Err(err) = aurora_ui::move_workspace_panel(
+                    &mut ws,
+                    &mut focus,
+                    DockPanel::Properties,
+                    target,
+                    &scales,
+                ) {
+                    unreachable!("{err:?}");
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                if let Err(err) = aurora_ui::raise_floating(&mut ws, 0) {
+                    unreachable!("{err:?}");
+                }
+                if let Err(err) = aurora_ui::set_panel_collapsed(&mut ws.tree, ws.layers, true) {
+                    unreachable!("{err:?}");
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                let saved = ws.dock_arrangement();
+                assert!(saved.slots().is_empty());
+                assert_eq!(saved.floating().len(), 2);
+                crate::save_workspace_layout(&path, &ws);
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let loaded = load(&bytes);
+                assert_eq!(
+                    loaded.dock_arrangement(),
+                    saved,
+                    "floats, groups and stacking survive"
+                );
+                assert_eq!(
+                    aurora_ui::panel_is_collapsed(&loaded.tree, loaded.layers).ok(),
+                    Some(true),
+                    "a floating panel's collapse too"
+                );
+                every_panel_once(&loaded);
+
+                // 0.166.0's own bytes: a rearranged rail, no float stack.
+                let slot = |panels: &[&str], selected: u32| SavedDockSlot {
+                    placement: SavedPlacement::Rail,
+                    panels: panels.iter().map(|p| (*p).to_owned()).collect(),
+                    selected,
+                };
+                let v4 = WorkspaceLayoutV4 {
+                    rail_width: 270.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                    rail_collapsed: false,
+                    dock: vec![slot(&["history"], 0), slot(&["properties", "layers"], 1)],
+                };
+                let v4_bytes = encode(&v4);
+                assert!(
+                    postcard::from_bytes::<WorkspaceLayout>(&v4_bytes).is_err(),
+                    "a 0.166.0 file is not the current shape"
+                );
+                let from_v4 = load(&v4_bytes);
+                assert!(from_v4.floating.is_empty());
+                assert_eq!(
+                    from_v4
+                        .dock_arrangement()
+                        .slots()
+                        .iter()
+                        .map(|s| (s.panels.clone(), s.selected))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (vec![DockPanel::History], 0),
+                        (vec![DockPanel::Properties, DockPanel::Layers], 1)
+                    ],
+                    "the 0.166.0 arrangement"
+                );
+                let default = aurora_ui::DockArrangement::default();
+                let v3 = load(&encode(&WorkspaceLayoutV3 {
+                    rail_width: 280.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                    rail_collapsed: true,
+                }));
+                assert_eq!(v3.dock_arrangement(), default);
+                assert!(aurora_ui::rail_collapsed(&v3));
+                let v2 = load(&encode(&WorkspaceLayoutV2 {
+                    rail_width: 280.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                }));
+                assert_eq!(v2.dock_arrangement(), default);
+                let v1 = load(&encode(&WorkspaceLayoutV1 {
+                    rail_width: 280.0,
+                    layers_collapsed: true,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                }));
+                assert_eq!(v1.dock_arrangement(), default);
+            }
+
+            /// AC-6: damaged floats repair — a garbage stack, a NaN
+            /// position (docked), an out-of-bounds one (clamped by the
+            /// first layout) and a duplicate across rail and float — so
+            /// every panel appears exactly once; a truncated current file
+            /// decodes as its 0.166.0 prefix; garbage bytes change nothing.
+            #[test]
+            fn damaged_floats_repair_and_truncated_or_garbage_bytes_are_safe() {
+                let slot = |placement, panels: &[&str], selected: u32| SavedDockSlot {
+                    placement,
+                    panels: panels.iter().map(|p| (*p).to_owned()).collect(),
+                    selected,
+                };
+                let damaged = WorkspaceLayout {
+                    rail_width: 250.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                    rail_collapsed: false,
+                    dock: vec![
+                        slot(
+                            SavedPlacement::Floating {
+                                x: f32::NAN,
+                                y: 4.0,
+                            },
+                            &["layers"],
+                            0,
+                        ),
+                        slot(
+                            SavedPlacement::Floating { x: 9.0e7, y: 9.0e7 },
+                            &["history", "properties"],
+                            7,
+                        ),
+                        slot(SavedPlacement::Rail, &["properties"], 0),
+                    ],
+                    float_stack: vec![99, 1, 1, 2],
+                };
+                let bytes = encode(&damaged);
+                let loaded = load(&bytes);
+                every_panel_once(&loaded);
+                let arrangement = loaded.dock_arrangement();
+                assert!(!arrangement.is_floating(DockPanel::Layers), "NaN: docked");
+                assert!(
+                    arrangement.is_floating(DockPanel::History),
+                    "out of bounds: kept, clamped"
+                );
+                assert!(
+                    !arrangement.is_floating(DockPanel::Properties),
+                    "a duplicate keeps its first place in the repaired order (rail slots first)"
+                );
+                let canvas = bounds(&loaded, loaded.canvas_area);
+                let frame = bounds(&loaded, frame(&loaded, DockPanel::History));
+                assert!(frame.x >= canvas.x && frame.y >= canvas.y);
+                assert!(frame.x + i64::from(frame.width) <= canvas.x + i64::from(canvas.width));
+                assert!(frame.y + i64::from(frame.height) <= canvas.y + i64::from(canvas.height));
+
+                // Truncated inside the stack: the 0.166.0 prefix decodes.
+                let good = encode(&WorkspaceLayout {
+                    float_stack: vec![0],
+                    dock: vec![slot(
+                        SavedPlacement::Floating { x: 3.0, y: 4.0 },
+                        &["layers"],
+                        0,
+                    )],
+                    ..damaged.clone()
+                });
+                let cut = good
+                    .get(..good.len() - 1)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default();
+                match decode_workspace_layout(&cut) {
+                    Ok(layout) => assert!(layout.float_stack.is_empty(), "decoded as V4"),
+                    Err(err) => unreachable!("the 0.166.0 prefix decodes: {err}"),
+                }
+                every_panel_once(&load(&cut));
+                // Cut deeper, inside a float's position: still a workspace
+                // with every panel once (some older prefix, or nothing).
+                for len in 0..good.len() {
+                    let prefix = good.get(..len).map(<[u8]>::to_vec).unwrap_or_default();
+                    every_panel_once(&load(&prefix));
+                }
+                let garbage = load(&[0xff; 7]);
+                assert_eq!(
+                    garbage.dock_arrangement(),
+                    aurora_ui::DockArrangement::default()
+                );
+                every_panel_once(&garbage);
+                // Applied directly onto a workspace that already floats.
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                apply_workspace_layout(&mut ws, &damaged, &crate::test_layout_scales());
+                lay(&mut ws, 1.0, WINDOW);
+                every_panel_once(&ws);
+            }
+
+            /// Review J-1 at the app level: a closed floating panel (lone,
+            /// or a fully closed group) leaves the canvas reachable under
+            /// its old rect; the palette toggle reopens it in place.
+            #[test]
+            #[allow(clippy::too_many_lines)]
+            fn a_closed_floating_panel_gives_the_canvas_back() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                let rect = bounds(&ws, frame(&ws, DockPanel::Layers));
+                let inside = centre(rect);
+                assert_eq!(pointer_in_canvas(&ws, inside), None);
+                let _ = activate_command(
+                    &mut ws,
+                    &mut focus,
+                    crate::COMMAND_CLOSE_LAYERS,
+                    &mut FakeFileDialog::default(),
+                );
+                lay(&mut ws, 1.0, WINDOW);
+                assert!(
+                    pointer_in_canvas(&ws, inside).is_some(),
+                    "the canvas is back there"
+                );
+                assert!(
+                    matches!(
+                        wheel_target(&ws, inside, false, false),
+                        WheelTarget::Canvas(_)
+                    ),
+                    "the wheel zooms again"
+                );
+                assert!(
+                    focus
+                        .focused()
+                        .is_none_or(|id| !ws.tree.is_within(frame(&ws, DockPanel::Layers), id)),
+                    "focus repaired"
+                );
+                let _ = activate_command(
+                    &mut ws,
+                    &mut focus,
+                    crate::COMMAND_TOGGLE_LAYERS,
+                    &mut FakeFileDialog::default(),
+                );
+                lay(&mut ws, 1.0, WINDOW);
+                let back = bounds(&ws, frame(&ws, DockPanel::Layers));
+                assert_eq!((back.x, back.y, back.width), (rect.x, rect.y, rect.width));
+                assert_eq!(
+                    pointer_in_canvas(&ws, inside),
+                    None,
+                    "it covers the canvas again"
+                );
+
+                // A floating group, fully closed: its grip band is gone too.
+                float(&mut ws, &mut focus, DockPanel::History);
+                let scales = crate::test_layout_scales();
+                let join = aurora_ui::DropTarget::JoinFloating(1);
+                if let Err(err) = aurora_ui::move_workspace_panel(
+                    &mut ws,
+                    &mut focus,
+                    DockPanel::Properties,
+                    join,
+                    &scales,
+                ) {
+                    unreachable!("{err:?}");
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                let Some(grip) = ws.floating.iter().find_map(|f| f.grip) else {
+                    unreachable!("a floating group");
+                };
+                // The grip's right end, clear of the Layers float above it.
+                let grip_box = bounds(&ws, grip);
+                let band = at(
+                    grip_box,
+                    grip_box.width as f32 - 4.0,
+                    grip_box.height as f32 / 2.0,
+                );
+                assert_eq!(
+                    pointer_in_canvas(&ws, band),
+                    None,
+                    "the grip covers the canvas"
+                );
+                for command in [
+                    crate::COMMAND_CLOSE_HISTORY,
+                    crate::COMMAND_CLOSE_PROPERTIES,
+                ] {
+                    let _ = activate_command(
+                        &mut ws,
+                        &mut focus,
+                        command,
+                        &mut FakeFileDialog::default(),
+                    );
+                    lay(&mut ws, 1.0, WINDOW);
+                }
+                assert!(
+                    pointer_in_canvas(&ws, band).is_some(),
+                    "no invisible grip band"
+                );
+                every_panel_once(&ws);
+            }
+
+            /// Review (a): with Properties floating (in a group, collapsed)
+            /// and the rail collapsed, a Curves layer becoming active shows
+            /// and selects Properties in its float and raises it — and
+            /// leaves the rail collapsed, since Properties is not in it.
+            #[test]
+            #[allow(clippy::too_many_lines)]
+            fn the_curves_rule_shows_a_floating_properties_without_expanding_the_rail() {
+                let (first, _) = super::curves_layers();
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let scales = crate::test_layout_scales();
+                float(&mut ws, &mut focus, DockPanel::History);
+                let join = aurora_ui::DropTarget::JoinFloating(0);
+                if let Err(err) = aurora_ui::move_workspace_panel(
+                    &mut ws,
+                    &mut focus,
+                    DockPanel::Properties,
+                    join,
+                    &scales,
+                ) {
+                    unreachable!("{err:?}");
+                }
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                let Some(group) = ws.group_of(ws.properties).cloned() else {
+                    unreachable!("Properties is in a floating group");
+                };
+                if let Err(err) = {
+                    let handle = ws.history;
+                    aurora_ui::select_panel_tab(&mut ws, handle)
+                } {
+                    unreachable!("{err:?}");
+                }
+                if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true) {
+                    unreachable!("{err:?}");
+                }
+                if let Err(err) = aurora_ui::set_rail_collapsed(&mut ws, true) {
+                    unreachable!("{err:?}");
+                }
+                lay(&mut ws, 1.0, WINDOW);
+                let mut shown_for = None;
+                assert!(crate::expand_properties_for_curves(
+                    &mut ws,
+                    &mut shown_for,
+                    Some(first)
+                ));
+                lay(&mut ws, 1.0, WINDOW);
+                assert!(aurora_ui::rail_collapsed(&ws), "the rail stays collapsed");
+                assert_eq!(
+                    aurora_ui::panel_group_shown(&ws.tree, &group),
+                    Some(1),
+                    "Properties' tab"
+                );
+                assert_eq!(
+                    aurora_ui::panel_is_collapsed(&ws.tree, ws.properties).ok(),
+                    Some(false)
+                );
+                assert_eq!(
+                    ws.floating.last().map(|f| f.frame),
+                    Some(frame(&ws, DockPanel::Properties)),
+                    "its float is raised"
+                );
+                assert!(bounds(&ws, ws.properties.root).height > 0);
+            }
+
+            /// AC-7 at the app level: collapsing the rail leaves a focused
+            /// floating panel focused and outside the hidden rail, and its
+            /// strip button hidden; Dock expands the rail again.
+            #[test]
+            fn a_collapsed_rail_leaves_floating_panels_focused_and_usable() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                float(&mut ws, &mut focus, DockPanel::Layers);
+                assert_eq!(focus.focused(), Some(ws.layers.root));
+                let _ = activate_command(
+                    &mut ws,
+                    &mut focus,
+                    crate::COMMAND_TOGGLE_PANELS,
+                    &mut FakeFileDialog::default(),
+                );
+                lay(&mut ws, 1.0, WINDOW);
+                assert!(aurora_ui::rail_collapsed(&ws));
+                assert_eq!(
+                    focus.focused(),
+                    Some(ws.layers.root),
+                    "focus stays on the float"
+                );
+                assert!(bounds(&ws, ws.layers.root).height > 0);
+                assert!(pointer_in_canvas(&ws, centre(bounds(&ws, ws.layers.header))).is_none());
+                let Some(button) = ws.panel_strip.button_for(ws.layers) else {
+                    unreachable!("a button");
+                };
+                assert_eq!(bounds(&ws, button).height, 0, "no strip button for a float");
+                assert!(run_panel_float(
+                    &mut ws,
+                    &mut focus,
+                    &crate::test_layout_scales(),
+                    DockPanel::Layers,
+                    false
+                ));
+                lay(&mut ws, 1.0, WINDOW);
+                assert!(!aurora_ui::rail_collapsed(&ws));
+                assert!(
+                    bounds(&ws, button).height == 0,
+                    "the rail is back; the strip is hidden"
+                );
             }
         }
 
@@ -71990,6 +73294,7 @@ mod panel_scroll_tests {
                     panel_group_tab: 0,
                     rail_collapsed: true,
                     dock: crate::test_saved_dock(0),
+                    float_stack: Vec::new(),
                 };
                 let bytes = encode(postcard::to_allocvec(&current));
                 assert_eq!(crate::decode_workspace_layout(&bytes).ok(), Some(current));

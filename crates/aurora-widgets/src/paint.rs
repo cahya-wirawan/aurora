@@ -475,6 +475,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
         | WidgetKind::Panel
+        | WidgetKind::RaisedPanel
         | WidgetKind::Dialog
         | WidgetKind::DropdownList
         | WidgetKind::Tooltip
@@ -1092,6 +1093,7 @@ pub fn paint_widget(
         // row types stayed separate).
         WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
+        WidgetKind::RaisedPanel => paint_raised_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
         WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
         WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
@@ -2640,6 +2642,45 @@ fn paint_panel(
         (fill_mesh, [fr, fg, fb, 1.0]),
         (border_mesh, [br, bg, bb, 1.0]),
     ])
+}
+
+/// A raised (floating) panel's paint (0.167.0, [`WidgetKind::RaisedPanel`]):
+/// the shape [`paint_dialog`] and [`paint_dropdown_list`] share
+/// ([`bordered_surface`]) — a `radius.sm` rounded rect (a docked panel's
+/// radius, [`paint_panel`]) filled with **`surface.raised`**, "Elevation 1:
+/// dropdowns, popovers" (`design/tokens/vocabulary.md`), the lowest raised
+/// level: a floating panel sits over the canvas but under every popover
+/// and modal. In Dark that fill is one neutral step lighter than
+/// `surface.panel`, the "elevation also lightens the surface" rule of
+/// `design/tokens/scales.toml`'s `elevation.*` comment; the `elevation.1`
+/// shadow is not drawn (nothing here draws shadows). An unconditional
+/// `border.default` stroke and the High Contrast themes' conditional
+/// [`control_outline`] go over it, as for a dialog.
+///
+/// **Nothing at all for an empty box** (unlike [`paint_panel`], whose
+/// collapsed root is never zero-area in practice): a floating panel the
+/// user closed leaves a zero-height frame over the canvas, and a stroked
+/// zero-height rect would draw a stray hairline across the image.
+///
+/// A design-owner question, raised rather than resolved: a dropdown's list
+/// opened *on* a floating panel resolves the same `surface.raised` fill
+/// as the panel under it, told apart only by the border.
+fn paint_raised_panel(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    if bounds.width == 0 || bounds.height == 0 {
+        return Ok(Vec::new());
+    }
+    bordered_surface(
+        bounds,
+        theme.surface.raised,
+        scales.radius.sm as f32,
+        theme,
+        scale_factor,
+    )
 }
 
 /// A drop indicator's paint (0.166.0, `widgets::drop_indicator`):
@@ -4689,6 +4730,56 @@ mod tests {
             [r, g, b, theme.state.disabled_opacity],
             "a disabled swatch still shows its own color, just dimmed"
         );
+    }
+
+    /// 0.167.0: a raised (floating) panel paints `surface.raised` — in
+    /// Dark one step lighter than a docked panel's `surface.panel` — with
+    /// the `border.default` outline, and nothing at all at zero area (a
+    /// closed floating panel's frame must not leave a hairline).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_raised_panel_paints_surface_raised_and_nothing_when_empty() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let panel = match tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::Region),
+            WidgetKind::RaisedPanel,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = dark_theme();
+        assert_ne!(
+            theme.surface.raised.to_srgb_f32(),
+            theme.surface.panel.to_srgb_f32(),
+            "Dark separates the two, so this test can tell them apart"
+        );
+        for (height, expected) in [(400, 2), (0, 0)] {
+            if let Err(err) = tree.set_bounds(
+                panel,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 240,
+                    height,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
+            let paints = match paint_widget(&tree, panel, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(paints.len(), expected, "height {height}: {paints:?}");
+            if let [(_, fill), (_, border)] = paints.as_slice() {
+                let [r, g, b] = theme.surface.raised.to_srgb_f32();
+                assert_eq!(*fill, [r, g, b, 1.0], "surface.raised");
+                let [r, g, b] = theme.border.default.to_srgb_f32();
+                assert_eq!(*border, [r, g, b, 1.0], "border.default");
+            }
+        }
     }
 
     #[test]

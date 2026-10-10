@@ -284,6 +284,21 @@ pub enum WidgetKind {
     /// index.html`'s own 12 named widgets — it's workspace chrome, not
     /// a component in that gallery's own sense.
     Panel,
+    /// A [`Panel`] lifted above other content (0.167.0): a floating
+    /// panel, or the frame holding one, drawn over the canvas. The same
+    /// titled-region semantics as [`Panel`] (its first unlabelled child
+    /// still draws a `Region` root's title), painted one elevation step
+    /// up: `surface.raised` ("Elevation 1: dropdowns, popovers",
+    /// `design/tokens/vocabulary.md`) with `radius.sm` and an
+    /// unconditional `border.default` outline — `paint::paint_raised_panel`.
+    /// In the Dark theme that is the lighter surface `elevation.*`'s own
+    /// comment calls for; the `elevation.1` shadow itself is not drawn
+    /// (nothing in this crate draws shadows yet). Nothing here knows what
+    /// floats or why: `aurora-ui` switches a panel between the two kinds.
+    /// No state, for the reason [`Panel`] has none.
+    ///
+    /// [`Panel`]: WidgetKind::Panel
+    RaisedPanel,
     /// A modal dialog's own root — `widgets::dialog`'s `insert_dialog` is
     /// the only constructor. No state, for the same reason [`Panel`] has
     /// none: its paint is a pure function of its own bounds and the
