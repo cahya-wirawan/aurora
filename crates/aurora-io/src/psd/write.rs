@@ -19,11 +19,10 @@
 //! record — `lsct` type `1` (open: Aurora's tree has no collapsed
 //! state, and open/closed is UI-only in Photoshop) followed by `8BIM`
 //! and the group's blend key — carrying the group's name, opacity,
-//! fill, blend mode and visibility. Aurora's groups are always isolated,
-//! so a group is written with its own mode (`norm` for Normal), never
-//! `pass` (Pass Through); the reader maps `pass` to `Normal` and says
-//! so at open, so a file that had Pass Through groups has already been
-//! reported as converted, and re-saving writes what Aurora shows.
+//! fill, blend mode and visibility. A group is written with its own
+//! mode: `pass` for a Pass Through group (0.179.0, which composites as
+//! Photoshop's own Pass Through and reads back as one), `norm` for an
+//! isolated Normal group, and so on.
 //! Nesting is capped at [`super::MAX_GROUP_DEPTH`], the reader's own
 //! limit, and every divider counts towards [`PSD_MAX_RECORDS`].
 //!
@@ -296,7 +295,7 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// The PSD blend key for each of Aurora's 27 modes — the inverse of the
+/// The PSD blend key for each of Aurora's 28 modes — the inverse of the
 /// reader's `blend_for_key`, exhaustive with no wildcard so a new mode
 /// cannot be written by accident.
 #[must_use]
@@ -329,6 +328,9 @@ pub fn psd_blend_key(mode: BlendMode) -> [u8; 4] {
         BlendMode::Saturation => *b"sat ",
         BlendMode::Color => *b"colr",
         BlendMode::Luminosity => *b"lum ",
+        // Group-only (`aurora_doc::LayerTree` refuses it anywhere else),
+        // so it only ever reaches a group's folder record and its `lsct`.
+        BlendMode::PassThrough => *b"pass",
     }
 }
 

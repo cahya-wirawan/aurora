@@ -98,10 +98,9 @@
 //! both call it once per `LayerTree::roots` entry): every group
 //! composites its own visible direct children in isolation, then that
 //! isolated result is composited one level up using the group's own
-//! opacity/blend mode — the only semantic `aurora_doc::BlendMode`'s
-//! 27 variants can actually express, since the schema has no "Pass
-//! Through" mode to model Photoshop's own isolated-vs-pass-through
-//! distinction with. Real for the common cases — a single child of any
+//! opacity/blend mode — except a Pass Through group (0.179.0,
+//! `aurora_doc::BlendMode::PassThrough`), whose children composite
+//! straight onto the backdrop below it (`fold_pass_through_group`). Real for the common cases — a single child of any
 //! opacity, or multiple children combining via `Normal` — after
 //! `resolve_tile`'s own un-premultiply fix; a group whose *own*
 //! children combine via a non-`Normal` blend mode against each other
@@ -7212,7 +7211,9 @@ fn settle_pending_opacity(cx: &mut LayerControlEdit<'_>, captured: Option<Widget
 ///   or an assistive technology's `SetValue`/`Increment`): one
 ///   `History::set_opacity` step per change.
 /// - **Blend mode** (`Committed { changed: true }`): one
-///   `History::set_blend_mode` step, `BlendMode::ALL[index]`.
+///   `History::set_blend_mode` step, the mode at `index` in the active
+///   layer's own option list (`aurora_ui::blend_mode_at`: Pass Through
+///   first for a group, 0.179.0).
 /// - **Visibility** (`Toggled`): one `History::set_visible` step.
 ///
 /// Anything else (focus, an opened list, a highlight moving) is
@@ -7277,8 +7278,8 @@ fn apply_layer_control_outcome(
                     index,
                     changed: true,
                 },
-        }) if *id == controls.blend => match aurora_doc::BlendMode::ALL.get(*index) {
-            Some(&mode) => cx.history.set_blend_mode(cx.layers, active, mode),
+        }) if *id == controls.blend => match aurora_ui::blend_mode_at(cx.layers, active, *index) {
+            Some(mode) => cx.history.set_blend_mode(cx.layers, active, mode),
             None => return CompositeInvalidation::None,
         },
         PointerOutcome::Action(Outcome::Toggled { id, state }) if *id == controls.visible => cx
@@ -12072,6 +12073,15 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
         aurora_doc::BlendMode::Luminosity => aurora_render::BlendMode::Luminosity,
         aurora_doc::BlendMode::DarkerColor => aurora_render::BlendMode::DarkerColor,
         aurora_doc::BlendMode::LighterColor => aurora_render::BlendMode::LighterColor,
+        // Pass Through (0.179.0) is not a blend function either: a
+        // pass-through group is composited by [`fold_pass_through_group`],
+        // which folds its children into the accumulator below it and never
+        // asks for this translation. `aurora_doc` refuses the mode on
+        // anything but a group, so the only way here is a caller compositing
+        // a pass-through group *as a unit* (`resolve_tile` called on it
+        // directly), which then gets an isolated Normal group — the
+        // pre-0.179.0 rendering — rather than an undefined one.
+        aurora_doc::BlendMode::PassThrough => aurora_render::BlendMode::Normal,
         // `Dissolve` has no real mapping here, on purpose, permanently —
         // not a placeholder waiting on `aurora_render::BlendMode` to grow
         // a variant. Dissolve is stochastic per-pixel selection, not a
@@ -12775,15 +12785,13 @@ impl CompositeBudget {
 /// document, and sizing it from the document itself is what pays that
 /// back — see [`CompositeBudget`].
 ///
-/// **No "Pass Through" mode**: `aurora_doc::BlendMode`'s 27 variants
-/// have no such variant — Photoshop's real distinction between an
-/// isolated and a pass-through group isn't modeled in this schema at
-/// all. Given that, isolating *every* group, always, is the only
-/// semantic this data model can actually express, so that is what this
-/// function implements — a deliberate, documented simplification, not
-/// an oversight; real Pass Through semantics (if ever wanted) would
-/// need a new field on [`aurora_doc::LayerKind::Group`] first, which is
-/// separate, still-open follow-on work.
+/// **Pass Through** (0.179.0): this function always composites a group
+/// *isolated*. A Pass Through group never reaches it from the real
+/// compositing paths — [`fold_layer_into`] routes one to
+/// [`fold_pass_through_group`], which folds its children onto the
+/// backdrop below instead — so only a caller asking for a pass-through
+/// group *as a unit* gets it isolated, at `Normal`
+/// (`translate_blend_mode`'s `PassThrough` arm).
 ///
 /// The returned `(texels, opacity, blend_mode)` are **`id`'s own,
 /// unapplied** — the caller (whichever level actually contains `id`:
@@ -13319,6 +13327,21 @@ fn fold_layer_into(
     if matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_))) {
         return apply_adjustment_layer(accumulator, id, layers, store, doc_origin, depth, budget);
     }
+    if layers.blend_mode(id) == Some(aurora_doc::BlendMode::PassThrough)
+        && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
+    {
+        return fold_pass_through_group(
+            accumulator,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
     match resolve_tile(
         id,
         layers,
@@ -13335,6 +13358,117 @@ fn fold_layer_into(
         }
         None => false,
     }
+}
+
+/// Folds a **Pass Through** group (0.179.0, `aurora_doc::BlendMode::PassThrough`)
+/// into `accumulator`, the premultiplied composite of everything below it
+/// in its own context (its parent group's accumulator, or the document's).
+///
+/// Photoshop's Pass Through: the group creates no isolated layer. Its
+/// visible children fold, bottom to top, **straight into `accumulator`**
+/// through [`fold_layer_into`] — so a `Multiply` child multiplies what is
+/// below the group, an adjustment child (Curves) adjusts everything below
+/// it in this context including layers below the group, and a nested
+/// pass-through group recurses the same way. The group's own opacity and
+/// enabled mask then interpolate between the backdrop before the group,
+/// `B`, and the accumulator after its children, `C`:
+///
+/// `result = B + (C - B) * (opacity * mask_coverage)`
+///
+/// per texel and per channel, in premultiplied space. Premultiplied
+/// matters at a transparent backdrop: there `B = 0` and the formula is
+/// exactly a source-over of `C` at that opacity, which is what Photoshop
+/// shows (and what psd-tools' `_apply_passthrough_source` special-cases
+/// in straight colour). With opacity `1` and no enabled mask the
+/// backdrop is not copied at all and the result is `C` exactly.
+///
+/// The group's **Fill** opacity is not applied, like every other layer's
+/// in Aurora today (the PSD reader reports it for a pass-through group).
+/// `Dissolve` cannot occur: the group's mode *is* Pass Through.
+///
+/// Returns whether anything changed the accumulator, the same contract
+/// as [`fold_layer_into`].
+#[allow(clippy::too_many_arguments)]
+fn fold_pass_through_group(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !admit_composite_node(id, layers, depth, budget) {
+        return false;
+    }
+    let Some(opacity) = layers.opacity(id) else {
+        return false;
+    };
+    let Some(children) = layers.children(id) else {
+        return false;
+    };
+    // Exactly the backdrop, untouched: the formula above at `t = 0`.
+    if opacity <= 0.0 {
+        return false;
+    }
+    let mask = layers.mask(id).filter(|mask| mask.enabled);
+    let backdrop = (opacity < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
+    let mut changed = false;
+    for &child_id in children.iter().rev() {
+        if budget.is_exhausted() {
+            break;
+        }
+        changed |= fold_layer_into(
+            accumulator,
+            child_id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth.saturating_add(1),
+            budget,
+        );
+    }
+    if !changed {
+        return false;
+    }
+    let Some(backdrop) = backdrop else {
+        return true;
+    };
+    // The mask's per-texel coverage, read the one way every other mask in
+    // this file is read (`apply_mask`): masking an opaque white tile
+    // leaves coverage in its alpha.
+    let coverage = mask.map(|mask| {
+        let one = half::f16::from_f32(1.0);
+        apply_mask(
+            &vec![one; accumulator.len()],
+            mask,
+            layers.mask_surface_id(id),
+            store,
+            doc_origin,
+            budget,
+        )
+    });
+    for (index, (out, below)) in accumulator
+        .chunks_exact_mut(aurora_tile::CHANNELS)
+        .zip(backdrop.chunks_exact(aurora_tile::CHANNELS))
+        .enumerate()
+    {
+        let covered = coverage.as_ref().map_or(1.0, |coverage| {
+            coverage
+                .get(index * aurora_tile::CHANNELS + 3)
+                .map_or(0.0, |alpha| alpha.to_f32())
+        });
+        let t = (opacity * covered).clamp(0.0, 1.0);
+        for (channel, &base) in out.iter_mut().zip(below) {
+            let b = base.to_f32();
+            *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(t, b));
+        }
+    }
+    true
 }
 
 /// How many distinct Curves parameter sets [`curves_lut`] keeps built per
@@ -13399,10 +13533,12 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
 /// are an exact passthrough rather than an `f16` un-/re-premultiply round
 /// trip. Returns `true` when the layer was applied.
 ///
-/// Known differences from Photoshop, disclosed: groups here are always
-/// isolated (Aurora has no Pass Through mode), so an adjustment inside a
-/// group never reaches layers below the group; and fill opacity is not
-/// applied, matching how pixel layers composite today.
+/// Inside a Pass Through group (0.179.0) the accumulator is the one below
+/// the group, so the adjustment reaches layers below the group too
+/// ([`fold_pass_through_group`]); inside any other group it is that
+/// group's isolated accumulator. Known difference from Photoshop,
+/// disclosed: fill opacity is not applied, matching how pixel layers
+/// composite today.
 #[allow(clippy::too_many_arguments)]
 fn apply_adjustment_layer(
     accumulator: &mut [half::f16],
@@ -17884,10 +18020,9 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// the full mechanism). A group's own
 /// `opacity`/`blend_mode` **are** now aggregated into its children's
 /// effective compositing — [`resolve_tile`]'s own doc comment has the
-/// real isolated-compositing semantic (every group isolates, always;
-/// there is no "Pass Through" mode in `aurora_doc::BlendMode` to
-/// express Photoshop's own distinction, so this is the only semantic
-/// the schema can actually express) — real for the common cases (a
+/// real isolated-compositing semantic (every group isolates except a
+/// Pass Through one, 0.179.0, which [`fold_pass_through_group`] folds
+/// onto the backdrop below it) — real for the common cases (a
 /// single child of any opacity, or multiple children combining via
 /// `Normal`) after [`resolve_tile`]'s own un-premultiply fix, with a
 /// narrower, still-open gap remaining for a group's own children
@@ -19104,9 +19239,8 @@ fn read_layer_window(
 /// `blend_mode` **are** now aggregated into its children's effective
 /// compositing, via the same isolated-compositing semantic
 /// [`resolve_tile`]'s own doc comment lays out (every group composites
-/// in isolation, always — `aurora_doc::BlendMode` has no "Pass Through"
-/// variant to express Photoshop's own distinction, so isolation is the
-/// only semantic this schema can actually express). Real for the common
+/// in isolation except a Pass Through one, 0.179.0, which
+/// [`fold_pass_through_group`] folds onto the backdrop below it). Real for the common
 /// cases (a single child of any opacity, or multiple children combining
 /// via `Normal`) after [`resolve_tile`]'s own un-premultiply fix — a
 /// narrower, still-open gap remains for a group's own children
@@ -23619,8 +23753,8 @@ impl App {
     /// its children's effective compositing, by isolating a group's own
     /// visible direct children first and then compositing that isolated
     /// result one level up using the group's own opacity/blend mode
-    /// (the only semantic `aurora_doc::BlendMode` can express, since it
-    /// has no "Pass Through" variant) — real for the common cases (a
+    /// (a Pass Through group, 0.179.0, instead folds its children onto
+    /// the backdrop below it) — real for the common cases (a
     /// single child of any opacity, or multiple children combining via
     /// `Normal`) after `resolve_tile`'s own un-premultiply fix, with a
     /// narrower, still-open gap for a group's own children combining
@@ -31302,7 +31436,6 @@ mod tests {
     /// and more than two.
     const CURVES_RGB_OVER_ONE: usize = 209;
     const CURVES_RGB_OVER_TWO: usize = 3;
-    const PASS_THROUGH_CURVES: &str = "inside a Pass Through group, which Aurora doesn't have";
     /// Other `curv` corpus files: `(file, max error where no Curves mask is
     /// fractional, a report line that explains a difference)`.
     const CURVES_CORPUS_EXPECTED: &[(&str, f64, Option<&str>)] = &[
@@ -31322,26 +31455,20 @@ mod tests {
             68.0,
             Some("4 clipped layers"),
         ),
-        // Curves inside Pass Through groups.
+        // Curves inside Pass Through groups — composited as Pass Through
+        // since 0.179.0, so no longer reported; what remains is named in
+        // each file's own report (a Levels layer left out, fill layers).
         (
             "adjustments/adjustment_nested_composition_1.psd",
-            254.0,
-            Some(PASS_THROUGH_CURVES),
+            137.0,
+            None,
         ),
-        (
-            "adjustments/adjustment_nested_composition_2.psd",
-            182.0,
-            Some(PASS_THROUGH_CURVES),
-        ),
-        (
-            "adjustments/adjustment_nested_composition_3.psd",
-            1.0,
-            Some(PASS_THROUGH_CURVES),
-        ),
+        ("adjustments/adjustment_nested_composition_2.psd", 3.0, None),
+        ("adjustments/adjustment_nested_composition_3.psd", 1.0, None),
         (
             "adjustments/adjustment_nested_composition_4.psd",
-            167.0,
-            Some(PASS_THROUGH_CURVES),
+            113.0,
+            None,
         ),
         // A Levels layer left out.
         (
@@ -31383,7 +31510,20 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../corpora/psd/reference/psd-tools-fixtures")
             .join(relative);
-        let Ok(bytes) = std::fs::read(&path) else {
+        psd_merged_diff(&path, relative)
+    }
+
+    /// [`curves_corpus_diff`] for any PSD path: Aurora's composite against
+    /// the file's own merged image.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::collapsible_if
+    )]
+    fn psd_merged_diff(path: &std::path::Path, relative: &str) -> Option<CurvesDiff> {
+        let Ok(bytes) = std::fs::read(path) else {
             println!("SKIPPED: corpus file not present at {}", path.display());
             return None;
         };
@@ -31552,6 +31692,69 @@ mod tests {
                 CURVES_CORPUS_EXPECTED.len()
             );
         }
+    }
+
+    /// AC-4 (0.179.0): psd-tools' Pass Through fixtures, each against the
+    /// file's own merged image (Photoshop's rendering), pinned at the
+    /// measured maximum error per file (8-bit levels, solid pixels) as a
+    /// regression guard. PLAN.md's 0.179.0 entry records the numbers
+    /// before Pass Through existed next to these.
+    const PASS_THROUGH_CORPUS_EXPECTED: &[(&str, f64)] = &[
+        ("passthrough_blendmodes1.psd", 1.0),
+        ("passthrough_blendmodes2.psd", 1.0),
+        ("passthrough_blendmodes3.psd", 2.0),
+        ("passthrough_opacity.psd", 86.0),
+        ("passthrough_fill_blendmode.psd", 134.0),
+        ("passthrough_fill_adjustment.psd", 152.0),
+        ("passthrough_vector_mask.psd", 156.0),
+        ("passthrough_clipping_mask_blendmode.psd", 1.0),
+        ("passthrough_clipping_mask_adjustment.psd", 170.0),
+    ];
+
+    /// AC-4 (0.179.0): the user's own Photoshop template (not committed;
+    /// point `AURORA_PASS_THROUGH_PSD` at it), against its merged image.
+    /// Prints the numbers PLAN.md records; asserts nothing beyond opening.
+    #[test]
+    #[ignore = "needs a local PSD named by AURORA_PASS_THROUGH_PSD"]
+    fn a_local_pass_through_psd_against_its_merged_image() {
+        let Some(path) = std::env::var_os("AURORA_PASS_THROUGH_PSD") else {
+            println!("SKIPPED: AURORA_PASS_THROUGH_PSD not set");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let started = std::time::Instant::now();
+        let Some(diff) = psd_merged_diff(&path, "local") else {
+            unreachable!("could not read {}", path.display());
+        };
+        println!(
+            "LOCAL max {:?} mean {:?} max_solid {} over_one {} over_two {} report {:?} ({:?})",
+            diff.max,
+            diff.mean,
+            diff.max_solid,
+            diff.over_one,
+            diff.over_two,
+            diff.report,
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn pass_through_corpus_files_composite_like_photoshops_merged_image() {
+        let mut over = Vec::new();
+        for &(file, max_solid) in PASS_THROUGH_CORPUS_EXPECTED {
+            let Some(diff) = curves_corpus_diff(file) else {
+                println!("not run: {file} (corpus file missing)");
+                continue;
+            };
+            println!(
+                "PT {file}: max {:?} mean {:?} max_solid {} report {:?}",
+                diff.max, diff.mean, diff.max_solid, diff.report
+            );
+            if diff.max_solid > max_solid {
+                over.push(format!("{file}: {} > {max_solid}", diff.max_solid));
+            }
+        }
+        assert!(over.is_empty(), "{over:?}");
     }
 
     /// 0.150.0: a PSD vector mask is rasterised and composited — a blue
@@ -38117,6 +38320,303 @@ mod tests {
                 "50% grey multiplied by 50% grey must darken to 25% grey, not stay 50%"
             );
         }
+    }
+
+    /// A document for the Pass Through tests (0.179.0): a 4x1 opaque
+    /// `base` root at `base_rgba`, and a group above it holding `children`
+    /// (bottom to top: name, blend mode, RGBA or `None` for a Curves layer
+    /// that inverts). Returns the tree and the group's id.
+    #[allow(clippy::type_complexity)]
+    fn pass_through_doc(
+        store: &mut aurora_tile::TileStore,
+        base_rgba: [f32; 4],
+        group_mode: aurora_doc::BlendMode,
+        children: &[(&str, aurora_doc::BlendMode, Option<[f32; 4]>)],
+    ) -> (aurora_doc::LayerTree, aurora_doc::LayerId) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let base = match layers.add_pixel_layer("base", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Some(surface) = layers.surface_id(base) {
+            fill_solid(store, surface, tile_id, base_rgba);
+        }
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(group, group_mode) {
+            unreachable!("{err:?}");
+        }
+        add_pass_through_children(&mut layers, store, group, children);
+        (layers, group)
+    }
+
+    #[allow(clippy::single_match_else)] // two real arms: pixels or a Curves layer
+    fn add_pass_through_children(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        group: aurora_doc::LayerId,
+        children: &[(&str, aurora_doc::BlendMode, Option<[f32; 4]>)],
+    ) {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for &(name, mode, rgba) in children {
+            let id = match rgba {
+                Some(rgba) => {
+                    let id = match layers.add_pixel_layer(name, bounds, Some(group)) {
+                        Ok(id) => id,
+                        Err(err) => unreachable!("{err:?}"),
+                    };
+                    if let Some(surface) = layers.surface_id(id) {
+                        fill_solid(store, surface, tile_id, rgba);
+                    }
+                    id
+                }
+                None => {
+                    let invert = match aurora_core::ToneCurve::new(&[
+                        aurora_core::CurvePoint { x: 0.0, y: 1.0 },
+                        aurora_core::CurvePoint { x: 1.0, y: 0.0 },
+                    ]) {
+                        Ok(curve) => curve,
+                        Err(err) => unreachable!("{err:?}"),
+                    };
+                    let mut params = aurora_core::CurvesParams::identity();
+                    params.composite = invert;
+                    match layers.add_adjustment_layer_at(
+                        name,
+                        aurora_doc::Adjustment::Curves(params),
+                        Some(group),
+                        0,
+                    ) {
+                        Ok(id) => id,
+                        Err(err) => unreachable!("{err:?}"),
+                    }
+                }
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+        }
+    }
+
+    fn composite_4x1(
+        layers: &aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+    ) -> aurora_io::Image {
+        match composite_document(layers, store, 4, 1) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn assert_near(got: [f32; 4], want: [f32; 4], what: &str) {
+        assert!(
+            got.iter().zip(want).all(|(g, w)| (g - w).abs() < 2e-3),
+            "{what}: got {got:?}, want {want:?}"
+        );
+    }
+
+    /// AC-2 (0.179.0): a Multiply child of a Pass Through group multiplies
+    /// the layer *below the group* (0.5 x 0.5 = 0.25); the same child in an
+    /// isolated Normal group has nothing to multiply and shows itself (0.5)
+    /// — the regression half, unchanged from before Pass Through existed.
+    #[test]
+    fn a_pass_through_groups_multiply_child_darkens_the_backdrop_below_the_group() {
+        use aurora_doc::BlendMode as B;
+        let (_dir, mut store) = real_tile_store();
+        let child = [("mul", B::Multiply, Some([0.5, 0.5, 0.5, 1.0]))];
+        let (layers, _) =
+            pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::PassThrough, &child);
+        let image = composite_4x1(&layers, &mut store);
+        for x in 0..4 {
+            assert_near(
+                image_pixel(&image, x, 0),
+                [0.25, 0.25, 0.25, 1.0],
+                "pass through",
+            );
+        }
+        let (_dir, mut store) = real_tile_store();
+        let (layers, _) = pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::Normal, &child);
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(
+            image_pixel(&image, 0, 0),
+            [0.5, 0.5, 0.5, 1.0],
+            "isolated Normal group",
+        );
+        // A Multiply *isolated group* multiplies its isolated result
+        // instead — the same 0.25 here, reached the other way.
+        let (_dir, mut store) = real_tile_store();
+        let (layers, _) = pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::Multiply, &child);
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(
+            image_pixel(&image, 0, 0),
+            [0.25, 0.25, 0.25, 1.0],
+            "isolated Multiply group",
+        );
+    }
+
+    /// AC-2: the group's opacity lerps between the backdrop before it and
+    /// the result after its children: 0.5 + (0.25 - 0.5) * 0.5 = 0.375.
+    /// Over a transparent backdrop the same lerp, done premultiplied, is a
+    /// plain source-over at that opacity: (1, 0, 0) at alpha 0.5.
+    #[test]
+    fn a_pass_through_groups_opacity_lerps_from_the_backdrop() {
+        use aurora_doc::BlendMode as B;
+        let (_dir, mut store) = real_tile_store();
+        let child = [("mul", B::Multiply, Some([0.5, 0.5, 0.5, 1.0]))];
+        let (mut layers, group) =
+            pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::PassThrough, &child);
+        assert!(layers.set_opacity(group, 0.5).is_ok());
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(
+            image_pixel(&image, 0, 0),
+            [0.375, 0.375, 0.375, 1.0],
+            "opacity 0.5",
+        );
+        assert!(layers.set_opacity(group, 0.0).is_ok());
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(image_pixel(&image, 0, 0), [0.5, 0.5, 0.5, 1.0], "opacity 0");
+
+        let (_dir, mut store) = real_tile_store();
+        let red = [("red", B::Normal, Some([1.0, 0.0, 0.0, 1.0]))];
+        let (mut layers, group) =
+            pass_through_doc(&mut store, [0.0, 0.0, 0.0, 0.0], B::PassThrough, &red);
+        assert!(layers.set_opacity(group, 0.5).is_ok());
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(
+            image_pixel(&image, 0, 0),
+            [1.0, 0.0, 0.0, 0.5],
+            "transparent backdrop",
+        );
+    }
+
+    /// AC-2: an enabled group mask lerps per pixel — coverage 0, 1 and 0.5
+    /// at x = 0, 1, 2 give the backdrop, the full multiply, and halfway; a
+    /// disabled mask is ignored.
+    #[test]
+    fn a_pass_through_groups_mask_lerps_per_pixel() {
+        use aurora_doc::BlendMode as B;
+        let (_dir, mut store) = real_tile_store();
+        let child = [("mul", B::Multiply, Some([0.5, 0.5, 0.5, 1.0]))];
+        let (mut layers, group) =
+            pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::PassThrough, &child);
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        assert!(layers.add_mask(group, bounds).is_ok());
+        let Some(surface) = layers.mask_surface_id(group) else {
+            unreachable!("masked group");
+        };
+        let written =
+            aurora_doc::write_mask_coverage_region(&mut store, surface, (0, 0), 4, 1, |x, _| {
+                [0.0, 1.0, 0.5, 1.0].get(x as usize).copied().unwrap_or(1.0)
+            });
+        assert!(written.is_ok(), "{written:?}");
+        let image = composite_4x1(&layers, &mut store);
+        for (x, v) in [(0, 0.5), (1, 0.25), (2, 0.375), (3, 0.25)] {
+            assert_near(
+                image_pixel(&image, x, 0),
+                [v, v, v, 1.0],
+                &format!("x = {x}"),
+            );
+        }
+        assert!(layers.set_mask_enabled(group, false).is_ok());
+        let image = composite_4x1(&layers, &mut store);
+        assert_near(
+            image_pixel(&image, 0, 0),
+            [0.25, 0.25, 0.25, 1.0],
+            "disabled mask",
+        );
+    }
+
+    /// AC-2: a Pass Through group nested in a Pass Through group still
+    /// reaches the base layer (0.25 at full opacity, 0.375 with the outer
+    /// group at 50%); with the inner group isolated instead its Multiply
+    /// child has nothing to multiply and the outer lerp is between 0.5 and
+    /// 0.5.
+    #[test]
+    fn nested_pass_through_groups_recurse() {
+        use aurora_doc::BlendMode as B;
+        for (inner_mode, want) in [(B::PassThrough, 0.375), (B::Normal, 0.5)] {
+            let (_dir, mut store) = real_tile_store();
+            let (mut layers, outer) =
+                pass_through_doc(&mut store, [0.5, 0.5, 0.5, 1.0], B::PassThrough, &[]);
+            let inner = match layers.add_group("inner", Some(outer)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert!(layers.set_blend_mode(inner, inner_mode).is_ok());
+            add_pass_through_children(
+                &mut layers,
+                &mut store,
+                inner,
+                &[("mul", B::Multiply, Some([0.5, 0.5, 0.5, 1.0]))],
+            );
+            assert!(layers.set_opacity(outer, 0.5).is_ok());
+            let image = composite_4x1(&layers, &mut store);
+            assert_near(
+                image_pixel(&image, 0, 0),
+                [want, want, want, 1.0],
+                &format!("{inner_mode:?}"),
+            );
+        }
+    }
+
+    /// AC-2: a Curves layer inside a Pass Through group adjusts the layer
+    /// below the group (an inverting curve turns 0.25 into 0.75); inside an
+    /// isolated group it has nothing below it and changes nothing.
+    #[test]
+    fn curves_inside_a_pass_through_group_adjust_layers_below_the_group() {
+        use aurora_doc::BlendMode as B;
+        for (mode, want) in [(B::PassThrough, 0.75), (B::Normal, 0.25)] {
+            let (_dir, mut store) = real_tile_store();
+            let (layers, _) = pass_through_doc(
+                &mut store,
+                [0.25, 0.25, 0.25, 1.0],
+                mode,
+                &[("invert", B::Normal, None)],
+            );
+            let image = composite_4x1(&layers, &mut store);
+            assert_near(
+                image_pixel(&image, 0, 0),
+                [want, want, want, 1.0],
+                &format!("{mode:?}"),
+            );
+        }
+    }
+
+    /// AC-2: a document with a visible Pass Through group never qualifies
+    /// for the GPU fast path, which composites groups isolated; hidden, it
+    /// contributes nothing on either path and does not refuse.
+    #[test]
+    fn a_visible_pass_through_group_refuses_the_gpu_fast_path() {
+        use aurora_doc::BlendMode as B;
+        let (_dir, mut store) = real_tile_store();
+        let (mut layers, group) = pass_through_doc(
+            &mut store,
+            [0.5, 0.5, 0.5, 1.0],
+            B::PassThrough,
+            &[("mul", B::Multiply, Some([0.5, 0.5, 0.5, 1.0]))],
+        );
+        assert!(!document_qualifies_for_gpu_compositing(&layers));
+        assert!(layers.set_visible(group, false).is_ok());
+        assert!(document_qualifies_for_gpu_compositing(&layers));
     }
 
     #[test]
@@ -49008,7 +49508,10 @@ mod tests {
     #[test]
     fn document_qualifies_for_gpu_compositing_admits_exactly_the_modes_with_a_dispatch_counter() {
         let mut admitted = Vec::new();
-        for mode in aurora_doc::BlendMode::ALL {
+        // Pixel-layer modes only: a pixel layer refuses the group-only
+        // Pass Through (0.179.0), whose groups always refuse the GPU path
+        // (`a_visible_pass_through_group_refuses_the_gpu_fast_path`).
+        for mode in aurora_doc::BlendMode::modes_for(false) {
             let stack: [StackEntry; 1] = [("only", mode, 1.0, [0.25, 0.5, 0.75, 1.0])];
             if document_qualifies_for_gpu_compositing(&root_stack_tree(&stack)) {
                 admitted.push(mode);

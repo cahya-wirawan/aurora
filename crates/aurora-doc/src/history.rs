@@ -2976,6 +2976,49 @@ mod tests {
         assert_eq!(tree.fill_opacity(id), Some(0.5));
     }
 
+    /// AC-1/AC-5 (0.179.0): Pass Through goes through the ordinary
+    /// blend-mode op — undo restores the group's previous mode, redo
+    /// re-applies it, and a pixel layer's refusal records no step.
+    #[test]
+    fn set_blend_mode_pass_through_on_a_group_undoes_and_a_pixel_layer_refuses() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let pixel = match history.add_pixel_layer(&mut tree, "p", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_blend_mode(&mut tree, group, BlendMode::PassThrough) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_mode(group), Some(BlendMode::PassThrough));
+        let undo_len = history.undo_stack.len();
+        assert!(
+            history
+                .set_blend_mode(&mut tree, pixel, BlendMode::PassThrough)
+                .is_err()
+        );
+        assert_eq!(
+            history.undo_stack.len(),
+            undo_len,
+            "a refusal records no step"
+        );
+        assert_eq!(tree.blend_mode(pixel), Some(BlendMode::Normal));
+        assert!(history.undo(&mut tree).is_ok());
+        assert_eq!(tree.blend_mode(group), Some(BlendMode::Normal));
+        assert!(history.redo(&mut tree).is_ok());
+        assert_eq!(tree.blend_mode(group), Some(BlendMode::PassThrough));
+    }
+
     #[test]
     fn set_blend_mode_undo_redo_round_trips() {
         let mut tree = LayerTree::new();

@@ -266,17 +266,24 @@ fn write_psd_round_trips_flat_layers_through_read() {
 
 #[test]
 fn write_psd_all_27_blend_keys_round_trip() {
-    for mode in BlendMode::ALL {
+    for mode in BlendMode::modes_for(false) {
         assert_eq!(blend_for_key(psd_blend_key(mode)), PsdBlend::Mode(mode));
     }
+    // 0.179.0: Pass Through is written as `pass`, which the reader keeps
+    // for a group (`pass_through_group_writes_pass_and_round_trips`).
+    assert_eq!(psd_blend_key(BlendMode::PassThrough), *b"pass");
+    assert_eq!(
+        blend_for_key(psd_blend_key(BlendMode::PassThrough)),
+        PsdBlend::PassThrough
+    );
     let mut keys: Vec<[u8; 4]> = BlendMode::ALL.iter().map(|&m| psd_blend_key(m)).collect();
     keys.sort_unstable();
     keys.dedup();
-    assert_eq!(keys.len(), 27);
+    assert_eq!(keys.len(), 28);
 
     let mut doc = Doc::new((4, 4));
     let px = image(4, 4, |_, _| [0.5, 0.25, 0.75, 1.0]);
-    for mode in BlendMode::ALL {
+    for mode in BlendMode::modes_for(false) {
         let id = doc.layer(&format!("{mode:?}"), rect(0, 0, 4, 4), Some((&px, 0, 0)));
         ok(doc.tree.set_blend_mode(id, mode));
     }
@@ -286,8 +293,52 @@ fn write_psd_all_27_blend_keys_round_trip() {
         .iter()
         .map(|&id| back.layers.blend_mode(id))
         .collect();
-    let want: Vec<_> = BlendMode::ALL.iter().map(|&m| Some(m)).collect();
+    let want: Vec<_> = BlendMode::modes_for(false)
+        .iter()
+        .map(|&m| Some(m))
+        .collect();
     assert_eq!(modes, want);
+}
+
+/// AC-3 (0.179.0): a Pass Through group is written as `pass` in both its
+/// record and its `lsct`, reads back as Pass Through with nothing
+/// reported, and passes the writer's own verification; an isolated
+/// Normal group beside it still writes `norm`.
+#[test]
+fn pass_through_group_writes_pass_and_round_trips() {
+    let mut doc = Doc::new((4, 4));
+    doc.layer_in("Base", rect(0, 0, 4, 4), Some(&px(4, 4, 0)), None);
+    let g = doc.group("Pass", None);
+    let inner = doc.layer_in("In", rect(0, 0, 4, 4), Some(&px(4, 4, 1)), Some(g));
+    ok(doc.tree.set_blend_mode(inner, BlendMode::Multiply));
+    ok(doc.tree.set_blend_mode(g, BlendMode::PassThrough));
+    ok(doc.tree.set_opacity(g, 128.0 / 255.0));
+    let normal = doc.group("Plain", None);
+    doc.layer_in("In2", rect(0, 0, 2, 2), Some(&px(2, 2, 2)), Some(normal));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    // Records: Base, end, In, Pass, end, In2, Plain.
+    assert_eq!(blend_key_of(&bytes, 3), *b"pass");
+    assert_eq!(blend_key_of(&bytes, 6), *b"norm");
+    let recs = records(&bytes);
+    let mut folder = 1u32.to_be_bytes().to_vec();
+    folder.extend_from_slice(b"8BIMpass");
+    assert_eq!(rec(&recs, 3).0.as_deref(), Some(folder.as_slice()));
+    let back = read_back(&bytes);
+    let l = &back.layers;
+    let Some(pass) = l
+        .roots()
+        .iter()
+        .copied()
+        .find(|&id| l.name(id) == Some("Pass"))
+    else {
+        unreachable!("group read back")
+    };
+    assert_eq!(l.blend_mode(pass), Some(BlendMode::PassThrough));
+    assert_eq!(l.opacity(pass), Some(128.0 / 255.0));
+    assert!(back.report.items.is_empty(), "{:?}", back.report);
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("pass.psd"), false));
 }
 
 #[test]
@@ -1823,7 +1874,7 @@ fn group_blend_and_props_round_trip() {
             !section
                 .as_deref()
                 .is_some_and(|s| s.windows(4).any(|w| w == b"pass")),
-            "never Pass Through"
+            "a Normal/Multiply group is never written as Pass Through"
         );
     }
     let back = read_back(&bytes);
@@ -2279,6 +2330,9 @@ fn write_psd_group_fixtures_for_psd_tools() {
     ok(doc.tree.set_mask_density(masked, 128.0 / 255.0));
     let inner = doc.group("Inner 内側", Some(outer));
     ok(doc.tree.set_visible(inner, false));
+    // 0.179.0: a Pass Through group, so psd-tools reads `pass` back from
+    // both its record and its `lsct`.
+    ok(doc.tree.set_blend_mode(inner, BlendMode::PassThrough));
     ok(doc.tree.set_fill_opacity(inner, 51.0 / 255.0));
     doc.layer_in("Deep", rect(10, 10, 8, 8), Some(&px(8, 8, 2)), Some(inner));
     doc.mask(inner, rect(2, 2, 30, 20), (0, 0, 30, 20), |x, y| {

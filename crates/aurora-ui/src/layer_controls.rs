@@ -41,29 +41,56 @@ pub struct LayerControls {
     pub root: WidgetId,
     /// Opacity, in percent (`0..=100`).
     pub opacity: WidgetId,
-    /// Blend mode; option `i` is `BlendMode::ALL[i]`.
+    /// Blend mode; option `i` is `BlendMode::modes_for(is_group)[i]` for
+    /// the active layer (Pass Through first for a group, 0.179.0).
     pub blend: WidgetId,
     /// Whether the active layer is visible.
     pub visible: WidgetId,
 }
 
-/// The blend-mode dropdown's options, in `BlendMode::ALL` order — the one
-/// place that order is turned into labels, so an option index and
-/// `BlendMode::ALL[index]` can never drift apart.
+/// The blend-mode dropdown's options for a pixel or adjustment layer:
+/// the 27 layer modes in `BlendMode::ALL` order, without the group-only
+/// Pass Through. See [`blend_mode_options_for`].
 #[must_use]
 pub fn blend_mode_options() -> Vec<String> {
-    BlendMode::ALL
+    blend_mode_options_for(false)
+}
+
+/// The blend-mode dropdown's options for a group (`is_group`, Pass
+/// Through first, as in Photoshop's own group menu, 0.179.0) or for any
+/// other layer — `BlendMode::modes_for`, turned into labels in this one
+/// place, so an option index and the mode it names cannot drift apart.
+#[must_use]
+pub fn blend_mode_options_for(is_group: bool) -> Vec<String> {
+    BlendMode::modes_for(is_group)
         .iter()
         .map(|&mode| blend_mode_label(mode).to_owned())
         .collect()
 }
 
-/// The dropdown option index of `mode` (its position in `BlendMode::ALL`).
+/// The dropdown option index of `mode` in a pixel or adjustment layer's
+/// list ([`blend_mode_options`]); `None` for Pass Through.
 #[must_use]
 pub fn blend_mode_index(mode: BlendMode) -> Option<usize> {
-    BlendMode::ALL
+    blend_mode_index_for(false, mode)
+}
+
+/// The dropdown option index of `mode` in [`blend_mode_options_for`]'s
+/// list for `is_group`.
+#[must_use]
+pub fn blend_mode_index_for(is_group: bool, mode: BlendMode) -> Option<usize> {
+    BlendMode::modes_for(is_group)
         .iter()
         .position(|&candidate| candidate == mode)
+}
+
+/// The mode the blend dropdown's option `index` names while `id` is the
+/// active layer — its own list ([`blend_mode_options_for`]) decides, so
+/// Pass Through can only ever be picked for a group.
+#[must_use]
+pub fn blend_mode_at(layers: &LayerTree, id: LayerId, index: usize) -> Option<BlendMode> {
+    let is_group = layers.kind(id)?.is_group();
+    BlendMode::modes_for(is_group).get(index).copied()
 }
 
 /// The user-facing name of `mode` — Photoshop's own menu names, since a
@@ -99,6 +126,7 @@ pub const fn blend_mode_label(mode: BlendMode) -> &'static str {
         BlendMode::Saturation => "Saturation",
         BlendMode::Color => "Color",
         BlendMode::Luminosity => "Luminosity",
+        BlendMode::PassThrough => "Pass Through",
     }
 }
 
@@ -253,8 +281,16 @@ pub fn sync_layer_controls(
             changed = true;
         }
     }
-    let index = blend_mode_index(layers.blend_mode(id).unwrap_or_default());
-    if widgets::dropdown_state(tree, controls.blend)?.selected() != index {
+    // A group lists Pass Through first and anything else does not list it
+    // at all (0.179.0), so the options follow the active layer's kind.
+    let is_group = layers.kind(id).is_some_and(aurora_doc::LayerKind::is_group);
+    let index = blend_mode_index_for(is_group, layers.blend_mode(id).unwrap_or_default());
+    let options = blend_mode_options_for(is_group);
+    let shown = widgets::dropdown_state(tree, controls.blend)?;
+    if shown.options() != options.as_slice() {
+        widgets::set_dropdown_options(tree, controls.blend, options, index)?;
+        changed = true;
+    } else if shown.selected() != index {
         widgets::set_dropdown_selected(tree, controls.blend, index)?;
         changed = true;
     }
@@ -286,8 +322,8 @@ pub fn layer_controls_contains(
 #[cfg(test)]
 mod tests {
     use super::{
-        LayerControls, blend_mode_index, blend_mode_label, blend_mode_options,
-        insert_layer_controls, sync_layer_controls,
+        LayerControls, blend_mode_index, blend_mode_index_for, blend_mode_label,
+        blend_mode_options, blend_mode_options_for, insert_layer_controls, sync_layer_controls,
     };
     use crate::layers_panel::populate_layers_panel;
     use crate::workspace::{build_workspace, set_rail_width};
@@ -360,22 +396,27 @@ mod tests {
 
     #[test]
     fn every_blend_mode_has_a_distinct_non_empty_label_in_all_order() {
-        let options = blend_mode_options();
+        let options = blend_mode_options_for(true);
         assert_eq!(options.len(), BlendMode::ALL.len());
+        assert_eq!(blend_mode_options().len(), BlendMode::ALL.len() - 1);
         let distinct: HashSet<&str> = options.iter().map(String::as_str).collect();
         assert_eq!(
             distinct.len(),
             BlendMode::ALL.len(),
             "labels must be distinct"
         );
-        for (index, &mode) in BlendMode::ALL.iter().enumerate() {
+        for (index, &mode) in BlendMode::modes_for(true).iter().enumerate() {
             assert!(!blend_mode_label(mode).trim().is_empty());
             assert_eq!(
                 options.get(index).map(String::as_str),
                 Some(blend_mode_label(mode))
             );
+            assert_eq!(blend_mode_index_for(true, mode), Some(index));
+        }
+        for (index, &mode) in BlendMode::modes_for(false).iter().enumerate() {
             assert_eq!(blend_mode_index(mode), Some(index));
         }
+        assert_eq!(blend_mode_index(BlendMode::PassThrough), None);
         assert_eq!(
             blend_mode_label(BlendMode::LinearDodge),
             "Linear Dodge (Add)"
@@ -562,6 +603,57 @@ mod tests {
         assert!(!slider_value(tree, controls.opacity).1);
         assert!(!dropdown_selected(tree, controls.blend).1);
         assert!(!checkbox_checked(tree, controls.visible).1);
+    }
+
+    /// AC-5 (0.179.0): a group's dropdown lists Pass Through first and
+    /// shows it selected; a pixel layer's lists it nowhere, and switching
+    /// the active layer between the two swaps the list.
+    #[test]
+    fn the_dropdown_lists_pass_through_first_for_a_group_and_never_for_a_layer() {
+        let (mut ws, controls) = built(1600.0, 900.0);
+        let tree = &mut ws.tree;
+        let (mut layers, pixel) = doc();
+        let group = match layers.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(layers.set_blend_mode(group, BlendMode::PassThrough).is_ok());
+        assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
+        let Ok(state) = aurora_widgets::widgets::dropdown_state(tree, controls.blend) else {
+            unreachable!("dropdown");
+        };
+        assert_eq!(
+            state.options().first().map(String::as_str),
+            Some("Pass Through")
+        );
+        assert_eq!(state.options().len(), BlendMode::ALL.len());
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(
+            super::blend_mode_at(&layers, group, 0),
+            Some(BlendMode::PassThrough)
+        );
+        assert_eq!(
+            super::blend_mode_at(&layers, group, 1),
+            Some(BlendMode::Normal)
+        );
+
+        assert!(sync_layer_controls(tree, controls, &layers, Some(pixel), None).is_ok());
+        let Ok(state) = aurora_widgets::widgets::dropdown_state(tree, controls.blend) else {
+            unreachable!("dropdown");
+        };
+        assert!(!state.options().iter().any(|o| o == "Pass Through"));
+        assert_eq!(state.options().len(), BlendMode::ALL.len() - 1);
+        assert_eq!(state.selected(), blend_mode_index(BlendMode::Normal));
+        assert_eq!(
+            super::blend_mode_at(&layers, pixel, 0),
+            Some(BlendMode::Normal)
+        );
+        assert!(
+            BlendMode::modes_for(false)
+                .iter()
+                .enumerate()
+                .all(|(i, &m)| super::blend_mode_at(&layers, pixel, i) == Some(m))
+        );
     }
 
     #[test]

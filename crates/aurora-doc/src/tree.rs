@@ -272,6 +272,7 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
         // tree that aliases another layer's mask storage.
         validate_layer_id_range(&ids, &layers)?;
         validate_opacities(&layers)?;
+        validate_blend_modes(&layers)?;
         Ok(Self { ids, layers, roots })
     }
 }
@@ -607,6 +608,24 @@ fn validate_opacities(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocEr
         .min_by_key(|(raw, _)| *raw)
     {
         return Err(DocError::OpacityOutOfRange(value));
+    }
+    Ok(())
+}
+
+/// Refuses a tree in which a group-only blend mode
+/// ([`BlendMode::PassThrough`], 0.179.0) sits on a pixel or adjustment
+/// layer — the whole-tree counterpart to [`LayerTree::set_blend_mode`]'s
+/// own refusal, so a crafted `.aur` manifest, journal `Restore` or replay
+/// cannot assemble one either. The lowest offending raw id is reported,
+/// for the same determinism reason [`validate_opacities`] gives.
+fn validate_blend_modes(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocError> {
+    if let Some((_, id)) = layers
+        .iter()
+        .filter(|(_, entry)| entry.blend_mode.is_group_only() && !entry.kind.is_group())
+        .map(|(id, _)| (id.to_raw(), *id))
+        .min_by_key(|(raw, _)| *raw)
+    {
+        return Err(DocError::GroupOnlyBlendMode(id));
     }
     Ok(())
 }
@@ -1335,6 +1354,7 @@ impl LayerTree {
         let start_depth = parent.map_or(1, |id| self.depth_of(id).saturating_add(1));
         validate_shape(&incoming, &[root], parent, start_depth)?;
         validate_opacities(&incoming)?;
+        validate_blend_modes(&incoming)?;
 
         // Every id in `incoming` is about to become live, and the ids in
         // a captured subtree are whatever they originally were -- which,
@@ -1717,6 +1737,7 @@ impl LayerTree {
         validate_id_allocator(&self.ids, &self.layers)?;
         validate_layer_id_range(&self.ids, &self.layers)?;
         validate_opacities(&self.layers)?;
+        validate_blend_modes(&self.layers)?;
         validate_origins(&self.layers)
     }
 
@@ -1965,9 +1986,16 @@ impl LayerTree {
 
     /// # Errors
     ///
-    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, and
+    /// [`DocError::GroupOnlyBlendMode`] (0.179.0) for a group-only mode
+    /// ([`BlendMode::PassThrough`]) on a pixel or adjustment layer — which
+    /// is refused, never coerced to another mode, and leaves the layer
+    /// unchanged.
     pub fn set_blend_mode(&mut self, id: LayerId, blend_mode: BlendMode) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if blend_mode.is_group_only() && !entry.kind.is_group() {
+            return Err(DocError::GroupOnlyBlendMode(id));
+        }
         entry.blend_mode = blend_mode;
         Ok(())
     }
@@ -2350,6 +2378,69 @@ mod tests {
             width: 10,
             height: 10,
         }
+    }
+
+    /// AC-1 (0.179.0): a group takes Pass Through and round-trips it
+    /// through real `postcard` bytes; a pixel or adjustment layer refuses
+    /// it, unchanged; and a decoded tree holding it on a pixel layer is
+    /// refused as a whole.
+    #[test]
+    fn pass_through_is_group_only_and_round_trips_on_a_group() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let pixel = match tree.add_pixel_layer("p", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let curves = match tree.add_adjustment_layer_at(
+            "c",
+            crate::layer::Adjustment::Curves(aurora_core::CurvesParams::identity()),
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(tree.set_blend_mode(group, BlendMode::PassThrough).is_ok());
+        assert_eq!(tree.blend_mode(group), Some(BlendMode::PassThrough));
+        for id in [pixel, curves] {
+            assert!(matches!(
+                tree.set_blend_mode(id, BlendMode::PassThrough),
+                Err(DocError::GroupOnlyBlendMode(refused)) if refused == id
+            ));
+            assert_eq!(tree.blend_mode(id), Some(BlendMode::Normal), "unchanged");
+        }
+        assert!(tree.validate().is_ok());
+
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let restored: LayerTree = match postcard::from_bytes(&bytes) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(restored.blend_mode(group), Some(BlendMode::PassThrough));
+
+        // Bypass the setter, as a crafted file would.
+        if let Some(entry) = tree.layers.get_mut(&pixel) {
+            entry.blend_mode = BlendMode::PassThrough;
+        }
+        assert!(matches!(
+            tree.validate(),
+            Err(DocError::GroupOnlyBlendMode(refused)) if refused == pixel
+        ));
+        let crafted = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<LayerTree>(&crafted).is_err(),
+            "a decoded pixel layer with Pass Through is refused"
+        );
     }
 
     #[test]
