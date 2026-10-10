@@ -152,6 +152,7 @@ mod color_swatch;
 mod command_palette;
 mod curve_editor;
 mod dialog;
+mod drop_indicator;
 mod dropdown;
 mod label;
 mod list_row;
@@ -195,6 +196,10 @@ pub use curve_editor::{
 };
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
+pub use drop_indicator::{
+    DropIndicatorKind, DropIndicatorState, drop_indicator_state, hide_drop_indicator,
+    insert_drop_indicator, show_drop_indicator,
+};
 pub use dropdown::{
     DropdownKey, DropdownOutcome, DropdownState, commit_dropdown_row, dropdown_of_row,
     dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
@@ -391,6 +396,12 @@ pub enum WidgetKind {
     /// no solids; [`crate::text_runs`] draws its text in `text.secondary`
     /// (`text.disabled` when disabled).
     Label(LabelState),
+    /// A drag-and-drop drop indicator (0.166.0) — created by
+    /// `drop_indicator.rs`'s [`insert_drop_indicator`], hidden until a
+    /// drag shows it. Paints an `accent.primary` line or outline
+    /// (`paint::paint_drop_indicator`), nothing while hidden; never
+    /// focusable, AT-`hidden`.
+    DropIndicator(DropIndicatorState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

@@ -16,9 +16,8 @@
 //! only its own docked *slot*, `Workspace`'s own `layers`/`properties`/
 //! `history` fields, would need to become optional for that, a real,
 //! separate architecture decision deliberately not made
-//! ([`close_panel`]'s own doc comment). Still genuinely open: drag-to-
-//! redock and floating panels — both need real interaction/drag-state
-//! machinery this crate doesn't build yet.
+//! ([`close_panel`]'s own doc comment). Drag-to-redock landed in 0.166.0
+//! (`crate::redock`). Still genuinely open: floating panels (0.167.0).
 
 use accesskit::{Action, Node, Orientation, Role};
 use aurora_theme::Scales;
@@ -960,6 +959,61 @@ pub fn close_panel(
     tree.set_accessibility(panel.body, Node::new(Role::GenericContainer))
 }
 
+/// Puts `panel` into the shape a tab group needs, or back into a lone
+/// docked panel's (0.166.0, drag-to-redock — [`crate::panel_group`] then
+/// takes over a grouped one's role, label and visibility). Grouped: its
+/// title slot is zero height ([`grouped_header_style`]). Lone: the
+/// one-row title slot again ([`header_style`]), the root shown, its
+/// accessibility node back to a focusable `Role::Region` with no
+/// `labelled_by` and the `Collapse`/`Expand` action matching its state.
+/// Either way the title slot keeps its `display` (a closed panel stays
+/// closed) and the root's floor is recomputed from its shown children.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] for a malformed handle.
+pub(crate) fn set_panel_grouped(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    grouped: bool,
+    scales: &Scales,
+) -> Result<(), WidgetError> {
+    let display = tree
+        .style(panel.header)
+        .ok_or(WidgetError::UnknownWidget(panel.header))?
+        .display;
+    let header = if grouped {
+        grouped_header_style()
+    } else {
+        header_style(scales)
+    };
+    tree.set_style(panel.header, Style { display, ..header })?;
+    let collapsed = panel_is_collapsed(tree, panel)?;
+    if !grouped {
+        set_display(tree, panel.root, Display::Flex)?;
+        let node = tree
+            .accessibility(panel.root)
+            .ok_or(WidgetError::UnknownWidget(panel.root))?;
+        let mut updated = node.clone();
+        updated.set_role(Role::Region);
+        updated.clear_labelled_by();
+        updated.clear_hidden();
+        updated.add_action(Action::Focus);
+        if collapsed {
+            updated.remove_action(Action::Collapse);
+            updated.add_action(Action::Expand);
+        } else {
+            updated.remove_action(Action::Expand);
+            updated.add_action(Action::Collapse);
+        }
+        if updated != *node {
+            tree.set_accessibility(panel.root, updated)?;
+        }
+    }
+    let sizing = panel_sizing(tree, panel)?;
+    set_root_style(tree, panel, collapsed, sizing)
+}
+
 /// Sets only `id`'s own `display`, keeping the rest of its style.
 pub(crate) fn set_display(
     tree: &mut WidgetTree<WidgetKind>,
@@ -1551,7 +1605,8 @@ mod tests {
         };
         // 0.164.0: a grouped panel's tab draws its name; its zero-height
         // title slot draws nothing.
-        let Ok(bar) = widgets::tab_bar_state(&ws.tree, ws.panel_group.bar) else {
+        let Ok(bar) = widgets::tab_bar_state(&ws.tree, crate::workspace::test_group(&ws).bar)
+        else {
             unreachable!("the group has a bar");
         };
         let tabs = bar.tabs().to_vec();
@@ -1694,7 +1749,7 @@ mod tests {
         if let Err(err) = set_panel_collapsed(&mut ws.tree, ws.layers, true) {
             unreachable!("{err:?}");
         }
-        let group = ws.panel_group.clone();
+        let group = crate::workspace::test_group(&ws);
         if let Err(err) = crate::set_panel_group_collapsed(&mut ws.tree, &group, true) {
             unreachable!("{err:?}");
         }
@@ -1749,7 +1804,7 @@ mod tests {
         assert_eq!(display(&ws, ws.layers.header), taffy::Display::None);
         let (Some(closed_root), Some(next_root)) = (
             ws.tree.bounds(ws.layers.root),
-            ws.tree.bounds(ws.panel_group.root),
+            ws.tree.bounds(crate::workspace::test_group(&ws).root),
         ) else {
             unreachable!("just laid out");
         };

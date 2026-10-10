@@ -4,7 +4,8 @@
 //! bullet, first slice.
 //!
 //! **Mostly static** — see [`crate::panel`]'s own doc comment for what's
-//! deliberately not here yet (drag-to-redock, persisted layouts).
+//! deliberately not here yet (floating panels). Drag-to-redock and its
+//! persisted arrangement are 0.166.0's ([`crate::redock`], [`crate::dock`]).
 //! [`rail_width`]/[`set_rail_width`] are the one real piece of dock
 //! interactivity so far — dragging the rail's own width is real
 //! pointer-driven interaction `aurora-app` owns, this module only
@@ -42,13 +43,14 @@ use aurora_widgets::{FocusManager, WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, Display, FlexDirection, Style};
 
+use crate::dock::{DockArrangement, DockPanel};
 use crate::panel::{
     PanelHandle, PanelSizing, close_panel, insert_panel, panel_is_closed, panel_is_collapsed,
     set_panel_collapsed, set_panel_sizing,
 };
 use crate::panel_group::{
-    PanelGroup, insert_panel_group, panel_group_shown, set_panel_group_collapsed,
-    show_panel_group_tab, sync_panel_group,
+    PanelGroup, insert_panel_group, panel_group_selected, panel_group_shown,
+    set_panel_group_collapsed, show_panel_group_tab, sync_panel_group,
 };
 use crate::panel_strip::{
     PanelStrip, insert_panel_strip, panel_strip_shown, set_panel_strip_shown,
@@ -63,7 +65,7 @@ pub const OPTIONS_BAR_LABEL: &str = "Tool options";
 /// The Properties + History tab group's tab-list label (0.164.0).
 pub const PANEL_GROUP_LABEL: &str = "Properties and History";
 
-/// The tab [`build_workspace`] selects in [`Workspace::panel_group`], and
+/// The tab [`build_workspace`] selects in the default Properties + History group, and
 /// the one a saved layout without a tab falls back to: `0`, Properties
 /// (0.164.0). Properties is where the Curves editor and a layer's own
 /// settings live — what a user reaches for most — while History is
@@ -121,21 +123,29 @@ pub struct Workspace {
     /// yet" gap every widget here already has.
     pub divider: WidgetId,
     /// The side rail — a fixed-width dock area holding the three
-    /// panels below, stacked. Resizable via [`set_rail_width`]; still
-    /// no drag-to-redock or persisted width across sessions (see this
+    /// panels below, stacked. Resizable via [`set_rail_width`]; its
+    /// panels rearranged by drag-to-redock (0.166.0, [`Self::slots`]; see this
     /// module's own doc comment).
     pub rail: WidgetId,
     pub layers: PanelHandle,
-    /// The Properties panel — since 0.164.0 the first tab of
-    /// [`Self::panel_group`], still an ordinary [`PanelHandle`].
+    /// The Properties panel — by default (0.164.0) the first tab of the
+    /// Properties + History group in [`Self::slots`], always an ordinary
+    /// [`PanelHandle`].
     pub properties: PanelHandle,
-    /// The History panel — since 0.164.0 the second tab of
-    /// [`Self::panel_group`].
+    /// The History panel — by default the second tab of that group.
     pub history: PanelHandle,
-    /// The Properties + History tab group (0.164.0, [`crate::panel_group`]):
-    /// one dock slot under Layers, which stays on its own. Its members are
-    /// [`Self::properties`] then [`Self::history`].
-    pub panel_group: PanelGroup,
+    /// The rail's dock slots, top to bottom (0.166.0, drag-to-redock;
+    /// [`crate::dock`]): each a lone panel or a tab group
+    /// ([`crate::panel_group`]). The default is Layers on its own, then
+    /// Properties + History as tabs ([`crate::DockArrangement::default`]);
+    /// [`crate::apply_dock_arrangement`] rearranges them, moving the
+    /// panels' own subtrees, so [`Self::layers`]/[`Self::properties`]/
+    /// [`Self::history`] stay valid across every move.
+    pub slots: Vec<RailSlot>,
+    /// The drag-to-redock drop indicator (0.166.0): an absolutely
+    /// placed root child, hidden except during a panel drag
+    /// ([`crate::PanelDrag`]).
+    pub drop_indicator: WidgetId,
     /// The collapsed rail's label strip (0.165.0, [`crate::panel_strip`]):
     /// the root's child right after [`Self::rail`], hidden while the rail
     /// is expanded and shown in its place while it is collapsed
@@ -153,6 +163,116 @@ pub struct Workspace {
     /// a caller first populates it. `aurora-app` hit-tests a press (and
     /// looks up an assistive technology's `Click`) here to jump.
     pub history_rows: HashMap<WidgetId, usize>,
+}
+
+/// One rail dock slot (0.166.0): a lone docked panel, or a tab group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailSlot {
+    Panel(PanelHandle),
+    Group(PanelGroup),
+}
+
+impl RailSlot {
+    /// The slot's own root in the rail: the panel's, or the group's.
+    #[must_use]
+    pub fn root(&self) -> WidgetId {
+        match self {
+            Self::Panel(panel) => panel.root,
+            Self::Group(group) => group.root,
+        }
+    }
+
+    /// The slot's panels, in tab order.
+    #[must_use]
+    pub fn panels(&self) -> Vec<PanelHandle> {
+        match self {
+            Self::Panel(panel) => vec![*panel],
+            Self::Group(group) => group.members.clone(),
+        }
+    }
+}
+
+impl Workspace {
+    /// The handle of a rail panel by identity.
+    #[must_use]
+    pub fn panel(&self, panel: DockPanel) -> PanelHandle {
+        match panel {
+            DockPanel::Layers => self.layers,
+            DockPanel::Properties => self.properties,
+            DockPanel::History => self.history,
+        }
+    }
+
+    /// The identity of a rail panel's handle (`None` for any other panel,
+    /// the Widget Gallery's say).
+    #[must_use]
+    pub fn dock_panel(&self, panel: PanelHandle) -> Option<DockPanel> {
+        DockPanel::ALL
+            .into_iter()
+            .find(|&candidate| self.panel(candidate).root == panel.root)
+    }
+
+    /// Every tab group in the rail, top to bottom.
+    pub fn groups(&self) -> impl Iterator<Item = &PanelGroup> {
+        self.slots.iter().filter_map(|slot| match slot {
+            RailSlot::Group(group) => Some(group),
+            RailSlot::Panel(_) => None,
+        })
+    }
+
+    /// The tab group `panel` is a member of, if it is grouped.
+    #[must_use]
+    pub fn group_of(&self, panel: PanelHandle) -> Option<&PanelGroup> {
+        self.groups().find(|group| group.index_of(panel).is_some())
+    }
+
+    /// The tab group whose subtree holds `id` (its bar, a tab, a member's
+    /// widget), if any.
+    #[must_use]
+    pub fn group_holding(&self, id: WidgetId) -> Option<&PanelGroup> {
+        self.groups()
+            .find(|group| self.tree.contains(group.root) && self.tree.is_within(group.root, id))
+    }
+
+    /// The rail panel whose subtree holds `id`, or whose group tab `id`
+    /// is (a focused tab names its panel).
+    #[must_use]
+    pub fn panel_holding(&self, id: WidgetId) -> Option<PanelHandle> {
+        for group in self.groups() {
+            if let Ok(state) = widgets::tab_bar_state(&self.tree, group.bar)
+                && let Some(index) = state.index_of(id)
+            {
+                return group.members.get(index).copied();
+            }
+        }
+        DockPanel::ALL
+            .into_iter()
+            .map(|panel| self.panel(panel))
+            .find(|panel| self.tree.contains(panel.root) && self.tree.is_within(panel.root, id))
+    }
+
+    /// The current arrangement, read from the slots and each group's
+    /// selected tab.
+    #[must_use]
+    pub fn dock_arrangement(&self) -> DockArrangement {
+        let raw = self
+            .slots
+            .iter()
+            .map(|slot| {
+                let panels = slot
+                    .panels()
+                    .into_iter()
+                    .map(|panel| self.dock_panel(panel))
+                    .collect();
+                let selected = match slot {
+                    RailSlot::Panel(_) => 0,
+                    RailSlot::Group(group) => panel_group_selected(&self.tree, group).unwrap_or(0),
+                };
+                (panels, selected)
+            })
+            .collect();
+        DockArrangement::repaired(raw).0
+    }
 }
 
 /// The rail's own layout style at `width` (logical px) — shared by
@@ -342,6 +462,11 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     // 0.165.0: the collapsed rail's label strip, right after the rail,
     // hidden until the rail collapses.
     let panel_strip = insert_rail_strip(&mut tree, root, scales, [layers, properties, history]);
+    // 0.166.0: the drag-to-redock drop indicator, hidden until a drag.
+    let drop_indicator = match widgets::insert_drop_indicator(&mut tree, root) {
+        Ok(id) => id,
+        Err(err) => unreachable!("root was just created by new_tree: {err:?}"),
+    };
 
     Workspace {
         tree,
@@ -356,7 +481,8 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         layers,
         properties,
         history,
-        panel_group,
+        slots: vec![RailSlot::Panel(layers), RailSlot::Group(panel_group)],
+        drop_indicator,
         panel_strip,
         history_current: None,
         history_rows: HashMap::new(),
@@ -649,11 +775,12 @@ pub fn refocus_workspace(workspace: &mut Workspace, focus: &mut FocusManager) ->
     {
         let collapsed = rail_collapsed(workspace);
         let target = if collapsed && workspace.tree.is_within(workspace.rail, focused) {
-            let panel = if workspace.tree.is_within(workspace.layers.root, focused) {
-                Some(workspace.layers)
-            } else {
-                panel_group_shown(&workspace.tree, &workspace.panel_group)
-                    .and_then(|index| workspace.panel_group.members.get(index).copied())
+            // The strip button of the panel that held focus: a lone
+            // panel, or its group's shown member (0.166.0: any slot).
+            let panel = match workspace.group_holding(focused) {
+                Some(group) => panel_group_shown(&workspace.tree, group)
+                    .and_then(|index| group.members.get(index).copied()),
+                None => workspace.panel_holding(focused),
             };
             panel.and_then(|panel| workspace.panel_strip.button_for(panel))
         } else if !collapsed
@@ -661,14 +788,10 @@ pub fn refocus_workspace(workspace: &mut Workspace, focus: &mut FocusManager) ->
                 .tree
                 .is_within(workspace.panel_strip.root, focused)
         {
-            workspace.panel_strip.panel_for(focused).and_then(|panel| {
-                match workspace.panel_group.index_of(panel) {
-                    Some(_) => widgets::tab_bar_state(&workspace.tree, workspace.panel_group.bar)
-                        .ok()
-                        .and_then(widgets::TabBarState::selected_tab),
-                    None => Some(panel.root),
-                }
-            })
+            workspace
+                .panel_strip
+                .panel_for(focused)
+                .and_then(|panel| panel_focus_target(workspace, panel))
         } else {
             None
         };
@@ -676,13 +799,29 @@ pub fn refocus_workspace(workspace: &mut Workspace, focus: &mut FocusManager) ->
             moved = focus.focus(&mut workspace.tree, target).is_ok();
         }
     }
-    let group = workspace.panel_group.clone();
-    crate::refocus_out_of_hidden(&mut workspace.tree, focus, &group) || moved
+    let group = focus
+        .focused()
+        .and_then(|focused| workspace.group_holding(focused))
+        .cloned();
+    crate::panel_group::refocus_out_of_hidden_in(&mut workspace.tree, focus, group.as_ref())
+        || moved
+}
+
+/// Where keyboard focus goes to land "on" `panel` (0.166.0): its group's
+/// selected tab when it is grouped, else its own root.
+#[must_use]
+pub fn panel_focus_target(workspace: &Workspace, panel: PanelHandle) -> Option<WidgetId> {
+    match workspace.group_of(panel) {
+        Some(group) => widgets::tab_bar_state(&workspace.tree, group.bar)
+            .ok()
+            .and_then(widgets::TabBarState::selected_tab),
+        None => Some(panel.root),
+    }
 }
 
 /// The panel-toggle command's action on `panel` (0.164.0 for grouped
 /// panels): an ungrouped panel flips collapsed/expanded, as before. A
-/// panel in [`Workspace::panel_group`] that is its group's shown,
+/// panel in a tab group that is its group's shown,
 /// expanded tab collapses the group to its tab row; otherwise its tab is
 /// selected and the group expanded (reopening it if it was closed).
 ///
@@ -693,8 +832,9 @@ pub fn toggle_workspace_panel(
     workspace: &mut Workspace,
     panel: PanelHandle,
 ) -> Result<(), WidgetError> {
-    let group = workspace.panel_group.clone();
-    if let Some(index) = group.index_of(panel) {
+    if let Some(group) = workspace.group_of(panel).cloned()
+        && let Some(index) = group.index_of(panel)
+    {
         let showing = panel_group_shown(&workspace.tree, &group) == Some(index)
             && !panel_is_collapsed(&workspace.tree, panel)?;
         return if showing {
@@ -719,8 +859,7 @@ pub fn close_workspace_panel(
     panel: PanelHandle,
 ) -> Result<(), WidgetError> {
     close_panel(&mut workspace.tree, panel)?;
-    let group = workspace.panel_group.clone();
-    if group.index_of(panel).is_some() {
+    if let Some(group) = workspace.group_of(panel).cloned() {
         sync_panel_group(&mut workspace.tree, &group)?;
     }
     Ok(())
@@ -738,7 +877,9 @@ pub fn select_panel_tab(
     workspace: &mut Workspace,
     panel: PanelHandle,
 ) -> Result<bool, WidgetError> {
-    let group = workspace.panel_group.clone();
+    let Some(group) = workspace.group_of(panel).cloned() else {
+        return Ok(false);
+    };
     let Some(index) = group.index_of(panel) else {
         return Ok(false);
     };
@@ -764,8 +905,9 @@ pub fn show_workspace_panel(
     if panel_is_closed(&workspace.tree, panel)? {
         return Ok(false);
     }
-    let group = workspace.panel_group.clone();
-    if let Some(index) = group.index_of(panel) {
+    if let Some(group) = workspace.group_of(panel).cloned()
+        && let Some(index) = group.index_of(panel)
+    {
         if panel_group_shown(&workspace.tree, &group) == Some(index)
             && !panel_is_collapsed(&workspace.tree, panel)?
         {
@@ -785,9 +927,19 @@ pub fn show_workspace_panel(
 /// out, and it is not the default tab.
 #[cfg(test)]
 pub(crate) fn show_history_tab(workspace: &mut Workspace) {
-    let group = workspace.panel_group.clone();
-    if let Err(err) = crate::show_panel_group_tab(&mut workspace.tree, &group, 1) {
+    let history = workspace.history;
+    if let Err(err) = select_panel_tab(workspace, history) {
         unreachable!("{err:?}");
+    }
+}
+
+/// The group holding Properties (test support, 0.166.0): the default
+/// Properties + History group, under any arrangement that keeps it.
+#[cfg(test)]
+pub(crate) fn test_group(workspace: &Workspace) -> PanelGroup {
+    match workspace.group_of(workspace.properties) {
+        Some(group) => group.clone(),
+        None => unreachable!("Properties is grouped in this test"),
     }
 }
 
@@ -951,12 +1103,19 @@ mod tests {
         assert_eq!(ws.tree.parent(ws.rail), Some(ws.root));
         assert_eq!(
             ws.tree.children(ws.rail),
-            Some([ws.layers.root, ws.panel_group.root].as_slice()),
+            Some([ws.layers.root, crate::workspace::test_group(&ws).root].as_slice()),
             "the rail docks Layers, then the Properties + History tab group (0.164.0)"
         );
         assert_eq!(
-            ws.tree.children(ws.panel_group.root),
-            Some([ws.panel_group.bar, ws.properties.root, ws.history.root].as_slice()),
+            ws.tree.children(crate::workspace::test_group(&ws).root),
+            Some(
+                [
+                    crate::workspace::test_group(&ws).bar,
+                    ws.properties.root,
+                    ws.history.root
+                ]
+                .as_slice()
+            ),
             "the group holds its tab row, then Properties and History in mockup order"
         );
 
@@ -1016,10 +1175,10 @@ mod tests {
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&test_scales()) as u32;
-        let Some(group_bounds) = ws.tree.bounds(ws.panel_group.root) else {
+        let Some(group_bounds) = ws.tree.bounds(crate::workspace::test_group(&ws).root) else {
             unreachable!("just laid out");
         };
-        let Some(bar_bounds) = ws.tree.bounds(ws.panel_group.bar) else {
+        let Some(bar_bounds) = ws.tree.bounds(crate::workspace::test_group(&ws).bar) else {
             unreachable!("just laid out");
         };
         // 0.164.0: Layers is its title plus one row; the group under it is
@@ -1061,7 +1220,7 @@ mod tests {
         super::show_history_tab(&mut ws);
         ws.tree.compute_layout(1000.0, 800.0);
         let (Some(group_bounds), Some(history_bounds), Some(properties_bounds)) = (
-            ws.tree.bounds(ws.panel_group.root),
+            ws.tree.bounds(crate::workspace::test_group(&ws).root),
             ws.tree.bounds(ws.history.root),
             ws.tree.bounds(ws.properties.root),
         ) else {
@@ -1334,7 +1493,7 @@ mod tests {
         ] {
             let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, (true, true, true), count);
-            let group = ws.panel_group.clone();
+            let group = crate::workspace::test_group(&ws);
             if let Err(err) = crate::show_panel_group_tab(&mut ws.tree, &group, tab) {
                 unreachable!("{err:?}");
             }
@@ -1478,14 +1637,14 @@ mod tests {
         let mut previous = rail.y;
         // 0.164.0: the rail's slots are Layers, then the Properties +
         // History group — its tab row over whichever tab is shown.
-        let shown = match crate::panel_group_shown(&ws.tree, &ws.panel_group) {
+        let shown = match crate::panel_group_shown(&ws.tree, &crate::workspace::test_group(ws)) {
             Some(0) => ("properties", ws.properties.root),
             Some(_) => ("history", ws.history.root),
             None => unreachable!("{what}: no tab is shown"),
         };
         for (name, root) in [
             ("layers", ws.layers.root),
-            ("tab row", ws.panel_group.bar),
+            ("tab row", crate::workspace::test_group(ws).bar),
             shown,
         ] {
             let Some(bounds) = ws.tree.bounds(root) else {
@@ -1994,7 +2153,7 @@ mod tests {
     fn expand_rail_showing_opens_the_buttons_own_panel_or_tab() {
         let mut ws = build_workspace(&test_scales());
         let history = ws.history;
-        let group = ws.panel_group.clone();
+        let group = crate::workspace::test_group(&ws);
         for (panel, tab) in [
             (ws.history, Some(1)),
             (ws.properties, Some(0)),
@@ -2074,9 +2233,10 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert!(super::refocus_workspace(&mut ws, &mut focus));
-        let selected_tab = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar)
-            .ok()
-            .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
+        let selected_tab =
+            aurora_widgets::widgets::tab_bar_state(&ws.tree, crate::workspace::test_group(&ws).bar)
+                .ok()
+                .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
         assert_eq!(focus.focused(), selected_tab, "the History tab");
         // Focus in the shown History tab moves to Hist on collapse.
         if let Err(err) = focus

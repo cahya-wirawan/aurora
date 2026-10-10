@@ -129,9 +129,11 @@
 //!   `border.focus` *inside* the focused tab's own bounds (tabs tile
 //!   flush, so an outside ring would paint onto the neighbour). With
 //!   roving focus the focused tab is always the selected one, so the ring
-//!   covers its 2 px `accent.primary` underline — which is the same colour
-//!   in every built-in theme; the underline shows again on blur. Flagged to
-//!   the design owner. There is still no `focused` field: focus lives in
+//!   covers its `accent.primary` underline (`size.indicator_width` thick —
+//!   a token since 0.166.0, closing the stroke-weight gap flagged here) —
+//!   which is the same colour in every built-in theme; the underline shows
+//!   again on blur. The ring-over-underline overlap is still flagged to the
+//!   design owner. There is still no `focused` field: focus lives in
 //!   `FocusManager`, and its visibility (`:focus-visible`) with it.
 //! - **No glyphs**: tab labels reach the accessibility tree only. Tabs
 //!   therefore share the bar's width **equally** (`flex_grow: 1`,

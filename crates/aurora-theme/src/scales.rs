@@ -79,6 +79,11 @@ pub struct SizeScale {
     /// (0.162.0: the 0.161.0 engineering cap made a token, value 10, for
     /// the design owner to tune). A count of rows, not px.
     pub content_panel_max_rows: u32,
+    /// The stroke thickness of selection and target indicators — the
+    /// selected tab's underline, the drag-to-redock drop indicator
+    /// (0.166.0: a provisional 2, for the design owner to tune). Logical
+    /// px, not scaled by density.
+    pub indicator_width: u32,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -340,6 +345,18 @@ mod tests {
 
     /// 0.162.0: the content-panel row-cap token parses, at the design
     /// owner's value (10 rows, the 0.161.0 engineering cap it replaced).
+    /// 0.166.0: the indicator stroke token parses, at its provisional
+    /// value (2, the weight the tab underline and drop indicator used as
+    /// literals before).
+    #[test]
+    fn the_indicator_width_token_parses() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(scales.size.indicator_width, 2);
+    }
+
     #[test]
     fn the_content_panel_max_rows_token_parses() {
         let scales = match Scales::from_toml_str(SCALES_TOML) {

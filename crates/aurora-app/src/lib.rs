@@ -2709,11 +2709,55 @@ fn startup_document(
 /// whose last `rail_collapsed` byte is corrupt fails as current and then
 /// decodes as V2 — harmlessly, loading with the rail expanded. The day a field is ever *removed*, not appended,
 /// this scheme stops working and a version tag becomes the right call.
+///
+/// **0.166.0: `dock`**, the panel arrangement (drag-to-redock): the rail's
+/// slots top to bottom, each its panels in tab order (by
+/// [`aurora_ui::DockPanel::key`], so a panel unknown to this build is
+/// just dropped) and its selected tab, appended the same way, with a third
+/// fallback level ([`WorkspaceLayoutV3`], the 0.165.0 shape; a layout
+/// without it loads the default arrangement). Each slot carries its
+/// placement as an enum ([`SavedPlacement`], only `Rail` today) so
+/// 0.167.0's floating panels add a variant, not a layout version. The
+/// arrangement is repaired on load, never refused
+/// ([`aurora_ui::DockArrangement::repaired`]): every panel ends up in it
+/// exactly once. `panel_group_tab` is still written — the tab of
+/// whichever group holds Properties and History both, else `0` — so a
+/// 0.165.0 build reading this file (which ignores the trailing `dock`)
+/// gets a sensible tab.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayout {
+    rail_width: f32,
+    layers_collapsed: bool,
+    properties_collapsed: bool,
+    history_collapsed: bool,
+    panel_group_tab: u32,
+    rail_collapsed: bool,
+    dock: Vec<SavedDockSlot>,
+}
+
+/// One saved dock slot (0.166.0).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SavedDockSlot {
+    placement: SavedPlacement,
+    panels: Vec<String>,
+    selected: u32,
+}
+
+/// Where a saved slot lives — see [`aurora_ui::DockPlacement`]. An enum
+/// on the wire (a `postcard` varint tag), so a later variant decodes
+/// alongside this one without a new layout version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum SavedPlacement {
+    Rail,
+}
+
 // Four independent on/off preferences in a fixed wire format: an enum
 // per flag would change nothing on disk and only obscure the layout.
+/// The layout as saved by 0.165.0 — no dock arrangement.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-struct WorkspaceLayout {
+struct WorkspaceLayoutV3 {
     rail_width: f32,
     layers_collapsed: bool,
     properties_collapsed: bool,
@@ -2741,15 +2785,74 @@ struct WorkspaceLayoutV1 {
     history_collapsed: bool,
 }
 
-/// Decodes a saved layout: the current shape first, then the 0.164.0 one
-/// (the rail loads expanded), then the pre-0.164.0 one (whose missing tab
-/// also becomes the default tab). The error reported is the current
-/// shape's.
+/// The default arrangement as saved slots — what a layout older than
+/// 0.166.0 means, since those builds had only that arrangement.
+fn default_saved_dock(panel_group_tab: u32) -> Vec<SavedDockSlot> {
+    let mut arrangement = aurora_ui::DockArrangement::default();
+    if panel_group_tab == 1 {
+        arrangement.select(aurora_ui::DockPanel::History);
+    }
+    saved_dock(&arrangement)
+}
+
+/// An arrangement as saved slots.
+fn saved_dock(arrangement: &aurora_ui::DockArrangement) -> Vec<SavedDockSlot> {
+    arrangement
+        .slots()
+        .iter()
+        .map(|slot| SavedDockSlot {
+            placement: SavedPlacement::Rail,
+            panels: slot
+                .panels
+                .iter()
+                .map(|panel| panel.key().to_owned())
+                .collect(),
+            selected: u32::try_from(slot.selected).unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Saved slots as a valid arrangement, repaired (unknown, duplicate and
+/// missing panels, empty slots, out-of-range tabs —
+/// [`aurora_ui::DockArrangement::repaired`]). Returns whether anything
+/// was repaired.
+fn arrangement_from_saved(dock: &[SavedDockSlot]) -> (aurora_ui::DockArrangement, bool) {
+    let raw = dock
+        .iter()
+        .map(|slot| {
+            let SavedPlacement::Rail = slot.placement;
+            (
+                slot.panels
+                    .iter()
+                    .map(|key| aurora_ui::DockPanel::from_key(key))
+                    .collect(),
+                usize::try_from(slot.selected).unwrap_or(usize::MAX),
+            )
+        })
+        .collect();
+    aurora_ui::DockArrangement::repaired(raw)
+}
+
+/// Decodes a saved layout: the current shape first, then the 0.165.0 one
+/// (the default arrangement), the 0.164.0 one (the rail also loads
+/// expanded), then the pre-0.164.0 one (whose missing tab also becomes
+/// the default tab). The error reported is the current shape's.
 fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Error> {
     let current = match postcard::from_bytes::<WorkspaceLayout>(bytes) {
         Ok(layout) => return Ok(layout),
         Err(err) => err,
     };
+    if let Ok(v3) = postcard::from_bytes::<WorkspaceLayoutV3>(bytes) {
+        return Ok(WorkspaceLayout {
+            rail_width: v3.rail_width,
+            layers_collapsed: v3.layers_collapsed,
+            properties_collapsed: v3.properties_collapsed,
+            history_collapsed: v3.history_collapsed,
+            panel_group_tab: v3.panel_group_tab,
+            rail_collapsed: v3.rail_collapsed,
+            dock: default_saved_dock(v3.panel_group_tab),
+        });
+    }
     if let Ok(v2) = postcard::from_bytes::<WorkspaceLayoutV2>(bytes) {
         return Ok(WorkspaceLayout {
             rail_width: v2.rail_width,
@@ -2758,17 +2861,22 @@ fn decode_workspace_layout(bytes: &[u8]) -> Result<WorkspaceLayout, postcard::Er
             history_collapsed: v2.history_collapsed,
             panel_group_tab: v2.panel_group_tab,
             rail_collapsed: false,
+            dock: default_saved_dock(v2.panel_group_tab),
         });
     }
     match postcard::from_bytes::<WorkspaceLayoutV1>(bytes) {
-        Ok(old) => Ok(WorkspaceLayout {
-            rail_width: old.rail_width,
-            layers_collapsed: old.layers_collapsed,
-            properties_collapsed: old.properties_collapsed,
-            history_collapsed: old.history_collapsed,
-            panel_group_tab: u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0),
-            rail_collapsed: false,
-        }),
+        Ok(old) => {
+            let tab = u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0);
+            Ok(WorkspaceLayout {
+                rail_width: old.rail_width,
+                layers_collapsed: old.layers_collapsed,
+                properties_collapsed: old.properties_collapsed,
+                history_collapsed: old.history_collapsed,
+                panel_group_tab: tab,
+                rail_collapsed: false,
+                dock: default_saved_dock(tab),
+            })
+        }
         Err(_) => Err(current),
     }
 }
@@ -2786,6 +2894,32 @@ fn layout_path() -> Option<PathBuf> {
     Some(dirs.config_dir().join("workspace-layout.postcard"))
 }
 
+/// The layout `workspace` is in now, at `rail_width`.
+fn workspace_layout(workspace: &aurora_ui::Workspace, rail_width: f32) -> WorkspaceLayout {
+    let collapsed = |panel| aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
+    let arrangement = workspace.dock_arrangement();
+    // For a 0.165.0 reader: History's tab when it is the selected tab of
+    // the slot that also holds Properties.
+    let panel_group_tab = arrangement
+        .slots()
+        .iter()
+        .find(|slot| {
+            slot.panels.contains(&aurora_ui::DockPanel::Properties)
+                && slot.panels.contains(&aurora_ui::DockPanel::History)
+        })
+        .filter(|slot| slot.selected_panel() == Some(aurora_ui::DockPanel::History))
+        .map_or(0, |_| 1);
+    WorkspaceLayout {
+        rail_width,
+        layers_collapsed: collapsed(workspace.layers),
+        properties_collapsed: collapsed(workspace.properties),
+        history_collapsed: collapsed(workspace.history),
+        panel_group_tab,
+        rail_collapsed: aurora_ui::rail_collapsed(workspace),
+        dock: saved_dock(&arrangement),
+    }
+}
+
 /// Reads `workspace`'s own current rail width and each panel's
 /// collapsed state (`aurora_ui::rail_width`/`panel_is_collapsed`) and
 /// writes them to `path`, creating its parent directory first if
@@ -2797,18 +2931,7 @@ fn save_workspace_layout(path: &Path, workspace: &aurora_ui::Workspace) {
     let Some(rail_width) = aurora_ui::rail_width(&workspace.tree, workspace.rail) else {
         return;
     };
-    let collapsed = |panel| aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
-    let layout = WorkspaceLayout {
-        rail_width,
-        layers_collapsed: collapsed(workspace.layers),
-        properties_collapsed: collapsed(workspace.properties),
-        history_collapsed: collapsed(workspace.history),
-        panel_group_tab: aurora_ui::panel_group_selected(&workspace.tree, &workspace.panel_group)
-            .ok()
-            .and_then(|tab| u32::try_from(tab).ok())
-            .unwrap_or(0),
-        rail_collapsed: aurora_ui::rail_collapsed(workspace),
-    };
+    let layout = workspace_layout(workspace, rail_width);
     let bytes = match postcard::to_allocvec(&layout) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -2839,7 +2962,7 @@ fn save_workspace_layout(path: &Path, workspace: &aurora_ui::Workspace) {
 /// already uses. Clamping a stale saved width (e.g. from a since-
 /// narrowed window) is `aurora_ui::set_rail_width`'s own job, not
 /// repeated here.
-fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
+fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace, scales: &Scales) {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -2856,6 +2979,21 @@ fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
             return;
         }
     };
+    apply_workspace_layout(workspace, &layout, scales);
+}
+
+/// Applies a decoded layout (0.166.0, split out of
+/// [`load_workspace_layout`] so a damaged one is testable without a
+/// file): the rail width (clamped by `aurora_ui::set_rail_width`), the
+/// panel arrangement — repaired, so every panel is placed exactly once —
+/// then each slot collapsed or expanded as saved (a group as its selected
+/// member was saved: its members collapse together), then the rail's own
+/// collapse.
+fn apply_workspace_layout(
+    workspace: &mut aurora_ui::Workspace,
+    layout: &WorkspaceLayout,
+    scales: &Scales,
+) {
     if let Err(err) = aurora_ui::set_rail_width(
         &mut workspace.tree,
         workspace.rail,
@@ -2864,32 +3002,44 @@ fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
     ) {
         tracing::warn!(?err, "failed to apply the saved rail width");
     }
-    if let Err(err) = aurora_ui::set_panel_collapsed(
-        &mut workspace.tree,
-        workspace.layers,
-        layout.layers_collapsed,
-    ) {
-        tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
+    let (arrangement, repaired) = arrangement_from_saved(&layout.dock);
+    if repaired {
+        tracing::warn!("the saved panel arrangement was damaged; repaired");
     }
-    // 0.164.0: the group's saved tab (an out-of-range one, from a future
-    // or damaged file, falls back to the default), then the group
-    // collapsed or expanded as that tab was saved — the group's members
-    // collapse together.
-    let group = workspace.panel_group.clone();
-    let tab = usize::try_from(layout.panel_group_tab)
-        .ok()
-        .filter(|&tab| tab < group.members.len())
-        .unwrap_or(aurora_ui::PANEL_GROUP_TAB_DEFAULT);
-    let collapsed = if tab == 0 {
-        layout.properties_collapsed
-    } else {
-        layout.history_collapsed
+    if let Err(err) = aurora_ui::apply_dock_arrangement(workspace, &arrangement, scales) {
+        tracing::warn!(?err, "failed to apply the saved panel arrangement");
+    }
+    let saved_collapsed = |panel: aurora_ui::DockPanel| match panel {
+        aurora_ui::DockPanel::Layers => layout.layers_collapsed,
+        aurora_ui::DockPanel::Properties => layout.properties_collapsed,
+        aurora_ui::DockPanel::History => layout.history_collapsed,
     };
-    if let Err(err) = aurora_widgets::widgets::select_tab(&mut workspace.tree, group.bar, tab)
-        .map(|_| ())
-        .and_then(|()| aurora_ui::set_panel_group_collapsed(&mut workspace.tree, &group, collapsed))
-    {
-        tracing::warn!(?err, "failed to apply the saved panel group tab");
+    for slot in workspace.slots.clone() {
+        let result = match slot {
+            aurora_ui::RailSlot::Panel(panel) => match workspace.dock_panel(panel) {
+                Some(id) => {
+                    aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, saved_collapsed(id))
+                }
+                None => Ok(()),
+            },
+            aurora_ui::RailSlot::Group(group) => {
+                let shown = aurora_ui::panel_group_selected(&workspace.tree, &group)
+                    .ok()
+                    .and_then(|tab| group.members.get(tab).copied())
+                    .and_then(|member| workspace.dock_panel(member));
+                match shown {
+                    Some(id) => aurora_ui::set_panel_group_collapsed(
+                        &mut workspace.tree,
+                        &group,
+                        saved_collapsed(id),
+                    ),
+                    None => Ok(()),
+                }
+            }
+        };
+        if let Err(err) = result {
+            tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
+        }
     }
     // 0.165.0: the rail collapsed to its label strip, or expanded, as saved.
     if let Err(err) = aurora_ui::set_rail_collapsed(workspace, layout.rail_collapsed) {
@@ -3695,14 +3845,15 @@ fn route_accessibility_action(
     // technology's `Click` (or `Focus`) selects it in the widget layer,
     // and the panel it names is then shown, here, past the modal gate.
     let on_panel_tabs = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
-        && aurora_ui::panel_group_contains(
-            &workspace.tree,
-            &workspace.panel_group,
-            request.target_node,
-        );
+        && aurora_ui::is_panel_group_tab(&workspace.tree, request.target_node);
     let handled = aurora_widgets::handle_action(&mut workspace.tree, focus, request);
     if on_panel_tabs && handled.is_ok() {
-        follow_panel_tabs(workspace, focus, request.action == accesskit::Action::Click);
+        follow_panel_tabs(
+            workspace,
+            focus,
+            request.target_node,
+            request.action == accesskit::Action::Click,
+        );
     }
     match handled {
         Ok(outcome) if on_panel_tabs => AccessibilityReaction::PanelTab(outcome),
@@ -4427,6 +4578,13 @@ enum ActivatedCommand {
     /// only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewCurves`].
     NewCurvesLayer,
+    /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
+    /// returned because rebuilding a tab group needs `App`'s `Scales`.
+    /// Run by [`run_panel_move`].
+    MovePanel(aurora_ui::DockPanel, aurora_ui::PanelMove),
+    /// Reset Panel Layout (0.166.0): the default arrangement back
+    /// ([`reset_panel_arrangement`]); needs `Scales` too.
+    ResetPanels,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -4449,6 +4607,65 @@ const COMMAND_CLOSE_HISTORY: &str = "view.close_history";
 const COMMAND_TOGGLE_PANELS: &str = "window.toggle_panels";
 /// [`COMMAND_TOGGLE_PANELS`]' label in the palette and the Window menu.
 const COMMAND_TOGGLE_PANELS_LABEL: &str = "Collapse or Expand Panels";
+/// The keyboard path for drag-to-redock (0.166.0; invariant 9 — not
+/// mouse-only): per panel, "Up" (out of its group into the gap above it,
+/// or above the slot before it), "Down" (likewise below) and "to Next
+/// Group" (a tab of the next slot, wrapping) —
+/// [`aurora_ui::PanelMove`]. One command per panel and move, the same
+/// per-panel shape as the focus/toggle/close commands, so a command
+/// never depends on where focus was before the palette took it.
+const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &str); 9] = {
+    use aurora_ui::DockPanel::{History, Layers, Properties};
+    use aurora_ui::PanelMove::{Down, NextGroup, Up};
+    [
+        ("view.move_layers_up", Layers, Up, "Move Layers Panel Up"),
+        (
+            "view.move_layers_down",
+            Layers,
+            Down,
+            "Move Layers Panel Down",
+        ),
+        (
+            "view.move_layers_next_group",
+            Layers,
+            NextGroup,
+            "Move Layers Panel to Next Group",
+        ),
+        (
+            "view.move_properties_up",
+            Properties,
+            Up,
+            "Move Properties Panel Up",
+        ),
+        (
+            "view.move_properties_down",
+            Properties,
+            Down,
+            "Move Properties Panel Down",
+        ),
+        (
+            "view.move_properties_next_group",
+            Properties,
+            NextGroup,
+            "Move Properties Panel to Next Group",
+        ),
+        ("view.move_history_up", History, Up, "Move History Panel Up"),
+        (
+            "view.move_history_down",
+            History,
+            Down,
+            "Move History Panel Down",
+        ),
+        (
+            "view.move_history_next_group",
+            History,
+            NextGroup,
+            "Move History Panel to Next Group",
+        ),
+    ]
+};
+/// Restores the default panel arrangement (0.166.0).
+const COMMAND_RESET_PANELS: &str = "window.reset_panels";
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
@@ -4494,7 +4711,7 @@ const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 /// `COMMAND_LAYER_DELETE` (0.143.0) resolve to [`ActivatedCommand::NewLayer`]/
 /// [`ActivatedCommand::DeleteLayer`], run by [`perform_layer_command`].
 fn palette_commands() -> Vec<CommandEntry> {
-    vec![
+    let mut commands = vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
@@ -4505,6 +4722,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
         CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
+        CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
@@ -4513,7 +4731,13 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
-    ]
+    ];
+    commands.extend(
+        PANEL_MOVE_COMMANDS
+            .iter()
+            .map(|(id, _, _, label)| CommandEntry::new(*id, *label)),
+    );
+    commands
 }
 
 /// Resolves an activated command-palette entry's own `id` (one of the
@@ -4638,6 +4862,15 @@ fn activate_command(
         }
         refocus_out_of_hidden(workspace, focus);
         return None;
+    }
+    if let Some(&(_, panel, direction, _)) = PANEL_MOVE_COMMANDS
+        .iter()
+        .find(|(command, _, _, _)| *command == id)
+    {
+        return Some(ActivatedCommand::MovePanel(panel, direction));
+    }
+    if id == COMMAND_RESET_PANELS {
+        return Some(ActivatedCommand::ResetPanels);
     }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
@@ -4779,18 +5012,156 @@ fn open_from_panel_strip(
     changed
 }
 
+/// A keyboard panel move (0.166.0, [`ActivatedCommand::MovePanel`]):
+/// `aurora_ui::move_workspace_panel_by`, which also lands focus on the
+/// moved panel. Returns whether the arrangement changed (`false` at an
+/// end — the top panel moved up, say). Not document state: nothing here
+/// reaches `History`.
+fn run_panel_move(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    panel: aurora_ui::DockPanel,
+    direction: aurora_ui::PanelMove,
+) -> bool {
+    match aurora_ui::move_workspace_panel_by(workspace, focus, panel, direction, scales) {
+        Ok(moved) => moved,
+        Err(err) => {
+            tracing::warn!(?err, "failed to move a panel");
+            false
+        }
+    }
+}
+
+/// Reset Panel Layout (0.166.0): the default arrangement
+/// (`aurora_ui::DockArrangement::default`) back, then the hidden-focus
+/// repair. Collapsed, closed and rail-collapsed states are left as they
+/// are. Returns whether the arrangement changed.
+fn reset_panel_arrangement(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+) -> bool {
+    // Review I2: through the focus-keeping apply, so focus on a tab the
+    // rebuild removes follows its panel instead of being cleared.
+    match aurora_ui::apply_dock_arrangement_keeping_focus(
+        workspace,
+        focus,
+        &aurora_ui::DockArrangement::default(),
+        scales,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to reset the panel layout");
+            false
+        }
+    }
+}
+
+// -- Drag-to-redock pointer routing (0.166.0; review I1) --
+//
+// The panel half of each pointer phase, as free functions so the order
+// `App` runs them in is testable headlessly. `App` calls
+// [`panel_pointer_pressed`] *before* the ordinary widget routing of a
+// press (which, for a tab, only arms the click tracker — a tab selects on
+// release — and never captures it), [`panel_pointer_moved`] *first* on
+// every move (ahead of a gallery capture, so nothing can starve a panel
+// press of its moves), and [`panel_pointer_released`] *after* the
+// ordinary widget release (so a below-threshold click on a tab still
+// selects it, and the drop then rebuilds the tab bars). Points are
+// window-logical ([`logical_point`]), so the drag threshold is logical.
+
+/// The panel half of a press: a second press ends a panel press or drag
+/// (cancelled, the layout untouched); a primary press on a docked panel's
+/// title or tab — with no modal open — may start one
+/// (`aurora_ui::PanelDrag::press`). Returns whether a live drag was
+/// cancelled (the caller re-lays out).
+fn panel_pointer_pressed(
+    workspace: &mut aurora_ui::Workspace,
+    panel_drag: &mut Option<aurora_ui::PanelDrag>,
+    modal_open: bool,
+    button: PointerButton,
+    position: (f32, f32),
+) -> bool {
+    let cancelled = cancel_panel_drag(workspace, panel_drag);
+    if button == PointerButton::Primary && !modal_open {
+        *panel_drag = aurora_ui::PanelDrag::press(workspace, position);
+    }
+    cancelled
+}
+
+/// The panel half of a move: `None` when there is no panel press (the
+/// caller routes the move as before); `Some(changed)` when the press owns
+/// it — below the threshold still a click, past it a drag retargeting
+/// the drop indicator. `changed`: the caller re-lays out.
+fn panel_pointer_moved(
+    workspace: &mut aurora_ui::Workspace,
+    panel_drag: &mut Option<aurora_ui::PanelDrag>,
+    position: (f32, f32),
+    scales: &Scales,
+) -> Option<bool> {
+    let drag = panel_drag.as_mut()?;
+    Some(match drag.update(workspace, position, scales) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to update a panel drag");
+            false
+        }
+    })
+}
+
+/// The panel half of a release — the drop: below the threshold, or on no
+/// target, it changes nothing; on one, the panel moves (not document
+/// state: nothing reaches `History`). Returns whether there was a panel
+/// press (the caller re-lays out).
+fn panel_pointer_released(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    panel_drag: &mut Option<aurora_ui::PanelDrag>,
+    scales: &Scales,
+) -> bool {
+    let Some(drag) = panel_drag.take() else {
+        return false;
+    };
+    if let Err(err) = drag.finish(workspace, focus, scales) {
+        tracing::warn!(?err, "failed to drop a panel");
+    }
+    true
+}
+
+/// Cancels a panel press or drag, if any: the indicator is hidden and
+/// the arrangement left exactly as it was. Returns whether there was one.
+fn cancel_panel_drag(
+    workspace: &mut aurora_ui::Workspace,
+    panel_drag: &mut Option<aurora_ui::PanelDrag>,
+) -> bool {
+    let Some(drag) = panel_drag.take() else {
+        return false;
+    };
+    if let Err(err) = drag.cancel(workspace) {
+        tracing::warn!(?err, "failed to cancel a panel drag");
+    }
+    true
+}
+
 /// After input reached the Properties + History tab bar (0.164.0): shows
 /// the panel of the tab it now selects (`aurora_ui::follow_panel_group_tab`;
 /// `activated` — a pointer press or an AT `Click` — also expands a
 /// collapsed group from its already-selected tab), then moves focus off
 /// anything that is now hidden ([`refocus_out_of_hidden`]). Returns
 /// whether the group changed.
+///
+/// 0.166.0: `id` (the tab or bar the input reached) picks the group —
+/// the rail may hold any number of them, or none.
 fn follow_panel_tabs(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
+    id: WidgetId,
     activated: bool,
 ) -> bool {
-    let group = workspace.panel_group.clone();
+    let Some(group) = workspace.group_holding(id).cloned() else {
+        return false;
+    };
     match aurora_ui::follow_panel_group_tab(&mut workspace.tree, &group, activated) {
         Ok(changed) => {
             refocus_out_of_hidden(workspace, focus);
@@ -5235,6 +5606,13 @@ fn route_widget_pointer(
             owner_of(&workspace.tree, gallery, captured)
         }
     };
+    // The widget this event is for, read before the click tracker moves
+    // on (0.166.0: which tab group a tab press belongs to).
+    let routed_id = match phase {
+        PointerPhase::Down => workspace.tree.hit_test(position),
+        PointerPhase::Up => click.captured().or(click.pressed()),
+        PointerPhase::Move => click.captured(),
+    };
     let event = PointerEvent { phase, position };
     let outcome =
         match handle_pointer_with(&mut workspace.tree, focus, click, event, modifiers, hit) {
@@ -5251,8 +5629,10 @@ fn route_widget_pointer(
     {
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
-    if owner == Some(WidgetOwner::PanelTabs) {
-        follow_panel_tabs(workspace, focus, phase == PointerPhase::Down);
+    if owner == Some(WidgetOwner::PanelTabs)
+        && let Some(id) = routed_id
+    {
+        follow_panel_tabs(workspace, focus, id, phase == PointerPhase::Down);
     }
     if owner == Some(WidgetOwner::PanelStrip)
         && let PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) = &outcome
@@ -5431,7 +5811,7 @@ fn route_widget_key(
         tracing::warn!(?err, "gallery failed to apply an outcome");
     }
     if owner == WidgetOwner::PanelTabs {
-        follow_panel_tabs(workspace, focus, false);
+        follow_panel_tabs(workspace, focus, focused, false);
     }
     if owner == WidgetOwner::PanelStrip
         && let KeyOutcome::Handled(PointerOutcome::Action(
@@ -20003,6 +20383,11 @@ struct App {
     /// tool-dependent, unlike everything `Drag` itself models (see
     /// [`RailResize`]'s own doc comment).
     rail_resize: Option<RailResize>,
+    /// A primary press on a docked panel's title or tab, and the
+    /// drag-to-redock drag it may become (0.166.0, `aurora_ui::PanelDrag`)
+    /// — from the press to the release, `Escape`, `CursorLeft`, a lost
+    /// window focus or a second press.
+    panel_drag: Option<aurora_ui::PanelDrag>,
     /// The native menu bar — macOS only, see this crate's own "native
     /// menu bar" section for why Windows/Linux aren't included. Built
     /// in [`App::new`] (no window needed); attached to the real
@@ -20152,7 +20537,7 @@ impl App {
     ) -> Self {
         let mut workspace = aurora_ui::build_workspace(&scales);
         if let Some(layout_path) = layout_path.as_deref() {
-            load_workspace_layout(layout_path, &mut workspace);
+            load_workspace_layout(layout_path, &mut workspace, &scales);
         }
         // Opened *before* recovery, not after: `recover_document` writes
         // the autosave's own tiles straight into a live store, so the
@@ -20298,6 +20683,7 @@ impl App {
             residency_viewport: None,
             drag: None,
             rail_resize: None,
+            panel_drag: None,
             #[cfg(target_os = "macos")]
             menu: build_menu(),
             background,
@@ -20424,6 +20810,12 @@ impl App {
         let Some(key) = key else {
             return;
         };
+        // 0.166.0: any key cancels a live panel press or drag, so no
+        // command (the palette, Collapse Panels, a panel move) runs under
+        // it; `Escape` is then consumed — that is all it meant.
+        if self.cancel_panel_drag() && key == Key::Named(NamedKey::Escape) {
+            return;
+        }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         let routed = route_widget_key(
@@ -20507,6 +20899,10 @@ impl App {
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
+            Some(ActivatedCommand::MovePanel(panel, direction)) => {
+                self.move_panel(panel, direction);
+            }
+            Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -21785,6 +22181,21 @@ impl App {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
 
+        // 0.166.0 (review I1: first): a panel press owns every move
+        // until its release — below the threshold it is still a click;
+        // past it, a drag that shows the drop indicator
+        // ([`panel_pointer_moved`]).
+        if let Some(changed) = panel_pointer_moved(
+            &mut self.workspace,
+            &mut self.panel_drag,
+            position,
+            &self.scales,
+        ) {
+            if changed {
+                self.relayout_after_gallery();
+            }
+            return;
+        }
         // A gallery drag owns every move until its release (0.131.0) —
         // wherever the pointer goes, canvas and rail included.
         if self.gallery_click.captured().is_some() {
@@ -21898,6 +22309,8 @@ impl App {
             self.push_accessibility();
             return;
         }
+
+        self.begin_panel_press(button, position);
 
         // During a gallery drag (0.131.0) a second button's press is
         // nobody's: it must not start a pan or a stroke under the drag.
@@ -22367,6 +22780,16 @@ impl App {
         // running them unconditionally means a release can never strand
         // one behind a gallery click.
         self.rail_resize = None;
+        // 0.166.0: the drop, after the widget release above
+        // ([`panel_pointer_released`]).
+        if panel_pointer_released(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.panel_drag,
+            &self.scales,
+        ) {
+            self.relayout_after_gallery();
+        }
         let ending = self.drag.take();
         self.commit_drag(ending);
         // Whatever owned the pointer let go: the tooltip may arm again
@@ -22397,6 +22820,7 @@ impl App {
         };
         let pointer_owned = self.drag.is_some()
             || self.rail_resize.is_some()
+            || self.panel_drag.is_some()
             || self.gallery_click.captured().is_some();
         match wheel_target(
             &self.workspace,
@@ -22491,6 +22915,10 @@ impl App {
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
+            Some(ActivatedCommand::MovePanel(panel, direction)) => {
+                self.move_panel(panel, direction);
+            }
+            Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             None => {}
         }
         self.push_accessibility();
@@ -22769,6 +23197,57 @@ impl App {
                 self.ime_cursor_area = Some(area);
             }
         }
+    }
+
+    /// A keyboard panel move ([`run_panel_move`], 0.166.0): ends a live
+    /// panel drag first (its indicator and target would be stale), then
+    /// re-lays out and re-announces.
+    fn move_panel(&mut self, panel: aurora_ui::DockPanel, direction: aurora_ui::PanelMove) {
+        self.cancel_panel_drag();
+        run_panel_move(
+            &mut self.workspace,
+            &mut self.focus,
+            &self.scales,
+            panel,
+            direction,
+        );
+        self.relayout_after_gallery();
+    }
+
+    /// Reset Panel Layout ([`reset_panel_arrangement`], 0.166.0).
+    fn reset_panels(&mut self) {
+        self.cancel_panel_drag();
+        reset_panel_arrangement(&mut self.workspace, &mut self.focus, &self.scales);
+        self.relayout_after_gallery();
+    }
+
+    /// The panel half of a press (0.166.0): a second press ends a panel
+    /// press or drag (cancelled, the layout untouched); a primary press on
+    /// a docked panel's title or tab — with no palette open — may start
+    /// one (`aurora_ui::PanelDrag::press`). The press then routes as it
+    /// always did (a tab press still switches tabs), so a click stays a
+    /// click.
+    fn begin_panel_press(&mut self, button: PointerButton, position: (f32, f32)) {
+        if panel_pointer_pressed(
+            &mut self.workspace,
+            &mut self.panel_drag,
+            self.dialog.is_some() || self.command_palette.is_some(),
+            button,
+            position,
+        ) {
+            self.relayout_after_gallery();
+        }
+    }
+
+    /// Cancels a panel press or drag, if any (0.166.0): the indicator is
+    /// hidden and the arrangement left exactly as it was. Returns whether
+    /// there was one.
+    fn cancel_panel_drag(&mut self) -> bool {
+        let cancelled = cancel_panel_drag(&mut self.workspace, &mut self.panel_drag);
+        if cancelled {
+            self.relayout_after_gallery();
+        }
+        cancelled
     }
 
     /// Opens or closes the Widget Gallery ([`toggle_gallery`]), then
@@ -23839,7 +24318,14 @@ impl ApplicationHandler<AppEvent> for App {
             // No caret, and no blink wake-ups, while another window has
             // keyboard focus (`caret_step`); the redraw every real event
             // gets repaints the caret's disappearance or return.
-            WindowEvent::Focused(focused) => self.caret.window_focused = focused,
+            WindowEvent::Focused(focused) => {
+                self.caret.window_focused = focused;
+                // 0.166.0: a release lost with the focus must not leave a
+                // panel drag live.
+                if !focused {
+                    self.cancel_panel_drag();
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = translate_modifiers(modifiers.state());
             }
@@ -23889,6 +24375,8 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_position = None;
+                // 0.166.0: leaving the window cancels a panel drag.
+                self.cancel_panel_drag();
                 // Dragging off the window edge ends the drag, and used
                 // to end it by simply dropping it -- losing a live
                 // stroke's whole undo entry along with it. Commit it the
@@ -24138,10 +24626,42 @@ pub fn run() -> anyhow::Result<()> {
 /// tests that click or scroll History rows need it laid out.
 #[cfg(test)]
 fn show_history_tab_for_test(workspace: &mut aurora_ui::Workspace) {
-    let group = workspace.panel_group.clone();
-    if let Err(err) = aurora_ui::show_panel_group_tab(&mut workspace.tree, &group, 1) {
+    let history = workspace.history;
+    if let Err(err) = aurora_ui::select_panel_tab(workspace, history) {
         unreachable!("{err:?}");
     }
+}
+
+/// The tab group holding Properties (0.166.0 test support): the default
+/// Properties + History group, under any arrangement that keeps it.
+#[cfg(test)]
+fn test_group(workspace: &aurora_ui::Workspace) -> aurora_ui::PanelGroup {
+    match workspace.group_of(workspace.properties) {
+        Some(group) => group.clone(),
+        None => unreachable!("Properties is grouped in this test"),
+    }
+}
+
+/// The committed scales (0.166.0 test support for layout loads).
+#[cfg(test)]
+fn test_layout_scales() -> Scales {
+    const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+    match Scales::from_toml_str(SCALES_TOML) {
+        Ok(scales) => scales,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+/// The default arrangement saved with the group's raw tab `tab` (0.166.0
+/// test support: a pre-0.166.0 test's tab, damaged or not, carried into
+/// the current layout's `dock`).
+#[cfg(test)]
+fn test_saved_dock(tab: u32) -> Vec<SavedDockSlot> {
+    let mut dock = default_saved_dock(0);
+    if let Some(slot) = dock.get_mut(1) {
+        slot.selected = tab;
+    }
+    dock
 }
 
 /// The committed scales every test workspace is built with
@@ -30339,10 +30859,12 @@ mod tests {
         );
         // 0.164.0: then the group's selected tab (one stop per tab row,
         // roving focus), then the shown tab's panel; History is hidden.
-        let selected_tab =
-            aurora_widgets::widgets::tab_bar_state(&workspace.tree, workspace.panel_group.bar)
-                .ok()
-                .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
+        let selected_tab = aurora_widgets::widgets::tab_bar_state(
+            &workspace.tree,
+            crate::test_group(&workspace).bar,
+        )
+        .ok()
+        .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
         assert_eq!(focus.focused(), selected_tab);
         let _ = run_command(
             &mut workspace,
@@ -31306,9 +31828,11 @@ mod tests {
         assert_eq!(state.query(), "lay");
         // "Focus Layers Panel", "Toggle Layers Panel", "Close Layers
         // Panel", (0.143.0) "New Layer" and "Delete Layer", and
-        // (0.155.0) "New Curves Layer" all match -- the first inserted
-        // (`palette_commands`'s own order) is what ends up selected.
-        assert_eq!(state.results().len(), 6);
+        // (0.155.0) "New Curves Layer" all match, and (0.166.0) "Reset
+        // Panel Layout" and the three "Move Layers Panel ..." commands --
+        // the first inserted (`palette_commands`'s own order) is what ends
+        // up selected.
+        assert_eq!(state.results().len(), 10);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -32112,7 +32636,7 @@ mod tests {
                 let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
                 assert_eq!(picked, None);
                 assert_eq!(
-                    aurora_ui::panel_group_shown(&workspace.tree, &workspace.panel_group),
+                    aurora_ui::panel_group_shown(&workspace.tree, &crate::test_group(&workspace)),
                     Some(1),
                     "toggling a hidden tab selects it"
                 );
@@ -53918,14 +54442,14 @@ mod tests {
             unreachable!("{err:?}");
         }
         // 0.164.0: Properties is a tab of a group, which collapses as one.
-        let group = original.panel_group.clone();
+        let group = crate::test_group(&original);
         if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut original.tree, &group, true) {
             unreachable!("{err:?}");
         }
 
         super::save_workspace_layout(&path, &original);
         let mut loaded = aurora_ui::build_workspace(&crate::test_workspace_scales());
-        super::load_workspace_layout(&path, &mut loaded);
+        super::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
 
         assert_eq!(
             aurora_ui::rail_width(&loaded.tree, loaded.rail),
@@ -53944,7 +54468,7 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         }
         assert_eq!(
-            aurora_ui::panel_group_selected(&loaded.tree, &loaded.panel_group).ok(),
+            aurora_ui::panel_group_selected(&loaded.tree, &crate::test_group(&loaded)).ok(),
             Some(0),
             "the default tab round-trips"
         );
@@ -53959,7 +54483,7 @@ mod tests {
         let path = dir.path().join("does-not-exist.postcard");
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
 
-        super::load_workspace_layout(&path, &mut workspace);
+        super::load_workspace_layout(&path, &mut workspace, &crate::test_layout_scales());
 
         assert_eq!(
             aurora_ui::rail_width(&workspace.tree, workspace.rail),
@@ -60993,8 +61517,9 @@ mod tests {
         let checkbox = rig.g().checkbox;
         assert_eq!(
             rig.workspace.tree.children(root).map(<[WidgetId]>::len),
-            Some(6),
-            "tools, canvas column, divider, rail, label strip (0.165.0), gallery"
+            Some(7),
+            "tools, canvas column, divider, rail, label strip (0.165.0), \
+             drop indicator (0.166.0), gallery"
         );
         if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, checkbox) {
             unreachable!("{err:?}");
@@ -61012,6 +61537,7 @@ mod tests {
                     rig.workspace.divider,
                     rig.workspace.rail,
                     rig.workspace.panel_strip.root,
+                    rig.workspace.drop_indicator,
                 ]
                 .as_slice()
             ),
@@ -66381,7 +66907,7 @@ mod tests {
                     if start_on_history {
                         // 0.164.0: the History tab selected — the group's
                         // collapse follows `start_collapsed`.
-                        let group = shell.workspace.panel_group.clone();
+                        let group = crate::test_group(&shell.workspace);
                         let tree = &mut shell.workspace.tree;
                         if let Err(err) = aurora_widgets::widgets::select_tab(tree, group.bar, 1)
                             .map(|_| ())
@@ -66427,7 +66953,7 @@ mod tests {
                     // slot, so the editor has the rest of the rail.
                     assert_eq!(history.height, 0, "{what}: History is the hidden tab");
                     assert_eq!(
-                        aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group),
+                        aurora_ui::panel_group_shown(&ws.tree, &crate::test_group(ws)),
                         Some(0),
                         "{what}: the Properties tab is the one shown"
                     );
@@ -66494,10 +67020,10 @@ mod tests {
             assert!(shell.run(LayerCommand::NewCurves));
             let ws = &shell.workspace;
             assert_eq!(
-                aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group),
+                aurora_ui::panel_group_shown(&ws.tree, &crate::test_group(ws)),
                 Some(0)
             );
-            let tab = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.panel_group.bar)
+            let tab = aurora_widgets::widgets::tab_bar_state(&ws.tree, crate::test_group(ws).bar)
                 .ok()
                 .and_then(aurora_widgets::widgets::TabBarState::selected_tab);
             assert_eq!(shell.focus.focused(), tab, "focus is on the Properties tab");
@@ -69833,7 +70359,7 @@ mod panel_scroll_tests {
         }
 
         fn tab(ws: &aurora_ui::Workspace, index: usize) -> WidgetId {
-            match tab_bar_state(&ws.tree, ws.panel_group.bar)
+            match tab_bar_state(&ws.tree, crate::test_group(ws).bar)
                 .ok()
                 .and_then(|bar| bar.tabs().get(index).copied())
             {
@@ -69843,11 +70369,11 @@ mod panel_scroll_tests {
         }
 
         fn shown(ws: &aurora_ui::Workspace) -> Option<usize> {
-            aurora_ui::panel_group_shown(&ws.tree, &ws.panel_group)
+            aurora_ui::panel_group_shown(&ws.tree, &crate::test_group(ws))
         }
 
         fn selected(ws: &aurora_ui::Workspace) -> Option<usize> {
-            aurora_ui::panel_group_selected(&ws.tree, &ws.panel_group).ok()
+            aurora_ui::panel_group_selected(&ws.tree, &crate::test_group(ws)).ok()
         }
 
         fn bounds(ws: &aurora_ui::Workspace, id: WidgetId) -> aurora_core::Rect {
@@ -69906,8 +70432,8 @@ mod panel_scroll_tests {
         /// overlap, inside the rail.
         fn assert_one_slot(ws: &aurora_ui::Workspace, what: &str) {
             let layers = bounds(ws, ws.layers.root);
-            let group = bounds(ws, ws.panel_group.root);
-            let bar = bounds(ws, ws.panel_group.bar);
+            let group = bounds(ws, crate::test_group(ws).root);
+            let bar = bounds(ws, crate::test_group(ws).bar);
             let rail = bounds(ws, ws.rail);
             assert_eq!(
                 group.y,
@@ -69969,7 +70495,7 @@ mod panel_scroll_tests {
             let mut focus = FocusManager::default();
             let bar = ws
                 .tree
-                .accessibility(ws.panel_group.bar)
+                .accessibility(crate::test_group(&ws).bar)
                 .map(accesskit::Node::role);
             assert_eq!(bar, Some(accesskit::Role::TabList));
             for index in [0, 1] {
@@ -70190,7 +70716,7 @@ mod panel_scroll_tests {
             assert_eq!(shown(&ws), Some(1), "no auto-select every frame");
             // A collapsed group on History: a new Curves layer selects
             // Properties and expands the group.
-            let group = ws.panel_group.clone();
+            let group = crate::test_group(&ws);
             if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true) {
                 unreachable!("{err:?}");
             }
@@ -70238,7 +70764,7 @@ mod panel_scroll_tests {
             run(&mut ws, &mut focus, COMMAND_TOGGLE_HISTORY);
             assert_eq!(shown(&ws), Some(1), "a toggled panel selects its tab");
             run(&mut ws, &mut focus, COMMAND_TOGGLE_HISTORY);
-            let group = ws.panel_group.clone();
+            let group = crate::test_group(&ws);
             assert_eq!(
                 aurora_ui::panel_group_is_collapsed(&ws.tree, &group).ok(),
                 Some(true)
@@ -70408,7 +70934,7 @@ mod panel_scroll_tests {
         fn activating_the_selected_tab_of_a_collapsed_group_expands_it() {
             let mut ws = workspace();
             let mut focus = FocusManager::default();
-            let group = ws.panel_group.clone();
+            let group = crate::test_group(&ws);
             let collapse = |ws: &mut aurora_ui::Workspace| {
                 if let Err(err) = aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true) {
                     unreachable!("{err:?}");
@@ -70463,7 +70989,7 @@ mod panel_scroll_tests {
         #[test]
         fn grouped_panels_do_not_advertise_their_own_collapse_or_expand() {
             let mut ws = workspace();
-            let group = ws.panel_group.clone();
+            let group = crate::test_group(&ws);
             for collapsed in [true, false] {
                 if let Err(err) =
                     aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, collapsed)
@@ -70493,7 +71019,7 @@ mod panel_scroll_tests {
             crate::show_history_tab_for_test(&mut original);
             crate::save_workspace_layout(&path, &original);
             let mut loaded = workspace();
-            crate::load_workspace_layout(&path, &mut loaded);
+            crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
             assert_eq!((selected(&loaded), shown(&loaded)), (Some(1), Some(1)));
 
             // A pre-0.164.0 file: no tab field at all.
@@ -70512,7 +71038,7 @@ mod panel_scroll_tests {
             }
             let mut loaded = workspace();
             crate::show_history_tab_for_test(&mut loaded);
-            crate::load_workspace_layout(&path, &mut loaded);
+            crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
             assert_eq!(
                 aurora_ui::rail_width(&loaded.tree, loaded.rail),
                 Some(320.0),
@@ -70520,7 +71046,7 @@ mod panel_scroll_tests {
             );
             assert_eq!(selected(&loaded), Some(aurora_ui::PANEL_GROUP_TAB_DEFAULT));
             assert_eq!(
-                aurora_ui::panel_group_is_collapsed(&loaded.tree, &loaded.panel_group).ok(),
+                aurora_ui::panel_group_is_collapsed(&loaded.tree, &crate::test_group(&loaded)).ok(),
                 Some(true),
                 "the default tab's saved collapse applies to the group"
             );
@@ -70533,6 +71059,7 @@ mod panel_scroll_tests {
                 history_collapsed: false,
                 panel_group_tab: 7,
                 rail_collapsed: false,
+                dock: crate::test_saved_dock(7),
             };
             let bytes = match postcard::to_allocvec(&damaged) {
                 Ok(bytes) => bytes,
@@ -70543,7 +71070,7 @@ mod panel_scroll_tests {
             }
             let mut loaded = workspace();
             crate::show_history_tab_for_test(&mut loaded);
-            crate::load_workspace_layout(&path, &mut loaded);
+            crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
             assert_eq!(
                 aurora_ui::rail_width(&loaded.tree, loaded.rail),
                 Some(280.0)
@@ -70554,6 +71081,581 @@ mod panel_scroll_tests {
         /// 0.165.0: the right rail collapsed to a narrow label strip, end
         /// to end through the app's own command, routing, focus,
         /// persistence, Curves and pointer-mapping functions.
+        /// 0.166.0: drag-to-redock at the app level — the routing a press
+        /// takes alongside a `PanelDrag`, the keyboard commands and the
+        /// persisted arrangement. The drag state machine itself is tested
+        /// in `aurora_ui::redock`.
+        mod panel_redock {
+            use super::{centre, press, selected, tab};
+            use crate::tests::FakeFileDialog;
+            use crate::{
+                ActivatedCommand, COMMAND_RESET_PANELS, FocusManager, PANEL_MOVE_COMMANDS,
+                SavedDockSlot, SavedPlacement, WidgetId, WorkspaceLayout, WorkspaceLayoutV1,
+                WorkspaceLayoutV2, WorkspaceLayoutV3, activate_command, apply_workspace_layout,
+                decode_workspace_layout, palette_commands, reset_panel_arrangement, run_panel_move,
+            };
+            use aurora_ui::{DockPanel, PanelMove};
+
+            const WINDOW: (f32, f32) = (1000.0, 800.0);
+
+            fn workspace() -> aurora_ui::Workspace {
+                let mut ws = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                ws
+            }
+
+            fn shape(ws: &aurora_ui::Workspace) -> Vec<(Vec<DockPanel>, usize)> {
+                ws.dock_arrangement()
+                    .slots()
+                    .iter()
+                    .map(|slot| (slot.panels.clone(), slot.selected))
+                    .collect()
+            }
+
+            fn run(ws: &mut aurora_ui::Workspace, focus: &mut FocusManager, id: &str) -> bool {
+                let picked = activate_command(ws, focus, id, &mut FakeFileDialog::default());
+                let scales = crate::test_layout_scales();
+                let changed = match picked {
+                    Some(ActivatedCommand::MovePanel(panel, direction)) => {
+                        run_panel_move(ws, focus, &scales, panel, direction)
+                    }
+                    Some(ActivatedCommand::ResetPanels) => {
+                        reset_panel_arrangement(ws, focus, &scales)
+                    }
+                    other => unreachable!("{id} activated {other:?}"),
+                };
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                changed
+            }
+
+            /// Every panel's root sits exactly once in the rail: directly,
+            /// or as a member of exactly one group in it — read off the
+            /// tree, not the model.
+            fn every_panel_once_in_the_tree(ws: &aurora_ui::Workspace) {
+                for panel in DockPanel::ALL {
+                    let root = ws.panel(panel).root;
+                    let parent = ws.tree.parent(root);
+                    let in_rail = parent == Some(ws.rail)
+                        || parent.is_some_and(|p| ws.tree.parent(p) == Some(ws.rail));
+                    assert!(in_rail, "{panel:?} is docked in the rail");
+                    let homes = ws
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.panels().iter().any(|h| h.root == root))
+                        .count();
+                    assert_eq!(homes, 1, "{panel:?} appears exactly once");
+                }
+                let roots: Vec<WidgetId> = ws.slots.iter().map(aurora_ui::RailSlot::root).collect();
+                assert_eq!(ws.tree.children(ws.rail).map(<[_]>::to_vec), Some(roots));
+            }
+
+            /// AC-1 at the routing level: what `App` does on a tab click —
+            /// a `PanelDrag` press beside the ordinary widget routing,
+            /// released without travel — switches the tab exactly as
+            /// before and moves nothing.
+            #[test]
+            fn a_tab_click_with_a_panel_press_still_just_switches_tabs() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let at = centre(match ws.tree.bounds(tab(&ws, 1)) {
+                    Some(bounds) => bounds,
+                    None => unreachable!("laid out"),
+                });
+                let before = shape(&ws);
+                let drag = aurora_ui::PanelDrag::press(&ws, at);
+                assert_eq!(drag.map(|d| d.panel()), Some(DockPanel::History));
+                press(&mut ws, &mut focus, at);
+                let scales = crate::test_layout_scales();
+                if let Some(drag) = drag {
+                    assert_eq!(drag.finish(&mut ws, &mut focus, &scales).ok(), Some(false));
+                }
+                assert_eq!(selected(&ws), Some(1), "the tab switched, as before");
+                let mut expected = before;
+                if let Some(slot) = expected.get_mut(1) {
+                    slot.1 = 1;
+                }
+                assert_eq!(shape(&ws), expected, "and nothing moved");
+            }
+
+            /// AC-5: every move command is in the palette and resolves to
+            /// its panel and move; running them rearranges the rail with
+            /// focus on the moved panel and the AccessKit rail order equal
+            /// to the slots; Reset Panel Layout restores the default.
+            #[test]
+            fn the_move_commands_rearrange_with_focus_and_order_kept_and_reset_restores() {
+                let ids: Vec<String> = palette_commands().into_iter().map(|e| e.id).collect();
+                for (id, panel, direction, _) in PANEL_MOVE_COMMANDS {
+                    assert!(ids.iter().any(|known| known == id), "{id} in the palette");
+                    let mut ws = workspace();
+                    let mut focus = FocusManager::default();
+                    assert_eq!(
+                        activate_command(&mut ws, &mut focus, id, &mut FakeFileDialog::default()),
+                        Some(ActivatedCommand::MovePanel(panel, direction))
+                    );
+                }
+                assert!(ids.iter().any(|known| known == COMMAND_RESET_PANELS));
+
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let layers_row = ws.layers.body;
+                assert!(run(&mut ws, &mut focus, "view.move_layers_next_group"));
+                assert_eq!(
+                    shape(&ws),
+                    vec![(
+                        vec![DockPanel::Properties, DockPanel::History, DockPanel::Layers],
+                        2
+                    )]
+                );
+                assert_eq!(
+                    focus.focused(),
+                    aurora_ui::panel_focus_target(&ws, ws.layers),
+                    "focus lands on the moved panel's tab"
+                );
+                assert!(ws.tree.contains(layers_row), "content kept");
+                every_panel_once_in_the_tree(&ws);
+                let update = ws.tree.accessibility_update(ws.root);
+                let at_rail = update
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| *id == ws.rail)
+                    .map(|(_, node)| node.children().to_vec());
+                assert_eq!(at_rail, ws.tree.children(ws.rail).map(<[_]>::to_vec));
+
+                assert!(run(&mut ws, &mut focus, "view.move_history_down"));
+                assert!(run(&mut ws, &mut focus, "view.move_properties_up"));
+                assert_eq!(
+                    shape(&ws),
+                    vec![
+                        (vec![DockPanel::Properties], 0),
+                        (vec![DockPanel::Layers], 0),
+                        (vec![DockPanel::History], 0)
+                    ]
+                );
+                assert_eq!(focus.focused(), Some(ws.properties.root));
+                every_panel_once_in_the_tree(&ws);
+                assert!(!run(&mut ws, &mut focus, "view.move_properties_up"), "top");
+
+                assert!(run(&mut ws, &mut focus, COMMAND_RESET_PANELS));
+                assert_eq!(shape(&ws), shape(&workspace()), "the default again");
+                every_panel_once_in_the_tree(&ws);
+                assert!(
+                    !run(&mut ws, &mut focus, COMMAND_RESET_PANELS),
+                    "already default"
+                );
+            }
+
+            fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+                match postcard::to_allocvec(value) {
+                    Ok(bytes) => bytes,
+                    Err(err) => unreachable!("{err}"),
+                }
+            }
+
+            fn load(bytes: &[u8]) -> aurora_ui::Workspace {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let path = dir.path().join("workspace-layout.postcard");
+                if let Err(err) = std::fs::write(&path, bytes) {
+                    unreachable!("{err}");
+                }
+                let mut ws = workspace();
+                crate::load_workspace_layout(&path, &mut ws, &crate::test_layout_scales());
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                ws
+            }
+
+            /// AC-6: a rearranged, collapsed layout survives a save and a
+            /// load into a fresh workspace (a restart); 0.165.0 (V3),
+            /// 0.164.0 (V2) and older (V1) files still decode, with the
+            /// default arrangement.
+            #[test]
+            fn the_arrangement_round_trips_and_older_layouts_still_decode() {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let path = dir.path().join("workspace-layout.postcard");
+                let mut original = workspace();
+                let mut focus = FocusManager::default();
+                assert!(run(&mut original, &mut focus, "view.move_history_up"));
+                assert!(run(
+                    &mut original,
+                    &mut focus,
+                    "view.move_properties_next_group"
+                ));
+                let group = crate::test_group(&original);
+                if let Err(err) =
+                    aurora_ui::set_panel_group_collapsed(&mut original.tree, &group, true)
+                {
+                    unreachable!("{err:?}");
+                }
+                let saved = shape(&original);
+                assert_eq!(
+                    saved,
+                    vec![
+                        (vec![DockPanel::Layers, DockPanel::Properties], 1),
+                        (vec![DockPanel::History], 0)
+                    ]
+                );
+                crate::save_workspace_layout(&path, &original);
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let loaded = load(&bytes);
+                assert_eq!(shape(&loaded), saved, "the arrangement survives a restart");
+                assert_eq!(
+                    aurora_ui::panel_group_is_collapsed(&loaded.tree, &crate::test_group(&loaded))
+                        .ok(),
+                    Some(true),
+                    "and the group's collapse"
+                );
+                every_panel_once_in_the_tree(&loaded);
+
+                let default = shape(&workspace());
+                let v3 = load(&encode(&WorkspaceLayoutV3 {
+                    rail_width: 280.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 1,
+                    rail_collapsed: true,
+                }));
+                let mut history_tab = default.clone();
+                if let Some(slot) = history_tab.get_mut(1) {
+                    slot.1 = 1;
+                }
+                assert_eq!(shape(&v3), history_tab, "0.165.0: default, its tab kept");
+                assert!(aurora_ui::rail_collapsed(&v3), "and its rail collapse");
+                let v2 = load(&encode(&WorkspaceLayoutV2 {
+                    rail_width: 280.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                }));
+                assert_eq!(shape(&v2), default);
+                let v1 = load(&encode(&WorkspaceLayoutV1 {
+                    rail_width: 280.0,
+                    layers_collapsed: true,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                }));
+                assert_eq!(shape(&v1), default);
+                assert_eq!(
+                    aurora_ui::panel_is_collapsed(&v1.tree, v1.layers).ok(),
+                    Some(true)
+                );
+            }
+
+            /// AC-6: a file naming an unknown panel, a duplicate, an empty
+            /// slot and an out-of-range tab, and missing a panel, loads
+            /// repaired with every panel exactly once; a truncated current
+            /// file decodes as its 0.165.0 prefix; garbage changes nothing.
+            #[test]
+            fn a_damaged_layout_repairs_so_every_panel_appears_exactly_once() {
+                let slot = |panels: &[&str], selected: u32| SavedDockSlot {
+                    placement: SavedPlacement::Rail,
+                    panels: panels.iter().map(|p| (*p).to_owned()).collect(),
+                    selected,
+                };
+                let damaged = WorkspaceLayout {
+                    rail_width: 300.0,
+                    layers_collapsed: false,
+                    properties_collapsed: false,
+                    history_collapsed: false,
+                    panel_group_tab: 0,
+                    rail_collapsed: false,
+                    dock: vec![
+                        slot(&["brushes", "history"], 0),
+                        slot(&[], 0),
+                        slot(&["history", "layers"], 99),
+                    ],
+                };
+                let bytes = encode(&damaged);
+                let decoded = match decode_workspace_layout(&bytes) {
+                    Ok(layout) => layout,
+                    Err(err) => unreachable!("a damaged arrangement still decodes: {err}"),
+                };
+                assert_eq!(decoded, damaged);
+                let loaded = load(&bytes);
+                assert_eq!(
+                    shape(&loaded),
+                    vec![
+                        (vec![DockPanel::History], 0),
+                        (vec![DockPanel::Layers], 0),
+                        (vec![DockPanel::Properties], 0)
+                    ],
+                    "unknown and duplicate dropped, empty slot gone, Properties appended"
+                );
+                every_panel_once_in_the_tree(&loaded);
+
+                // Applied directly too, onto a non-default workspace.
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                assert!(run(&mut ws, &mut focus, "view.move_layers_next_group"));
+                apply_workspace_layout(&mut ws, &damaged, &crate::test_layout_scales());
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+                every_panel_once_in_the_tree(&ws);
+
+                // A current file cut inside its arrangement decodes as V3.
+                let good = encode(&WorkspaceLayout {
+                    dock: crate::test_saved_dock(1),
+                    ..damaged.clone()
+                });
+                let cut = good
+                    .get(..good.len() - 3)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default();
+                match decode_workspace_layout(&cut) {
+                    Ok(layout) => assert_eq!(layout.dock, crate::default_saved_dock(0)),
+                    Err(err) => unreachable!("the 0.165.0 prefix decodes: {err}"),
+                }
+                every_panel_once_in_the_tree(&load(&cut));
+                // Garbage: no layout at all, the workspace as built.
+                let garbage = load(&[0xff; 3]);
+                assert_eq!(shape(&garbage), shape(&workspace()));
+            }
+
+            /// One pointer event in `App`'s own order (review I1): the
+            /// panel half of a press before the widget routing, the panel
+            /// half of a move first, the widget release before the drop.
+            /// `at` is physical, divided by `scale` like `App` does.
+            #[allow(clippy::too_many_arguments)]
+            fn pointer(
+                ws: &mut aurora_ui::Workspace,
+                focus: &mut FocusManager,
+                click: &mut crate::ClickTracker,
+                panel_drag: &mut Option<aurora_ui::PanelDrag>,
+                phase: crate::PointerPhase,
+                at: (f64, f64),
+                scale: f64,
+            ) {
+                let position = crate::logical_point(at, scale);
+                let scales = crate::test_layout_scales();
+                let widget = |ws: &mut aurora_ui::Workspace,
+                              focus: &mut FocusManager,
+                              click: &mut crate::ClickTracker,
+                              phase| {
+                    let _ = crate::route_widget_pointer(
+                        ws,
+                        focus,
+                        &mut None,
+                        None,
+                        None,
+                        click,
+                        &scales,
+                        false,
+                        phase,
+                        position,
+                        crate::Modifiers::none(),
+                        &mut crate::NoTextHit,
+                    );
+                };
+                match phase {
+                    crate::PointerPhase::Down => {
+                        crate::panel_pointer_pressed(
+                            ws,
+                            panel_drag,
+                            false,
+                            crate::PointerButton::Primary,
+                            position,
+                        );
+                        widget(ws, focus, click, phase);
+                    }
+                    crate::PointerPhase::Move => {
+                        if crate::panel_pointer_moved(ws, panel_drag, position, &scales).is_none() {
+                            widget(ws, focus, click, phase);
+                        }
+                    }
+                    crate::PointerPhase::Up => {
+                        widget(ws, focus, click, phase);
+                        crate::panel_pointer_released(ws, focus, panel_drag, &scales);
+                    }
+                }
+                ws.tree.compute_layout(WINDOW.0, WINDOW.1);
+            }
+
+            fn physical(point: (f32, f32), scale: f64) -> (f64, f64) {
+                (f64::from(point.0) * scale, f64::from(point.1) * scale)
+            }
+
+            fn bounds(ws: &aurora_ui::Workspace, id: WidgetId) -> aurora_core::Rect {
+                match ws.tree.bounds(id) {
+                    Some(bounds) => bounds,
+                    None => unreachable!("laid out"),
+                }
+            }
+
+            /// Review I1: press, a move past the threshold and a release,
+            /// in `App`'s own order, really drop — a History tab dragged to
+            /// the rail's bottom, then the Layers title row dragged onto
+            /// the group's tab strip — and a click below the threshold on
+            /// a tab still switches it and moves nothing.
+            #[test]
+            fn the_app_pointer_order_drops_a_drag_and_a_click_still_switches_tabs() {
+                use crate::PointerPhase::{Down, Move, Up};
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let mut click = crate::ClickTracker::default();
+                let mut drag = None;
+                let tab_at = centre(bounds(&ws, tab(&ws, 1)));
+                // A click: 2 px of travel, released on the tab.
+                let nudged = (tab_at.0 + 2.0, tab_at.1);
+                for (phase, at) in [(Down, tab_at), (Move, nudged), (Up, nudged)] {
+                    pointer(
+                        &mut ws,
+                        &mut focus,
+                        &mut click,
+                        &mut drag,
+                        phase,
+                        physical(at, 1.0),
+                        1.0,
+                    );
+                }
+                assert_eq!(selected(&ws), Some(1), "the tab switched");
+                let mut expected = shape(&workspace());
+                if let Some(slot) = expected.get_mut(1) {
+                    slot.1 = 1;
+                }
+                assert_eq!(shape(&ws), expected, "nothing moved");
+
+                // A drag: History's tab to the bottom of the rail.
+                let rail = bounds(&ws, ws.rail);
+                #[allow(clippy::cast_precision_loss)]
+                let bottom = (tab_at.0, (rail.y + i64::from(rail.height)) as f32 - 2.0);
+                for (phase, at) in [
+                    (Down, tab_at),
+                    (Move, (tab_at.0, tab_at.1 + 30.0)),
+                    (Move, bottom),
+                    (Up, bottom),
+                ] {
+                    pointer(
+                        &mut ws,
+                        &mut focus,
+                        &mut click,
+                        &mut drag,
+                        phase,
+                        physical(at, 1.0),
+                        1.0,
+                    );
+                }
+                assert!(drag.is_none(), "the release ended it");
+                assert_eq!(
+                    shape(&ws),
+                    vec![
+                        (vec![DockPanel::Layers], 0),
+                        (vec![DockPanel::Properties], 0),
+                        (vec![DockPanel::History], 0)
+                    ],
+                    "the drop was applied"
+                );
+
+                // A lone title row onto another lone panel's title row.
+                let title = centre(bounds(&ws, ws.layers.header));
+                let onto = centre(bounds(&ws, ws.history.header));
+                for (phase, at) in [(Down, title), (Move, onto), (Up, onto)] {
+                    pointer(
+                        &mut ws,
+                        &mut focus,
+                        &mut click,
+                        &mut drag,
+                        phase,
+                        physical(at, 1.0),
+                        1.0,
+                    );
+                }
+                assert_eq!(
+                    shape(&ws),
+                    vec![
+                        (vec![DockPanel::Properties], 0),
+                        (vec![DockPanel::History, DockPanel::Layers], 1)
+                    ],
+                    "joined as the selected tab"
+                );
+            }
+
+            /// Threshold units: positions are logical, so at scale 2 a
+            /// 6-physical-px (3 pt) move is still a click and a
+            /// 10-physical-px (5 pt) one is a drag — the threshold is
+            /// 4 pt, 8 physical px, not 4 physical px.
+            #[test]
+            fn the_drag_threshold_is_logical_at_scale_two() {
+                use crate::PointerPhase::{Down, Move};
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                let mut click = crate::ClickTracker::default();
+                let mut drag = None;
+                let title = physical(centre(bounds(&ws, ws.layers.header)), 2.0);
+                pointer(&mut ws, &mut focus, &mut click, &mut drag, Down, title, 2.0);
+                pointer(
+                    &mut ws,
+                    &mut focus,
+                    &mut click,
+                    &mut drag,
+                    Move,
+                    (title.0 + 6.0, title.1),
+                    2.0,
+                );
+                assert_eq!(drag.map(|d| d.is_active()), Some(false), "3 pt: a click");
+                pointer(
+                    &mut ws,
+                    &mut focus,
+                    &mut click,
+                    &mut drag,
+                    Move,
+                    (title.0 + 10.0, title.1),
+                    2.0,
+                );
+                assert_eq!(drag.map(|d| d.is_active()), Some(true), "5 pt: a drag");
+            }
+
+            /// Review I2: Reset Panel Layout with focus on a tab the reset
+            /// removes keeps focus on that panel's new place, not nowhere.
+            #[test]
+            fn reset_panel_layout_keeps_focus_on_the_panel_it_held() {
+                let mut ws = workspace();
+                let mut focus = FocusManager::default();
+                assert!(run(&mut ws, &mut focus, "view.move_layers_next_group"));
+                let Some(layers_tab) = aurora_ui::panel_focus_target(&ws, ws.layers) else {
+                    unreachable!("Layers is grouped");
+                };
+                if let Err(err) = focus.focus(&mut ws.tree, layers_tab) {
+                    unreachable!("{err:?}");
+                }
+                // The reset rebuilds the bar that tab lives in.
+                assert!(run(&mut ws, &mut focus, COMMAND_RESET_PANELS));
+                assert_eq!(shape(&ws), shape(&workspace()));
+                let Some(focused) = focus.focused() else {
+                    unreachable!("focus is kept, not cleared");
+                };
+                assert_eq!(
+                    ws.panel_holding(focused).map(|panel| panel.root),
+                    Some(ws.layers.root),
+                    "on Layers' new place"
+                );
+                assert_eq!(Some(focused), aurora_ui::panel_focus_target(&ws, ws.layers));
+            }
+
+            /// Layout moves are not document state: the command path never
+            /// reaches `run_command`/`History` — `ActivatedCommand::
+            /// MovePanel` is dispatched to `run_panel_move`, whose
+            /// signature takes no document at all. Pinned here: the move
+            /// commands are not shortcuts either.
+            #[test]
+            fn the_move_commands_are_not_document_commands() {
+                let _ = PanelMove::Up;
+                for (id, _, _, _) in PANEL_MOVE_COMMANDS {
+                    assert!(
+                        !id.starts_with("edit.") && !id.starts_with("layer."),
+                        "{id}"
+                    );
+                }
+            }
+        }
+
         mod rail_label_strip {
             use std::collections::HashMap;
 
@@ -70634,7 +71736,7 @@ mod panel_scroll_tests {
                 for (which, want_tab) in [(0_usize, None), (1, Some(0_usize)), (2, Some(1))] {
                     let mut ws = workspace();
                     let mut focus = FocusManager::default();
-                    let group = ws.panel_group.clone();
+                    let group = crate::test_group(&ws);
                     if let Err(err) =
                         aurora_ui::set_panel_group_collapsed(&mut ws.tree, &group, true).and_then(
                             |()| aurora_ui::set_panel_collapsed(&mut ws.tree, ws.layers, true),
@@ -70819,7 +71921,7 @@ mod panel_scroll_tests {
                 }
                 crate::save_workspace_layout(&path, &original);
                 let mut loaded = workspace();
-                crate::load_workspace_layout(&path, &mut loaded);
+                crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
                 assert!(aurora_ui::rail_collapsed(&loaded), "collapsed, as saved");
                 assert_eq!(
                     aurora_ui::rail_width(&loaded.tree, loaded.rail),
@@ -70851,7 +71953,7 @@ mod panel_scroll_tests {
                 if let Err(err) = aurora_ui::set_rail_collapsed(&mut loaded, true) {
                     unreachable!("{err:?}");
                 }
-                crate::load_workspace_layout(&path, &mut loaded);
+                crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
                 assert!(
                     !aurora_ui::rail_collapsed(&loaded),
                     "a 0.164.0 file loads expanded"
@@ -70869,7 +71971,7 @@ mod panel_scroll_tests {
                     history_collapsed: false,
                 })));
                 let mut loaded = workspace();
-                crate::load_workspace_layout(&path, &mut loaded);
+                crate::load_workspace_layout(&path, &mut loaded, &crate::test_layout_scales());
                 assert!(!aurora_ui::rail_collapsed(&loaded));
                 assert_eq!(
                     aurora_ui::rail_width(&loaded.tree, loaded.rail),
@@ -70887,6 +71989,7 @@ mod panel_scroll_tests {
                     history_collapsed: false,
                     panel_group_tab: 0,
                     rail_collapsed: true,
+                    dock: crate::test_saved_dock(0),
                 };
                 let bytes = encode(postcard::to_allocvec(&current));
                 assert_eq!(crate::decode_workspace_layout(&bytes).ok(), Some(current));

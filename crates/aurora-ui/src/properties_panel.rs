@@ -486,7 +486,7 @@ mod tests {
             let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
                 ws.tree.bounds(ws.layers.root),
                 ws.tree.bounds(ws.properties.root),
-                ws.tree.bounds(ws.panel_group.bar),
+                ws.tree.bounds(crate::workspace::test_group(&ws).bar),
             ) else {
                 unreachable!("just laid out");
             };

@@ -11,7 +11,8 @@
 //! [`panel::close_panel`], and [`workspace::set_rail_width`] are the
 //! real interactivity landed so far. See each module's own doc comment
 //! for exactly what's built and what's deliberately still open
-//! (drag-to-redock, floating, persisted layouts, the menubar/toolbar/
+//! (floating panels — drag-to-redock landed in 0.166.0, [`redock`] and
+//! [`dock`] — and the menubar/toolbar/
 //! status bar). [`layers_panel::populate_layers_panel`],
 //! [`history_panel::populate_history_panel`], and
 //! [`properties_panel::populate_properties_panel`] are the "Layers,
@@ -36,6 +37,7 @@
 
 pub mod canvas_view;
 pub mod curves_controls;
+pub mod dock;
 pub mod gallery_panel;
 pub mod history_panel;
 pub mod layer_controls;
@@ -44,6 +46,7 @@ pub mod panel;
 pub mod panel_group;
 pub mod panel_strip;
 pub mod properties_panel;
+pub mod redock;
 pub mod status_bar;
 pub mod tool;
 pub mod tool_controls;
@@ -56,6 +59,7 @@ pub use curves_controls::{
     curves_params, curves_selected_channel, insert_curves_controls, select_curves_channel,
     sync_curves_controls, with_channel_curve,
 };
+pub use dock::{DockArrangement, DockPanel, DockPlacement, DockSlot, DropTarget, PanelMove};
 pub use gallery_panel::{
     GALLERY_CURVE_CAPTION, GalleryPanel, apply_gallery_outcome, gallery_close_popovers,
     gallery_contains, gallery_content_height, gallery_hover, gallery_light_dismiss,
@@ -75,14 +79,20 @@ pub use panel::{
 };
 pub use panel_group::{
     PanelGroup, follow_panel_group_tab, insert_panel_group, is_panel_group_tab,
-    panel_group_contains, panel_group_is_collapsed, panel_group_selected, panel_group_shown,
-    refocus_out_of_hidden, set_panel_group_collapsed, show_panel_group_tab, sync_panel_group,
+    panel_group_contains, panel_group_is_collapsed, panel_group_label, panel_group_selected,
+    panel_group_shown, refocus_out_of_hidden, set_panel_group_collapsed, show_panel_group_tab,
+    sync_panel_group,
 };
 pub use panel_strip::{
     PANEL_SHORT_LABELS, PANEL_STRIP_LABEL, PanelStrip, is_panel_strip_button, panel_short_label,
     panel_strip_shown,
 };
 pub use properties_panel::populate_properties_panel;
+pub use redock::{
+    PANEL_DRAG_THRESHOLD, PanelDrag, apply_dock_arrangement, apply_dock_arrangement_keeping_focus,
+    drop_indicator_rect, drop_target_at, move_workspace_panel, move_workspace_panel_by,
+    panel_drag_source,
+};
 pub use status_bar::{
     STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
     sample_format_text, status_bar_text, sync_status_bar, zoom_text,
@@ -97,8 +107,8 @@ pub use tools_panel::{
     tools_panel_contains,
 };
 pub use workspace::{
-    OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, Workspace, build_workspace,
-    close_workspace_panel, expand_rail_showing, rail_collapsed, rail_width, refocus_workspace,
-    select_panel_tab, set_rail_collapsed, set_rail_width, show_workspace_panel,
-    toggle_rail_collapsed, toggle_workspace_panel,
+    OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RailSlot, Workspace,
+    build_workspace, close_workspace_panel, expand_rail_showing, panel_focus_target,
+    rail_collapsed, rail_width, refocus_workspace, select_panel_tab, set_rail_collapsed,
+    set_rail_width, show_workspace_panel, toggle_rail_collapsed, toggle_workspace_panel,
 };
