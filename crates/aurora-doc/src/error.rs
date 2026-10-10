@@ -24,6 +24,15 @@ pub enum DocError {
     /// not an adjustment layer (0.155.0).
     #[error("layer {0:?} is not an adjustment layer")]
     NotAnAdjustment(LayerId),
+    /// [`crate::LayerTree::set_effects`] was asked to put layer effects
+    /// on an adjustment layer (0.180.0): only pixel layers and groups
+    /// carry them, as in Photoshop.
+    #[error("layer {0:?} is an adjustment layer and cannot have layer effects")]
+    EffectsOnAdjustment(LayerId),
+    /// [`crate::LayerTree::set_effects`] was given effects that fail
+    /// [`aurora_core::LayerEffects::validate`] (0.180.0).
+    #[error("invalid layer effects: {0}")]
+    InvalidEffects(aurora_core::effects::EffectsError),
     /// A group-only blend mode ([`crate::BlendMode::PassThrough`],
     /// 0.179.0) was set on, or decoded for, a layer that is not a group.
     #[error("layer {0:?} is not a group, so it cannot use Pass Through blending")]

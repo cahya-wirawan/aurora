@@ -209,6 +209,8 @@ struct Losses {
     rounded_opacity: usize,
     rounded_density: usize,
     dissolve: usize,
+    /// Layers carrying effects (0.180.0): no `lfx2` is written yet.
+    effects: usize,
     clipped: u64,
     nan: u64,
     /// The written layers add up to more than the reader's
@@ -251,6 +253,12 @@ impl Losses {
                     "layer mask density",
                     "layer mask densities"
                 )
+            ));
+        }
+        if self.effects > 0 {
+            items.push(format!(
+                "{} effects aren't saved to .psd yet (they are kept in .aur).",
+                plural(self.effects as u64, "layer's", "layers'")
             ));
         }
         if self.dissolve > 0 {
@@ -542,6 +550,9 @@ fn census_of(
         }
         if layers.blend_mode(id) == Some(BlendMode::Dissolve) {
             losses.dissolve += 1;
+        }
+        if layers.effects(id).is_some() {
+            losses.effects += 1;
         }
         match layers.kind(id) {
             Some(LayerKind::Group { children }) => {

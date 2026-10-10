@@ -14653,37 +14653,64 @@ fn composite_roots_into_tile(
 #[must_use]
 fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> bool {
     layers.roots().iter().all(|&id| {
+        // 0.180.0: `layer_shows_effects` is deliberately *not* asked here
+        // yet. No path draws effects before E2, so refusing the GPU for a
+        // document with effects would only make it slower for no visual
+        // change; E2 wires the refusal in, alongside the CPU rendering.
         layers.visible(id) != Some(true)
             || curves_layer_qualifies_for_gpu(layers, id)
-            || matches!(
-                (layers.kind(id), layers.blend_mode(id)),
-                (
-                    Some(aurora_doc::LayerKind::Pixel { .. }),
-                    Some(
-                        aurora_doc::BlendMode::Normal
-                            | aurora_doc::BlendMode::Multiply
-                            | aurora_doc::BlendMode::Darken
-                            | aurora_doc::BlendMode::Lighten
-                            | aurora_doc::BlendMode::Screen
-                            | aurora_doc::BlendMode::Difference
-                            | aurora_doc::BlendMode::LinearDodge
-                            | aurora_doc::BlendMode::LinearBurn
-                            | aurora_doc::BlendMode::ColorBurn
-                            | aurora_doc::BlendMode::ColorDodge
-                            | aurora_doc::BlendMode::Overlay
-                            | aurora_doc::BlendMode::HardLight
-                            | aurora_doc::BlendMode::LinearLight
-                            | aurora_doc::BlendMode::VividLight
-                            | aurora_doc::BlendMode::HardMix
-                            | aurora_doc::BlendMode::PinLight
-                            | aurora_doc::BlendMode::SoftLight
-                            | aurora_doc::BlendMode::Subtract
-                            | aurora_doc::BlendMode::Divide
-                            | aurora_doc::BlendMode::Dissolve
-                    ) | None
-                )
-            )
+            || pixel_layer_mode_qualifies_for_gpu(layers, id)
     })
+}
+
+/// Whether `id` has a layer effect Photoshop would draw (master switch,
+/// `present` and `enab` all on) — what will refuse the GPU fast path
+/// once E2 renders effects. Not wired into
+/// [`document_qualifies_for_gpu_compositing`] in 0.180.0 (see there), so
+/// only its own test calls it until then.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
+fn layer_shows_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    layers
+        .effects(id)
+        .is_some_and(aurora_core::LayerEffects::shows_any)
+}
+
+/// The per-mode half of [`document_qualifies_for_gpu_compositing`]: a
+/// pixel layer at `Normal`, `Dissolve` or one of the GPU blend modes.
+#[must_use]
+fn pixel_layer_mode_qualifies_for_gpu(
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+) -> bool {
+    matches!(
+        (layers.kind(id), layers.blend_mode(id)),
+        (
+            Some(aurora_doc::LayerKind::Pixel { .. }),
+            Some(
+                aurora_doc::BlendMode::Normal
+                    | aurora_doc::BlendMode::Multiply
+                    | aurora_doc::BlendMode::Darken
+                    | aurora_doc::BlendMode::Lighten
+                    | aurora_doc::BlendMode::Screen
+                    | aurora_doc::BlendMode::Difference
+                    | aurora_doc::BlendMode::LinearDodge
+                    | aurora_doc::BlendMode::LinearBurn
+                    | aurora_doc::BlendMode::ColorBurn
+                    | aurora_doc::BlendMode::ColorDodge
+                    | aurora_doc::BlendMode::Overlay
+                    | aurora_doc::BlendMode::HardLight
+                    | aurora_doc::BlendMode::LinearLight
+                    | aurora_doc::BlendMode::VividLight
+                    | aurora_doc::BlendMode::HardMix
+                    | aurora_doc::BlendMode::PinLight
+                    | aurora_doc::BlendMode::SoftLight
+                    | aurora_doc::BlendMode::Subtract
+                    | aurora_doc::BlendMode::Divide
+                    | aurora_doc::BlendMode::Dissolve
+            ) | None
+        )
+    )
 }
 
 /// Whether root `id` is a Curves adjustment layer the GPU Curves pass
@@ -76973,5 +77000,51 @@ mod panel_scroll_tests {
             }),
             crate::DialogEffect::Unknown
         );
+    }
+}
+
+#[cfg(test)]
+mod effects_gpu_predicate_tests {
+    /// 0.180.0: `layer_shows_effects` sees an effect that would draw and
+    /// not a turned-off one; and, until E2 renders effects, a document
+    /// with visible effects still takes the GPU path (no refusal yet).
+    #[test]
+    fn layer_shows_effects_gates_and_the_gpu_path_is_unchanged_in_e1() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(super::document_qualifies_for_gpu_compositing(&layers));
+        let mut fx = aurora_core::LayerEffects::default();
+        fx.drop_shadows
+            .push(aurora_core::effects::DropShadow::default());
+        assert!(!super::layer_shows_effects(&layers, id), "no effects");
+        if let Err(err) = layers.set_effects(id, Some(fx.clone())) {
+            unreachable!("{err:?}");
+        }
+        assert!(super::layer_shows_effects(&layers, id));
+        // E1: nothing draws effects, so the document keeps the GPU path.
+        assert!(super::document_qualifies_for_gpu_compositing(&layers));
+        fx.enabled = false;
+        if let Err(err) = layers.set_effects(id, Some(fx.clone())) {
+            unreachable!("{err:?}");
+        }
+        assert!(!super::layer_shows_effects(&layers, id), "master off");
+        fx.enabled = true;
+        if let Some(shadow) = fx.drop_shadows.first_mut() {
+            shadow.gate.enabled = false;
+        }
+        if let Err(err) = layers.set_effects(id, Some(fx)) {
+            unreachable!("{err:?}");
+        }
+        assert!(!super::layer_shows_effects(&layers, id), "enab off");
+        assert!(super::document_qualifies_for_gpu_compositing(&layers));
     }
 }

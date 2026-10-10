@@ -2211,6 +2211,39 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's effects (0.180.0), or `None` when it has none or
+    /// `id` does not exist.
+    #[must_use]
+    pub fn effects(&self, id: LayerId) -> Option<&aurora_core::LayerEffects> {
+        self.layers.get(&id)?.effects.as_deref()
+    }
+
+    /// Replaces the layer's effects (0.180.0); `None` removes them.
+    /// Effects are data only (invariant §7.3.2): nothing is baked.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::EffectsOnAdjustment`] if it is an adjustment layer;
+    /// [`DocError::InvalidEffects`] if `effects` fails
+    /// [`aurora_core::LayerEffects::validate`]. Nothing is changed when
+    /// any happens.
+    pub fn set_effects(
+        &mut self,
+        id: LayerId,
+        effects: Option<aurora_core::LayerEffects>,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if matches!(entry.kind, LayerKind::Adjustment(_)) {
+            return Err(DocError::EffectsOnAdjustment(id));
+        }
+        if let Some(effects) = &effects {
+            effects.validate().map_err(DocError::InvalidEffects)?;
+        }
+        entry.effects = effects.map(Box::new);
+        Ok(())
+    }
+
     /// Sets the mask's [`LayerMask::density`] (0.149.0).
     ///
     /// # Errors

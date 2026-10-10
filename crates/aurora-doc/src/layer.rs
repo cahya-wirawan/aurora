@@ -366,6 +366,44 @@ fn full_mask_density() -> f32 {
     FULL_MASK_DENSITY
 }
 
+impl From<aurora_core::effects::EffectBlendMode> for BlendMode {
+    /// An effect's blend mode as a layer blend mode (0.180.0): the same
+    /// 27 modes, by name. Exhaustive, so a new mode on either side fails
+    /// to compile here rather than mapping silently.
+    fn from(mode: aurora_core::effects::EffectBlendMode) -> Self {
+        use aurora_core::effects::EffectBlendMode as E;
+        match mode {
+            E::Normal => Self::Normal,
+            E::Dissolve => Self::Dissolve,
+            E::Darken => Self::Darken,
+            E::Multiply => Self::Multiply,
+            E::ColorBurn => Self::ColorBurn,
+            E::LinearBurn => Self::LinearBurn,
+            E::DarkerColor => Self::DarkerColor,
+            E::Lighten => Self::Lighten,
+            E::Screen => Self::Screen,
+            E::ColorDodge => Self::ColorDodge,
+            E::LinearDodge => Self::LinearDodge,
+            E::LighterColor => Self::LighterColor,
+            E::Overlay => Self::Overlay,
+            E::SoftLight => Self::SoftLight,
+            E::HardLight => Self::HardLight,
+            E::VividLight => Self::VividLight,
+            E::LinearLight => Self::LinearLight,
+            E::PinLight => Self::PinLight,
+            E::HardMix => Self::HardMix,
+            E::Difference => Self::Difference,
+            E::Exclusion => Self::Exclusion,
+            E::Subtract => Self::Subtract,
+            E::Divide => Self::Divide,
+            E::Hue => Self::Hue,
+            E::Saturation => Self::Saturation,
+            E::Color => Self::Color,
+            E::Luminosity => Self::Luminosity,
+        }
+    }
+}
+
 /// One layer's bookkeeping: identity data plus its position in the tree.
 ///
 /// `Clone`: needed by [`crate::tree::RemovedSubtree`]'s own `Clone` impl,
@@ -381,6 +419,15 @@ pub(crate) struct LayerEntry {
     pub(crate) visible: bool,
     pub(crate) lock: LayerLock,
     pub(crate) mask: Option<LayerMask>,
+    /// The layer's effects (0.180.0), on a pixel layer or a group only.
+    /// `#[serde(skip)]` for exactly [`LayerMask::density`]'s reason:
+    /// `LayerEntry` is positional `postcard` inside the `.aur` manifest
+    /// and the journal, so the effects travel separately — as `.aur`'s
+    /// optional `layer-effects` entry, and as the `LayerOp::SetEffects`
+    /// [`crate::History::save_journal`] emits after a journaled `Restore`
+    /// of a subtree that carries some.
+    #[serde(skip)]
+    pub(crate) effects: Option<Box<aurora_core::LayerEffects>>,
 }
 
 impl LayerEntry {
@@ -395,12 +442,29 @@ impl LayerEntry {
             visible: true,
             lock: LayerLock::default(),
             mask: None,
+            effects: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_effect_blend_mode_maps_to_the_layer_mode_of_the_same_position() {
+        // Same declaration order on both sides, PassThrough (doc only)
+        // appended last: the postcard ordinals agree too.
+        for (index, mode) in aurora_core::effects::EffectBlendMode::ALL
+            .iter()
+            .enumerate()
+        {
+            let layer = super::BlendMode::from(*mode);
+            let a = postcard::to_allocvec(mode).unwrap_or_default();
+            let b = postcard::to_allocvec(&layer).unwrap_or_default();
+            assert_eq!(a, b, "{index} {mode:?}");
+            assert_ne!(layer, super::BlendMode::PassThrough);
+        }
+    }
 
     /// The pre-0.149.0 wire shape of [`super::LayerMask`], field for field.
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
