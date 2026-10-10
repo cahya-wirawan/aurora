@@ -78,6 +78,23 @@ every id before moving anything. Full gate green on the RTX 3090
 **Not verified:** interactive drag feel on real hardware, VoiceOver.
 Details: "Next action", addendum 0.166.0.
 
+**Previously (2026-10-10, 0.165.2): a load-stress sweep, and the one flaky
+test it found.** The whole workspace suite (`AURORA_REQUIRE_GPU=1`, RTX
+3090) was run 10 times under 12 competing CPU-bound processes to flush out
+timing-dependent tests before CI does. Exactly one test failed, twice in
+10 runs:
+`aurora-tile`'s `scratch::tests::the_canonical_lock_file_is_never_visible_before_it_is_locked`,
+on its own "the pollers never saw the lock file at all" sanity assertion,
+never on a real violation. Cause: under load the poller threads may not
+be scheduled before `take_lock` returns, and the test stopped them
+straight away. It now keeps them running, after the lock is taken and
+before it is released, until one has probed the held lock (bounded at
+5 s, so a poller that never runs still fails the assertion instead of
+hanging). The race detector itself is unchanged. `aurora-tile`'s lib
+tests, re-run 40 times under the same load: 40/40 green. Test-only; no
+product code changed. Every other test passed all 10 loaded runs.
+Branch `003-flaky_test_sweep`.
+
 **Previously (2026-10-10, 0.165.1): a second CI test race fixed.** GitHub
 Actions' Ubuntu run failed in
 `store::insert_encoded_tests::an_inserted_tile_reads_from_pending_before_its_write_lands`
