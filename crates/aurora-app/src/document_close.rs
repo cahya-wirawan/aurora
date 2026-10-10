@@ -149,12 +149,18 @@ pub(crate) fn open_exported_not_saved_dialog(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialogSave {
     Aur,
+    /// `.psd`/`.psb` (0.177.0): a save only when lossless (an empty
+    /// report); otherwise the document stays unsaved and the close or
+    /// quit does not go ahead.
+    Psd,
     ExportOnly,
 }
 
 pub(crate) fn dialog_save_kind(path: &std::path::Path) -> DialogSave {
     if crate::is_aur_path(path) {
         DialogSave::Aur
+    } else if crate::psd_save::is_psd_save_path(path) || crate::psd_save::is_psb_save_path(path) {
+        DialogSave::Psd
     } else {
         DialogSave::ExportOnly
     }
@@ -222,6 +228,7 @@ pub(crate) fn final_autosave_unsaved(
             session.canvas_size,
             &mut session.skipped_tiles,
             store,
+            session.import_losses.as_deref(),
         );
         let after = modified(&path);
         session.park_autosave = None;
@@ -315,12 +322,15 @@ pub(crate) fn retire_session(
         .map_or(0, aurora_tile::TileStore::discard)
 }
 
-/// Records a save's outcome on `doc` (0.174.0): only a landed `.aur`
-/// save makes the document clean and gives it this path and name; an
-/// export (any other extension) or a failed save changes nothing.
-/// Returns whether the document is now saved.
+/// Records a save's outcome on `doc` (0.174.0): a landed `.aur` save —
+/// or, since 0.177.0, a landed *lossless* `.psd` save (design-owner
+/// decision 2026-10-10; the caller passes `landed` only for an empty
+/// report, `psd_save::record_psd_save`) — makes the document clean and
+/// gives it this path and name; an export (any other extension) or a
+/// failed save changes nothing. Returns whether the document is now
+/// saved.
 pub(crate) fn after_save(doc: &mut DocumentSession, path: &std::path::Path, landed: bool) -> bool {
-    if !(landed && crate::is_aur_path(path)) {
+    if !(landed && (crate::is_aur_path(path) || crate::psd_save::is_psd_save_path(path))) {
         return false;
     }
     doc.mark_clean();

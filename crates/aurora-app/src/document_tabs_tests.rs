@@ -625,6 +625,7 @@ fn every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
         );
     }
     let b_id = rig.doc.id;
@@ -644,6 +645,7 @@ fn every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
         );
     }
     assert!(document_tabs::sync_autosave_sessions(
@@ -693,6 +695,7 @@ fn a_crashed_two_document_run_is_recovered_as_two_sessions() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
         );
         assert!(path.exists());
         paths.push(path);
@@ -985,6 +988,7 @@ fn a_parked_document_is_autosaved_with_its_edits() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
         );
     }
     assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
@@ -1985,6 +1989,7 @@ fn a_close_activates_the_neighbour_and_removes_the_store_and_autosave() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
         );
     }
     assert!(worker.wait_idle(std::time::Duration::from_secs(20)));

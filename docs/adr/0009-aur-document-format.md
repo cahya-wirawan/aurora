@@ -32,6 +32,14 @@ PRD §8.1's own technology table already narrowed the *serialization* half of th
 
 **`postcard` over `rkyv`** for the metadata entries: `rkyv`'s zero-copy design ties its wire format to Rust's own in-memory type layout, in direct tension with §14's "specified and freely implementable" goal, and its real selling point — avoiding a deserialization pass over huge data — doesn't apply here, since the actual huge data (pixels) is handled separately by `aurora_tile::codec`, not by whatever serializes the comparatively small `LayerTree`/`History` structs. `postcard`'s simple, documented, `no_std`-friendly wire format is the better fit for something meant to be independently implementable.
 
+### Optional entries added since (append-only)
+
+Each is written only when it has something to say, so an ordinary save stays byte-identical to the previous version's; a file without it decodes exactly as before; and an older Aurora skips it as an unknown entry (the forward rule above).
+
+- `skipped-tiles` — tiles a best-effort writer could not read.
+- `mask-density` (0.149.0) — masks below full density, `postcard`, version first.
+- `import-losses` (0.177.0) — the lines of a PSD's "Opened With Changes" report for a document opened from another file, `postcard` `{ version: 1, lines }`, so a later Photoshop save of the document still lists what its open dropped after a `.aur` save or a crash recovery. Read as untrusted data: at most 256 lines of at most 1,024 characters, control and text-direction characters dropped (the layer-name rule), and any decode problem — an oversized, damaged, empty or unknown-version entry — reads as one generic line ("This document was opened with changes from another file."), never as none, so it errs towards asking. **Known limit (0.177.0 review, L-5):** an Aurora older than 0.177.0 that opens and re-saves such a file drops the entry, so a later PSD save from 0.177.0+ over the original would not list those losses. That needs a deliberate downgrade, and older versions cannot write PSDs themselves.
+
 ## Alternatives considered
 
 **A hand-rolled binary chunk container** (RIFF/PNG-style: magic + version + a flat sequence of length-prefixed, typed chunks), the same shape `aurora_tile::codec` already uses one level down. Rejected in favour of ZIP specifically because ZIP already *is* that shape (a central directory is a chunk index), plus it comes with ubiquitous, battle-tested tooling in every ecosystem — a user can inspect a `.aur` file's contents with a file manager they already have, a real, tangible instance of "open format" a bespoke container wouldn't provide for free. Reinventing chunk framing, a table of contents, and a parser for it would be real, avoidable engineering effort duplicating what ZIP readers already do correctly.

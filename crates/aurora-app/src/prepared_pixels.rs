@@ -787,6 +787,7 @@ mod tests {
             &mut aurora_io::SkippedTiles::new(),
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             store,
+            None,
         ) {
             crate::SnapshotOutcome::Taken(job) => job,
             other => unreachable!("{other:?}"),

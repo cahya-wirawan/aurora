@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 from psd_tools import PSDImage
-from psd_tools.constants import Tag
+from psd_tools.constants import Resource, Tag
 
 TOLERANCE = 1.0 / 65535.0 + 1e-9
 
@@ -77,6 +77,24 @@ def main():
     check("depth", psd.depth, 16)
     check("channels", psd.channels, 4)
     check("colour mode", int(psd.color_mode), 3)
+
+    # 0.177.0: the sRGB ICC profile as image resource 1039.
+    icc = psd.image_resources.get_data(Resource.ICC_PROFILE)
+    if not icc:
+        fail("no ICC profile resource (1039)")
+    check("ICC size field", int.from_bytes(icc[0:4], "big"), len(icc))
+    check("ICC signature", icc[36:40], b"acsp")
+    check("ICC colour space", icc[16:20], b"RGB ")
+    if b"s\x00R\x00G\x00B" not in icc and b"sRGB" not in icc:
+        fail("ICC profile does not name sRGB")
+    try:
+        import io
+        from PIL import ImageCms
+
+        name = ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(io.BytesIO(icc)))
+        print(f"ICC profile parsed by Pillow/LittleCMS: {name.strip()!r}")
+    except ImportError:
+        print("Pillow's ImageCms is not installed; ICC header checked by hand only")
 
     layers = list(psd)  # psd-tools lists the top level bottom-to-top
     check("layer count", len(layers), len(spec["layers"]))

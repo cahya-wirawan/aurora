@@ -48,19 +48,39 @@ impl IccProfile {
         self.inner.icc().map_err(ColorError::SerializeFailed)
     }
 
-    /// Whether this profile is *exactly* the built-in [`Self::srgb`]
-    /// profile — deliberately narrow: a byte-exact match of
-    /// [`Self::to_bytes`] output against `Self::srgb().to_bytes()`,
-    /// confirmed deterministic (two independent `Self::srgb()`
-    /// instances re-serialize to identical bytes — `lcms2`'s built-in
-    /// sRGB definition carries no per-instance timestamp/ID the way a
-    /// freshly-authored profile might), not any attempt at real
-    /// colorimetric equivalence between differently-encoded sRGB-ish
-    /// profiles. A file carrying some *other* sRGB-labeled ICC profile
-    /// with different bytes correctly returns `false` here — Aurora
-    /// can't cheaply prove that's colorimetrically identical, so it
-    /// gets full profile treatment rather than being silently
-    /// reclassified.
+    /// The built-in sRGB profile's serialised bytes, made once per
+    /// process and reused (0.177.0 review M-2). `lcms2` stamps the current
+    /// date and time (and may compute a profile ID) into every
+    /// serialisation's header, so two calls a second apart differ in
+    /// those bytes; a caller that writes the bytes and later checks them
+    /// (the PSD writer and its verifier) needs one stable copy.
+    ///
+    /// # Errors
+    ///
+    /// [`ColorError::SerializeFailed`] if `lcms2` cannot serialise it.
+    pub fn srgb_bytes() -> Result<Vec<u8>, ColorError> {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        if let Some(bytes) = BYTES.get() {
+            return Ok(bytes.clone());
+        }
+        let made = Self::srgb().to_bytes()?;
+        Ok(BYTES.get_or_init(|| made).clone())
+    }
+
+    /// Whether this profile is the built-in [`Self::srgb`] profile:
+    /// its [`Self::to_bytes`] equal [`Self::srgb_bytes`] in every byte
+    /// but the ones `lcms2` stamps per serialisation — the header's
+    /// creation date and time (bytes 24..36) and profile ID (84..100)
+    /// ([`icc_bytes_match_ignoring_stamps`]). Deliberately narrow: no
+    /// attempt at colorimetric equivalence, so some *other* sRGB-labelled
+    /// profile with different bytes is `false` and gets full profile
+    /// treatment.
+    ///
+    /// Until 0.177.0 this compared the raw bytes and claimed that was
+    /// deterministic; it was not — the stamped date made it `false`
+    /// whenever the two serialisations straddled a second, which could
+    /// make a PNG export embed an `iCCP` profile instead of its `sRGB`
+    /// chunk.
     ///
     /// Exists here rather than in a format crate (e.g. `aurora-io`)
     /// because it's a colour-domain concept: any format with its own
@@ -73,13 +93,64 @@ impl IccProfile {
     /// Returns [`ColorError::SerializeFailed`] if either profile fails
     /// to serialize via [`Self::to_bytes`].
     pub fn is_exactly_srgb(&self) -> Result<bool, ColorError> {
-        Ok(self.to_bytes()? == Self::srgb().to_bytes()?)
+        Ok(icc_bytes_match_ignoring_stamps(
+            &self.to_bytes()?,
+            &Self::srgb_bytes()?,
+        ))
     }
+}
+
+/// The ICC header ranges a serialiser stamps: the creation date and time
+/// (24..36) and the profile ID, an MD5 of the profile (84..100).
+const STAMPED: [std::ops::Range<usize>; 2] = [24..36, 84..100];
+
+/// Whether two serialised ICC profiles are the same profile: equal
+/// length and equal bytes everywhere outside the header's creation date
+/// and time and profile ID (0.177.0 review M-2).
+#[must_use]
+pub fn icc_bytes_match_ignoring_stamps(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .enumerate()
+            .all(|(i, (x, y))| x == y || STAMPED.iter().any(|r| r.contains(&i)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::IccProfile;
+    use super::{IccProfile, icc_bytes_match_ignoring_stamps};
+
+    #[test]
+    fn is_exactly_srgb_ignores_a_different_creation_stamp() {
+        let Ok(bytes) = IccProfile::srgb().to_bytes() else {
+            unreachable!("serialises")
+        };
+        // Another moment's serialisation: a different date and time, and
+        // a different profile ID.
+        let mut later = bytes.clone();
+        for i in (24..36).chain(84..100) {
+            if let Some(b) = later.get_mut(i) {
+                *b = b.wrapping_add(1);
+            }
+        }
+        assert!(icc_bytes_match_ignoring_stamps(&bytes, &later));
+        let Ok(parsed) = IccProfile::from_bytes(&later) else {
+            unreachable!("still a valid profile")
+        };
+        assert!(matches!(parsed.is_exactly_srgb(), Ok(true)));
+        // Any byte outside the stamps still counts.
+        let mut other = bytes.clone();
+        if let Some(b) = other.get_mut(40) {
+            *b = b.wrapping_add(1);
+        }
+        assert!(!icc_bytes_match_ignoring_stamps(&bytes, &other));
+        assert!(!icc_bytes_match_ignoring_stamps(
+            &bytes,
+            bytes.get(..bytes.len() - 1).unwrap_or_default()
+        ));
+        // The cached bytes are stable within the process.
+        assert_eq!(IccProfile::srgb_bytes().ok(), IccProfile::srgb_bytes().ok());
+    }
 
     // CC0-licensed, from the colord-data Debian package -- see
     // corpora/icc/README.md for full provenance.

@@ -141,10 +141,19 @@ fn byte(bytes: &[u8], at: usize) -> u8 {
         .unwrap_or_else(|| unreachable!("short file"))
 }
 
-/// Offset of the first layer record: header 26, colour data 4,
-/// resources 4, section length 4, layer info length 4, global mask 4,
-/// `8BIM` `Lr16` and its length 12, layer count 2.
-const FIRST_RECORD: usize = 26 + 4 + 4 + 4 + 4 + 4 + 12 + 2;
+/// Offset of the layer-and-mask section's length: header 26, colour data
+/// 4, then the image resources (0.177.0: the sRGB ICC profile) behind
+/// their own 4-byte length.
+fn section_at(bytes: &[u8]) -> usize {
+    26 + 4 + 4 + be32(bytes, 30) as usize
+}
+
+/// Offset of the first layer record: the section length 4, layer info
+/// length 4, global mask 4, `8BIM` `Lr16` and its length 12, layer
+/// count 2.
+fn first_record(bytes: &[u8]) -> usize {
+    section_at(bytes) + 4 + 4 + 4 + 12 + 2
+}
 
 /// One parsed record: (rect, [(id, len)], key, opacity, flags, extra
 /// start, extra len), and where the next one starts.
@@ -288,7 +297,7 @@ fn hidden_layer_sets_flag_bit_1() {
         let id = doc.layer("L", rect(0, 0, 4, 4), None);
         ok(doc.tree.set_visible(id, visible));
         let (bytes, _) = ok(doc.write());
-        let record = parse_record(&bytes, FIRST_RECORD);
+        let record = parse_record(&bytes, first_record(&bytes));
         assert_eq!(record.flags & 0x02 != 0, !visible);
         assert_eq!(record.flags & !0x02, 0);
     }
@@ -300,7 +309,7 @@ fn unicode_name_writes_luni_and_ascii_pascal() {
     let mut doc = Doc::new((4, 4));
     doc.layer(name, rect(0, 0, 4, 4), None);
     let (bytes, _) = ok(doc.write());
-    let record = parse_record(&bytes, FIRST_RECORD);
+    let record = parse_record(&bytes, first_record(&bytes));
     // Mask length and blending-ranges length, both 0, then the name.
     let pascal_at = record.extra_at + 8;
     let len = usize::from(byte(&bytes, pascal_at));
@@ -351,7 +360,7 @@ fn long_names_are_shortened_and_itemised() {
 /// Walks every channel of every record (bottom-to-top) and returns, per
 /// channel, `(declared length, compression, row counts, data start)`.
 fn channel_layout(bytes: &[u8], layers: usize) -> Vec<(u32, u16, Vec<u16>, usize, usize)> {
-    let mut at = FIRST_RECORD;
+    let mut at = first_record(bytes);
     let mut records = Vec::new();
     for _ in 0..layers {
         let r = parse_record(bytes, at);
@@ -489,8 +498,8 @@ fn merged_image_is_planar_white_matted_and_reads_back() {
     });
     doc.layer("A", rect(0, 0, 3, 2), None);
     let (bytes, _) = ok(doc.write());
-    let section = be32(&bytes, 34) as usize;
-    let merged = 38 + section;
+    let section = be32(&bytes, section_at(&bytes)) as usize;
+    let merged = section_at(&bytes) + 4 + section;
     assert_eq!(be16(&bytes, merged), 1);
     let mut at = merged + 2 + 2 * 8;
     let mut planes = Vec::new();
@@ -587,6 +596,7 @@ fn writer_matches_test_writer_bytes_for_a_two_layer_file() {
             f.layers = vec![back, front];
             f.merged = Some(planes);
             f.merged_compression = 1;
+            f.resources = ok(super::write::icc_resource());
         })
         .write();
     assert_eq!(bytes.len(), oracle.len());
@@ -691,8 +701,9 @@ fn lr16_block_is_padded_to_4_outside_its_length() {
         let px = image(5, 3, |x, y| [level(x), level(y), level(x + y), 1.0]);
         doc.layer(name, rect(0, 0, 5, 3), Some((&px, 0, 0)));
         let (bytes, _) = ok(doc.write());
-        let section = be32(&bytes, 34) as usize;
-        let lr16 = be32(&bytes, 34 + 4 + 4 + 4 + 8) as usize;
+        let at = section_at(&bytes);
+        let section = be32(&bytes, at) as usize;
+        let lr16 = be32(&bytes, at + 4 + 4 + 4 + 8) as usize;
         assert_eq!(section % 4, 0, "{name}");
         // Section: layer info length, global mask length, `8BIM` `Lr16`
         // and its length, then the block and its padding.
@@ -721,21 +732,25 @@ fn big_endian_fields_are_big_endian() {
     assert_eq!(bytes.get(22..24), Some(&[0, 16][..]));
     assert_eq!(bytes.get(24..26), Some(&[0, 3][..]));
     assert_eq!(
-        bytes.get(FIRST_RECORD - 2..FIRST_RECORD),
+        bytes.get(first_record(&bytes) - 2..first_record(&bytes)),
         Some(&[0xFF, 0xFF][..])
     );
-    let record = parse_record(&bytes, FIRST_RECORD);
+    let record = parse_record(&bytes, first_record(&bytes));
     // One tile occupied: the extent is that tile's part of the bounds.
     assert_eq!(record.rect, [1, -0x0203, 3, -0x0203 + 256]);
     assert_eq!(
-        bytes.get(FIRST_RECORD + 4..FIRST_RECORD + 8),
+        bytes.get(first_record(&bytes) + 4..first_record(&bytes) + 8),
         Some(&[0xFF, 0xFF, 0xFD, 0xFD][..])
     );
-    assert_eq!(byte(&bytes, FIRST_RECORD + 18 + 24 + 8), 128, "opacity");
+    assert_eq!(
+        byte(&bytes, first_record(&bytes) + 18 + 24 + 8),
+        128,
+        "opacity"
+    );
     // Every channel id is a big-endian i16: -1 is FF FF.
     assert_eq!(record.channels.first().map(|c| c.0), Some(-1));
     assert_eq!(
-        bytes.get(FIRST_RECORD + 18..FIRST_RECORD + 20),
+        bytes.get(first_record(&bytes) + 18..first_record(&bytes) + 20),
         Some(&[0xFF, 0xFF][..])
     );
 }
@@ -795,7 +810,7 @@ fn streaming_writer_is_correct_across_several_tiles_per_side() {
     }
     let (bytes, outcome) = ok(doc.write());
     // The extent is the occupied tiles' union: the whole bounds here.
-    let record = parse_record(&bytes, FIRST_RECORD);
+    let record = parse_record(&bytes, first_record(&bytes));
     assert_eq!(record.rect, [11, -37, 11 + 600, -37 + 700]);
     let back = read_back(&bytes);
     let Some(p) = back.pixels.first() else {
@@ -841,7 +856,7 @@ fn extent_is_the_occupied_tiles_not_the_bounds() {
         300,
     ));
     let (bytes, _) = ok(doc.write());
-    let record = parse_record(&bytes, FIRST_RECORD);
+    let record = parse_record(&bytes, first_record(&bytes));
     assert_eq!(record.rect, [256, 512, 512, 768]);
 }
 
@@ -1263,7 +1278,10 @@ fn a_psd_reaching_the_size_limit_is_refused_with_a_psb_hint() {
         &mut source,
         &mut doc.store,
         PsdSaveOptions::default(),
-        1_000,
+        super::write::WriteLimits {
+            max_bytes: 5_000,
+            ..Default::default()
+        },
     );
     let Err(err) = result else {
         unreachable!("over the limit")
@@ -1311,4 +1329,192 @@ fn replace_verified_keeps_0o664_exactly_whatever_the_umask() {
     ok(save(&mut doc, &target, false));
     let mode = ok(std::fs::metadata(&target)).permissions().mode() & 0o777;
     assert_eq!(mode, 0o664);
+}
+
+// ---------------------------------------------------------------------
+// 0.177.0: ICC, round-trip budget, verify skip, early size refusal,
+// symbolic links
+// ---------------------------------------------------------------------
+
+#[test]
+fn icc_resource_is_srgb_and_reader_still_tags_srgb() {
+    let mut doc = flat_doc();
+    let (bytes, outcome) = ok(doc.write());
+    // Resource 1039 is the first and only resource, holding a full ICC
+    // profile that parses and is byte-for-byte the built-in sRGB one.
+    let len = be32(&bytes, 30) as usize;
+    let res = bytes_at(&bytes, 34, len);
+    assert_eq!(res.get(..4), Some(&b"8BIM"[..]));
+    assert_eq!(be16(res, 4), 1039);
+    let size = be32(res, 8) as usize;
+    let profile = bytes_at(res, 12, size);
+    // lcms2's built-in sRGB, apart from the creation date and time its
+    // serialiser stamps into header bytes 24..36.
+    let srgb = ok(IccProfile::srgb().to_bytes());
+    assert_eq!(profile.len(), srgb.len());
+    let unstamped = |p: &[u8]| -> Vec<u8> {
+        p.iter()
+            .enumerate()
+            .filter(|(i, _)| !(24..36).contains(i))
+            .map(|(_, b)| *b)
+            .collect()
+    };
+    assert_eq!(unstamped(profile), unstamped(&srgb));
+    assert_eq!(be32(profile, 0) as usize, size, "ICC header size field");
+    assert_eq!(profile.get(36..40), Some(&b"acsp"[..]), "ICC signature");
+    assert_eq!(profile.get(16..20), Some(&b"RGB "[..]), "colour space");
+    ok(IccProfile::from_bytes(profile));
+    // The reader opens it as sRGB with nothing reported.
+    let back = read_back(&bytes);
+    assert!(back.report.is_empty(), "{:?}", back.report);
+    // (The reader tags every layer with `IccProfile::srgb()` and reports
+    // a profile that does not name sRGB; the empty report is that check.)
+    assert!(!back.pixels.is_empty());
+    assert!(outcome.report.is_empty());
+}
+
+#[test]
+fn a_file_aurora_cannot_reopen_is_itemised() {
+    let mut doc = flat_doc();
+    let mut out = Cursor::new(Vec::new());
+    let mut source = &doc.composite;
+    let outcome = ok(super::write::write_psd_limited(
+        &mut out,
+        &doc.tree,
+        doc.canvas,
+        &mut source,
+        &mut doc.store,
+        PsdSaveOptions::default(),
+        super::write::WriteLimits {
+            reopen_budget: 16 * 16 - 1,
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        outcome.report.items,
+        [
+            "Aurora can't reopen this file yet: its layers add up to more than 268,435,456 \
+          pixels. Photoshop can open it."
+        ]
+    );
+    // At the real budget the same document reports nothing.
+    assert!(ok(doc.write()).1.report.is_empty());
+}
+
+#[test]
+fn verify_skips_the_reader_pass_past_its_budget() {
+    let mut doc = flat_doc();
+    let (bytes, outcome) = ok(doc.write());
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("v.psd");
+    ok(std::fs::write(&path, &bytes));
+    let mut bad = outcome.expected.clone();
+    if let Some(l) = bad.layers.first_mut() {
+        l.decoded_hash ^= 1;
+    }
+    // Within the budget the reader pass runs and sees the difference...
+    assert!(super::write::verify_psd_file_with_budget(&path, &bad, 16 * 16).is_err());
+    // ...past it only the raw pass runs, which does not look at it.
+    ok(super::write::verify_psd_file_with_budget(
+        &path,
+        &bad,
+        16 * 16 - 1,
+    ));
+    // The raw pass still catches a raw difference past the budget.
+    let mut raw_bad = outcome.expected;
+    if let Some(l) = raw_bad.layers.first_mut() {
+        l.sample_hash ^= 1;
+    }
+    assert!(super::write::verify_psd_file_with_budget(&path, &raw_bad, 0).is_err());
+}
+
+#[test]
+fn a_psd_that_cannot_fit_is_refused_before_a_byte_is_written() {
+    let mut doc = Doc::new((64, 64));
+    let px = image(64, 64, |x, y| [level(x), level(y), 0.5, 1.0]);
+    doc.layer("A", rect(0, 0, 64, 64), Some((&px, 0, 0)));
+    let mut out = Cursor::new(Vec::new());
+    let mut source = &doc.composite;
+    let result = super::write::write_psd_limited(
+        &mut out,
+        &doc.tree,
+        doc.canvas,
+        &mut source,
+        &mut doc.store,
+        PsdSaveOptions::default(),
+        super::write::WriteLimits {
+            // Below even PackBits' best case for these rows.
+            max_bytes: 2_000,
+            ..Default::default()
+        },
+    );
+    let Err(err) = result else {
+        unreachable!("refused")
+    };
+    assert!(err.to_string().contains("use .psb"), "{err}");
+    assert!(out.into_inner().is_empty(), "nothing written");
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_through_a_symlink_replaces_the_real_file_and_keeps_the_link() {
+    let dir = ok(tempfile::tempdir());
+    let real_dir = dir.path().join("real");
+    ok(std::fs::create_dir(&real_dir));
+    let real = real_dir.join("art.psd");
+    ok(std::fs::write(&real, b"old"));
+    let link = dir.path().join("link.psd");
+    ok(std::os::unix::fs::symlink(&real, &link));
+    let mut doc = flat_doc();
+    let outcome = ok(save(&mut doc, &link, false));
+    assert!(
+        ok(std::fs::symlink_metadata(&link))
+            .file_type()
+            .is_symlink()
+    );
+    ok(verify_psd_file(&real, &outcome.expected));
+    assert_eq!(
+        dir_listing(&real_dir),
+        ["art.psd"],
+        "temp beside the real file, gone"
+    );
+    // A dangling link is refused, and nothing is created.
+    let dangling = dir.path().join("dangling.psd");
+    ok(std::os::unix::fs::symlink(
+        dir.path().join("missing.psd"),
+        &dangling,
+    ));
+    let mut doc = flat_doc();
+    assert!(save(&mut doc, &dangling, false).is_err());
+    assert!(!dir.path().join("missing.psd").exists());
+}
+
+#[test]
+fn write_verified_temp_touches_nothing_until_persist() {
+    let dir = ok(tempfile::tempdir());
+    let target = dir.path().join("out.psd");
+    ok(std::fs::write(&target, b"the user's file"));
+    let (value, temp) = ok(crate::write_verified_temp(
+        &target,
+        |file| {
+            std::io::Write::write_all(file, b"new")?;
+            Ok(3)
+        },
+        |_, _| Ok(()),
+    ));
+    assert_eq!(value, 3);
+    assert_eq!(ok(std::fs::read(&target)), b"the user's file");
+    let temp_path = temp.path().to_path_buf();
+    assert!(temp_path.exists());
+    drop(temp);
+    assert!(!temp_path.exists(), "dropped = removed");
+    assert_eq!(ok(std::fs::read(&target)), b"the user's file");
+    let ((), temp) = ok(crate::write_verified_temp(
+        &target,
+        |file| std::io::Write::write_all(file, b"new").map_err(IoError::from),
+        |_, ()| Ok(()),
+    ));
+    ok(temp.persist());
+    assert_eq!(ok(std::fs::read(&target)), b"new");
+    assert_eq!(dir_listing(dir.path()), ["out.psd"]);
 }

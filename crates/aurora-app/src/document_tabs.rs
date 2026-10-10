@@ -111,6 +111,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
         cx.doc.canvas_size,
         &mut cx.doc.skipped_tiles,
         store,
+        cx.doc.import_losses.as_deref(),
     );
     cx.doc.park_autosave = submitted.map(|generation| (revision, generation));
     true
