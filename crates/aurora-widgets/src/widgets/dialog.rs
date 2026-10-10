@@ -26,6 +26,15 @@
 //! non-urgent `Role::Dialog` variant is real, separate follow-on work if
 //! this crate ever needs one.
 //!
+//! **Choosing is this module's job, acting is not (0.169.0).** Every
+//! input path resolves to one [`DialogChoice`] — "action `id` chosen on
+//! dialog `root`": [`DialogHandle::key`] for the keyboard (`Enter`,
+//! `Space`, `Escape` for the cancel action, `Tab`/`Shift+Tab` trapped in
+//! the buttons) and [`DialogHandle::choice_for`] for a pointer click or an
+//! assistive technology's `Click` on a button. The caller maps the root to
+//! what it opened the dialog for and decides what happens. Before 0.169.0
+//! the choice reached no one: the caller only logged it.
+//!
 //! **Action *handling* is deliberately not this module's job**: it
 //! builds the buttons and returns their ids; deciding what happens when
 //! one is activated (closing the dialog, taking some action) is the
@@ -116,6 +125,7 @@ use taffy::{
 use super::button::insert_button;
 use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
+use crate::shortcut::{Key, KeyChord, NamedKey};
 use crate::tree::{WidgetId, WidgetTree};
 
 /// The share of the window's own width a dialog spans. A proportion,
@@ -338,6 +348,15 @@ fn message_style(scales: &Scales) -> Style {
 }
 
 /// One dialog action button — e.g. `("recover", "Recover Document")`.
+///
+/// **Default and cancel (0.169.0).** A dialog may mark one action as its
+/// *default* ([`Self::as_default`]: initial focus, and `Enter` when no
+/// action button is focused) and one as its *cancel*
+/// ([`Self::as_cancel`]: `Escape`). One action may be both — an
+/// acknowledgement-only alert's single "OK" is. A dialog with no cancel
+/// action is not dismissable by `Escape`: the key does nothing, so the
+/// user must pick an action. When more than one action is marked, the
+/// first marked one wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogAction {
     /// Opaque to this crate — the caller defines what its own ids mean,
@@ -345,6 +364,10 @@ pub struct DialogAction {
     /// `super::command_palette::CommandEntry::id` already uses.
     pub id: String,
     pub label: String,
+    /// The dialog's default action (see the type's own doc comment).
+    pub is_default: bool,
+    /// The dialog's cancel action, chosen by `Escape`.
+    pub is_cancel: bool,
 }
 
 impl DialogAction {
@@ -353,8 +376,51 @@ impl DialogAction {
         Self {
             id: id.into(),
             label: label.into(),
+            is_default: false,
+            is_cancel: false,
         }
     }
+
+    /// Marks this action as the dialog's default.
+    #[must_use]
+    pub fn as_default(mut self) -> Self {
+        self.is_default = true;
+        self
+    }
+
+    /// Marks this action as the dialog's cancel (`Escape`).
+    #[must_use]
+    pub fn as_cancel(mut self) -> Self {
+        self.is_cancel = true;
+        self
+    }
+}
+
+/// "Action `action` was chosen on dialog `dialog`" (0.169.0) — the one
+/// result every input path produces: a key ([`DialogHandle::key`]), a
+/// pointer click or an assistive technology's `Click` on a button
+/// ([`DialogHandle::choice_for`]). Generic: `action` is the caller's own
+/// id, `dialog` the dialog's root, and the caller maps `dialog` to
+/// whatever the dialog was opened *for*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogChoice {
+    /// The dialog's own root ([`DialogHandle::root`]).
+    pub dialog: WidgetId,
+    /// The chosen action's id, as given to [`insert_dialog`].
+    pub action: String,
+}
+
+/// What one key press means to an open dialog ([`DialogHandle::key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogKeyOutcome {
+    /// An action was chosen; the caller closes the dialog and acts on it.
+    Chosen(DialogChoice),
+    /// `Tab`/`Shift+Tab`: move focus to this action button. Focus is
+    /// trapped in the dialog's own buttons and wraps around.
+    MoveFocus(WidgetId),
+    /// Nothing happens — including `Escape` on a dialog with no cancel
+    /// action. The key is still the dialog's (it is modal).
+    Ignored,
 }
 
 /// One inserted dialog's own widget ids.
@@ -372,14 +438,26 @@ pub struct DialogHandle {
     /// the real, focusable button widget built for it, in the same
     /// order they were given.
     pub actions: Vec<(String, WidgetId)>,
+    /// The default action's button, if one was marked
+    /// ([`DialogAction::as_default`]).
+    pub default_action: Option<WidgetId>,
+    /// The cancel action's button, if one was marked
+    /// ([`DialogAction::as_cancel`]).
+    pub cancel_action: Option<WidgetId>,
 }
 
 impl DialogHandle {
-    /// The first action's own button, if any — the usual place to move
-    /// focus to when a dialog opens.
+    /// The first action's own button, if any.
     #[must_use]
     pub fn first_action(&self) -> Option<WidgetId> {
         self.actions.first().map(|(_, id)| *id)
+    }
+
+    /// Where focus goes when the dialog opens: the default action's
+    /// button, else the first action's.
+    #[must_use]
+    pub fn initial_focus(&self) -> Option<WidgetId> {
+        self.default_action.or_else(|| self.first_action())
     }
 
     /// The action id `button` belongs to, if `button` is one of this
@@ -391,6 +469,72 @@ impl DialogHandle {
             .iter()
             .find(|(_, id)| *id == button)
             .map(|(action_id, _)| action_id.as_str())
+    }
+
+    /// The choice an activation of `button` (a pointer click, an
+    /// assistive technology's `Click`, `Enter`/`Space` while focused)
+    /// makes — `None` when `button` is none of this dialog's actions.
+    #[must_use]
+    pub fn choice_for(&self, button: WidgetId) -> Option<DialogChoice> {
+        self.action_id(button).map(|action| DialogChoice {
+            dialog: self.root,
+            action: action.to_owned(),
+        })
+    }
+
+    /// What `chord` means while this dialog is open and `focused` holds
+    /// keyboard focus:
+    ///
+    /// - `Enter` chooses the focused action button, or the default action
+    ///   when focus is on none of them (the focused button wins, as on
+    ///   Windows and GTK; focus starts on the default, so an untouched
+    ///   dialog's `Enter` is the default either way);
+    /// - `Space` chooses the focused action button only;
+    /// - `Escape` chooses the cancel action, and does nothing when there
+    ///   is none;
+    /// - `Tab`/`Shift+Tab` move focus to the next/previous action button,
+    ///   wrapping around.
+    ///
+    /// A chord with `Ctrl`, `Alt` or `Meta` held is ignored, as is
+    /// `Shift` with anything but `Tab`.
+    #[must_use]
+    pub fn key(&self, chord: &KeyChord, focused: Option<WidgetId>) -> DialogKeyOutcome {
+        let mods = chord.modifiers;
+        if mods.control || mods.alt || mods.meta {
+            return DialogKeyOutcome::Ignored;
+        }
+        let focused_action = focused.filter(|id| self.action_id(*id).is_some());
+        let chosen = |button: Option<WidgetId>| {
+            button
+                .and_then(|id| self.choice_for(id))
+                .map_or(DialogKeyOutcome::Ignored, DialogKeyOutcome::Chosen)
+        };
+        match chord.key {
+            Key::Named(NamedKey::Tab) => self
+                .next_action(focused_action, mods.shift)
+                .map_or(DialogKeyOutcome::Ignored, DialogKeyOutcome::MoveFocus),
+            _ if mods.shift => DialogKeyOutcome::Ignored,
+            Key::Named(NamedKey::Enter) => chosen(focused_action.or(self.default_action)),
+            Key::Named(NamedKey::Space) => chosen(focused_action),
+            Key::Named(NamedKey::Escape) => chosen(self.cancel_action),
+            _ => DialogKeyOutcome::Ignored,
+        }
+    }
+
+    /// The action button after (or, `backwards`, before) `from`, wrapping;
+    /// from no action button, the first (or last) one.
+    fn next_action(&self, from: Option<WidgetId>, backwards: bool) -> Option<WidgetId> {
+        let count = self.actions.len();
+        if count == 0 {
+            return None;
+        }
+        let index = match from.and_then(|id| self.actions.iter().position(|(_, b)| *b == id)) {
+            Some(at) if backwards => (at + count - 1) % count,
+            Some(at) => (at + 1) % count,
+            None if backwards => count - 1,
+            None => 0,
+        };
+        self.actions.get(index).map(|(_, id)| *id)
     }
 }
 
@@ -465,8 +609,16 @@ pub fn insert_dialog(
     )?;
 
     let mut action_ids = Vec::with_capacity(actions.len());
+    let mut default_action = None;
+    let mut cancel_action = None;
     for action in actions {
         let button = insert_button(tree, root, scales, action.label)?;
+        if action.is_default && default_action.is_none() {
+            default_action = Some(button);
+        }
+        if action.is_cancel && cancel_action.is_none() {
+            cancel_action = Some(button);
+        }
         action_ids.push((action.id, button));
     }
 
@@ -475,6 +627,8 @@ pub fn insert_dialog(
         title: title_id,
         message: message_id,
         actions: action_ids,
+        default_action,
+        cancel_action,
     })
 }
 
@@ -855,5 +1009,277 @@ mod tests {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+    }
+
+    // -- 0.169.0: choosing an action --
+
+    fn chord(key: crate::shortcut::Key, shift: bool) -> crate::shortcut::KeyChord {
+        let modifiers = crate::shortcut::Modifiers {
+            shift,
+            ..crate::shortcut::Modifiers::none()
+        };
+        crate::shortcut::KeyChord::new(modifiers, key)
+    }
+
+    fn named(key: crate::shortcut::NamedKey) -> crate::shortcut::Key {
+        crate::shortcut::Key::Named(key)
+    }
+
+    /// A laid-out "Replace / Cancel / Other" dialog: Replace is the
+    /// default, Cancel the cancel.
+    fn choice_dialog() -> (
+        crate::WidgetTree<crate::widgets::WidgetKind>,
+        super::DialogHandle,
+    ) {
+        let (mut tree, root) = sized_tree();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Replace?",
+            "Message",
+            vec![
+                DialogAction::new("other", "Other"),
+                DialogAction::new("replace", "Replace").as_default(),
+                DialogAction::new("cancel", "Cancel").as_cancel(),
+            ],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(WINDOW.0, WINDOW.1);
+        (tree, handle)
+    }
+
+    fn button(handle: &super::DialogHandle, id: &str) -> WidgetId {
+        match handle.actions.iter().find(|(a, _)| a == id) {
+            Some((_, button)) => *button,
+            None => unreachable!("no action {id}"),
+        }
+    }
+
+    fn chosen(handle: &super::DialogHandle, action: &str) -> super::DialogKeyOutcome {
+        super::DialogKeyOutcome::Chosen(super::DialogChoice {
+            dialog: handle.root,
+            action: action.to_owned(),
+        })
+    }
+
+    #[test]
+    fn default_and_cancel_are_recorded_and_initial_focus_is_the_default() {
+        let (_, handle) = choice_dialog();
+        assert_eq!(handle.default_action, Some(button(&handle, "replace")));
+        assert_eq!(handle.cancel_action, Some(button(&handle, "cancel")));
+        assert_eq!(handle.initial_focus(), Some(button(&handle, "replace")));
+        assert_ne!(handle.initial_focus(), handle.first_action());
+    }
+
+    #[test]
+    fn without_a_default_initial_focus_is_the_first_action_and_the_first_marked_wins() {
+        let (mut tree, root) = sized_tree();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &test_scales(),
+            "T",
+            "M",
+            vec![
+                DialogAction::new("a", "A"),
+                DialogAction::new("b", "B").as_cancel(),
+                DialogAction::new("c", "C").as_cancel(),
+            ],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(handle.default_action, None);
+        assert_eq!(handle.initial_focus(), handle.first_action());
+        assert_eq!(handle.cancel_action, Some(button(&handle, "b")));
+    }
+
+    #[test]
+    fn enter_space_and_escape_choose_the_right_action() {
+        use crate::shortcut::NamedKey;
+        let (_, handle) = choice_dialog();
+        let replace = button(&handle, "replace");
+        let other = button(&handle, "other");
+        // Enter: the focused button wins; with focus on no button, the default.
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Enter), false), Some(replace)),
+            chosen(&handle, "replace")
+        );
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Enter), false), Some(other)),
+            chosen(&handle, "other")
+        );
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Enter), false), Some(handle.message)),
+            chosen(&handle, "replace")
+        );
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Enter), false), None),
+            chosen(&handle, "replace")
+        );
+        // Space: the focused button only.
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Space), false), Some(other)),
+            chosen(&handle, "other")
+        );
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Space), false), None),
+            super::DialogKeyOutcome::Ignored
+        );
+        // Escape: the cancel action, wherever focus is — never the default.
+        for focused in [Some(replace), Some(other), None] {
+            assert_eq!(
+                handle.key(&chord(named(NamedKey::Escape), false), focused),
+                chosen(&handle, "cancel")
+            );
+        }
+        // Modified chords are not the dialog's.
+        let ctrl_enter = crate::shortcut::KeyChord::new(
+            crate::shortcut::Modifiers {
+                control: true,
+                ..crate::shortcut::Modifiers::none()
+            },
+            named(NamedKey::Enter),
+        );
+        assert_eq!(
+            handle.key(&ctrl_enter, Some(replace)),
+            super::DialogKeyOutcome::Ignored
+        );
+        assert_eq!(
+            handle.key(&chord(named(NamedKey::Enter), true), Some(replace)),
+            super::DialogKeyOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn escape_does_nothing_without_a_cancel_action() {
+        use crate::shortcut::NamedKey;
+        let (mut tree, root) = sized_tree();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &test_scales(),
+            "T",
+            "M",
+            vec![DialogAction::new("go", "Go").as_default()],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            handle.key(
+                &chord(named(NamedKey::Escape), false),
+                handle.initial_focus()
+            ),
+            super::DialogKeyOutcome::Ignored
+        );
+        // An action that is both default and cancel (an "OK"): Escape is it.
+        let ok = match insert_dialog(
+            &mut tree,
+            root,
+            &test_scales(),
+            "T",
+            "M",
+            vec![DialogAction::new("ok", "OK").as_default().as_cancel()],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            ok.key(&chord(named(NamedKey::Escape), false), None),
+            chosen(&ok, "ok")
+        );
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_the_action_buttons_and_wrap() {
+        use crate::shortcut::NamedKey;
+        let (mut tree, handle) = choice_dialog();
+        let mut focus = crate::FocusManager::default();
+        let order: Vec<WidgetId> = handle.actions.iter().map(|(_, b)| *b).collect();
+        let tab = chord(named(NamedKey::Tab), false);
+        let back = chord(named(NamedKey::Tab), true);
+        let Some(start) = handle.initial_focus() else {
+            unreachable!("has actions");
+        };
+        if let Err(err) = focus.focus(&mut tree, start) {
+            unreachable!("{err:?}");
+        }
+        let mut seen = Vec::new();
+        for _ in 0..order.len() {
+            match handle.key(&tab, focus.focused()) {
+                super::DialogKeyOutcome::MoveFocus(next) => {
+                    if let Err(err) = focus.focus(&mut tree, next) {
+                        unreachable!("{err:?}");
+                    }
+                    seen.push(next);
+                }
+                other => unreachable!("{other:?}"),
+            }
+        }
+        let &[other, replace, cancel] = order.as_slice() else {
+            unreachable!("three actions");
+        };
+        // replace -> cancel -> other (wrapped) -> replace.
+        assert_eq!(seen, vec![cancel, other, replace]);
+        assert_eq!(
+            handle.key(&back, Some(other)),
+            super::DialogKeyOutcome::MoveFocus(cancel),
+            "Shift+Tab wraps backwards"
+        );
+        assert_eq!(
+            handle.key(&back, None),
+            super::DialogKeyOutcome::MoveFocus(cancel)
+        );
+        assert_eq!(
+            handle.key(&tab, None),
+            super::DialogKeyOutcome::MoveFocus(other)
+        );
+    }
+
+    /// AC-1 at the widget level: a pointer click (hit test) and an
+    /// assistive technology's `Click` (`handle_action`) on the same button
+    /// produce the same choice `Enter`/`Space` on it does.
+    #[test]
+    fn pointer_and_accessibility_clicks_make_the_same_choice_as_the_keyboard() {
+        use crate::shortcut::NamedKey;
+        let (mut tree, handle) = choice_dialog();
+        let cancel = button(&handle, "cancel");
+        let Some(bounds) = tree.bounds(cancel) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+        let by_pointer = tree.hit_test(center).and_then(|hit| handle.choice_for(hit));
+        let mut focus = crate::FocusManager::default();
+        let request = accesskit::ActionRequest {
+            action: Action::Click,
+            target_tree: crate::ACCESSIBILITY_TREE_ID,
+            target_node: cancel,
+            data: None,
+        };
+        let by_at = match crate::handle_action(&mut tree, &mut focus, &request) {
+            Ok(crate::ActionOutcome::Activated(id)) => handle.choice_for(id),
+            other => unreachable!("{other:?}"),
+        };
+        let by_key = match handle.key(&chord(named(NamedKey::Space), false), Some(cancel)) {
+            super::DialogKeyOutcome::Chosen(choice) => Some(choice),
+            other => unreachable!("{other:?}"),
+        };
+        let expected = Some(super::DialogChoice {
+            dialog: handle.root,
+            action: "cancel".to_owned(),
+        });
+        assert_eq!(by_pointer, expected);
+        assert_eq!(by_at, expected);
+        assert_eq!(by_key, expected);
+        assert_eq!(handle.choice_for(handle.message), None);
+        assert_eq!(handle.choice_for(handle.root), None);
     }
 }

@@ -184,7 +184,9 @@
 //! **Scope, stated honestly**: still just one dialog action ("Continue"
 //! — its message changes depending on whether recovery actually
 //! happened), because recovery itself is unconditional and automatic
-//! rather than a user choice. And autosave now happens **only at
+//! rather than a user choice. (0.169.0 audit: there is no "Recover
+//! Document" / "Discard" choice to route, so none was lost; "Continue"
+//! acknowledges, which is what it says.) And autosave now happens **only at
 //! lifecycle boundaries** — a fresh session's startup document, and
 //! each document replacement (`App::open_file`/`App::open_aur_file`).
 //! Live per-edit re-triggering was removed in 0.49.0: building a `.aur`
@@ -519,9 +521,9 @@ use aurora_text::TextEngine;
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, DialogHandle, TextFieldChord, WidgetKind, command_palette_state,
-    handle_text_field_chord, insert_command_palette, insert_dialog, move_command_palette_selection,
-    set_command_palette_query,
+    CommandEntry, DialogAction, DialogHandle, DialogKeyOutcome, TextFieldChord, WidgetKind,
+    command_palette_state, handle_text_field_chord, insert_command_palette, insert_dialog,
+    move_command_palette_selection, set_command_palette_query,
 };
 use aurora_widgets::{
     ClickTracker, FocusOrigin, KeyOutcome, NoTextHit, PointerEvent, PointerOutcome, PointerPhase,
@@ -1080,7 +1082,7 @@ const PSD_REPORT_DISMISS: &str = "psd.report.dismiss";
 /// The import-report dialog's single "OK": the document is already
 /// open; the dialog only says what it could not show.
 fn psd_report_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(PSD_REPORT_DISMISS, "OK")]
+    vec![acknowledge_action(PSD_REPORT_DISMISS, "OK")]
 }
 
 /// The import-report message for a PSD that opened but uses things
@@ -3167,11 +3169,113 @@ fn apply_saved_collapse(workspace: &mut aurora_ui::Workspace, layout: &Workspace
 
 const CRASH_RECOVERY_CONTINUE: &str = "recovery.continue";
 
+/// What the App opened a dialog *for* (0.169.0) — carried by the open
+/// dialog ([`OpenDialog`]) so a chosen action id is dispatched to the
+/// right handler ([`dialog_effect`]). `aurora-widgets` knows only "action
+/// `id` on dialog `root`" ([`aurora_widgets::widgets::DialogChoice`]);
+/// this is the App's half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DialogPurpose {
+    /// "Aurora Didn't Close Properly" ([`open_crash_recovery_dialog`]).
+    CrashRecovery,
+    /// "Opened With Changes", a PSD import report ([`PSD_REPORT_TITLE`]).
+    OpenedWithChanges,
+    /// "Couldn't Open File" ([`OPEN_FAILED_TITLE`]).
+    OpenFailed,
+    /// "Couldn't Save File" ([`SAVE_FAILED_TITLE`]).
+    SaveFailed,
+    /// "Couldn't Export This Document".
+    ExportRefused,
+    /// "This Document Is Missing Content".
+    SkippedTiles,
+    /// "Can't Move This Layer Further".
+    MoveRefused,
+    /// "Replace Workspace “name”?" (0.169.0): the user saved a workspace
+    /// under a taken name.
+    ReplaceWorkspace(String),
+}
+
+/// The open modal dialog (0.169.0): its widgets, what it was opened for,
+/// and where keyboard focus was when it opened (restored on close,
+/// [`close_dialog`]). Derefs to the widget-level [`DialogHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenDialog {
+    handle: DialogHandle,
+    purpose: DialogPurpose,
+    restore_focus: Option<WidgetId>,
+}
+
+impl std::ops::Deref for OpenDialog {
+    type Target = DialogHandle;
+
+    fn deref(&self) -> &DialogHandle {
+        &self.handle
+    }
+}
+
+/// The typed result of a dialog choice (0.169.0): the same value whether
+/// it was chosen by a key ([`handle_dialog_key`]), a pointer click
+/// ([`handle_dialog_pointer`]) or an assistive technology's `Click`
+/// ([`apply_accessibility_action`]). The dialog is already closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogResult {
+    purpose: DialogPurpose,
+    action: String,
+}
+
+/// What a [`DialogResult`] asks the App to do ([`dialog_effect`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DialogEffect {
+    /// An acknowledgement ("OK", "Continue"): closing was the whole job.
+    Acknowledged,
+    /// Run this workspace command (the Replace Workspace dialog).
+    Workspace(workspace_presets::WorkspaceCommand),
+    /// The action id is not one this purpose's dialog has — logged,
+    /// nothing done.
+    Unknown,
+}
+
+/// Dispatches `result` by its purpose (0.169.0). Every dialog the App
+/// opens is listed here with every action it shows.
+fn dialog_effect(result: &DialogResult) -> DialogEffect {
+    let action = result.action.as_str();
+    match &result.purpose {
+        DialogPurpose::CrashRecovery if action == CRASH_RECOVERY_CONTINUE => {
+            DialogEffect::Acknowledged
+        }
+        DialogPurpose::OpenedWithChanges if action == PSD_REPORT_DISMISS => {
+            DialogEffect::Acknowledged
+        }
+        DialogPurpose::OpenFailed if action == OPEN_FAILED_DISMISS => DialogEffect::Acknowledged,
+        DialogPurpose::SaveFailed if action == SAVE_FAILED_DISMISS => DialogEffect::Acknowledged,
+        DialogPurpose::ExportRefused if action == EXPORT_REFUSED_DISMISS => {
+            DialogEffect::Acknowledged
+        }
+        DialogPurpose::SkippedTiles if action == SKIPPED_TILES_DISMISS => {
+            DialogEffect::Acknowledged
+        }
+        DialogPurpose::MoveRefused if action == MOVE_REFUSED_DISMISS => DialogEffect::Acknowledged,
+        DialogPurpose::ReplaceWorkspace(name) => {
+            match workspace_presets::replace_workspace_choice(name, action) {
+                Some(command) => DialogEffect::Workspace(command),
+                None => DialogEffect::Unknown,
+            }
+        }
+        _ => DialogEffect::Unknown,
+    }
+}
+
+/// The single acknowledgement action an alert with nothing to choose
+/// shows: default (focused, `Enter`) and cancel (`Escape`) at once.
+fn acknowledge_action(id: &str, label: &str) -> DialogAction {
+    DialogAction::new(id, label).as_default().as_cancel()
+}
+
 /// The crash-recovery dialog's own, honest content — a single "Continue"
 /// action either way (see this section's own doc comment for why there
 /// is no separate "Recover Document" choice); only the message differs.
 fn crash_recovery_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(CRASH_RECOVERY_CONTINUE, "Continue")]
+    vec![acknowledge_action(CRASH_RECOVERY_CONTINUE, "Continue")]
 }
 
 /// The crash-recovery dialog's message — reports whether [`recover_document`]
@@ -3214,14 +3318,16 @@ fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
 /// (`App::push_accessibility`/`App::apply_resize`) — the same "pure
 /// dispatch, caller owns the one real platform side-effect" split
 /// [`select_layer`] already uses.
+#[allow(clippy::too_many_arguments)]
 fn open_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     scales: &Scales,
     title: &str,
     message: &str,
     actions: Vec<DialogAction>,
+    purpose: DialogPurpose,
 ) -> bool {
     if dialog.is_some() {
         tracing::warn!(
@@ -3245,12 +3351,18 @@ fn open_dialog(
             return false;
         }
     };
-    if let Some(button) = handle.first_action()
+    // 0.169.0: remember where focus was, then focus the default action.
+    let restore_focus = focus.focused();
+    if let Some(button) = handle.initial_focus()
         && let Err(err) = focus.focus(&mut workspace.tree, button)
     {
         tracing::warn!(?err, title, "failed to focus a dialog");
     }
-    *dialog = Some(handle);
+    *dialog = Some(OpenDialog {
+        handle,
+        purpose,
+        restore_focus,
+    });
     true
 }
 
@@ -3261,7 +3373,7 @@ fn open_dialog(
 fn open_crash_recovery_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     scales: &Scales,
     recovered: bool,
 ) -> bool {
@@ -3273,6 +3385,7 @@ fn open_crash_recovery_dialog(
         "Aurora Didn't Close Properly",
         crash_recovery_dialog_message(recovered),
         crash_recovery_dialog_actions(),
+        DialogPurpose::CrashRecovery,
     )
 }
 
@@ -3283,7 +3396,7 @@ const EXPORT_REFUSED_DISMISS: &str = "export.refused.dismiss";
 /// touched. Acknowledging is the whole interaction, the same shape
 /// [`crash_recovery_dialog_actions`] settled on for the same reason.
 fn export_refused_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(EXPORT_REFUSED_DISMISS, "OK")]
+    vec![acknowledge_action(EXPORT_REFUSED_DISMISS, "OK")]
 }
 
 /// The itemized message for an export refused because
@@ -3365,7 +3478,7 @@ const OPEN_FAILED_DISMISS: &str = "open.failed.dismiss";
 /// failed and nothing changed, so acknowledging is the whole
 /// interaction.
 fn open_failed_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(OPEN_FAILED_DISMISS, "OK")]
+    vec![acknowledge_action(OPEN_FAILED_DISMISS, "OK")]
 }
 
 /// The formats this build opens, in the words a user knows them by —
@@ -3550,7 +3663,7 @@ fn open_failure_message(file_name: &str, extension: &str, failure: &OpenFailure)
 fn open_open_failed_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     scales: &Scales,
     message: &str,
 ) -> bool {
@@ -3562,6 +3675,7 @@ fn open_open_failed_dialog(
         OPEN_FAILED_TITLE,
         message,
         open_failed_dialog_actions(),
+        DialogPurpose::OpenFailed,
     )
 }
 
@@ -3600,7 +3714,7 @@ const SAVE_FAILED_DISMISS: &str = "save.failed.dismiss";
 
 /// The refused-save dialog's own single "OK".
 fn save_failed_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(SAVE_FAILED_DISMISS, "OK")]
+    vec![acknowledge_action(SAVE_FAILED_DISMISS, "OK")]
 }
 
 /// The sentence every refused save ends with: nothing was written, and
@@ -3646,7 +3760,7 @@ const SKIPPED_TILES_DISMISS: &str = "skipped.tiles.dismiss";
 /// missing cannot be recovered from it, so acknowledging is the whole
 /// interaction.
 fn skipped_tiles_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(SKIPPED_TILES_DISMISS, "OK")]
+    vec![acknowledge_action(SKIPPED_TILES_DISMISS, "OK")]
 }
 
 /// The itemized message for a `.aur` file that was written by
@@ -3749,7 +3863,7 @@ const MOVE_REFUSED_DISMISS: &str = "move.refused.dismiss";
 /// chosen. The drag is still live and still the user's to finish or
 /// abandon; this only tells them why it stopped moving.
 fn move_refused_dialog_actions() -> Vec<DialogAction> {
-    vec![DialogAction::new(MOVE_REFUSED_DISMISS, "OK")]
+    vec![acknowledge_action(MOVE_REFUSED_DISMISS, "OK")]
 }
 
 /// The message for a `Drag::Move` that `aurora_doc::LayerTree::set_bounds`
@@ -3769,21 +3883,33 @@ fn move_refused_message() -> &'static str {
 }
 
 /// Closes the open dialog (a no-op if none is open): removes it from
-/// `workspace.tree` and clears any focus left dangling on it — the same
+/// `workspace.tree`, clears any focus left dangling on it — the same
 /// [`FocusManager::validate`] pattern [`close_command_palette`] already
-/// uses.
+/// uses — and (0.169.0) returns focus to where it was when the dialog
+/// opened ([`OpenDialog::restore_focus`]) if that widget still exists and
+/// can take focus; otherwise focus stays cleared, the palette's own
+/// fallback. Returns the closed dialog.
 fn close_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
-) {
-    let Some(handle) = dialog.take() else {
-        return;
-    };
-    if let Err(err) = workspace.tree.remove(handle.root) {
+    dialog: &mut Option<OpenDialog>,
+) -> Option<OpenDialog> {
+    let open = dialog.take()?;
+    if let Err(err) = workspace.tree.remove(open.root) {
         tracing::warn!(?err, "failed to close the open dialog");
     }
     focus.validate(&workspace.tree);
+    if let Some(previous) = open.restore_focus
+        && workspace.tree.contains(previous)
+        && let Err(err) = focus.focus(&mut workspace.tree, previous)
+    {
+        tracing::debug!(?err, "focus before the dialog can no longer be restored");
+    }
+    // Review J1 (0.169.0): never leave the restored focus on a widget a
+    // panel change hid while the dialog was up, without waiting for the
+    // next layout's backstop.
+    aurora_ui::refocus_workspace(workspace, focus);
+    Some(open)
 }
 
 /// Routes one key press while a modal dialog is open —
@@ -3794,39 +3920,79 @@ fn close_dialog(
 fn handle_dialog_key(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     chord: KeyChord,
-) {
-    let Some(handle) = dialog.as_ref() else {
-        return;
-    };
-    match chord.key {
-        Key::Named(NamedKey::Escape) => close_dialog(workspace, focus, dialog),
-        Key::Named(NamedKey::Enter) => {
-            let action = focus
-                .focused()
-                .and_then(|id| handle.action_id(id))
-                .map(str::to_owned);
-            run_dialog_action(workspace, focus, dialog, action);
+) -> Option<DialogResult> {
+    let handle = dialog.as_ref()?;
+    // 0.169.0: the widget layer decides what the key chooses
+    // (`DialogHandle::key`): Enter/Space on the focused button, Enter for
+    // the default, Escape for the cancel (nothing without one), Tab and
+    // Shift+Tab trapped in the buttons.
+    match handle.key(&chord, focus.focused()) {
+        DialogKeyOutcome::Chosen(choice) => {
+            run_dialog_action(workspace, focus, dialog, Some(choice.action))
         }
-        _ => {}
+        DialogKeyOutcome::MoveFocus(button) => {
+            if let Err(err) = focus.focus(&mut workspace.tree, button) {
+                tracing::warn!(?err, "failed to move focus within the dialog");
+            }
+            None
+        }
+        DialogKeyOutcome::Ignored => None,
     }
 }
 
-/// Closes the open dialog and, if `action` names one of its
-/// own action ids, logs it as chosen — the shared "resolve, then close"
-/// step [`handle_dialog_key`]'s own `Enter` case and
-/// [`handle_dialog_pointer`]'s own button-click case both need, factored
-/// out so there's exactly one place this dialog's actions actually run.
+/// Closes the open dialog and, if `action` names one of its own action
+/// ids, returns the typed [`DialogResult`] (its purpose and that id) —
+/// the shared "resolve, then close" step the keyboard
+/// ([`handle_dialog_key`]), the pointer ([`handle_dialog_pointer`]) and an
+/// assistive technology ([`apply_accessibility_action`]) all go through,
+/// so there's exactly one place a choice becomes a result. Before 0.169.0
+/// it only logged the id: no choice ever reached the App.
 fn run_dialog_action(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     action: Option<String>,
-) {
-    close_dialog(workspace, focus, dialog);
-    if let Some(action) = action {
-        tracing::info!(action, "dialog action chosen");
+) -> Option<DialogResult> {
+    let closed = close_dialog(workspace, focus, dialog)?;
+    let action = action?;
+    if closed.action_id_known(&action) {
+        tracing::info!(action, purpose = ?closed.purpose, "dialog action chosen");
+        Some(DialogResult {
+            purpose: closed.purpose,
+            action,
+        })
+    } else {
+        tracing::warn!(action, "a dialog action this dialog does not have");
+        None
+    }
+}
+
+impl OpenDialog {
+    /// Whether `action` is one of this dialog's own action ids.
+    fn action_id_known(&self, action: &str) -> bool {
+        self.actions.iter().any(|(id, _)| id == action)
+    }
+}
+
+/// What a pointer press did while a dialog might be open
+/// ([`handle_dialog_pointer`], 0.169.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DialogPointer {
+    /// No dialog was open; the press is someone else's.
+    NotOpen,
+    /// A dialog is open and swallowed the press (not on an action).
+    Swallowed,
+    /// The press chose an action; the dialog is closed.
+    Chosen(DialogResult),
+}
+
+impl DialogPointer {
+    /// Whether a dialog was open to take the press.
+    #[cfg(test)]
+    fn was_open(&self) -> bool {
+        !matches!(self, Self::NotOpen)
     }
 }
 
@@ -3847,26 +4013,23 @@ fn run_dialog_action(
 fn handle_dialog_pointer(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     button: PointerButton,
     position: (f32, f32),
-) -> bool {
-    if dialog.is_none() {
-        return false;
+) -> DialogPointer {
+    let Some(handle) = dialog.as_ref() else {
+        return DialogPointer::NotOpen;
+    };
+    if button == PointerButton::Primary
+        && let Some(choice) = workspace
+            .tree
+            .hit_test(position)
+            .and_then(|hit| handle.choice_for(hit))
+        && let Some(result) = run_dialog_action(workspace, focus, dialog, Some(choice.action))
+    {
+        return DialogPointer::Chosen(result);
     }
-    if button == PointerButton::Primary {
-        let action = dialog.as_ref().and_then(|handle| {
-            workspace
-                .tree
-                .hit_test(position)
-                .and_then(|hit| handle.action_id(hit))
-        });
-        let action = action.map(str::to_owned);
-        if action.is_some() {
-            run_dialog_action(workspace, focus, dialog, action);
-        }
-    }
-    true
+    DialogPointer::Swallowed
 }
 
 /// What [`route_accessibility_action`] decided an assistive technology's
@@ -4080,7 +4243,7 @@ fn reconcile_layer_rows(
 struct AccessibilityContext<'a> {
     workspace: &'a mut aurora_ui::Workspace,
     focus: &'a mut FocusManager,
-    dialog: &'a mut Option<DialogHandle>,
+    dialog: &'a mut Option<OpenDialog>,
     /// The open command palette's root, if any.
     palette: Option<WidgetId>,
     scales: &'a Scales,
@@ -4129,7 +4292,7 @@ struct AccessibilityContext<'a> {
 
 /// What the caller of [`apply_accessibility_action`] still has to do —
 /// the two side effects only `App` can perform.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AccessibilityEffects {
     /// The widget tree may have changed shape or content: re-run layout
     /// (`App::apply_resize` from the window's own size, as every other
@@ -4144,6 +4307,9 @@ struct AccessibilityEffects {
     /// selected (0.160.0). The context holds the tool by value, so the app
     /// applies it, through [`AppCommand::SelectTool`].
     select_tool: Option<aurora_ui::Tool>,
+    /// A dialog action an assistive technology chose (0.169.0); the dialog
+    /// is closed and the App runs it (`App::run_dialog_result`).
+    dialog: Option<DialogResult>,
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -4328,6 +4494,7 @@ fn apply_accessibility_action(
         && cx.gallery.as_ref().is_some_and(|gallery| {
             aurora_ui::gallery_contains(&cx.workspace.tree, gallery, request.target_node)
         });
+    let mut dialog_result = None;
     let reaction = match cx.palette {
         Some(palette)
             if cx.dialog.is_none()
@@ -4338,7 +4505,7 @@ fn apply_accessibility_action(
         _ => route_accessibility_action(
             cx.workspace,
             cx.focus,
-            cx.dialog.as_ref(),
+            cx.dialog.as_ref().map(|open| &open.handle),
             cx.layer_rows,
             cx.layer_controls.controls.as_ref(),
             cx.tool_controls.as_ref(),
@@ -4347,7 +4514,7 @@ fn apply_accessibility_action(
     };
     match reaction {
         AccessibilityReaction::DialogAction(action) => {
-            run_dialog_action(cx.workspace, cx.focus, cx.dialog, action);
+            dialog_result = run_dialog_action(cx.workspace, cx.focus, cx.dialog, action);
         }
         AccessibilityReaction::PressLayer(layer_id) => {
             end_pointer_opacity_drag(cx);
@@ -4420,6 +4587,7 @@ fn apply_accessibility_action(
                 relayout: true,
                 redraw: true,
                 select_tool: Some(tool),
+                dialog: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -4472,6 +4640,7 @@ fn apply_accessibility_action(
         relayout: true,
         redraw: true,
         select_tool: None,
+        dialog: dialog_result,
     }
 }
 
@@ -4711,6 +4880,10 @@ enum ActivatedCommand {
     /// reset the active one, save as, or delete — run by
     /// `App::run_workspace_command`.
     Workspace(workspace_presets::WorkspaceCommand),
+    /// A dialog action was chosen by a key (0.169.0) — run by
+    /// `App::run_dialog_result`, as a pointer's or an assistive
+    /// technology's choice of the same action is.
+    Dialog(DialogResult),
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -8909,7 +9082,7 @@ fn handle_palette_key(
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
-    dialog: &mut Option<DialogHandle>,
+    dialog: &mut Option<OpenDialog>,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
     tool_settings: &ToolSettings,
@@ -8927,8 +9100,7 @@ fn handle_key(
 ) -> Option<ActivatedCommand> {
     let chord = KeyChord::new(modifiers, key);
     if dialog.is_some() {
-        handle_dialog_key(workspace, focus, dialog, chord);
-        return None;
+        return handle_dialog_key(workspace, focus, dialog, chord).map(ActivatedCommand::Dialog);
     }
     if palette.is_some() {
         return handle_palette_key(
@@ -20373,7 +20545,7 @@ struct App {
     /// see [`move_refusal_unreported`] for the bug that assumption
     /// caused, and `open_dialog`'s own suppression log line for what is
     /// left behind when a refusal loses the race for the slot.
-    dialog: Option<DialogHandle>,
+    dialog: Option<OpenDialog>,
     /// This run's own "still running" marker file — written in [`run`]
     /// before this `App` is built, cleared on a clean shutdown
     /// (`WindowEvent::CloseRequested`).
@@ -21093,6 +21265,9 @@ impl App {
         if let Some(tool) = effects.select_tool {
             self.select_tool_command(tool);
         }
+        if let Some(result) = &effects.dialog {
+            self.run_dialog_result(result);
+        }
         if effects.relayout {
             let window_size = self.window.as_ref().map(|window| window.inner_size());
             if let Some(size) = window_size {
@@ -21243,6 +21418,7 @@ impl App {
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
+            Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -21729,6 +21905,7 @@ impl App {
             PSD_REPORT_TITLE,
             message,
             psd_report_dialog_actions(),
+            DialogPurpose::OpenedWithChanges,
         );
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -22161,6 +22338,7 @@ impl App {
             SAVE_FAILED_TITLE,
             &message,
             save_failed_dialog_actions(),
+            DialogPurpose::SaveFailed,
         );
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -22204,6 +22382,7 @@ impl App {
             "This Document Is Missing Content",
             message,
             skipped_tiles_dialog_actions(),
+            DialogPurpose::SkippedTiles,
         );
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -22254,6 +22433,7 @@ impl App {
             "Couldn't Export This Document",
             message,
             export_refused_dialog_actions(),
+            DialogPurpose::ExportRefused,
         );
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -22623,6 +22803,7 @@ impl App {
     /// from under its fixed reference point — are exactly the pair
     /// [`commit_ending_drag`] and [`Self::active_layer`]'s own doc
     /// comment describe.
+    #[allow(clippy::too_many_lines)]
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -22639,15 +22820,23 @@ impl App {
         // the same way it already owns the keyboard (`handle_key`'s own
         // routing order) — a modal alert blocks everything else,
         // including layer selection and canvas tools.
-        if handle_dialog_pointer(
+        match handle_dialog_pointer(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
             button,
             position,
         ) {
-            self.push_accessibility();
-            return;
+            DialogPointer::NotOpen => {}
+            DialogPointer::Swallowed => {
+                self.push_accessibility();
+                return;
+            }
+            DialogPointer::Chosen(result) => {
+                self.run_dialog_result(&result);
+                self.relayout_after_gallery();
+                return;
+            }
         }
 
         self.begin_panel_press(button, position);
@@ -23002,6 +23191,7 @@ impl App {
             "Can't Move This Layer Further",
             move_refused_message(),
             move_refused_dialog_actions(),
+            DialogPurpose::MoveRefused,
         );
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -23261,6 +23451,7 @@ impl App {
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
             Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
+            Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
             None => {}
         }
         self.push_accessibility();
@@ -23579,6 +23770,22 @@ impl App {
         ));
     }
 
+    /// Runs a chosen dialog action (0.169.0) — where every input path's
+    /// [`DialogResult`] lands (a key through `ActivatedCommand::Dialog`, a
+    /// pointer press through [`handle_dialog_pointer`], an assistive
+    /// technology's `Click` through [`AccessibilityEffects::dialog`]),
+    /// dispatched by its purpose ([`dialog_effect`]). The dialog is already
+    /// closed and focus restored.
+    fn run_dialog_result(&mut self, result: &DialogResult) {
+        match dialog_effect(result) {
+            DialogEffect::Acknowledged => {}
+            DialogEffect::Workspace(command) => self.run_workspace_command(command),
+            DialogEffect::Unknown => {
+                tracing::warn!(?result, "a dialog result with no handler");
+            }
+        }
+    }
+
     /// A workspace preset command (0.168.0,
     /// `workspace_presets::run_workspace_command`): ends a live panel drag
     /// first, saves the presets file when they changed, then re-lays out
@@ -23589,6 +23796,7 @@ impl App {
             &mut self.workspace,
             &mut self.focus,
             &mut self.command_palette,
+            &mut self.dialog,
             &mut self.presets,
             &self.scales,
             command,
@@ -25662,7 +25870,7 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
-        let Some(button) = dialog.as_ref().and_then(DialogHandle::first_action) else {
+        let Some(button) = dialog.as_deref().and_then(DialogHandle::first_action) else {
             unreachable!("just opened, with an action");
         };
         let expected = dialog
@@ -25672,7 +25880,7 @@ mod tests {
         let reaction = route_accessibility_action(
             &mut workspace,
             &mut focus,
-            dialog.as_ref(),
+            dialog.as_deref(),
             &layer_rows,
             None,
             None,
@@ -25707,7 +25915,7 @@ mod tests {
             let reaction = route_accessibility_action(
                 &mut workspace,
                 &mut focus,
-                dialog.as_ref(),
+                dialog.as_deref(),
                 &layer_rows,
                 None,
                 None,
@@ -26703,7 +26911,7 @@ mod tests {
         struct AtState {
             workspace: aurora_ui::Workspace,
             focus: FocusManager,
-            dialog: Option<DialogHandle>,
+            dialog: Option<OpenDialog>,
             palette: Option<WidgetId>,
             scales: Scales,
             layers: aurora_doc::LayerTree,
@@ -26927,6 +27135,7 @@ mod tests {
                         relayout: true,
                         redraw: true,
                         select_tool: Some(tool),
+                        dialog: None,
                     },
                     "{tool:?}"
                 );
@@ -27119,6 +27328,7 @@ mod tests {
             relayout: true,
             redraw: true,
             select_tool: None,
+            dialog: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -27701,6 +27911,300 @@ mod tests {
             assert_eq!(
                 state.tool_settings.brush_radius, 80.0,
                 "the rest of the pointer gesture did not override the action"
+            );
+        }
+
+        // -- 0.169.0: dialog choices reach the App as typed results --
+
+        fn replace_dialog_state() -> AtState {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+            assert!(crate::workspace_presets::open_replace_workspace_dialog(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                &state.scales,
+                "Paint",
+            ));
+            state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+            state
+        }
+
+        fn dialog_button(state: &AtState, action: &str) -> WidgetId {
+            let found = state
+                .dialog
+                .as_ref()
+                .and_then(|open| open.actions.iter().find(|(id, _)| id == action));
+            match found {
+                Some((_, button)) => *button,
+                None => unreachable!("the dialog has {action}"),
+            }
+        }
+
+        /// The whole keyboard path: `handle_key`, as `App` calls it.
+        fn press(state: &mut AtState, key: Key, shift: bool) -> Option<ActivatedCommand> {
+            let modifiers = Modifiers {
+                shift,
+                ..Modifiers::none()
+            };
+            let picked = handle_key(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                &mut state.palette,
+                &mut state.tool,
+                &state.tool_settings,
+                &mut state.layers,
+                &mut state.history,
+                &mut state.pixel_history,
+                None,
+                &mut state.undo_order,
+                &default_shortcuts(),
+                modifiers,
+                key,
+                None,
+                &mut crate::tests::FakeClipboard::default(),
+                &mut crate::tests::FakeFileDialog::default(),
+            );
+            state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+            picked
+        }
+
+        fn click_at(state: &mut AtState, button: WidgetId) -> DialogPointer {
+            let Some(bounds) = state.workspace.tree.bounds(button) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let center = (
+                bounds.x as f32 + bounds.width as f32 / 2.0,
+                bounds.y as f32 + bounds.height as f32 / 2.0,
+            );
+            handle_dialog_pointer(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                PointerButton::Primary,
+                center,
+            )
+        }
+
+        fn result(action: &str) -> DialogResult {
+            DialogResult {
+                purpose: DialogPurpose::ReplaceWorkspace("Paint".to_owned()),
+                action: action.to_owned(),
+            }
+        }
+
+        /// AC-1: the keyboard (`Enter`/`Space` on the focused button,
+        /// `Escape` for the cancel), a pointer click and an assistive
+        /// technology's `Click` produce the identical typed result, and
+        /// each closes the dialog.
+        #[test]
+        fn a_dialog_choice_is_the_same_typed_result_by_key_pointer_and_at_click() {
+            use crate::workspace_presets::{WORKSPACE_REPLACE, WORKSPACE_REPLACE_CANCEL};
+            for action in [WORKSPACE_REPLACE, WORKSPACE_REPLACE_CANCEL] {
+                let mut by_key = replace_dialog_state();
+                let button = dialog_button(&by_key, action);
+                if let Err(err) = by_key.focus.focus(&mut by_key.workspace.tree, button) {
+                    unreachable!("{err:?}");
+                }
+                let key = press(&mut by_key, Key::Named(NamedKey::Enter), false);
+
+                let mut by_space = replace_dialog_state();
+                let button = dialog_button(&by_space, action);
+                if let Err(err) = by_space.focus.focus(&mut by_space.workspace.tree, button) {
+                    unreachable!("{err:?}");
+                }
+                let space = press(&mut by_space, Key::Named(NamedKey::Space), false);
+
+                let mut by_pointer = replace_dialog_state();
+                let button = dialog_button(&by_pointer, action);
+                let pointer = click_at(&mut by_pointer, button);
+
+                let mut by_at = replace_dialog_state();
+                let button = dialog_button(&by_at, action);
+                let at = by_at.act(&a11y_request(button, accesskit::Action::Click));
+
+                assert_eq!(
+                    key,
+                    Some(ActivatedCommand::Dialog(result(action))),
+                    "{action}"
+                );
+                assert_eq!(
+                    space,
+                    Some(ActivatedCommand::Dialog(result(action))),
+                    "{action}"
+                );
+                assert_eq!(pointer, DialogPointer::Chosen(result(action)), "{action}");
+                assert_eq!(at.dialog, Some(result(action)), "{action}");
+                for state in [&by_key, &by_space, &by_pointer, &by_at] {
+                    assert!(state.dialog.is_none(), "{action}: closed");
+                    assert!(
+                        !state.workspace.tree.is_within(state.workspace.root, button),
+                        "{action}: the dialog's widgets are gone"
+                    );
+                }
+            }
+        }
+
+        /// AC-2: focus starts on the default (Replace); Enter on it is
+        /// Replace; Escape is Cancel — never the default — wherever focus
+        /// is; Tab/Shift+Tab stay in the dialog's buttons.
+        #[test]
+        fn enter_is_the_default_escape_the_cancel_and_tab_stays_in_the_dialog() {
+            use crate::workspace_presets::{WORKSPACE_REPLACE, WORKSPACE_REPLACE_CANCEL};
+            let mut state = replace_dialog_state();
+            let replace = dialog_button(&state, WORKSPACE_REPLACE);
+            let cancel = dialog_button(&state, WORKSPACE_REPLACE_CANCEL);
+            assert_eq!(state.focus.focused(), Some(replace), "initial focus");
+            assert_eq!(press(&mut state, Key::Named(NamedKey::Tab), false), None);
+            assert_eq!(state.focus.focused(), Some(cancel));
+            assert_eq!(press(&mut state, Key::Named(NamedKey::Tab), false), None);
+            assert_eq!(state.focus.focused(), Some(replace), "wraps");
+            assert_eq!(press(&mut state, Key::Named(NamedKey::Tab), true), None);
+            assert_eq!(state.focus.focused(), Some(cancel), "Shift+Tab");
+            assert!(state.dialog.is_some(), "Tab chooses nothing");
+            // Escape with focus on Replace is still Cancel.
+            assert_eq!(press(&mut state, Key::Named(NamedKey::Tab), false), None);
+            assert_eq!(state.focus.focused(), Some(replace));
+            assert_eq!(
+                press(&mut state, Key::Named(NamedKey::Escape), false),
+                Some(ActivatedCommand::Dialog(result(WORKSPACE_REPLACE_CANCEL)))
+            );
+            let mut state = replace_dialog_state();
+            assert_eq!(
+                press(&mut state, Key::Named(NamedKey::Enter), false),
+                Some(ActivatedCommand::Dialog(result(WORKSPACE_REPLACE)))
+            );
+        }
+
+        /// AC-2: a dialog with no cancel action is not dismissed by
+        /// Escape — the key is swallowed and the dialog stays open.
+        #[test]
+        fn escape_leaves_a_dialog_without_a_cancel_action_open() {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            assert!(open_dialog(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                &state.scales,
+                "Choose",
+                "Pick one.",
+                // The default second, so focus on open is provably the
+                // default and not merely the first action.
+                vec![
+                    DialogAction::new("b", "B"),
+                    DialogAction::new("a", "A").as_default(),
+                ],
+                DialogPurpose::MoveRefused,
+            ));
+            let default = state.dialog.as_ref().and_then(|open| open.default_action);
+            assert!(default.is_some());
+            assert_ne!(
+                default,
+                state.dialog.as_ref().and_then(|open| open.first_action())
+            );
+            assert_eq!(state.focus.focused(), default, "focus on open: the default");
+            assert_eq!(press(&mut state, Key::Named(NamedKey::Escape), false), None);
+            assert!(state.dialog.is_some(), "still open");
+            assert_eq!(state.focus.focused(), default, "Escape moved nothing");
+        }
+
+        /// AC-5: closing a dialog — by any path — puts focus back where it
+        /// was when the dialog opened; if that widget is gone, focus is
+        /// left cleared (the palette's own fallback).
+        #[test]
+        fn focus_returns_to_where_it_was_when_the_dialog_closes() {
+            use crate::workspace_presets::{
+                WORKSPACE_REPLACE, WORKSPACE_REPLACE_CANCEL, open_replace_workspace_dialog,
+            };
+            for path in ["key", "pointer", "at"] {
+                let mut state = AtState::new(
+                    aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                    aurora_doc::LayerTree::new(),
+                    None,
+                );
+                state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                let Some(before) = state.workspace.tools.button_for(aurora_ui::Tool::Eraser) else {
+                    unreachable!("every tool has a button");
+                };
+                if let Err(err) = state.focus.focus(&mut state.workspace.tree, before) {
+                    unreachable!("{err:?}");
+                }
+                assert!(open_replace_workspace_dialog(
+                    &mut state.workspace,
+                    &mut state.focus,
+                    &mut state.dialog,
+                    &state.scales,
+                    "Paint",
+                ));
+                state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+                assert_ne!(state.focus.focused(), Some(before), "{path}: moved in");
+                match path {
+                    "key" => {
+                        let _ = press(&mut state, Key::Named(NamedKey::Escape), false);
+                    }
+                    "pointer" => {
+                        let cancel = dialog_button(&state, WORKSPACE_REPLACE_CANCEL);
+                        let _ = click_at(&mut state, cancel);
+                    }
+                    _ => {
+                        let replace = dialog_button(&state, WORKSPACE_REPLACE);
+                        let _ = state.act(&a11y_request(replace, accesskit::Action::Click));
+                    }
+                }
+                assert!(state.dialog.is_none(), "{path}: closed");
+                assert_eq!(state.focus.focused(), Some(before), "{path}: restored");
+            }
+
+            // The fallback: a remembered widget that no longer exists.
+            let mut state = replace_dialog_state();
+            if let Some(open) = state.dialog.as_mut() {
+                open.restore_focus = Some(open.handle.message);
+            }
+            let _ = press(&mut state, Key::Named(NamedKey::Escape), false);
+            assert!(state.dialog.is_none());
+            assert_eq!(state.focus.focused(), None, "nothing to restore to");
+        }
+
+        /// AC-5: one dialog at a time — a second request while one is open
+        /// is refused (not queued, not replacing), and the open one keeps
+        /// its purpose and focus; once it closes, the next one opens.
+        #[test]
+        fn a_second_dialog_is_refused_while_one_is_open() {
+            let mut state = replace_dialog_state();
+            let focused = state.focus.focused();
+            assert!(!open_open_failed_dialog(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                &state.scales,
+                "boom",
+            ));
+            assert_eq!(
+                state.dialog.as_ref().map(|open| open.purpose.clone()),
+                Some(DialogPurpose::ReplaceWorkspace("Paint".to_owned()))
+            );
+            assert_eq!(state.focus.focused(), focused);
+            let _ = press(&mut state, Key::Named(NamedKey::Escape), false);
+            assert!(open_open_failed_dialog(
+                &mut state.workspace,
+                &mut state.focus,
+                &mut state.dialog,
+                &state.scales,
+                "boom",
+            ));
+            assert_eq!(
+                state.dialog.as_ref().map(|open| open.purpose.clone()),
+                Some(DialogPurpose::OpenFailed)
             );
         }
     }
@@ -55085,7 +55589,7 @@ mod tests {
             center,
         );
 
-        assert!(opened, "a dialog was open to route the click to");
+        assert!(opened.was_open(), "a dialog was open to route the click to");
         assert_eq!(dialog, None, "clicking the action button must close it");
         assert!(!workspace.tree.contains(handle.root));
     }
@@ -55147,7 +55651,10 @@ mod tests {
             outside,
         );
 
-        assert!(opened, "a dialog was open, so the click must be swallowed");
+        assert!(
+            opened.was_open(),
+            "a dialog was open, so the click must be swallowed"
+        );
         assert_eq!(
             dialog,
             Some(handle),
@@ -55244,6 +55751,9 @@ mod tests {
                     title,
                     message,
                     actions,
+                    // The purpose plays no part in layout, which is all
+                    // this test measures.
+                    crate::DialogPurpose::ExportRefused,
                 ),
                 "{title} must open"
             );
@@ -55397,7 +55907,7 @@ mod tests {
                 PointerButton::Primary,
                 center,
             );
-            assert!(opened, "a dialog was open to route the click to");
+            assert!(opened.was_open(), "a dialog was open to route the click to");
             assert_eq!(
                 dialog, None,
                 "in a 1000x{height} window the action must still be clickable, \
@@ -55459,7 +55969,7 @@ mod tests {
             PointerButton::Primary,
             center,
         );
-        assert!(opened, "a dialog was open to route the click to");
+        assert!(opened.was_open(), "a dialog was open to route the click to");
         assert_eq!(
             dialog, None,
             "at the window's own minimum size the action must still be \
@@ -55588,13 +56098,16 @@ mod tests {
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut dialog = None;
-        assert!(!handle_dialog_pointer(
-            &mut workspace,
-            &mut focus,
-            &mut dialog,
-            PointerButton::Primary,
-            (0.0, 0.0),
-        ));
+        assert!(
+            !handle_dialog_pointer(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                PointerButton::Primary,
+                (0.0, 0.0),
+            )
+            .was_open()
+        );
     }
 
     /// A modal dialog is an *overlay*: it must not participate in
@@ -55820,6 +56333,7 @@ mod tests {
             "This Document Is Missing Content",
             &message,
             skipped_tiles_dialog_actions(),
+            crate::DialogPurpose::SkippedTiles,
         ));
         assert!(dialog.is_some(), "the missing-content dialog must be open");
     }
@@ -56215,6 +56729,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         );
 
         let Some(handle) = dialog else {
@@ -56258,6 +56773,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         );
         let first = dialog.clone();
         // A *different* dialog, to pin that the guard is about the slot
@@ -56286,6 +56802,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         );
         let Some(handle) = dialog.clone() else {
             unreachable!("just opened");
@@ -56320,6 +56837,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         );
 
         handle_dialog_key(
@@ -56458,6 +56976,7 @@ mod tests {
             "Can't Move This Layer Further",
             move_refused_message(),
             move_refused_dialog_actions(),
+            crate::DialogPurpose::MoveRefused,
         );
         assert!(!opened, "the occupied slot must refuse the second dialog");
         if opened {
@@ -56485,6 +57004,7 @@ mod tests {
             "Can't Move This Layer Further",
             move_refused_message(),
             move_refused_dialog_actions(),
+            crate::DialogPurpose::MoveRefused,
         );
         assert!(opened, "an empty slot must accept the refusal");
         if opened {
@@ -56537,6 +57057,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         );
         assert!(
             !swallowed,
@@ -56575,6 +57096,7 @@ mod tests {
             "Can't Move This Layer Further",
             move_refused_message(),
             move_refused_dialog_actions(),
+            crate::DialogPurpose::MoveRefused,
         );
 
         let Some(handle) = dialog.clone() else {
@@ -66864,7 +67386,7 @@ mod tests {
     struct DialogRig {
         workspace: aurora_ui::Workspace,
         focus: FocusManager,
-        dialog: Option<crate::DialogHandle>,
+        dialog: Option<crate::OpenDialog>,
         scales: Scales,
         worker: OpenWorker,
         installed: Vec<std::path::PathBuf>,
@@ -66948,6 +67470,7 @@ mod tests {
                 title,
                 &message,
                 actions,
+                crate::DialogPurpose::OpenedWithChanges,
             ));
         }
     }
@@ -66963,6 +67486,7 @@ mod tests {
             "Couldn't Export This Document",
             &incomplete_composite_message(1, "boom"),
             export_refused_dialog_actions(),
+            crate::DialogPurpose::ExportRefused,
         ));
         let Some(handle) = rig.dialog.as_ref() else {
             unreachable!("it just opened");
@@ -70967,7 +71491,7 @@ mod panel_scroll_tests {
             let reaction = route_accessibility_action(
                 &mut ws,
                 &mut focus,
-                dialog.as_ref(),
+                dialog.as_deref(),
                 &HashMap::new(),
                 None,
                 None,
@@ -72497,6 +73021,7 @@ mod panel_scroll_tests {
                     "Title",
                     "Message",
                     vec![aurora_widgets::widgets::DialogAction::new("ok", "OK")],
+                    crate::DialogPurpose::OpenFailed,
                 ));
                 lay(&mut ws, 1.0, WINDOW);
                 let Some(handle) = dialog.as_ref() else {
@@ -73296,7 +73821,7 @@ mod panel_scroll_tests {
                 let reaction = route_accessibility_action(
                     &mut blocked,
                     &mut modal_focus,
-                    dialog.as_ref(),
+                    dialog.as_deref(),
                     &HashMap::new(),
                     None,
                     None,
@@ -73566,5 +74091,93 @@ mod panel_scroll_tests {
                 }
             }
         }
+    }
+
+    /// AC-3: every dialog the App opens, with every action it shows,
+    /// dispatches to its own purpose's handler: each acknowledgement-only
+    /// alert's single action is its default and its cancel and is
+    /// `Acknowledged` under its own purpose only; the Replace Workspace
+    /// dialog's Replace saves over the name and its Cancel returns to the
+    /// name prompt; an id a purpose's dialog does not have does nothing.
+    #[test]
+    fn every_app_dialog_action_dispatches_to_its_own_purpose() {
+        use crate::workspace_presets::{
+            WORKSPACE_REPLACE, WORKSPACE_REPLACE_CANCEL, WorkspaceCommand,
+        };
+        let acknowledgements = [
+            (
+                crate::DialogPurpose::CrashRecovery,
+                crate::crash_recovery_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::OpenedWithChanges,
+                crate::psd_report_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::OpenFailed,
+                crate::open_failed_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::SaveFailed,
+                crate::save_failed_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::ExportRefused,
+                crate::export_refused_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::SkippedTiles,
+                crate::skipped_tiles_dialog_actions(),
+            ),
+            (
+                crate::DialogPurpose::MoveRefused,
+                crate::move_refused_dialog_actions(),
+            ),
+        ];
+        for (purpose, actions) in &acknowledgements {
+            assert_eq!(actions.len(), 1, "{purpose:?}: one action");
+            for action in actions {
+                assert!(action.is_default && action.is_cancel, "{purpose:?}");
+                for (other, _) in &acknowledgements {
+                    let effect = crate::dialog_effect(&crate::DialogResult {
+                        purpose: other.clone(),
+                        action: action.id.clone(),
+                    });
+                    let expected = if other == purpose {
+                        crate::DialogEffect::Acknowledged
+                    } else {
+                        crate::DialogEffect::Unknown
+                    };
+                    assert_eq!(effect, expected, "{} under {other:?}", action.id);
+                }
+            }
+        }
+        let replace = |action: &str| {
+            crate::dialog_effect(&crate::DialogResult {
+                purpose: crate::DialogPurpose::ReplaceWorkspace("Paint".to_owned()),
+                action: action.to_owned(),
+            })
+        };
+        assert_eq!(
+            replace(WORKSPACE_REPLACE),
+            crate::DialogEffect::Workspace(WorkspaceCommand::Save {
+                name: "Paint".to_owned(),
+                replace: true
+            })
+        );
+        assert_eq!(
+            replace(WORKSPACE_REPLACE_CANCEL),
+            crate::DialogEffect::Workspace(WorkspaceCommand::ReturnToNamePrompt(
+                "Paint".to_owned()
+            ))
+        );
+        assert_eq!(replace("ok"), crate::DialogEffect::Unknown);
+        assert_eq!(
+            crate::dialog_effect(&crate::DialogResult {
+                purpose: crate::DialogPurpose::CrashRecovery,
+                action: WORKSPACE_REPLACE.to_owned(),
+            }),
+            crate::DialogEffect::Unknown
+        );
     }
 }
