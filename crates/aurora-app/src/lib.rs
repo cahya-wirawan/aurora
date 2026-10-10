@@ -2118,6 +2118,11 @@ fn request_autosave_within(
             // "not written", which a caller retries.
             let after = modified(path);
             let written = after.is_some() && after != before;
+            // 0.175.0 (L-1): `landed` means on disk, so a written
+            // synchronous autosave records its own generation there.
+            if written {
+                worker.mark_landed(document, generation);
+            }
             // Written (complete or partial) on this thread, so the index
             // may name it now (0.171.0).
             if path.exists() || partial_autosave_path(path).exists() {
@@ -4495,6 +4500,9 @@ enum AccessibilityReaction {
     PanelTab(aurora_widgets::ActionOutcome),
     /// An action on a document tab (0.173.0).
     DocumentTab(aurora_widgets::ActionOutcome),
+    /// An assistive technology's `Click` on a document tab's "×" close
+    /// button (0.175.0): close the document at this tab position.
+    CloseDocumentTab(usize),
     /// A `Click` on a button of the collapsed rail's label strip (0.165.0):
     /// [`open_from_panel_strip`] has already expanded the rail with that
     /// button's panel shown; the caller lays out again.
@@ -4572,6 +4580,18 @@ fn route_accessibility_action(
             .is_some_and(|node| node.supports_action(accesskit::Action::Click))
     {
         return AccessibilityReaction::JumpHistory(target);
+    }
+    // 0.175.0: a document tab's "×" close button is the app's: it closes
+    // that tab's document (the same path as Close Document).
+    if request.action == accesskit::Action::Click
+        && request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
+        && let Some(index) = aurora_ui::document_tab_close_index(
+            &workspace.tree,
+            workspace.document_tabs,
+            request.target_node,
+        )
+    {
+        return AccessibilityReaction::CloseDocumentTab(index);
     }
     // 0.164.0: a tab of the Properties + History group — an assistive
     // technology's `Click` (or `Focus`) selects it in the widget layer,
@@ -4770,6 +4790,9 @@ struct AccessibilityEffects {
     /// A dialog action an assistive technology chose (0.169.0); the dialog
     /// is closed and the App runs it (`App::run_dialog_result`).
     dialog: Option<DialogResult>,
+    /// A document tab position whose "×" an assistive technology clicked
+    /// (0.175.0); the App closes that document (`App::close_document_tab`).
+    close_tab: Option<usize>,
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -5048,6 +5071,7 @@ fn apply_accessibility_action(
                 redraw: true,
                 select_tool: Some(tool),
                 dialog: None,
+                close_tab: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -5069,6 +5093,15 @@ fn apply_accessibility_action(
         }
         AccessibilityReaction::DocumentTab(outcome) => {
             tracing::debug!(?outcome, "accessibility action on a document tab");
+        }
+        AccessibilityReaction::CloseDocumentTab(index) => {
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                select_tool: None,
+                dialog: None,
+                close_tab: Some(index),
+            };
         }
         AccessibilityReaction::PanelStrip(panel) => {
             tracing::debug!(?panel, "accessibility click on a panel strip button");
@@ -5104,6 +5137,7 @@ fn apply_accessibility_action(
         redraw: true,
         select_tool: None,
         dialog: dialog_result,
+        close_tab: None,
     }
 }
 
@@ -5163,31 +5197,47 @@ enum AppCommand {
 /// just with the source string checked in rather than read from
 /// preferences.
 fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
+    default_shortcuts_for(PRIMARY_IS_META)
+}
+
+/// The platform's primary command modifier's chord spelling (0.175.0):
+/// `Cmd` on macOS, `Ctrl` elsewhere — the same choice the text field's
+/// editing chords make ([`PRIMARY_IS_META`]), computed from a flag rather
+/// than a `cfg` so both tables are built and tested on every platform.
+fn primary_modifier(primary_is_meta: bool) -> &'static str {
+    if primary_is_meta { "Cmd" } else { "Ctrl" }
+}
+
+/// [`default_shortcuts`] for a platform whose primary modifier is `Cmd`
+/// (`primary_is_meta`) or `Ctrl`. A binding spelled `Primary+…` takes
+/// that modifier; `Ctrl+Tab`/`Ctrl+Shift+Tab` stay literal `Ctrl` on
+/// every platform (`Cmd+Tab` is macOS's application switcher).
+fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> {
     let bindings = [
         ("Tab", AppCommand::FocusNext),
         ("Shift+Tab", AppCommand::FocusPrevious),
-        ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
+        ("Primary+Shift+P", AppCommand::ToggleCommandPalette),
         // Matches Photoshop's/every mainstream editor's own convention
         // (`Ctrl+Z`/`Ctrl+Shift+Z`, not a separate `Ctrl+Y` for redo).
         // Literally `Ctrl`, even on macOS -- this registry has no
         // per-platform rebinding yet, so a macOS user's own muscle-memory
         // `Cmd+Z` doesn't resolve; a real, named gap, not silently
         // missing.
-        ("Ctrl+Z", AppCommand::Undo),
-        ("Ctrl+Shift+Z", AppCommand::Redo),
+        ("Primary+Z", AppCommand::Undo),
+        ("Primary+Shift+Z", AppCommand::Redo),
         // Photoshop's own New Layer chord, and literally `Ctrl` for the
         // same reason as Undo above (macOS `Cmd+Shift+N` does not resolve
         // -- the same named gap). Delete Layer is deliberately unbound: a
         // bare `Delete`/`Backspace` would collide with a focused text
         // field's own editing and with a future "clear selection".
-        ("Ctrl+Shift+N", AppCommand::NewLayer),
+        ("Primary+Shift+N", AppCommand::NewLayer),
         // 0.172.0: the browser and editor convention for cycling open
         // documents. The registry matches whole chords exactly, so these
         // never collide with plain `Tab`/`Shift+Tab` focus traversal.
         ("Ctrl+Tab", AppCommand::NextDocument),
         ("Ctrl+Shift+Tab", AppCommand::PreviousDocument),
         // 0.174.0: the universal close-document chord.
-        ("Ctrl+W", AppCommand::CloseDocument),
+        ("Primary+W", AppCommand::CloseDocument),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
         // users already carry in muscle memory. Every tool here does
@@ -5202,6 +5252,11 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
+        let source = source.replace(
+            "Primary+",
+            &format!("{}+", primary_modifier(primary_is_meta)),
+        );
+        let source = source.as_str();
         let chord = match KeyChord::parse(source) {
             Ok(chord) => chord,
             Err(err) => unreachable!("{source:?} is a fixed, checked-in shortcut string: {err:?}"),
@@ -5332,6 +5387,8 @@ enum ActivatedCommand {
     /// `Scales` and click tracker, neither of which `activate_command`
     /// takes. See [`toggle_gallery`].
     ToggleWidgetGallery,
+    /// Quit Aurora (0.175.0): the quit review (`App::request_quit`).
+    Quit,
     /// New Layer / Delete Layer (0.143.0) — returned rather than done
     /// inline for the reason `Undo`/`Redo` are: they need live document
     /// state (`App::run_layer_command`, [`perform_layer_command`]).
@@ -5478,6 +5535,21 @@ const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 6] = {
 };
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
+/// "Quit Aurora" (0.175.0): the macOS application menu's Quit item, a
+/// custom item rather than `PredefinedMenuItem::quit` (which terminated
+/// the app directly), routed to the same quit review a window close runs.
+const COMMAND_APP_QUIT: &str = "app.quit";
+
+/// Whether a native menu command may run while a modal dialog is open
+/// (0.175.0): only Quit, which itself waits for the dialog to close
+/// (`App::request_quit`'s pending quit) rather than being dropped.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    expect(dead_code, reason = "the native menu exists on macOS only")
+)]
+fn menu_command_allowed_with_dialog(id: &str) -> bool {
+    id == COMMAND_APP_QUIT
+}
 const COMMAND_UNDO: &str = "edit.undo";
 const COMMAND_REDO: &str = "edit.redo";
 const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
@@ -5705,6 +5777,9 @@ fn activate_command(
     }
     if let Some(command) = document_tabs::document_command_for(id) {
         return Some(ActivatedCommand::Document(command));
+    }
+    if id == COMMAND_APP_QUIT {
+        return Some(ActivatedCommand::Quit);
     }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
@@ -8353,6 +8428,21 @@ fn gpu_target_needs_resize(current: Option<(u32, u32)>, requested: (u32, u32)) -
 // architecture already points toward, not a native OS integration on
 // every platform.
 
+/// The application menu's "Quit Aurora" item (0.175.0, `Cmd+Q`): routed
+/// to [`COMMAND_APP_QUIT`], the quit review, never a direct terminate.
+#[cfg(target_os = "macos")]
+fn quit_menu_item() -> muda::MenuItem {
+    muda::MenuItem::with_id(
+        COMMAND_APP_QUIT,
+        "Quit Aurora",
+        true,
+        Some(muda::accelerator::Accelerator::new(
+            Some(muda::accelerator::Modifiers::SUPER),
+            muda::accelerator::Code::KeyQ,
+        )),
+    )
+}
+
 /// Builds the native menu's own cross-platform structure: an app menu
 /// (About/Services/Hide/Quit — see this function's own doc comment
 /// below for why this exists at all), File > Open File…/Save As…,
@@ -8389,6 +8479,7 @@ fn gpu_target_needs_resize(current: Option<(u32, u32)>, requested: (u32, u32)) -
 /// operation) gives Cocoa's rename a proper target and leaves `File`
 /// alone.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)] // one declarative menu table (0.175.0: over 100 lines)
 fn build_menu() -> muda::Menu {
     let menu = muda::Menu::new();
 
@@ -8411,7 +8502,9 @@ fn build_menu() -> muda::Menu {
             &muda::PredefinedMenuItem::hide_others(None),
             &muda::PredefinedMenuItem::show_all(None),
             &muda::PredefinedMenuItem::separator(),
-            &muda::PredefinedMenuItem::quit(None),
+            // 0.175.0: a custom item, so Quit runs the quit review
+            // (`COMMAND_APP_QUIT`) instead of terminating at once.
+            &quit_menu_item(),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -21780,6 +21873,9 @@ impl App {
         if let Some(result) = &effects.dialog {
             self.run_dialog_result(result);
         }
+        if let Some(index) = effects.close_tab {
+            self.close_document_tab(index);
+        }
         if effects.relayout {
             let window_size = self.window.as_ref().map(|window| window.inner_size());
             if let Some(size) = window_size {
@@ -21931,6 +22027,9 @@ impl App {
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
+            Some(ActivatedCommand::Quit) => {
+                let _ = self.request_quit();
+            }
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             Some(ActivatedCommand::NewCurvesLayer) => {
@@ -22308,6 +22407,15 @@ impl App {
             }
             document_close::CloseStep::Unknown => {}
         }
+    }
+
+    /// A tab's "×" (0.175.0, pointer or assistive technology): closes the
+    /// document at tab position `index` as Close Document would.
+    fn close_document_tab(&mut self, index: usize) {
+        if let Some(id) = document_close::tab_document(&self.shelf, &self.doc, index) {
+            self.request_close_document(id);
+        }
+        self.relayout_after_gallery();
     }
 
     /// Opens the close or quit dialog for `id` and lays it out.
@@ -23778,6 +23886,20 @@ impl App {
             }
         }
 
+        // 0.175.0: a document tab's "×" closes that tab's document — by
+        // id, through Close Document's own path (an unsaved one asks) —
+        // and never selects or switches to the tab first.
+        if button == PointerButton::Primary
+            && let Some(index) = aurora_ui::document_tab_close_at(
+                &self.workspace.tree,
+                self.workspace.document_tabs,
+                position,
+            )
+        {
+            self.close_document_tab(index);
+            return;
+        }
+
         self.begin_panel_press(button, position);
 
         // During a gallery drag (0.131.0) a second button's press is
@@ -24357,7 +24479,7 @@ impl App {
     /// `a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses`.
     #[cfg(target_os = "macos")]
     fn handle_menu_event(&mut self, event: &muda::MenuEvent) {
-        if self.dialog.is_some() {
+        if self.dialog.is_some() && !menu_command_allowed_with_dialog(event.id().as_ref()) {
             // Annotated rather than inferred: `MenuId`'s `AsRef` has no
             // `&str`-typed context to resolve against inside the macro.
             let id: &str = event.id().as_ref();
@@ -24381,6 +24503,9 @@ impl App {
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
+            Some(ActivatedCommand::Quit) => {
+                let _ = self.request_quit();
+            }
             Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             Some(ActivatedCommand::NewCurvesLayer) => {
@@ -24751,14 +24876,6 @@ impl App {
             DialogEffect::Unknown => {
                 tracing::warn!(?result, "a dialog result with no handler");
             }
-        }
-        if document_close::pending_quit_ready(
-            self.quit_pending,
-            self.dialog.is_some(),
-            self.quit_review.is_some(),
-        ) {
-            self.quit_pending = false;
-            let _ = self.request_quit();
         }
     }
 
@@ -25984,6 +26101,15 @@ impl ApplicationHandler<AppEvent> for App {
             self.finish_shutdown();
             el.exit();
             return;
+        }
+        // 0.175.0 (F-3): a window close that waited for a dialog starts
+        // the quit review the first iteration no dialog is open.
+        if document_close::take_pending_quit(
+            &mut self.quit_pending,
+            self.dialog.is_some(),
+            self.quit_review.is_some(),
+        ) {
+            let _ = self.request_quit();
         }
         // 0.174.0: unsaved marks follow every change, relabelled only
         // when one differs.
@@ -28156,6 +28282,7 @@ mod tests {
                         redraw: true,
                         select_tool: Some(tool),
                         dialog: None,
+                        close_tab: None,
                     },
                     "{tool:?}"
                 );
@@ -28349,6 +28476,7 @@ mod tests {
             redraw: true,
             select_tool: None,
             dialog: None,
+            close_tab: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -29069,6 +29197,28 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// 0.175.0 AC-2: an assistive technology's `Click` on a document
+        /// tab's "×" asks the App to close that tab's document — the same
+        /// path as Close Document — and selects nothing itself.
+        #[test]
+        fn an_at_click_on_a_document_tabs_close_button_closes_that_tab() {
+            let mut state = AtState::new(
+                aurora_ui::build_workspace(&crate::test_workspace_scales()),
+                aurora_doc::LayerTree::new(),
+                None,
+            );
+            state.workspace.tree.compute_layout(WIDTH, HEIGHT);
+            let bar = state.workspace.document_tabs;
+            let Some(button) =
+                aurora_widgets::widgets::tab_close_button(&state.workspace.tree, bar, 0)
+            else {
+                unreachable!("the strip is closable")
+            };
+            let effects = state.act(&a11y_request(button, accesskit::Action::Click));
+            assert_eq!(effects.close_tab, Some(0));
+            assert!(effects.dialog.is_none());
         }
 
         /// 0.174.0 AC-3: the close dialog's Save (Enter, the default),

@@ -160,10 +160,17 @@ pub(crate) fn dialog_save_kind(path: &std::path::Path) -> DialogSave {
     }
 }
 
-/// Whether a window close request that waited for an open dialog
-/// (review Q-3) should start the quit review now.
-pub(crate) fn pending_quit_ready(pending: bool, dialog_open: bool, reviewing: bool) -> bool {
-    pending && !dialog_open && !reviewing
+/// Polled once per loop iteration (0.175.0, F-3): a pending quit is taken
+/// — and cleared — the first time no dialog is open, whichever way that
+/// dialog closed, and dropped if a review is already running (it covers
+/// the request). So it can never stay set and fire on a later,
+/// unrelated dialog's close. `true` means "start the quit review now".
+pub(crate) fn take_pending_quit(pending: &mut bool, dialog_open: bool, reviewing: bool) -> bool {
+    if !*pending || dialog_open {
+        return false;
+    }
+    *pending = false;
+    !reviewing
 }
 
 /// Whether a shutdown must keep this run's recovery data (review Q-1):
@@ -196,17 +203,37 @@ pub(crate) fn final_autosave_unsaved(
         let Some(store) = session.tile_store.as_mut() else {
             continue;
         };
-        let _ = worker.supersede(id);
+        let generation = worker.supersede(id);
+        let path = namespace.session_path(id);
+        // F-1 (0.175.0): counted, and named in the index, only when the
+        // canonical file really was (re)written — judged by its mtime, as
+        // the over-budget synchronous autosave does (a failed write leaves
+        // it as it was; a partial one goes to the partial path).
+        let modified = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        };
+        let before = modified(&path);
         crate::write_autosave(
-            &namespace.session_path(id),
+            &path,
             &session.layers,
             &session.history,
             session.canvas_size,
             &mut session.skipped_tiles,
             store,
         );
-        let _ = worker.note_written(id);
+        let after = modified(&path);
         session.park_autosave = None;
+        if after.is_none() || after == before {
+            tracing::warn!(
+                id,
+                "the final autosave did not land; the previous one stays"
+            );
+            continue;
+        }
+        worker.mark_landed(id, generation);
+        let _ = worker.note_written(id);
         written += 1;
     }
     written
@@ -300,6 +327,17 @@ pub(crate) fn after_save(doc: &mut DocumentSession, path: &std::path::Path, land
     doc.path = Some(path.to_path_buf());
     doc.name = crate::display_file_name(path);
     true
+}
+
+/// The document a tab-strip position names (0.175.0): what a tab's "×"
+/// close button closes, by id, through the same `begin_close` path as
+/// Close Document.
+pub(crate) fn tab_document(
+    shelf: &DocumentShelf,
+    active: &DocumentSession,
+    index: usize,
+) -> Option<DocumentId> {
+    shelf.tab_order(active).get(index).copied()
 }
 
 /// Every unsaved document's id, in tab order.

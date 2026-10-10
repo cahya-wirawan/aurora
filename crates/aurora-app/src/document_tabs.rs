@@ -86,12 +86,14 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
     // — *and* that autosave landed complete, so nothing new to write.
     let revision = cx.doc.undo_order.revision;
     let id = cx.doc.id.get();
+    // L-2 (0.175.0): nor while that write is still queued or in flight.
     if let Some((saved, generation)) = cx.doc.park_autosave
         && saved == revision
-        && park
+        && (park
             .worker
             .landed(id)
             .is_some_and(|landed| landed >= generation)
+            || park.worker.outstanding(id, generation))
     {
         return false;
     }
@@ -436,6 +438,24 @@ pub(crate) fn sync_autosave_sessions(
     worker.set_sessions(index_entries(shelf, active, key), Some(active.id.get()))
 }
 
+/// Every open document's plain name in tab order (0.175.0 review P-1): the
+/// tabs' accessible names, with no unsaved marker.
+pub(crate) fn tab_names(shelf: &DocumentShelf, active: &DocumentSession) -> Vec<String> {
+    shelf
+        .tab_order(active)
+        .into_iter()
+        .map(|id| {
+            if id == active.id {
+                active.name.clone()
+            } else {
+                shelf
+                    .get(id)
+                    .map_or_else(String::new, |session| session.name.clone())
+            }
+        })
+        .collect()
+}
+
 /// Every open document's name in tab order, and the active one's index.
 pub(crate) fn tab_labels(shelf: &DocumentShelf, active: &DocumentSession) -> (Vec<String>, usize) {
     let order = shelf.tab_order(active);
@@ -488,6 +508,13 @@ pub(crate) fn sync_document_tab_bar(
         aurora_ui::set_document_tab_descriptions(&mut workspace.tree, bar, descriptions)
     {
         tracing::warn!(?err, "failed to describe the document tabs' unsaved state");
+    }
+    // 0.175.0 review P-1: the accessible names are the documents' own,
+    // without the drawn unsaved marker.
+    if let Err(err) =
+        aurora_ui::set_document_tab_names(&mut workspace.tree, bar, tab_names(shelf, active))
+    {
+        tracing::warn!(?err, "failed to name the document tabs");
     }
     focus.validate(&workspace.tree);
     if on_bar

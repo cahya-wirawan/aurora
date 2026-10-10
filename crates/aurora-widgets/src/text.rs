@@ -457,12 +457,25 @@ pub fn text_runs(
             } else {
                 theme.text.secondary
             };
-            vec![run(
-                &state.label,
-                rgba(color, opacity(state.is_disabled(), theme)),
-                full,
-                HAlign::Center,
-            )]
+            let color = rgba(color, opacity(state.is_disabled(), theme));
+            if state.is_closable() {
+                // 0.175.0: the label stops short of the close button,
+                // drawn here as the tab's own text in the button's box.
+                let close = crate::widgets::tab_close_width(scales).min(full.2);
+                let label_box = (full.0, full.1, full.2 - close, full.3);
+                let close_box = (full.0 + full.2 - close, full.1, close, full.3);
+                vec![
+                    ellipsized(run(&state.label, color, label_box, HAlign::Center)),
+                    run(
+                        crate::widgets::TAB_CLOSE_GLYPH,
+                        color,
+                        close_box,
+                        HAlign::Center,
+                    ),
+                ]
+            } else {
+                vec![run(&state.label, color, full, HAlign::Center)]
+            }
         }
         WidgetKind::TreeItem(state) => {
             // One row tall, like the selection fill: a row's own box
@@ -1253,6 +1266,59 @@ mod tests {
 
     const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
     const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+
+    /// The tab's own paint draws its label short of the button and the
+    /// "×" in the button's box; a plain tab draws one centred label.
+    #[test]
+    fn a_closable_tab_draws_its_label_and_a_close_glyph() {
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(256.0_f32),
+                height: taffy::style_helpers::length(120.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = crate::widgets::test_scales();
+        let Ok(bar) = crate::widgets::insert_tab_bar(
+            &mut tree,
+            root,
+            &scales,
+            "Panels",
+            vec!["Tab 0".to_owned(), "Tab 1".to_owned()],
+            0,
+        ) else {
+            unreachable!("inserted")
+        };
+        assert!(matches!(
+            crate::widgets::set_tab_bar_closable(&mut tree, bar, true),
+            Ok(true)
+        ));
+        tree.compute_layout(256.0, 120.0);
+        let theme = dark_theme();
+        let Some(tab) = crate::widgets::tab_bar_state(&tree, bar)
+            .ok()
+            .and_then(|state| state.tabs().first().copied())
+        else {
+            unreachable!("a tab")
+        };
+        let Some(bounds) = tree.bounds(tab) else {
+            unreachable!("laid out")
+        };
+        let runs = text_runs(&tree, tab, bounds, bounds, None, &theme, &scales);
+        let texts: Vec<&str> = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(texts, vec!["Tab 0", crate::widgets::TAB_CLOSE_GLYPH]);
+        let close = crate::widgets::tab_close_width(&scales);
+        #[allow(clippy::cast_precision_loss)]
+        let right = bounds.x as f32 + bounds.width as f32;
+        assert!(
+            runs.first()
+                .is_some_and(|run| run.rect.0 + run.rect.2 <= right - close + 0.5)
+        );
+        assert!(
+            runs.get(1)
+                .is_some_and(|run| (run.rect.0 + run.rect.2 - right).abs() < 0.5)
+        );
+    }
 
     fn dark_theme() -> Theme {
         let Ok(palette) = Palette::from_toml_str(PALETTE_TOML) else {

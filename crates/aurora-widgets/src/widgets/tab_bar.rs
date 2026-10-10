@@ -248,6 +248,21 @@ struct TabMetrics {
     pad_h: f32,
     /// `row_height(scales)`.
     min_height: f32,
+    /// The close button's width on a closable bar (0.175.0):
+    /// [`tab_close_width`].
+    close_width: f32,
+}
+
+/// What a closable tab's close button shows (0.175.0): U+00D7
+/// MULTIPLICATION SIGN, which the bundled Inter maps.
+pub const TAB_CLOSE_GLYPH: &str = "\u{d7}";
+
+/// A closable tab's close button width (0.175.0): one control row, so the
+/// button is a square hit target the height of a tab's text row, and the
+/// tab's label stops short of it.
+#[must_use]
+pub fn tab_close_width(scales: &Scales) -> f32 {
+    row_height(scales)
 }
 
 /// A tab bar's own state — the payload of its bar
@@ -271,6 +286,13 @@ pub struct TabBarState {
     /// missing means none. Kept across [`set_tab_labels`], so a caller
     /// that changes both sets the labels first.
     descriptions: Vec<String>,
+    /// Each tab's accessible name by position (0.175.0 review P-1), when
+    /// it differs from the drawn label; empty or missing means the label.
+    /// Kept across [`set_tab_labels`], like the descriptions.
+    names: Vec<String>,
+    /// Whether each tab carries a close button (0.175.0,
+    /// [`set_tab_bar_closable`]).
+    closable: bool,
     /// Always `< labels.len()` — a tab bar has exactly one selected tab.
     selected: usize,
     /// One `Tab` child per label, in order.
@@ -285,6 +307,8 @@ impl TabBarState {
             disabled: false,
             labels,
             descriptions: Vec::new(),
+            names: Vec::new(),
+            closable: false,
             selected,
             tabs: Vec::new(),
             metrics,
@@ -294,6 +318,23 @@ impl TabBarState {
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         self.disabled
+    }
+
+    /// Tab `index`'s accessible name (0.175.0 review P-1): its set name,
+    /// else its drawn label.
+    #[must_use]
+    pub fn accessible_name(&self, index: usize) -> &str {
+        self.names
+            .get(index)
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.labels.get(index))
+            .map_or("", String::as_str)
+    }
+
+    /// Whether the bar's tabs carry close buttons (0.175.0).
+    #[must_use]
+    pub fn is_closable(&self) -> bool {
+        self.closable
     }
 
     /// Every tab's accessible description by position (0.174.0); empty
@@ -419,9 +460,18 @@ pub struct TabState {
     pub label: String,
     selected: bool,
     disabled: bool,
+    /// Whether this tab has a close button (0.175.0), mirrored from the bar.
+    closable: bool,
 }
 
 impl TabState {
+    /// Whether this tab has a close button (0.175.0): its label then
+    /// stops short of the button, which the tab's own paint draws.
+    #[must_use]
+    pub fn is_closable(&self) -> bool {
+        self.closable
+    }
+
     #[must_use]
     pub fn is_selected(&self) -> bool {
         self.selected
@@ -544,6 +594,7 @@ pub fn insert_tab_bar(
         pad_v: spacing(scales.spacing.xs),
         pad_h: spacing(scales.spacing.sm),
         min_height: row_height(scales),
+        close_width: tab_close_width(scales),
     };
     let state = TabBarState::new(label.to_owned(), tabs, selected, metrics);
     let bar = tree.insert(
@@ -696,6 +747,7 @@ pub fn set_tab_labels(
                     label: String::new(),
                     selected: false,
                     disabled,
+                    closable: false,
                 }),
             )?);
         }
@@ -780,6 +832,180 @@ fn with_tab_bar_mut<T>(
     Ok(result)
 }
 
+/// A closable tab's style (0.175.0): the plain tab style with room for
+/// the close button on the right.
+fn tab_style_for(metrics: TabMetrics, closable: bool) -> Style {
+    let mut style = tab_style(metrics);
+    if closable {
+        style.padding.right = length(metrics.pad_h + metrics.close_width);
+    }
+    style
+}
+
+/// A close button's box: pinned to its tab's right edge, full height.
+fn close_style(metrics: TabMetrics) -> Style {
+    Style {
+        position: taffy::Position::Absolute,
+        inset: LayoutRect {
+            left: auto(),
+            right: zero(),
+            top: zero(),
+            bottom: zero(),
+        },
+        size: Size {
+            width: length(metrics.close_width),
+            height: auto(),
+        },
+        ..Default::default()
+    }
+}
+
+/// A close button's node: a `Role::Button` named "Close `label`" that
+/// declares `Click` — and **not** `Focus`, so it is no `Tab` stop: the
+/// tab list keeps its one roving stop (the APG tabs pattern), and the
+/// keyboard closes the selected tab with the app's own close chord.
+fn close_node(label: &str, disabled: bool) -> Node {
+    let mut node = Node::new(Role::Button);
+    node.set_label(format!("Close {label}"));
+    if disabled {
+        node.set_disabled();
+    } else {
+        node.add_action(Action::Click);
+    }
+    node
+}
+
+/// The close button of `tab`, if it has one: its one `Role::Button`
+/// child.
+fn close_child(tree: &WidgetTree<WidgetKind>, tab: WidgetId) -> Option<WidgetId> {
+    tree.children(tab)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .find(|&child| {
+            matches!(tree.payload(child), Some(WidgetKind::Container))
+                && tree
+                    .accessibility(child)
+                    .is_some_and(|node| node.role() == Role::Button)
+        })
+}
+
+/// Makes every tab's close button match the bar (0.175.0): present with
+/// the right name on a closable bar, absent otherwise, and each tab's
+/// padding and `closable` flag to suit. Only what differs is touched.
+fn sync_close_buttons(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
+    let current = state(tree, bar)?;
+    let (closable, metrics, disabled) = (current.closable, current.metrics, current.disabled);
+    let tabs = current.tabs.clone();
+    let names: Vec<String> = (0..tabs.len())
+        .map(|index| current.accessible_name(index).to_owned())
+        .collect();
+    for (index, &tab) in tabs.iter().enumerate() {
+        // P-1: the close button is named after the tab's accessible name.
+        let label = names.get(index).map_or("", String::as_str);
+        let was = matches!(tree.payload(tab), Some(WidgetKind::Tab(t)) if t.closable);
+        if was != closable {
+            tree.set_style(tab, tab_style_for(metrics, closable))?;
+            if let Some(WidgetKind::Tab(t)) = tree.payload_mut(tab) {
+                t.closable = closable;
+            }
+            tree.mark_dirty(tab)?;
+        }
+        let expected = close_node(label, disabled);
+        match (closable, close_child(tree, tab)) {
+            (true, None) => {
+                let _ = tree.insert(tab, close_style(metrics), expected, WidgetKind::Container)?;
+            }
+            (true, Some(button)) => {
+                if tree.accessibility(button) != Some(&expected) {
+                    tree.set_accessibility(button, expected)?;
+                    tree.mark_dirty(button)?;
+                }
+            }
+            (false, Some(button)) => tree.remove(button)?,
+            (false, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Gives every tab of `bar` a close button, or takes them away (0.175.0).
+/// `Ok(false)` when it already was so. A close button never selects or
+/// focuses anything itself: a caller hit-tests it
+/// ([`tab_close_index`]) and closes what the tab names.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`] if
+/// `bar` is not a tab bar.
+pub fn set_tab_bar_closable(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    closable: bool,
+) -> Result<bool, WidgetError> {
+    if state(tree, bar)?.closable == closable {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.closable = closable;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// The close button of tab `index`, if the bar is closable.
+#[must_use]
+pub fn tab_close_button(
+    tree: &WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    index: usize,
+) -> Option<WidgetId> {
+    let tab = *state(tree, bar).ok()?.tabs.get(index)?;
+    close_child(tree, tab)
+}
+
+/// Which tab's close button `id` is, if it is one of `bar`'s and can be
+/// used: `None` on a disabled bar (0.175.0 review P-2 — its close node
+/// declares no `Click`), so neither a pointer nor an assistive-technology
+/// route can close through it.
+#[must_use]
+pub fn tab_close_index(
+    tree: &WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    id: WidgetId,
+) -> Option<usize> {
+    let tab = tree.parent(id)?;
+    let current = state(tree, bar).ok()?;
+    if current.disabled {
+        return None;
+    }
+    let index = current.index_of(tab)?;
+    (close_child(tree, tab) == Some(id)).then_some(index)
+}
+
+/// Sets each tab's accessible name by position (0.175.0 review P-1),
+/// when it should differ from the drawn label (empty means the label) —
+/// a marker drawn in the label, say, that the name should not announce.
+/// Close buttons follow ("Close `name`"). `Ok(false)` when unchanged.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] if `bar` is not a tab bar.
+pub fn set_tab_accessible_names(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    names: Vec<String>,
+) -> Result<bool, WidgetError> {
+    if state(tree, bar)?.names == names {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.names = names;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 /// The `Tab` children of `bar`, in order.
 fn tab_children(tree: &WidgetTree<WidgetKind>, bar: WidgetId) -> Vec<WidgetId> {
     tree.children(bar)
@@ -811,6 +1037,11 @@ fn tab_children(tree: &WidgetTree<WidgetKind>, bar: WidgetId) -> Vec<WidgetId> {
 /// children behind, which the next reconcile finds and replaces (they
 /// are not the tracked `tabs`), so it cannot leave a permanent duplicate.
 fn reconcile(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
+    reconcile_tabs(tree, bar)?;
+    sync_close_buttons(tree, bar)
+}
+
+fn reconcile_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
     let current = state(tree, bar)?;
     let intact =
         current.tabs.len() == current.labels.len() && tab_children(tree, bar) == current.tabs;
@@ -832,7 +1063,8 @@ fn reconcile(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), Wid
                     if t.selected == selected && t.disabled == current.disabled && t.label == label
             );
             let description = current.descriptions.get(index).map_or("", String::as_str);
-            let expected = tab_node(label, description, index, len, selected, current.disabled);
+            let name = current.accessible_name(index);
+            let expected = tab_node(name, description, index, len, selected, current.disabled);
             let node_ok = tree.accessibility(tab) == Some(&expected);
             (!(payload_ok && node_ok)).then_some((tab, index, expected))
         })
@@ -869,19 +1101,24 @@ fn rebuild_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), 
     let disabled = current.disabled;
     let style = tab_style(current.metrics);
     let descriptions = current.descriptions.clone();
+    let names: Vec<String> = (0..labels.len())
+        .map(|index| current.accessible_name(index).to_owned())
+        .collect();
     let len = labels.len();
     let mut tabs = Vec::with_capacity(len);
     for (index, label) in labels.into_iter().enumerate() {
         let on = index == selected;
         let description = descriptions.get(index).map_or("", String::as_str);
+        let name = names.get(index).map_or("", String::as_str);
         tabs.push(tree.insert(
             bar,
             style.clone(),
-            tab_node(&label, description, index, len, on, disabled),
+            tab_node(name, description, index, len, on, disabled),
             WidgetKind::Tab(TabState {
                 label,
                 selected: on,
                 disabled,
+                closable: false,
             }),
         )?);
     }
@@ -927,6 +1164,7 @@ mod tests {
             pad_v: 8.0,
             pad_h: 12.0,
             min_height: 21.0,
+            close_width: 21.0,
         };
         TabBarState::new("Panels".to_owned(), labels(n), selected, metrics)
     }
@@ -1957,5 +2195,122 @@ mod tests {
             children,
             "no tab added or removed"
         );
+    }
+
+    // -- 0.175.0: closable tabs --
+
+    fn closable(selected: usize) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, bar) = inserted(selected);
+        assert!(matches!(
+            super::set_tab_bar_closable(&mut tree, bar, true),
+            Ok(true)
+        ));
+        assert!(
+            matches!(super::set_tab_bar_closable(&mut tree, bar, true), Ok(false)),
+            "no-op"
+        );
+        (tree, bar)
+    }
+
+    fn close_name(tree: &WidgetTree<WidgetKind>, bar: WidgetId, index: usize) -> Option<String> {
+        super::tab_close_button(tree, bar, index)
+            .and_then(|button| tree.accessibility(button))
+            .and_then(|node| node.label().map(str::to_owned))
+    }
+
+    /// Every tab gets one close button: a `Role::Button` named "Close
+    /// `label`" that declares `Click` but not `Focus` (no `Tab` stop), at
+    /// the tab's right edge, one control row wide; `tab_close_index` maps
+    /// it back to its tab, and nothing else maps.
+    #[test]
+    fn a_closable_bar_gives_every_tab_a_named_close_button() {
+        let (mut tree, bar) = closable(0);
+        assert!(snapshot(&tree, bar).is_closable());
+        tree.compute_layout(256.0, 120.0);
+        let scales = test_scales();
+        for index in 0..3 {
+            let Some(button) = super::tab_close_button(&tree, bar, index) else {
+                unreachable!("tab {index} has a close button")
+            };
+            let Some(node) = tree.accessibility(button) else {
+                unreachable!("a node")
+            };
+            assert_eq!(node.role(), Role::Button);
+            let name = labels(3).get(index).map(|label| format!("Close {label}"));
+            assert_eq!(node.label(), name.as_deref());
+            assert!(node.supports_action(Action::Click));
+            assert!(!node.supports_action(Action::Focus), "not a Tab stop");
+            assert_eq!(super::tab_close_index(&tree, bar, button), Some(index));
+            let tab = snapshot(&tree, bar).tabs().get(index).copied();
+            let (Some(tab), Some(b), Some(t)) = (
+                tab,
+                tree.bounds(button),
+                tab.and_then(|tab| tree.bounds(tab)),
+            ) else {
+                unreachable!("laid out")
+            };
+            assert!(matches!(tree.payload(tab), Some(WidgetKind::Tab(t)) if t.is_closable()));
+            assert_eq!(
+                b.x + i64::from(b.width),
+                t.x + i64::from(t.width),
+                "at the tab's right edge"
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let width = super::tab_close_width(&scales).round() as i64;
+            assert!(
+                (i64::from(b.width) - width).abs() <= 1,
+                "{} vs {width}",
+                b.width
+            );
+            assert_eq!(
+                super::tab_close_index(&tree, bar, tab),
+                None,
+                "a tab is not its button"
+            );
+        }
+        assert_structure_is_sound(&tree, bar);
+    }
+
+    /// Relabel, grow, shrink, disable and un-close all keep exactly one
+    /// correctly named close button per tab (or none).
+    #[test]
+    fn close_buttons_follow_relabels_disable_and_unclose() {
+        let (mut tree, bar) = closable(0);
+        let names = vec!["a.png".to_owned(), "b.aur".to_owned()];
+        assert!(set_tab_labels(&mut tree, bar, names, 1).is_ok());
+        assert_eq!(close_name(&tree, bar, 0).as_deref(), Some("Close a.png"));
+        assert_eq!(close_name(&tree, bar, 1).as_deref(), Some("Close b.aur"));
+        assert_eq!(
+            close_name(&tree, bar, 2),
+            None,
+            "the removed tab's button went with it"
+        );
+        let grown = vec!["a.png".to_owned(), "b.aur".to_owned(), "c.psd".to_owned()];
+        assert!(set_tab_labels(&mut tree, bar, grown, 0).is_ok());
+        assert_eq!(close_name(&tree, bar, 2).as_deref(), Some("Close c.psd"));
+        for index in 0..3 {
+            let tab = snapshot(&tree, bar).tabs().get(index).copied();
+            let buttons = tab
+                .and_then(|tab| tree.children(tab))
+                .map_or(0, <[WidgetId]>::len);
+            assert_eq!(buttons, 1, "exactly one close button on tab {index}");
+        }
+        assert!(set_tab_bar_disabled(&mut tree, bar, true).is_ok());
+        let disabled = super::tab_close_button(&tree, bar, 0).and_then(|b| tree.accessibility(b));
+        assert!(
+            disabled.is_some_and(|node| node.is_disabled() && !node.supports_action(Action::Click))
+        );
+        assert!(matches!(
+            super::set_tab_bar_closable(&mut tree, bar, false),
+            Ok(true)
+        ));
+        for index in 0..3 {
+            assert_eq!(super::tab_close_button(&tree, bar, index), None);
+            let tab = snapshot(&tree, bar).tabs().get(index).copied();
+            assert!(tab.is_some_and(
+                |tab| matches!(tree.payload(tab), Some(WidgetKind::Tab(t)) if !t.is_closable())
+            ));
+        }
+        assert_structure_is_sound(&tree, bar);
     }
 }

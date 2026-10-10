@@ -121,6 +121,10 @@
   .tab { padding: var(--spacing-xs) var(--spacing-sm); font-size: var(--type-size-sm); color: var(--text-secondary); border-bottom: 2px solid transparent; }
   .tab.active { color: var(--text-primary); border-color: var(--accent-primary); }
   .tab.state-focus { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+  /* 0.175.0: a closable tab's "×" is the tab's own text colour, in a
+     square one control row wide at the tab's right edge. */
+  .tab .tab-close { display: inline-block; min-width: var(--size-row-height, 1.5em); text-align: center; color: inherit; }
+  .tabbar.state-disabled { opacity: var(--state-disabled-opacity); }
 
   /* --- Tooltip --- */
   .tooltip {
@@ -228,6 +232,20 @@
           <div class="tab state-focus">Paths</div>
         </div>
         <span class="label">active / default / focused</span>
+      </div>
+      <div class="state-cell">
+        <div class="tabbar">
+          <div class="tab active">photo.aur <span class="tab-close">&times;</span></div>
+          <div class="tab">&bull; Untitled 2 <span class="tab-close">&times;</span></div>
+        </div>
+        <span class="label">closable (0.175.0): active / unsaved</span>
+      </div>
+      <div class="state-cell">
+        <div class="tabbar state-disabled">
+          <div class="tab active">photo.aur <span class="tab-close">&times;</span></div>
+          <div class="tab">scan.psd <span class="tab-close">&times;</span></div>
+        </div>
+        <span class="label">closable, disabled</span>
       </div>
     </div>
   </section>
