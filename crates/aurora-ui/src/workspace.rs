@@ -88,7 +88,7 @@ const RAIL_MAX_WIDTH: f32 = 600.0;
 /// The rail's own starting width — the same share of a 1000px-wide
 /// viewport the old 3:1 canvas:rail flex ratio already gave it (750/250),
 /// kept for continuity rather than picked fresh.
-const RAIL_WIDTH_DEFAULT: f32 = 250.0;
+pub const RAIL_WIDTH_DEFAULT: f32 = 250.0;
 
 /// The main workspace: a canvas area and a side rail holding the
 /// Layers/Properties/History panels the approved mockup shows.

@@ -109,9 +109,10 @@ pub use tools_panel::{
     tools_panel_contains,
 };
 pub use workspace::{
-    FloatFrame, OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RailSlot, Workspace,
-    build_workspace, close_workspace_panel, docked_sizing, expand_rail_showing, floating_index_at,
-    panel_focus_target, rail_collapsed, rail_width, raise_floating, refocus_workspace,
-    select_panel_tab, set_rail_collapsed, set_rail_width, show_workspace_panel,
-    sync_floating_frames, sync_floating_shown, toggle_rail_collapsed, toggle_workspace_panel,
+    FloatFrame, OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RAIL_WIDTH_DEFAULT,
+    RailSlot, Workspace, build_workspace, close_workspace_panel, docked_sizing,
+    expand_rail_showing, floating_index_at, panel_focus_target, rail_collapsed, rail_width,
+    raise_floating, refocus_workspace, select_panel_tab, set_rail_collapsed, set_rail_width,
+    show_workspace_panel, sync_floating_frames, sync_floating_shown, toggle_rail_collapsed,
+    toggle_workspace_panel,
 };

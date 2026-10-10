@@ -540,6 +540,7 @@ use winit::window::{Window, WindowId};
 mod background_autosave;
 mod background_open;
 mod prepared_pixels;
+mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
     background_open_step,
@@ -3115,6 +3116,18 @@ fn apply_workspace_layout(
     if let Err(err) = aurora_ui::apply_dock_arrangement(workspace, &arrangement, scales) {
         tracing::warn!(?err, "failed to apply the saved panel arrangement");
     }
+    apply_saved_collapse(workspace, layout);
+    // 0.165.0: the rail collapsed to its label strip, or expanded, as saved.
+    if let Err(err) = aurora_ui::set_rail_collapsed(workspace, layout.rail_collapsed) {
+        tracing::warn!(?err, "failed to apply the saved rail collapse");
+    }
+}
+
+/// Each slot collapsed or expanded as `layout` saved it (a group as its
+/// selected member was saved; floating slots too) — shared by a load
+/// ([`apply_workspace_layout`]) and a workspace preset switch
+/// (`workspace_presets::apply_layout_keeping_focus`, 0.168.0).
+fn apply_saved_collapse(workspace: &mut aurora_ui::Workspace, layout: &WorkspaceLayout) {
     let saved_collapsed = |panel: aurora_ui::DockPanel| match panel {
         aurora_ui::DockPanel::Layers => layout.layers_collapsed,
         aurora_ui::DockPanel::Properties => layout.properties_collapsed,
@@ -3149,10 +3162,6 @@ fn apply_workspace_layout(
         if let Err(err) = result {
             tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
         }
-    }
-    // 0.165.0: the rail collapsed to its label strip, or expanded, as saved.
-    if let Err(err) = aurora_ui::set_rail_collapsed(workspace, layout.rail_collapsed) {
-        tracing::warn!(?err, "failed to apply the saved rail collapse");
     }
 }
 
@@ -4691,12 +4700,17 @@ enum ActivatedCommand {
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
     MovePanel(aurora_ui::DockPanel, aurora_ui::PanelMove),
-    /// Reset Panel Layout (0.166.0): the default arrangement back
-    /// ([`reset_panel_arrangement`]); needs `Scales` too.
+    /// Reset Panel Layout (0.166.0): since 0.168.0 the Essentials
+    /// workspace preset applied and made active (`App::reset_panels`);
+    /// needs `Scales` too.
     ResetPanels,
     /// "Float PANEL Panel" (`true`) / "Dock PANEL Panel" (`false`),
     /// 0.167.0 ([`PANEL_FLOAT_COMMANDS`], run by [`run_panel_float`]).
     SetPanelFloating(aurora_ui::DockPanel, bool),
+    /// A workspace preset command (0.168.0, `workspace_presets`): switch,
+    /// reset the active one, save as, or delete — run by
+    /// `App::run_workspace_command`.
+    Workspace(workspace_presets::WorkspaceCommand),
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -5028,6 +5042,9 @@ fn activate_command(
     {
         return Some(ActivatedCommand::SetPanelFloating(panel, floating));
     }
+    if let Some(command) = workspace_presets::workspace_command_for(id) {
+        return Some(ActivatedCommand::Workspace(command));
+    }
     if id == COMMAND_FILE_OPEN {
         return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
     }
@@ -5215,29 +5232,80 @@ fn run_panel_float(
     }
 }
 
-/// Reset Panel Layout (0.166.0): the default arrangement
-/// (`aurora_ui::DockArrangement::default`) back, then the hidden-focus
-/// repair. Collapsed, closed and rail-collapsed states are left as they
-/// are. Returns whether the arrangement changed.
+/// The document state [`refill_reopened_panels`] repopulates from.
+struct RefillDocument<'a> {
+    layers: &'a aurora_doc::LayerTree,
+    undo_order: &'a UndoOrder,
+    tool: aurora_ui::Tool,
+    tool_settings: &'a ToolSettings,
+}
+
+/// Repopulates the panels a workspace preset's apply reopened (0.168.0
+/// review J5): a close empties a panel's body (`aurora_ui::close_panel`),
+/// and a preset only expands it, so each reopened panel is refilled
+/// through the refresh the app already uses for it — Layers through
+/// [`rebuild_layer_rows`] (keeping the active layer), History through
+/// [`refresh_history_panel`], Properties through
+/// [`refresh_properties_panel`]. The panels' control strips live outside
+/// their bodies and survive a close, so they need nothing here.
+#[allow(clippy::too_many_arguments)]
+fn refill_reopened_panels(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    reopened: &[aurora_ui::DockPanel],
+    document: &RefillDocument<'_>,
+    layer_rows: &mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+) {
+    for &panel in reopened {
+        match panel {
+            aurora_ui::DockPanel::Layers => {
+                let preferred = *active_layer;
+                rebuild_layer_rows(
+                    workspace,
+                    focus,
+                    scales,
+                    document.layers,
+                    layer_rows,
+                    active_layer,
+                    view,
+                    preferred,
+                );
+            }
+            aurora_ui::DockPanel::History => {
+                refresh_history_panel(workspace, document.undo_order);
+            }
+            aurora_ui::DockPanel::Properties => {
+                refresh_properties_panel(workspace, document.tool, document.tool_settings);
+            }
+        }
+    }
+}
+
+/// Reset Panel Layout (0.166.0): since 0.168.0 the whole Essentials
+/// workspace preset back (`workspace_presets::essentials_layout` — the
+/// default arrangement, every float docked, the rail expanded at its
+/// default width, nothing collapsed, the default tab), keeping focus
+/// where it can. In the app it is an alias of "Workspace: Essentials",
+/// so it also makes Essentials the active preset
+/// ([`ActivatedCommand::ResetPanels`]). Returns whether the arrangement
+/// changed. The app's Reset Panel Layout runs that switch
+/// (`App::reset_panels`), which applies this same layout through the same
+/// function; this wrapper is what the 0.166.0/0.167.0 tests call.
+#[cfg(test)]
 fn reset_panel_arrangement(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     scales: &Scales,
 ) -> bool {
-    // Review I2: through the focus-keeping apply, so focus on a tab the
-    // rebuild removes follows its panel instead of being cleared.
-    match aurora_ui::apply_dock_arrangement_keeping_focus(
+    workspace_presets::apply_layout_keeping_focus(
         workspace,
         focus,
-        &aurora_ui::DockArrangement::default(),
+        &workspace_presets::essentials_layout(),
         scales,
-    ) {
-        Ok(changed) => changed,
-        Err(err) => {
-            tracing::warn!(?err, "failed to reset the panel layout");
-            false
-        }
-    }
+    )
 }
 
 // -- Drag-to-redock pointer routing (0.166.0; review I1) --
@@ -8725,6 +8793,16 @@ fn handle_palette_key(
             }
         }
         Key::Named(NamedKey::Enter) => {
+            // 0.168.0: the workspace name prompt checks the typed name; a
+            // refused one keeps the prompt open with the reason shown.
+            match workspace_presets::name_prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(command)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::Workspace(command));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             let selected = command_palette_state(&workspace.tree, root)
                 .ok()
                 .and_then(|state| state.selected())
@@ -8740,6 +8818,7 @@ fn handle_palette_key(
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
                     tracing::warn!(?err, "failed to update command palette query");
                 }
+                workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
             }
         }
         // Copy/paste against the real system clipboard, on the platform's
@@ -8767,6 +8846,7 @@ fn handle_palette_key(
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
                     tracing::warn!(?err, "failed to update command palette query");
                 }
+                workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
             }
         }
         // A plain, unmodified character types into the query. A
@@ -8790,6 +8870,7 @@ fn handle_palette_key(
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
                     tracing::warn!(?err, "failed to update command palette query");
                 }
+                workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
             }
         }
         _ => {}
@@ -20308,6 +20389,10 @@ struct App {
     /// callers already use, not a reactive save on every
     /// resize/collapse.
     layout_path: Option<PathBuf>,
+    /// The workspace presets file, beside [`Self::layout_path`] (0.168.0).
+    presets_path: Option<PathBuf>,
+    /// The user's workspace presets and the active one (0.168.0).
+    presets: workspace_presets::WorkspacePresets,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
     /// read once the real window exists (`resumed`) and kept current via
     /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
@@ -20774,6 +20859,13 @@ impl App {
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace, &scales);
         }
+        let presets_path = layout_path
+            .as_deref()
+            .map(workspace_presets::presets_path_for);
+        let presets = presets_path
+            .as_deref()
+            .map(workspace_presets::load_presets)
+            .unwrap_or_default();
         // Opened *before* recovery, not after: `recover_document` writes
         // the autosave's own tiles straight into a live store, so the
         // store has to exist first.
@@ -20880,6 +20972,8 @@ impl App {
             dialog,
             marker_path,
             layout_path,
+            presets_path,
+            presets,
             skipped_tiles,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
@@ -21029,6 +21123,7 @@ impl App {
     /// result-row count, which changes each row's own share of the
     /// body's height (`aurora_widgets::widgets::command_palette`'s own
     /// `row_style`), not just the palette's own first appearance.
+    #[allow(clippy::too_many_lines)]
     fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -21096,6 +21191,7 @@ impl App {
         // edits nothing and the editor follows the document (0.156.0).
         self.end_curves_drag_for_key();
         let tool_before = self.tool;
+        let palette_was_open = self.command_palette.is_some();
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
@@ -21114,6 +21210,13 @@ impl App {
             event.text.as_deref(),
             &mut self.clipboard,
             &mut self.file_dialog,
+        );
+        // 0.168.0: a palette this key opened lists the workspace presets.
+        workspace_presets::add_workspace_entries_if_opened(
+            &mut self.workspace,
+            palette_was_open,
+            self.command_palette,
+            &self.presets,
         );
         // Review RT136-2: a radius drag cannot carry over onto the tool
         // this key just switched to.
@@ -21139,6 +21242,7 @@ impl App {
             }
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
+            Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
             None => {}
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
@@ -23156,6 +23260,7 @@ impl App {
             }
             Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
             Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
+            Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
             None => {}
         }
         self.push_accessibility();
@@ -23465,10 +23570,54 @@ impl App {
         self.relayout_after_gallery();
     }
 
-    /// Reset Panel Layout ([`reset_panel_arrangement`], 0.166.0).
+    /// Reset Panel Layout (0.166.0): since 0.168.0 an alias of
+    /// "Workspace: Essentials" — the Essentials preset applied
+    /// (`reset_panel_arrangement`'s layout) and made active.
     fn reset_panels(&mut self) {
+        self.run_workspace_command(workspace_presets::WorkspaceCommand::Switch(
+            workspace_presets::ESSENTIALS.to_owned(),
+        ));
+    }
+
+    /// A workspace preset command (0.168.0,
+    /// `workspace_presets::run_workspace_command`): ends a live panel drag
+    /// first, saves the presets file when they changed, then re-lays out
+    /// (which clamps floats into the window) and re-announces.
+    fn run_workspace_command(&mut self, command: workspace_presets::WorkspaceCommand) {
         self.cancel_panel_drag();
-        reset_panel_arrangement(&mut self.workspace, &mut self.focus, &self.scales);
+        let outcome = workspace_presets::run_workspace_command(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            &mut self.presets,
+            &self.scales,
+            command,
+        );
+        if outcome.presets_changed
+            && let Some(path) = self.presets_path.as_deref()
+            && let Err(err) = workspace_presets::save_presets(path, &self.presets)
+        {
+            tracing::warn!(?err, path = %path.display(), "failed to save the workspace presets");
+        }
+        // Review J5: a reopened panel is refilled, never left empty.
+        let reopened = workspace_presets::emptied_panels(&self.workspace);
+        if outcome.applied && !reopened.is_empty() {
+            refill_reopened_panels(
+                &mut self.workspace,
+                &mut self.focus,
+                &self.scales,
+                &reopened,
+                &RefillDocument {
+                    layers: &self.layers,
+                    undo_order: &self.undo_order,
+                    tool: self.tool,
+                    tool_settings: &self.tool_settings,
+                },
+                &mut self.layer_rows,
+                &mut self.active_layer,
+                &mut self.canvas_view,
+            );
+        }
         self.relayout_after_gallery();
     }
 

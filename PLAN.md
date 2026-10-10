@@ -26,7 +26,70 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-10, 0.167.0): floating panels, inside the main
+**Latest (2026-10-10, 0.168.0): workspace presets, Photoshop-style.**
+Workspace round 6. A built-in **Essentials** preset is the default
+layout (`workspace_presets::essentials_layout`: the default arrangement,
+every panel docked, the rail expanded at the now-public
+`aurora_ui::RAIL_WIDTH_DEFAULT`, nothing collapsed, the default tab).
+**Save Workspace As…** (palette) captures the live `WorkspaceLayout` —
+the arrangement with floats and their stacking, rail width, rail
+collapse, each panel's collapse, the selected tabs; never tool settings
+or document state — under a typed name and makes it active. Name entry
+is a **prompt**: the command palette's own widget with its own label
+("Workspace Name") and no filtering (new generic
+`aurora_widgets::widgets::insert_command_prompt`,
+`set_command_palette_commands`, `set_command_palette_message`), chosen
+over a dialog with a text field because `insert_dialog` hosts no field
+and dialog actions are not routed back to the app (they only log), while
+the palette already has typing, paste, Escape, Enter, focus on open and a
+`Role::TextInput` node; the prompt's one row says what Enter does.
+Validation: trimmed, non-empty, no control, separator or bidi
+override/isolate characters (review J1), at most
+`WORKSPACE_NAME_MAX_CHARS` (64 scalar values), never "Essentials" in any
+case; a refused name keeps the
+prompt open, its row and the field's accessible description carrying the
+reason, withdrawn on the next edit. Saving over a user preset's name
+(case-insensitive) is **confirmed in the prompt itself** — it reopens
+with the name, a "Replace Workspace …" row and a description saying so;
+a second Enter overwrites (taking the new spelling), Escape cancels.
+**Dynamic palette entries**, appended when a key opens the palette
+(`add_workspace_entries_if_opened`; the static `palette_commands` is
+unchanged): "Workspace: Essentials", "Workspace: `name`" per preset,
+"Reset `active`", "Save Workspace As…", "Delete Workspace: `name`" per
+user preset (never Essentials). **Switching** applies the preset's
+layout through `apply_dock_arrangement_keeping_focus`, then rail width,
+collapse, the rail's collapse and the hidden-focus repair
+(`apply_layout_keeping_focus`); floats are clamped by the next layout.
+**Active preset**: edits after a switch change the live layout only;
+"Reset `name`" re-applies the saved state; **Reset Panel Layout is now an
+alias of "Workspace: Essentials"** (the whole Essentials layout — so,
+unlike 0.166.0/0.167.0, it also expands collapsed panels and the rail and
+restores the default width and tab — and Essentials becomes active).
+**Delete** removes a user preset; Essentials cannot be deleted; deleting
+the active one makes Essentials active and leaves the live layout alone.
+**Persistence: a separate file**, `workspace-presets.postcard` beside the
+layout file, not a sixth `WorkspaceLayout` version: the layout's decode
+chain (current → V4 → V3 → V2 → V1) is untouched, a damaged presets file
+can never cost the live layout, and each preset's layout is its own byte
+string decoded with that same chain, so one bad preset is dropped alone.
+Header magic `AWSP` + version 1 + active name + count; decoding never
+fails (garbage, wrong magic/version or a truncated header → Essentials
+only; a truncated entry keeps those before it; an invalid, duplicate or
+undecodable entry is dropped; each kept arrangement repaired with
+`arrangement_from_saved`; a non-finite rail width → default; a dangling
+active name → Essentials). Written to a temporary file, synced, renamed
+(the live layout file is still written in place, unchanged). Palette
+only — not in the macOS menus. Nothing reaches `History`. Full gate with
+`AURORA_REQUIRE_GPU=1`, one pass: **3,139 passed, 0 failed, 61 ignored,
+0 skipped** (3,143 after the review revision: control/bidi names refused,
+100-preset and 1 MiB caps, the temporary cleaned up on failure, reopened
+panels refilled), strict rustdoc, `cargo deny`, contrast exit 0. Branch `006-workspace_presets`.
+**Not verified:** a human typing a name or switching workspaces on real
+hardware, VoiceOver reading the prompt's description, the macOS menu
+dispatch arm (one added line, not compiled here).
+Details: "Next action", addendum 0.168.0.
+
+**Previously (2026-10-10, 0.167.0): floating panels, inside the main
 window.** Workspace round 5, second half. A panel or tab dragged past
 `PANEL_DRAG_THRESHOLD` and dropped anywhere over the canvas area (not
 the rail, status bar, tools panel or options bar) floats there, the
@@ -80,7 +143,7 @@ expands a collapsed rail for a floating Properties panel.
 VoiceOver, the macOS menu dispatch arm (not compiled here, Linux only).
 Details: "Next action", addendum 0.167.0.
 
-**Previous (2026-10-10, 0.166.0): drag-to-redock docked panels, the
+**Previously (2026-10-10, 0.166.0): drag-to-redock docked panels, the
 arrangement persisted.** Workspace round 5, first half (floating panels
 are 0.167.0). A press on a lone panel's title row or on a group's tab
 that travels more than `aurora_ui::PANEL_DRAG_THRESHOLD` (4 logical px,
@@ -7509,7 +7572,10 @@ structural design work.
   `cargo deny check all` clean too. `scripts/check_layering.py` is
   still the one unrun check (`python3` remains absent).
 - [~] **Docking, panels, custom workspaces** — first slice done
-  2026-08-03 (**update 0.167.0:** floating panels inside the main window
+  2026-08-03 (**update 0.168.0:** workspace presets — built-in
+  Essentials, Save Workspace As (a name prompt), switch, Reset, Delete,
+  persisted in a separate versioned file — "Next action", addendum
+  0.168.0; **update 0.167.0:** floating panels inside the main window
   — tear off over the canvas, move, raise, re-dock, join/split floating
   groups, clamp, Float/Dock commands, persisted as a fifth layout
   version; separate OS windows out of scope — "Next action", addendum
@@ -31220,6 +31286,152 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-10-10 (0.168.0) — workspace presets.** Branch
+`006-workspace_presets` (from `main` at 7b25b62, 0.167.0). Files:
+`aurora-widgets` `widgets/command_palette.rs` (a *prompt*: the palette
+with its own label and no filtering — `insert_command_prompt`,
+`set_command_palette_commands`, `set_command_palette_message`, label/
+filtering/message on `CommandPaletteState`; one test), `widgets/mod.rs`
+(exports); `aurora-ui` `workspace.rs`/`lib.rs` (`RAIL_WIDTH_DEFAULT` made
+public); `aurora-app` new `workspace_presets.rs` (model, validation,
+Essentials, apply, palette entries, prompt, file format; ten tests),
+`lib.rs` (`apply_saved_collapse` factored out of `apply_workspace_layout`,
+`ActivatedCommand::Workspace` at both dispatch sites, the prompt's Enter
+and query-follow in `handle_palette_key`, the palette extension after
+`handle_key`, `App::run_workspace_command`, `App::reset_panels` now
+"Workspace: Essentials", `reset_panel_arrangement` test-only and applying
+Essentials, `App.presets`/`presets_path`). 3,128 + 11 = **3,139 tests**, measured (1 `aurora-widgets`, 10 `aurora-app`). Gate, one pass after the last code change, `AURORA_REQUIRE_GPU=1` (a CPU or missing adapter fails; 0 `SKIPPED` lines): fmt, layering, style lint, `check --locked`, clippy `-D warnings`, **3,139 passed, 0 failed, 61 ignored, 0 skipped**, strict rustdoc, `cargo deny`, contrast exit 0. A first gate attempt failed only at rustdoc (two intra-doc links to the now test-only `reset_panel_arrangement`) — fixed, with one doc comment reworded, then the whole gate re-run from the top.
+
+Evidence per criterion: AC-1 `essentials_is_the_default_layout_and_
+switching_to_it_restores_it` (also Reset Panel Layout); AC-2
+`workspace_names_are_trimmed_capped_and_never_essentials`, `save_as_
+captures_the_layout_refuses_bad_names_and_confirms_overwrites`; AC-3
+`palette_workspace_entries_follow_saves_and_deletes`, `switching_keeps_
+focus_and_clamps_floats_at_scale_one_and_two`; AC-4 `reset_restores_the_
+saved_preset_and_edits_never_touch_it`; AC-5 `delete_refuses_essentials_
+and_falls_back_from_the_active_preset`; AC-6 `presets_round_trip_through_
+the_file`, `damaged_presets_repair_or_fall_back_and_never_fail` (every
+prefix length, `0xff`/zero/text garbage, wrong magic and version, invalid,
+duplicate and undecodable entries, V1/V4 layouts inside a preset, a
+damaged arrangement and NaN width, a dangling active name) plus the
+unchanged 0.167.0 `floats_round_trip_and_older_layouts_still_decode`;
+AC-7 `the_name_prompt_is_keyboard_and_at_accessible`; widget
+`a_prompt_never_filters_and_carries_its_label_and_message`.
+
+Mutations (the scratchpad script backs each file up, mutates it, runs
+`AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --lib`, restores, `touch`es
+and checks sha256 — every one restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| N1 empty-name rule removed | killed: damaged_presets_repair_or_fall_back_and_never_fail, save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites, workspace_names_are_trimmed_capped_and_never_essentials |
+| N2 length cap removed | killed: damaged_presets_repair_or_fall_back_and_never_fail, save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites, workspace_names_are_trimmed_capped_and_never_essentials |
+| N2b length cap off by one (>=) | killed: workspace_names_are_trimmed_capped_and_never_essentials |
+| N3 Essentials rule removed | killed: damaged_presets_repair_or_fall_back_and_never_fail, save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites, workspace_names_are_trimmed_capped_and_never_essentials |
+| N3b Essentials compared case-sensitively | killed: essentials_is_the_default_layout_and_switching_to_it_restores_it, save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites, workspace_names_are_trimmed_capped_and_never_essentials |
+| N4 name not trimmed | killed: damaged_presets_repair_or_fall_back_and_never_fail, save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites, workspace_names_are_trimmed_capped_and_never_essentials |
+| D1 delete's Essentials guard removed | SURVIVED |
+| D2 palette offers Delete for Essentials | killed: palette_workspace_entries_follow_saves_and_deletes |
+| D3 deleting the active preset keeps it active | killed: delete_refuses_essentials_and_falls_back_from_the_active_preset, presets_round_trip_through_the_file |
+| R1 reset applies the live layout, not the saved one | killed: reset_restores_the_saved_preset_and_edits_never_touch_it |
+| R2 a switch does not make the preset active | killed: essentials_is_the_default_layout_and_switching_to_it_restores_it, reset_restores_the_saved_preset_and_edits_never_touch_it |
+| P1 workspace entries never added to the palette | killed: palette_workspace_entries_follow_saves_and_deletes, reset_restores_the_saved_preset_and_edits_never_touch_it |
+| P2 user presets get no switch entry | killed: palette_workspace_entries_follow_saves_and_deletes |
+| F1 preset layouts decode without the fallback chain | killed: damaged_presets_repair_or_fall_back_and_never_fail |
+| F2 damaged layouts not repaired | killed: damaged_presets_repair_or_fall_back_and_never_fail |
+| F3 a truncated entry drops the whole list | killed: damaged_presets_repair_or_fall_back_and_never_fail |
+| F4 duplicate names kept | killed: damaged_presets_repair_or_fall_back_and_never_fail |
+| F5 a dangling active name kept | killed: damaged_presets_repair_or_fall_back_and_never_fail |
+| A2 an edit leaves the refusal message | killed: save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites |
+| A1 a refused name closes the prompt | killed: save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites |
+| O1 overwrite without asking | killed: save_as_captures_the_layout_refuses_bad_names_and_confirms_overwrites |
+| S1 switch through the non-focus-keeping apply | killed: reset_panel_layout_keeps_focus_on_the_panel_it_held |
+| S2 no hidden-focus repair after a switch | killed: switching_keeps_focus_and_clamps_floats_at_scale_one_and_two |
+| S3 switch skips the rail collapse | killed: essentials_is_the_default_layout_and_switching_to_it_restores_it, reset_restores_the_saved_preset_and_edits_never_touch_it |
+
+D1 survives because it is redundant: Essentials is never in the user
+list (validation refuses the name on save and on load), so `user_index`
+already refuses it; D2 (the palette offering it) is the guard that
+matters and is killed. S1 is killed only by the 0.166.0 test
+`reset_panel_layout_keeps_focus_on_the_panel_it_held`, through the
+Reset-to-Essentials path. A first A2 mutant did not compile and was
+replaced by one that does (the A2 row above; review J4 found the row
+missing from the first version of this table).
+
+Disclosures: (1) **interactive use is not verified** — all headless; no
+human has typed a workspace name, switched or deleted one on real
+hardware, nor heard the prompt with VoiceOver. (2) Name entry reuses the
+palette's text handling: no caret movement or selection inside the name
+(type, Backspace, paste at the end), as in the palette. (3) The refusal
+message is a row title plus the field's accessible *description*; no
+live-region announcement is made, so whether a screen reader speaks it
+without re-focusing is unverified. (4) Overwrite confirmation happens in
+the prompt (a second Enter), not in an `AlertDialog`: dialog actions only
+log today, routing them back would touch three paths. (5) Workspace
+commands are palette-only, not in the macOS Window menu; the macOS
+dispatch arm got one line, not compiled here. (6) **Reset Panel Layout
+changed meaning**: it now applies the whole Essentials layout (expands
+collapsed panels and the rail, default width and tab) and makes
+Essentials active, where 0.166.0/0.167.0 reset the arrangement only.
+(7) A layout does not record *closed* panels (close = collapse + emptied
+body), so a preset reopens a closed panel expanded — refilled since the
+review revision (J5). (8) The presets file is saved on
+every change (save, delete, a switch that changes the active name); the
+live layout file is still written in place at shutdown, not by
+temp-and-rename. (9) Capped since the review revision (J2): 100 presets,
+1 MiB read. (10) Names compare case-insensitively
+with `to_lowercase` (Unicode-aware, not locale-aware). (11) No new design
+token; the prompt reuses the palette's engineering-constant size. (12)
+The `App` methods are thin; the free functions they call are tested, the
+`App` wiring itself is not run headlessly.
+
+**Review revision (same round, judge PASS at 0.903 with five asks).**
+J1 — *fixed*: `validate_workspace_name` now also refuses any character
+`aurora_widgets::widgets::is_insertable_char` refuses (controls, U+2028/
+U+2029, and the bidi overrides and isolates U+202A–U+202E, U+2066–U+2069,
+which that function already covers, so no second list was needed) —
+`WorkspaceNameError::InvalidCharacter`, "A workspace name can't contain
+control or text-direction characters.", shown and announced like the
+other refusals; a name read from the file goes through the same check
+and is dropped. Test `workspace_names_with_control_or_bidi_characters_
+are_refused`. J2 — *fixed*: `MAX_WORKSPACE_PRESETS` (100) and
+`PRESETS_FILE_MAX_BYTES` (1 MiB), engineering constants; decoding stops
+at the 100th entry, the file is read through `take` (a larger file is
+decoded from its first 1 MiB, keeping every whole entry in it), and Save
+As refuses a *new* name when the list is full (the prompt reopens saying
+so; an existing name can still be replaced). `has_user` lowercases every
+kept name per check, so decoding is quadratic in the kept count — at most
+100² comparisons. Test `the_presets_file_and_list_are_capped`. J3 —
+*fixed*: the temporary is `workspace-presets.postcard.PID.tmp` and is
+removed when the write, sync or rename fails. Test `a_failed_save_
+leaves_no_temporary_file` (a directory where the file goes makes the
+rename fail). J4 — *fixed*: the A2 row is in the table above. J5 —
+*fixed*: after any preset apply (switch, Reset `active`, Reset Panel
+Layout), `App::run_workspace_command` refills every panel whose body is
+empty (`workspace_presets::emptied_panels`, read off the bodies because
+`aurora_ui::panel_is_closed` cannot see a closed *grouped* panel — its
+title row is always hidden) through the refreshes the app already uses
+(`refill_reopened_panels`: `rebuild_layer_rows` keeping the active layer,
+`refresh_history_panel`, `refresh_properties_panel`; the control strips
+sit outside the bodies and survive a close). Test `a_switch_that_reopens_
+closed_panels_refills_them` (all three closed, emptied, switched,
+refilled, every row id live). Disclosure (7) above is withdrawn for
+presets; the older Toggle-to-reopen path still shows a closed panel
+empty until the next refresh, unchanged. Revision mutations (same
+script, all restored OK):
+
+| # | Mutation | Result |
+|---|---|---|
+| J1 control/bidi characters accepted | killed: workspace_names_with_control_or_bidi_characters_are_refused |
+| J2a no preset-count cap on decode | killed: the_presets_file_and_list_are_capped |
+| J2b no read-size cap | killed: the_presets_file_and_list_are_capped |
+| J2c Save As ignores a full list | killed: the_presets_file_and_list_are_capped |
+| J3 temporary kept after a failed save | killed: a_failed_save_leaves_no_temporary_file |
+| J5a History not refilled | killed: a_switch_that_reopens_closed_panels_refills_them |
+| J5b emptied panels never detected | killed: a_switch_that_reopens_closed_panels_refills_them |
+
+Revision gate, one pass after the last code change (`df`: 33G free on `/home`; `AURORA_REQUIRE_GPU=1`, 0 `SKIPPED` lines): fmt, layering, style lint, `check --locked`, clippy `-D warnings`, **3,143 passed, 0 failed, 61 ignored, 0 skipped** (3,139 + 4 `aurora-app`), strict rustdoc, `cargo deny`, contrast exit 0.
 
 **Addendum 2026-10-10 (0.167.0) — floating panels inside the main
 window.** Branch `005-floating_panels_overlay` (from `main` at 1d143e0,

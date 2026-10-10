@@ -100,6 +100,15 @@ pub struct CommandPaletteState {
     /// Index into `filtered`/`rows`, not into `commands` directly —
     /// `None` only when `filtered` is empty.
     selected: Option<usize>,
+    /// The root's accessible name — "Command Palette", or a prompt's own
+    /// label ([`insert_command_prompt`], 0.168.0).
+    label: String,
+    /// `false` for a prompt: every command is shown whatever the query
+    /// (the query is free text the caller reads, not a search).
+    filtering: bool,
+    /// A message the root's accessible description carries — a prompt's
+    /// validation message, say ([`set_command_palette_message`]).
+    message: Option<String>,
 }
 
 impl CommandPaletteState {
@@ -111,6 +120,26 @@ impl CommandPaletteState {
     #[must_use]
     pub fn commands(&self) -> &[CommandEntry] {
         &self.commands
+    }
+
+    /// The root's accessible name ("Command Palette", or a prompt's label).
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Whether the query filters the commands — `false` for a prompt
+    /// ([`insert_command_prompt`]).
+    #[must_use]
+    pub fn is_filtering(&self) -> bool {
+        self.filtering
+    }
+
+    /// The message the root's accessible description carries, if any
+    /// ([`set_command_palette_message`]).
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 
     /// The results currently matching [`Self::query`], in display order.
@@ -205,10 +234,16 @@ fn row_style() -> Style {
     }
 }
 
-fn root_node(query: &str) -> Node {
+/// The command palette's own accessible name.
+const PALETTE_LABEL: &str = "Command Palette";
+
+fn root_node(label: &str, query: &str, message: Option<&str>) -> Node {
     let mut node = Node::new(Role::TextInput);
-    node.set_label("Command Palette");
+    node.set_label(label.to_owned());
     node.set_value(query.to_owned());
+    if let Some(message) = message {
+        node.set_description(message.to_owned());
+    }
     node.add_action(Action::Focus);
     node
 }
@@ -239,10 +274,41 @@ pub fn insert_command_palette(
     parent: WidgetId,
     commands: Vec<CommandEntry>,
 ) -> Result<WidgetId, WidgetError> {
+    insert_palette(tree, parent, PALETTE_LABEL.to_owned(), true, commands)
+}
+
+/// Inserts a *prompt* (0.168.0): the same widget as
+/// [`insert_command_palette`] — a `Role::TextInput` root named `label`
+/// whose value is the typed text, holding a `Role::ListBox` of rows — but
+/// the query never filters `commands`: it is free text the caller reads
+/// back ([`CommandPaletteState::query`]) when a row is activated, a name
+/// to save something under, say. Typing, selection and closing work
+/// exactly as in the palette; what a row means is the caller's.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+/// Nothing is added when this happens.
+pub fn insert_command_prompt(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    label: impl Into<String>,
+    commands: Vec<CommandEntry>,
+) -> Result<WidgetId, WidgetError> {
+    insert_palette(tree, parent, label.into(), false, commands)
+}
+
+fn insert_palette(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    label: String,
+    filtering: bool,
+    commands: Vec<CommandEntry>,
+) -> Result<WidgetId, WidgetError> {
     let root = tree.insert(
         parent,
         Style::default(),
-        root_node(""),
+        root_node(&label, "", None),
         WidgetKind::Container,
     )?;
 
@@ -269,6 +335,9 @@ pub fn insert_command_palette(
         filtered: Vec::new(),
         rows: Vec::new(),
         selected: None,
+        label,
+        filtering,
+        message: None,
     });
 
     rebuild_rows(tree, root, String::new())?;
@@ -321,6 +390,53 @@ pub fn set_command_palette_query(
     rebuild_rows(tree, root, query.to_owned())
 }
 
+/// Replaces `root`'s commands with `commands` and rebuilds its rows
+/// against the current query (0.168.0: a caller whose list depends on
+/// state the palette cannot see, or a prompt whose rows describe what the
+/// typed text would do). Selection resets to the first result.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `root` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a command
+/// palette. Nothing changes when this happens.
+pub fn set_command_palette_commands(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    commands: Vec<CommandEntry>,
+) -> Result<(), WidgetError> {
+    let query = state(tree, root)?.query.clone();
+    let Some(WidgetKind::CommandPalette(current)) = tree.payload_mut(root) else {
+        return Err(WidgetError::WrongWidgetKind(root));
+    };
+    current.commands = commands;
+    rebuild_rows(tree, root, query)
+}
+
+/// Sets (or, with `None`, clears) the message `root`'s accessible
+/// description carries (0.168.0) — a prompt's validation message, read
+/// out with the field it describes.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `root` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a command
+/// palette. Nothing changes when this happens.
+pub fn set_command_palette_message(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    message: Option<String>,
+) -> Result<(), WidgetError> {
+    let current = state(tree, root)?;
+    let node = root_node(&current.label, &current.query, message.as_deref());
+    tree.set_accessibility(root, node)?;
+    let Some(WidgetKind::CommandPalette(current)) = tree.payload_mut(root) else {
+        return Err(WidgetError::WrongWidgetKind(root));
+    };
+    current.message = message;
+    Ok(())
+}
+
 fn rebuild_rows(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
@@ -331,13 +447,16 @@ fn rebuild_rows(
     let query_strip = current.query_strip;
     let commands = current.commands.clone();
     let old_rows = current.rows.clone();
+    let filtering = current.filtering;
+    let label = current.label.clone();
+    let message = current.message.clone();
 
     let needle = query.to_ascii_lowercase();
     let filtered: Vec<usize> = commands
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            needle.is_empty() || entry.title.to_ascii_lowercase().contains(&needle)
+            !filtering || needle.is_empty() || entry.title.to_ascii_lowercase().contains(&needle)
         })
         .map(|(index, _)| index)
         .collect();
@@ -364,7 +483,7 @@ fn rebuild_rows(
         rows.push(row);
     }
 
-    tree.set_accessibility(root, root_node(&query))?;
+    tree.set_accessibility(root, root_node(&label, &query, message.as_deref()))?;
     // The strip draws the query: repaint it.
     tree.mark_dirty(query_strip)?;
 
@@ -440,8 +559,9 @@ pub fn move_command_palette_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandEntry, command_palette_state, insert_command_palette,
-        move_command_palette_selection, set_command_palette_query,
+        CommandEntry, command_palette_state, insert_command_palette, insert_command_prompt,
+        move_command_palette_selection, set_command_palette_commands, set_command_palette_message,
+        set_command_palette_query,
     };
     use crate::WidgetError;
     use crate::shortcut::KeyChord;
@@ -835,5 +955,73 @@ mod tests {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+    }
+
+    /// 0.168.0: a prompt is the palette with its own name and no
+    /// filtering; its commands and message can be replaced, and the
+    /// message is the root's accessible description.
+    #[test]
+    fn a_prompt_never_filters_and_carries_its_label_and_message() {
+        let (mut tree, root) = new_tree(Style::default());
+        let prompt = match insert_command_prompt(&mut tree, root, "Workspace Name", commands()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_command_palette_query(&mut tree, prompt, "zzz no match") {
+            unreachable!("{err:?}");
+        }
+        let state = match command_palette_state(&tree, prompt) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(!state.is_filtering());
+        assert_eq!(state.label(), "Workspace Name");
+        assert_eq!(state.results().len(), 3, "a prompt shows every row");
+        let node = tree.accessibility(prompt).cloned();
+        assert_eq!(
+            node.as_ref().and_then(|n| n.label()),
+            Some("Workspace Name")
+        );
+        assert_eq!(node.as_ref().and_then(|n| n.value()), Some("zzz no match"));
+        assert_eq!(node.as_ref().and_then(|n| n.description()), None);
+
+        if let Err(err) = set_command_palette_message(&mut tree, prompt, Some("Bad".to_owned())) {
+            unreachable!("{err:?}");
+        }
+        let replaced = vec![CommandEntry::new("only", "Only Row")];
+        if let Err(err) = set_command_palette_commands(&mut tree, prompt, replaced) {
+            unreachable!("{err:?}");
+        }
+        let state = match command_palette_state(&tree, prompt) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.message(), Some("Bad"));
+        assert_eq!(state.query(), "zzz no match", "the query survives");
+        assert_eq!(state.selected().map(|c| c.id.as_str()), Some("only"));
+        assert_eq!(state.rows().len(), 1);
+        let node = tree.accessibility(prompt).cloned();
+        assert_eq!(node.as_ref().and_then(|n| n.description()), Some("Bad"));
+        if let Err(err) = set_command_palette_message(&mut tree, prompt, None) {
+            unreachable!("{err:?}");
+        }
+        let node = tree.accessibility(prompt).cloned();
+        assert_eq!(node.as_ref().and_then(|n| n.description()), None);
+
+        // The ordinary palette still filters, under its own name.
+        let palette = match insert_command_palette(&mut tree, root, commands()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_command_palette_query(&mut tree, palette, "undo") {
+            unreachable!("{err:?}");
+        }
+        let state = match command_palette_state(&tree, palette) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(state.is_filtering());
+        assert_eq!(state.label(), "Command Palette");
+        assert_eq!(state.results().len(), 1);
     }
 }
