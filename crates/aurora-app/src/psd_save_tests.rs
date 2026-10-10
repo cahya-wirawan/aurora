@@ -519,14 +519,20 @@ fn a_deferred_save_with_changes_asks_once_the_dialog_closes() {
 #[test]
 fn preflight_refusal_shows_couldnt_save_with_reason() {
     let mut doc = Doc::new();
-    ok(doc.tree.add_group("Group", None));
+    // 0.178.0: groups and masks are written; Curves still are not (R4).
+    ok(doc.tree.add_adjustment_layer_at(
+        "Curves",
+        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::default()),
+        None,
+        0,
+    ));
     let path = doc.path("copy.psd");
     let Err(failure) = doc.save(&path) else {
         unreachable!("refused")
     };
     let message = psd_save_failure_message("copy.psd", &failure);
     assert!(
-        message.contains("saving groups to PSD is not yet supported"),
+        message.contains("saving Curves layers to PSD is not"),
         "{message}"
     );
     assert!(message.ends_with(crate::SAVE_FAILED_UNCHANGED), "{message}");
@@ -802,4 +808,136 @@ fn an_old_aur_without_the_entry_carries_nothing() {
         ok(doc.save_carrying(&target, carried)),
         PsdSaveStep::Saved
     ));
+}
+
+/// The tree's shape, top-to-bottom: `name` or `name(children)`.
+fn shape(layers: &LayerTree, ids: &[aurora_doc::LayerId]) -> String {
+    ids.iter()
+        .map(|&id| {
+            let name = layers.name(id).unwrap_or_default().to_owned();
+            match layers.kind(id) {
+                Some(aurora_doc::LayerKind::Group { children }) => {
+                    format!("{name}({})", shape(layers, children))
+                }
+                _ => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn find(layers: &LayerTree, name: &str) -> aurora_doc::LayerId {
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
+    while let Some(id) = stack.pop() {
+        if layers.name(id) == Some(name) {
+            return id;
+        }
+        if let Some(children) = layers.children(id) {
+            stack.extend_from_slice(children);
+        }
+    }
+    unreachable!("no layer named {name}")
+}
+
+/// 0.178.0 (R3): a document with nested groups and a masked layer goes
+/// through Save As `.psd` and comes back with the same tree, the same
+/// group and layer properties, the same layer pixels and the same mask.
+#[test]
+fn save_as_psd_round_trips_nested_groups_and_a_masked_layer() {
+    let mut doc = Doc::new();
+    // Background, Top at the root; then Outer(Inner(Masked), Loose) on top.
+    let outer = ok(doc.tree.add_group("Outer", None));
+    ok(doc.tree.set_blend_mode(outer, BlendMode::Multiply));
+    ok(doc.tree.set_opacity(outer, 128.0 / 255.0));
+    let loose = ok(doc
+        .tree
+        .add_pixel_layer("Loose", rect(0, 0, 8, 8), Some(outer)));
+    let inner = ok(doc.tree.add_group("Inner", Some(outer)));
+    ok(doc.tree.set_visible(inner, false));
+    let masked = ok(doc
+        .tree
+        .add_pixel_layer("Masked", rect(0, 0, 8, 8), Some(inner)));
+    for (id, value) in [(loose, 0.125f32), (masked, 0.625)] {
+        let samples: Vec<f16> = (0..64)
+            .flat_map(|i| [value, (i % 8) as f32 / 8.0, 0.5, 1.0].map(f16::from_f32))
+            .collect();
+        let image = ok(aurora_io::Image::new(8, 8, IccProfile::srgb(), samples));
+        let Some(surface) = doc.tree.surface_id(id) else {
+            unreachable!("pixel layer")
+        };
+        ok(aurora_io::write_into_store_at(
+            &image,
+            &mut doc.store,
+            surface,
+            0,
+            0,
+        ));
+    }
+    ok(doc.tree.add_mask(masked, rect(1, 2, 5, 4)));
+    let Some(mask_surface) = doc.tree.mask_surface_id(masked) else {
+        unreachable!("mask surface")
+    };
+    ok(aurora_doc::write_mask_coverage_region(
+        &mut doc.store,
+        mask_surface,
+        (0, 0),
+        5,
+        4,
+        |x, y| ((x + y) % 5) as f32 / 4.0,
+    ));
+    let want_shape = shape(&doc.tree, doc.tree.roots());
+    assert_eq!(want_shape, "Outer(Inner(Masked),Loose),Top,Background");
+
+    let path = doc.path("groups.psd");
+    assert!(
+        matches!(ok(doc.save(&path)), PsdSaveStep::Saved),
+        "lossless"
+    );
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    assert!(back.report.items.is_empty(), "{:?}", back.report);
+    assert_eq!(shape(&back.layers, back.layers.roots()), want_shape);
+
+    // Group and layer properties.
+    let l = &back.layers;
+    let (b_outer, b_inner) = (find(l, "Outer"), find(l, "Inner"));
+    assert_eq!(l.blend_mode(b_outer), Some(BlendMode::Multiply));
+    assert_eq!(l.opacity(b_outer), Some(128.0 / 255.0));
+    assert_eq!(l.visible(b_inner), Some(false));
+    assert_eq!(l.visible(b_outer), Some(true));
+
+    // Pixels: every layer's decoded image equals the original exactly.
+    for name in ["Background", "Top", "Loose", "Masked"] {
+        let (orig, got) = (find(&doc.tree, name), find(l, name));
+        let Some(surface) = doc.tree.surface_id(orig) else {
+            unreachable!("pixel layer")
+        };
+        let want = ok(aurora_io::read_from_store(&mut doc.store, surface, 8, 8));
+        let pixels = back.pixels.iter().find(|p| p.layer == got);
+        let Some(pixels) = pixels else {
+            unreachable!("{name} has pixels")
+        };
+        assert_eq!(pixels.offset, (0, 0), "{name}");
+        assert_eq!(pixels.image.samples(), want.samples(), "{name} pixels");
+    }
+
+    // The mask: same bounds, enabled, coverage sample for sample.
+    let b_masked = find(l, "Masked");
+    let mask = l.mask(b_masked).cloned();
+    let Some(mask) = mask else {
+        unreachable!("mask read back")
+    };
+    assert_eq!(mask.bounds, rect(1, 2, 5, 4));
+    assert!(mask.enabled && !mask.inverted);
+    let coverage = back.masks.iter().find(|m| m.layer == b_masked);
+    let Some(coverage) = coverage else {
+        unreachable!("mask coverage")
+    };
+    assert_eq!(
+        (coverage.offset, coverage.width, coverage.height),
+        ((0, 0), 5, 4)
+    );
+    let want: Vec<f16> = (0..4u32)
+        .flat_map(|y| (0..5u32).map(move |x| f16::from_f32(((x + y) % 5) as f32 / 4.0)))
+        .collect();
+    assert_eq!(coverage.coverage, want);
 }

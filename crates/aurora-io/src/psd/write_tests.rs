@@ -1,4 +1,4 @@
-//! Tests for the flat PSD writer (0.176.0, round R1).
+//! Tests for the PSD writer (0.176.0, round R1; groups and masks 0.178.0, R3).
 #![allow(clippy::many_single_char_names)]
 
 use std::io::Cursor;
@@ -604,7 +604,7 @@ fn writer_matches_test_writer_bytes_for_a_two_layer_file() {
 }
 
 #[test]
-fn preflight_refuses_groups_masks_curves_and_oversize() {
+fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
     let opts = PsdSaveOptions::default();
     let base = || {
         let mut tree = LayerTree::new();
@@ -617,11 +617,12 @@ fn preflight_refuses_groups_masks_curves_and_oversize() {
         Ok(vec![])
     );
 
+    // 0.178.0: groups and masks are written.
     let mut groups = base();
     ok(groups.add_group("G", None));
     assert_eq!(
-        psd_save_preflight(&groups, (4, 4), opts),
-        Err(PsdSaveRefusal::GroupsNotYetSupported { count: 1 })
+        psd_save_preflight(&groups, (4, 4), opts).map(|r| r.items),
+        Ok(vec![])
     );
 
     let mut masked = base();
@@ -632,8 +633,8 @@ fn preflight_refuses_groups_masks_curves_and_oversize() {
         .unwrap_or_else(|| unreachable!());
     ok(masked.add_mask(id, rect(0, 0, 4, 4)));
     assert_eq!(
-        psd_save_preflight(&masked, (4, 4), opts),
-        Err(PsdSaveRefusal::MasksNotYetSupported { count: 1 })
+        psd_save_preflight(&masked, (4, 4), opts).map(|r| r.items),
+        Ok(vec![])
     );
 
     let mut curves = base();
@@ -673,7 +674,12 @@ fn preflight_refuses_groups_masks_curves_and_oversize() {
 
     // `write_psd` refuses through the same checks before writing a byte.
     let mut doc = Doc::new((4, 4));
-    ok(doc.tree.add_group("G", None));
+    ok(doc.tree.add_adjustment_layer_at(
+        "C",
+        Adjustment::Curves(aurora_core::CurvesParams::default()),
+        None,
+        0,
+    ));
     let mut out = Cursor::new(Vec::new());
     let mut source = &doc.composite;
     let result = write_psd(
@@ -687,7 +693,7 @@ fn preflight_refuses_groups_masks_curves_and_oversize() {
     assert!(matches!(
         result,
         Err(IoError::PsdSaveRefused(
-            PsdSaveRefusal::GroupsNotYetSupported { .. }
+            PsdSaveRefusal::CurvesNotYetSupported { .. }
         ))
     ));
     assert!(out.into_inner().is_empty());
@@ -1517,4 +1523,822 @@ fn write_verified_temp_touches_nothing_until_persist() {
     ok(temp.persist());
     assert_eq!(ok(std::fs::read(&target)), b"new");
     assert_eq!(dir_listing(dir.path()), ["out.psd"]);
+}
+
+// ---------------------------------------------------------------------
+// Groups and masks (0.178.0, round R3)
+// ---------------------------------------------------------------------
+
+impl Doc {
+    /// Adds a layer on top of `parent`'s children (or the roots).
+    fn layer_in(
+        &mut self,
+        name: &str,
+        bounds: Rect,
+        pixels: Option<&Image>,
+        parent: Option<LayerId>,
+    ) -> LayerId {
+        let id = ok(self.tree.add_pixel_layer(name, bounds, parent));
+        if let Some(img) = pixels {
+            let Some(surface) = self.tree.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            ok(crate::write_into_store_at(
+                img,
+                &mut self.store,
+                surface,
+                0,
+                0,
+            ));
+        }
+        id
+    }
+
+    fn group(&mut self, name: &str, parent: Option<LayerId>) -> LayerId {
+        ok(self.tree.add_group(name, parent))
+    }
+
+    /// Adds a mask at `bounds`, its coverage `f(x, y)` (mask-local)
+    /// painted over the `paint` part of it (mask-local x, y, w, h).
+    fn mask(
+        &mut self,
+        id: LayerId,
+        bounds: Rect,
+        paint: (u32, u32, u32, u32),
+        f: impl Fn(u32, u32) -> f32,
+    ) {
+        ok(self.tree.add_mask(id, bounds));
+        let Some(surface) = self.tree.mask_surface_id(id) else {
+            unreachable!("mask surface");
+        };
+        let (x, y, w, h) = paint;
+        ok(aurora_doc::write_mask_coverage_region(
+            &mut self.store,
+            surface,
+            (x, y),
+            w,
+            h,
+            |cx, cy| f(x + cx, y + cy),
+        ));
+    }
+}
+
+/// The tree's shape, top-to-bottom: `name` or `name(children)`.
+fn shape(tree: &LayerTree, ids: &[LayerId]) -> String {
+    ids.iter()
+        .map(|&id| {
+            let name = tree.name(id).unwrap_or_default().to_owned();
+            match tree.children(id) {
+                Some(children) if tree.kind(id).is_some_and(aurora_doc::LayerKind::is_group) => {
+                    format!("{name}({})", shape(tree, children))
+                }
+                _ => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A re-read document with its masks written into a store of its own.
+struct Reopened {
+    doc: super::PsdDocument,
+    _dir: tempfile::TempDir,
+    store: TileStore,
+}
+
+fn reopen(bytes: &[u8]) -> Reopened {
+    let doc = read_back(bytes);
+    let (dir, mut store) = store();
+    for mask in &doc.masks {
+        ok(super::write_mask_pixels(mask, &doc.layers, &mut store));
+    }
+    Reopened {
+        doc,
+        _dir: dir,
+        store,
+    }
+}
+
+/// Aurora's effective mask coverage at a document pixel — the app's
+/// `apply_mask`: inside the bounds the painted coverage (unpainted is
+/// `1.0`), outside them `0.0`; then `inverted`; then the density.
+fn coverage_at(tree: &LayerTree, store: &mut TileStore, id: LayerId, x: i64, y: i64) -> f32 {
+    let density = tree.mask(id).map_or(1.0, |m| m.density);
+    density * shown_at(tree, store, id, x, y) + (1.0 - density)
+}
+
+/// [`coverage_at`] before the density: the coverage after `inverted`.
+fn shown_at(tree: &LayerTree, store: &mut TileStore, id: LayerId, x: i64, y: i64) -> f32 {
+    let Some(mask) = tree.mask(id) else {
+        return 1.0;
+    };
+    let b = mask.bounds;
+    let raw = if b.contains_point(x, y) {
+        let (Ok(lx), Ok(ly)) = (u32::try_from(x - b.x), u32::try_from(y - b.y)) else {
+            unreachable!("inside the bounds")
+        };
+        let tile = aurora_tile::TileId {
+            x: lx / aurora_tile::TILE,
+            y: ly / aurora_tile::TILE,
+        };
+        match tree.mask_surface_id(id) {
+            Some(surface) if store.contains_tile(surface, tile) => {
+                let t = ok(store.get(surface, tile));
+                let at = (((ly % aurora_tile::TILE) * aurora_tile::TILE + lx % aurora_tile::TILE)
+                    * 4) as usize;
+                t.texels()
+                    .get(at..at + 4)
+                    .map_or(1.0, aurora_doc::read_mask_coverage)
+            }
+            _ => 1.0,
+        }
+    } else {
+        0.0
+    };
+    if mask.inverted { 1.0 - raw } else { raw }
+}
+
+/// Every record's (`lsct` data, rect, channel ids, flags, mask data) in
+/// file order, parsed straight from the bytes.
+type Rec = (Option<Vec<u8>>, [i32; 4], Vec<i16>, Vec<u8>, String);
+
+/// Record `i` of `recs`.
+fn rec(recs: &[Rec], i: usize) -> &Rec {
+    recs.get(i).unwrap_or_else(|| unreachable!("record {i}"))
+}
+
+fn records(bytes: &[u8]) -> Vec<Rec> {
+    let count = usize::from(
+        be16(bytes, first_record(bytes) - 2)
+            .cast_signed()
+            .unsigned_abs(),
+    );
+    let mut at = first_record(bytes);
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let r = parse_record(bytes, at);
+        let mask_len = be32(bytes, r.extra_at) as usize;
+        let mask = bytes_at(bytes, r.extra_at + 4, mask_len).to_vec();
+        let ranges_at = r.extra_at + 4 + mask_len;
+        let name_at = ranges_at + 4 + be32(bytes, ranges_at) as usize;
+        let plen = usize::from(byte(bytes, name_at));
+        let name = String::from_utf8_lossy(bytes_at(bytes, name_at + 1, plen)).into_owned();
+        let mut block = name_at + (plen + 1).next_multiple_of(4);
+        let mut section = None;
+        while block < r.end {
+            let key = bytes_at(bytes, block + 4, 4).to_vec();
+            let len = be32(bytes, block + 8) as usize;
+            if key == b"lsct" {
+                section = Some(bytes_at(bytes, block + 12, len).to_vec());
+            }
+            block += 12 + len;
+        }
+        let ids = r.channels.iter().map(|(id, _)| *id).collect();
+        out.push((section, r.rect, ids, mask, name));
+        let _ = r.flags;
+        at = r.end;
+    }
+    out
+}
+
+fn blend_key_of(bytes: &[u8], index: usize) -> [u8; 4] {
+    let mut at = first_record(bytes);
+    for _ in 0..index {
+        at = parse_record(bytes, at).end;
+    }
+    let r = parse_record(bytes, at);
+    let blend_at = at + 18 + 6 * r.channels.len();
+    let mut key = [0u8; 4];
+    key.copy_from_slice(bytes_at(bytes, blend_at + 4, 4));
+    key
+}
+
+fn px(w: u32, h: u32, seed: u32) -> Image {
+    image(w, h, |x, y| {
+        [level(x + seed), level(y), level(x + y + seed), 1.0]
+    })
+}
+
+/// Three levels of groups with siblings above and below at every level.
+fn nested_doc() -> (Doc, [LayerId; 3]) {
+    let mut doc = Doc::new((12, 10));
+    // Added bottom first at each level.
+    doc.layer_in("Bottom", rect(0, 0, 12, 10), Some(&px(12, 10, 0)), None);
+    let g1 = doc.group("G1", None);
+    doc.layer_in("L1b", rect(1, 1, 4, 4), Some(&px(4, 4, 1)), Some(g1));
+    let g2 = doc.group("G2", Some(g1));
+    doc.layer_in("L2b", rect(2, 2, 3, 3), Some(&px(3, 3, 2)), Some(g2));
+    let g3 = doc.group("G3", Some(g2));
+    doc.layer_in("L3", rect(3, 3, 5, 2), Some(&px(5, 2, 3)), Some(g3));
+    doc.layer_in("L2a", rect(4, 1, 2, 6), Some(&px(2, 6, 4)), Some(g2));
+    doc.layer_in("L1a", rect(0, 5, 6, 5), Some(&px(6, 5, 5)), Some(g1));
+    doc.layer_in("Top", rect(6, 0, 6, 10), Some(&px(6, 10, 6)), None);
+    (doc, [g1, g2, g3])
+}
+
+#[test]
+fn nested_groups_round_trip_order_and_membership() {
+    let (mut doc, _) = nested_doc();
+    let want = shape(&doc.tree, doc.tree.roots());
+    assert_eq!(want, "Top,G1(L1a,G2(L2a,G3(L3),L2b),L1b),Bottom");
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    // Two records per group.
+    assert_eq!(outcome.expected.layers.len(), 7 + 2 * 3);
+    let back = read_back(&bytes);
+    assert!(back.report.items.is_empty(), "{:?}", back.report);
+    assert_eq!(shape(&back.layers, back.layers.roots()), want);
+    // Pixels: every layer's decoded image equals what was written.
+    assert_eq!(back.pixels.len(), 7);
+    // And the verifier (both passes) accepts the file.
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("nested.psd"), false));
+}
+
+#[test]
+fn group_divider_precedes_children_folder_follows() {
+    let mut doc = Doc::new((4, 4));
+    let g = doc.group("Group", None);
+    doc.layer_in("Child", rect(0, 0, 4, 4), Some(&px(4, 4, 0)), Some(g));
+    let (bytes, outcome) = ok(doc.write());
+    let recs = records(&bytes);
+    assert_eq!(recs.len(), 3);
+    let kinds: Vec<_> = outcome.expected.layers.iter().map(|l| l.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            super::write::PsdRecordKind::GroupEnd,
+            super::write::PsdRecordKind::Layer,
+            super::write::PsdRecordKind::Group
+        ]
+    );
+    // Bottom: the bounding divider, type 3, empty, four 2-byte channels.
+    let (section, rect0, ids, mask, name) = rec(&recs, 0);
+    assert_eq!(section.as_deref(), Some(3u32.to_be_bytes().as_slice()));
+    assert_eq!(*rect0, [0; 4]);
+    assert_eq!(ids, &vec![-1, 0, 1, 2]);
+    assert!(mask.is_empty());
+    assert_eq!(name, super::write::PSD_GROUP_END_NAME);
+    let divider = parse_record(&bytes, first_record(&bytes));
+    assert!(divider.channels.iter().all(|&(_, len)| len == 2));
+    // Middle: the child. Top: the open folder, `8BIM` + its blend key.
+    assert_eq!(rec(&recs, 1).0, None);
+    assert_eq!(rec(&recs, 1).4, "Child");
+    let mut folder = 1u32.to_be_bytes().to_vec();
+    folder.extend_from_slice(b"8BIMnorm");
+    assert_eq!(rec(&recs, 2).0.as_deref(), Some(folder.as_slice()));
+    assert_eq!(rec(&recs, 2).4, "Group");
+    let back = read_back(&bytes);
+    assert_eq!(shape(&back.layers, back.layers.roots()), "Group(Child)");
+}
+
+#[test]
+fn group_blend_and_props_round_trip() {
+    let mut doc = Doc::new((4, 4));
+    doc.layer_in("Base", rect(0, 0, 4, 4), Some(&px(4, 4, 0)), None);
+    let g = doc.group("Mul", None);
+    doc.layer_in("In", rect(0, 0, 4, 4), Some(&px(4, 4, 1)), Some(g));
+    ok(doc.tree.set_blend_mode(g, BlendMode::Multiply));
+    ok(doc.tree.set_opacity(g, 128.0 / 255.0));
+    ok(doc.tree.set_fill_opacity(g, 51.0 / 255.0));
+    ok(doc.tree.set_visible(g, false));
+    let normal = doc.group("Plain", None);
+    doc.layer_in("In2", rect(0, 0, 2, 2), Some(&px(2, 2, 2)), Some(normal));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    // Records: Base, end, In, Mul, end, In2, Plain.
+    assert_eq!(blend_key_of(&bytes, 3), *b"mul ");
+    assert_eq!(blend_key_of(&bytes, 6), *b"norm");
+    let recs = records(&bytes);
+    assert_eq!(
+        bytes_at(rec(&recs, 3).0.as_deref().unwrap_or_default(), 4, 8),
+        b"8BIMmul "
+    );
+    assert_eq!(
+        bytes_at(rec(&recs, 6).0.as_deref().unwrap_or_default(), 4, 8),
+        b"8BIMnorm"
+    );
+    for (section, ..) in &recs {
+        assert!(
+            !section
+                .as_deref()
+                .is_some_and(|s| s.windows(4).any(|w| w == b"pass")),
+            "never Pass Through"
+        );
+    }
+    let back = read_back(&bytes);
+    let l = &back.layers;
+    let mul = l
+        .roots()
+        .iter()
+        .copied()
+        .find(|&id| l.name(id) == Some("Mul"));
+    let Some(mul) = mul else {
+        unreachable!("group read back")
+    };
+    assert_eq!(l.blend_mode(mul), Some(BlendMode::Multiply));
+    assert_eq!(l.opacity(mul), Some(128.0 / 255.0));
+    assert_eq!(l.fill_opacity(mul), Some(51.0 / 255.0));
+    assert_eq!(l.visible(mul), Some(false));
+    assert!(
+        back.report.items.is_empty(),
+        "no Pass Through note: {:?}",
+        back.report
+    );
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("props.psd"), false));
+}
+
+/// A layer with a mask at (2, 3) 5x4, painted over its left 3 columns.
+fn masked_doc() -> (Doc, LayerId) {
+    let mut doc = Doc::new((10, 9));
+    let id = doc.layer_in("M", rect(0, 0, 10, 9), Some(&px(10, 9, 0)), None);
+    doc.mask(id, rect(2, 3, 5, 4), (0, 0, 3, 4), |x, y| level(x + 2 * y));
+    (doc, id)
+}
+
+/// The effective coverage agrees everywhere the layer has pixels (the
+/// canvas, here) — and, for a mask that is not inverted, around it too.
+/// An inverted mask is read back with the layer's region as its bounds
+/// (shown outside the PSD rectangle), so past the region, where the layer
+/// has no pixels to show, it reads hidden.
+fn assert_same_coverage(doc: &mut Doc, id: LayerId, back: &mut Reopened) {
+    let back_id = back.doc.layers.roots().first().copied();
+    let Some(back_id) = back_id else {
+        unreachable!("a layer")
+    };
+    let inverted = doc.tree.mask(id).is_some_and(|m| m.inverted);
+    let margin = if inverted { 0 } else { 2 };
+    let (w, h) = (i64::from(doc.canvas.0), i64::from(doc.canvas.1));
+    for y in -margin..h + margin {
+        for x in -margin..w + margin {
+            let want = coverage_at(&doc.tree, &mut doc.store, id, x, y);
+            let got = coverage_at(&back.doc.layers, &mut back.store, back_id, x, y);
+            assert_eq!(got.to_bits(), want.to_bits(), "coverage at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn mask_bounds_and_default_round_trip() {
+    let (mut doc, id) = masked_doc();
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    let recs = records(&bytes);
+    let (_, _, ids, mask, _) = rec(&recs, 0);
+    assert_eq!(ids, &vec![-1, 0, 1, 2, -2]);
+    assert_eq!(mask.len(), 20);
+    // top, left, bottom, right in document coordinates; default 0; flags 0.
+    let edge = |i: usize| be32(mask, 4 * i).cast_signed();
+    assert_eq!([edge(0), edge(1), edge(2), edge(3)], [3, 2, 7, 7]);
+    assert_eq!(bytes_at(mask, 16, 4), &[0, 0, 0, 0]);
+    let mut back = reopen(&bytes);
+    let back_id = back
+        .doc
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    let m = back.doc.layers.mask(back_id).cloned();
+    let Some(m) = m else {
+        unreachable!("mask read back")
+    };
+    assert_eq!(m.bounds, rect(2, 3, 5, 4));
+    assert!(m.enabled && !m.inverted);
+    assert_eq!(m.density.to_bits(), 1.0f32.to_bits());
+    assert_same_coverage(&mut doc, id, &mut back);
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("mask.psd"), false));
+}
+
+#[test]
+fn mask_outside_bounds_round_trips() {
+    // Aurora's coverage outside a mask's bounds is 0.0 (hidden), so the
+    // default colour is 0; inverted, it is 1.0 and the default 255.
+    for inverted in [false, true] {
+        let (mut doc, id) = masked_doc();
+        ok(doc.tree.set_mask_inverted(id, inverted));
+        assert_eq!(
+            coverage_at(&doc.tree, &mut doc.store, id, 0, 0).to_bits(),
+            f32::from(u8::from(inverted)).to_bits()
+        );
+        let (bytes, _) = ok(doc.write());
+        let recs = records(&bytes);
+        assert_eq!(byte(&rec(&recs, 0).3, 16), if inverted { 255 } else { 0 });
+        let mut back = reopen(&bytes);
+        assert_same_coverage(&mut doc, id, &mut back);
+        let dir = ok(tempfile::tempdir());
+        ok(save(&mut doc, &dir.path().join("outside.psd"), false));
+    }
+}
+
+#[test]
+fn inverted_mask_baked_and_flag_clear() {
+    let (mut doc, id) = masked_doc();
+    ok(doc.tree.set_mask_inverted(id, true));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty());
+    let recs = records(&bytes);
+    let flags = byte(&rec(&recs, 0).3, 17);
+    assert_eq!(flags & 0x04, 0, "invert flag clear");
+    assert_eq!(byte(&rec(&recs, 0).3, 16), 255, "default colour flipped");
+    let mut back = reopen(&bytes);
+    let back_id = back
+        .doc
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    let m = back.doc.layers.mask(back_id).cloned();
+    assert!(m.is_some_and(|m| !m.inverted), "baked, not flagged");
+    // Painted 0.25 at mask (1, 0) reads back as 0.75.
+    assert_eq!(
+        coverage_at(&back.doc.layers, &mut back.store, back_id, 3, 3).to_bits(),
+        (1.0 - level(1)).to_bits()
+    );
+    assert_same_coverage(&mut doc, id, &mut back);
+}
+
+#[test]
+fn mask_density_parameter_round_trips() {
+    let (mut doc, id) = masked_doc();
+    ok(doc.tree.set_mask_density(id, 128.0 / 255.0));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    let recs = records(&bytes);
+    let mask = rec(&recs, 0).3.clone();
+    assert_eq!(byte(&mask, 17) & 0x10, 0x10, "parameters follow");
+    assert_eq!(bytes_at(&mask, 18, 2), &[0x01, 128], "user density only");
+    let mut back = reopen(&bytes);
+    let back_id = back
+        .doc
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    assert_eq!(
+        back.doc.layers.mask(back_id).map(|m| m.density),
+        Some(128.0 / 255.0)
+    );
+    assert!(back.doc.report.items.is_empty(), "{:?}", back.doc.report);
+    assert_same_coverage(&mut doc, id, &mut back);
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("density.psd"), false));
+}
+
+#[test]
+fn mask_density_rounding_itemised() {
+    let (mut doc, id) = masked_doc();
+    ok(doc.tree.set_mask_density(id, 0.3));
+    let report = ok(psd_save_preflight(
+        &doc.tree,
+        doc.canvas,
+        PsdSaveOptions::default(),
+    ));
+    assert_eq!(
+        report.items,
+        vec!["1 layer mask density will be rounded to Photoshop's 255 steps.".to_owned()]
+    );
+    let (bytes, outcome) = ok(doc.write());
+    assert_eq!(outcome.report, report);
+    let recs = records(&bytes);
+    assert_eq!(byte(&rec(&recs, 0).3, 19), 77);
+    let back = read_back(&bytes);
+    let back_id = back
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    assert_eq!(
+        back.layers.mask(back_id).map(|m| m.density),
+        Some(77.0 / 255.0)
+    );
+    // A density that rounds to full drops the block, and is still itemised.
+    ok(doc.tree.set_mask_density(id, 0.999));
+    let (bytes, outcome) = ok(doc.write());
+    assert_eq!(outcome.report.items.len(), 1);
+    assert_eq!(bytes_at(&rec(&records(&bytes), 0).3, 17, 3), &[0, 0, 0]);
+}
+
+#[test]
+fn disabled_mask_round_trips() {
+    let (mut doc, id) = masked_doc();
+    ok(doc.tree.set_mask_enabled(id, false));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty());
+    assert_eq!(byte(&rec(&records(&bytes), 0).3, 17), 0x02);
+    let mut back = reopen(&bytes);
+    let back_id = back
+        .doc
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    let m = back.doc.layers.mask(back_id).cloned();
+    assert!(m.is_some_and(|m| !m.enabled), "still disabled");
+    // Its coverage survives, for when it is enabled again.
+    ok(doc.tree.set_mask_enabled(id, true));
+    ok(back.doc.layers.set_mask_enabled(back_id, true));
+    assert_same_coverage(&mut doc, id, &mut back);
+    ok(doc.tree.set_mask_enabled(id, false));
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("disabled.psd"), false));
+}
+
+#[test]
+fn group_mask_round_trips() {
+    let mut doc = Doc::new((8, 8));
+    let g = doc.group("Masked group", None);
+    doc.layer_in("In", rect(0, 0, 8, 8), Some(&px(8, 8, 0)), Some(g));
+    doc.mask(g, rect(1, 2, 6, 5), (1, 1, 4, 3), |x, y| level(x * y + 1));
+    ok(doc.tree.set_mask_density(g, 204.0 / 255.0));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    let recs = records(&bytes);
+    // The folder (top record) carries the mask; the divider does not.
+    assert!(rec(&recs, 0).3.is_empty());
+    assert_eq!(rec(&recs, 2).2, vec![-1, 0, 1, 2, -2]);
+    assert_eq!(rec(&recs, 2).3.len(), 20);
+    let mut back = reopen(&bytes);
+    let bg = back
+        .doc
+        .layers
+        .roots()
+        .first()
+        .copied()
+        .unwrap_or_else(|| unreachable!());
+    let m = back.doc.layers.mask(bg).cloned();
+    let Some(m) = m else {
+        unreachable!("group mask read back")
+    };
+    assert_eq!(m.bounds, rect(1, 2, 6, 5));
+    assert_eq!(m.density.to_bits(), (204.0f32 / 255.0).to_bits());
+    for y in -1..10i64 {
+        for x in -1..10i64 {
+            assert_eq!(
+                coverage_at(&back.doc.layers, &mut back.store, bg, x, y).to_bits(),
+                coverage_at(&doc.tree, &mut doc.store, g, x, y).to_bits(),
+                "({x}, {y})"
+            );
+        }
+    }
+    let dir = ok(tempfile::tempdir());
+    ok(save(&mut doc, &dir.path().join("group-mask.psd"), false));
+}
+
+#[test]
+fn record_count_limit_counts_dividers() {
+    let opts = PsdSaveOptions::default();
+    let mut tree = LayerTree::new();
+    let g = ok(tree.add_group("G", None));
+    ok(tree.add_pixel_layer("In", rect(0, 0, 1, 1), Some(g)));
+    // 1 group (2 records) + 1 child + 32,764 roots = 32,767: fits.
+    for i in 0..32_764usize {
+        ok(tree.add_pixel_layer_at(format!("L{i}"), rect(0, 0, 1, 1), None, i));
+    }
+    assert!(psd_save_preflight(&tree, (4, 4), opts).is_ok());
+    // One more layer is 32,768 records though only 32,767 layers exist.
+    ok(tree.add_pixel_layer_at("One more", rect(0, 0, 1, 1), None, 0));
+    let refusal = psd_save_preflight(&tree, (4, 4), opts);
+    assert_eq!(
+        refusal,
+        Err(PsdSaveRefusal::TooManyLayers { count: 32_768 })
+    );
+    let Err(refusal) = refusal else {
+        unreachable!()
+    };
+    assert!(
+        refusal.to_string().contains("a group takes two"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn group_depth_limit_respected() {
+    let max = super::MAX_GROUP_DEPTH;
+    let mut doc = Doc::new((2, 2));
+    let mut parent = None;
+    for depth in 0..max {
+        parent = Some(doc.group(&format!("G{depth}"), parent));
+    }
+    doc.layer_in("Deepest", rect(0, 0, 2, 2), Some(&px(2, 2, 0)), parent);
+    let (bytes, outcome) = ok(doc.write());
+    assert_eq!(outcome.expected.layers.len(), 2 * max + 1);
+    let back = read_back(&bytes);
+    assert_eq!(
+        shape(&back.layers, back.layers.roots()),
+        shape(&doc.tree, doc.tree.roots())
+    );
+    // One level deeper is refused before a byte is written — the reader
+    // would refuse the file.
+    let innermost = parent;
+    let deeper = ok(doc.tree.add_group("Too deep", innermost));
+    let _ = deeper;
+    assert_eq!(
+        psd_save_preflight(&doc.tree, (2, 2), PsdSaveOptions::default()),
+        Err(PsdSaveRefusal::GroupsTooDeep {
+            depth: max + 1,
+            max
+        })
+    );
+    let result = doc.write();
+    assert!(matches!(
+        result,
+        Err(IoError::PsdSaveRefused(
+            PsdSaveRefusal::GroupsTooDeep { .. }
+        ))
+    ));
+}
+
+/// One record's JSON for `scripts/verify_psd_write.py`'s group pass:
+/// the node's props, its mask (bbox, default colour, disabled, density
+/// and every written `u16` sample) and, for a pixel layer, its planes;
+/// a group's children bottom-to-top.
+#[allow(clippy::cast_sign_loss, clippy::single_match_else)] // values in 0..=1
+fn node_json(doc: &mut Doc, id: LayerId) -> String {
+    let t = &doc.tree;
+    let name = t.name(id).unwrap_or_default().to_owned();
+    let key = psd_blend_key(t.blend_mode(id).unwrap_or_default());
+    let key = String::from_utf8_lossy(&key).into_owned();
+    let byte = |v: f32| (v * 255.0).round() as u32;
+    let props = format!(
+        "\"name\":{name:?},\"blend\":{key:?},\"opacity\":{},\"fill\":{},\"visible\":{}",
+        byte(t.opacity(id).unwrap_or(1.0)),
+        byte(t.fill_opacity(id).unwrap_or(1.0)),
+        t.visible(id).unwrap_or(true)
+    );
+    let mask = match t.mask(id).cloned() {
+        None => "null".to_owned(),
+        Some(m) => {
+            let b = m.bounds;
+            let mut rows = Vec::new();
+            for y in 0..i64::from(b.height) {
+                let mut row = Vec::new();
+                for x in 0..i64::from(b.width) {
+                    // The written sample: coverage (inverted baked), no density.
+                    let c = shown_at(&doc.tree, &mut doc.store, id, b.x + x, b.y + y);
+                    row.push(quantize_u16(c).to_string());
+                }
+                rows.push(format!("[{}]", row.join(",")));
+            }
+            let density = if m.density < 1.0 {
+                ((m.density * 255.0).round() as u32).to_string()
+            } else {
+                "null".to_owned()
+            };
+            format!(
+                "{{\"bbox\":[{},{},{},{}],\"default\":{},\"disabled\":{},\"density\":{density},\
+                 \"data\":[{}]}}",
+                b.x,
+                b.y,
+                b.right(),
+                b.bottom(),
+                if m.inverted { 255 } else { 0 },
+                !m.enabled,
+                rows.join(",")
+            )
+        }
+    };
+    match doc.tree.kind(id).cloned() {
+        Some(aurora_doc::LayerKind::Group { children }) => {
+            let kids: Vec<String> = children.iter().rev().map(|&c| node_json(doc, c)).collect();
+            format!(
+                "{{\"kind\":\"group\",{props},\"mask\":{mask},\"children\":[{}]}}",
+                kids.join(",")
+            )
+        }
+        _ => {
+            let Some(surface) = doc.tree.surface_id(id) else {
+                unreachable!("pixel layer")
+            };
+            let Some(aurora_doc::LayerKind::Pixel { bounds }) = doc.tree.kind(id).cloned() else {
+                unreachable!("pixel layer")
+            };
+            let img = ok(crate::read_from_store(
+                &mut doc.store,
+                surface,
+                bounds.width,
+                bounds.height,
+            ));
+            let plane = |c: usize| -> String {
+                let rows: Vec<String> = img
+                    .samples()
+                    .chunks_exact(4 * img.width() as usize)
+                    .map(|row| {
+                        let v: Vec<String> = row
+                            .chunks_exact(4)
+                            .map(|p| quantize_u16(p.get(c).map_or(0.0, |v| v.to_f32())).to_string())
+                            .collect();
+                        format!("[{}]", v.join(","))
+                    })
+                    .collect();
+                format!("[{}]", rows.join(","))
+            };
+            format!(
+                "{{\"kind\":\"pixel\",{props},\"mask\":{mask},\"left\":{},\"top\":{},\
+                 \"width\":{},\"height\":{},\"r\":{},\"g\":{},\"b\":{},\"a\":{}}}",
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+                plane(0),
+                plane(1),
+                plane(2),
+                plane(3)
+            )
+        }
+    }
+}
+
+#[test]
+#[ignore = "writes fixtures for scripts/verify_psd_write.py"]
+fn write_psd_group_fixtures_for_psd_tools() {
+    let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+        unreachable!("set AURORA_PSD_FIXTURE_DIR");
+    };
+    let out = Path::new(&out);
+    let mut doc = Doc::new((40, 30));
+    doc.layer_in("Background", rect(0, 0, 40, 30), Some(&px(40, 30, 0)), None);
+    let outer = doc.group("Outer", None);
+    ok(doc.tree.set_blend_mode(outer, BlendMode::Multiply));
+    ok(doc.tree.set_opacity(outer, 200.0 / 255.0));
+    let masked = doc.layer_in(
+        "Masked",
+        rect(4, 3, 20, 12),
+        Some(&px(20, 12, 1)),
+        Some(outer),
+    );
+    doc.mask(masked, rect(6, 5, 15, 9), (2, 1, 10, 6), |x, y| {
+        level(x + y)
+    });
+    ok(doc.tree.set_mask_density(masked, 128.0 / 255.0));
+    let inner = doc.group("Inner 内側", Some(outer));
+    ok(doc.tree.set_visible(inner, false));
+    ok(doc.tree.set_fill_opacity(inner, 51.0 / 255.0));
+    doc.layer_in("Deep", rect(10, 10, 8, 8), Some(&px(8, 8, 2)), Some(inner));
+    doc.mask(inner, rect(2, 2, 30, 20), (0, 0, 30, 20), |x, y| {
+        level(x * y)
+    });
+    ok(doc.tree.set_mask_inverted(inner, true));
+    ok(doc.tree.set_mask_enabled(inner, false));
+    doc.layer_in(
+        "Sibling",
+        rect(0, 20, 12, 10),
+        Some(&px(12, 10, 3)),
+        Some(outer),
+    );
+    let top = doc.layer_in("Top", rect(30, 0, 10, 30), Some(&px(10, 30, 4)), None);
+    ok(doc.tree.set_blend_mode(top, BlendMode::Screen));
+    let (bytes, outcome) = ok(doc.write());
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    ok(std::fs::write(out.join("groups.psd"), &bytes));
+    let roots: Vec<LayerId> = doc.tree.roots().iter().rev().copied().collect();
+    let nodes: Vec<String> = roots.iter().map(|&id| node_json(&mut doc, id)).collect();
+    let json = format!(
+        "{{\"width\":40,\"height\":30,\"tree\":[{}]}}",
+        nodes.join(",")
+    );
+    ok(std::fs::write(out.join("groups.json"), json));
+}
+
+/// A mask tile that was never painted (no tile at all in the store) is
+/// coverage `1.0`, inside the bounds, and is written as such — the
+/// common case of a mask added in the app and never painted, or painted
+/// only in part of a wide mask (mutation-run finding, 0.178.0).
+#[test]
+fn unpainted_mask_tiles_write_full_coverage() {
+    for painted in [false, true] {
+        let mut doc = Doc::new((300, 10));
+        doc.composite = px(300, 10, 0);
+        let id = doc.layer_in("Wide", rect(0, 0, 300, 10), Some(&px(300, 10, 0)), None);
+        if painted {
+            // Only the first of the mask's two tile columns exists.
+            doc.mask(id, rect(0, 0, 300, 10), (0, 0, 3, 3), |x, y| level(x + y));
+        } else {
+            ok(doc.tree.add_mask(id, rect(0, 0, 300, 10)));
+        }
+        let (bytes, outcome) = ok(doc.write());
+        assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+        let mut back = reopen(&bytes);
+        let back_id = back
+            .doc
+            .layers
+            .roots()
+            .first()
+            .copied()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            coverage_at(&back.doc.layers, &mut back.store, back_id, 280, 5).to_bits(),
+            1.0f32.to_bits(),
+            "painted: {painted}"
+        );
+        assert_same_coverage(&mut doc, id, &mut back);
+        let dir = ok(tempfile::tempdir());
+        ok(save(&mut doc, &dir.path().join("wide.psd"), false));
+    }
 }

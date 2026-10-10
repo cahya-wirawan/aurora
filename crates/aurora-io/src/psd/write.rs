@@ -1,13 +1,51 @@
-//! A streaming PSD **writer** for flat documents (0.176.0, PSD write
-//! round R1): root-level pixel layers only, written as a version-1 PSD,
-//! RGB, 16 bits per channel, `PackBits` (RLE) compressed, with the layer
-//! info in an `Lr16` global block (layer-info length 0, the way
-//! Photoshop itself stores 16-bit files) and a planar, white-matted
-//! four-channel merged image behind a negative layer count.
+//! A streaming PSD **writer** (0.176.0, PSD write round R1; groups and
+//! masks 0.178.0, R3): pixel layers, layer groups and user masks,
+//! written as a version-1 PSD, RGB, 16 bits per channel, `PackBits`
+//! (RLE) compressed, with the layer info in an `Lr16` global block
+//! (layer-info length 0, the way Photoshop itself stores 16-bit files)
+//! and a planar, white-matted four-channel merged image behind a
+//! negative layer count. The app's Save As reaches it (0.177.0).
+//! Curves layers and PSB are refused by [`psd_save_preflight`] as not
+//! supported yet.
 //!
-//! It is a library entry point only: nothing in the app calls it yet.
-//! Groups, masks, Curves layers and PSB are refused by
-//! [`psd_save_preflight`] as not supported yet.
+//! # Groups (0.178.0)
+//!
+//! A group is two records bracketing its children, the way Photoshop
+//! and psd-tools store it (`spike/psd-write/FINDINGS.md` finding 5):
+//! first (lowest in the file) a *bounding divider* named
+//! [`PSD_GROUP_END_NAME`] — an `lsct` block of type `3` and nothing
+//! else, an empty rectangle, and four empty channels of two bytes each;
+//! then the children, bottom-to-top, recursively; then the *folder*
+//! record — `lsct` type `1` (open: Aurora's tree has no collapsed
+//! state, and open/closed is UI-only in Photoshop) followed by `8BIM`
+//! and the group's blend key — carrying the group's name, opacity,
+//! fill, blend mode and visibility. Aurora's groups are always isolated,
+//! so a group is written with its own mode (`norm` for Normal), never
+//! `pass` (Pass Through); the reader maps `pass` to `Normal` and says
+//! so at open, so a file that had Pass Through groups has already been
+//! reported as converted, and re-saving writes what Aurora shows.
+//! Nesting is capped at [`super::MAX_GROUP_DEPTH`], the reader's own
+//! limit, and every divider counts towards [`PSD_MAX_RECORDS`].
+//!
+//! # Masks (0.178.0)
+//!
+//! A layer's or group's `aurora_doc::LayerMask` is written as a PSD
+//! user mask: 20 bytes of mask data — the rectangle (the mask's own
+//! `bounds`, document coordinates, exactly what the reader reads back
+//! as document coordinates), the default colour, the flags (bit 1:
+//! disabled; bit 4: a parameter block follows) and either the
+//! parameter block (presence bit 0, then the user-mask density as a
+//! `u8`, written only when the density is below full) or two bytes of
+//! padding — and a `-2` channel at the rectangle's size, `u16` coverage
+//! streamed by tile bands from the mask surface like any colour
+//! channel. Aurora's coverage is `0.0` outside the mask's bounds (the
+//! app's `apply_mask`; an unpainted texel inside them is `1.0`), so the
+//! default colour is `0`; an `inverted` mask is baked — every sample
+//! written as `1 - c` and the default colour `255` — and flags bit 2 is
+//! left clear. A density that is not a multiple of 1/255 is rounded and
+//! reported. Feather is not written (Aurora has none); a vector mask a
+//! PSD had was already converted to a pixel mask at open, and is
+//! written as one.
 //!
 //! # Streaming
 //!
@@ -44,7 +82,10 @@ use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree};
 use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
-use super::{PSD_MAX_EXTENT, PsdPixelSink, PsdPixels, unpack_bits};
+use super::{
+    MASK_DISABLED, MASK_PARAMETERS, MAX_GROUP_DEPTH, PSD_MAX_EXTENT, PsdPixelSink, PsdPixels,
+    unpack_bits,
+};
 use crate::error::IoError;
 use crate::image::Image;
 
@@ -55,6 +96,9 @@ pub const PSD_MAX_RECORDS: usize = 32_767;
 /// file of 2 GiB or more (its offsets are signed 32-bit). A larger
 /// document needs `.psb` (round R5).
 pub const PSD_MAX_FILE_BYTES: u64 = (1 << 31) - 1;
+
+/// The name a group's bounding divider record carries (Photoshop's own).
+pub const PSD_GROUP_END_NAME: &str = "</Layer group>";
 
 /// The longest layer name written, in UTF-16 code units; a longer name is
 /// shortened and reported.
@@ -96,10 +140,8 @@ pub enum PsdSaveRefusal {
     EmptyCanvas,
     /// `.psb` is not written yet.
     PsbNotYetSupported,
-    /// Layer groups are not written yet.
-    GroupsNotYetSupported { count: usize },
-    /// Layer masks are not written yet.
-    MasksNotYetSupported { count: usize },
+    /// Groups nest deeper than a PSD Aurora can reopen allows.
+    GroupsTooDeep { depth: usize, max: usize },
     /// Curves (adjustment) layers are not written yet.
     CurvesNotYetSupported { count: usize },
     /// More layer records than a PSD's layer count can hold.
@@ -122,14 +164,9 @@ impl std::fmt::Display for PsdSaveRefusal {
             ),
             Self::EmptyCanvas => write!(f, "the document has no pixels"),
             Self::PsbNotYetSupported => write!(f, "saving .psb files is not yet supported"),
-            Self::GroupsNotYetSupported { count } => write!(
+            Self::GroupsTooDeep { depth, max } => write!(
                 f,
-                "the document has {count} layer group(s); saving groups to PSD is not yet \
-                 supported"
-            ),
-            Self::MasksNotYetSupported { count } => write!(
-                f,
-                "the document has {count} layer mask(s); saving masks to PSD is not yet supported"
+                "the document's groups are nested {depth} deep; a PSD file holds at most {max}"
             ),
             Self::CurvesNotYetSupported { count } => write!(
                 f,
@@ -138,7 +175,8 @@ impl std::fmt::Display for PsdSaveRefusal {
             ),
             Self::TooManyLayers { count } => write!(
                 f,
-                "the document has {count} layers; a PSD file holds at most {PSD_MAX_RECORDS}"
+                "the document needs {count} layer records (a group takes two); a PSD file holds \
+                 at most {PSD_MAX_RECORDS}"
             ),
             Self::CompositeSizeMismatch { canvas, composite } => write!(
                 f,
@@ -170,6 +208,7 @@ impl PsdWriteReport {
 struct Losses {
     long_names: usize,
     rounded_opacity: usize,
+    rounded_density: usize,
     dissolve: usize,
     clipped: u64,
     nan: u64,
@@ -202,6 +241,16 @@ impl Losses {
                     self.rounded_opacity as u64,
                     "layer opacity or fill value",
                     "layer opacity or fill values"
+                )
+            ));
+        }
+        if self.rounded_density > 0 {
+            items.push(format!(
+                "{} will be rounded to Photoshop's 255 steps.",
+                plural(
+                    self.rounded_density as u64,
+                    "layer mask density",
+                    "layer mask densities"
                 )
             ));
         }
@@ -316,9 +365,37 @@ impl PsdCompositeSource for &Image {
     }
 }
 
-/// One layer as [`verify_psd_file`] expects to read it back.
+/// What one layer record is (0.178.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PsdRecordKind {
+    /// A pixel layer.
+    Layer,
+    /// A group's bounding divider (`lsct` type 3), below its children.
+    GroupEnd,
+    /// A group's folder record (`lsct` type 1), above its children,
+    /// carrying the group's own properties.
+    Group,
+}
+
+/// A user mask as [`verify_psd_file`] expects to read it back (0.178.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedMask {
+    /// The mask rectangle, document coordinates: top, left, bottom, right.
+    pub rect: [i32; 4],
+    pub default_color: u8,
+    pub flags: u8,
+    /// The user-mask density in the parameter block, when one is written.
+    pub density: Option<u8>,
+    /// A hash of every written `u16` coverage sample.
+    pub sample_hash: u64,
+    /// The same, over the `f16` values the reader decodes them to.
+    pub decoded_hash: u64,
+}
+
+/// One layer record as [`verify_psd_file`] expects to read it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectedLayer {
+    pub kind: PsdRecordKind,
     /// The name as written (after any shortening).
     pub name: String,
     pub blend: BlendMode,
@@ -331,6 +408,8 @@ pub struct PsdExpectedLayer {
     pub sample_hash: u64,
     /// The same, over the `f16` values the reader decodes them to.
     pub decoded_hash: u64,
+    /// The record's user mask, if it has one.
+    pub mask: Option<PsdExpectedMask>,
 }
 
 /// Everything [`verify_psd_file`] checks a written file against.
@@ -338,7 +417,8 @@ pub struct PsdExpectedLayer {
 pub struct PsdExpectation {
     pub width: u32,
     pub height: u32,
-    /// Bottom-to-top, the file's own order.
+    /// Every record bottom-to-top, the file's own order — group
+    /// dividers and folders included.
     pub layers: Vec<PsdExpectedLayer>,
     /// A hash of every written merged-image `u16` sample.
     pub merged_hash: u64,
@@ -368,13 +448,23 @@ fn refused(refusal: PsdSaveRefusal) -> IoError {
 ///
 /// The first refusal that applies, in this order: PSB, an empty or
 /// oversize canvas (over 30,000 px on either side: "use .psb"), no
-/// layers, groups, Curves layers, masks, more than 32,767 records.
+/// layers, groups nested deeper than [`super::MAX_GROUP_DEPTH`], Curves
+/// layers, more than 32,767 records (a group takes two).
 pub fn psd_save_preflight(
     layers: &LayerTree,
     canvas: (u32, u32),
     opts: PsdSaveOptions,
 ) -> Result<PsdWriteReport, PsdSaveRefusal> {
     preflight_losses(layers, canvas, opts).map(Losses::report)
+}
+
+/// What [`preflight_losses`] counts over the whole tree.
+#[derive(Debug, Default)]
+struct Census {
+    records: usize,
+    curves: usize,
+    /// The deepest group nesting past [`MAX_GROUP_DEPTH`], if any.
+    too_deep: Option<usize>,
 }
 
 fn preflight_losses(
@@ -396,31 +486,42 @@ fn preflight_losses(
     if roots.is_empty() {
         return Err(PsdSaveRefusal::NoLayers);
     }
-    let (mut groups, mut curves, mut masks) = (0, 0, 0);
-    for &id in roots {
-        match layers.kind(id) {
-            Some(LayerKind::Group { .. }) => groups += 1,
-            Some(LayerKind::Adjustment(_)) => curves += 1,
-            Some(LayerKind::Pixel { .. }) | None => {}
-        }
-        if layers.mask(id).is_some() {
-            masks += 1;
-        }
-    }
-    if groups > 0 {
-        return Err(PsdSaveRefusal::GroupsNotYetSupported { count: groups });
-    }
-    if curves > 0 {
-        return Err(PsdSaveRefusal::CurvesNotYetSupported { count: curves });
-    }
-    if masks > 0 {
-        return Err(PsdSaveRefusal::MasksNotYetSupported { count: masks });
-    }
-    if roots.len() > PSD_MAX_RECORDS {
-        return Err(PsdSaveRefusal::TooManyLayers { count: roots.len() });
-    }
     let mut losses = Losses::default();
-    for &id in roots {
+    let mut census = Census::default();
+    census_of(layers, roots, 0, &mut census, &mut losses);
+    if let Some(depth) = census.too_deep {
+        return Err(PsdSaveRefusal::GroupsTooDeep {
+            depth,
+            max: MAX_GROUP_DEPTH,
+        });
+    }
+    if census.curves > 0 {
+        return Err(PsdSaveRefusal::CurvesNotYetSupported {
+            count: census.curves,
+        });
+    }
+    if census.records > PSD_MAX_RECORDS {
+        return Err(PsdSaveRefusal::TooManyLayers {
+            count: census.records,
+        });
+    }
+    Ok(losses)
+}
+
+/// Counts `ids` (siblings, enclosed by `depth` groups) and everything
+/// below them: records (a group is two, its divider and its folder),
+/// Curves layers, nesting past [`MAX_GROUP_DEPTH`] — not descended into
+/// — and the structural losses. Recursion is bounded by
+/// [`MAX_GROUP_DEPTH`] + 1.
+fn census_of(
+    layers: &LayerTree,
+    ids: &[LayerId],
+    depth: usize,
+    census: &mut Census,
+    losses: &mut Losses,
+) {
+    for &id in ids {
+        census.records = census.records.saturating_add(1);
         if layers.name(id).unwrap_or_default().encode_utf16().count() > PSD_MAX_NAME_UNITS {
             losses.long_names += 1;
         }
@@ -432,11 +533,67 @@ fn preflight_losses(
                 losses.rounded_opacity += 1;
             }
         }
+        if let Some(mask) = layers.mask(id)
+            && (f32::from(opacity_byte(mask.density)) / 255.0).to_bits() != mask.density.to_bits()
+        {
+            losses.rounded_density += 1;
+        }
         if layers.blend_mode(id) == Some(BlendMode::Dissolve) {
             losses.dissolve += 1;
         }
+        match layers.kind(id) {
+            Some(LayerKind::Group { children }) => {
+                census.records = census.records.saturating_add(1); // its divider
+                let level = depth + 1;
+                if level > MAX_GROUP_DEPTH {
+                    census.too_deep = Some(census.too_deep.map_or(level, |d| d.max(level)));
+                } else {
+                    census_of(layers, children, level, census, losses);
+                }
+            }
+            Some(LayerKind::Adjustment(_)) => census.curves += 1,
+            Some(LayerKind::Pixel { .. }) | None => {}
+        }
     }
-    Ok(losses)
+}
+
+/// Every record in file order (bottom-to-top), each with the layer it
+/// comes from: a group gives its divider, its children (recursively)
+/// and its folder. The writer plans from it and the verifier rebuilds
+/// it from the document it reads back.
+///
+/// # Errors
+///
+/// [`PsdSaveRefusal::GroupsTooDeep`] past [`MAX_GROUP_DEPTH`], which also
+/// bounds the recursion.
+fn file_order(layers: &LayerTree) -> Result<Vec<(LayerId, PsdRecordKind)>, IoError> {
+    fn walk(
+        layers: &LayerTree,
+        ids: &[LayerId],
+        depth: usize,
+        out: &mut Vec<(LayerId, PsdRecordKind)>,
+    ) -> Result<(), IoError> {
+        if depth > MAX_GROUP_DEPTH {
+            return Err(refused(PsdSaveRefusal::GroupsTooDeep {
+                depth,
+                max: MAX_GROUP_DEPTH,
+            }));
+        }
+        // Siblings are top-to-bottom; the file stores records bottom-to-top.
+        for &id in ids.iter().rev() {
+            if let Some(LayerKind::Group { children }) = layers.kind(id) {
+                out.push((id, PsdRecordKind::GroupEnd));
+                walk(layers, children, depth + 1, out)?;
+                out.push((id, PsdRecordKind::Group));
+            } else {
+                out.push((id, PsdRecordKind::Layer));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(layers, layers.roots(), 0, &mut out)?;
+    Ok(out)
 }
 
 /// `0.0..=1.0` to the file's `0..=255`, rounded to nearest.
@@ -551,7 +708,10 @@ fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32)) -> u64 {
     };
     let layers = plans
         .iter()
-        .map(|p| rows(p.extent.2, p.extent.3, 4))
+        .map(|p| {
+            let mask = p.mask.as_ref().map_or(0, |m| rows(m.width, m.height, 1));
+            rows(p.extent.2, p.extent.3, 4).saturating_add(mask)
+        })
         .fold(0u64, u64::saturating_add);
     // The merged image has one compression field for all four planes.
     let merged_row_min = 2 * (u64::from(width) * 2).div_ceil(128);
@@ -559,15 +719,27 @@ fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32)) -> u64 {
     layers.saturating_add(merged)
 }
 
-/// One root pixel layer, planned before anything is written.
+/// One record, planned before anything is written.
 #[derive(Debug)]
 struct LayerPlan {
-    surface: SurfaceId,
+    /// The pixel surface; `None` for a group's two records.
+    surface: Option<SurfaceId>,
     /// The written extent in surface-local pixels: x, y, width, height.
     extent: (u32, u32, u32, u32),
+    mask: Option<MaskPlan>,
     expected: PsdExpectedLayer,
     pascal: Vec<u8>,
     luni: Vec<u16>,
+}
+
+/// A record's user mask, planned: where its coverage is and how much of
+/// it is written (its whole bounds, from the mask surface's origin).
+#[derive(Debug)]
+struct MaskPlan {
+    surface: Option<SurfaceId>,
+    width: u32,
+    height: u32,
+    inverted: bool,
 }
 
 /// The tile-occupied region of a layer's surface, intersected with its
@@ -607,16 +779,126 @@ fn i32_of(v: i64) -> Result<i32, IoError> {
 
 fn plan_layers(layers: &LayerTree, store: &TileStore) -> Result<Vec<LayerPlan>, IoError> {
     let mut plans = Vec::new();
-    // Roots are top-to-bottom; the file stores records bottom-to-top.
-    for &id in layers.roots().iter().rev() {
-        plans.push(plan_layer(layers, store, id)?);
+    for (id, kind) in file_order(layers)? {
+        plans.push(match kind {
+            PsdRecordKind::Layer => plan_layer(layers, store, id)?,
+            PsdRecordKind::GroupEnd => plan_group_end(),
+            PsdRecordKind::Group => plan_group(layers, id)?,
+        });
     }
     Ok(plans)
 }
 
+/// A record's name, blend, opacity, fill and visibility, from `id`.
+fn plan_props(
+    layers: &LayerTree,
+    id: LayerId,
+    kind: PsdRecordKind,
+    rect: [i32; 4],
+) -> Result<LayerPlan, IoError> {
+    let name = layers.name(id).unwrap_or_default();
+    let luni = written_name(name);
+    let written = String::from_utf16_lossy(&luni);
+    let (mask, expected_mask) = plan_mask(layers, id)?;
+    Ok(LayerPlan {
+        surface: None,
+        extent: (0, 0, 0, 0),
+        mask,
+        pascal: pascal_name(&written),
+        expected: PsdExpectedLayer {
+            kind,
+            name: written,
+            blend: layers.blend_mode(id).unwrap_or_default(),
+            opacity: opacity_byte(layers.opacity(id).unwrap_or(1.0)),
+            fill: opacity_byte(layers.fill_opacity(id).unwrap_or(1.0)),
+            visible: layers.visible(id).unwrap_or(true),
+            rect,
+            sample_hash: 0,
+            decoded_hash: 0,
+            mask: expected_mask,
+        },
+        luni,
+    })
+}
+
+/// A group's bounding divider: Photoshop's fixed name, `Normal`, fully
+/// opaque, visible, empty.
+fn plan_group_end() -> LayerPlan {
+    let luni: Vec<u16> = PSD_GROUP_END_NAME.encode_utf16().collect();
+    LayerPlan {
+        surface: None,
+        extent: (0, 0, 0, 0),
+        mask: None,
+        pascal: pascal_name(PSD_GROUP_END_NAME),
+        expected: PsdExpectedLayer {
+            kind: PsdRecordKind::GroupEnd,
+            name: PSD_GROUP_END_NAME.to_owned(),
+            blend: BlendMode::Normal,
+            opacity: u8::MAX,
+            fill: u8::MAX,
+            visible: true,
+            rect: [0; 4],
+            sample_hash: 0,
+            decoded_hash: 0,
+            mask: None,
+        },
+        luni,
+    }
+}
+
+/// A group's folder record: its own properties and mask, no pixels.
+fn plan_group(layers: &LayerTree, id: LayerId) -> Result<LayerPlan, IoError> {
+    plan_props(layers, id, PsdRecordKind::Group, [0; 4])
+}
+
+/// `id`'s user mask: the rectangle (its document-space `bounds`), the
+/// default colour (Aurora's coverage outside the bounds, `0`, or `255`
+/// once an inversion is baked in), the flags and the density byte.
+fn plan_mask(
+    layers: &LayerTree,
+    id: LayerId,
+) -> Result<(Option<MaskPlan>, Option<PsdExpectedMask>), IoError> {
+    let Some(mask) = layers.mask(id) else {
+        return Ok((None, None));
+    };
+    let b = mask.bounds;
+    let top = i32_of(b.y)?;
+    let left = i32_of(b.x)?;
+    let bottom = top
+        .checked_add(i32::try_from(b.height).map_err(|_| too_large("mask height"))?)
+        .ok_or_else(|| too_large("mask height"))?;
+    let right = left
+        .checked_add(i32::try_from(b.width).map_err(|_| too_large("mask width"))?)
+        .ok_or_else(|| too_large("mask width"))?;
+    let density = Some(opacity_byte(mask.density)).filter(|&d| d != u8::MAX);
+    let mut flags = 0u8;
+    if !mask.enabled {
+        flags |= MASK_DISABLED;
+    }
+    if density.is_some() {
+        flags |= MASK_PARAMETERS;
+    }
+    Ok((
+        Some(MaskPlan {
+            surface: layers.mask_surface_id(id),
+            width: b.width,
+            height: b.height,
+            inverted: mask.inverted,
+        }),
+        Some(PsdExpectedMask {
+            rect: [top, left, bottom, right],
+            default_color: if mask.inverted { u8::MAX } else { 0 },
+            flags,
+            density,
+            sample_hash: 0,
+            decoded_hash: 0,
+        }),
+    ))
+}
+
 fn plan_layer(layers: &LayerTree, store: &TileStore, id: LayerId) -> Result<LayerPlan, IoError> {
     let Some(LayerKind::Pixel { bounds }) = layers.kind(id) else {
-        return Err(refused(PsdSaveRefusal::GroupsNotYetSupported { count: 1 }));
+        return Err(refused(PsdSaveRefusal::CurvesNotYetSupported { count: 1 }));
     };
     let surface = layers.surface_id(id).ok_or(IoError::PsdMalformed {
         what: "a pixel layer without a surface",
@@ -641,32 +923,32 @@ fn plan_layer(layers: &LayerTree, store: &TileStore, id: LayerId) -> Result<Laye
     let right = left
         .checked_add(i32::try_from(ew).map_err(|_| too_large("layer width"))?)
         .ok_or_else(|| too_large("layer width"))?;
-    let name = layers.name(id).unwrap_or_default();
-    let luni = written_name(name);
-    let written = String::from_utf16_lossy(&luni);
-    Ok(LayerPlan {
-        surface,
-        extent,
-        pascal: pascal_name(&written),
-        expected: PsdExpectedLayer {
-            name: written,
-            blend: layers.blend_mode(id).unwrap_or_default(),
-            opacity: opacity_byte(layers.opacity(id).unwrap_or(1.0)),
-            fill: opacity_byte(layers.fill_opacity(id).unwrap_or(1.0)),
-            visible: layers.visible(id).unwrap_or(true),
-            rect: [top, left, bottom, right],
-            sample_hash: 0,
-            decoded_hash: 0,
-        },
-        luni,
-    })
+    let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [top, left, bottom, right])?;
+    plan.surface = Some(surface);
+    plan.extent = extent;
+    Ok(plan)
 }
 
-/// A record's extra data: empty mask, empty blending ranges, the Pascal
-/// name, `luni` and `iOpa`.
+/// A record's extra data: the mask data (20 bytes, or empty), empty
+/// blending ranges, the Pascal name, `luni`, `lsct` for a group's two
+/// records, and `iOpa`.
 fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     let mut extra = Vec::new();
-    extra.extend_from_slice(&0u32.to_be_bytes()); // mask data
+    match &plan.expected.mask {
+        Some(mask) => {
+            extra.extend_from_slice(&20u32.to_be_bytes());
+            for edge in mask.rect {
+                extra.extend_from_slice(&edge.to_be_bytes());
+            }
+            extra.extend_from_slice(&[mask.default_color, mask.flags]);
+            match mask.density {
+                // Parameter block: presence bit 0 (user density), then it.
+                Some(density) => extra.extend_from_slice(&[0x01, density]),
+                None => extra.extend_from_slice(&[0, 0]), // padding
+            }
+        }
+        None => extra.extend_from_slice(&0u32.to_be_bytes()),
+    }
     extra.extend_from_slice(&0u32.to_be_bytes()); // blending ranges
     extra.extend_from_slice(&plan.pascal);
     let units = u32::try_from(plan.luni.len()).map_err(|_| too_large("layer name"))?;
@@ -678,6 +960,13 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     for unit in &plan.luni {
         extra.extend_from_slice(&unit.to_be_bytes());
     }
+    if let Some(section) = section_data(&plan.expected) {
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"lsct");
+        let len = u32::try_from(section.len()).map_err(|_| too_large("lsct"))?;
+        extra.extend_from_slice(&len.to_be_bytes());
+        extra.extend_from_slice(&section);
+    }
     extra.extend_from_slice(b"8BIM");
     extra.extend_from_slice(b"iOpa");
     extra.extend_from_slice(&4u32.to_be_bytes());
@@ -685,8 +974,35 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     Ok(extra)
 }
 
-/// The order channels are stored in, and each one's RGBA slot.
+/// A record's `lsct` data: none for a layer; type `3` alone for a
+/// divider; type `1` (open), `8BIM` and the group's own blend key for a
+/// folder.
+fn section_data(expected: &PsdExpectedLayer) -> Option<Vec<u8>> {
+    match expected.kind {
+        PsdRecordKind::Layer => None,
+        PsdRecordKind::GroupEnd => Some(3u32.to_be_bytes().to_vec()),
+        PsdRecordKind::Group => {
+            let mut data = 1u32.to_be_bytes().to_vec();
+            data.extend_from_slice(b"8BIM");
+            data.extend_from_slice(&psd_blend_key(expected.blend));
+            Some(data)
+        }
+    }
+}
+
+/// The order colour channels are stored in, and each one's RGBA slot.
 const CHANNELS: [(i16, u8); 4] = [(-1, 3), (0, 0), (1, 1), (2, 2)];
+
+/// The user mask's channel id and its hash slot.
+const MASK_CHANNEL: (i16, u8) = (-2, 4);
+
+/// A record's channels in file order: the four colour channels, then
+/// `-2` when it has a mask.
+fn record_channels(plan: &LayerPlan) -> impl Iterator<Item = (i16, u8)> {
+    CHANNELS
+        .into_iter()
+        .chain(plan.mask.is_some().then_some(MASK_CHANNEL))
+}
 
 fn pos<W: Seek>(w: &mut W) -> Result<u64, IoError> {
     Ok(w.stream_position()?)
@@ -707,17 +1023,86 @@ fn u32_len(from: u64, to: u64, what: &'static str) -> Result<[u8; 4], IoError> {
         .to_be_bytes())
 }
 
+/// Where one channel's samples come from.
+#[derive(Clone, Copy, Debug)]
+enum PlaneSource {
+    /// One RGBA slot of a pixel surface; an absent tile is transparent
+    /// zeros. `None` (a group's records) writes nothing but the header.
+    Color {
+        surface: Option<SurfaceId>,
+        slot: u8,
+    },
+    /// A mask surface's coverage ([`aurora_doc::read_mask_coverage`]);
+    /// an absent tile, or no surface at all, is unpainted — `1.0` — and
+    /// `inverted` writes `1 - c`.
+    Mask {
+        surface: Option<SurfaceId>,
+        inverted: bool,
+    },
+}
+
+impl PlaneSource {
+    fn surface(self) -> Option<SurfaceId> {
+        match self {
+            Self::Color { surface, .. } | Self::Mask { surface, .. } => surface,
+        }
+    }
+
+    /// The hash slot: `0..=3` for RGBA, `4` for the mask.
+    fn slot(self) -> u8 {
+        match self {
+            Self::Color { slot, .. } => slot,
+            Self::Mask { .. } => MASK_CHANNEL.1,
+        }
+    }
+
+    /// The value of a texel no tile holds.
+    fn absent(self) -> f32 {
+        match self {
+            Self::Color { .. } => 0.0,
+            Self::Mask { inverted, .. } => {
+                if inverted {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+        }
+    }
+
+    /// The value of texel `index` (its first sample) of a present tile.
+    fn value(self, texels: &[f16], index: usize) -> f32 {
+        match self {
+            Self::Color { slot, .. } => texels
+                .get(index + usize::from(slot))
+                .map_or(0.0, |v| v.to_f32()),
+            Self::Mask { inverted, .. } => {
+                let c = texels
+                    .get(index..index + 4)
+                    .map_or(1.0, aurora_doc::read_mask_coverage);
+                if inverted { 1.0 - c } else { c }
+            }
+        }
+    }
+}
+
 /// Writes one channel: compression `1`, the row table (reserved, then
-/// filled in) and every packed row, one tile-row band at a time.
+/// filled in) and every packed row, one tile-row band at a time, over
+/// `extent` (surface-local `x, y, width, height`). Returns the hashes of
+/// the written `u16` samples and of the `f16` values the reader decodes
+/// them to.
 fn write_channel<W: Write + Seek>(
     w: &mut W,
     store: &mut TileStore,
-    plan: &mut LayerPlan,
-    slot: u8,
+    source: PlaneSource,
+    extent: (u32, u32, u32, u32),
     losses: &mut Losses,
     limit: u64,
-) -> Result<(), IoError> {
-    let (ex, ey, ew, eh) = plan.extent;
+) -> Result<(u64, u64), IoError> {
+    let (ex, ey, ew, eh) = extent;
+    let slot = source.slot();
+    let absent = quantize_u16(source.absent());
+    let (mut sample_sum, mut decoded_sum) = (0u64, 0u64);
     w.write_all(&1u16.to_be_bytes())?;
     let table_at = pos(w)?;
     let table_len = (eh as usize)
@@ -728,20 +1113,22 @@ fn write_channel<W: Write + Seek>(
     let row_samples = ew as usize;
     let mut band: Vec<u16> = Vec::new();
     let mut row_bytes: Vec<u8> = Vec::with_capacity(row_samples.saturating_mul(2));
-    let slot_index = usize::from(slot);
     let mut y = ey;
     while y < ey + eh {
         let ty = y / TILE;
         let band_end = ty.saturating_add(1).saturating_mul(TILE).min(ey + eh);
         let rows = (band_end - y) as usize;
         band.clear();
-        band.resize(row_samples.saturating_mul(rows), 0);
+        band.resize(row_samples.saturating_mul(rows), absent);
         for tx in (ex / TILE)..(ex + ew).div_ceil(TILE) {
             let id = TileId { x: tx, y: ty };
-            if !store.contains_tile(plan.surface, id) {
-                continue; // absent: transparent zeros
+            let Some(surface) = source.surface() else {
+                break;
+            };
+            if !store.contains_tile(surface, id) {
+                continue; // absent: the source's own default
             }
-            let tile = store.get(plan.surface, id)?;
+            let tile = store.get(surface, id)?;
             let texels = tile.texels();
             let x0 = (tx * TILE).max(ex);
             let x1 = tx.saturating_add(1).saturating_mul(TILE).min(ex + ew);
@@ -749,9 +1136,8 @@ fn write_channel<W: Write + Seek>(
                 let ly = (y - ty * TILE) as usize + r;
                 for x in x0..x1 {
                     let lx = (x - tx * TILE) as usize;
-                    let texel = (ly * TILE as usize + lx) * 4 + slot_index;
-                    let value = texels.get(texel).map_or(0.0, |v| v.to_f32());
-                    let q = quantize(value, losses);
+                    let texel = (ly * TILE as usize + lx) * 4;
+                    let q = quantize(source.value(texels, texel), losses);
                     if let Some(dst) = band.get_mut(r * row_samples + (x - ex) as usize) {
                         *dst = q;
                     }
@@ -764,17 +1150,10 @@ fn write_channel<W: Write + Seek>(
             for (x, &q) in row.iter().enumerate() {
                 row_bytes.extend_from_slice(&q.to_be_bytes());
                 let x = x as u32;
-                plan.expected.sample_hash =
-                    plan.expected
-                        .sample_hash
-                        .wrapping_add(sample_hash(slot, x, ry, u64::from(q)));
+                sample_sum = sample_sum.wrapping_add(sample_hash(slot, x, ry, u64::from(q)));
                 let decoded = f16::from_f32(promote_u16(q)).to_bits();
-                plan.expected.decoded_hash = plan.expected.decoded_hash.wrapping_add(sample_hash(
-                    slot,
-                    x,
-                    ry,
-                    u64::from(decoded),
-                ));
+                decoded_sum =
+                    decoded_sum.wrapping_add(sample_hash(slot, x, ry, u64::from(decoded)));
             }
             let packed = pack_bits(&row_bytes);
             let count = u16::try_from(packed.len()).map_err(|_| too_large("RLE row"))?;
@@ -785,7 +1164,8 @@ fn write_channel<W: Write + Seek>(
         check_size(w, limit)?;
     }
     let end = pos(w)?;
-    patch(w, table_at, &counts, end)
+    patch(w, table_at, &counts, end)?;
+    Ok((sample_sum, decoded_sum))
 }
 
 /// Stops the write once the file passes `limit` (an absolute position):
@@ -799,7 +1179,7 @@ fn check_size<W: Seek>(w: &mut W, limit: u64) -> Result<(), IoError> {
     Ok(())
 }
 
-/// Writes `layers` (root-level pixel layers only), their pixels from
+/// Writes `layers` (pixel layers, groups and their masks), their pixels from
 /// `store` and the merged image from `composite`, as a 16-bit RGB PSD.
 /// Runs [`psd_save_preflight`] first.
 ///
@@ -901,7 +1281,13 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     }
     let area = plans
         .iter()
-        .map(|p| u64::from(p.extent.2) * u64::from(p.extent.3))
+        .map(|p| {
+            let mask = p
+                .mask
+                .as_ref()
+                .map_or(0, |m| u64::from(m.width) * u64::from(m.height));
+            (u64::from(p.extent.2) * u64::from(p.extent.3)).saturating_add(mask)
+        })
         .fold(0u64, u64::saturating_add);
     losses.unreopenable = area > limits.reopen_budget;
     let mut buffered = std::io::BufWriter::new(&mut writer);
@@ -924,39 +1310,8 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     // Negative: the merged image's fourth channel is its transparency.
     w.write_all(&(-count).to_be_bytes())?;
 
-    let mut length_slots: Vec<[u64; 4]> = Vec::with_capacity(plans.len());
-    for plan in &plans {
-        for edge in plan.expected.rect {
-            w.write_all(&edge.to_be_bytes())?;
-        }
-        w.write_all(&4u16.to_be_bytes())?;
-        let mut slots = [0u64; 4];
-        for ((id, _), slot) in CHANNELS.iter().zip(slots.iter_mut()) {
-            w.write_all(&id.to_be_bytes())?;
-            *slot = pos(w)?;
-            w.write_all(&0u32.to_be_bytes())?;
-        }
-        length_slots.push(slots);
-        w.write_all(b"8BIM")?;
-        w.write_all(&psd_blend_key(plan.expected.blend))?;
-        // Flags bit 1 SET means hidden.
-        let flags: u8 = if plan.expected.visible { 0 } else { 0x02 };
-        w.write_all(&[plan.expected.opacity, 0, flags, 0])?;
-        let extra = record_extra(plan)?;
-        let extra_len = u32::try_from(extra.len()).map_err(|_| too_large("layer record"))?;
-        w.write_all(&extra_len.to_be_bytes())?;
-        w.write_all(&extra)?;
-    }
-
-    for (plan, slots) in plans.iter_mut().zip(&length_slots) {
-        for ((_, slot), &at) in CHANNELS.iter().zip(slots) {
-            let channel_start = pos(w)?;
-            write_channel(w, store, plan, *slot, &mut losses, limit)?;
-            let end = pos(w)?;
-            // The length includes the 2-byte compression field.
-            patch(w, at, &u32_len(channel_start, end, "channel")?, end)?;
-        }
-    }
+    let length_slots = write_records(w, &plans)?;
+    write_all_channels(w, store, &mut plans, &length_slots, &mut losses, limit)?;
     let lr16_end = pos(w)?;
     patch(
         w,
@@ -987,6 +1342,89 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             merged_hash,
         },
     })
+}
+
+/// Every record, with placeholder channel lengths; returns where each
+/// record's channel lengths are, to be filled in.
+fn write_records<W: Write + Seek>(
+    w: &mut W,
+    plans: &[LayerPlan],
+) -> Result<Vec<Vec<u64>>, IoError> {
+    let mut length_slots: Vec<Vec<u64>> = Vec::with_capacity(plans.len());
+    for plan in plans {
+        for edge in plan.expected.rect {
+            w.write_all(&edge.to_be_bytes())?;
+        }
+        let channels: Vec<(i16, u8)> = record_channels(plan).collect();
+        let nch = u16::try_from(channels.len()).map_err(|_| too_large("channels"))?;
+        w.write_all(&nch.to_be_bytes())?;
+        let mut slots = Vec::with_capacity(channels.len());
+        for (id, _) in channels {
+            w.write_all(&id.to_be_bytes())?;
+            slots.push(pos(w)?);
+            w.write_all(&0u32.to_be_bytes())?;
+        }
+        length_slots.push(slots);
+        w.write_all(b"8BIM")?;
+        w.write_all(&psd_blend_key(plan.expected.blend))?;
+        // Flags bit 1 SET means hidden.
+        let flags: u8 = if plan.expected.visible { 0 } else { 0x02 };
+        w.write_all(&[plan.expected.opacity, 0, flags, 0])?;
+        let extra = record_extra(plan)?;
+        let extra_len = u32::try_from(extra.len()).map_err(|_| too_large("layer record"))?;
+        w.write_all(&extra_len.to_be_bytes())?;
+        w.write_all(&extra)?;
+    }
+
+    Ok(length_slots)
+}
+
+/// Every record's channels, in record order, each one's length
+/// patched into its slot.
+fn write_all_channels<W: Write + Seek>(
+    w: &mut W,
+    store: &mut TileStore,
+    plans: &mut [LayerPlan],
+    length_slots: &[Vec<u64>],
+    losses: &mut Losses,
+    limit: u64,
+) -> Result<(), IoError> {
+    for (plan, slots) in plans.iter_mut().zip(length_slots) {
+        let channels: Vec<(i16, u8)> = record_channels(plan).collect();
+        for ((id, slot), &at) in channels.into_iter().zip(slots) {
+            let channel_start = pos(w)?;
+            if id == MASK_CHANNEL.0 {
+                let (source, extent) = match &plan.mask {
+                    Some(m) => (
+                        PlaneSource::Mask {
+                            surface: m.surface,
+                            inverted: m.inverted,
+                        },
+                        (0, 0, m.width, m.height),
+                    ),
+                    None => return Err(too_large("mask channel")),
+                };
+                let (sample, decoded) = write_channel(w, store, source, extent, losses, limit)?;
+                if let Some(mask) = plan.expected.mask.as_mut() {
+                    mask.sample_hash = mask.sample_hash.wrapping_add(sample);
+                    mask.decoded_hash = mask.decoded_hash.wrapping_add(decoded);
+                }
+            } else {
+                let source = PlaneSource::Color {
+                    surface: plan.surface,
+                    slot,
+                };
+                let (sample, decoded) =
+                    write_channel(w, store, source, plan.extent, losses, limit)?;
+                plan.expected.sample_hash = plan.expected.sample_hash.wrapping_add(sample);
+                plan.expected.decoded_hash = plan.expected.decoded_hash.wrapping_add(decoded);
+            }
+            let end = pos(w)?;
+            // The length includes the 2-byte compression field.
+            patch(w, at, &u32_len(channel_start, end, "channel")?, end)?;
+        }
+    }
+    Ok(())
 }
 
 /// The merged image: compression `1`, a row table for all four planes,
@@ -1201,6 +1639,105 @@ fn raw_header<R: std::io::Read + Seek>(
     Ok(())
 }
 
+/// One record's mask data, checked against `want` (0.178.0).
+fn raw_mask<R: std::io::Read + Seek>(
+    raw: &mut Raw<R>,
+    i: usize,
+    want: Option<&PsdExpectedMask>,
+) -> Result<(), IoError> {
+    let len = raw.u32()?;
+    let Some(want) = want else {
+        return check(&format!("record {i} mask data length"), len, 0);
+    };
+    check(&format!("record {i} mask data length"), len, 20)?;
+    let rect = [raw.i32()?, raw.i32()?, raw.i32()?, raw.i32()?];
+    check(&format!("record {i} mask rectangle"), rect, want.rect)?;
+    let [default_color, flags, presence, density] = raw.array::<4>()?;
+    check(
+        &format!("record {i} mask default colour"),
+        default_color,
+        want.default_color,
+    )?;
+    check(&format!("record {i} mask flags"), flags, want.flags)?;
+    let tail = match want.density {
+        Some(d) => [0x01, d],
+        None => [0, 0],
+    };
+    check(
+        &format!("record {i} mask parameters"),
+        [presence, density],
+        tail,
+    )
+}
+
+/// One record's fields, checked against `want`.
+fn raw_record<R: std::io::Read + Seek>(
+    raw: &mut Raw<R>,
+    i: usize,
+    want: &PsdExpectedLayer,
+) -> Result<RawRecord, IoError> {
+    let rect = [raw.i32()?, raw.i32()?, raw.i32()?, raw.i32()?];
+    check(&format!("layer {i} rectangle"), rect, want.rect)?;
+    let nch = raw.u16()?;
+    let want_nch = if want.mask.is_some() { 5 } else { 4 };
+    check(&format!("layer {i} channel count"), nch, want_nch)?;
+    let mut channels = Vec::new();
+    for _ in 0..nch {
+        let id = i16::from_be_bytes(raw.array()?);
+        channels.push((id, raw.u32()?));
+    }
+    check(
+        &format!("layer {i} blend signature"),
+        raw.array::<4>()?,
+        *b"8BIM",
+    )?;
+    check(
+        &format!("layer {i} blend key"),
+        raw.array::<4>()?,
+        psd_blend_key(want.blend),
+    )?;
+    let [opacity, _clip, flags, _filler] = raw.array::<4>()?;
+    check(&format!("layer {i} opacity"), opacity, want.opacity)?;
+    check(
+        &format!("layer {i} hidden flag"),
+        flags & 0x02 != 0,
+        !want.visible,
+    )?;
+    let extra = raw.u32()?;
+    let extra_end = raw.pos()? + u64::from(extra);
+    raw_mask(raw, i, want.mask.as_ref())?;
+    let ranges = raw.u32()?;
+    raw.skip(u64::from(ranges))?;
+    let [plen] = raw.array::<1>()?;
+    let padded = (usize::from(plen) + 1).next_multiple_of(4) - 1;
+    let _pascal = raw.bytes(padded)?;
+    let (mut name, mut fill, mut section) = (None, None, None);
+    while raw.pos()? < extra_end {
+        check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
+        let key = raw.array::<4>()?;
+        let len = raw.u32()?;
+        let data = raw.bytes(len as usize)?;
+        match &key {
+            b"luni" => name = super::decode_luni(&data),
+            b"iOpa" => fill = data.first().copied(),
+            b"lsct" => section = Some(data),
+            _ => {}
+        }
+    }
+    check(
+        &format!("layer {i} name"),
+        name.as_deref(),
+        Some(want.name.as_str()),
+    )?;
+    check(&format!("layer {i} fill"), fill, Some(want.fill))?;
+    check(
+        &format!("layer {i} section divider"),
+        section,
+        section_data(want),
+    )?;
+    Ok(RawRecord { rect, channels })
+}
+
 /// Checks the file structure field by field, with its own parser (not
 /// the reader's), and every sample against the writer's hashes.
 fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> Result<(), IoError> {
@@ -1219,60 +1756,7 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
     check("layer count", count, -n)?;
     let mut records = Vec::new();
     for (i, want) in expected.layers.iter().enumerate() {
-        let rect = [raw.i32()?, raw.i32()?, raw.i32()?, raw.i32()?];
-        check(&format!("layer {i} rectangle"), rect, want.rect)?;
-        let nch = raw.u16()?;
-        check(&format!("layer {i} channel count"), nch, 4)?;
-        let mut channels = Vec::new();
-        for _ in 0..nch {
-            let id = i16::from_be_bytes(raw.array()?);
-            channels.push((id, raw.u32()?));
-        }
-        check(
-            &format!("layer {i} blend signature"),
-            raw.array::<4>()?,
-            *b"8BIM",
-        )?;
-        check(
-            &format!("layer {i} blend key"),
-            raw.array::<4>()?,
-            psd_blend_key(want.blend),
-        )?;
-        let [opacity, _clip, flags, _filler] = raw.array::<4>()?;
-        check(&format!("layer {i} opacity"), opacity, want.opacity)?;
-        check(
-            &format!("layer {i} hidden flag"),
-            flags & 0x02 != 0,
-            !want.visible,
-        )?;
-        let extra = raw.u32()?;
-        let extra_end = raw.pos()? + u64::from(extra);
-        let mask = raw.u32()?;
-        raw.skip(u64::from(mask))?;
-        let ranges = raw.u32()?;
-        raw.skip(u64::from(ranges))?;
-        let [plen] = raw.array::<1>()?;
-        let padded = (usize::from(plen) + 1).next_multiple_of(4) - 1;
-        let _pascal = raw.bytes(padded)?;
-        let (mut name, mut fill) = (None, None);
-        while raw.pos()? < extra_end {
-            check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
-            let key = raw.array::<4>()?;
-            let len = raw.u32()?;
-            let data = raw.bytes(len as usize)?;
-            match &key {
-                b"luni" => name = super::decode_luni(&data),
-                b"iOpa" => fill = data.first().copied(),
-                _ => {}
-            }
-        }
-        check(
-            &format!("layer {i} name"),
-            name.as_deref(),
-            Some(want.name.as_str()),
-        )?;
-        check(&format!("layer {i} fill"), fill, Some(want.fill))?;
-        records.push(RawRecord { rect, channels });
+        records.push(raw_record(&mut raw, i, want)?);
     }
     for (i, (record, want)) in records.iter().zip(&expected.layers).enumerate() {
         let [top, left, bottom, right] = record.rect;
@@ -1280,15 +1764,22 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
         let h = u32::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0);
         let mut hash = 0u64;
         let order: Vec<i16> = record.channels.iter().map(|(id, _)| *id).collect();
-        check(
-            &format!("layer {i} channel order"),
-            order,
-            vec![-1, 0, 1, 2],
-        )?;
+        let mut want_order = vec![-1, 0, 1, 2];
+        if want.mask.is_some() {
+            want_order.push(MASK_CHANNEL.0);
+        }
+        check(&format!("layer {i} channel order"), order, want_order)?;
         for (&(_, len), (_, slot)) in record.channels.iter().zip(CHANNELS) {
             hash = hash.wrapping_add(raw_channel(&mut raw, len, slot, w, h)?);
         }
         check(&format!("layer {i} pixels"), hash, want.sample_hash)?;
+        if let (Some(mask), Some(&(_, len))) = (&want.mask, record.channels.get(4)) {
+            let [top, left, bottom, right] = mask.rect;
+            let mw = u32::try_from(i64::from(right) - i64::from(left)).unwrap_or(0);
+            let mh = u32::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0);
+            let got = raw_channel(&mut raw, len, MASK_CHANNEL.1, mw, mh)?;
+            check(&format!("layer {i} mask pixels"), got, mask.sample_hash)?;
+        }
     }
     raw.inner.seek(SeekFrom::Start(section_start + section))?;
     raw_merged(&mut raw, expected)
@@ -1326,46 +1817,68 @@ fn raw_merged<R: std::io::Read + Seek>(
 }
 
 /// The [`PsdPixelSink`] [`verify_psd_file`] reads through: hashes each
-/// decoded layer as it arrives and drops it, so memory stays at one layer.
+/// decoded layer and mask as it arrives and drops it, so memory stays at
+/// one layer.
 #[derive(Debug, Default)]
 struct CheckingSink {
     layers: Vec<(LayerId, u32, u32, u64)>,
+    /// Each mask's layer, coverage size and hash (over its own
+    /// `width x height` grid).
+    masks: Vec<(LayerId, u32, u32, u64)>,
+}
+
+fn hash_texels(samples: &[f16], width: u32, channels: usize, first_slot: u8) -> u64 {
+    let mut hash = 0u64;
+    for (i, px) in samples.chunks_exact(channels).enumerate() {
+        let x = (i % width.max(1) as usize) as u32;
+        let y = (i / width.max(1) as usize) as u32;
+        for (slot, v) in (first_slot..).zip(px) {
+            hash = hash.wrapping_add(sample_hash(slot, x, y, u64::from(v.to_bits())));
+        }
+    }
+    hash
 }
 
 impl PsdPixelSink for CheckingSink {
     fn layer(&mut self, pixels: PsdPixels) -> Result<(), IoError> {
         let width = pixels.image.width();
-        let mut hash = 0u64;
-        for (i, px) in pixels.image.samples().chunks_exact(4).enumerate() {
-            let x = (i % width.max(1) as usize) as u32;
-            let y = (i / width.max(1) as usize) as u32;
-            for (slot, v) in (0u8..).zip(px) {
-                hash = hash.wrapping_add(sample_hash(slot, x, y, u64::from(v.to_bits())));
-            }
-        }
+        let hash = hash_texels(pixels.image.samples(), width, 4, 0);
         self.layers
             .push((pixels.layer, width, pixels.image.height(), hash));
         Ok(())
     }
 
-    fn mask(&mut self, _mask: super::PsdMaskPixels) -> Result<(), IoError> {
-        Err(mismatch("a mask the writer did not write"))
+    fn mask(&mut self, mask: super::PsdMaskPixels) -> Result<(), IoError> {
+        let hash = hash_texels(&mask.coverage, mask.width, 1, MASK_CHANNEL.1);
+        self.masks.push((mask.layer, mask.width, mask.height, hash));
+        Ok(())
     }
+}
+
+fn rect_size([top, left, bottom, right]: [i32; 4]) -> (u64, u64) {
+    (
+        u64::try_from(i64::from(right) - i64::from(left)).unwrap_or(0),
+        u64::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0),
+    )
 }
 
 /// Reads a written PSD back and checks it against what [`write_psd`]
 /// said it wrote: twice, independently — once with a small parser of its
-/// own (header, `Lr16`, layer count and order, rectangles, blend keys,
-/// opacity, fill, visibility, names, the exact `u16` of every layer and
-/// merged-image sample, every RLE row's length) and once through the
-/// real reader ([`super::read_streaming`], one layer in memory at a
-/// time), checking the document it builds: names, blend modes, opacity,
-/// fill, visibility, sizes and the decoded `f16` samples.
+/// own (header, `Lr16`, record count and order, rectangles, blend keys,
+/// opacity, fill, visibility, names, `lsct` dividers, mask data, the
+/// exact `u16` of every layer, mask and merged-image sample, every RLE
+/// row's length) and once through the real reader
+/// ([`super::read_streaming`], one layer in memory at a time), checking
+/// the document it builds: the tree's shape (every group's divider,
+/// children and folder in order), names, blend modes, opacity, fill,
+/// visibility, masks (enabled, density, bounds) and the decoded `f16`
+/// samples of every layer and mask.
 ///
 /// Memory: the first pass holds one RLE row at a time. The second holds
 /// one whole decoded layer at a time (an `f16` RGBA [`Image`], up to
-/// 2 GiB under the reader's [`super::PIXEL_BUDGET`]); a file whose layers
-/// add up to more than that budget is checked by the first pass only.
+/// 2 GiB under the reader's [`super::PIXEL_BUDGET`]) and the reader holds
+/// one mask's coverage at a time; a file whose layers and masks add up to
+/// more than that budget is checked by the first pass only.
 ///
 /// # Errors
 ///
@@ -1392,10 +1905,9 @@ pub(crate) fn verify_psd_file_with_budget(
         .layers
         .iter()
         .map(|l| {
-            let [top, left, bottom, right] = l.rect;
-            let w = u64::try_from(i64::from(right) - i64::from(left)).unwrap_or(0);
-            let h = u64::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0);
-            w.saturating_mul(h)
+            let (w, h) = rect_size(l.rect);
+            let (mw, mh) = l.mask.as_ref().map_or((0, 0), |m| rect_size(m.rect));
+            w.saturating_mul(h).saturating_add(mw.saturating_mul(mh))
         })
         .fold(0u64, u64::saturating_add);
     if total > budget {
@@ -1405,10 +1917,14 @@ pub(crate) fn verify_psd_file_with_budget(
     let mut sink = CheckingSink::default();
     let doc = super::read_streaming(std::io::BufReader::new(file), &mut sink)?;
     check("canvas", doc.canvas_size, (expected.width, expected.height))?;
-    let roots: Vec<LayerId> = doc.layers.roots().iter().rev().copied().collect();
-    check("layer count", roots.len(), expected.layers.len())?;
+    let order = file_order(&doc.layers)?;
+    check("record count", order.len(), expected.layers.len())?;
     let mut decoded = sink.layers.into_iter();
-    for (i, (&id, want)) in roots.iter().zip(&expected.layers).enumerate() {
+    for (i, (&(id, kind), want)) in order.iter().zip(&expected.layers).enumerate() {
+        check(&format!("record {i} kind"), kind, want.kind)?;
+        if kind == PsdRecordKind::GroupEnd {
+            continue;
+        }
         let l = &doc.layers;
         check(
             &format!("layer {i} name"),
@@ -1435,6 +1951,10 @@ pub(crate) fn verify_psd_file_with_budget(
             l.visible(id),
             Some(want.visible),
         )?;
+        reader_mask(i, l.mask(id), want.mask.as_ref(), id, &sink.masks)?;
+        if kind != PsdRecordKind::Layer {
+            continue;
+        }
         let [top, left, bottom, right] = want.rect;
         if bottom > top && right > left {
             let Some((got_id, w, h, hash)) = decoded.next() else {
@@ -1458,6 +1978,81 @@ pub(crate) fn verify_psd_file_with_budget(
     }
     if decoded.next().is_some() {
         return Err(mismatch("more layers with pixels than were written"));
+    }
+    Ok(())
+}
+
+/// The reader pass's check of one record's mask: present exactly when
+/// one was written, enabled unless flagged disabled, never `inverted`
+/// (the inversion was baked), the written density, bounds equal to the
+/// rectangle when the default colour is hidden, and the decoded coverage
+/// whenever the reader kept the whole rectangle (it crops a shown-outside
+/// mask to the layer's region; the first pass checked every sample).
+fn reader_mask(
+    i: usize,
+    got: Option<&aurora_doc::LayerMask>,
+    want: Option<&PsdExpectedMask>,
+    id: LayerId,
+    masks: &[(LayerId, u32, u32, u64)],
+) -> Result<(), IoError> {
+    let (got, want) = match (got, want) {
+        (None, None) => return Ok(()),
+        (Some(got), Some(want)) => (got, want),
+        (got, _) => {
+            return Err(mismatch(format!(
+                "layer {i} mask: read {}, expected {}",
+                if got.is_some() { "one" } else { "none" },
+                if got.is_some() { "none" } else { "one" }
+            )));
+        }
+    };
+    check(
+        &format!("layer {i} mask enabled"),
+        got.enabled,
+        want.flags & MASK_DISABLED == 0,
+    )?;
+    check(&format!("layer {i} mask inverted"), got.inverted, false)?;
+    check(
+        &format!("layer {i} mask density"),
+        got.density,
+        want.density.map_or(1.0, |d| f32::from(d) / 255.0),
+    )?;
+    let [top, left, bottom, right] = want.rect;
+    let (w, h) = rect_size(want.rect);
+    if want.default_color == 0 {
+        check(
+            &format!("layer {i} mask bounds"),
+            (
+                got.bounds.x,
+                got.bounds.y,
+                got.bounds.right(),
+                got.bounds.bottom(),
+            ),
+            (
+                i64::from(left),
+                i64::from(top),
+                i64::from(right),
+                i64::from(bottom),
+            ),
+        )?;
+    }
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    let Some(&(_, mw, mh, hash)) = masks.iter().find(|(layer, ..)| *layer == id) else {
+        if want.default_color == 0 {
+            return Err(mismatch(format!("layer {i}: no mask coverage read back")));
+        }
+        return Ok(()); // wholly outside the layer's region
+    };
+    if (u64::from(mw), u64::from(mh)) == (w, h) {
+        check(
+            &format!("layer {i} decoded mask pixels"),
+            hash,
+            want.decoded_hash,
+        )?;
+    } else if want.default_color == 0 {
+        return Err(mismatch(format!("layer {i}: mask coverage cropped")));
     }
     Ok(())
 }
