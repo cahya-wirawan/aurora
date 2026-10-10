@@ -62,6 +62,10 @@ pub(crate) const UNTITLED: &str = "Untitled";
 pub(crate) struct DocumentShelf {
     pub(crate) parked: Vec<DocumentSession>,
     pub(crate) active_position: usize,
+    /// The tab-strip selection the code itself last wrote (0.173.0 review
+    /// D-1), `None` until a sync succeeds or after one failed: the strip
+    /// follower switches only when the user moved the strip away from it.
+    pub(crate) strip_selection: Option<usize>,
 }
 
 impl DocumentShelf {
@@ -194,6 +198,13 @@ pub(crate) struct DocumentSession {
     /// for the startup document, "Untitled N" for a New Document and
     /// "Recovered N" for a crash-recovered one. Not a path (R5).
     pub(crate) name: String,
+    /// The [`crate::UndoOrder`] revision of this session's last park
+    /// autosave and the worker generation of its *complete* write
+    /// (0.173.0, R3 carry-over R-1, review-revised): a park at the same
+    /// revision skips the snapshot only once the worker has landed that
+    /// generation. A failed or partial snapshot, or a failed synchronous
+    /// write, records `None`, so the next park retries.
+    pub(crate) park_autosave: Option<(crate::UndoRevision, u64)>,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -401,6 +412,7 @@ impl DocumentSession {
         Self {
             id,
             name: UNTITLED.to_owned(),
+            park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),
             layers,

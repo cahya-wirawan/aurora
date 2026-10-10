@@ -107,6 +107,11 @@ pub struct Workspace {
     /// (`aurora-app` puts [`crate::ToolControls`]' radius readout and
     /// slider here).
     pub options_bar: WidgetId,
+    /// The document tab strip (0.173.0, [`crate::document_tabs`]): a
+    /// `Role::TabList` "Documents" between [`Self::options_bar`] and
+    /// [`Self::canvas_area`], one tab per open document; the canvas area
+    /// is its `Role::TabPanel`. Not part of the saved layout.
+    pub document_tabs: WidgetId,
     /// Where the document canvas will render — `Canvas: infinite zoom,
     /// rotation, pan, ...` is a separate, still-open M1.8 bullet; this
     /// is an empty container reserving its place in the layout.
@@ -441,7 +446,8 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
     };
 
-    let (canvas_column, options_bar, canvas_area) = insert_canvas_column(&mut tree, root, scales);
+    let (canvas_column, options_bar, document_tabs, canvas_area) =
+        insert_canvas_column(&mut tree, root, scales);
     let initial = StatusInfo {
         zoom: crate::canvas_view::DEFAULT_ZOOM,
         scale_factor: 1.0,
@@ -529,6 +535,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         tools,
         canvas_column,
         options_bar,
+        document_tabs,
         canvas_area,
         status_bar,
         divider,
@@ -802,7 +809,7 @@ fn insert_canvas_column(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
     scales: &Scales,
-) -> (WidgetId, WidgetId, WidgetId) {
+) -> (WidgetId, WidgetId, WidgetId, WidgetId) {
     // The only element that grows: once the tools panel claims its
     // content width, the rail its fixed width and the divider none, the
     // canvas column absorbs whatever space is left. `min_size: 0` lets a
@@ -840,6 +847,12 @@ fn insert_canvas_column(
         Ok(id) => id,
         Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
     };
+    // 0.173.0: the document tab strip takes one row off the canvas.
+    let document_tabs =
+        match crate::document_tabs::insert_document_tabs(tree, canvas_column, scales) {
+            Ok(id) => id,
+            Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
+        };
     let canvas_area = match widgets::insert_container(
         tree,
         canvas_column,
@@ -855,7 +868,10 @@ fn insert_canvas_column(
         Ok(id) => id,
         Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
     };
-    (canvas_column, options_bar, canvas_area)
+    if let Err(err) = crate::document_tabs::link_document_panel(tree, document_tabs, canvas_area) {
+        unreachable!("both were just inserted: {err:?}");
+    }
+    (canvas_column, options_bar, document_tabs, canvas_area)
 }
 
 /// The options bar's style: a row, never shrinking on its column's main
@@ -1324,9 +1340,11 @@ mod tests {
                     "{case}: only the bar's padding overhangs"
                 );
             }
+            // 0.173.0: and under the document tab strip.
+            let strip = bounds_of(&ws, ws.document_tabs).height;
             assert_eq!(
                 (canvas.x, canvas.y, canvas.width),
-                (column.x, i64::from(bar.height), column.width),
+                (column.x, i64::from(bar.height + strip), column.width),
                 "{case}: the canvas sits under the bar, right of the tools"
             );
             assert_eq!(
@@ -1458,11 +1476,14 @@ mod tests {
         // 0.162.0: the status bar takes one row off the column's bottom.
         let status = bounds_of(&ws, ws.status_bar.root).height;
         assert!(status > 0, "status bar {status}");
-        assert_eq!(canvas_bounds.height, 800 - bar - status);
+        // 0.173.0: the document tab strip takes one row off its top.
+        let tabs = bounds_of(&ws, ws.document_tabs).height;
+        assert!(tabs > 0, "document tabs {tabs}");
+        assert_eq!(canvas_bounds.height, 800 - bar - tabs - status);
         assert_eq!(rail_bounds.height, 800);
         assert_eq!(
             (canvas_bounds.x, canvas_bounds.y),
-            (i64::from(tools), i64::from(bar))
+            (i64::from(tools), i64::from(bar + tabs))
         );
 
         let Some(layers_bounds) = ws.tree.bounds(ws.layers.root) else {
@@ -2569,5 +2590,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 0.173.0 (AC-4): the strip is a `Role::TabList` "Documents" between
+    /// the options bar and the canvas, its tabs named after the documents,
+    /// and the canvas area its `Role::TabPanel` labelled by the selected
+    /// tab — relinked on every sync, never to a removed tab.
+    #[test]
+    fn the_document_tab_strip_is_a_tab_list_and_the_canvas_its_tab_panel() {
+        let mut ws = super::build_workspace(&test_scales());
+        assert_eq!(ws.tree.parent(ws.document_tabs), Some(ws.canvas_column));
+        let children = ws
+            .tree
+            .children(ws.canvas_column)
+            .unwrap_or_default()
+            .to_vec();
+        let position = |id| children.iter().position(|&child| child == id);
+        assert_eq!(position(ws.options_bar), Some(0));
+        assert_eq!(position(ws.document_tabs), Some(1));
+        assert_eq!(position(ws.canvas_area), Some(2));
+        let bar = ws.tree.accessibility(ws.document_tabs).cloned();
+        assert_eq!(
+            bar.as_ref().map(accesskit::Node::role),
+            Some(accesskit::Role::TabList)
+        );
+        assert_eq!(
+            bar.as_ref().and_then(accesskit::Node::label),
+            Some(crate::DOCUMENT_TABS_LABEL)
+        );
+        let names = vec!["a.png".to_owned(), "b.psd".to_owned(), "c.aur".to_owned()];
+        if let Err(err) =
+            crate::sync_document_tabs(&mut ws.tree, ws.document_tabs, ws.canvas_area, names, 2)
+        {
+            unreachable!("{err:?}");
+        }
+        let tabs = match aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.document_tabs) {
+            Ok(state) => state.tabs().to_vec(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let labels: Vec<Option<String>> = tabs
+            .iter()
+            .map(|&tab| {
+                ws.tree
+                    .accessibility(tab)
+                    .filter(|node| node.role() == accesskit::Role::Tab)
+                    .and_then(|node| node.label().map(str::to_owned))
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                Some("a.png".to_owned()),
+                Some("b.psd".to_owned()),
+                Some("c.aur".to_owned())
+            ]
+        );
+        let panel = ws.tree.accessibility(ws.canvas_area).cloned();
+        assert_eq!(
+            panel.as_ref().map(accesskit::Node::role),
+            Some(accesskit::Role::TabPanel)
+        );
+        assert_eq!(
+            panel.as_ref().map(|node| node.labelled_by().to_vec()),
+            Some(tabs.get(2).copied().into_iter().collect::<Vec<_>>())
+        );
+        // Shrinking to one relinks to the surviving tab.
+        if let Err(err) = crate::sync_document_tabs(
+            &mut ws.tree,
+            ws.document_tabs,
+            ws.canvas_area,
+            vec!["a.png".to_owned()],
+            0,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let panel = ws.tree.accessibility(ws.canvas_area).cloned();
+        assert_eq!(
+            panel.map(|node| node.labelled_by().to_vec()),
+            Some(tabs.first().copied().into_iter().collect::<Vec<_>>())
+        );
+        let Some(&first) = tabs.first() else {
+            unreachable!("three tabs")
+        };
+        assert!(crate::is_document_tab(&ws.tree, ws.document_tabs, first));
+        assert!(!crate::is_document_tab(
+            &ws.tree,
+            ws.document_tabs,
+            ws.canvas_area
+        ));
     }
 }

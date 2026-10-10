@@ -1206,3 +1206,547 @@ fn ctrl_tab_in_a_focused_text_field_inserts_nothing_and_switches() {
         }))
     );
 }
+
+// -- 0.173.0 (R4): the document tab strip --
+
+fn strip(rig: &Rig) -> (Vec<String>, usize, Vec<WidgetId>) {
+    match aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, rig.workspace.document_tabs) {
+        Ok(state) => (
+            state.labels().to_vec(),
+            state.selected(),
+            state.tabs().to_vec(),
+        ),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn tab_names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|&name| name.to_owned()).collect()
+}
+
+/// AC-1 (R4): the strip lists every document in tab order with the active
+/// one selected, and follows an open, a New Document, a switch and a
+/// recovered set; AC-4: the canvas is the `TabPanel` labelled by the
+/// selected tab, whose AT name is the document's.
+#[test]
+#[allow(clippy::many_single_char_names)]
+fn the_tab_strip_lists_every_document_and_follows_open_new_switch_and_recovery() {
+    let (dir_a, dir_b, dir_c) = (tempdir(), tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let (c, _) = session("Untitled 2", 1, [0.0, 1.0, 0.0, 1.0], &dir_c);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    assert_eq!(strip(&rig).0, tab_names(&["a.png"]));
+    let _ = rig.open(b);
+    assert_eq!(
+        (strip(&rig).0, strip(&rig).1),
+        (tab_names(&["a.png", "b.psd"]), 1)
+    );
+    let _ = rig.open(c);
+    assert_eq!(strip(&rig).0, tab_names(&["a.png", "b.psd", "Untitled 2"]));
+    assert_eq!(strip(&rig).1, 2);
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Switched);
+    let (labels, selected, tabs) = strip(&rig);
+    assert_eq!((labels.len(), selected), (3, 0));
+    let panel = rig
+        .workspace
+        .tree
+        .accessibility(rig.workspace.canvas_area)
+        .cloned();
+    assert_eq!(
+        panel.as_ref().map(accesskit::Node::role),
+        Some(accesskit::Role::TabPanel)
+    );
+    assert_eq!(
+        panel.map(|node| node.labelled_by().to_vec()),
+        Some(tabs.first().copied().into_iter().collect::<Vec<_>>())
+    );
+    let first_name = tabs
+        .first()
+        .and_then(|&tab| rig.workspace.tree.accessibility(tab))
+        .and_then(|node| node.label().map(str::to_owned));
+    assert_eq!(first_name.as_deref(), Some("a.png"));
+    // A recovered set: the active document plus parked ones, as App::new
+    // builds it, shown in order.
+    let (d, _) = session("Untitled", 1, [1.0, 1.0, 1.0, 1.0], &dir_a);
+    let (e, _) = session("Recovered 2", 1, [1.0, 1.0, 1.0, 1.0], &dir_b);
+    let mut recovered = Rig::new(d);
+    recovered.shelf.parked.push(e);
+    assert!(document_tabs::sync_document_tab_bar(
+        &mut recovered.workspace,
+        &mut recovered.focus,
+        &mut recovered.shelf,
+        &recovered.doc,
+    ));
+    assert_eq!(
+        (strip(&recovered).0, strip(&recovered).1),
+        (tab_names(&["Untitled", "Recovered 2"]), 0)
+    );
+}
+
+/// AC-2 (R4): a pointer click, an arrow key and an AT `Click` on the strip
+/// each switch through `switch_document` — the documents, undo order and
+/// panels follow exactly as for `Ctrl+Tab` — and a switch from the strip
+/// keeps focus on its selected tab (AC-5, F8/F11). A refused switch puts
+/// the strip back.
+#[test]
+#[allow(clippy::too_many_lines)] // one scenario, three input paths in sequence
+fn click_keyboard_and_at_on_the_tab_strip_switch_like_ctrl_tab() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 3, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    // Keyboard: focus the strip's selected (b) tab, press Left.
+    let Some(&b_tab) = strip(&rig).2.get(1) else {
+        unreachable!("two tabs")
+    };
+    if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, b_tab) {
+        unreachable!("{err:?}");
+    }
+    let routed = crate::route_widget_key(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut None,
+        None,
+        None,
+        &rig.scales,
+        false,
+        false,
+        Modifiers::none(),
+        Key::Named(NamedKey::ArrowLeft),
+        None,
+        &mut FakeClipboard::default(),
+    );
+    assert!(
+        matches!(
+            routed,
+            Some((
+                crate::WidgetOwner::DocumentTabs,
+                aurora_widgets::KeyOutcome::Handled(_)
+            ))
+        ),
+        "{routed:?}"
+    );
+    assert_eq!(
+        document_tabs::follow_document_tabs(&mut rig.cx(None)),
+        Some(SwitchOutcome::Switched)
+    );
+    assert_eq!(rig.doc.id, a_id);
+    assert_eq!(rig.layer_rows.len(), 3, "a's panels");
+    let a_tab = strip(&rig).2.first().copied();
+    assert_eq!(
+        rig.focus.focused(),
+        a_tab,
+        "focus stays on the strip's selected tab"
+    );
+    assert_eq!(document_tabs::follow_document_tabs(&mut rig.cx(None)), None);
+    // AT Click on b's tab.
+    let request = accesskit::ActionRequest {
+        action: accesskit::Action::Click,
+        target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+        target_node: b_tab,
+        data: None,
+    };
+    let reaction = crate::route_accessibility_action(
+        &mut rig.workspace,
+        &mut rig.focus,
+        None,
+        &HashMap::new(),
+        None,
+        None,
+        &request,
+    );
+    assert!(
+        matches!(reaction, crate::AccessibilityReaction::DocumentTab(_)),
+        "{reaction:?}"
+    );
+    assert_eq!(
+        document_tabs::follow_document_tabs(&mut rig.cx(None)),
+        Some(SwitchOutcome::Switched)
+    );
+    assert_eq!(rig.doc.id, b_id);
+    assert_eq!(rig.layer_rows.len(), 1, "b's panels");
+    // Pointer: press and release on a's tab.
+    rig.workspace.tree.compute_layout(1000.0, 800.0);
+    let Some(a_tab) = a_tab else {
+        unreachable!("two tabs")
+    };
+    let Some(bounds) = rig.workspace.tree.bounds(a_tab) else {
+        unreachable!("laid out")
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let centre = (
+        bounds.x as f32 + bounds.width as f32 / 2.0,
+        bounds.y as f32 + bounds.height as f32 / 2.0,
+    );
+    let mut click = ClickTracker::default();
+    for phase in [
+        aurora_widgets::PointerPhase::Down,
+        aurora_widgets::PointerPhase::Up,
+    ] {
+        let routed = crate::route_widget_pointer(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &mut None,
+            None,
+            None,
+            &mut click,
+            &rig.scales,
+            false,
+            phase,
+            centre,
+            Modifiers::none(),
+            &mut aurora_widgets::NoTextHit,
+        );
+        assert_eq!(routed.owner, Some(crate::WidgetOwner::DocumentTabs));
+    }
+    assert_eq!(
+        document_tabs::follow_document_tabs(&mut rig.cx(None)),
+        Some(SwitchOutcome::Switched)
+    );
+    assert_eq!(rig.doc.id, a_id);
+    // Refused (a modal is open): the strip goes back to the active one.
+    rig.blocked = true;
+    if let Err(err) =
+        aurora_widgets::widgets::select_tab(&mut rig.workspace.tree, rig.workspace.document_tabs, 1)
+    {
+        unreachable!("{err:?}");
+    }
+    assert_eq!(
+        document_tabs::follow_document_tabs(&mut rig.cx(None)),
+        Some(SwitchOutcome::Blocked)
+    );
+    assert_eq!(rig.doc.id, a_id);
+    assert_eq!(
+        strip(&rig).1,
+        0,
+        "the strip shows the active document again"
+    );
+}
+
+/// AC-3 (R4): the canvas area is one row shorter — it starts under the
+/// options bar *and* the strip — and pointer mapping holds at scale 1 and
+/// 2: a point on the strip is not on the canvas, the canvas origin maps to
+/// (0, 0), and the physical rect is the logical one times the scale.
+#[test]
+fn the_canvas_is_one_row_shorter_and_pointer_mapping_holds_at_scale_1_and_2() {
+    let scales = crate::test_workspace_scales();
+    let mut ws = aurora_ui::build_workspace(&scales);
+    ws.tree.compute_layout(1000.0, 800.0);
+    let bounds = |id| match ws.tree.bounds(id) {
+        Some(bounds) => bounds,
+        None => unreachable!("laid out"),
+    };
+    let (options, strip, canvas, status) = (
+        bounds(ws.options_bar),
+        bounds(ws.document_tabs),
+        bounds(ws.canvas_area),
+        bounds(ws.status_bar.root),
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let row = aurora_widgets::widgets::row_height(&scales);
+    #[allow(clippy::cast_precision_loss)]
+    let strip_height = strip.height as f32;
+    assert!(strip_height >= row, "one row: {strip_height} >= {row}");
+    assert_eq!(strip.y, i64::from(options.height));
+    assert_eq!(canvas.y, i64::from(options.height + strip.height));
+    assert_eq!(
+        canvas.height,
+        800 - options.height - strip.height - status.height
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let (ox, oy) = (canvas.x as f32, canvas.y as f32);
+    assert_eq!(
+        crate::pointer_in_canvas(&ws, (ox + 5.0, oy - 1.0)),
+        None,
+        "on the strip"
+    );
+    assert_eq!(crate::pointer_in_canvas(&ws, (ox, oy)), Some((0.0, 0.0)));
+    assert_eq!(
+        crate::pointer_in_canvas(&ws, (ox + 7.0, oy + 9.0)),
+        Some((7.0, 9.0))
+    );
+    for scale in [1.0_f64, 2.0] {
+        #[allow(clippy::cast_possible_truncation)]
+        let s = scale as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (
+            ox * s,
+            oy * s,
+            canvas.width as f32 * s,
+            canvas.height as f32 * s,
+        );
+        assert_eq!(
+            crate::canvas_area_physical_rect(&ws, scale),
+            Some(expected),
+            "scale {scale}"
+        );
+    }
+}
+
+/// AC-6 (R4): the strip is not persisted — the saved layout of a
+/// workspace is the same before and after documents are added and
+/// switched on the strip, and it still decodes.
+#[test]
+fn the_tab_strip_is_not_part_of_the_saved_layout() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let before = crate::workspace_presets::live_layout(&rig.workspace);
+    let encoded_before = postcard::to_allocvec(&before).unwrap_or_default();
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Switched);
+    let after = crate::workspace_presets::live_layout(&rig.workspace);
+    assert_eq!(after, before);
+    let encoded_after = postcard::to_allocvec(&after).unwrap_or_default();
+    assert!(!encoded_after.is_empty());
+    assert_eq!(encoded_after, encoded_before, "byte-identical");
+    assert!(crate::decode_workspace_layout(&encoded_after).is_ok());
+}
+
+/// R-1 (R3 carry-over, 0.173.0): a park with no new step since the last
+/// park autosave skips it; a recorded step makes the next park write.
+#[test]
+fn an_unchanged_parked_document_is_not_autosaved_again() {
+    let (dir_a, dir_b, autosaves) = (tempdir(), tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4246);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let a_path = namespace.session_path(a_id.get());
+    let park = |rig: &mut Rig, worker: &mut background_autosave::AutosaveWorker| {
+        document_tabs::autosave_outgoing(&mut rig.cx_with(
+            None,
+            Some(document_tabs::ParkAutosave {
+                worker,
+                namespace: &namespace,
+            }),
+        ))
+    };
+    assert!(park(&mut rig, &mut worker), "the first park writes");
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(a_path.exists());
+    if let Err(err) = std::fs::remove_file(&a_path) {
+        unreachable!("{err:?}");
+    }
+    assert!(!park(&mut rig, &mut worker), "nothing new: skipped");
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(!a_path.exists(), "no write for an unchanged document");
+    // A recorded step (a committed stroke) moves the revision.
+    rig.start_stroke();
+    let _ = document_tabs::commit_live_gestures(&mut rig.cx(None));
+    assert!(park(&mut rig, &mut worker), "a new step: written");
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(a_path.exists());
+    let _ = rig.open(b);
+}
+
+/// AC-2/AC-5 (R4, F8/F11): with focus resting on the strip, a switch made
+/// elsewhere (`Ctrl+Tab`, the palette) moves focus to the strip's newly
+/// selected tab — never left on the now-unselected (unfocusable) one.
+#[test]
+fn focus_on_the_strip_follows_a_ctrl_tab_switch_to_the_selected_tab() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let (_, _, tabs) = strip(&rig);
+    let (Some(&a_tab), Some(&b_tab)) = (tabs.first(), tabs.get(1)) else {
+        unreachable!("two tabs")
+    };
+    if let Err(err) = rig.focus.focus(&mut rig.workspace.tree, b_tab) {
+        unreachable!("{err:?}");
+    }
+    let Some(target) = rig.shelf.cycled(&rig.doc, true) else {
+        unreachable!("two documents")
+    };
+    assert_eq!(target, a_id);
+    assert_eq!(rig.switch(target), SwitchOutcome::Switched);
+    assert_eq!(
+        strip(&rig).2,
+        tabs,
+        "the same tab widgets, relabelled in place"
+    );
+    assert_eq!(
+        rig.focus.focused(),
+        Some(a_tab),
+        "focus moved to the selected tab"
+    );
+}
+
+fn park_now(
+    rig: &mut Rig,
+    worker: &mut background_autosave::AutosaveWorker,
+    namespace: &autosave_files::AutosaveNamespace,
+) -> bool {
+    document_tabs::autosave_outgoing(&mut rig.cx_with(
+        None,
+        Some(document_tabs::ParkAutosave { worker, namespace }),
+    ))
+}
+
+/// Review R-1 (0.173.0): a park autosave counts as saved only once its
+/// complete write has landed. A failed worker write makes the next park at
+/// the same revision retry; a landed one makes it skip.
+#[test]
+fn a_failed_park_write_is_retried_and_a_landed_one_is_skipped() {
+    let (dir_a, root) = (tempdir(), tempdir());
+    let autosaves = root.path().join("autosaves");
+    if let Err(err) = std::fs::create_dir(&autosaves) {
+        unreachable!("{err:?}");
+    }
+    let namespace = autosave_files::AutosaveNamespace::acquire(autosaves.clone(), 4247);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let mut rig = Rig::new(a);
+    let id = rig.doc.id.get();
+    // A first park lands, then a recorded step moves the revision.
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    let first = worker.landed(id);
+    assert!(first.is_some());
+    rig.start_stroke();
+    let _ = document_tabs::commit_live_gestures(&mut rig.cx(None));
+    // The autosave directory goes away: the worker's newer write fails,
+    // and the landed generation stays the older one.
+    if let Err(err) = std::fs::remove_dir_all(&autosaves) {
+        unreachable!("{err:?}");
+    }
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert_eq!(worker.landed(id), first, "the newer write did not land");
+    assert!(
+        park_now(&mut rig, &mut worker, &namespace),
+        "same revision, but the write failed: retried"
+    );
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    // Back: the retry lands, and the next park skips.
+    if let Err(err) = std::fs::create_dir(&autosaves) {
+        unreachable!("{err:?}");
+    }
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(worker.landed(id).is_some());
+    assert!(namespace.session_path(id).exists());
+    assert!(
+        !park_now(&mut rig, &mut worker, &namespace),
+        "landed: skipped"
+    );
+}
+
+/// Review R-1: a snapshot that is not complete (tiles unreadable, so the
+/// job goes to the *partial* path) records nothing, so the next park at
+/// the same revision retries.
+#[test]
+fn a_partial_park_snapshot_is_retried() {
+    let (store_dir, autosaves) = (tempdir(), tempdir());
+    let Some(budget) = std::num::NonZeroUsize::new(1) else {
+        unreachable!("1 is non-zero")
+    };
+    let mut store = match aurora_tile::TileStore::new(store_dir.path().to_path_buf(), budget) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let mut tree = aurora_doc::LayerTree::new();
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+    let mut last = None;
+    for (name, rgba) in [
+        ("broken", [1.0, 0.0, 0.0, 1.0]),
+        ("intact", [0.0, 0.0, 1.0, 1.0]),
+    ] {
+        let id = match tree.add_pixel_layer(name, bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        fill_solid(&mut store, surface_id_for(id), TILE, rgba);
+        last = Some(id);
+    }
+    if let Err(err) = store.flush() {
+        unreachable!("{err:?}");
+    }
+    // The evicted tile's scratch file goes: the snapshot copies an
+    // evicted tile's bytes from disk, so it cannot read this one.
+    let files: Vec<std::path::PathBuf> = match std::fs::read_dir(store_dir.path()) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect(),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert!(!files.is_empty(), "a tile was evicted to scratch");
+    for file in files {
+        if let Err(err) = std::fs::remove_file(&file) {
+            unreachable!("{err:?}");
+        }
+    }
+    let session = DocumentSession::new(DocumentContents {
+        layers: tree,
+        history: aurora_doc::History::new(),
+        canvas_size: (256, 256),
+        skipped_tiles: aurora_io::SkippedTiles::new(),
+        active_layer: last,
+        canvas_view: aurora_ui::CanvasView::default(),
+        tile_store: Some(store),
+    });
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4248);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let mut rig = Rig::new(session);
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(
+        rig.doc.park_autosave.is_none(),
+        "a partial snapshot records nothing"
+    );
+    assert!(
+        park_now(&mut rig, &mut worker, &namespace),
+        "same revision, not saved complete: retried"
+    );
+}
+
+/// Review D-1: the strip follower switches only when the user moved the
+/// strip away from the selection the code last wrote — a stale selection
+/// left by a failed sync (`strip_selection` cleared) never switches.
+#[test]
+fn the_strip_follower_ignores_a_selection_no_sync_wrote() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    assert_eq!(rig.shelf.strip_selection, Some(1));
+    if let Err(err) =
+        aurora_widgets::widgets::select_tab(&mut rig.workspace.tree, rig.workspace.document_tabs, 0)
+    {
+        unreachable!("{err:?}");
+    }
+    rig.shelf.strip_selection = None;
+    assert_eq!(document_tabs::follow_document_tabs(&mut rig.cx(None)), None);
+    assert_eq!(rig.doc.id, b_id, "no switch from a selection nothing wrote");
+    rig.shelf.strip_selection = Some(1);
+    assert_eq!(
+        document_tabs::follow_document_tabs(&mut rig.cx(None)),
+        Some(SwitchOutcome::Switched)
+    );
+    assert_eq!(rig.doc.id, a_id);
+    assert_eq!(rig.shelf.strip_selection, Some(0));
+}

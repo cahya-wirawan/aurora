@@ -854,7 +854,7 @@ mod tests {
 
         let mut focus = aurora_widgets::FocusManager::new();
         let mut visited = Vec::new();
-        for _ in 0..6 + ws.tools.buttons.len() {
+        for _ in 0..7 + ws.tools.buttons.len() {
             match focus.focus_next(&mut ws.tree) {
                 Some(id) => visited.push(id),
                 None => unreachable!("the workspace has focusable widgets"),
@@ -863,6 +863,13 @@ mod tests {
 
         // 0.160.0: the tools panel's buttons come first, one stop each.
         let mut expected: Vec<_> = ws.tools.buttons.iter().map(|(_, id)| *id).collect();
+        // 0.173.0: then the document strip's selected tab (roving focus).
+        if let Some(tab) = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.document_tabs)
+            .ok()
+            .and_then(aurora_widgets::widgets::TabBarState::selected_tab)
+        {
+            expected.push(tab);
+        }
         expected.push(ws.layers.root);
         expected.extend_from_slice(&row_ids);
         // 0.164.0: then the group's selected tab (roving focus: one stop
