@@ -26,7 +26,94 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.192.1): the live canvas was washed out on an sRGB
+**Latest (2026-10-11, 0.193.0): the live canvas is clipped to the document, and
+the near pan bound is the document's own corner whichever layer is active.**
+- **Problem** (user's Mac screenshot of `6739968.psd`). The live view drew
+  layer content outside the 1080x1920 canvas (Nyepi's layers reach
+  (-2061,-646)-(3010,2693)): white shapes, a transparent checkerboard region
+  and an extra pagoda beside the artboard. The composite grid is anchored to
+  the active layer's origin and nothing clipped the draw. The pan bound was that
+  same origin, so the artboard opened offset by (+124, +36). Export, the
+  histogram and PSD merged composites already clip; Photoshop does too.
+- **Clip.** `canvas.wgsl`'s uniform gains `doc_clip: vec4<f32>` (the document
+  rectangle in the viewport's 0..1 space, from a new `t` varying); a fragment
+  outside it is `discard`ed, so it keeps the pass's clear colour (the app
+  background the canvas area already shows beyond an artboard: no new colour or
+  token) and the checkerboard is drawn only inside. `TileResidency::
+  set_document_clip(Option<rect>)` takes the rectangle in the same
+  document-local pixels as `set_origin`; `write_uniform` maps it to viewport
+  space with the same floored zoom and unwrapped scroll as `uv_offset`/`uv_scale`
+  (`clip_values`, `rendered_zoom_value`); a non-finite rectangle clips
+  everything; `resize` carries it. The uniform is 32 bytes and visible to the
+  fragment stage (also in `test_support`'s copy of the layout). `aurora-app`
+  sets it every frame from `document_clip_rect(canvas_size, active_layer_origin)`:
+  (0, 0)-(w, h) minus the grid anchor. The tile atlas and compositor are
+  untouched, so pixels inside the document are as before.
+- **Pan bound.** `pan_bounds` now has `min_doc = (0, 0)` always. To make the
+  corner addressable (a `TileId` is unsigned) `composite_reference_origin`
+  (hence `active_layer_origin`, the grid anchor) is `min(layer origin, 0)` per
+  axis: a layer at a negative origin (Nyepi's (-124, -36)) anchors the grid
+  exactly as before, a layer at a positive origin now anchors at the corner
+  instead of at itself. The far bound is still `anchor + MAX_DOC_ORIGIN_PX`
+  (it is `TileResidency::set_origin`'s saturation, not the document's far
+  edge, so scrolling past the right/bottom edge is unchanged and shows the
+  background). Consequence: the near-edge render/paint divergence a layer
+  switch or Move used to risk cannot happen any more (the local origin is
+  `doc - anchor >= 0`); the re-clamps stay as idempotent guards.
+- **Not done, on purpose: re-anchoring the composite grid to the document.**
+  Anchoring to the corner only for positive origins is the smallest change
+  that makes the corner reachable; anchoring *always* at the document would
+  change every cached `TileId`'s meaning for the usual negative-origin case,
+  the same-origin fast path for the active layer, and incremental invalidation
+  (`after_undo_redo`, `invalidate_doc_rects`, the background worker's
+  reference-origin stamp). That refactor stays a follow-on. Cost of the
+  partial change: an active layer at a positive origin loses the
+  `same_origin` fast path (its tiles go through `read_layer_window`, as every
+  other layer's already do).
+- **Tests.** `aurora-gpu` `render_test.rs` (offscreen readback, target cleared
+  to black): `canvas_pipeline_clips_the_tile_to_the_document_rectangle` (inside
+  green, edge pixels exact, one pixel outside each side clear, atlas content
+  outside hidden), `..._without_a_clip_draws_the_whole_atlas`,
+  `..._draws_the_checkerboard_only_inside_the_document`,
+  `..._clip_follows_a_fractional_pan_and_zoom` (20,20 at zoom 2),
+  `..._clip_edge_is_exact_for_a_grid_anchored_left_of_the_document`; unit tests
+  `clip_values_*` (viewport mapping, scroll, non-finite, floored zoom).
+  `aurora-app`: `the_pan_bound_is_the_document_corner_*` (negative origin,
+  inside the document, none/origin, mixed sign), the near bound for canvas
+  areas smaller and larger than the view, `the_brush_lands_under_the_cursor_
+  with_a_misaligned_active_layer` (paint position equals render position at
+  scale 1 and 2 for three origins), `the_document_clip_is_the_document_
+  rectangle_relative_to_the_grid_anchor`. Fourteen older tests encoded the
+  active-layer-origin bound and were rewritten for the new rule (positive
+  moved layer -> negative `two_layers_one_negative` fixture for the far bound;
+  `bounds_at` now builds a `PanBounds` directly).
+- **Mutations** (backup, mutate, test, restore, `sha256sum -c`): see the
+  three mutations, each really run:
+  1. Clip ignored (`if (false && ...)` in `fs_canvas`): failed
+     `canvas_pipeline_clips_the_tile_to_the_document_rectangle` and
+     `..._clip_follows_a_fractional_pan_and_zoom` (the unclipped and
+     grid-anchored tests stay green by design).
+  2. Clip off by one pixel (`scroll - 1.0` on both x edges in `clip_values`):
+     failed all five clip tests that carry an edge (two unit, three readback);
+     only the no-clip test stays green.
+  3. Pan bound reverted to the anchor (`min_doc = anchor`): failed four
+     `aurora-app` tests (`the_pan_bound_is_the_document_corner_for_a_layer_at_a_negative_origin`,
+     `..._for_a_mixed_sign_origin`, `the_near_bound_holds_for_a_canvas_area_...`,
+     `the_far_pan_bound_is_the_active_layers_origin_plus_the_document_ceiling`).
+     The positive-origin test passes under it only because the anchor is
+     capped at the corner, which is the point of the design.
+  Backed up to the scratchpad, restored, `sha256sum -c` OK for all three files.
+- **Gate:** 3,605 tests passed, 0 failed, 72 ignored (`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast` on an RTX 3090; 3,591 before, 14 net new); fmt, layering, hardcoded-style, check --locked, clippy -D warnings, rustdoc -D warnings, `cargo deny`, contrast and cross-clippy for windows-gnu and x86_64-apple-darwin all clean.
+- **Verified:** Linux/Vulkan (RTX 3090) readback and unit tests. **Not
+  verified:** the live window on the Mac. The user has to re-take the
+  screenshot (expect the artboard at the view's corner, nothing outside it,
+  the pan stopping at the document's top-left).
+- **Not changed:** a document that fits the view is still pinned top-left
+  (not centred); scrolling past the far edge is not bounded by the document.
+
+Review notes (0.193.0): the cost of the lost `same_origin` fast path for an active layer at a positive origin is not measured (it also moves that layer's shadow/stroke apron reads to the windowed branch). The clip edge is decided at pixel centres, so under fractional zoom (0.96, 1.5) it can be off by up to half a pixel; only exact boundaries and one fractional case (zoom 2) are tested. The brush test is near-algebraic and does not tie the clip rectangle to the pointer mapping. The 14 rewritten tests were not diffed by the reviewer.
+
+**Previously (2026-10-11, 0.192.1): the live canvas was washed out on an sRGB
 surface — `canvas.wgsl` encoded the picture twice. Fixed (canvas shader and a
 log line only).**
 - **Evidence from the user's screenshot** of `6739968.psd` (Mac, Metal),
@@ -33812,7 +33899,7 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Next round (found with 0.192.1): clip the live canvas to the document.** The live view draws layer content that lies outside the canvas rectangle (Nyepi's layers reach (-2061,-646)-(3010,2693) on a 1080x1920 canvas), as white shapes and a transparent checkerboard beside the artboard, and its pan bound is the active layer's origin rather than the document's, so the artboard opens offset. Photoshop clips to the canvas. Decide the pasteboard styling and the pan bound with Cahya, then clip in the view (shader or tile selection) without touching export.
+**Next round (follow-on from 0.193.0): anchor the composite grid to the document.** 0.193.0 clips the live canvas to the document and makes the near pan bound the document corner, with the grid anchor capped at the corner (`min(layer origin, 0)`). Anchoring the grid at the document corner always (then a negative-origin layer is just another layer) would let `composite_reference_origin` be a constant and simplify incremental invalidation, but changes every cached `TileId`; it needs the invalidation paths (`after_undo_redo`, `invalidate_doc_rects`, the background worker's reference-origin stamp) re-proved. Also open: bounding the far pan edge by the document, and centring a document smaller than the view.
 
 **Follow-up from 0.190.0 closed in 0.191.1:** the `masks.psd` Stroke residual was the shadow knockout, not the stroke (see the Latest entry).
 

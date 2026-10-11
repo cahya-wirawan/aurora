@@ -1860,3 +1860,173 @@ fn canvas_output_ramp_reads_back_unchanged_on_every_target_format() {
     }
     assert!(bad.is_empty(), "canvas output differs from input: {bad:?}");
 }
+
+// ---------------------------------------------------------------------------
+// 0.193.0: the canvas is clipped to the document rectangle.
+// ---------------------------------------------------------------------------
+
+/// Renders [`VIEWPORT`] with `tile (0,0)` painted `rgba` (or left empty for
+/// `None`), the view at `doc_origin`/`zoom` and the clip at `clip`, and
+/// reads `samples` back. The target is cleared to opaque black, so a
+/// discarded fragment reads `[0, 0, 0, 255]`.
+fn render_clipped(
+    rgba: Option<[f32; 4]>,
+    doc_origin: (f32, f32),
+    zoom: f32,
+    clip: Option<(f32, f32, f32, f32)>,
+    samples: &[(u32, u32)],
+) -> Option<Vec<[u8; 4]>> {
+    let context = real_context()?;
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+    if let Some(rgba) = rgba {
+        paint(&mut store, surface, TileId { x: 0, y: 0 }, rgba);
+    }
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    residency.set_document_clip(clip);
+    residency.set_origin(queue, doc_origin, VIEWPORT, zoom);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+    let mut canvas = CanvasPipeline::new(device);
+    Some(render_and_sample_pixels(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        VIEWPORT,
+        samples,
+    ))
+}
+
+const CLEAR: [u8; 4] = [0, 0, 0, 255];
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+#[test]
+fn canvas_pipeline_clips_the_tile_to_the_document_rectangle() {
+    // The atlas holds green everywhere in 0..256, but the document is only
+    // (64, 64)-(192, 192): inside shows the tile, outside shows the clear.
+    let samples = [
+        (128, 128), // inside
+        (64, 64),   // first pixel inside (top-left corner)
+        (191, 191), // last pixel inside
+        (63, 128),  // one pixel left of the edge
+        (192, 128), // one pixel right of the edge
+        (128, 63),  // one pixel above
+        (128, 192), // one pixel below
+        (10, 10),   // far outside, where the atlas has content
+        (250, 250),
+    ];
+    let Some(got) = render_clipped(
+        Some([0.0, 1.0, 0.0, 1.0]),
+        (0.0, 0.0),
+        1.0,
+        Some((64.0, 64.0, 192.0, 192.0)),
+        &samples,
+    ) else {
+        return;
+    };
+    let want = [
+        GREEN, GREEN, GREEN, CLEAR, CLEAR, CLEAR, CLEAR, CLEAR, CLEAR,
+    ];
+    assert_eq!(got, want, "samples {samples:?}");
+}
+
+#[test]
+fn canvas_pipeline_without_a_clip_draws_the_whole_atlas() {
+    let samples = [(10, 10), (128, 128), (250, 250)];
+    let Some(got) = render_clipped(Some([0.0, 1.0, 0.0, 1.0]), (0.0, 0.0), 1.0, None, &samples)
+    else {
+        return;
+    };
+    assert_eq!(got, vec![GREEN; 3]);
+}
+
+#[test]
+fn canvas_pipeline_draws_the_checkerboard_only_inside_the_document() {
+    // An empty (transparent) tile: inside the document the checkerboard
+    // shows (0.18 or 0.24 grey), outside nothing is drawn.
+    let samples = [
+        (100, 100),
+        (64, 64),
+        (63, 64),
+        (64, 63),
+        (191, 191),
+        (192, 191),
+        (191, 192),
+        (5, 5),
+    ];
+    let Some(got) = render_clipped(
+        None,
+        (0.0, 0.0),
+        1.0,
+        Some((64.0, 64.0, 192.0, 192.0)),
+        &samples,
+    ) else {
+        return;
+    };
+    let is_check = |p: [u8; 4]| p[0] == p[1] && p[1] == p[2] && (p[0] == 46 || p[0] == 61);
+    // Samples 0, 1 and 4 are inside the document, the rest outside.
+    for (n, (&at, &pixel)) in samples.iter().zip(got.iter()).enumerate() {
+        if [0, 1, 4].contains(&n) {
+            assert!(
+                is_check(pixel),
+                "sample {at:?} should be checkerboard, got {pixel:?}"
+            );
+        } else {
+            assert_eq!(pixel, CLEAR, "sample {at:?} is outside the document");
+        }
+    }
+}
+
+#[test]
+fn canvas_pipeline_clip_follows_a_fractional_pan_and_zoom() {
+    // View at document (20, 20), zoom 2: document x maps to screen
+    // (x - 20) * 2. The document rectangle (40, 40)-(100, 100) is
+    // therefore screen 40..160, so pixel 39 is out, 40 in, 159 in, 160 out.
+    let samples = [
+        (39, 100),
+        (40, 100),
+        (159, 100),
+        (160, 100),
+        (100, 39),
+        (100, 40),
+        (100, 159),
+        (100, 160),
+    ];
+    let Some(got) = render_clipped(
+        Some([0.0, 1.0, 0.0, 1.0]),
+        (20.0, 20.0),
+        2.0,
+        Some((40.0, 40.0, 100.0, 100.0)),
+        &samples,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        got,
+        vec![CLEAR, GREEN, GREEN, CLEAR, CLEAR, GREEN, GREEN, CLEAR],
+        "samples {samples:?}"
+    );
+}
+
+#[test]
+fn canvas_pipeline_clip_edge_is_exact_for_a_grid_anchored_left_of_the_document() {
+    // The anchor is (-124, -36) in the app: the document's top-left sits at
+    // grid-local (124, 36). With the view showing exactly the document's
+    // corner at the viewport's, the clip is (0, 0)-(w, h) shifted by it.
+    let samples = [(0, 0), (99, 99), (100, 100), (255, 255)];
+    // The view's top-left is grid-local (124, 36); the document runs from
+    // there to (124 + 100, 36 + 100).
+    let Some(got) = render_clipped(
+        Some([0.0, 1.0, 0.0, 1.0]),
+        (124.0, 36.0),
+        1.0,
+        Some((124.0, 36.0, 224.0, 136.0)),
+        &samples,
+    ) else {
+        return;
+    };
+    assert_eq!(got, vec![GREEN, GREEN, CLEAR, CLEAR]);
+}
