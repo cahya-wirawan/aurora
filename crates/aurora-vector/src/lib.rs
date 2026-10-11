@@ -61,7 +61,7 @@ pub use gradient::{
     ColorMesh, ColorVertex, DEFAULT_GRADIENT_CELLS, GradientCorners, MAX_GRADIENT_STOPS,
     bilinear_rect, horizontal_strip,
 };
-pub use mesh::{DEFAULT_TOLERANCE, Mesh, fill, stroke, tolerance_for_scale_factor};
+pub use mesh::{DEFAULT_TOLERANCE, Mesh, fill, stroke, stroke_rounded, tolerance_for_scale_factor};
 pub use path::{Path, PathBuilder};
 pub use point::Point;
 pub use shapes::rounded_rect;

@@ -1954,3 +1954,410 @@ mod text {
         assert!(resident(atlas.layout(), &kab));
     }
 }
+
+// ---- Icons (0.194.0) ------------------------------------------------
+
+/// Real-GPU proof that the icon set draws the pixels its geometry and its
+/// `icon.*` token imply, at scale 1 and 2. The path renderer does not
+/// antialias, so a covered pixel is exactly the token colour and every
+/// other one is the black clear — which is what lets these assert exact
+/// colours and exact one- and two-pixel line widths rather than "roughly".
+mod icons {
+    use super::{Frame, render_ops_with_atlas};
+    use crate::icons::IconKind;
+    use crate::paint::paint_widget_ops;
+    use crate::render::{GlyphAtlas, upload_paint_ops};
+    use crate::test_support::real_context;
+    use crate::widgets::{IconAccess, IconSize, IconTone, insert_icon, new_tree, test_scales};
+    use aurora_gpu::GpuContext;
+    use aurora_text::TextEngine;
+    use aurora_theme::{Palette, Theme, ThemeSet};
+    use taffy::Style;
+    use taffy::style_helpers::length;
+
+    /// Physical target: 64 x 64 (a 256-byte row).
+    const TARGET: u32 = 64;
+    /// The icon's logical offset in both scales.
+    const PAD: f32 = 8.0;
+
+    fn dark_theme() -> Theme {
+        let Ok(palette) =
+            Palette::from_toml_str(include_str!("../../../design/tokens/palette.toml"))
+        else {
+            unreachable!()
+        };
+        let mut themes = ThemeSet::new();
+        if themes
+            .register(include_str!("../../../design/themes/dark.toml"))
+            .is_err()
+        {
+            unreachable!()
+        }
+        match themes.resolve("Dark", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn token_bytes(theme: &Theme, tone: IconTone) -> [u8; 3] {
+        let color = match tone {
+            IconTone::Default => theme.icon.default,
+            IconTone::Secondary => theme.icon.secondary,
+            IconTone::Disabled => theme.icon.disabled,
+            IconTone::OnAccent => theme.icon.on_accent,
+        };
+        [color.r, color.g, color.b]
+    }
+
+    /// One 16 px icon at logical (8, 8), rendered at `scale` into a
+    /// 64 x 64 physical target.
+    fn render_icon(context: &GpuContext, kind: IconKind, tone: IconTone, scale: f32) -> Frame {
+        let logical = TARGET as f32 / scale;
+        let (mut tree, root) = new_tree(Style {
+            padding: taffy::Rect {
+                left: length(PAD),
+                top: length(PAD),
+                right: length(PAD),
+                bottom: length(PAD),
+            },
+            ..Style::default()
+        });
+        let scales = test_scales();
+        let id = match insert_icon(
+            &mut tree,
+            root,
+            &scales,
+            kind,
+            IconSize::Small,
+            tone,
+            IconAccess::Decorative,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(logical, logical);
+        let ops = match paint_widget_ops(&tree, id, &dark_theme(), &scales, scale) {
+            Ok(ops) => ops,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut engine = match TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut atlas = GlyphAtlas::new(context.device());
+        let gpu = upload_paint_ops(
+            context.device(),
+            context.queue(),
+            &mut engine,
+            &mut atlas,
+            ops,
+            scale,
+            |c| c,
+        );
+        render_ops_with_atlas(
+            context,
+            wgpu::TextureFormat::Rgba8Unorm,
+            (TARGET, TARGET),
+            (logical, logical),
+            &gpu,
+            &atlas,
+        )
+    }
+
+    fn is_lit(frame: &Frame, x: u32, y: u32) -> bool {
+        frame.pixel(x, y).iter().take(3).any(|&c| c != 0)
+    }
+
+    /// `(count, min x, min y, max x, max y)` of the lit pixels.
+    fn lit_stats(frame: &Frame) -> (usize, u32, u32, u32, u32) {
+        let (mut count, mut x0, mut y0, mut x1, mut y1) = (0, u32::MAX, u32::MAX, 0, 0);
+        for y in 0..TARGET {
+            for x in 0..TARGET {
+                if is_lit(frame, x, y) {
+                    count += 1;
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        (count, x0, y0, x1, y1)
+    }
+
+    /// The lengths of the lit runs down column `x`.
+    fn column_runs(frame: &Frame, x: u32) -> Vec<u32> {
+        let (mut runs, mut run) = (Vec::new(), 0);
+        for y in 0..TARGET {
+            if is_lit(frame, x, y) {
+                run += 1;
+            } else if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+        }
+        if run > 0 {
+            runs.push(run);
+        }
+        runs
+    }
+
+    #[test]
+    fn every_icon_renders_non_blank_in_exactly_its_token_colour_inside_its_box_at_both_scales() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let want = token_bytes(&theme, IconTone::Default);
+        for scale in [1.0_f32, 2.0] {
+            for kind in IconKind::ALL {
+                let frame = render_icon(&context, kind, IconTone::Default, scale);
+                let (count, x0, y0, x1, y1) = lit_stats(&frame);
+                assert!(
+                    count >= 8,
+                    "{kind:?} at {scale}x is (nearly) blank: {count}"
+                );
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (lo, hi) = ((PAD * scale) as u32, ((PAD + 16.0) * scale) as u32);
+                assert!(
+                    x0 >= lo && y0 >= lo && x1 < hi && y1 < hi,
+                    "{kind:?} at {scale}x draws outside its 16 px box: ({x0},{y0})-({x1},{y1})"
+                );
+                for y in 0..TARGET {
+                    for x in 0..TARGET {
+                        let px = frame.pixel(x, y);
+                        if is_lit(&frame, x, y) {
+                            assert_eq!(
+                                [px[0], px[1], px[2]],
+                                want,
+                                "{kind:?} at {scale}x, pixel ({x},{y}): not the icon.default colour"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_colour_follows_the_tone_and_the_four_tones_differ() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let mut seen = Vec::new();
+        for tone in IconTone::ALL {
+            let want = token_bytes(&theme, tone);
+            for scale in [1.0_f32, 2.0] {
+                let frame = render_icon(&context, IconKind::Lock, tone, scale);
+                let (count, ..) = lit_stats(&frame);
+                assert!(count > 0, "{tone:?} at {scale}x is blank");
+                for y in 0..TARGET {
+                    for x in 0..TARGET {
+                        if is_lit(&frame, x, y) {
+                            let px = frame.pixel(x, y);
+                            assert_eq!([px[0], px[1], px[2]], want, "{tone:?} at {scale}x");
+                        }
+                    }
+                }
+            }
+            seen.push(want);
+        }
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert_ne!(a, b, "two tones render the same colour in Dark");
+            }
+        }
+    }
+
+    #[test]
+    fn scale_two_is_the_same_icon_at_twice_the_raster() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        for kind in IconKind::ALL {
+            let one = render_icon(&context, kind, IconTone::Default, 1.0);
+            let two = render_icon(&context, kind, IconTone::Default, 2.0);
+            let (c1, a0, b0, a1, b1) = lit_stats(&one);
+            let (c2, p0, q0, p1, q1) = lit_stats(&two);
+            let (w1, h1) = (
+                i64::from(a1) - i64::from(a0) + 1,
+                i64::from(b1) - i64::from(b0) + 1,
+            );
+            let (w2, h2) = (
+                i64::from(p1) - i64::from(p0) + 1,
+                i64::from(q1) - i64::from(q0) + 1,
+            );
+            assert!(
+                (w2 - 2 * w1).abs() <= 2 && (h2 - 2 * h1).abs() <= 2,
+                "{kind:?}: extent {w1}x{h1} at 1x but {w2}x{h2} at 2x"
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = c2 as f32 / c1 as f32;
+            assert!(
+                (3.0..7.0).contains(&ratio),
+                "{kind:?}: {c1} lit pixels at 1x, {c2} at 2x (ratio {ratio}), expected about 4x"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_is_deterministic() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        for kind in IconKind::ALL {
+            for scale in [1.0_f32, 2.0] {
+                let a = render_icon(&context, kind, IconTone::Secondary, scale);
+                let b = render_icon(&context, kind, IconTone::Secondary, scale);
+                assert_eq!(
+                    a.bytes, b.bytes,
+                    "{kind:?} at {scale}x differs between runs"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_icons_render_alike() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let frames: Vec<(IconKind, Vec<u8>)> = IconKind::ALL
+            .iter()
+            .map(|&k| (k, render_icon(&context, k, IconTone::Default, 1.0).bytes))
+            .collect();
+        for (i, (a, fa)) in frames.iter().enumerate() {
+            for (b, fb) in frames.iter().skip(i + 1) {
+                assert_ne!(fa, fb, "{a:?} and {b:?} render identically at 16 px");
+            }
+        }
+    }
+
+    /// Axis-aligned lines are crisp: the new-layer square's top and
+    /// bottom edges, seen down a column clear of its corners and its
+    /// plus, are each exactly one physical pixel thick at scale 1 and
+    /// two at scale 2 (the stroke is one grid pixel and sits on pixel
+    /// centres — `icons::g`).
+    #[test]
+    fn axis_aligned_lines_are_exactly_one_grid_pixel_thick_at_both_scales() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        for scale in [1.0_f32, 2.0] {
+            let frame = render_icon(&context, IconKind::NewLayer, IconTone::Default, scale);
+            // Grid column 4 of the icon: logical x = 8 + 4.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let column = ((PAD + 4.0) * scale) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let thickness = scale as u32;
+            assert_eq!(
+                column_runs(&frame, column),
+                vec![thickness, thickness],
+                "top and bottom edges at {scale}x"
+            );
+        }
+    }
+
+    /// Not a check: writes a review sheet for a human (0.194.0). Every
+    /// icon on `surface.panel` in the Dark theme, in the default,
+    /// secondary and disabled tones; per tone one row rendered at scale 1
+    /// and one at scale 2, at their real pixel sizes; then the whole
+    /// sheet again enlarged 4x with nearest-neighbour so the pixels show.
+    /// Run: `AURORA_REQUIRE_GPU=1 cargo test -p aurora-widgets --lib
+    /// write_icon_review_sheet -- --ignored`.
+    #[test]
+    #[ignore = "writes a PNG for human review; asserts nothing"]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn write_icon_review_sheet() {
+        const OUT: &str = "/tmp/claude-1000/-home-cahya-Work-MachineLearning-aurora/d855cbb3-6f26-4834-a925-3bf96e1088a2/scratchpad/icons-sheet.png";
+        const CELL: u32 = 40;
+        const ZOOM: u32 = 4;
+        let Some(context) = real_context() else {
+            return;
+        };
+        let theme = dark_theme();
+        let panel = [
+            theme.surface.panel.r,
+            theme.surface.panel.g,
+            theme.surface.panel.b,
+            255,
+        ];
+        let columns = IconKind::ALL.len() as u32;
+        let rows = 6_u32;
+        let (width, height) = (columns * CELL, rows * CELL);
+        let mut sheet: Vec<u8> = panel
+            .iter()
+            .copied()
+            .cycle()
+            .take((width * height * 4) as usize)
+            .collect();
+        let tones = [IconTone::Default, IconTone::Secondary, IconTone::Disabled];
+        for (t, tone) in tones.iter().enumerate() {
+            for (s, scale) in [1.0_f32, 2.0].iter().enumerate() {
+                let row = (t * 2 + s) as u32;
+                // The icon's 16 logical px box inside the 64 px target.
+                let side = (16.0 * scale) as u32;
+                let from = (PAD * scale) as u32;
+                for (c, kind) in IconKind::ALL.iter().enumerate() {
+                    let frame = render_icon(&context, *kind, *tone, *scale);
+                    let (ox, oy) = (
+                        c as u32 * CELL + (CELL - side) / 2,
+                        row * CELL + (CELL - side) / 2,
+                    );
+                    for y in 0..side {
+                        for x in 0..side {
+                            if is_lit(&frame, from + x, from + y) {
+                                let px = frame.pixel(from + x, from + y);
+                                let at = (((oy + y) * width + ox + x) * 4) as usize;
+                                if let Some(dst) = sheet.get_mut(at..at + 4) {
+                                    dst.copy_from_slice(&[px[0], px[1], px[2], 255]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The sheet at its real size, with the 4x copy beneath it.
+        let (out_w, out_h) = (width * ZOOM, height + height * ZOOM);
+        let mut out: Vec<u8> = panel
+            .iter()
+            .copied()
+            .cycle()
+            .take((out_w * out_h * 4) as usize)
+            .collect();
+        for y in 0..height {
+            for x in 0..width {
+                let src = ((y * width + x) * 4) as usize;
+                let dst = ((y * out_w + x) * 4) as usize;
+                if let (Some(s), Some(d)) = (sheet.get(src..src + 4), out.get_mut(dst..dst + 4)) {
+                    d.copy_from_slice(s);
+                }
+            }
+        }
+        for y in 0..height * ZOOM {
+            for x in 0..out_w {
+                let src = (((y / ZOOM) * width + x / ZOOM) * 4) as usize;
+                let dst = (((height + y) * out_w + x) * 4) as usize;
+                if let (Some(s), Some(d)) = (sheet.get(src..src + 4), out.get_mut(dst..dst + 4)) {
+                    d.copy_from_slice(s);
+                }
+            }
+        }
+        let Ok(file) = std::fs::File::create(OUT) else {
+            unreachable!("the scratchpad directory exists");
+        };
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), out_w, out_h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let Ok(mut writer) = encoder.write_header() else {
+            unreachable!("a valid PNG header");
+        };
+        assert!(writer.write_image_data(&out).is_ok(), "the PNG writes");
+    }
+}

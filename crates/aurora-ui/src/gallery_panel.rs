@@ -44,7 +44,10 @@ use std::time::{Duration, Instant};
 use accesskit::Orientation;
 use aurora_core::ToneCurve;
 use aurora_theme::{Color, Scales};
-use aurora_widgets::widgets::{self, MenuItem, ScrollbarRange, Tooltip, WidgetKind, row_height};
+use aurora_widgets::icons::IconKind;
+use aurora_widgets::widgets::{
+    self, IconAccess, IconSize, IconTone, MenuItem, ScrollbarRange, Tooltip, WidgetKind, row_height,
+};
 use aurora_widgets::{
     ActionOutcome, FocusManager, PointerOutcome, WidgetError, WidgetId, WidgetTree,
 };
@@ -124,6 +127,14 @@ pub struct GalleryPanel {
     /// Toggle buttons (0.160.0, the tools panel's kind): off, on, and
     /// disabled-on. A click flips an enabled one.
     pub toggle_buttons: [WidgetId; 3],
+    /// The icon set (0.194.0), every icon in every tone: one wrapped row
+    /// of [`IconKind::ALL`] per tone in [`IconTone::ALL`] order (so
+    /// `icons[tone * IconKind::ALL.len() + kind]`), each under its
+    /// caption in [`GalleryPanel::icon_captions`].
+    pub icons: Vec<WidgetId>,
+    /// The three captions over the icon rows: "Icons: Default",
+    /// "Icons: Secondary", "Icons: Disabled".
+    pub icon_captions: [WidgetId; 3],
     /// Owned by [`Self::button`]; shown on hover after
     /// [`GALLERY_TOOLTIP_DELAY`] ([`gallery_hover`]/[`gallery_tick`]).
     pub tooltip: Tooltip,
@@ -358,6 +369,7 @@ fn build(
     let toggle_on = widgets::insert_toggle_button(tree, toggles, scales, "On", true)?;
     let toggle_disabled = widgets::insert_toggle_button(tree, toggles, scales, "Disabled", true)?;
     widgets::set_button_disabled(tree, toggle_disabled, true)?;
+    let (icons, icon_captions) = insert_icon_sets(tree, right, scales)?;
     let tooltip = Tooltip::new(tree, button, scales, "A tooltip", GALLERY_TOOLTIP_DELAY)?;
 
     Ok(GalleryPanel {
@@ -379,9 +391,65 @@ fn build(
         curve,
         curve_caption,
         toggle_buttons: [toggle_off, toggle_on, toggle_disabled],
+        icons,
+        icon_captions,
         tooltip,
         open_menu: None,
     })
+}
+
+/// The three tones the gallery shows the icon set in (0.194.0): the
+/// states an icon has in the Layers panel to come. `OnAccent` is not
+/// shown: it needs an accent fill behind it, which no gallery cell has.
+const GALLERY_ICON_TONES: [IconTone; 3] =
+    [IconTone::Default, IconTone::Secondary, IconTone::Disabled];
+
+/// One wrapped row of icons: `spacing.xxs` apart, as many per line as
+/// the column is wide.
+fn icon_row_style(scales: &Scales) -> Style {
+    let gap = length(px(scales.spacing.xxs));
+    Style {
+        flex_direction: FlexDirection::Row,
+        flex_wrap: taffy::FlexWrap::Wrap,
+        gap: Size {
+            width: gap,
+            height: gap,
+        },
+        size: Size {
+            width: length(gallery_editor_size(scales)),
+            height: auto(),
+        },
+        ..Default::default()
+    }
+}
+
+/// The icon set, every icon in every [`GALLERY_ICON_TONES`] tone, each
+/// row under a caption (a real `Label`). The icons are named (a
+/// `Role::Image` with the icon's name), since in the gallery each one
+/// stands alone.
+fn insert_icon_sets(
+    tree: &mut WidgetTree<WidgetKind>,
+    right: WidgetId,
+    scales: &Scales,
+) -> Result<(Vec<WidgetId>, [WidgetId; 3]), WidgetError> {
+    let mut icons = Vec::new();
+    let mut captions = [right; 3];
+    for (slot, tone) in captions.iter_mut().zip(GALLERY_ICON_TONES) {
+        *slot = widgets::insert_label(tree, right, scales, format!("Icons: {}", tone.name()))?;
+        let row = widgets::insert_container(tree, right, icon_row_style(scales))?;
+        for kind in IconKind::ALL {
+            icons.push(widgets::insert_icon(
+                tree,
+                row,
+                scales,
+                kind,
+                IconSize::Small,
+                tone,
+                IconAccess::Named(kind.name().to_owned()),
+            )?);
+        }
+    }
+    Ok((icons, captions))
 }
 
 /// The toggle-button demo row (0.160.0): a row, `spacing.sm` apart.
@@ -796,6 +864,8 @@ mod tests {
             g.curve_caption,
         ];
         ids.extend(g.toggle_buttons);
+        ids.extend(g.icons.iter().copied());
+        ids.extend(g.icon_captions);
         ids.extend(g.tree_rows);
         ids
     }
@@ -896,6 +966,41 @@ mod tests {
         assert_eq!(g.open_menu, None);
     }
 
+    /// 0.194.0: the gallery shows every icon in the default, secondary
+    /// and disabled tones, each a named image under a caption.
+    #[test]
+    fn the_gallery_shows_every_icon_in_every_tone_named_and_captioned() {
+        use super::{GALLERY_ICON_TONES, IconKind};
+        let (ws, g, _) = opened(TALL);
+        let n = IconKind::ALL.len();
+        assert_eq!(g.icons.len(), n * GALLERY_ICON_TONES.len());
+        for (t, tone) in GALLERY_ICON_TONES.iter().enumerate() {
+            let caption = g
+                .icon_captions
+                .get(t)
+                .and_then(|id| ws.tree.accessibility(*id));
+            assert_eq!(
+                caption.and_then(accesskit::Node::label),
+                Some(format!("Icons: {}", tone.name()).as_str())
+            );
+            for (k, kind) in IconKind::ALL.iter().enumerate() {
+                let Some(id) = g.icons.get(t * n + k) else {
+                    unreachable!()
+                };
+                let state = widgets::icon_state(&ws.tree, *id);
+                assert_eq!(state.map(|s| (s.kind, s.tone)).ok(), Some((*kind, *tone)));
+                let node = ws.tree.accessibility(*id);
+                assert_eq!(node.map(accesskit::Node::role), Some(Role::Image));
+                assert_eq!(node.and_then(accesskit::Node::label), Some(kind.name()));
+                assert!(
+                    ws.tree
+                        .bounds(*id)
+                        .is_some_and(|b| b.width == 16 && b.height == 16)
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_large_viewport_lays_every_widget_out_in_two_columns_right_of_the_rail() {
         let (ws, g, scales) = opened(TALL);
@@ -943,23 +1048,30 @@ mod tests {
         // and its padding, 29 px) and its column gap, in the right column.
         // 533 since 0.161.0: plus the curve editor's "Sample histogram"
         // caption (one row) and its column gap, in the right column.
-        assert!((min - 533.0).abs() < f32::EPSILON, "{min}");
+        // 776 since 0.194.0: plus the icon set, three captions each over
+        // two wrapped lines of 14 icons (243 px), in the right column.
+        assert!((min - 776.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
             // slider and text field stretching, that is the right column's
             // curve editor, not the left column's last tree row.
             // Since 0.160.0 the toggle-button row sits under it.
-            let (Some(row), Some(curve), Some(toggle), Some(body)) = (
+            // Since 0.194.0 the icon rows sit under the toggles.
+            let (Some(row), Some(curve), Some(toggle), Some(icon), Some(body)) = (
                 ws.tree.bounds(g.tree_rows[2]),
                 ws.tree.bounds(g.curve),
                 ws.tree.bounds(g.toggle_buttons[0]),
+                g.icons.last().and_then(|id| ws.tree.bounds(*id)),
                 ws.tree.bounds(g.panel.body),
             ) else {
                 unreachable!()
             };
             (
-                row.bottom().max(curve.bottom()).max(toggle.bottom()),
+                row.bottom()
+                    .max(curve.bottom())
+                    .max(toggle.bottom())
+                    .max(icon.bottom()),
                 body.bottom(),
             )
         };
@@ -1014,7 +1126,7 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 533.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!((min - 776.0).abs() < f32::EPSILON, "measured minimum {min}");
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the

@@ -26,7 +26,77 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.193.0): the live canvas is clipped to the document, and
+**Latest (2026-10-11, 0.194.0): round L1 of the Photoshop-style Layers panel — the
+vector icon foundation. No panel changes yet.**
+- **Decision** (design owner Cahya, 2026-10-11, reference
+  `images/flat-design-nyepi-template/layers-panel.png`): the Layers panel is
+  rebuilt Photoshop-style, with **our own vector icons** coloured by the
+  `icon.*` tokens. **The set is provisional** and meant to be swapped for a
+  designed one without touching panel code, so geometry is separate from the
+  widget. Series: **L1 (this round)** icons; **L2** rows (eye, chevrons, folder
+  icons, blend label, indent) and the Blend / Opacity / Fill controls; **L3**
+  bottom toolbar (new layer, delete exist; New Group with Pass Through default;
+  Curves via the adjustment button; mask and link until they exist; **`fx` is a
+  disabled placeholder until the effects UI exists** — its `Fx` icon is in the
+  set now); **L4** layer thumbnails (async, from tiles); **L5** Lock (model +
+  UI), Kind filter and search; later, Channels / Paths tabs.
+- **Icon geometry** (`aurora_widgets::icons`): `IconKind` (`Eye`, `EyeOff`,
+  `FolderClosed`, `FolderOpen`, `ChevronRight`, `ChevronDown`, `Lock`, `Fx`,
+  `NewLayer`, `Group`, `Delete`, `Link`, `Mask`, `Adjustment`; `Fx` is the
+  letters "fx" as strokes, not text) as plain data in a 24 x 24 box
+  (`icon_parts`), one stroke width (1.5 units = 1 px at 16 px), no text.
+  Drawn on a pixel grid (`g`: grid step `n` = centre of pixel `n` of a 16 px
+  icon) so orthogonal lines are exactly 1 px at scale 1 and 2 px at scale 2,
+  because the path renderer does not antialias.
+- **Icon widget** (`WidgetKind::Icon`, `widgets/icon.rs`): a square of
+  `spacing.md` (16 px, `IconSize::Small`) or `spacing.lg` (`Large`); colour by
+  `IconTone` (`Default`, `Secondary`, `Disabled`, `OnAccent` -> `icon.default`,
+  `icon.secondary`, `icon.disabled`, `icon.on_accent`); accessibility by
+  `IconAccess`: `Decorative` (a `Role::Image` node that is `hidden`, for an icon
+  inside a button or row that carries the name) or `Named(name)` (visible
+  `Role::Image` with a label); no actions, never a tab stop.
+- **Paint**: the existing `Paint` (mesh + colour) path, no new GPU pipeline.
+  The one extension is `aurora_vector::stroke_rounded` (round caps and joins:
+  `stroke`'s butt caps and mitres leave spikes on an eye's corners). An icon an
+  ancestor clips only partly is not drawn (meshes are not scissored).
+- **Gallery**: the in-app Widget Gallery shows the 14 icons in the default,
+  secondary and disabled tones, each row under a caption (the gallery's minimum
+  height pin moved 533 -> 776 px). `design/gallery/index.html` has no icon
+  section and was not changed.
+- **Contrast**: nine pairs added to `design/check_contrast.py` and to
+  `aurora-theme`'s `GATED_PAIRS` (20 -> 29): `icon.default` and `icon.secondary`
+  on `surface.panel`/`app`/`raised`/`sunken`, `icon.on_accent` on
+  `accent.primary`, all at 3:1 (WCAG 1.4.11). All pass in all five themes
+  (worst: `icon.secondary` on `surface.raised` 4.81 in Dark, 4.82 in Colour-
+  Critical; `icon.default` worst 8.59 in Colour-Critical on `surface.raised`; `icon.on_accent` worst 6.96 in Light). `icon.disabled` stays informational
+  (3.45–5.32 on `surface.panel`; 2.82 on Light's `surface.sunken`). No colour
+  changed.
+- **Tests** (24 new; 3,629 pass, 0 failed, 72 ignored, `AURORA_REQUIRE_GPU=1`): geometry (every icon non-empty, closed/open as
+  intended, inside the 24 x 24 box *as tessellated*, deterministic, scales,
+  right way up), widget (accessibility modes, tone colours, layout, setters,
+  clipping), real-GPU renders at scale 1 and 2 (non-blank, exactly the token
+  colour, tone follows state, 2x extent and raster, 1/2 px line width,
+  deterministic, no two icons alike), gallery. No golden images were added;
+  the checks are exact pixel assertions that need no bless.
+- **Mutations** (each run for real on the RTX 3090, restored by sha256):
+  colour role ignores state (2 failures); icon flipped vertically (1 — the new
+  right-way-up test, the symmetric tests could not see it); scale-2 tessellation
+  tolerance not scaled (1); scale-2 raster not scaled (3); decorative icon
+  shows a node (3).
+- **Weaknesses, stated plainly.** The icons are **provisional and no human has
+  seen them, on the Mac or anywhere**; I only looked at their rasters on a
+  Linux/Vulkan GPU. **The path renderer does not antialias** (no MSAA in any
+  widget pipeline), so 1 px diagonals and curves are hard-edged and thin at
+  scale 1 (a chevron is ~11 lit pixels); adding MSAA is a renderer decision for
+  later. A symmetric drawing sits half a pixel right of and below the box
+  centre. A partly clipped icon vanishes rather than being cut. There is no icon
+  size or stroke-width token: sizes use `spacing.md`/`spacing.lg`, and the
+  stroke is geometry inside the icon module (1.5 of 24 units) — provisional,
+  the design owner's to confirm.
+
+Review notes (0.194.0): (1) the gallery shows the Default, Secondary and Disabled tones only; the `OnAccent` tone and the `Large` size are covered by unit, GPU and contrast tests but are not in the gallery (no accent-filled cell yet): an explicit gap for L2. (2) The 1.5-unit stroke is a style value; before L2 builds around it, ask the design owner whether to make it a `size.icon_stroke` token. (3) For L2: an icon whose ancestor clips it only partly is not drawn at all, and L2 scrolls rows, so L2 must clip the row or add a scissor. (4) Crispness is pinned at scales 1 and 2 only; at fractional scales (1.25, 1.5) lines are uneven because nothing antialiases; `stroke_rounded` has no test for zero-length or non-finite input. (5) The reviewer could not run anything; the test count is the builder's.
+
+**Previously (2026-10-11, 0.193.0): the live canvas is clipped to the document, and
 the near pan bound is the document's own corner whichever layer is active.**
 - **Problem** (user's Mac screenshot of `6739968.psd`). The live view drew
   layer content outside the 1080x1920 canvas (Nyepi's layers reach
@@ -33900,6 +33970,8 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Layers panel series, round L2 (0.195.0):** rebuild the Layers rows Photoshop-style on the 0.194.0 icons — eye toggle, disclosure chevron, folder icon, name, blend label, nested indent — and the Blend / Opacity / Fill controls on top (see the 0.194.0 entry for L3–L5). The composite-grid anchoring follow-on below is unchanged.
 
 **Next round (follow-on from 0.193.0): anchor the composite grid to the document.** 0.193.0 clips the live canvas to the document and makes the near pan bound the document corner, with the grid anchor capped at the corner (`min(layer origin, 0)`). Anchoring the grid at the document corner always (then a negative-origin layer is just another layer) would let `composite_reference_origin` be a constant and simplify incremental invalidation, but changes every cached `TileId`; it needs the invalidation paths (`after_undo_redo`, `invalidate_doc_rects`, the background worker's reference-origin stamp) re-proved. Also open: bounding the far pan edge by the document, and centring a document smaller than the view.
 

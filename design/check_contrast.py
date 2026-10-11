@@ -62,6 +62,19 @@ PAIRS = [
     # sit on a surface.sunken halo; the halo against the bars is the
     # text.secondary pair just above. The selected marker's accent disc:
     ("accent.primary on surface.sunken (marker on its halo)", "accent.primary", "surface.sunken", 3.0, "UI graphic (curve marker)"),
+    # 0.194.0 (Layers panel round L1): the icon set is drawn in icon.default
+    # and icon.secondary on every surface an icon sits on, and icon.on_accent
+    # on the selected-row accent fill. WCAG 1.4.11 graphical objects: 3:1.
+    # icon.disabled stays informational (disabled content).
+    ("icon.default on surface.panel", "icon.default", "surface.panel", 3.0, "UI graphic (icon)"),
+    ("icon.default on surface.app", "icon.default", "surface.app", 3.0, "UI graphic (icon)"),
+    ("icon.default on surface.raised", "icon.default", "surface.raised", 3.0, "UI graphic (icon)"),
+    ("icon.default on surface.sunken", "icon.default", "surface.sunken", 3.0, "UI graphic (icon)"),
+    ("icon.secondary on surface.panel", "icon.secondary", "surface.panel", 3.0, "UI graphic (icon)"),
+    ("icon.secondary on surface.app", "icon.secondary", "surface.app", 3.0, "UI graphic (icon)"),
+    ("icon.secondary on surface.raised", "icon.secondary", "surface.raised", 3.0, "UI graphic (icon)"),
+    ("icon.secondary on surface.sunken", "icon.secondary", "surface.sunken", 3.0, "UI graphic (icon)"),
+    ("icon.on_accent on accent.primary", "icon.on_accent", "accent.primary", 3.0, "UI graphic (icon)"),
 ]
 
 # Not gated (informational only). (label, fg, bg, reason)

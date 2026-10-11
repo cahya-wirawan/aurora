@@ -154,6 +154,7 @@ mod curve_editor;
 mod dialog;
 mod drop_indicator;
 mod dropdown;
+mod icon;
 mod label;
 mod list_row;
 mod menu;
@@ -205,6 +206,10 @@ pub use dropdown::{
     DropdownKey, DropdownOutcome, DropdownState, commit_dropdown_row, dropdown_of_row,
     dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
     set_dropdown_options, set_dropdown_selected, toggle_dropdown,
+};
+pub use icon::{
+    IconAccess, IconSize, IconState, IconTone, icon_side, icon_state, insert_icon, set_icon_access,
+    set_icon_kind, set_icon_tone,
 };
 pub use label::{LabelState, insert_label, label_state, set_label_disabled, set_label_text};
 pub use list_row::ListRowState;
@@ -420,6 +425,11 @@ pub enum WidgetKind {
     /// (`paint::paint_drop_indicator`), nothing while hidden; never
     /// focusable, AT-`hidden`.
     DropIndicator(DropIndicatorState),
+    /// An icon (0.194.0) — one picture of `crate::icons`' set, drawn as
+    /// vector geometry in an `icon.*` colour (`paint::paint_icon`),
+    /// created by `icon.rs`'s [`insert_icon`]. Decorative (AT-`hidden`) or
+    /// named (`Role::Image`); never focusable, no actions.
+    Icon(IconState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

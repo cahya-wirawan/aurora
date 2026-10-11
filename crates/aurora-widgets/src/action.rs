@@ -371,6 +371,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::Label(state) => state.disabled,
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
+        | WidgetKind::Icon(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
@@ -970,6 +971,16 @@ mod tests {
         // A label declares no action at all: the sweep proves none routes.
         ok(insert_label(&mut tree, root, &scales, "Size 24 px"));
         ok(crate::widgets::insert_drop_indicator(&mut tree, root));
+        // An icon declares no action either: the sweep proves none routes.
+        ok(crate::widgets::insert_icon(
+            &mut tree,
+            root,
+            &scales,
+            crate::icons::IconKind::Eye,
+            crate::widgets::IconSize::Small,
+            crate::widgets::IconTone::Default,
+            crate::widgets::IconAccess::Named("Eye".into()),
+        ));
         tree.compute_layout(800.0, 600.0);
         let _ = tree.take_damage();
         Fixture {
@@ -1808,9 +1819,10 @@ mod tests {
             WidgetKind::Label(_) => 23,
             WidgetKind::DropIndicator(_) => 24,
             WidgetKind::RaisedPanel => 25,
+            WidgetKind::Icon(_) => 26,
         }
     }
-    const KIND_COUNT: usize = 26;
+    const KIND_COUNT: usize = 27;
 
     /// The data a well-formed request for `action` on `id` would carry.
     fn well_formed(f: &Fixture, id: WidgetId, action: Action) -> Option<ActionData> {

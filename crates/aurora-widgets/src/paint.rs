@@ -121,17 +121,19 @@ use aurora_core::Rect;
 use aurora_theme::{Color, Scales, Theme};
 use aurora_vector::{
     ColorMesh, DEFAULT_GRADIENT_CELLS, GradientCorners, Mesh, Path, PathBuilder, Point,
-    bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, tolerance_for_scale_factor,
+    bilinear_rect, fill, horizontal_strip, rounded_rect, stroke, stroke_rounded,
+    tolerance_for_scale_factor,
 };
 
 use crate::error::WidgetError;
+use crate::icons::icon_paths;
 use crate::input::FocusManager;
 use crate::text::{TextRun, intersect, text_runs};
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
-    CurveEditorState, DropdownState, Hsv, ListRowState, MARKER_RING_WIDTH, ScrollbarState,
-    SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind,
+    CurveEditorState, DropdownState, Hsv, IconState, IconTone, ListRowState, MARKER_RING_WIDTH,
+    ScrollbarState, SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind,
     checkbox_box_rect, plot_rect, row_height,
 };
 
@@ -470,6 +472,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
         WidgetKind::Label(state) => state.disabled,
+        WidgetKind::Icon(state) => state.tone == IconTone::Disabled,
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
         | WidgetKind::CommandPalette(_)
@@ -1111,6 +1114,8 @@ pub fn paint_widget(
         WidgetKind::DropIndicator(state) => {
             paint_drop_indicator(*state, bounds, theme, scales, scale_factor)
         }
+        // Whole or not at all: see `paint_icon`.
+        WidgetKind::Icon(state) => paint_icon(state, full, bounds, theme, scale_factor),
         // A label paints no solids; `crate::text_runs` draws its text.
         WidgetKind::ColorPicker(_)
         | WidgetKind::CurveEditorPoint(_)
@@ -1191,6 +1196,53 @@ fn clip_to_clipping_ancestors(
     bounds: Rect,
 ) -> Option<Rect> {
     tree.visible_rect(id, bounds)
+}
+
+/// An icon's shapes (0.194.0): its filled parts (one mesh), then its
+/// strokes (one mesh, round caps and joins), both in the `icon.*` colour
+/// its tone names — opaque, so a stroke's self-overlap at a join never
+/// shows. The unit box is scaled to the widget's own square (its shorter
+/// side, centred) and drawn at its position in the **full** bounds; if an
+/// ancestor clips the icon at all (`bounds != full`) nothing is drawn,
+/// since a mesh is not scissored and a half-icon would spill over its
+/// neighbour.
+fn paint_icon(
+    state: &IconState,
+    full: Rect,
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    if bounds != full {
+        return Ok(vec![]);
+    }
+    let side = full.width.min(full.height) as f32;
+    let origin = (
+        full.x as f32 + (full.width as f32 - side) / 2.0,
+        full.y as f32 + (full.height as f32 - side) / 2.0,
+    );
+    let color = match state.tone {
+        IconTone::Default => theme.icon.default,
+        IconTone::Secondary => theme.icon.secondary,
+        IconTone::Disabled => theme.icon.disabled,
+        IconTone::OnAccent => theme.icon.on_accent,
+    };
+    let [r, g, b] = color.to_srgb_f32();
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let paths = icon_paths(state.kind, origin, side);
+    let mut paints = Vec::new();
+    if let Some(path) = &paths.fill {
+        paints.push((
+            fill(path, tolerance).map_err(WidgetError::Paint)?,
+            [r, g, b, 1.0],
+        ));
+    }
+    if let Some(path) = &paths.stroke {
+        let mesh =
+            stroke_rounded(path, paths.stroke_width, tolerance).map_err(WidgetError::Paint)?;
+        paints.push((mesh, [r, g, b, 1.0]));
+    }
+    Ok(paints)
 }
 
 fn paint_button(
