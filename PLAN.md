@@ -26,7 +26,87 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.188.0): the background compositor folds a job's
+**Latest (2026-10-11, 0.189.0): opening a PSD is about twice as fast
+(round R5 of the large-template performance plan, open time).**
+- **Measured first** (release, Nyepi, 4,021 tiles, 8 hardware threads, a box
+  with load average ~4 from other users, so absolute numbers are noisy).
+  `PreparedPsd::stream` took 2.68–2.80 s on 0.188.0:
+  - read, parse and decode 1.35–1.44 s: `write_plane` (u8/u16 → `f16`)
+    1.03–1.12 s, layer buffer allocation 0.17–0.19 s, RLE decode
+    0.16 s, file reads 0.01 s;
+  - tile build and encode 1.21–1.26 s: fill 0.17–0.18 s, `lz4` and the tile
+    buffers around it 1.05–1.10 s;
+  - staging writes 0.09–0.10 s; UI-thread install 1.6–3.0 ms; peak RSS
+    +42–97 MiB.
+  No profiler was usable (`perf_event_paranoid` 4), so these are timing
+  counters, since removed.
+- **Changes.**
+  - `aurora-io` `psd.rs`: `promote_u8_table`/`promote_u16_table` (lookup
+    tables built from the same `f16::from_f32(promote_*)` call, so
+    bit-identical) replace the per-sample division and software half
+    conversion. `decode_four_channels`: an RGBA layer whose image is at most
+    64 MiB reads its four channels, decodes them on up to
+    `min(4, cores − 1)` threads (`std::thread::scope`) and interleaves
+    them in one pass; other layers keep the one-plane-at-a-time path, so the
+    peak does not grow with the document.
+  - `aurora-io` `import.rs`: `image_tile_ids` and `encode_image_tile` are
+    the per-tile body `encode_image_tiles_at` now runs. A tile whose source
+    texels are all bit-for-bit `+0.0` (`placed_region_is_zero`, an exact test:
+    `-0.0`, the smallest subnormal and colour under zero alpha all fail it)
+    reuses one cached encoded blank tile; the tile stays present, with the same
+    bytes `EncodedTile::of` makes. Other tiles use a per-thread tile buffer.
+    `ImageView` is a `Sync` view of an `Image` (which holds an lcms2 handle).
+  - `aurora-tile`: `codec::EncodeScratch` and `encode_with`, byte-identical to
+    `encode` through reusable buffers (the half-megabyte allocations and their
+    page faults were most of a tile's encode time and serialize across
+    threads); `EncodedTile::of_texels_with`.
+  - `aurora-app` `prepared_pixels.rs`: the streaming sink encodes a layer's
+    tiles on a rayon pool of `composite_threads()` threads and overlaps that
+    with decoding the next layer when the image is at most 64 MiB
+    (`OVERLAP_IMAGE_BYTES`), so at most one such layer is in flight
+    (a constant extra: the ≤ 64 MiB image plus its encoded tiles until staged, so roughly twice that); masks and bigger layers encode in place.
+    `OpenTimings` rides on `PreparedPsd` and is logged.
+- **Measured after** (same box): 1.31–1.50 s (three runs 1.41, 1.31,
+  1.50). UI-thread install 1.7 ms. Peak RSS +34–52 MiB steady, +134–147 MiB in
+  the first run of a process (thread stacks, tables; 92–97 before). The route
+  there: tables + zero reuse + parallel encode gave 2.7 → 1.45 s; parallel
+  encode alone changed nothing (1, 3 and 7 threads all 1.28–1.49 s) until the
+  tile buffers were reused, after which the encode wait fell from 0.2 s to
+  0.06 s. The decode thread is now the long pole and runs 1.1–1.25 s beside
+  the pool against 0.75 s alone (contention, cause not investigated).
+- **Not done / not measured.** The decode thread is not parallelised further
+  (row-parallel conversion, parallel layer buffers). The 2 GiB noisy-PSD
+  measurement (PRD: under 5 s) was not rerun: its 512 MiB layers exceed both
+  64 MiB caps, so it takes the 0.154.0 path with the tables, the zero reuse
+  and the tile-buffer reuse. Other OSes, fewer cores (2 cores: the pool has
+  one thread and encodes in place) and a real window while opening are not
+  measured.
+- **Tests.** aurora-io: `every_encoded_tile_equals_the_plain_encode_of_the_filled_tile`
+  (against a hand-written reference, at three offsets, over zero, subnormal,
+  `-0.0`, colour-under-zero-alpha and noisy tiles),
+  `a_wholly_zero_tile_is_still_present_and_reuses_the_blank_encoding`,
+  `image_tile_ids_refuses_what_the_encoder_refuses`, the tables-equal-direct
+  tests for all 256 and 65,536 inputs, `write_plane` for both depths, and
+  `rgba_layers_decode_to_the_direct_conversion_on_every_path` (both depths,
+  all four compressions). aurora-tile: `encode_with_is_byte_identical_to_encode_for_every_kind_of_tile`.
+  aurora-app `open_time_tests.rs`: `nyepi_tiles_are_the_0_188_0_tiles_on_any_thread_count`
+  (FNV fingerprint of all 4,021 tiles recorded from a 0.188.0 checkout; skips
+  when the file is absent), `a_noisy_psd_streams_to_the_same_tiles_on_any_thread_count`
+  (8 and 16 bit), `the_pool_encodes_a_layers_tiles_in_the_sequential_order`, and the
+  ignored `nyepi_open_breakdown`. None is timing-sensitive, so no 20× stress run.
+- **Mutations** (each restored, sha256 checked): the pool writing a tile to the
+  wrong slot (killed by 3); the zero test as a threshold `> 1` (2) and ignoring the
+  sign bit (2); a superseded open still installing (3, the existing
+  `background_open` tests); the last in-flight layer never finished (2); green and
+  blue swapped in the four-channel path (1); the u8 table off by one (3).
+  **Survived:** `encode_with`'s `n + 4 < raw.len()` as `<=`, which differs only
+  when the compressed block is exactly as long as the raw payload (not
+  constructed).
+- **Gate.** `cargo test --workspace`, `AURORA_REQUIRE_GPU=1`: 3,511 passed, 0
+  failed, 72 ignored. Clippy, doc, deny, contrast and the Windows and macOS
+  cross-clippy are clean. The corpus-free worktree run is in the final report.
+
+**Previously (2026-10-11, 0.188.0): the background compositor folds a job's
 tiles in parallel (round R4 of the large-template performance plan; ADR
 0012's 0.188.0 addendum).**
 - **Design.** The worker owns a rayon pool of

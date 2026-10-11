@@ -90,7 +90,7 @@ pub fn write_into_store_at(
                 continue;
             }
             let tile = store.get_mut(surface, TileId { x: tx, y: ty })?;
-            if let Some(dirty) = fill_placed_tile(image, dx, dy, tx, ty, tile.texels_mut()) {
+            if let Some(dirty) = fill_placed_tile(image.view(), dx, dy, tx, ty, tile.texels_mut()) {
                 tile.mark_dirty(dirty);
             }
         }
@@ -123,6 +123,24 @@ pub type EncodedTiles = Vec<(TileId, EncodedTile)>;
 /// [`IoError::ImagePlacementOutOfRange`] exactly when
 /// [`write_into_store_at`] returns it; nothing is encoded then.
 pub fn encode_image_tiles_at(image: &Image, dx: u32, dy: u32) -> Result<EncodedTiles, IoError> {
+    let ids = image_tile_ids(image, dx, dy)?;
+    Ok(ids
+        .into_iter()
+        .map(|id| (id, encode_image_tile(image.view(), dx, dy, id)))
+        .collect())
+}
+
+/// The tiles an image placed at surface-local `(dx, dy)` overlaps, in
+/// row-major tile order — exactly the tiles [`encode_image_tiles_at`]
+/// returns (0.189.0). With [`encode_image_tile`] it lets a caller encode
+/// the tiles on several threads and still produce, in this order, the
+/// tiles the sequential function would.
+///
+/// # Errors
+///
+/// [`IoError::ImagePlacementOutOfRange`] exactly when
+/// [`write_into_store_at`] returns it.
+pub fn image_tile_ids(image: &Image, dx: u32, dy: u32) -> Result<Vec<TileId>, IoError> {
     let width = image.width();
     let height = image.height();
     if width == 0 || height == 0 {
@@ -136,18 +154,110 @@ pub fn encode_image_tiles_at(image: &Image, dx: u32, dy: u32) -> Result<EncodedT
     };
     let right = dx.checked_add(width).ok_or_else(out_of_range)?;
     let bottom = dy.checked_add(height).ok_or_else(out_of_range)?;
-    let mut tiles = Vec::new();
+    let mut ids = Vec::new();
     for ty in (dy / TILE)..bottom.div_ceil(TILE) {
         for tx in (dx / TILE)..right.div_ceil(TILE) {
-            if placed_overlap(tx, ty, dx, dy, right, bottom).is_none() {
-                continue;
+            if placed_overlap(tx, ty, dx, dy, right, bottom).is_some() {
+                ids.push(TileId { x: tx, y: ty });
             }
-            let mut tile = Tile::blank();
-            let _dirty = fill_placed_tile(image, dx, dy, tx, ty, tile.texels_mut());
-            tiles.push((TileId { x: tx, y: ty }, EncodedTile::of(&tile)));
         }
     }
-    Ok(tiles)
+    Ok(ids)
+}
+
+/// One tile of [`encode_image_tiles_at`] (0.189.0): tile `id` of an image
+/// placed at `(dx, dy)`, built from a blank tile, filled by the shared
+/// row copy and encoded. A tile whose every texel is bit-for-bit `+0.0`
+/// (an exact test, not a threshold: a nearly transparent texel, `-0.0` or
+/// a non-zero colour under zero alpha all fail it) skips the compression
+/// and reuses the encoded blank tile — the same bytes
+/// [`EncodedTile::of`] makes for it, so the result is identical and the
+/// tile is still present, never elided.
+#[must_use]
+pub fn encode_image_tile(image: ImageView<'_>, dx: u32, dy: u32, id: TileId) -> EncodedTile {
+    if placed_region_is_zero(image, dx, dy, id) {
+        return blank_encoded_tile().clone();
+    }
+    // One tile buffer and one encoder scratch per thread, reused: a fresh
+    // half-megabyte `Tile` and working buffers per tile cost more in page
+    // faults than the compression did, and the faults serialize across the
+    // encode pool's threads.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<half::f16>, aurora_tile::codec::EncodeScratch)> =
+            std::cell::RefCell::new((Vec::new(), aurora_tile::codec::EncodeScratch::default()));
+    }
+    let encode = |buffers: &mut (Vec<half::f16>, aurora_tile::codec::EncodeScratch)| {
+        let (texels, scratch) = buffers;
+        texels.clear();
+        texels.resize(aurora_tile::SAMPLES, half::f16::ZERO);
+        let _dirty = fill_placed_tile(image, dx, dy, id.x, id.y, texels);
+        EncodedTile::of_texels_with(texels, scratch)
+    };
+    if let Ok(Some(tile)) =
+        SCRATCH.try_with(|cell| cell.try_borrow_mut().ok().map(|mut b| encode(&mut b)))
+    {
+        return tile;
+    }
+    // Unreachable in practice (no re-entrancy, thread not ending); the slow
+    // path makes the same bytes.
+    let mut tile = Tile::blank();
+    let _dirty = fill_placed_tile(image, dx, dy, id.x, id.y, tile.texels_mut());
+    EncodedTile::of(&tile)
+}
+
+/// A decoded image's pixels without its colour profile (0.189.0): plain
+/// borrowed data, so several threads can read it at once —
+/// [`Image`] itself holds an `lcms2` profile handle and is not `Sync`.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageView<'a> {
+    samples: &'a [half::f16],
+    width: u32,
+    height: u32,
+}
+
+impl Image {
+    /// This image's samples and size, as a `Sync` view.
+    #[must_use]
+    pub fn view(&self) -> ImageView<'_> {
+        ImageView {
+            samples: self.samples(),
+            width: self.width(),
+            height: self.height(),
+        }
+    }
+}
+
+/// Whether every source texel tile `id` takes from the placed image is
+/// bit-for-bit `+0.0`, so the tile [`fill_placed_tile`] would build is the
+/// blank tile (the rest of an edge tile is blank already). Reads the
+/// source rows only: no tile is allocated. `false` when the geometry does
+/// not overlap or overflows, which sends the caller down the full path.
+fn placed_region_is_zero(image: ImageView<'_>, dx: u32, dy: u32, id: TileId) -> bool {
+    let (Some(right), Some(bottom)) = (dx.checked_add(image.width), dy.checked_add(image.height))
+    else {
+        return false;
+    };
+    let Some((x0, y0, x1, y1)) = placed_overlap(id.x, id.y, dx, dy, right, bottom) else {
+        return false;
+    };
+    let row_len = image.width as usize;
+    let w = (x1 - x0) as usize;
+    for sy in y0..y1 {
+        let start = ((sy - dy) as usize * row_len + (x0 - dx) as usize) * CHANNELS;
+        let Some(row) = image.samples.get(start..start + w * CHANNELS) else {
+            return false;
+        };
+        if row.iter().fold(0_u16, |acc, t| acc | t.to_bits()) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// `EncodedTile::of(&Tile::blank())`, made once.
+fn blank_encoded_tile() -> &'static EncodedTile {
+    static BLANK: std::sync::OnceLock<EncodedTile> = std::sync::OnceLock::new();
+    BLANK.get_or_init(|| EncodedTile::of(&Tile::blank()))
 }
 
 /// Tile `(tx, ty)`'s overlap with an image placed at `(dx, dy)` whose
@@ -177,20 +287,20 @@ fn placed_overlap(
 /// cannot drift apart. `None` (nothing written) when they do not overlap
 /// or the placement overflows.
 fn fill_placed_tile(
-    image: &Image,
+    image: ImageView<'_>,
     dx: u32,
     dy: u32,
     tx: u32,
     ty: u32,
     texels: &mut [half::f16],
 ) -> Option<aurora_core::Rect> {
-    let right = dx.checked_add(image.width())?;
-    let bottom = dy.checked_add(image.height())?;
+    let right = dx.checked_add(image.width)?;
+    let bottom = dy.checked_add(image.height)?;
     let (x0, y0, x1, y1) = placed_overlap(tx, ty, dx, dy, right, bottom)?;
     let tile_x0 = tx * TILE;
     let tile_y0 = ty * TILE;
-    let samples = image.samples();
-    let row_len = image.width() as usize;
+    let samples = image.samples;
+    let row_len = image.width as usize;
     let w = (x1 - x0) as usize;
     for sy in y0..y1 {
         // Image-local source row/column, tile-local destination.
@@ -558,5 +668,139 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(read_back.samples(), written.samples());
+    }
+    /// A reference for one tile that shares nothing with the shipped
+    /// builder but the format: a blank tile, the placed rows copied by
+    /// hand, then the plain encode.
+    fn reference_tile(image: &Image, dx: u32, dy: u32, id: TileId) -> aurora_tile::EncodedTile {
+        let mut tile = aurora_tile::Tile::blank();
+        let (w, h) = (image.width() as usize, image.height() as usize);
+        for ty in 0..TILE as usize {
+            for tx in 0..TILE as usize {
+                let sx = (id.x * TILE) as usize + tx;
+                let sy = (id.y * TILE) as usize + ty;
+                let (Some(ix), Some(iy)) =
+                    (sx.checked_sub(dx as usize), sy.checked_sub(dy as usize))
+                else {
+                    continue;
+                };
+                if ix >= w || iy >= h {
+                    continue;
+                }
+                for c in 0..4 {
+                    let src = image.samples().get((iy * w + ix) * 4 + c).copied();
+                    let dst = tile.texels_mut().get_mut((ty * TILE as usize + tx) * 4 + c);
+                    if let (Some(src), Some(dst)) = (src, dst) {
+                        *dst = src;
+                    }
+                }
+            }
+        }
+        aurora_tile::EncodedTile::of(&tile)
+    }
+
+    /// An image placed over several tiles whose tiles are: wholly zero,
+    /// zero but for one `f16::MIN_POSITIVE_SUBNORMAL` texel, zero but for
+    /// a `-0.0` texel, transparent with a non-zero colour, and noisy.
+    fn mixed_image() -> Image {
+        let side = TILE * 3 + 17;
+        let mut samples = vec![f16::ZERO; side as usize * side as usize * 4];
+        let put = |samples: &mut Vec<f16>, x: u32, y: u32, value: [f16; 4]| {
+            let at = (y as usize * side as usize + x as usize) * 4;
+            for (i, v) in value.into_iter().enumerate() {
+                if let Some(slot) = samples.get_mut(at + i) {
+                    *slot = v;
+                }
+            }
+        };
+        // Tile (1, 0): one smallest-subnormal alpha texel.
+        put(
+            &mut samples,
+            TILE + 3,
+            5,
+            [f16::ZERO, f16::ZERO, f16::ZERO, f16::from_bits(1)],
+        );
+        // Tile (2, 0): one negative zero.
+        put(
+            &mut samples,
+            2 * TILE + 9,
+            9,
+            [f16::NEG_ZERO, f16::ZERO, f16::ZERO, f16::ZERO],
+        );
+        // Tile (0, 1): colour under zero alpha.
+        put(
+            &mut samples,
+            4,
+            TILE + 4,
+            [f16::ONE, f16::ZERO, f16::ZERO, f16::ZERO],
+        );
+        // Tile (1, 1): noise.
+        let mut seed = 0x1234_5678_u32;
+        for y in TILE..2 * TILE {
+            for x in TILE..2 * TILE {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = f16::from_f32((seed >> 8) as f32 / (1_u32 << 24) as f32);
+                put(&mut samples, x, y, [v, v, v, f16::ONE]);
+            }
+        }
+        // Tiles (0,0), (2,1), the whole third row and the edge tiles stay zero.
+        match Image::new(side, side, IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn every_encoded_tile_equals_the_plain_encode_of_the_filled_tile() {
+        let image = mixed_image();
+        for (dx, dy) in [(0, 0), (37, 101), (TILE, 2 * TILE + 5)] {
+            let ids = match super::image_tile_ids(&image, dx, dy) {
+                Ok(ids) => ids,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert!(ids.len() >= 16, "{} tiles", ids.len());
+            let all = match super::encode_image_tiles_at(&image, dx, dy) {
+                Ok(all) => all,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(all.len(), ids.len());
+            for ((id, tile), want_id) in all.iter().zip(&ids) {
+                assert_eq!(id, want_id);
+                let want = reference_tile(&image, dx, dy, *id);
+                assert_eq!(tile.bytes(), want.bytes(), "tile {id:?} at ({dx}, {dy})");
+                let single = super::encode_image_tile(image.view(), dx, dy, *id);
+                assert_eq!(single.bytes(), want.bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn a_wholly_zero_tile_is_still_present_and_reuses_the_blank_encoding() {
+        let image = mixed_image();
+        let blank = aurora_tile::EncodedTile::of(&aurora_tile::Tile::blank());
+        let zero = super::encode_image_tile(image.view(), 0, 0, TileId { x: 0, y: 0 });
+        assert_eq!(zero.bytes(), blank.bytes());
+        // The smallest-subnormal, negative-zero and colour-under-alpha
+        // tiles are NOT blank: an exact test, not a threshold.
+        for id in [
+            TileId { x: 1, y: 0 },
+            TileId { x: 2, y: 0 },
+            TileId { x: 0, y: 1 },
+        ] {
+            let tile = super::encode_image_tile(image.view(), 0, 0, id);
+            assert_ne!(tile.bytes(), blank.bytes(), "{id:?} was treated as blank");
+        }
+        let all = match super::encode_image_tiles_at(&image, 0, 0) {
+            Ok(all) => all,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(all.iter().any(|(id, _)| *id == TileId { x: 0, y: 0 }));
+    }
+
+    #[test]
+    fn image_tile_ids_refuses_what_the_encoder_refuses() {
+        let image = mixed_image();
+        assert!(super::image_tile_ids(&image, u32::MAX, 0).is_err());
+        assert!(super::encode_image_tiles_at(&image, u32::MAX, 0).is_err());
     }
 }

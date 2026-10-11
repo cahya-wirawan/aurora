@@ -4852,3 +4852,95 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
         assert_eq!(adjustments, 0, "{name}");
     }
 }
+
+#[test]
+fn the_promotion_tables_hold_exactly_the_direct_conversion() {
+    for v in 0..=u8::MAX {
+        let want = f16::from_f32(aurora_color::promote_u8(v));
+        let got = super::promote_u8_table().get(usize::from(v)).copied();
+        assert_eq!(got.map(f16::to_bits), Some(want.to_bits()), "u8 {v}");
+    }
+    assert_eq!(super::promote_u16_table().len(), 65_536);
+    for v in 0..=u16::MAX {
+        let want = f16::from_f32(aurora_color::promote_u16(v));
+        let got = super::promote_u16_table().get(usize::from(v)).copied();
+        assert_eq!(got.map(f16::to_bits), Some(want.to_bits()), "u16 {v}");
+    }
+}
+
+#[test]
+fn write_plane_equals_the_direct_conversion_for_both_depths() {
+    let plane8: Vec<u8> = (0..=u8::MAX).collect();
+    let mut samples = vec![f16::ZERO; plane8.len() * 4];
+    super::write_plane(&mut samples, &plane8, 2, 1);
+    for (i, v) in plane8.iter().enumerate() {
+        let want = f16::from_f32(aurora_color::promote_u8(*v));
+        assert_eq!(
+            samples.get(i * 4 + 2).map(|s| s.to_bits()),
+            Some(want.to_bits())
+        );
+        assert_eq!(samples.get(i * 4).map(|s| s.to_bits()), Some(0));
+    }
+    let plane16: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_be_bytes).collect();
+    let mut samples = vec![f16::ZERO; 65_536 * 4];
+    super::write_plane(&mut samples, &plane16, 1, 2);
+    for v in 0..=u16::MAX {
+        let want = f16::from_f32(aurora_color::promote_u16(v));
+        assert_eq!(
+            samples.get(usize::from(v) * 4 + 1).map(|s| s.to_bits()),
+            Some(want.to_bits()),
+            "{v}"
+        );
+    }
+}
+
+/// Every sample of an RGBA layer, at both depths and every compression,
+/// is exactly the direct conversion of the stored value — through the
+/// four-channel fast path (threads, one interleave pass) on a machine with
+/// three or more cores, the general path otherwise.
+#[test]
+fn rgba_layers_decode_to_the_direct_conversion_on_every_path() {
+    let (w, h) = (37_u32, 29_u32);
+    let (wi, hi) = (37_i32, 29_i32);
+    let mut seed = 99_u32;
+    let mut next = move |depth: u16| -> u16 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let v = (seed >> 8) as u16;
+        if depth == 8 { v & 0xFF } else { v }
+    };
+    for depth in [8_u16, 16] {
+        for compression in 0..=3_u16 {
+            let rgba: Vec<[u16; 4]> = (0..w * h)
+                .map(|_| [next(depth), next(depth), next(depth), next(depth)])
+                .collect();
+            let bytes = TestPsd::new(1, w, h, depth)
+                .with(|p| {
+                    p.lr16 = depth == 16;
+                    p.layers = vec![
+                        TestLayer::pixels("l", 0, 0, wi, hi, depth, &rgba)
+                            .with(|l| l.compression = compression),
+                    ];
+                })
+                .write();
+            let document = doc(&bytes);
+            let Some(placed) = document.pixels.first() else {
+                unreachable!("one pixel layer");
+            };
+            for (i, px) in rgba.iter().enumerate() {
+                for (c, stored) in px.iter().enumerate() {
+                    let want = if depth == 8 {
+                        f16::from_f32(aurora_color::promote_u8(*stored as u8))
+                    } else {
+                        f16::from_f32(aurora_color::promote_u16(*stored))
+                    };
+                    let got = placed.image.samples().get(i * 4 + c).map(|s| s.to_bits());
+                    assert_eq!(
+                        got,
+                        Some(want.to_bits()),
+                        "depth {depth} comp {compression} px {i} ch {c}"
+                    );
+                }
+            }
+        }
+    }
+}

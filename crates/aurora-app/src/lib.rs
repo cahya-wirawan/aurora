@@ -25163,7 +25163,15 @@ impl App {
             pixels,
             masks,
             report,
+            timings,
         } = document;
+        tracing::info!(
+            total_ms = timings.total.as_millis(),
+            encode_ms = timings.encode.as_millis(),
+            stage_ms = timings.stage.as_millis(),
+            tiles = timings.tiles,
+            "opened document decoded"
+        );
         let mut report = report;
         // Review B-1: set before the install, whose autosave carries it.
         self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
@@ -71942,6 +71950,7 @@ mod tests {
             pixels: prepared_layers,
             masks: prepared_masks,
             report: _,
+            timings: _,
         } = document;
         let started = std::time::Instant::now();
         let (_freed, failed) = crate::replace_document_pixels_prepared(
@@ -72024,7 +72033,11 @@ mod tests {
     /// to `path` (0.154.0's measurement), raw-compressed, without ever
     /// holding it in memory. The merged image is left out: a reader of a
     /// layered file never needs it.
-    fn write_noisy_psd(path: &std::path::Path, side: u32, depth: u16) -> std::io::Result<u64> {
+    pub(crate) fn write_noisy_psd(
+        path: &std::path::Path,
+        side: u32,
+        depth: u16,
+    ) -> std::io::Result<u64> {
         use std::io::Write as _;
         const LAYERS: u32 = 4;
         let bps = u64::from(depth / 8);
@@ -82112,3 +82125,7 @@ mod occlusion_cull_tests {
 #[cfg(test)]
 #[path = "background_composite_tests.rs"]
 mod background_composite_tests;
+
+#[cfg(test)]
+#[path = "open_time_tests.rs"]
+mod open_time_tests;

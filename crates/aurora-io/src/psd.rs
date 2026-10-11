@@ -2250,19 +2250,52 @@ fn undo_prediction(data: &mut [u8], row_bytes: usize, bps: usize) {
     }
 }
 
+/// Every 8-bit sample's `f16`, `f16::from_f32(promote_u8(v))` (0.189.0):
+/// the per-sample division and software half conversion were the biggest
+/// single cost of opening a layered PSD (1.0 s of 2.7 s on the Nyepi
+/// template), and there are only 256 inputs.
+fn promote_u8_table() -> &'static [f16] {
+    static TABLE: std::sync::OnceLock<Vec<f16>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=u8::MAX)
+            .map(|v| f16::from_f32(promote_u8(v)))
+            .collect()
+    })
+}
+
+/// The 16-bit counterpart: 65,536 entries (128 KiB), built on first use.
+fn promote_u16_table() -> &'static [f16] {
+    static TABLE: std::sync::OnceLock<Vec<f16>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=u16::MAX)
+            .map(|v| f16::from_f32(promote_u16(v)))
+            .collect()
+    })
+}
+
 /// Writes one decoded plane into channel `channel` of an RGBA `f16`
-/// buffer, promoting each sample straight to float.
+/// buffer, promoting each sample straight to float (through the lookup
+/// tables above, which hold exactly what the direct conversion returns).
 fn write_plane(samples: &mut [f16], plane: &[u8], channel: usize, bps: usize) {
     if bps == 2 {
+        let table = promote_u16_table();
         for (px, pair) in samples.chunks_exact_mut(4).zip(plane.chunks_exact(2)) {
             if let ([hi, lo], Some(slot)) = (pair, px.get_mut(channel)) {
-                *slot = f16::from_f32(promote_u16(u16::from_be_bytes([*hi, *lo])));
+                let value = u16::from_be_bytes([*hi, *lo]);
+                *slot = table
+                    .get(usize::from(value))
+                    .copied()
+                    .unwrap_or_else(|| f16::from_f32(promote_u16(value)));
             }
         }
     } else {
+        let table = promote_u8_table();
         for (px, value) in samples.chunks_exact_mut(4).zip(plane) {
             if let Some(slot) = px.get_mut(channel) {
-                *slot = f16::from_f32(promote_u8(*value));
+                *slot = table
+                    .get(usize::from(*value))
+                    .copied()
+                    .unwrap_or_else(|| f16::from_f32(promote_u8(*value)));
             }
         }
     }
@@ -2390,6 +2423,13 @@ fn decode_pending(
     for chan in pending.slots.iter().flatten() {
         check_channel(src, *chan, row_bytes, height, header.psb())?;
     }
+    if let Some(samples) = decode_four_channels(pending, src, width, height, bps)? {
+        let mut samples = samples;
+        if header.gray() {
+            replicate_gray(&mut samples);
+        }
+        return Image::new(pending.width, pending.height, profile.get(), samples);
+    }
     let mut samples = opaque_buffer(width, height)?;
     for (channel, chan) in pending.slots.iter().enumerate() {
         if let Some(chan) = chan {
@@ -2403,6 +2443,131 @@ fn decode_pending(
         replicate_gray(&mut samples);
     }
     Image::new(pending.width, pending.height, profile.get(), samples)
+}
+
+/// The largest layer image (`f16` RGBA bytes) [`decode_four_channels`]
+/// takes (0.189.0): it holds all four decoded planes at once, so bigger
+/// layers keep the one-plane-at-a-time path and the peak stays what it was.
+const FOUR_CHANNEL_IMAGE_BYTES: usize = 64 << 20;
+
+/// How many threads a layer's channels may decode on: one fewer than the
+/// machine's parallelism, at most the four channels (the UI thread keeps a
+/// core). Fewer than two means no fan-out.
+fn channel_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get().saturating_sub(1))
+            .min(4)
+    })
+}
+
+/// The fast path for the common layer — all four channels present and the
+/// image small enough (0.189.0): the four channels' bytes are read, decoded
+/// on up to [`channel_threads`] threads, and interleaved into the RGBA
+/// `f16` buffer in one pass through the promotion tables. `Ok(None)` when
+/// the layer is not that case (the caller takes the general path); the
+/// values and every check are the general path's.
+fn decode_four_channels(
+    pending: &PendingPixels,
+    src: &mut dyn ByteSource,
+    width: usize,
+    height: usize,
+    bps: usize,
+) -> Result<Option<Vec<f16>>, IoError> {
+    let [Some(c0), Some(c1), Some(c2), Some(c3)] = pending.slots else {
+        return Ok(None);
+    };
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| malformed("layer size"))?;
+    let image_bytes = pixels.saturating_mul(8);
+    let threads = channel_threads();
+    if threads < 2 || image_bytes > FOUR_CHANNEL_IMAGE_BYTES {
+        return Ok(None);
+    }
+    let mut data = Vec::with_capacity(4);
+    for chan in [c0, c1, c2, c3] {
+        data.push(src.read_at(chan.offset, chan.len, "channel image data")?);
+    }
+    let psb = pending.header.psb();
+    let decode = |bytes: &Vec<u8>| decode_channel(bytes, width, height, bps, psb);
+    let mut planes: Vec<Result<Vec<u8>, IoError>> = Vec::with_capacity(4);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(4);
+        for bytes in data.iter().skip(1) {
+            let spawned = std::thread::Builder::new()
+                .name("aurora-psd-channel".to_owned())
+                .spawn_scoped(scope, || decode(bytes));
+            handles.push(spawned.ok());
+        }
+        // The first channel decodes here, beside the others.
+        planes.push(
+            data.first()
+                .map_or_else(|| Err(malformed("channel")), decode),
+        );
+        for (handle, bytes) in handles.into_iter().zip(data.iter().skip(1)) {
+            planes.push(match handle {
+                Some(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(malformed("a channel decode that did not finish"))),
+                // The thread could not start: decode it here.
+                None => decode(bytes),
+            });
+        }
+    });
+    drop(data);
+    let mut decoded = Vec::with_capacity(4);
+    for plane in planes {
+        decoded.push(plane?);
+    }
+    let [r, g, b, a] = decoded.as_slice() else {
+        return Ok(None);
+    };
+    let len = pixels
+        .checked_mul(4)
+        .ok_or_else(|| malformed("layer size"))?;
+    let mut samples = try_alloc(len)?;
+    samples.resize(len, f16::ZERO);
+    if bps == 2 {
+        let table = promote_u16_table();
+        let at = |plane: &[u8], i: usize| -> f16 {
+            let value = match plane.get(i * 2..i * 2 + 2) {
+                Some([hi, lo]) => u16::from_be_bytes([*hi, *lo]),
+                _ => 0,
+            };
+            table
+                .get(usize::from(value))
+                .copied()
+                .unwrap_or_else(|| f16::from_f32(promote_u16(value)))
+        };
+        for (i, px) in samples.chunks_exact_mut(4).enumerate() {
+            if let [pr, pg, pb, pa] = px {
+                *pr = at(r, i);
+                *pg = at(g, i);
+                *pb = at(b, i);
+                *pa = at(a, i);
+            }
+        }
+    } else {
+        let table = promote_u8_table();
+        let at = |plane: &[u8], i: usize| -> f16 {
+            let value = plane.get(i).copied().unwrap_or(0);
+            table
+                .get(usize::from(value))
+                .copied()
+                .unwrap_or_else(|| f16::from_f32(promote_u8(value)))
+        };
+        for (i, px) in samples.chunks_exact_mut(4).enumerate() {
+            if let [pr, pg, pb, pa] = px {
+                *pr = at(r, i);
+                *pg = at(g, i);
+                *pb = at(b, i);
+                *pa = at(a, i);
+            }
+        }
+    }
+    Ok(Some(samples))
 }
 
 /// The record's user mask, or `None` when it has none: no mask data, or
