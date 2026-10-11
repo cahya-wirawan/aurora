@@ -75,6 +75,15 @@ pub struct Stats {
     /// unusually aggressive relative to scratch-disk throughput, not
     /// that anything is wrong.
     pub superseded_writes: u64,
+    /// Reads ([`TileStore::get`]/[`TileStore::get_mut`] and the other
+    /// paths through the store's residency check) that found the tile
+    /// already resident (0.183.0): no decode, no I/O. With [`Self::faults`]
+    /// (page-ins from the scratch disk), [`Self::pending_hits`] and
+    /// [`Self::tiles_created`] it splits every read into a hit or a miss.
+    pub resident_hits: u64,
+    /// Reads served by decoding a tile still queued for its scratch write
+    /// (`pending`; 0.183.0): a miss, but one without disk I/O.
+    pub pending_hits: u64,
 }
 
 /// One entry of [`TileStore::pending`]: the `write_generation` the bytes
@@ -1463,6 +1472,7 @@ impl TileStore {
         self.reconcile_pending();
 
         if self.resident.contains(&(surface, id)) {
+            self.stats.resident_hits += 1;
             return Ok(());
         }
         // Peeked, not removed: `codec::decode` can fail even here, on
@@ -1475,6 +1485,7 @@ impl TileStore {
         // actually produced a whole tile.
         if let Some((_generation, bytes)) = self.pending.get(&(surface, id)) {
             let texels = codec::decode(bytes)?;
+            self.stats.pending_hits += 1;
             self.forget_pending((surface, id));
             self.paged_out.remove(&(surface, id));
             self.make_resident((surface, id), Tile::from_texels(texels));
