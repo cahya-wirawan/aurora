@@ -28782,6 +28782,16 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             };
 
+        // 0.192.1: the swapchain format decides whether the canvas shader
+        // must hand linear light (`SRGB_TARGET`); logged once so a report
+        // from a Mac or Windows box says which it was.
+        tracing::info!(
+            format = ?surface.format(),
+            srgb = surface.format().is_srgb(),
+            scale_factor = window.scale_factor(),
+            "window surface created"
+        );
+
         let adapter =
             accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone());
         window.set_visible(true);

@@ -86,6 +86,8 @@ impl CanvasPipeline {
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
     ) -> &wgpu::RenderPipeline {
+        // `SRGB_TARGET` is derived from `target_format` below, so the
+        // pipeline cache key needs no entry of its own for it.
         let key = PipelineKey {
             shader: LABEL,
             vertex_entry: "vs_canvas",
@@ -118,7 +120,19 @@ impl CanvasPipeline {
                         blend: key.blend.to_wgpu(),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    // An sRGB target re-encodes on store, so the shader
+                    // hands it linear light (0.192.1, `SRGB_TARGET`).
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[(
+                            "SRGB_TARGET",
+                            if key.target_format.is_srgb() {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        )],
+                        ..wgpu::PipelineCompilationOptions::default()
+                    },
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 multiview_mask: None,
