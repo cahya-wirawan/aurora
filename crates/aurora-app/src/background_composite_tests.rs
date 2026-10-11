@@ -1542,3 +1542,50 @@ fn composite_threads_leaves_a_core_and_is_at_least_one() {
         assert_eq!(threads, available.get() - 1);
     }
 }
+
+// ---- 0.192.0: small-machine bounds ----
+
+/// The worker's shared drop-shadow cache is capped for the machine that
+/// dispatched to it, 64 MiB (256 tiles) when small and 256 MiB (1,024)
+/// otherwise.
+#[test]
+fn the_workers_shared_shadow_cache_follows_the_machine_size() {
+    for (small, want) in [(true, 256), (false, 1024)] {
+        let _guard = crate::small_machine::force_small_machine(small);
+        let (_d, mut store) = store_with_budget(256);
+        let (layers, size) = fixture(&mut store);
+        let tiles = grid(size);
+        let mut worker = CompositeWorker::with_threads(noop_waker(), 2);
+        let mut cache = CompositeCache::default();
+        assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+        let _ = worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT);
+        let start = Instant::now();
+        while worker.shadow_cap_entries() == 0 && start.elapsed() < WAIT {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.shadow_cap_entries(), want, "small = {small}");
+        worker.shutdown();
+    }
+}
+
+/// The equality tests of the worker, again with the machine forced small.
+macro_rules! worker_on_a_small_machine {
+    ($($name:ident => $test:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                let _small = crate::small_machine::force_small_machine(true);
+                $test();
+            }
+        )*
+    };
+}
+
+worker_on_a_small_machine! {
+    worker_equals_sync_on_a_small_machine => worker_composite_equals_sync_composite,
+    worker_equals_sync_with_evicted_sources_on_a_small_machine => worker_composite_equals_sync_composite_with_evicted_sources,
+    worker_equals_sync_with_strokes_on_a_small_machine => the_workers_composite_equals_the_synchronous_one_with_strokes,
+    worker_equals_sync_with_glows_on_a_small_machine => the_workers_composite_equals_the_synchronous_one_with_outer_glows,
+    several_threads_equal_sync_on_a_small_machine => a_job_folded_on_several_threads_equals_the_sync_composite,
+    pools_shadow_cache_keeps_documents_apart_on_a_small_machine => the_pools_shadow_cache_never_mixes_two_documents_up,
+}

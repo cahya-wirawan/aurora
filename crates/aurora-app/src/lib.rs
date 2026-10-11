@@ -551,6 +551,7 @@ mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
+mod small_machine;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -13614,13 +13615,13 @@ fn effect_tile_coverage(
     Some(coverage)
 }
 
-/// The most one drop-shadow coverage cache holds (0.182.0
-/// review): 256 MiB, i.e. 1,024 tiles of 256² `f32`. Past it the least
-/// recently used tile is dropped. One thread-local cache per non-pool
-/// thread, and one shared cache for the background worker and its pool.
-const SHADOW_CACHE_BYTES: usize = 256 << 20;
-
-/// One cached tile's size.
+/// One cached tile's size. A drop-shadow coverage cache holds at most the
+/// cap in [`small_machine::shadow_cache_bytes`] (0.182.0 review: 256 MiB,
+/// 1,024 tiles; 0.192.0: 64 MiB, 256 tiles, on a small machine) and past
+/// it drops the least recently used tile: one thread-local cache per
+/// non-pool thread, one shared cache for the background worker and its
+/// pool. A cache reads its cap once, when it is made
+/// ([`ShadowCache::with_cap_bytes`]).
 const SHADOW_CACHE_ENTRY_BYTES: usize =
     aurora_tile::TILE as usize * aurora_tile::TILE as usize * std::mem::size_of::<f32>();
 
@@ -13654,22 +13655,50 @@ struct ShadowCacheKey {
 /// pass** (RC-2). A pass visits its (shadow, tile) pairs in order, so plain
 /// LRU would evict each entry just before the next pass reuses it once a
 /// pass needs more than the cap; here, when every entry has been used this
-/// pass, a new one is simply not kept, so the first [`SHADOW_CACHE_BYTES`]
+/// pass, a new one is simply not kept, so the first [`small_machine::shadow_cache_bytes`]
 /// worth of the pass survives to the next and only the rest recompute.
 /// Entries left over from earlier passes (old versions after an edit, a
 /// closed document) are what gets evicted. Eviction is `O(log n)` through
 /// `order`, keyed `(last pass used, use stamp)`.
 type ShadowStamp = (u64, u64);
 
-#[derive(Default)]
 pub(crate) struct ShadowCache {
+    /// The most entries kept (0.192.0): the byte cap in whole tiles, at
+    /// least one, so even a cap under one tile's plane keeps working (it
+    /// holds one entry) instead of evicting everything for nothing.
+    cap_entries: usize,
     entries: std::collections::HashMap<ShadowCacheKey, (ShadowStamp, std::sync::Arc<Vec<f32>>)>,
     order: std::collections::BTreeMap<ShadowStamp, ShadowCacheKey>,
     clock: u64,
     pass: u64,
 }
 
+impl Default for ShadowCache {
+    /// A cache capped for this machine ([`small_machine::shadow_cache_bytes`]).
+    fn default() -> Self {
+        Self::with_cap_bytes(small_machine::shadow_cache_bytes())
+    }
+}
+
 impl ShadowCache {
+    /// A cache holding at most `bytes` of coverage tiles, rounded down to
+    /// whole tiles and never below one.
+    pub(crate) fn with_cap_bytes(bytes: usize) -> Self {
+        Self {
+            cap_entries: (bytes / SHADOW_CACHE_ENTRY_BYTES).max(1),
+            entries: std::collections::HashMap::new(),
+            order: std::collections::BTreeMap::new(),
+            clock: 0,
+            pass: 0,
+        }
+    }
+
+    /// The most entries this cache keeps.
+    #[cfg(test)]
+    pub(crate) fn cap_entries(&self) -> usize {
+        self.cap_entries
+    }
+
     fn begin_pass(&mut self) {
         self.pass += 1;
     }
@@ -13686,7 +13715,7 @@ impl ShadowCache {
     }
 
     fn insert(&mut self, key: ShadowCacheKey, coverage: std::sync::Arc<Vec<f32>>) {
-        let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
+        let cap = self.cap_entries;
         if let Some((old, _)) = self.entries.remove(&key) {
             self.order.remove(&old);
         }
@@ -13720,11 +13749,16 @@ thread_local! {
 /// parallel background compositor's, so its pool's threads hit each
 /// other's entries (a tile is folded by whichever thread picks it up, a
 /// different one from job to job) and the pool as a whole stays within
-/// [`SHADOW_CACHE_BYTES`] instead of that much per thread. The lock is
+/// [`small_machine::shadow_cache_bytes`] instead of that much per thread. The lock is
 /// held only for a lookup or an insert, never while a coverage is
 /// computed (two threads missing the same key compute the same value,
 /// and the second insert replaces the first).
 pub(crate) type SharedShadowCache = std::sync::Arc<std::sync::Mutex<ShadowCache>>;
+
+/// A [`SharedShadowCache`] capped at `bytes` (0.192.0).
+pub(crate) fn new_shared_shadow_cache(bytes: usize) -> SharedShadowCache {
+    std::sync::Arc::new(std::sync::Mutex::new(ShadowCache::with_cap_bytes(bytes)))
+}
 
 thread_local! {
     /// This thread's [`SharedShadowCache`], when it has one (0.188.0):
@@ -75775,11 +75809,10 @@ mod tests {
     mod fill_and_overlay_tests {
         use super::*;
         use crate::{
-            APRON_CELL_READS, CompositeTileAt, SHADOW_CACHE, SHADOW_CACHE_BYTES,
-            SHADOW_CACHE_ENTRY_BYTES, SHADOW_COMPUTES, STROKE_COMPUTES, ShadowCache,
-            ShadowCacheKey, effect_reach_rects, fold_layer_into, invalidate_painted_tiles,
-            layer_renders_effects, layer_shows_effects, pixel_layer_texels, shadow_tile_coverage,
-            stroke_invalidation, stroke_tile_planes,
+            APRON_CELL_READS, CompositeTileAt, SHADOW_CACHE, SHADOW_CACHE_ENTRY_BYTES,
+            SHADOW_COMPUTES, STROKE_COMPUTES, ShadowCache, ShadowCacheKey, effect_reach_rects,
+            fold_layer_into, invalidate_painted_tiles, layer_renders_effects, layer_shows_effects,
+            pixel_layer_texels, shadow_tile_coverage, stroke_invalidation, stroke_tile_planes,
         };
 
         const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
@@ -76857,9 +76890,11 @@ mod tests {
 
         #[test]
         fn shadow_cache_respects_its_memory_cap() {
+            let _large = crate::small_machine::force_small_machine(false);
             let mut cache = ShadowCache::default();
-            let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
+            let cap = crate::small_machine::SHADOW_CACHE_BYTES_LARGE / SHADOW_CACHE_ENTRY_BYTES;
             assert_eq!(cap, 1024);
+            assert_eq!(cache.cap_entries(), cap);
             let key = |i: usize| ShadowCacheKey {
                 kind: 0,
                 store: 1,
@@ -78003,6 +78038,7 @@ mod tests {
         }
 
         include!("outer_glow_tests.rs");
+        include!("small_machine_effect_tests.rs");
     }
 }
 
