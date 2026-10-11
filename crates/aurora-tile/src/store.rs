@@ -219,6 +219,22 @@ pub enum TileSnapshot {
 /// result whose generation is not the one `pending` holds — before they
 /// look at whether it succeeded, so a superseded *failure* cannot enter
 /// the failed-write queue either. Counted in [`Stats::superseded_writes`].
+/// One tile handed to another store without copying it where that can be
+/// avoided (0.186.0, the background compositor's mirror): a resident
+/// tile's own texel buffer, shared copy-on-write, or an evicted tile's
+/// encoded bytes. Built by [`TileStore::share_tile`], adopted by
+/// [`TileStore::insert_share`]. Unlike [`TileSnapshot`] it never copies a
+/// resident tile, so it is only for a consumer that holds it briefly
+/// enough that the owner's next write paying for one copy is cheaper.
+#[derive(Debug, Clone)]
+pub enum TileShare {
+    /// A resident tile's texels, shared with the owning store.
+    Texels(Arc<Vec<half::f16>>),
+    /// An evicted tile's encoded bytes (from `pending`, or read from the
+    /// scratch disk — the one case that does I/O).
+    Encoded(Arc<Vec<u8>>),
+}
+
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -769,6 +785,24 @@ impl TileStore {
 
     /// Distinct for every `TileStore` this process constructs (0.182.0),
     /// so a cache shared across stores never mixes up their surfaces.
+    /// Every tile this store holds — [`TileStore::contains_tile`] is
+    /// `true` for exactly these keys — with its current
+    /// [`TileStore::content_version`] (0.186.0). A tile `get` materialized
+    /// blank and never wrote is listed at version `0`, because
+    /// `contains_tile` already sees it. This is what lets the background
+    /// compositor mirror a store by diffing against what it last sent,
+    /// instead of snapshotting every tile. Each key appears once.
+    #[must_use]
+    pub fn held_tile_versions(&self) -> Vec<((SurfaceId, TileId), u64)> {
+        let mut keys: HashSet<(SurfaceId, TileId)> = HashSet::new();
+        keys.extend(self.resident.iter().map(|(key, _)| *key));
+        keys.extend(self.paged_out.keys().copied());
+        keys.extend(self.pending.keys().copied());
+        keys.into_iter()
+            .map(|key| (key, self.content_version(key.0, key.1)))
+            .collect()
+    }
+
     #[must_use]
     pub fn serial(&self) -> u64 {
         self.serial
@@ -1073,6 +1107,54 @@ impl TileStore {
     ///
     /// The bytes are not validated: [`EncodedTile`] can only be made by
     /// this crate's encoder, so they are a whole tile by construction.
+    /// [`TileStore::snapshot_tile`]'s sharing twin (0.186.0): a resident
+    /// tile is handed out as an `Arc` clone of its own texels — no copy;
+    /// the owner's next [`Tile::texels_mut`] copies once if the share is
+    /// still alive — and an evicted one as its encoded bytes. Never pages
+    /// in, decodes or evicts. Reads the scratch disk only for a tile that
+    /// is paged out and no longer pending, exactly as `snapshot_tile` does.
+    ///
+    /// # Errors
+    ///
+    /// [`TileError::Io`] if a paged-out tile's scratch file can't be read.
+    pub fn share_tile(
+        &mut self,
+        surface: SurfaceId,
+        id: TileId,
+    ) -> Result<Option<TileShare>, TileError> {
+        self.reconcile_pending();
+        let key = (surface, id);
+        if let Some(tile) = self.resident.peek(&key) {
+            return Ok(Some(TileShare::Texels(tile.shared_texels())));
+        }
+        Ok(match self.snapshot_tile(surface, id)? {
+            Some(TileSnapshot::Encoded(bytes)) => Some(TileShare::Encoded(bytes)),
+            Some(TileSnapshot::Texels(texels)) => Some(TileShare::Texels(Arc::new(texels))),
+            None => None,
+        })
+    }
+
+    /// Adopts a tile another store [shared](TileStore::share_tile)
+    /// (0.186.0), replacing whatever this store held at that key and
+    /// bumping its content version. Shared texels become a resident tile
+    /// (making room first, like a page-in); encoded bytes are held exactly
+    /// as [`TileStore::insert_encoded`] holds them — and decoded, with the
+    /// codec's own validation, only if something reads the tile.
+    pub fn insert_share(&mut self, surface: SurfaceId, id: TileId, tile: TileShare) {
+        match tile {
+            TileShare::Encoded(bytes) => self.insert_encoded(surface, id, EncodedTile(bytes)),
+            TileShare::Texels(texels) => {
+                let key = (surface, id);
+                if self.contains_tile(surface, id) {
+                    self.forget_tile(surface, id);
+                }
+                self.bump_content_version(surface, id);
+                self.forgotten_while_pending.remove(&key);
+                self.make_resident(key, Tile::from_shared(texels));
+            }
+        }
+    }
+
     pub fn insert_encoded(&mut self, surface: SurfaceId, id: TileId, tile: EncodedTile) {
         let key = (surface, id);
         if self.contains_tile(surface, id) {
@@ -1441,6 +1523,18 @@ impl TileStore {
 
     /// How many tiles may be resident right now (0.185.0): the fixed
     /// budget, or this store's current share of its pool.
+    /// The residency pool this store is a member of, if it was built with
+    /// [`TileStore::new_shared`] (0.186.0: the background compositor's
+    /// mirror joins the same pool, so the two stores' budgets are shares
+    /// of one total instead of two).
+    #[must_use]
+    pub fn pool(&self) -> Option<Arc<ResidencyPool>> {
+        match &self.budget {
+            Budget::Fixed(_) => None,
+            Budget::Shared(membership) => Some(membership.pool()),
+        }
+    }
+
     #[must_use]
     pub fn budget_tiles(&self) -> usize {
         self.budget.tiles()

@@ -298,6 +298,10 @@ impl PoolMembership {
     pub(crate) fn share(&self) -> NonZeroUsize {
         self.0.share()
     }
+
+    pub(crate) fn pool(&self) -> Arc<ResidencyPool> {
+        Arc::clone(&self.0)
+    }
 }
 
 impl Drop for PoolMembership {

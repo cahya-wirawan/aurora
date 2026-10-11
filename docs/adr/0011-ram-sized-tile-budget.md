@@ -50,3 +50,8 @@ ADR 0005 settled the mechanism — a tile-count LRU, a byte budget at the fixed 
 - A document's working set exceeds the budget on a realistic machine and an in-order composite pass thrashes the LRU (measured: Nyepi at 2,048 tiles, a 4 GiB machine's budget — see PLAN.md 0.185.0). Then a scan-resistant policy (2Q, CLOCK-Pro) or protecting the current pass's tiles is the next step.
 - Users report memory pressure on machines where a quarter of RAM is too much (the GPU driver or other applications need more).
 - FR-026's scratch-disk preferences land and own this number.
+
+## Addendum (0.186.0, ADR 0012)
+
+The background compositor's mirror store is a pool member too. It joins the document store's own pool when it is created and leaves when it is released (document switch or close) or dropped. While a document is being composited in the background, the pool therefore counts one more member, and each share is `max(floor, total / members)`. The bound on UI + mirror resident tiles is the total plus one floor.
+
