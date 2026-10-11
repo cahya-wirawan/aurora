@@ -26,7 +26,140 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.182.0): layer effects, round E3 — Drop Shadow
+**Latest (2026-10-11, 0.183.0): large-template performance, round R1 —
+measured, then occlusion culling and a row-copy window read.** Measured
+first, on the user's Nyepi template (1080×1920, 277 nodes: 223 pixel
+layers, 54 groups, 0 adjustments, 47 layers drawing effects, 9 enabled
+masks; **all 54 groups are Pass Through at opacity 1, Fill 1, no mask**;
+9 roots; 4,021 stored layer tiles), release build, `--nocapture`
+breakdown added to the ignored `a_local_effects_psd_edit_costs`, which now
+runs at the old benchmark budget (16 tiles) **and** the app's
+`TILE_BUDGET` (256), with culling off and on. New: `TileStore`'s `Stats`
+gains `resident_hits` and `pending_hits` (with `faults` and
+`tiles_created` they split every read into hit or miss); a test-only
+`profiled` timer (`ProfileSlot`, `COMPOSITE_PROFILE`).
+
+- **Occlusion culling** (`fold_plan_for_tile`, `search_cover`,
+  `fold_context_into`, `fold_planned_node`, called from
+  `composite_roots_into_tile`, so canvas, export and histogram all use it):
+  per composite tile, the topmost **cover** in a context — a visible pixel
+  layer, `Normal` (not `Dissolve`), opacity × Fill exactly 1, no enabled
+  mask, no drawn effects, declared bounds containing the whole tile, every
+  resolved texel's alpha bits exactly `f16` 1.0 (those texels are reused for
+  the fold) — is folded first and everything below it in the same
+  accumulator is skipped, with its reads, shadows and adjustments. At most
+  4 candidates are read per search. The search descends opaque, unmasked
+  Pass Through groups (they share the accumulator); an isolated group is
+  not searched (v1); a translucent or masked Pass Through group is a
+  boundary for its parent and searches its own children when it folds, the
+  cull staying inside it. Aurora does not model clipping (clipped layers
+  are shown unclipped and reported), so no clipping stack can be split.
+  `COMPOSITE_CULLED_FOLDS` (test-only) counts skipped nodes.
+- **Exactness:** at source alpha 1, `fold_texel` gives `(1 − da)·s + da·s`,
+  within two `f32` ulps of the `f16` source for any finite backdrop with
+  `da` in `[0, 1]`, so it rounds back bit for bit; **no mismatch was
+  found** anywhere (Nyepi: 8,294,400 samples, 0 differ; corpus; 320 random
+  trees with fractional backdrops). Not covered by that argument: a
+  non-finite backdrop, and a `−0.0` source channel over a negative
+  premultiplied backdrop — neither reachable from in-gamut content.
+- **`read_layer_window` copies rows** (R2 item pulled forward, as the
+  breakdown showed culling is not the biggest win): one slice copy per row
+  from the resident tile instead of a whole-tile `to_vec` and a checked
+  per-texel copy. Bit-identical by construction (same samples, same
+  places); every differential and golden still passes.
+- **Result: a ~15 % win, far short of the targets.** Warm full composite
+  10.1 s → 8.6 s at budget 256, 11.1 s → 9.8 s at 16; open + first
+  composite 18.9 s → 16.1 s (256), 20.9 s → 18.0 s (16). Targets were warm
+  ≤ 3 s and open ≤ 10 s: **missed**. Culling skipped only 73 of ~3,700
+  layer×tile folds: the template's layers are canvas-sized PSD layers with
+  small shapes, so few tiles have an exactly opaque cover above much.
+- **Behaviour changes, disclosed:** an unreadable tile in a layer hidden
+  under a cover is no longer read, so it **no longer refuses an export**
+  (`export_with_an_unreadable_tile_in_a_culled_layer`; with culling off it
+  still refuses). Culled nodes are not charged to `CompositeBudget`, so the
+  per-tile node budget is reached later, never sooner (every budget test
+  green). A tile only partly inside a cover's bounds — every canvas-edge
+  tile of a canvas-sized cover — never culls (v1). Corpus files are mostly
+  smaller than one tile, so only 1 of 235 corpus files culls.
+- **`residency.visible_tiles()` is not clamped to the canvas** (the grid
+  covers the viewport); off-canvas tiles still composite, cheaply when
+  nothing is stored there. Not changed this round.
+
+See the 0.183.0 addendum below for the breakdown, numbers, mutations and
+gate. Next (R2): the fold itself (1.7 ms per plain fold, zero-alpha texels
+not skipped), the effects path's per-tile allocations, and the residency
+budget — the budget size is Cahya's call.
+
+**0.183.0 addendum: breakdown, performance, mutations and gate.**
+
+Breakdown of one warm full composite of Nyepi (release, `composite_document`,
+40 composite tiles, 12 of them canvas-edge tiles), before any change
+(culling off, old per-texel window copy):
+
+| | budget 16 | budget 256 |
+|---|---|---|
+| total | 11.09 s | 10.11 s |
+| store hits / disk page-ins / evictions | 0 / 4,779 / 4,779 (81 MiB read) | 1,502 / 3,277 / 3,277 (48 MiB) |
+| `read_layer_window` (8,869 calls) | 3,068 ms | 2,061 ms |
+| `pixel_layer_texels`, inclusive (15,657 calls) | 3,922 ms | 2,926 ms |
+| plain layer folds (1,811 calls, ~1.7 ms each) | 3,138 ms | 3,135 ms |
+| effects folds, inclusive (1,880 calls) | 4,827 ms | 4,658 ms |
+| shadow-cache misses (786 calls) | 1.8 ms | 1.7 ms |
+
+So: no single dominant cost. Thrash costs about 1 s (16 vs 256); the plain
+fold and the effects fold together are ~7.8 s; reads are ~3–4 s.
+
+Nyepi, release, every existing cost case (0.182.0 = culling off, old window
+copy; 0.183.0 = culling on, row copy; same machine, same run conditions):
+
+| case | 16, 0.182.0 | 16, 0.183.0 | 256, 0.182.0 | 256, 0.183.0 |
+|---|---|---|---|---|
+| open + first composite | 20.93 s | 17.99 s | 18.94 s | 16.08 s |
+| warm full composite | 11.09 s | 9.83 s | 10.11 s | 8.61 s |
+| visibility toggle | 11.05 s | 9.68 s | 10.10 s | 8.55 s |
+| opacity step (shadowed) | 11.10 s | 9.79 s | 10.03 s | 8.54 s |
+| dab, shadowed (3 tiles) | 0.94 s | 0.95 s | 0.94 s | 0.90 s |
+| dab, unshadowed (1 tile) | 0.20 s | 0.21 s | 0.21 s | 0.20 s |
+
+Culling alone (old window copy): warm 10.11 → 8.80 s at 256; the row copy
+then took `read_layer_window` 1,845 → 1,634 ms (culled) and 2,061 → 1,724 ms
+(uncull'd) at 256, and nothing measurable at 16, where page-ins dominate it.
+
+Mutations (each applied to a scratchpad copy's original, `AURORA_REQUIRE_GPU=1
+cargo test -p aurora-app --lib occlusion_cull_tests`, restored, sha256
+checked): **8 of 8 killed.**
+
+| mutation | killed by |
+|---|---|
+| drop the `Normal` check | 8 tests (`cull_rejects_a_dissolve_cover`, the rejection controls — the `Screen` middle layer becomes a cover — and `random_trees_cull_equals_uncull`) |
+| drop the Fill check | `cull_rejects_fill_below_one`, `random_trees_cull_equals_uncull` |
+| drop the mask check | `cull_rejects_a_masked_cover` |
+| cull across a translucent Pass Through | `cull_stays_inside_a_translucent_or_masked_pass_through_group` |
+| `>= 0.99` instead of `== 1.0` | `cull_rejects_a_cover_one_texel_short_of_opaque`, `random_trees_cull_equals_uncull` |
+| cull across an isolated-group boundary | `cull_stays_inside_an_isolated_group`, `random_trees_cull_equals_uncull` |
+| remove the counter | 15 tests |
+| cover allowed with effects | `cull_rejects_a_cover_with_overlay_or_shadow` only |
+
+Pixel-level detection: only the Normal, Fill, `>= 0.99` and isolated-group
+mutations change pixels (the property test sees them); the mask, translucent
+Pass Through and effects mutations are caught only by the counter
+assertions in their own synthetic tests.
+
+Gate (one pass after the last code change — a doc-comment link fix — on
+Linux, `/home` 43 G free): `cargo fmt --all --check`, `check_layering.py`,
+`check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+`cargo clippy --workspace --all-targets --all-features -D warnings`, and
+`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`: **3,446
+passed, 0 failed, 68 ignored**; `cargo doc … --document-private-items
+--keep-going` with `-D warnings` clean; `cargo deny check all` ok;
+`check_contrast.py` passes. Cross-clippy `-p aurora-app --all-targets` for
+`x86_64-pc-windows-gnu` and `x86_64-apple-darwin` (with the lcms stub)
+clean. The ignored `occlusion_cull_matches_uncull_on_nyepi` was run locally
+in release: 8,294,400 samples, 0 differ, 73 folds culled. An earlier gate
+run passed with the same counts; `cargo doc` then failed on a link to a
+test-only item, which was fixed, and the gate was run again.
+
+**Previously (2026-10-11, 0.182.0): layer effects, round E3 — Drop Shadow
 drawn, with a shadow-coverage cache (review revision).** A pixel layer's shown drop shadows (`DrSh`, or `lmfx`'s
 `dropShadowMulti` in list order, bottom to top — unverified against
 Photoshop, no corpus file has two on one layer) are drawn on the CPU in

@@ -13219,6 +13219,29 @@ fn pixel_layer_texels(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> Option<Vec<half::f16>> {
+    profiled(ProfileSlot::LayerTexels, || {
+        pixel_layer_texels_unprofiled(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            budget,
+        )
+    })
+}
+
+/// [`pixel_layer_texels`]' body, under [`profiled`] (0.183.0).
+fn pixel_layer_texels_unprofiled(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+) -> Option<Vec<half::f16>> {
     let surface = layers.surface_id(id)?;
     let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
     let texels = if origin == reference_origin {
@@ -13416,9 +13439,9 @@ fn shadow_tile_coverage(
     #[cfg(test)]
     SHADOW_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
-    let coverage = std::rc::Rc::new(compute_shadow_tile_coverage(
-        id, layers, store, tile, own, geometry, budget,
-    )?);
+    let coverage = std::rc::Rc::new(profiled(ProfileSlot::ShadowMiss, || {
+        compute_shadow_tile_coverage(id, layers, store, tile, own, geometry, budget)
+    })?);
     // Review RC-1: a source or mask tile that failed to page in was
     // skipped (or failed open), so this coverage is degraded; the versions
     // in the key have not changed, so caching it would keep serving it.
@@ -14126,6 +14149,7 @@ fn fold_layer_into(
             reference_origin,
             depth,
             budget,
+            None,
         );
     }
     // A pixel layer drawing layer effects (0.181.0): only a shown colour
@@ -14134,17 +14158,19 @@ fn fold_layer_into(
     // plain path below, so it stays bit-identical to the GPU path, which
     // it keeps too (`document_qualifies_for_gpu_compositing`).
     if layer_renders_effects(layers, id) {
-        return fold_layer_with_effects(
-            accumulator,
-            id,
-            layers,
-            store,
-            tile_id,
-            doc_origin,
-            reference_origin,
-            depth,
-            budget,
-        );
+        return profiled(ProfileSlot::EffectsFold, || {
+            fold_layer_with_effects(
+                accumulator,
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            )
+        });
     }
     match resolve_tile(
         id,
@@ -14157,7 +14183,9 @@ fn fold_layer_into(
         budget,
     ) {
         Some((texels, opacity, blend_mode)) => {
-            aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
+            profiled(ProfileSlot::LayerFold, || {
+                aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
+            });
             true
         }
         None => false,
@@ -14206,6 +14234,7 @@ fn fold_pass_through_group(
     reference_origin: (i64, i64),
     depth: usize,
     budget: &mut CompositeBudget,
+    plan: Option<PlanRef<'_>>,
 ) -> bool {
     if !admit_composite_node(id, layers, depth, budget) {
         return false;
@@ -14222,23 +14251,38 @@ fn fold_pass_through_group(
     }
     let mask = layers.mask(id).filter(|mask| mask.enabled);
     let backdrop = (opacity < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
-    let mut changed = false;
-    for &child_id in children.iter().rev() {
-        if budget.is_exhausted() {
-            break;
-        }
-        changed |= fold_layer_into(
-            accumulator,
-            child_id,
+    // Occlusion culling (0.183.0): `plan` is the rest of the enclosing
+    // context's plan when this group is opaque and on its path. A
+    // translucent or masked group is a boundary for the enclosing search,
+    // so it searches its own children here; the cull stays inside it,
+    // since the lerp below still reads the backdrop.
+    let confined = if plan.is_none() && backdrop.is_some() {
+        fold_plan_for_tile(
+            children,
             layers,
             store,
             tile_id,
             doc_origin,
             reference_origin,
             depth.saturating_add(1),
-            budget,
-        );
-    }
+        )
+    } else {
+        None
+    };
+    let plan = plan.or_else(|| confined.as_ref().map(FoldPlan::as_ref));
+    let changed = fold_context_into(
+        accumulator,
+        children,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth.saturating_add(1),
+        budget,
+        plan,
+        true,
+    ) > 0;
     if !changed {
         return false;
     }
@@ -14434,6 +14478,356 @@ fn apply_adjustment_layer(
     true
 }
 
+/// How many cover candidates [`fold_plan_for_tile`] reads per context
+/// before giving up (0.183.0): each candidate costs one layer-tile read
+/// that the fold may then repeat, so a context with many large,
+/// not-quite-opaque layers pays at most this many extra reads.
+const MAX_COVER_CANDIDATES: usize = 4;
+
+/// One accumulator context's occlusion-cull plan for one composite tile
+/// (0.183.0, [`fold_plan_for_tile`]).
+///
+/// `path` runs from a node of the searched context down through opaque,
+/// unmasked Pass Through groups (which share that context's accumulator)
+/// to the **cover**: a visible pixel layer whose resolved texels on this
+/// tile are all exactly opaque and that folds as plain `Normal` at full
+/// opacity, so folding it leaves the accumulator equal to its own texels
+/// whatever was there before. `cover` holds those texels, read once by the
+/// search and reused for the fold.
+#[derive(Debug)]
+struct FoldPlan {
+    path: Vec<aurora_doc::LayerId>,
+    cover: Vec<half::f16>,
+}
+
+impl FoldPlan {
+    fn as_ref(&self) -> PlanRef<'_> {
+        PlanRef {
+            path: &self.path,
+            cover: &self.cover,
+        }
+    }
+}
+
+/// A borrowed [`FoldPlan`], or the rest of one below a Pass Through group
+/// on its path.
+#[derive(Debug, Clone, Copy)]
+struct PlanRef<'a> {
+    path: &'a [aurora_doc::LayerId],
+    cover: &'a [half::f16],
+}
+
+/// Whether `id`'s metadata qualifies it as a cover on the composite tile
+/// at `doc_origin` (0.183.0, v1 criteria): a pixel layer in `Normal` (not
+/// `Dissolve`), content opacity (opacity × Fill) exactly `1`, no enabled
+/// mask, no drawn effects ([`layer_renders_effects`]), declared bounds
+/// containing the whole tile, and a depth the fold itself would admit. The
+/// texels are checked separately ([`opaque_cover_texels`]).
+fn is_cover_candidate(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    doc_origin: (i64, i64),
+    depth: usize,
+) -> bool {
+    let tile = i64::from(aurora_tile::TILE);
+    depth <= aurora_doc::MAX_LAYER_TREE_DEPTH
+        && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+        && layers
+            .blend_mode(id)
+            .unwrap_or(aurora_doc::BlendMode::Normal)
+            == aurora_doc::BlendMode::Normal
+        && content_opacity(layers, id) == Some(1.0)
+        && !layers.mask(id).is_some_and(|mask| mask.enabled)
+        && !layer_renders_effects(layers, id)
+        && layers.bounds(id).is_some_and(|b| {
+            b.x <= doc_origin.0
+                && b.y <= doc_origin.1
+                && b.x + i64::from(b.width) >= doc_origin.0 + tile
+                && b.y + i64::from(b.height) >= doc_origin.1 + tile
+        })
+}
+
+/// Whether `id` is a Pass Through group the cover search may descend
+/// into without leaving its context: opacity exactly `1` and no enabled
+/// mask, so [`fold_pass_through_group`] keeps no backdrop and its result
+/// is its children's fold, bit for bit.
+fn is_opaque_pass_through(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
+        && layers.blend_mode(id) == Some(aurora_doc::BlendMode::PassThrough)
+        && layers.opacity(id) == Some(1.0)
+        && !layers.mask(id).is_some_and(|mask| mask.enabled)
+}
+
+/// `id`'s resolved texels on this tile when every one is exactly opaque
+/// (alpha bits `f16` `1.0`), else `None`. Read through
+/// [`pixel_layer_texels`], the fold's own read, under a scratch budget: a
+/// failed read is simply not a cover, and the real fold notes the error.
+fn opaque_cover_texels(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+) -> Option<Vec<half::f16>> {
+    let mut scratch = CompositeBudget {
+        nodes: 0,
+        reported: true,
+        store_errors: 0,
+        first_store_error: None,
+    };
+    let texels = pixel_layer_texels(
+        id,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        &mut scratch,
+    )?;
+    let one = half::f16::ONE.to_bits();
+    let opaque = texels.len() == aurora_tile::SAMPLES
+        && scratch.store_errors == 0
+        && texels
+            .chunks_exact(aurora_tile::CHANNELS)
+            .all(|texel| texel.get(3).map(|a| a.to_bits()) == Some(one));
+    opaque.then_some(texels)
+}
+
+/// Occlusion culling (0.183.0): finds the topmost cover in `context`
+/// (child ids newest first, as [`aurora_doc::LayerTree`] stores them) on
+/// the composite tile at `doc_origin`, for [`fold_context_into`] to fold
+/// from and skip everything below.
+///
+/// The search walks top-down, skipping hidden nodes and adjustment
+/// layers (both fold above the cover unchanged), and descends into
+/// opaque, unmasked Pass Through groups ([`is_opaque_pass_through`]),
+/// which share this context's accumulator. Any other group — an isolated
+/// group, or a translucent or masked Pass Through group — is a boundary:
+/// not searched (the latter searches its own children when it folds,
+/// [`fold_pass_through_group`]), but the search continues below it. At
+/// most [`MAX_COVER_CANDIDATES`] candidates' texels are read.
+///
+/// **Exactness.** At source alpha `1`, `Normal` and opacity `1`,
+/// `aurora_render`'s `fold_texel` gives `(1 - da)·s + da·s` for colour
+/// and `1 + da·0` for alpha. For any finite backdrop with `da` in
+/// `[0, 1]` that is within two `f32` ulps of the `f16` source, so it
+/// rounds back to it bit for bit; the fold below the cover therefore
+/// cannot change the result. Not covered: a non-finite backdrop (`0·inf`
+/// is NaN) and a `-0.0` source channel over a negative premultiplied
+/// backdrop channel (`-0 + +0` vs `+0 + -0`), neither reachable from
+/// in-gamut content.
+///
+/// `depth` is the context's own fold depth (1 for the roots).
+fn fold_plan_for_tile(
+    context: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+) -> Option<FoldPlan> {
+    if !occlusion_culling_enabled() {
+        return None;
+    }
+    profiled(ProfileSlot::CullSearch, || {
+        let mut candidates = 0;
+        let mut path = Vec::new();
+        let cover = search_cover(
+            context,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            &mut candidates,
+            &mut path,
+        )?;
+        Some(FoldPlan { path, cover })
+    })
+}
+
+/// [`fold_plan_for_tile`]'s recursive walk; pushes the path on success.
+#[allow(clippy::too_many_arguments)]
+fn search_cover(
+    nodes: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    candidates: &mut usize,
+    path: &mut Vec<aurora_doc::LayerId>,
+) -> Option<Vec<half::f16>> {
+    for &id in nodes {
+        if *candidates >= MAX_COVER_CANDIDATES {
+            return None;
+        }
+        if layers.visible(id) != Some(true) {
+            continue;
+        }
+        match layers.kind(id) {
+            Some(aurora_doc::LayerKind::Pixel { .. }) => {
+                if !is_cover_candidate(id, layers, doc_origin, depth) {
+                    continue;
+                }
+                *candidates += 1;
+                if let Some(texels) =
+                    opaque_cover_texels(id, layers, store, tile_id, doc_origin, reference_origin)
+                {
+                    path.push(id);
+                    return Some(texels);
+                }
+            }
+            Some(aurora_doc::LayerKind::Group { children })
+                if is_opaque_pass_through(layers, id)
+                    && depth < aurora_doc::MAX_LAYER_TREE_DEPTH =>
+            {
+                path.push(id);
+                if let Some(texels) = search_cover(
+                    children,
+                    layers,
+                    store,
+                    tile_id,
+                    doc_origin,
+                    reference_origin,
+                    depth.saturating_add(1),
+                    candidates,
+                    path,
+                ) {
+                    return Some(texels);
+                }
+                path.pop();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Folds one accumulator context — `nodes`, newest first as the tree
+/// stores them — bottom to top into `accumulator` through
+/// [`fold_layer_into`], returning how many nodes changed it. With a
+/// `plan` (0.183.0), the fold starts at the plan's first node and every
+/// node below it is skipped (`COMPOSITE_CULLED_FOLDS`, test builds). `stop_when_exhausted`
+/// is a group's per-child budget break; the roots have none.
+#[allow(clippy::too_many_arguments)]
+fn fold_context_into(
+    accumulator: &mut [half::f16],
+    nodes: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+    plan: Option<PlanRef<'_>>,
+    stop_when_exhausted: bool,
+) -> usize {
+    let start = plan.and_then(|plan| {
+        let first = plan.path.first()?;
+        nodes.iter().position(|node| node == first)
+    });
+    let end = start.map_or(nodes.len(), |index| index + 1);
+    let Some(kept) = nodes.get(..end) else {
+        return 0;
+    };
+    if start.is_some() {
+        note_culled_folds(nodes.len() - end);
+    }
+    let mut folded = 0_usize;
+    for (index, &id) in kept.iter().enumerate().rev() {
+        if stop_when_exhausted && budget.is_exhausted() {
+            break;
+        }
+        let changed = match plan {
+            Some(plan) if start == Some(index) => fold_planned_node(
+                accumulator,
+                id,
+                PlanRef {
+                    path: plan.path.get(1..).unwrap_or(&[]),
+                    cover: plan.cover,
+                },
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            ),
+            _ => fold_layer_into(
+                accumulator,
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            ),
+        };
+        if changed {
+            folded = folded.saturating_add(1);
+        }
+    }
+    folded
+}
+
+/// Folds the node a [`FoldPlan`] starts at: the cover itself — the plain
+/// arm of [`fold_layer_into`] ([`resolve_tile`], then
+/// `aurora_render::composite_layer_into`) with the texels the search
+/// already read — or an opaque Pass Through group on the way to it,
+/// whose own children are then culled by the rest of the plan.
+#[allow(clippy::too_many_arguments)]
+fn fold_planned_node(
+    accumulator: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    rest: PlanRef<'_>,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    if !rest.path.is_empty() {
+        return fold_pass_through_group(
+            accumulator,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+            Some(rest),
+        );
+    }
+    if !admit_composite_node(id, layers, depth, budget) {
+        return false;
+    }
+    let Some(opacity) = content_opacity(layers, id) else {
+        return false;
+    };
+    profiled(ProfileSlot::LayerFold, || {
+        aurora_render::composite_layer_into(
+            accumulator,
+            rest.cover,
+            opacity,
+            translate_blend_mode(aurora_doc::BlendMode::Normal),
+        );
+    });
+    true
+}
+
 /// Composites one tile of `layers`' **root level** on the CPU: every
 /// root layer resolved by [`resolve_tile`] in paint order (bottom-to-top
 /// — [`aurora_doc::LayerTree::roots`] is newest-first) and folded, one
@@ -14535,22 +14929,30 @@ fn composite_roots_into_tile(
     budget: &mut CompositeBudget,
 ) -> (Vec<half::f16>, usize) {
     let mut composited = aurora_render::transparent_tile();
-    let mut folded = 0_usize;
-    for &id in layers.roots().iter().rev() {
-        if fold_layer_into(
-            &mut composited,
-            id,
-            layers,
-            store,
-            tile_id,
-            doc_origin,
-            reference_origin,
-            1,
-            budget,
-        ) {
-            folded = folded.saturating_add(1);
-        }
-    }
+    // Occlusion culling (0.183.0): fold from the topmost exactly-opaque
+    // cover up, skipping every root below it (`fold_plan_for_tile`).
+    let plan = fold_plan_for_tile(
+        layers.roots(),
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        1,
+    );
+    let folded = fold_context_into(
+        &mut composited,
+        layers.roots(),
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        1,
+        budget,
+        plan.as_ref().map(FoldPlan::as_ref),
+        false,
+    );
     // The accumulator has stopped being an accumulator and is now this
     // tile's finished composite, handed to callers (export, the
     // eyedropper, the canvas atlas) that all expect straight alpha --
@@ -16556,6 +16958,85 @@ fn note_composite_straighten_pass() {
 /// `note_*` pairs above.
 #[cfg(not(test))]
 fn note_composite_straighten_pass() {}
+
+/// What [`profiled`] times (0.183.0, test builds only).
+#[derive(Debug, Clone, Copy)]
+enum ProfileSlot {
+    /// [`read_layer_window`]: a windowed (misaligned) layer or mask read.
+    ReadWindow,
+    /// [`pixel_layer_texels`]: one layer's texels on one tile, inclusive.
+    LayerTexels,
+    /// `aurora_render::composite_layer_into` for a plain layer fold.
+    LayerFold,
+    /// [`fold_layer_with_effects`], inclusive.
+    EffectsFold,
+    /// [`compute_shadow_tile_coverage`]: a shadow-cache miss.
+    ShadowMiss,
+    /// [`fold_plan_for_tile`]: the cover search.
+    CullSearch,
+}
+
+/// Calls and nanoseconds per [`ProfileSlot`] on this thread (0.183.0,
+/// test builds only): the Nyepi cost test's breakdown.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct CompositeProfile {
+    slots: [(u64, u64); 6],
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPOSITE_PROFILE: std::cell::Cell<CompositeProfile> =
+        const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 6] }) };
+    /// Test-only: context nodes skipped below a cover by occlusion culling
+    /// (0.183.0, [`fold_context_into`]), so tests can see a cull happen —
+    /// the cull being output-identical, nothing else can.
+    static COMPOSITE_CULLED_FOLDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: `true` turns occlusion culling off on this thread, for
+    /// the cull-versus-uncull differentials.
+    static COMPOSITE_CULLING_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn profiled<T>(slot: ProfileSlot, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    COMPOSITE_PROFILE.with(|profile| {
+        let mut current = profile.get();
+        if let Some((calls, total)) = current.slots.get_mut(slot as usize) {
+            *calls = calls.saturating_add(1);
+            *total = total.saturating_add(nanos);
+        }
+        profile.set(current);
+    });
+    out
+}
+
+#[cfg(not(test))]
+fn profiled<T>(_slot: ProfileSlot, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[cfg(test)]
+fn note_culled_folds(skipped: usize) {
+    COMPOSITE_CULLED_FOLDS.with(|n| n.set(n.get().saturating_add(skipped as u64)));
+}
+
+#[cfg(not(test))]
+fn note_culled_folds(_skipped: usize) {}
+
+/// Whether [`fold_plan_for_tile`] searches for a cover: always in a
+/// shipping build; tests can turn it off per thread.
+#[cfg(test)]
+fn occlusion_culling_enabled() -> bool {
+    !COMPOSITE_CULLING_DISABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn occlusion_culling_enabled() -> bool {
+    true
+}
 
 /// Test-only tally of [`recomposite_visible_tiles`]'s `write_composited`
 /// decisions, in three buckets:
@@ -19893,6 +20374,21 @@ fn read_layer_window(
     budget: &mut CompositeBudget,
     kind: WindowKind,
 ) -> LayerWindow {
+    profiled(ProfileSlot::ReadWindow, || {
+        read_layer_window_unprofiled(store, surface, layer_origin, doc_origin, budget, kind)
+    })
+}
+
+/// [`read_layer_window`]'s body, under [`profiled`] (0.183.0).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn read_layer_window_unprofiled(
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    layer_origin: (i64, i64),
+    doc_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+    kind: WindowKind,
+) -> LayerWindow {
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
     let window_y = doc_origin.1 - layer_origin.1;
@@ -19985,7 +20481,7 @@ fn read_layer_window(
                     continue;
                 }
             };
-            let texels = src.texels().to_vec();
+            let texels = src.texels();
             // First real source tile for this window: now, and only
             // now, is a destination buffer worth having.
             let out = out.get_or_insert_with(|| {
@@ -19994,24 +20490,21 @@ fn read_layer_window(
                     aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
                 ]
             });
+            // 0.183.0: one slice copy per row, straight from the resident
+            // tile (no whole-tile `to_vec`); the same samples land in the
+            // same places as the old per-texel copy, so bit-identical.
+            let span = (col_hi - col_lo) as usize * aurora_tile::CHANNELS;
+            let row_len = aurora_tile::TILE as usize * aurora_tile::CHANNELS;
             for src_row in row_lo..row_hi {
-                let dst_row = (src_row - window_y) as usize;
-                let in_tile_row = (src_row - tile_y * tile_size) as usize;
-                for src_col in col_lo..col_hi {
-                    let dst_col = (src_col - window_x) as usize;
-                    let in_tile_col = (src_col - tile_x * tile_size) as usize;
-                    let src_index = (in_tile_row * aurora_tile::TILE as usize + in_tile_col)
-                        * aurora_tile::CHANNELS;
-                    let dst_index =
-                        (dst_row * aurora_tile::TILE as usize + dst_col) * aurora_tile::CHANNELS;
-                    for channel in 0..aurora_tile::CHANNELS {
-                        if let (Some(&s), Some(d)) = (
-                            texels.get(src_index + channel),
-                            out.get_mut(dst_index + channel),
-                        ) {
-                            *d = s;
-                        }
-                    }
+                let dst_start = (src_row - window_y) as usize * row_len
+                    + (col_lo - window_x) as usize * aurora_tile::CHANNELS;
+                let src_start = (src_row - tile_y * tile_size) as usize * row_len
+                    + (col_lo - tile_x * tile_size) as usize * aurora_tile::CHANNELS;
+                if let (Some(d), Some(s)) = (
+                    out.get_mut(dst_start..dst_start + span),
+                    texels.get(src_start..src_start + span),
+                ) {
+                    d.copy_from_slice(s);
                 }
             }
         }
@@ -75300,11 +75793,85 @@ mod tests {
             let Ok(bytes) = std::fs::read(&path) else {
                 unreachable!("unreadable");
             };
+            // 0.183.0: at the old benchmark budget (16) and the app's
+            // (`TILE_BUDGET`), each with occlusion culling off (the 0.182.0
+            // path) and on.
+            for budget in [16, crate::TILE_BUDGET] {
+                for cull in [false, true] {
+                    println!("COST ==== budget {budget}, culling {cull} ====");
+                    crate::COMPOSITE_CULLING_DISABLED.with(|c| c.set(!cull));
+                    edit_costs(&bytes, budget, !cull && budget == 16);
+                    crate::COMPOSITE_CULLING_DISABLED.with(|c| c.set(false));
+                }
+            }
+        }
+
+        /// One full-composite breakdown line (0.183.0): store hits and
+        /// misses, the profile slots and the folds culled since `before`.
+        fn print_breakdown(
+            what: &str,
+            store: &aurora_tile::TileStore,
+            before: (aurora_tile::Stats, crate::CompositeProfile, u64),
+        ) {
+            let (stats, profile, culled) = before;
+            let now = *store.stats();
+            let now_profile = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
+            let now_culled = crate::COMPOSITE_CULLED_FOLDS.with(std::cell::Cell::get);
+            println!(
+                "BREAKDOWN {what}: store hits {} | misses: disk page-ins {} pending {} \
+                 created {} | evictions {} | read {} MiB",
+                now.resident_hits - stats.resident_hits,
+                now.faults - stats.faults,
+                now.pending_hits - stats.pending_hits,
+                now.tiles_created - stats.tiles_created,
+                now.evictions - stats.evictions,
+                (now.bytes_read - stats.bytes_read) >> 20,
+            );
+            let names = [
+                "read_layer_window",
+                "pixel_layer_texels (incl.)",
+                "plain layer fold",
+                "effects fold (incl.)",
+                "shadow miss",
+                "cull search",
+            ];
+            for ((name, (calls, nanos)), (calls0, nanos0)) in
+                names.iter().zip(now_profile.slots).zip(profile.slots)
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let ms = (nanos - nanos0) as f64 / 1e6;
+                println!(
+                    "BREAKDOWN {what}:   {name}: {} calls, {ms:.1} ms",
+                    calls - calls0
+                );
+            }
+            println!("BREAKDOWN {what}:   culled folds {}", now_culled - culled);
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn edit_costs(bytes: &[u8], budget: usize, describe: bool) {
             clear_shadow_cache();
-            let (_scratch, mut store) = real_tile_store();
+            let dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(nonzero) = std::num::NonZeroUsize::new(budget) else {
+                unreachable!("non-zero");
+            };
+            let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), nonzero) {
+                Ok(store) => store,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let snapshot = |store: &aurora_tile::TileStore| {
+                (
+                    *store.stats(),
+                    crate::COMPOSITE_PROFILE.with(std::cell::Cell::get),
+                    crate::COMPOSITE_CULLED_FOLDS.with(std::cell::Cell::get),
+                )
+            };
             let started = std::time::Instant::now();
             let (document, _image) = open_and_composite_psd(
-                &bytes,
+                bytes,
                 &mut store,
                 (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
             );
@@ -75316,6 +75883,45 @@ mod tests {
             while let Some(id) = all.pop() {
                 all.extend(layers.children(id).unwrap_or(&[]));
                 ids.push(id);
+            }
+            if describe {
+                let (mut pixels, mut adjustments, mut effects, mut masks) = (0, 0, 0, 0);
+                for &id in &ids {
+                    match layers.kind(id) {
+                        Some(aurora_doc::LayerKind::Group { children }) => println!(
+                            "STRUCTURE group {:?}: {} children, mode {:?}, opacity {:?}, \
+                             fill {:?}, mask {:?}, visible {:?}",
+                            layers.name(id),
+                            children.len(),
+                            layers.blend_mode(id),
+                            layers.opacity(id),
+                            layers.fill_opacity(id),
+                            layers.mask(id).map(|m| m.enabled),
+                            layers.visible(id),
+                        ),
+                        Some(aurora_doc::LayerKind::Adjustment(_)) => adjustments += 1,
+                        _ => pixels += 1,
+                    }
+                    effects += usize::from(layer_renders_effects(&layers, id));
+                    masks += usize::from(layers.mask(id).is_some_and(|m| m.enabled));
+                }
+                println!(
+                    "STRUCTURE {w}x{h}: {} nodes, {} roots, {pixels} pixel, {adjustments} \
+                     adjustment, {effects} drawing effects, {masks} enabled masks",
+                    ids.len(),
+                    layers.roots().len(),
+                );
+                let store_tiles = ids
+                    .iter()
+                    .filter_map(|&id| layers.surface_id(id))
+                    .map(|surface| {
+                        (0..64_u32)
+                            .flat_map(|y| (0..64_u32).map(move |x| aurora_tile::TileId { x, y }))
+                            .filter(|&t| store.contains_tile(surface, t))
+                            .count()
+                    })
+                    .sum::<usize>();
+                println!("STRUCTURE stored layer tiles (first 64x64 of each grid): {store_tiles}");
             }
             let shadowed = ids.iter().copied().find(|&id| {
                 matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
@@ -75333,9 +75939,11 @@ mod tests {
             };
             let full =
                 |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore, what: &str| {
+                    let before = snapshot(store);
                     let t = std::time::Instant::now();
                     let _ = composite_document(layers, store, w, h);
                     println!("COST {what}: {:?}", t.elapsed());
+                    print_breakdown(what, store, before);
                 };
             full(&layers, &mut store, "warm full composite (no edit)");
             ok(layers.set_visible(plain, false));
@@ -79499,5 +80107,975 @@ mod effects_gpu_predicate_tests {
         }
         assert!(!super::layer_shows_effects(&layers, id), "enab off");
         assert!(super::document_qualifies_for_gpu_compositing(&layers));
+    }
+}
+
+/// Occlusion culling (0.183.0): every test compares the culled composite
+/// with the uncull'd one bit for bit, and reads [`COMPOSITE_CULLED_FOLDS`]
+/// to show whether a cull actually happened.
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
+mod occlusion_cull_tests {
+    use super::*;
+
+    const T: i64 = aurora_tile::TILE as i64;
+    const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+
+    fn ok<V, E: std::fmt::Debug>(result: Result<V, E>) -> V {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn store_with_budget(budget: usize) -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = ok(tempfile::tempdir());
+        let Some(budget) = std::num::NonZeroUsize::new(budget) else {
+            unreachable!("non-zero budget");
+        };
+        let store = ok(aurora_tile::TileStore::new(
+            dir.path().to_path_buf(),
+            budget,
+        ));
+        (dir, store)
+    }
+
+    fn rect(x: i64, y: i64, width: u32, height: u32) -> aurora_core::Rect {
+        aurora_core::Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Paints every stored tile of a layer-local surface whose grid starts
+    /// at `bounds`' origin and covers `bounds`, with `paint(x, y)` at each
+    /// document position.
+    fn paint_surface(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        bounds: aurora_core::Rect,
+        paint: &dyn Fn(i64, i64) -> [f32; 4],
+    ) {
+        let tiles_x = i64::from(bounds.width.div_ceil(aurora_tile::TILE));
+        let tiles_y = i64::from(bounds.height.div_ceil(aurora_tile::TILE));
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let id = aurora_tile::TileId {
+                    x: tx as u32,
+                    y: ty as u32,
+                };
+                let Ok(tile) = store.get_mut(surface, id) else {
+                    unreachable!("writable");
+                };
+                for (i, texel) in tile
+                    .texels_mut()
+                    .chunks_exact_mut(aurora_tile::CHANNELS)
+                    .enumerate()
+                {
+                    let lx = (i as i64) % T + tx * T;
+                    let ly = (i as i64) / T + ty * T;
+                    let value = if lx < i64::from(bounds.width) && ly < i64::from(bounds.height) {
+                        paint(bounds.x + lx, bounds.y + ly)
+                    } else {
+                        [0.0; 4]
+                    };
+                    for (channel, v) in texel.iter_mut().zip(value) {
+                        *channel = half::f16::from_f32(v);
+                    }
+                }
+                tile.mark_dirty(rect(0, 0, aurora_tile::TILE, aurora_tile::TILE));
+            }
+        }
+    }
+
+    /// A pixel layer under `parent` (on top of its siblings) with `bounds`
+    /// painted by `paint`.
+    fn layer(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        parent: Option<aurora_doc::LayerId>,
+        bounds: aurora_core::Rect,
+        paint: &dyn Fn(i64, i64) -> [f32; 4],
+    ) -> aurora_doc::LayerId {
+        let id = ok(layers.add_pixel_layer("p", bounds, parent));
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("pixel layer");
+        };
+        paint_surface(store, surface, bounds, paint);
+        id
+    }
+
+    /// An opaque, position-dependent colour.
+    fn opaque(x: i64, y: i64) -> [f32; 4] {
+        [
+            ((x * 7 + y * 3).rem_euclid(97)) as f32 / 97.0,
+            ((x * 5 + y * 11).rem_euclid(89)) as f32 / 89.0,
+            ((x + y * 13).rem_euclid(83)) as f32 / 83.0,
+            1.0,
+        ]
+    }
+
+    /// A translucent, position-dependent colour.
+    fn translucent(x: i64, y: i64) -> [f32; 4] {
+        let [r, g, b, _] = opaque(y, x);
+        [r, g, b, ((x * 3 + y).rem_euclid(61)) as f32 / 61.0]
+    }
+
+    fn full_tile() -> aurora_core::Rect {
+        rect(0, 0, aurora_tile::TILE, aurora_tile::TILE)
+    }
+
+    fn curves() -> aurora_core::CurvesParams {
+        let points: Vec<aurora_core::CurvePoint> =
+            [(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)]
+                .iter()
+                .map(|&(x, y)| aurora_core::CurvePoint::new(x, y))
+                .collect();
+        aurora_core::CurvesParams {
+            composite: ok(aurora_core::ToneCurve::new(&points)),
+            red: None,
+            green: None,
+            blue: None,
+        }
+    }
+
+    fn add_curves(
+        layers: &mut aurora_doc::LayerTree,
+        parent: Option<aurora_doc::LayerId>,
+    ) -> aurora_doc::LayerId {
+        ok(
+            layers.add_adjustment_layer_at(
+                "c",
+                aurora_doc::Adjustment::Curves(curves()),
+                parent,
+                0,
+            ),
+        )
+    }
+
+    fn set_culling(enabled: bool) {
+        COMPOSITE_CULLING_DISABLED.with(|c| c.set(!enabled));
+    }
+
+    fn culled_folds() -> u64 {
+        COMPOSITE_CULLED_FOLDS.with(std::cell::Cell::get)
+    }
+
+    fn clear_shadow_cache() {
+        SHADOW_CACHE.with(|c| {
+            if let Ok(mut c) = c.try_borrow_mut() {
+                *c = ShadowCache::default();
+            }
+        });
+    }
+
+    /// One composite tile, culled or not, and the folds culled.
+    fn tile_with(
+        layers: &aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        tile: (i64, i64),
+        cull: bool,
+    ) -> (Vec<half::f16>, u64) {
+        set_culling(cull);
+        clear_shadow_cache();
+        let before = culled_folds();
+        let mut budget = CompositeBudget::for_pass(layers);
+        budget.next_tile(layers);
+        let (out, _) = composite_roots_into_tile(
+            layers,
+            store,
+            aurora_tile::TileId {
+                x: tile.0 as u32,
+                y: tile.1 as u32,
+            },
+            (tile.0 * T, tile.1 * T),
+            (0, 0),
+            &mut budget,
+        );
+        set_culling(true);
+        (out, culled_folds() - before)
+    }
+
+    /// Every mismatching sample, as `(index, culled bits, uncull'd bits)`.
+    fn mismatches(culled: &[half::f16], plain: &[half::f16]) -> Vec<(usize, u16, u16)> {
+        let mut out: Vec<(usize, u16, u16)> = culled
+            .iter()
+            .zip(plain)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
+            .collect();
+        if culled.len() != plain.len() {
+            out.push((usize::MAX, 0, 0));
+        }
+        out
+    }
+
+    /// Tile `tile`'s culled and uncull'd composites, asserted bit-identical;
+    /// returns the culled one and how many folds were culled.
+    #[track_caller]
+    fn differential(
+        layers: &aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        tile: (i64, i64),
+    ) -> (Vec<half::f16>, u64) {
+        let (plain, none) = tile_with(layers, store, tile, false);
+        assert_eq!(none, 0, "culling off culls nothing");
+        let (culled, skipped) = tile_with(layers, store, tile, true);
+        let bad = mismatches(&culled, &plain);
+        assert!(
+            bad.is_empty(),
+            "{} samples differ, first {:?}",
+            bad.len(),
+            bad.get(..bad.len().min(8))
+        );
+        (culled, skipped)
+    }
+
+    fn bottom_and_cover(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+    ) -> aurora_doc::LayerId {
+        let _ = layer(layers, store, None, full_tile(), &translucent);
+        // Opaque, but `Screen`: not a cover itself.
+        let middle = layer(layers, store, None, rect(0, 0, 300, 300), &opaque);
+        ok(layers.set_blend_mode(middle, aurora_doc::BlendMode::Screen));
+        layer(layers, store, None, full_tile(), &opaque)
+    }
+
+    #[test]
+    fn cull_keeps_curves_above_the_cover() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let cover = bottom_and_cover(&mut layers, &mut store);
+        let _ = cover;
+        let (cover_only, _) = {
+            let mut probe = aurora_doc::LayerTree::new();
+            let _ = layer(&mut probe, &mut store, None, full_tile(), &opaque);
+            tile_with(&probe, &mut store, (0, 0), false)
+        };
+        let _ = add_curves(&mut layers, None);
+        let (out, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(skipped, 2, "both layers under the cover are culled");
+        assert!(
+            !mismatches(&out, &cover_only).is_empty(),
+            "the Curves layer above the cover still applies"
+        );
+    }
+
+    #[test]
+    fn cull_keeps_a_multiply_and_a_dissolve_layer_above_the_cover() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = bottom_and_cover(&mut layers, &mut store);
+        let multiply = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        ok(layers.set_blend_mode(multiply, aurora_doc::BlendMode::Multiply));
+        let dissolve = layer(&mut layers, &mut store, None, full_tile(), &opaque);
+        ok(layers.set_blend_mode(dissolve, aurora_doc::BlendMode::Dissolve));
+        ok(layers.set_opacity(dissolve, 0.5));
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(skipped, 2);
+    }
+
+    /// The cover's metadata each rejected in turn: nothing is culled, and
+    /// the composite is still identical.
+    fn rejected(setup: &dyn Fn(&mut aurora_doc::LayerTree, aurora_doc::LayerId)) {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let cover = bottom_and_cover(&mut layers, &mut store);
+        let (_, control) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(control, 2, "control: the unmodified cover culls");
+        setup(&mut layers, cover);
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(skipped, 0, "the modified cover must not cull");
+    }
+
+    #[test]
+    fn cull_rejects_a_masked_cover() {
+        rejected(&|layers, cover| {
+            ok(layers.add_mask(cover, full_tile()));
+            assert!(layers.mask(cover).is_some_and(|m| m.enabled));
+        });
+    }
+
+    #[test]
+    fn cull_rejects_fill_below_one() {
+        for fill in [0.0, 0.5, 0.999] {
+            rejected(&|layers, cover| ok(layers.set_fill_opacity(cover, fill)));
+        }
+    }
+
+    #[test]
+    fn cull_rejects_opacity_below_one() {
+        for opacity in [0.0, 0.5, 0.9999] {
+            rejected(&|layers, cover| ok(layers.set_opacity(cover, opacity)));
+        }
+    }
+
+    #[test]
+    fn cull_rejects_a_dissolve_cover() {
+        rejected(&|layers, cover| {
+            ok(layers.set_blend_mode(cover, aurora_doc::BlendMode::Dissolve));
+        });
+    }
+
+    #[test]
+    fn cull_rejects_a_cover_with_overlay_or_shadow() {
+        rejected(&|layers, cover| {
+            let fx = aurora_core::LayerEffects {
+                color_overlays: vec![aurora_core::effects::ColorOverlay::default()],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(cover, Some(fx)));
+            assert!(layer_renders_effects(layers, cover));
+        });
+        rejected(&|layers, cover| {
+            let fx = aurora_core::LayerEffects {
+                drop_shadows: vec![aurora_core::effects::DropShadow {
+                    distance: 4.0,
+                    size: 3.0,
+                    ..aurora_core::effects::DropShadow::default()
+                }],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(cover, Some(fx)));
+            assert!(layer_renders_effects(layers, cover));
+        });
+    }
+
+    #[test]
+    fn cull_rejects_a_cover_one_texel_short_of_opaque() {
+        let short = half::f16::from_bits(half::f16::ONE.to_bits() - 1);
+        for (x, y) in [(0, 0), (255, 255), (17, 200)] {
+            let (_d, mut store) = store_with_budget(64);
+            let mut layers = aurora_doc::LayerTree::new();
+            let cover = bottom_and_cover(&mut layers, &mut store);
+            let Some(surface) = layers.surface_id(cover) else {
+                unreachable!("pixel layer");
+            };
+            let Ok(tile) = store.get_mut(surface, TILE0) else {
+                unreachable!("writable");
+            };
+            if let Some(a) = tile.texels_mut().get_mut(((y * T + x) * 4 + 3) as usize) {
+                *a = short;
+            }
+            let (_, skipped) = differential(&layers, &mut store, (0, 0));
+            assert_eq!(skipped, 0, "texel ({x}, {y}) is short of opaque");
+        }
+    }
+
+    #[test]
+    fn cull_rejects_partial_tile_coverage() {
+        // Declared bounds one texel short of the tile.
+        rejected(&|layers, cover| {
+            ok(layers.set_bounds(cover, rect(0, 0, 255, 256)));
+        });
+        // Bounds that cover, content that does not.
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &opaque);
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &|x, y| {
+            if x < 128 { opaque(x, y) } else { [0.0; 4] }
+        });
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(skipped, 0);
+        // A tile only partly inside a layer at the canvas edge: tile (1, 0)
+        // of a 300 px wide cover.
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, rect(0, 0, 512, 256), &opaque);
+        let _ = layer(&mut layers, &mut store, None, rect(0, 0, 300, 256), &opaque);
+        let (_, inside) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(inside, 1, "tile (0, 0) is wholly inside the cover");
+        let (_, edge) = differential(&layers, &mut store, (1, 0));
+        assert_eq!(edge, 0, "tile (1, 0) is only partly inside it");
+    }
+
+    #[test]
+    fn cull_handles_a_misaligned_windowed_cover() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(
+            &mut layers,
+            &mut store,
+            None,
+            rect(-5, -300, 700, 900),
+            &translucent,
+        );
+        let _ = layer(
+            &mut layers,
+            &mut store,
+            None,
+            rect(-37, -11, 600, 600),
+            &opaque,
+        );
+        for tile in [(0, 0), (1, 1)] {
+            let (_, skipped) = differential(&layers, &mut store, tile);
+            assert_eq!(skipped, 1, "tile {tile:?}");
+        }
+        // Tile (2, 0) reaches past the cover's right edge (563).
+        let (_, edge) = differential(&layers, &mut store, (2, 0));
+        assert_eq!(edge, 0);
+    }
+
+    #[test]
+    fn cull_crosses_an_opaque_pass_through_group() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let _ = add_curves(&mut layers, None);
+        let group = ok(layers.add_group("g", None));
+        ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+        let _ = layer(&mut layers, &mut store, Some(group), full_tile(), &opaque);
+        let _ = layer(&mut layers, &mut store, Some(group), full_tile(), &opaque);
+        let multiply = layer(
+            &mut layers,
+            &mut store,
+            Some(group),
+            full_tile(),
+            &translucent,
+        );
+        ok(layers.set_blend_mode(multiply, aurora_doc::BlendMode::Multiply));
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(
+            skipped, 3,
+            "two roots below the group, one child below the cover"
+        );
+    }
+
+    #[test]
+    fn cull_stays_inside_a_translucent_or_masked_pass_through_group() {
+        for masked in [false, true] {
+            let (_d, mut store) = store_with_budget(64);
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = layer(&mut layers, &mut store, None, full_tile(), &opaque);
+            let group = ok(layers.add_group("g", None));
+            ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+            if masked {
+                ok(layers.add_mask(group, full_tile()));
+                if let Some(surface) = layers.mask_surface_id(group) {
+                    paint_surface(&mut store, surface, full_tile(), &|x, _| {
+                        [(x as f32) / 255.0; 4]
+                    });
+                }
+            } else {
+                ok(layers.set_opacity(group, 0.5));
+            }
+            let _ = layer(
+                &mut layers,
+                &mut store,
+                Some(group),
+                full_tile(),
+                &translucent,
+            );
+            let _ = layer(&mut layers, &mut store, Some(group), full_tile(), &opaque);
+            let (out, skipped) = differential(&layers, &mut store, (0, 0));
+            assert_eq!(
+                skipped, 1,
+                "only the child below the cover (masked: {masked})"
+            );
+            assert!(out.iter().any(|v| v.to_f32() > 0.0));
+        }
+    }
+
+    #[test]
+    fn cull_stays_inside_an_isolated_group() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let group = ok(layers.add_group("g", None));
+        let _ = layer(
+            &mut layers,
+            &mut store,
+            Some(group),
+            full_tile(),
+            &translucent,
+        );
+        let _ = layer(&mut layers, &mut store, Some(group), full_tile(), &opaque);
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        assert_eq!(skipped, 0, "v1 does not search inside an isolated group");
+    }
+
+    #[test]
+    fn cull_skips_shadows_and_adjustments_of_culled_layers() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let shadowed = layer(&mut layers, &mut store, None, rect(0, 0, 200, 200), &opaque);
+        let fx = aurora_core::LayerEffects {
+            drop_shadows: vec![aurora_core::effects::DropShadow {
+                distance: 6.0,
+                size: 4.0,
+                ..aurora_core::effects::DropShadow::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        };
+        ok(layers.set_effects(shadowed, Some(fx)));
+        assert!(layer_renders_effects(&layers, shadowed));
+        let _ = add_curves(&mut layers, None);
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &opaque);
+        let computes = || SHADOW_COMPUTES.with(std::cell::Cell::get);
+        let effects = || {
+            COMPOSITE_PROFILE.with(|p| {
+                p.get()
+                    .slots
+                    .get(ProfileSlot::EffectsFold as usize)
+                    .map_or(0, |s| s.0)
+            })
+        };
+        let (s0, e0) = (computes(), effects());
+        let _ = tile_with(&layers, &mut store, (0, 0), false);
+        let (s1, e1) = (computes(), effects());
+        assert!(
+            s1 > s0 && e1 > e0,
+            "uncull'd: the shadow is computed and folded"
+        );
+        let (_, skipped) = differential(&layers, &mut store, (0, 0));
+        let (_, _) = tile_with(&layers, &mut store, (0, 0), true);
+        assert_eq!(skipped, 2, "the shadowed layer and the Curves layer");
+        let (s2, e2) = (computes(), effects());
+        let _ = tile_with(&layers, &mut store, (0, 0), true);
+        assert_eq!((computes(), effects()), (s2, e2), "culled: neither runs");
+    }
+
+    /// The Nyepi template's shape: an opaque full-canvas background, shapes
+    /// with shadows in an opaque Pass Through group above it, an opaque
+    /// photo panel over part of the canvas, and text-like small layers.
+    fn nyepi_shaped(store: &mut aurora_tile::TileStore) -> (aurora_doc::LayerTree, (u32, u32)) {
+        let (w, h) = (700_u32, 600_u32);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, store, None, rect(0, 0, w, h), &opaque);
+        let group = ok(layers.add_group("shapes", None));
+        ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+        for k in 0..4_i64 {
+            let id = layer(
+                &mut layers,
+                store,
+                Some(group),
+                rect(0, 0, w, h),
+                &move |x, y| {
+                    if (x - 120 * k - 60).abs() < 50 && (y - 90 * k - 80).abs() < 40 {
+                        opaque(y, x)
+                    } else {
+                        [0.0; 4]
+                    }
+                },
+            );
+            let fx = aurora_core::LayerEffects {
+                drop_shadows: vec![aurora_core::effects::DropShadow {
+                    distance: 5.0,
+                    size: 6.0,
+                    ..aurora_core::effects::DropShadow::default()
+                }],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+        }
+        let _ = layer(
+            &mut layers,
+            store,
+            Some(group),
+            rect(0, 0, 520, 512),
+            &opaque,
+        );
+        let text = layer(&mut layers, store, None, rect(0, 0, w, h), &|x, y| {
+            if (x / 9 + y / 7) % 5 == 0 {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.0; 4]
+            }
+        });
+        ok(layers.set_blend_mode(text, aurora_doc::BlendMode::Screen));
+        (layers, (w, h))
+    }
+
+    fn export(
+        layers: &aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        size: (u32, u32),
+        cull: bool,
+    ) -> Result<Vec<half::f16>, aurora_io::IoError> {
+        set_culling(cull);
+        clear_shadow_cache();
+        let image = composite_document(layers, store, size.0, size.1);
+        set_culling(true);
+        image.map(|image| image.samples().to_vec())
+    }
+
+    #[test]
+    fn cull_counter_fires_on_nyepi_shaped_stack() {
+        let (_d, mut store) = store_with_budget(256);
+        let (layers, size) = nyepi_shaped(&mut store);
+        let plain = ok(export(&layers, &mut store, size, false));
+        let before = culled_folds();
+        let culled = ok(export(&layers, &mut store, size, true));
+        let skipped = culled_folds() - before;
+        let bad = mismatches(&culled, &plain);
+        assert!(
+            bad.is_empty(),
+            "{} samples differ: {:?}",
+            bad.len(),
+            bad.get(..4)
+        );
+        // Tiles (0, 0), (1, 0), (0, 1), (1, 1) lie inside the 520×512 panel:
+        // each culls the background and the four shadowed shapes.
+        assert_eq!(skipped, 4 * 5, "culled folds");
+    }
+
+    #[test]
+    fn export_with_an_unreadable_tile_in_a_culled_layer() {
+        // Decided behaviour (0.183.0): a layer hidden under an exactly
+        // opaque cover is never read, so its unreadable tile no longer
+        // refuses the export — the exported pixels are exactly what the
+        // readable layers show. With culling off it still refuses.
+        let (dir, mut store) = store_with_budget(1);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let cover = ok(layers.add_pixel_layer("cover", full_tile(), None));
+        let Some(cover_surface) = layers.surface_id(cover) else {
+            unreachable!("pixel layer");
+        };
+        // Painting the cover evicts the bottom layer's tile to disk.
+        paint_surface(&mut store, cover_surface, full_tile(), &opaque);
+        ok(store.flush());
+        let mut damaged = 0;
+        for entry in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "tile") {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                ok(std::fs::write(
+                    &path,
+                    bytes.get(..bytes.len() / 2).unwrap_or(&[]),
+                ));
+                damaged += 1;
+            }
+        }
+        assert_eq!(damaged, 1, "only the bottom layer's tile is on disk");
+        let plain = export(&layers, &mut store, (256, 256), false);
+        assert!(
+            matches!(plain, Err(aurora_io::IoError::IncompleteComposite { .. })),
+            "uncull'd: refused, {plain:?}"
+        );
+        let culled = ok(export(&layers, &mut store, (256, 256), true));
+        let mut probe = aurora_doc::LayerTree::new();
+        let only = ok(probe.add_pixel_layer("cover", full_tile(), None));
+        let (_d2, mut other) = store_with_budget(4);
+        let Some(surface) = probe.surface_id(only) else {
+            unreachable!("pixel layer");
+        };
+        paint_surface(&mut other, surface, full_tile(), &opaque);
+        let want = ok(export(&probe, &mut other, (256, 256), false));
+        assert!(
+            mismatches(&culled, &want).is_empty(),
+            "the cover's own pixels"
+        );
+    }
+
+    /// A small seeded generator (xorshift64*), so failures reproduce.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn pick<V: Copy>(&mut self, items: &[V], fallback: V) -> V {
+            items
+                .get(self.below(items.len() as u64) as usize)
+                .copied()
+                .unwrap_or(fallback)
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    fn random_node(
+        rng: &mut Rng,
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        parent: Option<aurora_doc::LayerId>,
+        depth: usize,
+    ) {
+        const SHARES: [f32; 3] = [0.0, 0.5, 1.0];
+        let roll = rng.below(100);
+        let mode = if rng.chance(50) {
+            aurora_doc::BlendMode::Normal
+        } else {
+            let separable: Vec<_> = aurora_doc::BlendMode::ALL
+                .into_iter()
+                .filter(|m| *m != aurora_doc::BlendMode::PassThrough)
+                .collect();
+            rng.pick(&separable, aurora_doc::BlendMode::Normal)
+        };
+        let opacity = if rng.chance(60) {
+            1.0
+        } else {
+            rng.pick(&SHARES, 1.0)
+        };
+        let fill = if rng.chance(70) {
+            1.0
+        } else {
+            rng.pick(&SHARES, 1.0)
+        };
+        let id = if roll < 20 && depth < 3 {
+            let group = ok(layers.add_group("g", parent));
+            let group_mode = if rng.chance(50) {
+                aurora_doc::BlendMode::PassThrough
+            } else {
+                mode
+            };
+            ok(layers.set_blend_mode(group, group_mode));
+            for _ in 0..=rng.below(3) {
+                random_node(rng, layers, store, Some(group), depth + 1);
+            }
+            group
+        } else if roll < 32 {
+            let id = add_curves(layers, parent);
+            ok(layers.set_blend_mode(id, mode));
+            id
+        } else {
+            let x = rng.below(300) as i64 - 250;
+            let y = rng.below(300) as i64 - 250;
+            let w = 250 + rng.below(600) as u32;
+            let h = 250 + rng.below(600) as u32;
+            let seed = rng.next();
+            let holed = rng.chance(30);
+            let (hx, hy, hw) = (
+                rng.below(300) as i64,
+                rng.below(300) as i64,
+                1 + rng.below(80) as i64,
+            );
+            let hole_alpha = rng.pick(&[0.0, 0.5, 0.999], 0.0);
+            let id = layer(layers, store, parent, rect(x, y, w, h), &move |px, py| {
+                let s = seed as i64 & 0xff;
+                let [r, g, b, _] = opaque(px + s, py - s);
+                let inside_hole = holed && (px - hx).abs() < hw && (py - hy).abs() < hw;
+                [r, g, b, if inside_hole { hole_alpha } else { 1.0 }]
+            });
+            ok(layers.set_blend_mode(id, mode));
+            if rng.chance(10) {
+                let fx = aurora_core::LayerEffects {
+                    drop_shadows: vec![aurora_core::effects::DropShadow {
+                        distance: 3.0,
+                        size: 2.0,
+                        ..aurora_core::effects::DropShadow::default()
+                    }],
+                    ..aurora_core::LayerEffects::default()
+                };
+                ok(layers.set_effects(id, Some(fx)));
+            }
+            id
+        };
+        if !matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
+            || layers.blend_mode(id) != Some(aurora_doc::BlendMode::PassThrough)
+            || rng.chance(50)
+        {
+            ok(layers.set_opacity(id, opacity));
+        }
+        if !matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. })) {
+            ok(layers.set_fill_opacity(id, fill));
+        }
+        if rng.chance(15) {
+            ok(layers.add_mask(id, rect(-64, -64, 600, 600)));
+            if rng.chance(50)
+                && let Some(surface) = layers.mask_surface_id(id)
+            {
+                let level = rng.pick(&[0.0, 0.5, 1.0], 1.0);
+                paint_surface(store, surface, rect(-64, -64, 600, 600), &move |x, _| {
+                    [if x < 100 { level } else { 1.0 }; 4]
+                });
+            }
+        }
+        if rng.chance(5) {
+            ok(layers.set_visible(id, false));
+        }
+    }
+
+    #[test]
+    fn random_trees_cull_equals_uncull() {
+        let mut rng = Rng(0x0A0B_0C0D_1830_0001);
+        let mut culled_total = 0;
+        let mut trees_culled = 0;
+        let trees = 320;
+        for tree in 0..trees {
+            let (_d, mut store) = store_with_budget(512);
+            let mut layers = aurora_doc::LayerTree::new();
+            for _ in 0..=rng.below(5) {
+                random_node(&mut rng, &mut layers, &mut store, None, 1);
+            }
+            let mut this_tree = 0;
+            for tile in [(0, 0), (1, 1), (0, 1)] {
+                let (plain, _) = tile_with(&layers, &mut store, tile, false);
+                let (culled, skipped) = tile_with(&layers, &mut store, tile, true);
+                let bad = mismatches(&culled, &plain);
+                assert!(
+                    bad.is_empty(),
+                    "tree {tree} tile {tile:?}: {} samples differ, first {:?}",
+                    bad.len(),
+                    bad.get(..bad.len().min(8))
+                );
+                this_tree += skipped;
+            }
+            culled_total += this_tree;
+            trees_culled += usize::from(this_tree > 0);
+        }
+        println!("random trees: {trees_culled}/{trees} culled, {culled_total} folds skipped");
+        assert!(
+            trees_culled >= trees / 10,
+            "the generator must exercise culling"
+        );
+    }
+
+    /// Every PSD/PSB of the psd-tools corpus Aurora can open, exported with
+    /// and without culling: bit-identical.
+    #[test]
+    fn occlusion_cull_matches_uncull_on_the_psd_corpus() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpora/psd/reference");
+        if !root.exists() {
+            println!("SKIPPED: corpus absent");
+            return;
+        }
+        let mut pending = vec![root];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
+                {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let (mut compared, mut culled_total, mut culled_files) = (0, 0, 0);
+        for path in &files {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let Ok(document) = open_psd_document(&bytes) else {
+                continue;
+            };
+            let (_d, mut store) = store_with_budget(256);
+            let incoming: Vec<_> = document
+                .pixels
+                .iter()
+                .map(|p| (p.layer, &p.image, p.offset))
+                .collect();
+            let (_freed, failed) = replace_document_pixels(
+                &mut store,
+                aurora_doc::LayerTree::new(),
+                aurora_doc::History::new(),
+                &document.layers,
+                &incoming,
+                &document.masks,
+            );
+            if failed > 0 {
+                continue;
+            }
+            let size = document.canvas_size;
+            let plain = export(&document.layers, &mut store, size, false);
+            let before = culled_folds();
+            let culled = export(&document.layers, &mut store, size, true);
+            let skipped = culled_folds() - before;
+            match (plain, culled) {
+                (Ok(plain), Ok(culled)) => {
+                    let bad = mismatches(&culled, &plain);
+                    assert!(
+                        bad.is_empty(),
+                        "{}: {} samples differ, first {:?}",
+                        path.display(),
+                        bad.len(),
+                        bad.get(..bad.len().min(8))
+                    );
+                }
+                (plain, culled) => {
+                    assert_eq!(plain.is_ok(), culled.is_ok(), "{}", path.display());
+                }
+            }
+            compared += 1;
+            culled_total += skipped;
+            culled_files += usize::from(skipped > 0);
+        }
+        println!(
+            "corpus: {compared} of {} files compared, {culled_files} culled, {culled_total} folds skipped",
+            files.len()
+        );
+        assert!(compared > 100, "the harness opened {compared} files");
+        assert!(culled_files > 0, "some corpus file culls");
+    }
+
+    /// The user's Nyepi template (`AURORA_EFFECTS_PSD`): culled export
+    /// bit-identical to the uncull'd one.
+    #[test]
+    #[ignore = "needs a local PSD named by AURORA_EFFECTS_PSD"]
+    fn occlusion_cull_matches_uncull_on_nyepi() {
+        let Some(path) = std::env::var_os("AURORA_EFFECTS_PSD") else {
+            println!("SKIPPED: AURORA_EFFECTS_PSD not set");
+            return;
+        };
+        let bytes = ok(std::fs::read(&path));
+        let document = ok(open_psd_document(&bytes));
+        let (_d, mut store) = store_with_budget(TILE_BUDGET);
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+            &document.masks,
+        );
+        assert_eq!(failed, 0);
+        drop(incoming);
+        let size = document.canvas_size;
+        let plain = ok(export(&document.layers, &mut store, size, false));
+        let before = culled_folds();
+        let culled = ok(export(&document.layers, &mut store, size, true));
+        let skipped = culled_folds() - before;
+        let bad = mismatches(&culled, &plain);
+        println!(
+            "NYEPI cull differential: {} samples, {} differ, {skipped} folds culled",
+            plain.len(),
+            bad.len()
+        );
+        for (i, c, p) in bad.iter().take(16) {
+            let texel = i / 4;
+            println!(
+                "  texel ({}, {}) channel {}: culled {c:#06x} uncull'd {p:#06x}",
+                texel % size.0 as usize,
+                texel / size.0 as usize,
+                i % 4
+            );
+        }
+        assert!(bad.is_empty());
+        assert!(skipped > 0);
     }
 }
