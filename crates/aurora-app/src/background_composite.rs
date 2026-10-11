@@ -34,7 +34,7 @@
 //! code, and each tile's result is a pure function of the mirror's
 //! content and the job's tree: bit-identical to the sequential fold. The
 //! pool's threads share one drop-shadow coverage cache
-//! ([`crate::SharedShadowCache`], one `SHADOW_CACHE_BYTES` cap for the
+//! ([`crate::SharedShadowCache`], one `small_machine::shadow_cache_bytes` cap for the
 //! whole pool, keyed by the mirror's serial); Curves LUTs and scratch
 //! buffers stay per thread (bounded, see the addendum).
 //!
@@ -193,6 +193,9 @@ pub(crate) struct CompositeWorker {
 pub(crate) struct TestHooks {
     pub(crate) threads: Arc<Mutex<HashSet<std::thread::ThreadId>>>,
     pub(crate) before_tile: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The entry cap of the shared drop-shadow cache the worker made
+    /// (0.192.0); zero until its thread has started.
+    pub(crate) shadow_cap_entries: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for CompositeWorker {
@@ -249,6 +252,14 @@ impl CompositeWorker {
     #[must_use]
     pub(crate) fn threads_used(&self) -> usize {
         self.hooks.threads.lock().map_or(0, |threads| threads.len())
+    }
+
+    /// Test-only: the entry cap of the worker's shared drop-shadow cache
+    /// (zero until its thread has started).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn shadow_cap_entries(&self) -> usize {
+        self.hooks.shadow_cap_entries.load(Ordering::SeqCst)
     }
 
     /// Whether a job is in flight.
@@ -353,13 +364,22 @@ impl CompositeWorker {
         let composited = Arc::clone(&self.composited);
         let mirror_resident = Arc::clone(&self.mirror_resident);
         let threads = self.threads;
+        // Read here, on the caller's thread (0.192.0): a test's forced
+        // machine size is per thread, and the answer is the same for the
+        // whole process in the app.
+        let shadow_bytes = crate::small_machine::shadow_cache_bytes();
         #[cfg(test)]
         let hooks = self.hooks.clone();
         let spawned = std::thread::Builder::new()
             .name("aurora-composite".into())
             .spawn(move || {
                 // One drop-shadow cache for this thread and the whole pool.
-                let shadows = crate::SharedShadowCache::default();
+                let shadows = crate::new_shared_shadow_cache(shadow_bytes);
+                #[cfg(test)]
+                hooks.shadow_cap_entries.store(
+                    shadows.lock().map_or(0, |cache| cache.cap_entries()),
+                    Ordering::SeqCst,
+                );
                 crate::use_shared_shadow_cache(Some(Arc::clone(&shadows)));
                 let pool = build_pool(threads, &shadows);
                 let context = WorkerContext {

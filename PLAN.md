@@ -26,7 +26,73 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.191.1): the `masks.psd` Stroke residual is explained
+**Latest (2026-10-11, 0.192.0): bounds for small machines — a machine with
+4 or fewer cores or 8 GiB or less of RAM gets a 64 MiB effects cache and no
+encode/decode overlap on a PSD open.**
+- **Decision (design owner, Cahya, 2026-10-11, #2).** "Mirror memory on
+  small machines: bound it. The mirror keeps sharing the document's pool.
+  Machines with ≤ 4 cores or ≤ 8 GiB RAM get a smaller shadow cache and no
+  overlap." ADR 0012 has an addendum; the pool shares (ADR 0011) and the
+  thread counts are untouched.
+- **The function.** `aurora-app`'s new `small_machine` module:
+  `small_machine(cores, ram: Option<u64>) -> bool` is
+  `cores <= SMALL_MACHINE_MAX_CORES (4) || ram.is_none_or(|r| r <= SMALL_MACHINE_MAX_RAM_BYTES (8 GiB))`.
+  `is_small_machine()` reads `available_parallelism` (unreadable = 1 core)
+  and `aurora_tile::physical_ram_bytes()` (unreadable = small) once into a
+  `OnceLock` and logs the result; no new platform code.
+- **Override.** `AURORA_SMALL_MACHINE`: `0`/`false`/`off`/`no` force large,
+  any other non-empty value forces small, unset detects. **One deliberate
+  difference from `AURORA_REQUIRE_GPU`'s parsing: an empty (or blank) value
+  means detect, not off**, so an empty `${{ }}` expansion cannot force a
+  small machine large. `override_from_value` is pure and tested.
+- **What is bounded.** (1) The drop-shadow/stroke/glow coverage cache
+  (`ShadowCache`): 64 MiB (256 tiles) on a small machine, 256 MiB (1,024)
+  otherwise, for the worker's shared cache (read when its thread starts) and
+  each thread's own (on first use). The cap is held in whole tiles, at least
+  one (`ShadowCache::with_cap_bytes`): before, a cap under one tile would
+  have evicted down to nothing on every insert; now it keeps one entry.
+  (2) `PreparedPsd::stream` does not overlap a layer's tile encode with the
+  next layer's decode (`stream_with_options`' `overlap` flag, off on a small
+  machine; the pool still spreads the encode over `composite_threads()`
+  threads). `OpenTimings::overlapped_layers` counts the overlap so a test can
+  see it.
+- **Pixels unchanged.** Tests (all new, all headless): the pure function on
+  4 vs 5 cores, 8 GiB - 1 / 8 GiB / 8 GiB + 1, RAM `None`, either limit
+  alone; the override parser and its precedence; the default cache's cap
+  forced either way and `with_cap_bytes` at 0, 1, one tile - 1, one tile, two
+  tiles; a layered shadow + outside stroke + outer glow composite over a 3 x 3
+  tile grid is bit-identical at 256 MiB, 64 MiB, three tiles, one tile and
+  zero bytes of cache, held no more entries than the cap and recomputed more
+  at the tiny caps (eviction works); a 0-byte cache holds one entry and keeps
+  its order index in step; the worker's shared cache cap is 256 / 1,024
+  forced small / large; the worker-equals-sync tests (plain, evicted
+  sources, strokes, glows, several threads, two documents) and the shadow,
+  stroke and glow seam/cache tests re-run with the machine forced small; the
+  noisy 8- and 16-bit PSDs and Nyepi's recorded 0.188.0 tile fingerprint
+  come out the same with the overlap off, with `overlapped_layers` 4 vs 0;
+  `PreparedPsd::stream` follows the forced machine size.
+- **Test hook.** `small_machine::force_small_machine(bool)` (test-only, a
+  guard) forces the answer on the calling thread; code on other threads is
+  handed the answer by a caller on that thread (the worker's cap and the
+  open's flag are), so no test depends on the CI machine's size or on
+  process-global state.
+- **Gate.** 3,589 tests pass (`AURORA_REQUIRE_GPU=1`, RTX 3090; 0 failed,
+  72 ignored), 33 more than 0.191.1's 3,556. Fifteen mutations (thresholds off
+  by one both ways on both limits, detection failure as large, unreadable
+  cores as many, the overlap check and `stream` ignoring the flag, the shadow
+  cap ignoring the flag in `shadow_cache_bytes_for`, `shadow_cache_bytes`, the
+  worker and the default cache, the one-tile minimum, `insert` ignoring the
+  cap) were each killed by a new test.
+- **Known weaknesses.** Not measured on a real small machine: neither the
+  memory saved nor the recomposite and open time it costs. On a 2-core
+  machine the worker's pool already has one thread, which ADR 0012 measured
+  about 25 % slower than 0.187.0's sequential fold; unchanged. A cap read
+  once at cache creation means the `AURORA_SMALL_MACHINE` change needs a
+  restart. The 8 GiB threshold counts RAM reported by the OS, not what is
+  free. The UI thread's own cache is a separate cache from the worker's, so a
+  small machine still holds up to 128 MiB of coverage, not 64.
+
+**Previously (2026-10-11, 0.191.1): the `masks.psd` Stroke residual is explained
 and fixed — a knockout drop shadow is also hidden under the layer's Outside
 (or Center) stroke ring.**
 - **Diagnosis (measured).** `corpora/psd/reference/psd-tools-fixtures/masks.psd`,

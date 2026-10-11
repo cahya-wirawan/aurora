@@ -234,3 +234,75 @@ fn the_pool_encodes_a_layers_tiles_in_the_sequential_order() {
         crate::prepared_pixels::encode_layer_tiles(pool.as_deref(), &image, u32::MAX, 0).is_err()
     );
 }
+
+/// The fingerprint and the overlapped-layer count of one streamed open.
+fn overlap_fingerprint(
+    path: &std::path::Path,
+    threads: usize,
+    overlap: bool,
+) -> ((u64, usize), usize) {
+    let (_dir, store) = new_store();
+    let document = ok(crate::PreparedPsd::stream_with_options(
+        path,
+        Some(&store.staging_root()),
+        threads,
+        overlap,
+    ));
+    (fingerprint(&document), document.timings.overlapped_layers)
+}
+
+/// 0.192.0: a small machine encodes each layer in place; the tiles are the
+/// overlapped open's, byte for byte, and the overlap really is off.
+#[test]
+fn a_noisy_psd_streams_to_the_same_tiles_with_the_overlap_off() {
+    for depth in [8_u16, 16] {
+        let dir = ok(tempfile::tempdir());
+        let path = dir.path().join("noisy.psd");
+        ok(crate::tests::write_noisy_psd(&path, 600, depth));
+        let (overlapped, overlapped_layers) = overlap_fingerprint(&path, 4, true);
+        let (in_place, in_place_layers) = overlap_fingerprint(&path, 4, false);
+        assert!(overlapped.1 > 0);
+        // Four layers: each one that decodes while the last still encodes
+        // is overlapped (all four are, the pool being there).
+        assert_eq!(overlapped_layers, 4, "{depth}-bit: the overlap ran");
+        assert_eq!(in_place_layers, 0, "{depth}-bit: the overlap is off");
+        assert_eq!(in_place, overlapped, "{depth}-bit: tiles");
+        // And against no pool at all, the old sequential open.
+        assert_eq!(overlap_fingerprint(&path, 1, true).0, overlapped);
+    }
+}
+
+/// `PreparedPsd::stream` — the open's real entry — follows the machine:
+/// no overlap when it is small, the same tiles either way.
+#[test]
+fn the_real_open_overlaps_only_on_a_large_machine_and_never_changes_a_tile() {
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("noisy.psd");
+    ok(crate::tests::write_noisy_psd(&path, 600, 16));
+    let open = |small: bool| {
+        let _guard = crate::small_machine::force_small_machine(small);
+        let (_dir, store) = new_store();
+        let document = ok(crate::PreparedPsd::stream(
+            &path,
+            Some(&store.staging_root()),
+        ));
+        (fingerprint(&document), document.timings.overlapped_layers)
+    };
+    let (small, small_overlapped) = open(true);
+    let (large, _large_overlapped) = open(false);
+    assert_eq!(small_overlapped, 0, "a small machine encodes in place");
+    assert_eq!(small, large);
+}
+
+/// 0.192.0: the user's template opens to the recorded 0.188.0 tiles with
+/// the overlap off, as on a small machine.
+#[test]
+fn nyepi_tiles_are_the_0_188_0_tiles_with_the_overlap_off() {
+    let Some(path) = nyepi_path() else {
+        println!("SKIPPED: the Nyepi template is not present");
+        return;
+    };
+    let (in_place, overlapped_layers) = overlap_fingerprint(&path, 7, false);
+    assert_eq!(overlapped_layers, 0);
+    assert_eq!(in_place, NYEPI_FINGERPRINT_0_188_0);
+}

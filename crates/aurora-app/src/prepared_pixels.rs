@@ -36,6 +36,10 @@
 //!   +4,352 MiB for the 0.153.0 path. Every user mask's coverage is still
 //!   held until its layer is handed on, and a tile whose staging write
 //!   fails stays in memory ([`PreparedTile::Memory`]).
+//! - **Small machines (0.192.0).** On a machine with 4 or fewer cores or 8 GiB
+//!   or less of RAM ([`crate::small_machine`]) a layer's tiles are never
+//!   encoded on the pool while the next layer decodes; each layer encodes in
+//!   place first. The tiles are the same.
 
 use std::path::Path;
 
@@ -152,6 +156,10 @@ pub(crate) struct OpenTimings {
     pub(crate) total: std::time::Duration,
     /// Tiles the sink produced.
     pub(crate) tiles: usize,
+    /// Layers whose tiles were encoded on the pool while the next layer
+    /// decoded (0.192.0): zero on a small machine, where the overlap is
+    /// off.
+    pub(crate) overlapped_layers: usize,
 }
 
 impl PreparedPsd {
@@ -233,21 +241,39 @@ impl PreparedPsd {
         path: &Path,
         staging: Option<&StagingRoot>,
     ) -> Result<Self, crate::OpenFailure> {
-        Self::stream_with_threads(
+        Self::stream_with_options(
             path,
             staging,
             crate::background_composite::composite_threads(),
+            crate::small_machine::overlap_allowed(),
         )
     }
 
-    /// [`Self::stream`] with each layer's tiles encoded on `encode_threads`
-    /// threads (0.189.0; one or none encodes on the decode thread itself).
-    /// The tiles are the same, in the same order, for any count — the
-    /// tests pin that.
+    /// [`Self::stream_with_options`] with the overlap on, for the tests
+    /// that vary the thread count.
+    #[cfg(test)]
     pub(crate) fn stream_with_threads(
         path: &Path,
         staging: Option<&StagingRoot>,
         encode_threads: usize,
+    ) -> Result<Self, crate::OpenFailure> {
+        Self::stream_with_options(path, staging, encode_threads, true)
+    }
+
+    /// [`Self::stream`] with each layer's tiles encoded on `encode_threads`
+    /// threads (0.189.0; one or none encodes on the decode thread itself)
+    /// and, when `overlap` is set, a layer small enough
+    /// ([`OVERLAP_IMAGE_BYTES`]) encoding on the pool while the next one
+    /// decodes. A small machine ([`crate::small_machine`], 0.192.0) passes
+    /// `false`: each layer then encodes in place, as before 0.189.0, so
+    /// the decoded images never sit beside an encoding layer. The tiles
+    /// are the same, in the same order, for any count and either setting —
+    /// the tests pin that.
+    pub(crate) fn stream_with_options(
+        path: &Path,
+        staging: Option<&StagingRoot>,
+        encode_threads: usize,
+        overlap: bool,
     ) -> Result<Self, crate::OpenFailure> {
         let file = std::fs::File::open(path).map_err(|err| {
             tracing::warn!(path = %path.display(), %err, "failed to open the chosen file");
@@ -267,6 +293,7 @@ impl PreparedPsd {
         let started = std::time::Instant::now();
         let mut sink = StreamSink {
             pool: build_encode_pool(encode_threads),
+            overlap,
             in_flight: None,
             area,
             pixels: Vec::new(),
@@ -336,6 +363,9 @@ struct StreamSink {
     /// The pool a layer's tiles are encoded on; `None` encodes on the
     /// decode thread.
     pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    /// Whether a layer may encode on the pool while the next one decodes
+    /// (off on a small machine, 0.192.0).
+    overlap: bool,
     /// The layer encoding on the pool while the next one decodes.
     in_flight: Option<InFlight>,
     area: Option<StagingArea>,
@@ -428,7 +458,8 @@ impl aurora_io::PsdPixelSink for StreamSink {
             .samples()
             .len()
             .saturating_mul(std::mem::size_of::<half::f16>());
-        if let (Some(pool), true) = (&self.pool, bytes <= OVERLAP_IMAGE_BYTES) {
+        if let (Some(pool), true, true) = (&self.pool, self.overlap, bytes <= OVERLAP_IMAGE_BYTES) {
+            self.timings.overlapped_layers += 1;
             let (send, result) = std::sync::mpsc::channel();
             let task_pool = std::sync::Arc::clone(pool);
             let aurora_io::PsdPixels { layer, image, .. } = placed;
