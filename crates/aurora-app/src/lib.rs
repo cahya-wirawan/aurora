@@ -22380,9 +22380,13 @@ const TILE_BUDGET: usize = 256;
 /// quarter of physical RAM between 128 MiB and 8 GiB, or
 /// `AURORA_TILE_BUDGET_MB` clamped to that range, computed once. Every
 /// document's store joins it through [`open_tile_store`], so the open
-/// documents share it — each holds `max(floor, total / open stores)` —
-/// and a closed document's share goes back to the rest at once. A parked
-/// document shrinks when the event loop's `about_to_wait` calls
+/// documents share it, and a closed document's share goes back to the
+/// rest at once. Since 0.187.0 the active document (with its background
+/// compositor's mirror) holds three quarters and the parked ones, a
+/// pending open among them, split the last quarter, each floored
+/// ([`aurora_tile::pool_shares`]; moved by
+/// [`document_session::hand_tile_pool_over`]). A parked document shrinks
+/// when the event loop's `about_to_wait` calls
 /// [`document_session::DocumentShelf::enforce_tile_budgets`].
 fn tile_pool() -> &'static std::sync::Arc<aurora_tile::ResidencyPool> {
     static POOL: std::sync::OnceLock<std::sync::Arc<aurora_tile::ResidencyPool>> =
@@ -23939,6 +23943,9 @@ impl App {
             &mut app.shelf,
             &app.doc,
         );
+        // 0.187.0: the startup document holds the residency pool's active
+        // share; crash-recovered documents start parked.
+        let _ = app.doc.claim_active_tile_share();
         app
     }
 
@@ -28526,6 +28533,12 @@ impl ApplicationHandler<AppEvent> for App {
         // `EVICTION_BURST` tiles per store per turn (review RB-1), and
         // the loop does not sleep while any store is still over. A
         // comparison per store when nothing changed.
+        //
+        // 0.187.0: every change of the active document already moves the
+        // pool's active share (`document_session::hand_tile_pool_over`);
+        // re-claiming it here, a lock and a store, is the backstop that
+        // keeps it on the active document whatever path changed it.
+        let _ = self.doc.claim_active_tile_share();
         let (evicted, over) = self
             .shelf
             .enforce_tile_budgets(&mut self.doc, aurora_tile::EVICTION_BURST);

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use aurora_core::Rect;
 use lru::LruCache;
 
-use crate::budget::{EVICTION_BURST, PoolMembership, ResidencyPool};
+use crate::budget::{EVICTION_BURST, PoolGroup, PoolMembership, ResidencyPool};
 use crate::codec;
 use crate::error::TileError;
 use crate::staging::{StagedTile, StagingRoot};
@@ -739,6 +739,23 @@ impl TileStore {
         // On an error the membership is dropped with the half-built
         // value, so a store that fails to open leaves at once.
         Self::with_budget(scratch_dir, Budget::Shared(pool.join()))
+    }
+
+    /// Like [`Self::new_shared`], but the store joins `group` rather than
+    /// a group of its own (0.187.0): the background compositor's mirror
+    /// joins its document's group ([`Self::pool_group`]), so it is active
+    /// exactly when its document is, and the two split the active share.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]. A store that fails to open does not stay a
+    /// member.
+    pub fn new_shared_in(
+        scratch_dir: PathBuf,
+        pool: &Arc<ResidencyPool>,
+        group: PoolGroup,
+    ) -> Result<Self, TileError> {
+        Self::with_budget(scratch_dir, Budget::Shared(pool.join_group(group)))
     }
 
     fn with_budget(scratch_dir: PathBuf, budget: Budget) -> Result<Self, TileError> {
@@ -1521,8 +1538,6 @@ impl TileStore {
         self.resident.len()
     }
 
-    /// How many tiles may be resident right now (0.185.0): the fixed
-    /// budget, or this store's current share of its pool.
     /// The residency pool this store is a member of, if it was built with
     /// [`TileStore::new_shared`] (0.186.0: the background compositor's
     /// mirror joins the same pool, so the two stores' budgets are shares
@@ -1535,6 +1550,54 @@ impl TileStore {
         }
     }
 
+    /// The pool group this store belongs to, if it is pooled (0.187.0).
+    #[must_use]
+    pub fn pool_group(&self) -> Option<PoolGroup> {
+        match &self.budget {
+            Budget::Fixed(_) => None,
+            Budget::Shared(membership) => Some(membership.group()),
+        }
+    }
+
+    /// Makes this store's group the pool's active one (0.187.0; see
+    /// [`ResidencyPool::activate`]): the store and any mirror in its
+    /// group get the active share, and whichever group was active is
+    /// parked. Nothing is evicted here. Returns whether the store is
+    /// pooled.
+    #[must_use = "false means the store is not pooled and nothing was activated"]
+    pub fn activate_pool_group(&self) -> bool {
+        match &self.budget {
+            Budget::Fixed(_) => false,
+            Budget::Shared(membership) => {
+                membership.pool().activate(membership.group());
+                true
+            }
+        }
+    }
+
+    /// Parks this store's group if it is the pool's active one (0.187.0;
+    /// see [`ResidencyPool::deactivate`]). Returns whether it was.
+    #[must_use = "whether the group was the active one"]
+    pub fn deactivate_pool_group(&self) -> bool {
+        match &self.budget {
+            Budget::Fixed(_) => false,
+            Budget::Shared(membership) => membership.pool().deactivate(membership.group()),
+        }
+    }
+
+    /// Whether this store's group is its pool's active one (0.187.0).
+    #[must_use]
+    pub fn is_pool_active(&self) -> bool {
+        match &self.budget {
+            Budget::Fixed(_) => false,
+            Budget::Shared(membership) => {
+                membership.pool().active_group() == Some(membership.group())
+            }
+        }
+    }
+
+    /// How many tiles may be resident right now (0.185.0): the fixed
+    /// budget, or this store's current share of its pool.
     #[must_use]
     pub fn budget_tiles(&self) -> usize {
         self.budget.tiles()
@@ -5626,5 +5689,58 @@ mod pool_tests {
             assert!(next < 400, "no progress");
         }
         assert_eq!(a.resident_len(), a.budget_tiles());
+    }
+
+    /// 0.187.0: activating a store's group moves the bigger share to it
+    /// at once; the store it moved from, parked, shrinks only through
+    /// `enforce_budget`'s ordinary eviction path, and every pixel comes
+    /// back. A mirror joined in the active store's group splits that
+    /// share with it, and the shares of all three stay within the total.
+    #[test]
+    fn a_switch_moves_the_bigger_share_and_the_parked_store_shrinks_without_loss() {
+        let pool = ResidencyPool::new(nz(16), nz(2));
+        let (_da, mut a) = shared(&pool);
+        let (_db, b) = shared(&pool);
+        assert!(a.activate_pool_group());
+        assert!(a.is_pool_active() && !b.is_pool_active());
+        assert_eq!((a.budget_tiles(), b.budget_tiles()), (12, 4));
+        let s = SurfaceId::from_raw(0);
+        paint(&mut a, s, 12);
+        assert_eq!((a.resident_len(), a.stats().evictions), (12, 0));
+
+        // The switch: b active, a parked.
+        assert!(b.activate_pool_group());
+        assert!(b.is_pool_active() && !a.is_pool_active());
+        assert_eq!((a.budget_tiles(), b.budget_tiles()), (4, 12));
+        assert!(
+            a.over_budget(),
+            "a admits nothing, so it waits for enforcement"
+        );
+        assert_eq!(a.enforce_budget(usize::MAX), 8);
+        assert_eq!(a.resident_len(), 4);
+        assert!(reads_back(&mut a, s, 12), "the shrink lost nothing");
+
+        // b's mirror joins b's group: the two split the active share.
+        let Some(group) = b.pool_group() else {
+            unreachable!("pooled")
+        };
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mirror = match TileStore::new_shared_in(dir.path().to_path_buf(), &pool, group) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(mirror.is_pool_active());
+        assert_eq!(
+            (b.budget_tiles(), mirror.budget_tiles(), a.budget_tiles()),
+            (6, 6, 4)
+        );
+        assert!(b.budget_tiles() + mirror.budget_tiles() + a.budget_tiles() <= 16);
+        // Parking b parks its mirror with it.
+        assert!(b.deactivate_pool_group());
+        assert!(!mirror.is_pool_active());
+        assert!(!b.deactivate_pool_group(), "only the active group parks");
     }
 }

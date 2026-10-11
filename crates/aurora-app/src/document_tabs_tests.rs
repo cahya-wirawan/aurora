@@ -2701,6 +2701,167 @@ fn open_documents_share_the_tile_budget_and_a_parked_one_shrinks_without_loss() 
     assert_eq!(shelf.enforce_tile_budgets(&mut active, 64), (0, false));
 }
 
+/// A one-layer session whose store is a member of `pool`, with `tiles`
+/// tiles of its layer painted (each a distinct solid colour).
+fn pooled_session(
+    name: &str,
+    tiles: u32,
+    dir: &tempfile::TempDir,
+    pool: &std::sync::Arc<aurora_tile::ResidencyPool>,
+) -> (DocumentSession, aurora_tile::SurfaceId) {
+    let (mut session, ids) = session(name, 1, [0.0, 0.0, 0.0, 0.0], dir);
+    let Some(&layer) = ids.first() else {
+        unreachable!("one layer")
+    };
+    let surface = surface_id_for(layer);
+    let Ok(sub) = tempfile::tempdir_in(dir.path()) else {
+        unreachable!("a scratch subdirectory")
+    };
+    let mut store = match aurora_tile::TileStore::new_shared(sub.keep(), pool) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    for x in 0..tiles {
+        let v = x as f32 / 16.0;
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x, y: 0 },
+            [v, 0.5, 1.0 - v, 1.0],
+        );
+    }
+    session.tile_store = Some(store);
+    (session, surface)
+}
+
+/// Every open session in `rig` whose store holds the pool's active share.
+fn active_share_holders(rig: &Rig) -> Vec<DocumentId> {
+    std::iter::once(&rig.doc)
+        .chain(rig.shelf.parked.iter())
+        .filter(|session| {
+            session
+                .tile_store
+                .as_ref()
+                .is_some_and(aurora_tile::TileStore::is_pool_active)
+        })
+        .map(|session| session.id)
+        .collect()
+}
+
+fn budget_of(session: &DocumentSession) -> usize {
+    session
+        .tile_store
+        .as_ref()
+        .map_or(0, aurora_tile::TileStore::budget_tiles)
+}
+
+/// 0.187.0: the active document holds the pool's bigger share (three
+/// quarters; the parked split the last quarter), and every change of the
+/// active document — an open's install, a switch, a reverted open, a
+/// close — moves it, so exactly one open document holds it. A pending
+/// open's store counts as a parked member. The document switched away
+/// from shrinks through the ordinary eviction path and loses nothing.
+#[test]
+fn the_active_document_holds_the_bigger_share_through_open_switch_and_close() {
+    let Some(total) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("non-zero")
+    };
+    let pool = aurora_tile::ResidencyPool::new(total, std::num::NonZeroUsize::MIN);
+    let (dir_a, dir_b, dir_c) = (tempdir(), tempdir(), tempdir());
+    let (a, surface_a) = pooled_session("A", 12, &dir_a, &pool);
+    let a_id = a.id;
+    let mut rig = Rig::new(a);
+    // App::new's claim for the startup document.
+    assert!(rig.doc.claim_active_tile_share());
+    assert_eq!(active_share_holders(&rig), [a_id]);
+    assert_eq!(budget_of(&rig.doc), 16, "alone, the whole pool");
+    let expected: Vec<Vec<f32>> = {
+        let Some(store) = rig.doc.tile_store.as_mut() else {
+            unreachable!("a store")
+        };
+        (0..12)
+            .map(|x| read_all_texels(store, surface_a, aurora_tile::TileId { x, y: 0 }))
+            .collect()
+    };
+
+    // A pending open's store is a parked member: A keeps the bigger share.
+    let (b, _) = pooled_session("B", 0, &dir_b, &pool);
+    let b_id = b.id;
+    assert_eq!(
+        (pool.members(), budget_of(&rig.doc), budget_of(&b)),
+        (2, 12, 4)
+    );
+    assert_eq!(active_share_holders(&rig), [a_id]);
+
+    // Its install moves the bigger share to B; A, parked, shrinks
+    // through eviction to its quarter and reads back bit for bit.
+    let _ = rig.open(b);
+    assert_eq!(rig.doc.id, b_id);
+    assert_eq!(active_share_holders(&rig), [b_id]);
+    assert_eq!((budget_of(&rig.doc), budget_of(rig.parked(a_id))), (12, 4));
+    let (evicted, over) = rig.shelf.enforce_tile_budgets(&mut rig.doc, usize::MAX);
+    assert_eq!((evicted, over), (8, false));
+    {
+        let Some(store) = rig
+            .shelf
+            .parked
+            .iter_mut()
+            .find(|session| session.id == a_id)
+            .and_then(|session| session.tile_store.as_mut())
+        else {
+            unreachable!("A is parked with its store")
+        };
+        assert_eq!(store.resident_len(), 4);
+        for (x, want) in (0..12).zip(&expected) {
+            let got = read_all_texels(store, surface_a, aurora_tile::TileId { x, y: 0 });
+            assert!(
+                got.iter()
+                    .zip(want)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "tile {x} round-trips after the shrink"
+            );
+        }
+        // Reading every tile back paged them in; the parked store is
+        // brought inside its quarter again.
+        let _ = store.enforce_budget(usize::MAX);
+    }
+
+    // A switch moves it back.
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Switched);
+    assert_eq!(active_share_holders(&rig), [a_id]);
+    assert_eq!((budget_of(&rig.doc), budget_of(rig.parked(b_id))), (12, 4));
+
+    // An open that failed after its session went active is reverted:
+    // the share returns to A, and C's store leaves the pool.
+    let (c, _) = pooled_session("C", 0, &dir_c, &pool);
+    let parked_at = rig.open(c);
+    assert_eq!(active_share_holders(&rig), [rig.doc.id]);
+    assert_ne!(rig.doc.id, a_id);
+    let abandoned = rig.shelf.revert_push(&mut rig.doc, parked_at);
+    assert!(abandoned.is_some());
+    drop(abandoned);
+    assert_eq!(rig.doc.id, a_id);
+    assert_eq!(active_share_holders(&rig), [a_id]);
+    assert_eq!(pool.members(), 2);
+
+    // Closing the active document: B, the neighbour, takes the share
+    // (alone now, the whole pool).
+    let Some(closed) = close::close_document(&mut rig.cx(None), a_id, None) else {
+        unreachable!("A closes")
+    };
+    assert_eq!(active_share_holders(&rig), [b_id]);
+    assert!(
+        !closed
+            .tile_store
+            .as_ref()
+            .is_some_and(aurora_tile::TileStore::is_pool_active),
+        "the closed document no longer holds it"
+    );
+    drop(closed);
+    assert_eq!((pool.members(), budget_of(&rig.doc)), (1, 16));
+    assert_eq!(pool.active_members(), 1);
+}
+
 /// 0.185.0 review RB-3: residency never changes a pixel. A six-tile
 /// document of Normal, Multiply and Screen layers (one in a group, two
 /// translucent) composites bit-identically through a two-tile fixed

@@ -906,6 +906,67 @@ fn the_mirror_shares_the_documents_pool_budget() {
     worker.shutdown();
 }
 
+/// 0.187.0: the mirror joins its document's pool group, so with the
+/// document active the two split the active share (three quarters of the
+/// pool) while a parked document's quarter does not move; the three
+/// stores' resident tiles stay within the pool's total, and the result
+/// is still bit-identical while both active stores page.
+#[test]
+fn the_mirror_splits_its_documents_active_share_and_the_parked_share_holds() {
+    let (dir, parked_dir) = (ok(tempfile::tempdir()), ok(tempfile::tempdir()));
+    let (Some(total), Some(floor)) = (
+        std::num::NonZeroUsize::new(32),
+        std::num::NonZeroUsize::new(4),
+    ) else {
+        unreachable!("non-zero");
+    };
+    let pool = aurora_tile::ResidencyPool::new(total, floor);
+    let parked = ok(aurora_tile::TileStore::new_shared(
+        parked_dir.path().to_path_buf(),
+        &pool,
+    ));
+    let mut store = ok(aurora_tile::TileStore::new_shared(
+        dir.path().to_path_buf(),
+        &pool,
+    ));
+    assert!(store.activate_pool_group());
+    assert_eq!((store.budget_tiles(), parked.budget_tiles()), (24, 8));
+    let (layers, size) = fixture(&mut store);
+    let tiles = grid(size);
+    assert!(
+        store.held_tile_versions().len() > 24,
+        "the document exceeds its active share"
+    );
+    let mut worker = CompositeWorker::new(noop_waker());
+    let mut cache = CompositeCache::default();
+    assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+    assert_eq!(pool.members(), 3, "the mirror is a pool member");
+    assert_eq!(
+        pool.active_members(),
+        2,
+        "the mirror joined its document's active group"
+    );
+    assert_eq!(
+        (store.budget_tiles(), parked.budget_tiles()),
+        (12, 8),
+        "the document and its mirror split the active share; the parked quarter holds"
+    );
+    let _ = worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT);
+    let _ = store.enforce_budget(usize::MAX);
+    let both = store.resident_len() + worker.mirror_resident();
+    assert!(
+        both <= 24,
+        "UI {} + mirror {} resident tiles exceed the active share of 24",
+        store.resident_len(),
+        worker.mirror_resident()
+    );
+    assert!(both + parked.resident_len() <= total.get());
+    let have = read_composite(&mut store, &tiles);
+    let want = sync_composite(&layers, &mut store, &tiles);
+    assert_same(&have, &want, "paging mirror at the active share");
+    worker.shutdown();
+}
+
 /// Resident and peak resident set of this process, in MiB (Linux only).
 fn rss_mib() -> (u64, u64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -999,6 +1060,103 @@ fn nyepi_mirror_memory_and_first_dispatch_at_2048() {
         assert!(
             peak_tiles <= total + 256,
             "UI + mirror within the pool plus one floor"
+        );
+        worker.shutdown();
+    }
+}
+
+/// 0.187.0 measurement on the real template: the background composite
+/// of the whole view with one parked document open, at a 4 GiB
+/// machine's 2,048-tile pool, under the 0.186.0 equal split (no group
+/// active) against the active share (the document and its mirror split
+/// three quarters). Prints the shares, the mirror's residency, and the
+/// first and a warm (after an opacity edit) job's time to final pixels.
+#[test]
+#[ignore = "needs a local PSD named by AURORA_EFFECTS_PSD"]
+fn nyepi_active_share_against_the_equal_split_at_2048() {
+    let Some(path) = std::env::var_os("AURORA_EFFECTS_PSD") else {
+        println!("SKIPPED: AURORA_EFFECTS_PSD not set");
+        return;
+    };
+    // The CI rule: skip when no such file is present, not only when the
+    // variable is unset.
+    if !std::path::Path::new(&path).is_file() {
+        println!("SKIPPED: AURORA_EFFECTS_PSD names no file");
+        return;
+    }
+    let bytes = ok(std::fs::read(&path));
+    for active in [false, true] {
+        let document = ok(open_psd_document(&bytes));
+        let (dir, parked_dir) = (ok(tempfile::tempdir()), ok(tempfile::tempdir()));
+        let (Some(total), Some(floor)) = (
+            std::num::NonZeroUsize::new(2_048),
+            std::num::NonZeroUsize::new(256),
+        ) else {
+            unreachable!("non-zero");
+        };
+        let pool = aurora_tile::ResidencyPool::new(total, floor);
+        let parked = ok(aurora_tile::TileStore::new_shared(
+            parked_dir.path().to_path_buf(),
+            &pool,
+        ));
+        let mut store = ok(aurora_tile::TileStore::new_shared(
+            dir.path().to_path_buf(),
+            &pool,
+        ));
+        if active {
+            assert!(store.activate_pool_group());
+        }
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+            &document.masks,
+        );
+        assert_eq!(failed, 0);
+        drop(incoming);
+        let mut layers = document.layers;
+        let tiles = grid(document.canvas_size);
+        let mut worker = CompositeWorker::new(noop_waker());
+        let mut cache = CompositeCache::default();
+        let started = Instant::now();
+        assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+        let _ =
+            worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT * 5);
+        let first = started.elapsed();
+        let (ui_share, parked_share) = (store.budget_tiles(), parked.budget_tiles());
+        let top = top_layer(&layers);
+        let mut warm = Vec::new();
+        for opacity in [0.8_f32, 0.6, 0.4] {
+            ok(layers.set_opacity(top, opacity));
+            cache.bump();
+            let started = Instant::now();
+            assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+            let _ = worker
+                .wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT * 5);
+            warm.push(started.elapsed());
+        }
+        println!(
+            "NYEPI share @ 2048 ({}): members {}, active members {}; UI share {ui_share}, mirror \
+             resident {}, parked share {parked_share}; first job {first:?}, warm jobs {warm:?}",
+            if active {
+                "active share"
+            } else {
+                "equal split"
+            },
+            pool.members(),
+            pool.active_members(),
+            worker.mirror_resident(),
+        );
+        assert!(
+            ui_share * 2 + parked_share <= total.get() + floor.get(),
+            "the shares stay within the pool plus one floor"
         );
         worker.shutdown();
     }

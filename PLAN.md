@@ -26,7 +26,108 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.186.0): background CPU compositing, round R3 of
+**Latest (2026-10-11, 0.187.0): the active document gets a bigger share of
+the tile residency pool (design-owner decision, Cahya, 2026-10-11: "the active
+document gets a bigger share", a pending open counts; the weighting is
+engineering's, ADR 0011's 0.187.0 addendum).**
+- **Rule (`aurora_tile::pool_shares`).** Pool members belong to
+  `PoolGroup`s. A document's store is one group, and its background
+  compositor's mirror joins that group (`TileStore::new_shared_in`). At
+  most one group is active (`ResidencyPool::activate` replaces the
+  previous one).
+  - With an active group and parked members: the parked members split
+    `total / 4` (`PARKED_RESERVE_DIVISOR`), each ≥ floor. The active
+    group gets the rest, ≥ three quarters, split evenly between the
+    document and its mirror, each ≥ floor.
+  - With no active group, or nothing parked: the 0.186.0 equal split.
+  - At 16,384/256: alone 16,384; with its mirror 8,192 each; one parked
+    document gets 4,096 against 12,288 for the active one (6,144 each with
+    the mirror). The parked floors only cut into the active part past 16
+    parked documents. On a 4 GiB machine (2,048 tiles) with one parked
+    document and the mirror: 768 / 768 / 512, against the equal split's
+    682 each.
+- **Why a quarter.** The active document's share doesn't erode as more
+  documents are parked. The quarter keeps one parked large document warm
+  for switching back, ADR 0011's reason for rejecting "parked go to the
+  floor": 4,096 tiles, more than Nyepi's ~2,900. An active member never
+  gets less than the equal split.
+- **Bounds (tested, not just argued).** Every share is ≥ floor. The sum is
+  ≤ max(total, members × floor), so ≤ total whenever the floors fit and
+  ≤ total + one floor whenever (members − 1) × floor ≤ total. An active
+  member is ≥ the equal split, and > a parked one whenever
+  `a·(floor+1) + p·floor ≤ total` (a ≤ 2). All of these are checked
+  exhaustively over pools of 1–160 tiles, every floor, 0–3 active and
+  0–12 parked members: 669,760 cases.
+  They hold only for an active group of at most three members (all the
+  app creates); nine active and one parked can sum past total + floor.
+- **Moving it.** `DocumentShelf::swap_in`/`push_active`/`revert_push`/
+  `close_active`, the only places the active session changes, call
+  `document_session::hand_tile_pool_over`. It parks the outgoing group
+  first, so a session without a store leaves no group active, then
+  activates the incoming one.
+  - A switch, an open's install, a reverted open, a close, New Document
+    and the last-close "Untitled" all move it.
+  - `App::new` claims it for the startup document; crash-recovered
+    documents start parked.
+  - `about_to_wait` re-claims it for `App::doc` every turn as a backstop.
+  - A pending open's store is a parked member until its install.
+  - A document whose share shrank is parked and shrinks through the
+    existing per-turn `enforce_tile_budgets` (≤ `EVICTION_BURST` per turn).
+- **Tests (9 new, plus 1 ignored).**
+  - `aurora-tile` `budget` (5): the worked cases; the exhaustive
+    floor/bound/≥-equal/active>parked sweep; activation moves the share
+    and there is only one active group; a mirror in the document's group
+    splits the active share; the active group's last member leaving
+    leaves none active.
+  - `store::pool_tests` (1): a switch moves the bigger share, the parked
+    store shrinks through `enforce_budget` and reads back bit for bit, and
+    a mirror in the group splits the share.
+  - `aurora-app` (3 + 1 ignored):
+    `the_active_document_holds_the_bigger_share_through_open_switch_and_close`
+    (a pending open parked, install, shrink without loss, switch, reverted
+    open, close: exactly one holder after each step);
+    `handing_the_pool_to_a_session_without_a_store_leaves_no_group_active`;
+    `the_mirror_splits_its_documents_active_share_and_the_parked_share_holds`
+    (the mirror's group, the parked quarter unchanged, UI + mirror ≤ the
+    active share, still bit-identical while paging); and the ignored
+    `nyepi_active_share_against_the_equal_split_at_2048`.
+  - Every existing pool and mirror test is unchanged and green: a pool
+    with no active group still splits equally.
+- **Mutations (each really run and restored, sha256 checked).**
+  - Killed:
+    - the switch not moving the share (`swap_in`'s hand-over removed);
+    - the open-install hand-over removed;
+    - the close hand-over removed;
+    - the revert hand-over removed;
+    - the parked floor dropped;
+    - the active floor dropped;
+    - the mirror joining a group of its own (not counted in the active
+      group);
+    - the active count ignored in the math;
+    - the outgoing group not parked (killed only after adding the
+      no-store hand-over test; it first survived).
+  - **Survived:** removing both `App::new`'s startup claim and
+    `about_to_wait`'s per-turn backstop (all 1,003 `aurora-app` lib tests
+    green). No test constructs an `App`, so those two lines are unverified
+    by tests.
+- **Measured (Nyepi, release, 2,048-tile pool, floor 256, one empty parked
+  member, background composite of the 40-tile view; a shared dev box).**
+  - Shares: the equal split gave 682 / 682 / 682; the active share gave UI
+    768, mirror 768, parked 512.
+  - The first job was 15.9 s in both cases. Warm jobs (after an opacity
+    edit) were 8.3–8.7 s with the equal split and 8.5–9.1 s with the
+    active share.
+  - **No measurable gain at this size** (nominally slower, within run-to-run noise on a shared box; a handful of runs each). Nyepi's working set (~2,559 tiles
+    in the mirror) is far above both 682 and 768, so both thrash alike. At
+    16,384 tiles both fit, so the rule changes nothing there either. The
+    gain is only where the active share crosses a working set that the
+    equal split did not cover, and that was not measured.
+  - Not measured at all: a switch back to a parked large document under
+    this rule; RSS.
+  - These warm numbers are well above 0.186.0's 3.1 s at 16,384, because
+    this pool thrashes. They are not a regression of that path.
+
+**Previously (2026-10-11, 0.186.0): background CPU compositing, round R3 of
 the large-template performance plan (ADR 0012; review revision BG-1, BG-2,
 BG-3 and MEM-1 included).** A CPU-path recomposite of the view no longer runs
 in the redraw handler. It runs on one worker thread (`aurora-app`'s
