@@ -26,7 +26,150 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.184.0): large-template performance, round R2 —
+**Latest (2026-10-11, 0.185.0): a RAM-sized, shared tile residency
+budget (design-owner decision, Cahya, 2026-10-11; ADR 0011).** The fixed
+`TILE_BUDGET = 256` tiles (128 MiB) is gone from the app. The budget is
+now a share of physical RAM, decided in `aurora-tile`'s new `budget`
+module:
+- **Size.** `budget_bytes_for_ram`: RAM / 4, clamped to **[128 MiB,
+  8 GiB]** (256–16,384 tiles); unknown RAM gives the floor. In bytes,
+  converted through `TILE_BYTES`, so a tile-size change cannot break it.
+- **Detection.** `physical_ram_bytes`: Linux `/proc/meminfo` `MemTotal`
+  (no `unsafe`), macOS `sysctlbyname("hw.memsize")` (`libc`), Windows
+  `GlobalMemoryStatusEx` (`windows-sys` 0.61, already in the tree, one
+  feature added; no new crate in `Cargo.lock`). Other OSes and failures:
+  `None`, so the floor. macOS and Windows are cross-clippy clean but **not
+  run**. A container's cgroup limit is not read.
+- **Override.** `AURORA_TILE_BUDGET_MB`: whole MiB, clamped to the same
+  range; anything else is ignored.
+- **Sharing.** One process-wide `ResidencyPool` (`tile_pool` in
+  `aurora-app`); every document's store joins it through
+  `TileStore::new_shared` and leaves when dropped. Each member holds
+  `max(floor, total / members)`, re-read on every admission, so closing a
+  document grows the others at once. A parked document admits nothing, so
+  `DocumentShelf::enforce_tile_budgets` runs once per event-loop turn
+  (`about_to_wait`) and evicts it through the ordinary eviction path
+  (`TileStore::enforce_budget`): dirty tiles are encoded and written to
+  scratch, nothing is dropped. Equal split rather than "parked shrink to
+  the floor" so switching back to a large parked document does not page its
+  whole working set in again.
+- `resident` is now an unbounded `LruCache`; `make_room` alone enforces
+  the budget (previously the cache's own capacity equalled it), so no
+  capacity change can drop a tile behind the eviction path.
+- **Eviction policy unchanged** (plain LRU): at this machine's budget
+  Nyepi fits and pages nothing in, so a scan-resistant policy has nothing
+  to win here. At 2,048 tiles (a 4 GiB machine) it still pages in 2,299
+  tiles per pass; that is the measured case for one later (deferred).
+
+**This machine:** 62 GiB RAM (`MemTotal`), so the ceiling applies:
+**8 GiB, 16,384 tiles**.
+
+Nyepi, release, every optimisation on (0.184.0 build = "before", same
+session, run back to back with nothing else compiling):
+
+| case | 256, 0.184.0 | 256, 0.185.0 | 2,048 | **16,384 (this machine's default)** |
+|---|---|---|---|---|
+| open + first composite | 13.17 s | 13.29 s | 11.25 s | **10.88 s** |
+| warm full composite | 5.43 s | 5.54 s | 4.90 s | **3.34 s** |
+| visibility toggle | 5.35 s | 5.43 s | 4.84 s | **3.33 s** |
+| opacity step (shadowed) | 5.37 s | 5.50 s | 4.84 s | **3.28 s** |
+| dab, shadowed (3 tiles) | 0.62 s | 0.62 s | 0.38 s | **0.38 s** |
+| dab, unshadowed (1 tile) | 0.16 s | 0.16 s | 0.15 s | **0.07 s** |
+| disk page-ins per warm pass | 2,913 | 2,913 | 2,299 | **0** |
+
+Breakdown, warm full composite at 16,384: store hits 4,239, page-ins 0,
+evictions 0, 0 MiB read; `read_layer_window` 94 ms (was 1,573 ms at
+256); `pixel_layer_texels` inclusive 253 ms (was 2,306 ms); plain folds
+1,508 ms; effects folds inclusive 1,573 ms. **The folds are now ~3.1 s of
+the 3.34 s.** Budget 16: 6.41 s warm, 4,216 page-ins (unchanged policy,
+shown for continuity).
+
+**Targets: warm ≤ 3 s missed (3.34 s); open + first composite ≤ 10 s
+missed (10.88 s).** The open's first composite still pages every staged
+tile in from scratch (they are installed as already-evicted tiles,
+0.153.0/0.154.0); that and the decode itself are R5's. Pixels: the budget
+changes only residency; no cross-budget Nyepi pixel differential was run
+this round (the store round-trip tests below cover the shrink).
+
+Tests added: `budget::tests` (9: the formula at 4/8/16/32/128 GiB, unknown,
+0, 1 byte, 256 MiB, `u64::MAX`, 2^50 and either side of each clamp; the
+override's accepted and rejected forms; `/proc/meminfo` parsing; this
+machine's budget in range; shares and pool join/leave),
+`store::pool_tests` (4: two stores share and closing one regrows the other;
+an active member shrinks on its next admission; a shrink writes dirty
+tiles back and every texel round-trips bit for bit, the dirty flag
+surviving; a fixed-budget store is outside any pool) and
+`document_tabs_tests::open_documents_share_the_tile_budget_and_a_parked_one_shrinks_without_loss`.
+
+Mutations (`AURORA_REQUIRE_GPU=1`, source restored after each, sha256
+checked): **8 of 8 killed** — floor ignored in the clamp; floor ignored in
+the pool share; ceiling ignored; override not clamped; detection failure
+giving the ceiling instead of the floor; a shrink that pops tiles without
+writing them; shares ignoring the member count; parked stores never
+enforced (killed by the app test).
+
+**0.185.0 review revision (RB-1–RB-3, before merge).**
+- **RB-1: a shrink can no longer freeze the UI.**
+  - `TileStore::enforce_budget(max_evictions)` evicts at most the cap,
+    and `over_budget()` reports what is left.
+  - `DocumentShelf::enforce_tile_budgets(active, EVICTION_BURST)`
+    (32 per store per turn) returns `(evicted, still_over)`.
+  - `about_to_wait` polls again at once while any store is over
+    (`tile_budget_poll`).
+  - `make_room` also evicts at most `EVICTION_BURST` per admission. This
+    goes beyond the review's "leave it alone": that path would otherwise
+    encode a pool member's whole excess on its next admission. It still
+    evicts before it admits, and at least one tile, so a store inside its
+    budget behaves exactly as before.
+  - Residency can overshoot a new share for a few turns (ADR 0011). The
+    32 is an estimate, not a measurement.
+  - Tests:
+    - `a_store_far_over_its_share_converges_in_capped_steps_without_loss`:
+      1,000 over, `ceil(1000/32)` = 32 calls of 1–32 evictions each, all
+      1,010 tiles bit-identical afterwards;
+    - `an_admission_evicts_at_most_a_burst_and_never_grows_an_over_budget_store`;
+    - `the_loop_keeps_waking_while_a_store_is_over_its_tile_budget`;
+    - the app test now converges a parked store at cap 1 in exactly 4
+      turns, reporting "still over" until then.
+- **RB-3: pixel identity measured.**
+  - The Nyepi cost test asserts the first composite is bit-identical at
+    budgets 256, 2,048 and 16,384 against budget 16. Measured: 8,294,400 samples, **0 differ** at each budget. Timings in that run were contended by mutation builds, so they are not used; the 16,384 row (3.35 s warm, 11.02 s open) matches the quiet run.
+  - `a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one`:
+    six tiles, with Normal, Multiply 0.75, and Screen 0.5 inside a group.
+    A two-tile fixed store (evicting and paging) against a 4,096-tile
+    pooled store (no evictions): 1,572,864 samples, 0 differ.
+- **RB-2 deferred.** A clean tile with a valid scratch copy is still
+  re-encoded and rewritten on eviction. Tracking "unchanged since its
+  confirmed write" touches the `pending`/generation/tombstone
+  bookkeeping, so it is not small. Disclosed in ADR 0011.
+- **Mutations, re-run in full: 12 of 12 killed.**
+  - The original 8. The shrink mutation was rewritten for the capped
+    signature and is now killed by two tests.
+  - The RB-1 enforcement cap ignored: killed by the convergence test.
+  - The admission burst uncapped: killed by the admission test.
+  - "Still over" never reported: killed by the app test.
+  - The loop sleeping while over: killed by the loop test.
+
+Gate (one pass after the last code change, Linux, `/home` 35 G free
+before): `cargo fmt --all --check`, `check_layering.py`,
+`check_no_hardcoded_style.py`, `cargo check --workspace --locked` and
+`cargo clippy --workspace --all-targets --all-features -D warnings` pass;
+`AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`: **3,469
+passed, 0 failed, 68 ignored** (3,455 + 14 new); `cargo doc …
+--document-private-items --keep-going` with `-D warnings` clean; `cargo
+deny check all` ok; `check_contrast.py` passes; cross-clippy `-p
+aurora-tile -p aurora-app --all-targets` for `x86_64-pc-windows-gnu` and
+`x86_64-apple-darwin` (lcms stub) clean. Stress: the 14 new tests, 20 runs
+under 12 `yes` processes: 20 of 20 green.
+
+**Re-run after the RB-1–RB-3 revision** (one pass after the last code
+change): the same gate. **3,473 passed, 0 failed, 68 ignored** (3,469 + 4
+new: two store tests, the loop test, the synthetic differential). `cargo
+doc`, `cargo deny check all`, `check_contrast.py` and both cross-clippy
+targets are clean. Stress on the 17 new tests (20 runs under 12 `yes`
+processes): 20 of 20 green.
+
+**Previously (2026-10-11, 0.184.0): large-template performance, round R2 —
 the per-fold cost.** The 0.183.0 breakdown showed the folds themselves
 take the time. Nyepi's layers are canvas-sized but mostly empty, so this
 round stops the fold from working on empty source. All four changes are
@@ -208,7 +351,7 @@ After the mutation runs, clippy's `verbose_bit_mask` rewrote the
 alpha-zero test from `bits & 0x7FFF == 0` to the equivalent
 `bits << 1 == 0`.
 
-**Previously (2026-10-11, 0.183.0): large-template performance, round R1 —
+**Earlier (2026-10-11, 0.183.0): large-template performance, round R1 —
 measured, then occlusion culling and a row-copy window read.** Measured
 first, on the user's Nyepi template (1080×1920, 277 nodes: 223 pixel
 layers, 54 groups, 0 adjustments, 47 layers drawing effects, 9 enabled

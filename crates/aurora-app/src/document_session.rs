@@ -69,6 +69,38 @@ pub(crate) struct DocumentShelf {
 }
 
 impl DocumentShelf {
+    /// Brings every open document's tile store inside its current budget
+    /// (0.185.0): `active`'s and every parked one's, each through
+    /// [`aurora_tile::TileStore::enforce_budget`], so a dirty tile is
+    /// written to scratch and nothing is lost. The active store keeps
+    /// itself inside its share on every admission anyway; a parked store
+    /// admits nothing, and after another document opened it would
+    /// otherwise keep the larger share it had. At most `max_per_store`
+    /// evictions per store per call (0.185.0 review RB-1), so the caller
+    /// stays responsive; returns how many tiles were evicted in all and
+    /// whether any store is still over its share (the caller must then
+    /// call again soon rather than sleep).
+    pub(crate) fn enforce_tile_budgets(
+        &mut self,
+        active: &mut DocumentSession,
+        max_per_store: usize,
+    ) -> (usize, bool) {
+        let mut evicted = 0;
+        let mut over = false;
+        for store in std::iter::once(&mut active.tile_store)
+            .chain(
+                self.parked
+                    .iter_mut()
+                    .map(|session| &mut session.tile_store),
+            )
+            .flatten()
+        {
+            evicted += store.enforce_budget(max_per_store);
+            over |= store.over_budget();
+        }
+        (evicted, over)
+    }
+
     /// How many documents are open, the active one included.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

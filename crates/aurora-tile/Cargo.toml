@@ -51,6 +51,12 @@ serde = { workspace = true }
 # Windows dependency graph entirely.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Only for `GlobalMemoryStatusEx` (0.185.0, `budget::physical_ram_bytes`,
+# the RAM-sized tile budget). Already in the tree (winit, tempfile and
+# others use 0.61), so this adds a feature, not a crate.
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }

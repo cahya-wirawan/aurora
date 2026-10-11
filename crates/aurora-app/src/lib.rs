@@ -8282,6 +8282,21 @@ fn next_control_flow(
     }
 }
 
+/// The loop's poll interval once tile-budget enforcement has run
+/// (0.185.0 review RB-1): zero — wake again at once — while a store is
+/// still over its share, so a shrink converges over consecutive turns
+/// instead of waiting for the next input event; `poll` otherwise.
+fn tile_budget_poll(
+    over_budget: bool,
+    poll: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if over_budget {
+        Some(std::time::Duration::ZERO)
+    } else {
+        poll
+    }
+}
+
 /// The earlier of two optional wake-up instants (0.139.0): the loop's
 /// one timer `deadline` for [`next_control_flow`], from the gallery
 /// tooltip's and the caret blink's. `None` only when neither exists.
@@ -22018,12 +22033,41 @@ fn remove_scratch_dir(dir: &Path) {
     }
 }
 
-/// A practical resident-tile budget for this crate's first live store —
-/// 256 tiles, 128 MiB at ADR 0005's fixed 512 KiB/tile — not a
-/// considered, user-facing default (that's FR-026's own, still-open
-/// scratch-disk-size preference); enough to paint comfortably in one
-/// session without constantly evicting.
+/// The fixed resident budget every store had up to 0.184.0 — 256 tiles,
+/// 128 MiB at ADR 0005's 512 KiB/tile — and since 0.185.0 the pool's
+/// per-store floor (`aurora_tile::FLOOR_BYTES`). The app itself now
+/// sizes its stores from [`tile_pool`]; tests that measured "the app's
+/// budget" before keep this as a fixed reference point.
+#[cfg(test)]
 const TILE_BUDGET: usize = 256;
+
+/// This process's one resident-tile budget (0.185.0, ADR 0011): a
+/// quarter of physical RAM between 128 MiB and 8 GiB, or
+/// `AURORA_TILE_BUDGET_MB` clamped to that range, computed once. Every
+/// document's store joins it through [`open_tile_store`], so the open
+/// documents share it — each holds `max(floor, total / open stores)` —
+/// and a closed document's share goes back to the rest at once. A parked
+/// document shrinks when the event loop's `about_to_wait` calls
+/// [`document_session::DocumentShelf::enforce_tile_budgets`].
+fn tile_pool() -> &'static std::sync::Arc<aurora_tile::ResidencyPool> {
+    static POOL: std::sync::OnceLock<std::sync::Arc<aurora_tile::ResidencyPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let ram = aurora_tile::physical_ram_bytes();
+        let value = std::env::var(aurora_tile::OVERRIDE_ENV).ok();
+        let bytes = aurora_tile::resolve_budget_bytes(ram, value.as_deref());
+        let pool = aurora_tile::ResidencyPool::from_bytes(bytes);
+        tracing::info!(
+            ?ram,
+            override_value = ?value,
+            budget_mib = bytes >> 20,
+            tiles = pool.total_tiles().get(),
+            floor_tiles = pool.floor_tiles().get(),
+            "tile residency budget"
+        );
+        pool
+    })
+}
 
 /// Opens this session's shared tile store at [`tile_store_scratch_dir`].
 /// Errors are logged, not fatal -- the same "must never stop the
@@ -22034,14 +22078,11 @@ const TILE_BUDGET: usize = 256;
 /// path (it is already logged by [`create_tile_store_scratch_dir`]),
 /// rather than falling back to a shared one.
 fn open_tile_store() -> Option<aurora_tile::TileStore> {
-    let Some(budget) = std::num::NonZeroUsize::new(TILE_BUDGET) else {
-        unreachable!("TILE_BUDGET is a fixed, non-zero constant");
-    };
     let Some(scratch_dir) = tile_store_scratch_dir() else {
         tracing::warn!("no tile scratch directory; painting is disabled this session");
         return None;
     };
-    match aurora_tile::TileStore::new(scratch_dir.to_path_buf(), budget) {
+    match aurora_tile::TileStore::new_shared(scratch_dir.to_path_buf(), tile_pool()) {
         Ok(store) => {
             // `TileStore::new` recreates `scratch_dir` itself if a temp
             // cleaner removed it (`create_private_dir`'s own self-heal) --
@@ -28105,6 +28146,23 @@ impl ApplicationHandler<AppEvent> for App {
         let poll = Some(MUDA_POLL_INTERVAL);
         #[cfg(not(target_os = "macos"))]
         let poll = None;
+        // 0.185.0: a store opened or closed since the last turn moved
+        // every share of the residency pool; a parked document admits
+        // nothing, so it is brought inside its share here, at most
+        // `EVICTION_BURST` tiles per store per turn (review RB-1), and
+        // the loop does not sleep while any store is still over. A
+        // comparison per store when nothing changed.
+        let (evicted, over) = self
+            .shelf
+            .enforce_tile_budgets(&mut self.doc, aurora_tile::EVICTION_BURST);
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                over,
+                "shrinking open documents to their tile budget shares"
+            );
+        }
+        let poll = tile_budget_poll(over, poll);
         el.set_control_flow(next_control_flow(now, deadline, poll));
 
         if self.needs_redraw
@@ -28383,7 +28441,7 @@ mod tests {
     use super::{
         CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
         earliest_deadline, fold_caret_step, gallery_hover_point, gallery_timer_step,
-        gpu_target_needs_resize, next_control_flow,
+        gpu_target_needs_resize, next_control_flow, tile_budget_poll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -67429,6 +67487,29 @@ mod tests {
         );
     }
 
+    /// 0.185.0 review RB-1: while a store is over its tile-budget share
+    /// the loop wakes again at once, whatever else it was waiting for;
+    /// once none is, the wait is exactly what it was without enforcement.
+    #[test]
+    fn the_loop_keeps_waking_while_a_store_is_over_its_tile_budget() {
+        let now = std::time::Instant::now();
+        let late = now + std::time::Duration::from_millis(500);
+        let poll = Some(std::time::Duration::from_millis(50));
+        assert_eq!(
+            next_control_flow(now, None, tile_budget_poll(true, None)),
+            ControlFlow::WaitUntil(now)
+        );
+        assert_eq!(
+            next_control_flow(now, Some(late), tile_budget_poll(true, poll)),
+            ControlFlow::WaitUntil(now)
+        );
+        assert_eq!(
+            next_control_flow(now, None, tile_budget_poll(false, None)),
+            ControlFlow::Wait
+        );
+        assert_eq!(tile_budget_poll(false, poll), poll);
+    }
+
     #[test]
     fn next_control_flow_waits_until_the_earliest_wakeup_or_blocks() {
         let now = std::time::Instant::now();
@@ -75972,18 +76053,34 @@ mod tests {
             let Ok(bytes) = std::fs::read(&path) else {
                 unreachable!("unreadable");
             };
-            // 0.183.0: at the old benchmark budget (16) and the app's
-            // (`TILE_BUDGET`), each with occlusion culling off (the 0.182.0
-            // path) and on.
-            // 0.184.0: "0.183.0" = culling on, fold skips off; "0.184.0" =
-            // both on (the scratch pool cannot be switched off).
-            for budget in [16, crate::TILE_BUDGET] {
-                for skips in [false, true] {
-                    let label = if skips { "0.184.0" } else { "0.183.0" };
-                    println!("COST ==== budget {budget}, {label} ====");
-                    crate::set_fold_skips_for_tests(skips);
-                    edit_costs(&bytes, budget, false);
-                    crate::set_fold_skips_for_tests(true);
+            // 0.183.0/0.184.0 compared culling and the fold skips off and
+            // on at budgets 16 and 256; both are on from here.
+            // 0.185.0: the old benchmark budget (16), the pre-0.185.0 app
+            // budget (`TILE_BUDGET`, now the floor), a 4 GiB machine's
+            // RAM-sized budget (2,048 tiles) and this machine's own
+            // (`tile_pool`, which honours `AURORA_TILE_BUDGET_MB`).
+            let pool = crate::tile_pool().total_tiles().get();
+            println!(
+                "COST physical RAM {:?} bytes, this machine's budget {pool} tiles ({} MiB)",
+                aurora_tile::physical_ram_bytes(),
+                (pool as u64 * aurora_tile::TILE_BYTES) >> 20
+            );
+            // RB-3: the first composite is bit-identical at every budget
+            // (residency must never change a pixel).
+            let mut reference: Option<Vec<u16>> = None;
+            for budget in [16, crate::TILE_BUDGET, 2048, pool] {
+                println!("COST ==== budget {budget} ====");
+                let bits = edit_costs(&bytes, budget, false);
+                match &reference {
+                    None => reference = Some(bits),
+                    Some(want) => {
+                        let differ = want.iter().zip(&bits).filter(|(a, b)| a != b).count();
+                        println!(
+                            "COST budget {budget} vs 16: {} samples, {differ} differ",
+                            bits.len()
+                        );
+                        assert_eq!((want.len(), differ), (bits.len(), 0), "budget {budget}");
+                    }
                 }
             }
         }
@@ -76035,7 +76132,9 @@ mod tests {
         }
 
         #[allow(clippy::too_many_lines)]
-        fn edit_costs(bytes: &[u8], budget: usize, describe: bool) {
+        /// Returns the first composite's samples as bits (0.185.0 review
+        /// RB-3), so the caller can compare budgets.
+        fn edit_costs(bytes: &[u8], budget: usize, describe: bool) -> Vec<u16> {
             clear_shadow_cache();
             let dir = match tempfile::tempdir() {
                 Ok(dir) => dir,
@@ -76056,7 +76155,7 @@ mod tests {
                 )
             };
             let started = std::time::Instant::now();
-            let (document, _image) = open_and_composite_psd(
+            let (document, first_image) = open_and_composite_psd(
                 bytes,
                 &mut store,
                 (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
@@ -76217,6 +76316,7 @@ mod tests {
                     );
                 }
             }
+            first_image.samples().iter().map(|s| s.to_bits()).collect()
         }
 
         /// Mean error per channel over `layer_effects.psd`'s shadow region
