@@ -17,6 +17,7 @@ use std::sync::Arc;
 use aurora_core::Rect;
 use lru::LruCache;
 
+use crate::budget::{EVICTION_BURST, PoolMembership, ResidencyPool};
 use crate::codec;
 use crate::error::TileError;
 use crate::staging::{StagedTile, StagingRoot};
@@ -382,7 +383,12 @@ pub struct TileStore {
     version_counter: u64,
     /// Distinct for every `TileStore` this process constructs.
     serial: u64,
-    budget: NonZeroUsize,
+    /// How many tiles may be resident (0.185.0): a fixed number, or a
+    /// share of a [`ResidencyPool`] that moves as stores join and leave.
+    /// Enforced by [`Self::make_room`] alone; `resident` itself is
+    /// unbounded, so no `LruCache` capacity can ever drop a tile behind
+    /// the eviction path's back.
+    budget: Budget,
     scratch_dir: PathBuf,
     /// A component of every filename this store writes, distinct for
     /// every `TileStore` this process constructs and, in practice,
@@ -656,6 +662,23 @@ fn instance_token() -> String {
     format!("{:x}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
+/// A store's resident budget: fixed at construction, or a live share of
+/// a [`ResidencyPool`] (0.185.0).
+#[derive(Debug)]
+enum Budget {
+    Fixed(NonZeroUsize),
+    Shared(PoolMembership),
+}
+
+impl Budget {
+    fn tiles(&self) -> usize {
+        match self {
+            Self::Fixed(tiles) => tiles.get(),
+            Self::Shared(membership) => membership.share().get(),
+        }
+    }
+}
+
 impl TileStore {
     /// Creates a store rooted at `scratch_dir` (created if missing),
     /// holding at most `budget` tiles resident at once, summed across
@@ -682,12 +705,33 @@ impl TileStore {
     /// refusing to page a document's pixels into a directory this
     /// process cannot secure is the point.
     pub fn new(scratch_dir: PathBuf, budget: NonZeroUsize) -> Result<Self, TileError> {
+        Self::with_budget(scratch_dir, Budget::Fixed(budget))
+    }
+
+    /// Like [`Self::new`], but the budget is this store's share of
+    /// `pool` (0.185.0): the store joins it here and leaves it when
+    /// dropped, and its share is re-read on every admission — see
+    /// [`ResidencyPool`] for how shares move, and
+    /// [`Self::enforce_budget`] for shrinking a store that admits
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]. A store that fails to open does not stay a
+    /// member.
+    pub fn new_shared(scratch_dir: PathBuf, pool: &Arc<ResidencyPool>) -> Result<Self, TileError> {
+        // On an error the membership is dropped with the half-built
+        // value, so a store that fails to open leaves at once.
+        Self::with_budget(scratch_dir, Budget::Shared(pool.join()))
+    }
+
+    fn with_budget(scratch_dir: PathBuf, budget: Budget) -> Result<Self, TileError> {
         create_private_dir(&scratch_dir).map_err(|source| TileError::ScratchDirUnavailable {
             path: scratch_dir.clone(),
             source,
         })?;
         Ok(Self {
-            resident: LruCache::new(budget),
+            resident: LruCache::unbounded(),
             paged_out: HashMap::new(),
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
@@ -1395,6 +1439,36 @@ impl TileStore {
         self.resident.len()
     }
 
+    /// How many tiles may be resident right now (0.185.0): the fixed
+    /// budget, or this store's current share of its pool.
+    #[must_use]
+    pub fn budget_tiles(&self) -> usize {
+        self.budget.tiles()
+    }
+
+    /// Evicts least-recently-used tiles, at most `max_evictions` of them,
+    /// towards no more than [`Self::budget_tiles`] resident (0.185.0;
+    /// the cap is review RB-1's), through the same
+    /// path every eviction takes: a dirty tile is encoded and handed to
+    /// the background writer, its bytes held in `pending` until the write
+    /// lands, so nothing is lost. A store's own admissions already keep
+    /// it inside its budget; this is for a pool member that admits
+    /// nothing (a parked document) after another store joined. Returns
+    /// how many tiles it evicted; no I/O on the caller's thread beyond
+    /// the encode. A caller that must stay responsive passes
+    /// [`EVICTION_BURST`] and calls again while [`Self::over_budget`].
+    pub fn enforce_budget(&mut self, max_evictions: usize) -> usize {
+        self.evict_down_to(self.budget_tiles(), max_evictions)
+    }
+
+    /// Whether more tiles are resident than [`Self::budget_tiles`] allows
+    /// — only after a pool's share shrank, until enforcement or
+    /// admissions catch up.
+    #[must_use]
+    pub fn over_budget(&self) -> bool {
+        self.resident.len() > self.budget_tiles()
+    }
+
     /// Resolves `(surface, id)` to a resident tile via, in priority order:
     /// (a) already resident, (b) still in [`Self::pending`] -- an eviction
     /// whose background write has not yet been confirmed, reinstated
@@ -1734,8 +1808,8 @@ impl TileStore {
     /// small on a workstation and far too large on a small machine.
     /// Invariant §7.3.1 is the reason a cap has to exist at all: nothing
     /// here may grow with document size.
-    const fn failed_write_capacity(&self) -> usize {
-        self.budget.get()
+    fn failed_write_capacity(&self) -> usize {
+        self.budget_tiles()
     }
 
     /// Records that `key`'s background write failed, so its `pending`
@@ -1958,8 +2032,24 @@ impl TileStore {
     /// `codec::encode`/`Tile::from_texels` cannot carry it across. See
     /// that field's own doc comment for what is and is not preserved, and
     /// `make_resident` for where it is put back.
+    ///
+    /// **Bounded** (0.185.0 review RB-1): at most [`EVICTION_BURST`]
+    /// evictions per admission. A store inside its budget needs exactly
+    /// one, so nothing changes for it; a pool member whose share just
+    /// shrank evicts a burst per admission — always at least one, so its
+    /// resident count never grows while it is over — and converges over
+    /// several admissions rather than encoding its whole excess at once.
     fn make_room(&mut self) {
-        while self.resident.len() >= self.budget.get() {
+        self.evict_down_to(self.budget_tiles().saturating_sub(1), EVICTION_BURST);
+    }
+
+    /// Evicts least-recently-used tiles until at most `limit` are
+    /// resident or `max_evictions` have gone — [`Self::make_room`]'s
+    /// loop, shared with [`Self::enforce_budget`]. Returns how many.
+    fn evict_down_to(&mut self, limit: usize, max_evictions: usize) -> usize {
+        let mut evicted = 0;
+        while self.resident.len() > limit && evicted < max_evictions {
+            evicted += 1;
             let Some(((victim_surface, victim_id), victim_tile)) = self.resident.pop_lru() else {
                 break;
             };
@@ -2023,6 +2113,7 @@ impl TileStore {
                 bytes,
             });
         }
+        evicted
     }
 
     /// Retires this store for good (0.174.0, a closed document): waits
@@ -5185,5 +5276,261 @@ mod content_version_tests {
         if let Ok(other) = other {
             assert_ne!(other.serial(), store.serial());
         }
+    }
+}
+
+/// The RAM-sized, pooled budget (0.185.0): stores sharing a
+/// [`ResidencyPool`] split it, a closed one hands its share back, and a
+/// shrink evicts through the ordinary path without losing a pixel.
+#[cfg(test)]
+mod pool_tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    use super::TileStore;
+    use crate::budget::ResidencyPool;
+    use crate::tile::{SurfaceId, TileId};
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    fn shared(pool: &Arc<ResidencyPool>) -> (tempfile::TempDir, TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        match TileStore::new_shared(dir.path().to_path_buf(), pool) {
+            Ok(store) => (dir, store),
+            Err(err) => unreachable!("{err}"),
+        }
+    }
+
+    /// A value unique to tile `i` and sample `k`, exact in `f16`.
+    fn sample(i: u32, k: usize) -> half::f16 {
+        half::f16::from_f32(((i as usize * 7 + k) % 1024) as f32 / 1024.0)
+    }
+
+    /// Paints every sample of tiles `0..n` of `s` with [`sample`].
+    fn paint(store: &mut TileStore, s: SurfaceId, n: u32) {
+        for i in 0..n {
+            let tile = match store.get_mut(s, TileId { x: i, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err}"),
+            };
+            for (k, texel) in tile.texels_mut().iter_mut().enumerate() {
+                *texel = sample(i, k);
+            }
+            tile.mark_dirty(super::WHOLE_TILE);
+        }
+    }
+
+    /// Whether tiles `0..n` of `s` read back exactly as [`paint`] wrote.
+    fn reads_back(store: &mut TileStore, s: SurfaceId, n: u32) -> bool {
+        (0..n).all(|i| match store.get(s, TileId { x: i, y: 0 }) {
+            Ok(tile) => tile
+                .texels()
+                .iter()
+                .enumerate()
+                .all(|(k, texel)| texel.to_bits() == sample(i, k).to_bits()),
+            Err(err) => unreachable!("{err}"),
+        })
+    }
+
+    #[test]
+    fn two_stores_share_the_pool_and_closing_one_regrows_the_other() {
+        let pool = ResidencyPool::new(nz(8), nz(2));
+        let (_da, mut a) = shared(&pool);
+        assert_eq!(a.budget_tiles(), 8);
+        let s = SurfaceId::from_raw(0);
+        paint(&mut a, s, 8);
+        assert_eq!((a.resident_len(), a.stats().evictions), (8, 0));
+
+        let (_db, mut b) = shared(&pool);
+        assert_eq!(
+            (pool.members(), a.budget_tiles(), b.budget_tiles()),
+            (2, 4, 4)
+        );
+        // `a` admits nothing, so it is over its share until enforced.
+        assert_eq!(a.resident_len(), 8);
+        assert_eq!(a.enforce_budget(usize::MAX), 4);
+        assert_eq!(a.resident_len(), 4);
+        assert_eq!(
+            a.enforce_budget(usize::MAX),
+            0,
+            "a second call evicts nothing"
+        );
+        paint(&mut b, SurfaceId::from_raw(1), 6);
+        assert_eq!(
+            b.resident_len(),
+            4,
+            "b's own admissions keep it in its share"
+        );
+
+        drop(b);
+        assert_eq!((pool.members(), a.budget_tiles()), (1, 8));
+        // Grown: four more tiles fit without one eviction.
+        let evictions = a.stats().evictions;
+        for i in 8..12 {
+            if let Err(err) = a.get_mut(s, TileId { x: i, y: 0 }) {
+                unreachable!("{err}");
+            }
+        }
+        assert_eq!((a.resident_len(), a.stats().evictions), (8, evictions));
+    }
+
+    #[test]
+    fn an_active_member_shrinks_to_its_share_on_its_next_admission() {
+        let pool = ResidencyPool::new(nz(6), nz(1));
+        let (_da, mut a) = shared(&pool);
+        let s = SurfaceId::from_raw(0);
+        paint(&mut a, s, 6);
+        let (_db, _b) = shared(&pool);
+        if let Err(err) = a.get_mut(s, TileId { x: 99, y: 0 }) {
+            unreachable!("{err}");
+        }
+        assert_eq!(a.resident_len(), 3);
+        assert_eq!(a.stats().evictions, 4);
+    }
+
+    #[test]
+    fn a_shrink_writes_dirty_tiles_back_and_every_pixel_round_trips() {
+        let pool = ResidencyPool::new(nz(8), nz(1));
+        let (_da, mut a) = shared(&pool);
+        let s = SurfaceId::from_raw(3);
+        paint(&mut a, s, 8);
+        let bytes_before = a.stats().bytes_written;
+        let others: Vec<_> = (0..3).map(|_| shared(&pool)).collect();
+        assert_eq!(a.budget_tiles(), 2);
+        assert_eq!(a.enforce_budget(usize::MAX), 6);
+        assert!(
+            a.stats().bytes_written > bytes_before,
+            "the dirty tiles were encoded"
+        );
+        // On disk, not only in `pending`: the reads below page in.
+        if let Err(err) = a.flush() {
+            unreachable!("{err}");
+        }
+        // The six evicted tiles still owe an upload once paged back in.
+        for i in 0..6 {
+            assert!(!a.is_resident(s, TileId { x: i, y: 0 }));
+        }
+        let faults = a.stats().faults;
+        let first = TileId { x: 0, y: 0 };
+        if let Err(err) = a.get(s, first) {
+            unreachable!("{err}");
+        }
+        assert!(
+            a.is_dirty(s, first),
+            "an evicted dirty tile still owes its upload"
+        );
+        assert!(reads_back(&mut a, s, 8), "every texel survives the shrink");
+        assert!(
+            a.stats().faults > faults,
+            "evicted tiles came back from scratch"
+        );
+        drop(others);
+        assert_eq!(a.budget_tiles(), 8);
+        assert!(reads_back(&mut a, s, 8));
+    }
+
+    #[test]
+    fn a_fixed_budget_store_is_untouched_by_any_pool() {
+        let pool = ResidencyPool::new(nz(2), nz(1));
+        let (_dp, _p) = shared(&pool);
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Ok(mut fixed) = TileStore::new(dir.path().to_path_buf(), nz(5)) else {
+            unreachable!("fresh tempdir");
+        };
+        paint(&mut fixed, SurfaceId::from_raw(0), 5);
+        assert_eq!(
+            (fixed.budget_tiles(), fixed.enforce_budget(usize::MAX)),
+            (5, 0)
+        );
+        assert_eq!(pool.members(), 1);
+    }
+
+    /// RB-1: a parked store 1,000 tiles over its share converges in
+    /// `ceil(1000 / EVICTION_BURST)` capped calls, never more than the cap
+    /// per call, and every texel round-trips afterwards.
+    #[test]
+    fn a_store_far_over_its_share_converges_in_capped_steps_without_loss() {
+        use crate::budget::EVICTION_BURST;
+        // 1,010 tiles, then 100 more members: the share drops to 10.
+        let pool = ResidencyPool::new(nz(1010), nz(1));
+        let (_da, mut a) = shared(&pool);
+        let s = SurfaceId::from_raw(5);
+        for i in 0..1010 {
+            let tile = match a.get_mut(s, TileId { x: i, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err}"),
+            };
+            for (k, texel) in tile.texels_mut().iter_mut().take(8).enumerate() {
+                *texel = sample(i, k);
+            }
+        }
+        let others: Vec<_> = (0..100).map(|_| shared(&pool)).collect();
+        assert_eq!(a.budget_tiles(), 10);
+        let mut turns = 0;
+        while a.over_budget() {
+            let evicted = a.enforce_budget(EVICTION_BURST);
+            assert!((1..=EVICTION_BURST).contains(&evicted), "{evicted}");
+            turns += 1;
+            assert!(turns <= 1000, "no progress");
+        }
+        assert_eq!(turns, 1000_usize.div_ceil(EVICTION_BURST));
+        assert_eq!(a.resident_len(), 10);
+        if let Err(err) = a.flush() {
+            unreachable!("{err}");
+        }
+        drop(others);
+        for i in 0..1010 {
+            let tile = match a.get(s, TileId { x: i, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err}"),
+            };
+            let texels = tile.texels();
+            assert!(
+                texels.iter().enumerate().all(|(k, t)| {
+                    let want = if k < 8 { sample(i, k) } else { half::f16::ZERO };
+                    t.to_bits() == want.to_bits()
+                }),
+                "tile {i} round-trips bit for bit"
+            );
+        }
+    }
+
+    /// RB-1: an active member far over its share evicts at most a burst
+    /// per admission, and its resident count never grows meanwhile.
+    #[test]
+    fn an_admission_evicts_at_most_a_burst_and_never_grows_an_over_budget_store() {
+        use crate::budget::EVICTION_BURST;
+        let pool = ResidencyPool::new(nz(200), nz(1));
+        let (_da, mut a) = shared(&pool);
+        let s = SurfaceId::from_raw(0);
+        for i in 0..200 {
+            if let Err(err) = a.get_mut(s, TileId { x: i, y: 0 }) {
+                unreachable!("{err}");
+            }
+        }
+        let (_db, _b) = shared(&pool);
+        let mut resident = a.resident_len();
+        let mut next = 200;
+        while a.over_budget() {
+            let before = a.stats().evictions;
+            if let Err(err) = a.get_mut(s, TileId { x: next, y: 0 }) {
+                unreachable!("{err}");
+            }
+            next += 1;
+            let evicted = a.stats().evictions - before;
+            assert!((1..=EVICTION_BURST as u64).contains(&evicted), "{evicted}");
+            assert!(a.resident_len() <= resident, "never grows while over");
+            resident = a.resident_len();
+            assert!(next < 400, "no progress");
+        }
+        assert_eq!(a.resident_len(), a.budget_tiles());
     }
 }

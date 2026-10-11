@@ -1,6 +1,6 @@
 # 0005. Tile size (256×256 px) and scratch-disk budget mechanism
 
-**Status:** Accepted
+**Status:** Accepted (the budget's size and sharing: see ADR 0011, 0.185.0)
 **Date:** 2026-07-28
 **Related:** PRD §6 *Precision/Scalability*, §7.2 (`aurora-tile`), §7.3.1, ADR 0002, ADR 0003, FR-026
 

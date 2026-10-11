@@ -2616,3 +2616,189 @@ fn a_disabled_strips_close_buttons_close_nothing() {
     let node = rig.workspace.tree.accessibility(button);
     assert!(node.is_some_and(|node| !node.supports_action(accesskit::Action::Click)));
 }
+
+/// 0.185.0, AC-3: open documents share one residency pool. A parked
+/// document painted at a full share is cut to half when a second store
+/// joins — through the eviction path, so every pixel comes back — and
+/// its share grows back when the other store closes.
+#[test]
+fn open_documents_share_the_tile_budget_and_a_parked_one_shrinks_without_loss() {
+    let Some(total) = std::num::NonZeroUsize::new(8) else {
+        unreachable!("non-zero")
+    };
+    let pool = aurora_tile::ResidencyPool::new(total, std::num::NonZeroUsize::MIN);
+    let shared = |dir: &tempfile::TempDir| match aurora_tile::TileStore::new_shared(
+        dir.path().to_path_buf(),
+        &pool,
+    ) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (mut parked, ids) = session("A", 1, [0.25, 0.5, 0.75, 1.0], &dir_a);
+    let Some(&layer) = ids.first() else {
+        unreachable!("one layer")
+    };
+    let surface = surface_id_for(layer);
+    let mut store_a = shared(&dir_a);
+    let tiles: Vec<aurora_tile::TileId> = (0..8).map(|x| aurora_tile::TileId { x, y: 0 }).collect();
+    for (n, &tile) in tiles.iter().enumerate() {
+        let v = n as f32 / 8.0;
+        fill_solid(&mut store_a, surface, tile, [v, 0.5, 1.0 - v, 1.0]);
+    }
+    let expected: Vec<Vec<f32>> = tiles
+        .iter()
+        .map(|&tile| read_all_texels(&mut store_a, surface, tile))
+        .collect();
+    assert_eq!(store_a.resident_len(), 8);
+    parked.tile_store = Some(store_a);
+    let mut shelf = DocumentShelf::default();
+    shelf.parked.push(parked);
+
+    let (mut active, _) = session("B", 1, [1.0, 0.0, 0.0, 1.0], &dir_b);
+    active.tile_store = Some(shared(&dir_b));
+    assert_eq!(pool.members(), 2);
+    // RB-1: one eviction per store per turn here, so the parked store,
+    // four over, needs four turns and reports "still over" until then.
+    let mut turns = 0;
+    loop {
+        let (evicted, over) = shelf.enforce_tile_budgets(&mut active, 1);
+        turns += 1;
+        assert!(evicted <= 1);
+        if !over {
+            break;
+        }
+        assert!(turns < 8, "no progress");
+    }
+    assert_eq!(turns, 4);
+    let Some(parked_store) = shelf.parked.first_mut().and_then(|s| s.tile_store.as_mut()) else {
+        unreachable!("parked document keeps its store")
+    };
+    assert_eq!(
+        (parked_store.resident_len(), parked_store.budget_tiles()),
+        (4, 4)
+    );
+    if let Err(err) = parked_store.flush() {
+        unreachable!("{err:?}");
+    }
+    for (tile, want) in tiles.iter().zip(&expected) {
+        let got = read_all_texels(parked_store, surface, *tile);
+        assert!(
+            got.iter()
+                .zip(want)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "tile {tile:?} round-trips bit for bit after the shrink"
+        );
+    }
+
+    // Closing the active document's store hands its share back.
+    active.tile_store = None;
+    assert_eq!(pool.members(), 1);
+    let Some(parked_store) = shelf.parked.first_mut().and_then(|s| s.tile_store.as_mut()) else {
+        unreachable!("parked document keeps its store")
+    };
+    assert_eq!(parked_store.budget_tiles(), 8);
+    assert_eq!(shelf.enforce_tile_budgets(&mut active, 64), (0, false));
+}
+
+/// 0.185.0 review RB-3: residency never changes a pixel. A six-tile
+/// document of Normal, Multiply and Screen layers (one in a group, two
+/// translucent) composites bit-identically through a two-tile fixed
+/// store, which evicts and pages in throughout, and a pooled store that
+/// holds it all.
+#[test]
+fn a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one() {
+    let canvas = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 768,
+        height: 512,
+    };
+    let mut tree = aurora_doc::LayerTree::new();
+    let add = |tree: &mut aurora_doc::LayerTree, name: &str, parent| match tree
+        .add_pixel_layer(name, canvas, parent)
+    {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let bottom = add(&mut tree, "bottom", None);
+    let multiply = add(&mut tree, "multiply", None);
+    let group = match tree.add_group("group", None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let screen = add(&mut tree, "screen", Some(group));
+    for (id, mode, opacity) in [
+        (multiply, aurora_doc::BlendMode::Multiply, 0.75),
+        (screen, aurora_doc::BlendMode::Screen, 0.5),
+    ] {
+        if let Err(err) = tree.set_blend_mode(id, mode) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_opacity(id, opacity) {
+            unreachable!("{err:?}");
+        }
+    }
+    let fill = |store: &mut aurora_tile::TileStore| {
+        for (n, layer) in [bottom, multiply, screen].into_iter().enumerate() {
+            for x in 0..3_u32 {
+                for y in 0..2_u32 {
+                    if (x + y + n as u32) % 3 == 2 && n > 0 {
+                        continue;
+                    }
+                    let v = (x * 2 + y + n as u32) as f32 / 8.0;
+                    let rgba = [v, 1.0 - v, 0.25 + v / 2.0, 1.0 - n as f32 / 8.0];
+                    fill_solid(
+                        store,
+                        surface_id_for(layer),
+                        aurora_tile::TileId { x, y },
+                        rgba,
+                    );
+                }
+            }
+        }
+    };
+    let (dir_small, dir_pool) = (tempdir(), tempdir());
+    let Some(two) = std::num::NonZeroUsize::new(2) else {
+        unreachable!("non-zero")
+    };
+    let mut small = match aurora_tile::TileStore::new(dir_small.path().to_path_buf(), two) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let Some(roomy) = std::num::NonZeroUsize::new(4096) else {
+        unreachable!("non-zero")
+    };
+    let pool = aurora_tile::ResidencyPool::new(roomy, std::num::NonZeroUsize::MIN);
+    let mut pooled = match aurora_tile::TileStore::new_shared(dir_pool.path().to_path_buf(), &pool)
+    {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    fill(&mut small);
+    fill(&mut pooled);
+    let composite = |store: &mut aurora_tile::TileStore| match crate::composite_document(
+        &tree, store, 768, 512,
+    ) {
+        Ok(image) => image
+            .samples()
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<u16>>(),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let (thrashed, held) = (composite(&mut small), composite(&mut pooled));
+    assert!(
+        small.stats().evictions > 0 && small.stats().faults > 0,
+        "the small store paged"
+    );
+    assert_eq!(
+        pooled.stats().evictions,
+        0,
+        "the pooled store held everything"
+    );
+    assert_eq!(thrashed.len(), 768 * 512 * 4);
+    assert!(thrashed.iter().any(|&b| b != 0), "not a blank composite");
+    let differ = thrashed.iter().zip(&held).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "residency changed {differ} samples");
+}
