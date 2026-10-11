@@ -26,7 +26,66 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.197.0): round L4 of the Photoshop-style Layers panel — layer
+**Latest (2026-10-12, 0.198.0): round L5a of the Photoshop-style Layers panel — layer locks, enforced.
+Nobody has seen the Lock row, the lock icons or the refusal notice in the live window on the Mac (or
+anywhere but a headless render at scale 2 and the unit tests); the press and dab call sites of the
+enforcement need a window and are covered only through the pure permission rules.**
+Series status: L1 icons (0.194.0), L2 rows and controls (0.195.0), L3 toolbar + New Group (0.196.0), L4
+thumbnails (0.197.0) and **L5a layer locks (this round)** done; next **L5b** Kind filter and name search;
+then smart-object preservation on PSD save (S1), clipping masks (C1), Levels / Hue-Saturation (A1).
+- **What the model and formats already did.** `aurora_doc::LayerLock { transparency, pixels, position }` was
+  already stored per layer and group, journaled and undoable (`LayerOp::SetLock`, `History::set_lock`,
+  replayed from a saved journal) and serialised positionally in the `.aur` manifest, so `.aur` files
+  round-trip it and files from before decode as "none". Nothing read or wrote it in PSD and nothing
+  enforced it.
+- **PSD encoding (verified with psd-tools 1.17.4 on the corpus).** Layer-record flags bit 0 = transparency
+  protected; tagged block `lspf` is a `u32`: bit 0 transparency, bit 1 composite (= pixels), bit 2 position,
+  bit 3 artboard "nesting", and exactly `0x8000_0000` for Lock All. In the corpus only Background layers
+  are locked (`lspf` 5, 7 or 13 with flags bit 0): Photoshop's own implicit Background locks, so a PSD
+  Background now opens locked (transparency + position), as in Photoshop. **Read** (`lock_from_psd`):
+  `lspf` bits unioned with the record flag; bit 31 or all three bits is Lock All; bit 3 is neither kept
+  nor reported (it is on every Background; a report would be on nearly every file). **Write**: flags bit 0
+  for transparency plus an `lspf` block (none when unlocked; all three set writes `0x8000_0000`), on
+  layers and group folders. Locks are lossless, so the save report never lists them. Both verifier passes
+  check flags and `lspf`; `scripts/verify_psd_write.py` now also reads a `locks.psd` (all eight
+  combinations) back through psd-tools (run: OK).
+- **Enforcement** (`aurora-app`; locks never affect compositing or export): **pixels** (or all) refuses
+  brush and eraser presses (no drag, so no stroke snapshot and no history row) and, defensively, every dab;
+  **transparency** lets the brush recolour texels that already have alpha without changing any alpha bit
+  (`aurora_brush::stamp_dab_preserving_alpha`: premultiplied `old * (1 - a) + colour * alpha * a`, alpha
+  kept, fully transparent texels untouched; repeated dabs accumulate toward the colour, there being no
+  per-stroke coverage map) and **refuses the eraser** (its whole job is alpha); **position** (or all)
+  refuses the Move tool (and `apply_move`); **Lock All refuses Delete Layer** (only the targeted node's own
+  lock; a group holding locked layers can still be deleted). Opacity, Fill, blend, visibility, rename and
+  reorder stay allowed: Photoshop's Lock All also blocks stack moves, which Aurora does not do. A refusal
+  is calm: a notice replaces the status bar's document readout (`StatusInfo::notice`) until it stops
+  applying (other layer, other tool, lock changed); no dialog. Delete's toolbar button stays enabled so
+  the notice can explain. The notice is not announced to a screen reader (the status node is `Live::Off`).
+- **Lock row** (`aurora_ui::layer_controls`): the strip's fourth and last row, just above the list (our Fill
+  is its own row, so beside-Fill as in the reference does not fit; last keeps it next to the list): "Lock:"
+  and four icon toggle buttons (new `widgets::insert_icon_toggle_button`: flat when off, `accent.primary`
+  fill with `icon.on_accent` when on, no new token) for transparent pixels, image pixels, position and all
+  ("all" is on only when all three are). They reflect the *active* layer, are Tab stops with `toggled` and
+  descriptions, and a click, `Space`/`Enter` or an AT `Click` makes one journaled `History::set_lock`
+  step labelled "Lock …"/"Unlock …" (`LockToggle`). New icons `TransparentPixels`, `Brush`, `Move`
+  (`IconKind::ALL` is 17; sheet rendered and viewed; the gallery follows, its pinned minimum height is
+  880 px, was 820). **Strip floor:** 4 rows, 135 px laid out at the default tokens (was 3 rows); the gap
+  count in its chrome is corrected to three. **Rows:** every row has a decorative `Lock` icon at its right
+  end (`Display::None` until a lock is set, no Tab stop, `icon.secondary`, `on_accent` when selected), a
+  reserved right inset keeps blend labels aligned (`TreeItemState::right_inset`), and the row description
+  ends ", locked". No hover tint on the lock buttons yet (hover is app-driven; not wired).
+- **Performance.** `nyepi_layers_panel_populate` (release): 277 rows, **1.30 ms** (1.08 ms before), 1215 widgets.
+- **Panel render** (scale 2, with the Lock row, a position-locked active layer, a lock-all layer and a
+  transparency + position Background): `layers-panel.png` from `layers_panel_render`.
+- **Mutations** (really run; each reverted and sha256-checked): pixels lock unchecked, transparency lock
+  ignored, position lock ignored by Move, Delete refusal removed, Lock button editing the wrong layer, PSD
+  writer dropping `lspf`, brush ignoring `preserve_alpha`: all seven killed. The first three mutate the
+  permission table, not the press/dab call sites (those need a window).
+- **Gate:** fmt, layering, no-hardcoded-style, `cargo check --locked`, clippy `-D warnings`, doc `-D warnings`, `cargo deny`, contrast and cross-clippy (windows-gnu, x86_64-apple-darwin) clean; **3,742 workspace tests pass with `AURORA_REQUIRE_GPU=1` on the RTX 3090 (0 failed, 76 ignored; 3,722 before this round)**. Pinned tests changed knowingly: the gallery's minimum height (820 -> 880), the Layers row icon lists (the lock icon is excluded from the helper and has its own tests), the `replace_document` descendant count (4 -> 5), and the strip's floor (a fourth row).
+
+Review notes (0.198.0): (1) A PSD's Background layer now opens transparency + position locked, as Photoshop shows it, so the eraser and Move are refused on it with a status-bar notice (Photoshop's eraser on a locked Background paints the background colour; Aurora refuses): a visible behaviour change on every PSD with a Background layer. (2) The press, dab and Move call sites in `App` need a window, so only the pure permission rules are unit-tested; manual checklist on the Mac: paint, erase and Move on a layer with each lock, a lock set mid-stroke, and a Move drag begun before a lock is set (the reviewer did not verify that `finish_move` commits nothing then). (3) The refusal notice has no timeout and is not announced to a screen reader. (4) `lspf` on a group record is checked with psd-tools only, not with Photoshop.
+
+**Previously (2026-10-11, 0.197.0): round L4 of the Photoshop-style Layers panel — layer
 thumbnails. Nobody has seen them in the live window on the Mac (or anywhere but a headless
 render at scale 2 and the unit tests).**
 Series status: L1 icons (0.194.0), L2 rows and controls (0.195.0), L3 toolbar + New Group

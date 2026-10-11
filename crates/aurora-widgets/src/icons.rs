@@ -81,11 +81,17 @@ pub enum IconKind {
     Mask,
     /// A half-filled circle: an adjustment layer.
     Adjustment,
+    /// A checkerboard square: lock transparent pixels (0.198.0).
+    TransparentPixels,
+    /// A paint brush: lock image pixels (0.198.0).
+    Brush,
+    /// Four arrows: lock position (0.198.0).
+    Move,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 14] = [
+    pub const ALL: [IconKind; 17] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -100,6 +106,9 @@ impl IconKind {
         IconKind::Link,
         IconKind::Mask,
         IconKind::Adjustment,
+        IconKind::TransparentPixels,
+        IconKind::Brush,
+        IconKind::Move,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -121,6 +130,9 @@ impl IconKind {
             IconKind::Link => "Link",
             IconKind::Mask => "Mask",
             IconKind::Adjustment => "Adjustment",
+            IconKind::TransparentPixels => "Transparent Pixels",
+            IconKind::Brush => "Brush",
+            IconKind::Move => "Move",
         }
     }
 }
@@ -413,6 +425,40 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 circle(PartStyle::Stroke, 8.0, 8.0, 6.0),
             ]
         }
+        IconKind::TransparentPixels => vec![
+            // Two filled checker squares inside the outline.
+            fill_part()
+                .m(2.0, 2.0)
+                .l(8.0, 2.0)
+                .l(8.0, 8.0)
+                .l(2.0, 8.0)
+                .closed(),
+            fill_part()
+                .m(8.0, 8.0)
+                .l(14.0, 8.0)
+                .l(14.0, 14.0)
+                .l(8.0, 14.0)
+                .closed(),
+            rounded_box(2.0, 2.0, 12.0, 12.0, 1.0),
+        ],
+        IconKind::Brush => vec![
+            // The handle, then the head with its bristles.
+            stroke_part().m(14.0, 2.0).l(9.0, 7.0),
+            stroke_part()
+                .m(7.0, 7.0)
+                .l(9.0, 9.0)
+                .c([9.0, 12.0], [6.0, 14.0], [2.0, 14.0])
+                .c([4.0, 12.0], [3.0, 10.0], [5.0, 8.0])
+                .closed(),
+        ],
+        IconKind::Move => vec![
+            stroke_part().m(8.0, 2.0).l(8.0, 14.0),
+            stroke_part().m(2.0, 8.0).l(14.0, 8.0),
+            stroke_part().m(6.0, 4.0).l(8.0, 2.0).l(10.0, 4.0),
+            stroke_part().m(6.0, 12.0).l(8.0, 14.0).l(10.0, 12.0),
+            stroke_part().m(4.0, 6.0).l(2.0, 8.0).l(4.0, 10.0),
+            stroke_part().m(12.0, 6.0).l(14.0, 8.0).l(12.0, 10.0),
+        ],
     }
 }
 
@@ -511,7 +557,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 14);
+        assert_eq!(IconKind::ALL.len(), 17);
         for (i, a) in IconKind::ALL.iter().enumerate() {
             assert!(!a.name().is_empty());
             for b in IconKind::ALL.iter().skip(i + 1) {

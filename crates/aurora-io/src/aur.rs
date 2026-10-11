@@ -4482,6 +4482,66 @@ mod tests {
         }
     }
 
+    /// 0.198.0: a layer's and a group's locks survive a save and reopen —
+    /// the manifest carries them and the journal replays to them — and an
+    /// unlocked layer stays unlocked (an old file's layers read as none).
+    #[test]
+    fn round_trips_layer_and_group_locks_and_their_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let pixel = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let other = match history.add_pixel_layer(&mut layers, "q", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let partial = aurora_doc::LayerLock {
+            transparency: true,
+            pixels: false,
+            position: true,
+        };
+        for (id, lock) in [(pixel, partial), (group, aurora_doc::LayerLock::all())] {
+            if let Err(err) = history.set_lock(&mut layers, id, lock) {
+                unreachable!("{err:?}");
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let reopened = &document.layers;
+        assert_eq!(reopened.lock(pixel), Some(partial));
+        assert_eq!(reopened.lock(group), Some(aurora_doc::LayerLock::all()));
+        assert_eq!(reopened.lock(other), Some(aurora_doc::LayerLock::none()));
+        match document.history.replay() {
+            Ok(replayed) => {
+                assert_eq!(replayed.lock(pixel), Some(partial));
+                assert_eq!(replayed.lock(group), Some(aurora_doc::LayerLock::all()));
+            }
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a
     /// PSD import's `curv`) survives a save and reopen — manifest and
     /// history — point for point. The points are stored as given, so a

@@ -219,6 +219,44 @@ def check_groups(folder):
     )
 
 
+def check_locks(folder):
+    """0.198.0: every lock combination reads back through psd-tools.
+
+    Photoshop's own encoding: the record flags' bit 0 is transparency, the
+    `lspf` block's bit 0/1/2 are transparency/composite (pixels)/position,
+    and exactly 0x80000000 is Lock All (all three set in Aurora's model).
+    """
+    spec_path = folder / "locks.json"
+    if not spec_path.exists():
+        print("no locks.json: the lock pass was skipped")
+        return
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "locks.psd")
+    by_name = {layer.name: layer for layer in psd}
+    for want in spec:
+        layer = by_name.get(want["name"])
+        if layer is None:
+            fail(f"locks: no layer {want['name']}")
+        locks = layer.locks
+        wanted = (want["transparency"], want["pixels"], want["position"])
+        if locks is None:
+            got = (False, False, False)
+            if layer._record.flags.transparency_protected:
+                fail(f"{want['name']}: flag bit 0 without an lspf block")
+        elif locks.complete:
+            got = (True, True, True)
+        else:
+            got = (locks.transparency, locks.composite, locks.position)
+        check(f"{want['name']} locks", got, wanted)
+        check(
+            f"{want['name']} flag bit 0",
+            bool(layer._record.flags.transparency_protected),
+            want["transparency"],
+        )
+    print(f"OK: psd-tools read the locks of {len(spec)} layers")
+
+
 if __name__ == "__main__":
     main()
     check_groups(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_locks(Path(sys.argv[1] if len(sys.argv) > 1 else "."))

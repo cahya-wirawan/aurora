@@ -4944,3 +4944,157 @@ fn rgba_layers_decode_to_the_direct_conversion_on_every_path() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Locks (0.198.0)
+// ---------------------------------------------------------------------
+
+mod locks {
+    use super::{TestLayer, TestPsd, doc, ok};
+    use crate::psd::{lspf_for_lock, read};
+    use aurora_doc::LayerLock;
+
+    fn one_layer(flags: u8, lspf: Option<u32>) -> aurora_doc::LayerTree {
+        let bytes = TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers.push(
+                    TestLayer::pixels("L", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]]).with(|l| {
+                        l.flags = flags;
+                        if let Some(v) = lspf {
+                            l.blocks.push((*b"lspf", v.to_be_bytes().to_vec()));
+                        }
+                    }),
+                );
+            })
+            .write();
+        let document = doc(&bytes);
+        assert!(document.report.is_empty(), "{:?}", document.report);
+        document.layers
+    }
+
+    fn lock_of(flags: u8, lspf: Option<u32>) -> LayerLock {
+        let tree = one_layer(flags, lspf);
+        let Some(&id) = tree.roots().first() else {
+            unreachable!("one layer");
+        };
+        tree.lock(id).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_lspf_bits_and_the_record_flag_map_to_the_lock() {
+        let none = LayerLock::none();
+        assert_eq!(lock_of(0, None), none);
+        assert_eq!(lock_of(0, Some(0)), none);
+        // The record flag alone is transparency (older writers).
+        assert_eq!(
+            lock_of(0x01, None),
+            LayerLock {
+                transparency: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            lock_of(0, Some(0x01)),
+            LayerLock {
+                transparency: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            lock_of(0, Some(0x02)),
+            LayerLock {
+                pixels: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            lock_of(0, Some(0x04)),
+            LayerLock {
+                position: true,
+                ..none
+            }
+        );
+        // Photoshop's Background: transparency + position (+ the artboard
+        // nesting bit, which is neither kept nor reported).
+        let background = LayerLock {
+            transparency: true,
+            position: true,
+            ..none
+        };
+        assert_eq!(lock_of(0x01, Some(5)), background);
+        assert_eq!(lock_of(0x01, Some(13)), background);
+        assert_eq!(lock_of(0, Some(0x08)), none, "nesting alone is not a lock");
+        // Lock All: exactly 0x8000_0000, or all three bits.
+        assert_eq!(lock_of(0, Some(0x8000_0000)), LayerLock::all());
+        assert_eq!(lock_of(0, Some(0x07)), LayerLock::all());
+        // A hidden flag does not disturb it.
+        assert_eq!(
+            lock_of(0x02, Some(0x04)),
+            LayerLock {
+                position: true,
+                ..none
+            }
+        );
+    }
+
+    #[test]
+    fn the_written_value_is_what_the_reader_reads_for_every_combination() {
+        for bits in 0..8u8 {
+            let lock = LayerLock {
+                transparency: bits & 1 != 0,
+                pixels: bits & 2 != 0,
+                position: bits & 4 != 0,
+            };
+            let lspf = lspf_for_lock(lock);
+            assert_eq!(lspf.is_some(), lock.is_any());
+            let flags = u8::from(lock.transparency);
+            assert_eq!(lock_of(flags, lspf), lock, "{lock:?} via {lspf:?}");
+        }
+        assert_eq!(lspf_for_lock(LayerLock::all()), Some(0x8000_0000));
+    }
+
+    #[test]
+    fn a_group_record_carries_its_lock_too() {
+        let px = [[0, 0, 0, 255]];
+        let bytes = TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::divider(),
+                    TestLayer::pixels("in", 0, 0, 1, 1, 8, &px),
+                    TestLayer::group("G", *b"norm").with(|l| {
+                        l.blocks
+                            .push((*b"lspf", 0x8000_0000u32.to_be_bytes().to_vec()));
+                    }),
+                ];
+            })
+            .write();
+        let document = ok(read(&bytes));
+        let Some(&group) = document.layers.roots().first() else {
+            unreachable!("a group");
+        };
+        assert_eq!(document.layers.lock(group), Some(LayerLock::all()));
+    }
+
+    /// Real Photoshop output: the corpus's Background layers carry
+    /// transparency + position. Skips when the corpus is absent.
+    #[test]
+    fn a_corpus_background_reads_as_transparency_and_position_locked() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpora/psd/reference/psd-tools-fixtures/16bit5x5.psd");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("SKIPPED: {} is absent", path.display());
+            return;
+        };
+        let document = doc(&bytes);
+        let tree = &document.layers;
+        let locked = tree
+            .roots()
+            .iter()
+            .filter_map(|&id| tree.lock(id))
+            .any(|lock| lock.transparency && lock.position && !lock.pixels);
+        assert!(
+            locked,
+            "the Background layer is locked as Photoshop locks it"
+        );
+    }
+}

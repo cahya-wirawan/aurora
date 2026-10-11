@@ -267,6 +267,10 @@ pub struct TreeItemState {
     /// edge (0.195.0; the Layers panel's blend-mode name). Drawn only; the
     /// accessible description stays the owner's to set.
     pub trailing: Option<String>,
+    /// Logical px kept clear at the row's right edge (0.198.0), for a
+    /// caller's own in-row content there (the Layers panel's lock icon);
+    /// the trailing label and the name stop short of it. Drawn only.
+    pub right_inset: u32,
     /// This row's own line height in logical px (0.197.0; `0` = the
     /// `row_height` token): the Layers panel's rows are taller than a text
     /// row to hold a thumbnail. Drives the row's top padding and minimum
@@ -615,6 +619,7 @@ pub fn insert_tree_item(
         has_children,
         label_inset: 0,
         trailing: None,
+        right_inset: 0,
         row_height: 0,
         key: None,
     };
@@ -873,6 +878,30 @@ pub fn set_tree_item_trailing(
     }
     with_tree_item_mut(tree, id, |state| {
         state.trailing = trailing.map(ToOwned::to_owned);
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Sets the room kept clear at `id`'s right edge, in logical px (`0` =
+/// none). Returns whether anything changed.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`].
+pub fn set_tree_item_right_inset(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    inset: u32,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::TreeItem(state)) if state.right_inset == inset => return Ok(false),
+        Some(WidgetKind::TreeItem(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_tree_item_mut(tree, id, |state| {
+        state.right_inset = inset;
         Ok(())
     })?;
     Ok(true)

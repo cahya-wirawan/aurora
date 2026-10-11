@@ -89,6 +89,10 @@ fn measure_toggle_button(
     measure: &mut TextMeasure<'_>,
 ) -> Option<Size<f32>> {
     state.toggled?;
+    // An icon toggle button (0.198.0) is sized by its style, not its label.
+    if state.icon.is_some() {
+        return None;
+    }
     let text = sanitize_label(&state.label);
     if text.trim().is_empty() {
         return None;

@@ -28,8 +28,9 @@
 //! into a document edit — live drag, one undo step per gesture — is
 //! `aurora-app`'s job, the same split the gallery panel draws.
 
-use aurora_doc::{BlendMode, LayerId, LayerTree};
+use aurora_doc::{BlendMode, LayerId, LayerLock, LayerTree};
 use aurora_theme::Scales;
+use aurora_widgets::icons::IconKind;
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::{TaffyZero as _, length};
@@ -56,6 +57,148 @@ pub struct LayerControls {
     /// Blend mode; option `i` is `BlendMode::modes_for(is_group)[i]` for
     /// the active layer (Pass Through first for a group, 0.179.0).
     pub blend: WidgetId,
+    /// The Lock row (0.198.0): the caption "Lock:" and four icon toggle
+    /// buttons, the last row of the strip, just above the list.
+    pub lock_row: WidgetId,
+    /// Lock transparent pixels.
+    pub lock_transparency: WidgetId,
+    /// Lock image pixels.
+    pub lock_pixels: WidgetId,
+    /// Lock position.
+    pub lock_position: WidgetId,
+    /// Lock all (all three set).
+    pub lock_all: WidgetId,
+}
+
+/// One of the Lock row's four toggles (0.198.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockToggle {
+    Transparency,
+    Pixels,
+    Position,
+    All,
+}
+
+impl LockToggle {
+    /// The four toggles in row order.
+    pub const ALL: [LockToggle; 4] = [
+        LockToggle::Transparency,
+        LockToggle::Pixels,
+        LockToggle::Position,
+        LockToggle::All,
+    ];
+
+    /// The button's accessible name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            LockToggle::Transparency => "Lock transparent pixels",
+            LockToggle::Pixels => "Lock image pixels",
+            LockToggle::Position => "Lock position",
+            LockToggle::All => "Lock all",
+        }
+    }
+
+    /// What the button does, for its description.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            LockToggle::Transparency => {
+                "Painting can change a locked layer's colours but never which pixels are transparent"
+            }
+            LockToggle::Pixels => "Brush and eraser can't change the layer's pixels",
+            LockToggle::Position => "The Move tool can't move the layer",
+            LockToggle::All => {
+                "Locks transparency, pixels and position, and protects the layer from deletion"
+            }
+        }
+    }
+
+    /// The icon.
+    #[must_use]
+    pub const fn icon(self) -> IconKind {
+        match self {
+            LockToggle::Transparency => IconKind::TransparentPixels,
+            LockToggle::Pixels => IconKind::Brush,
+            LockToggle::Position => IconKind::Move,
+            LockToggle::All => IconKind::Lock,
+        }
+    }
+
+    /// Whether this toggle shows as on for `lock`. "All" is on only when
+    /// all three are.
+    #[must_use]
+    pub fn is_on(self, lock: LayerLock) -> bool {
+        match self {
+            LockToggle::Transparency => lock.transparency,
+            LockToggle::Pixels => lock.pixels,
+            LockToggle::Position => lock.position,
+            LockToggle::All => lock == LayerLock::all(),
+        }
+    }
+
+    /// The lock after pressing this toggle on a layer locked as `lock`:
+    /// the three flip individually; "All" sets all three, or clears them
+    /// when all three are already set.
+    #[must_use]
+    pub fn pressed(self, lock: LayerLock) -> LayerLock {
+        match self {
+            LockToggle::Transparency => LayerLock {
+                transparency: !lock.transparency,
+                ..lock
+            },
+            LockToggle::Pixels => LayerLock {
+                pixels: !lock.pixels,
+                ..lock
+            },
+            LockToggle::Position => LayerLock {
+                position: !lock.position,
+                ..lock
+            },
+            LockToggle::All if lock == LayerLock::all() => LayerLock::none(),
+            LockToggle::All => LayerLock::all(),
+        }
+    }
+
+    /// The History label of pressing this toggle on `before` (`"Lock
+    /// transparent pixels"`, `"Unlock position"`, ...).
+    #[must_use]
+    pub fn history_label(self, before: LayerLock) -> String {
+        let what = match self {
+            LockToggle::Transparency => "transparent pixels",
+            LockToggle::Pixels => "image pixels",
+            LockToggle::Position => "position",
+            LockToggle::All => "all",
+        };
+        let verb = if self.is_on(before) { "Unlock" } else { "Lock" };
+        format!("{verb} {what}")
+    }
+}
+
+impl LayerControls {
+    /// The Lock-row toggle `widget` is, if it is one.
+    #[must_use]
+    pub fn lock_toggle_for(&self, widget: WidgetId) -> Option<LockToggle> {
+        [
+            (self.lock_transparency, LockToggle::Transparency),
+            (self.lock_pixels, LockToggle::Pixels),
+            (self.lock_position, LockToggle::Position),
+            (self.lock_all, LockToggle::All),
+        ]
+        .into_iter()
+        .find_map(|(id, toggle)| (id == widget).then_some(toggle))
+    }
+
+    /// The button for `toggle`.
+    #[must_use]
+    pub fn lock_button(&self, toggle: LockToggle) -> WidgetId {
+        match toggle {
+            LockToggle::Transparency => self.lock_transparency,
+            LockToggle::Pixels => self.lock_pixels,
+            LockToggle::Position => self.lock_position,
+            LockToggle::All => self.lock_all,
+        }
+    }
 }
 
 /// The blend-mode dropdown's options for a pixel or adjustment layer:
@@ -155,8 +298,18 @@ fn readout_width(scales: &Scales) -> f32 {
     width
 }
 
-/// The strip's rows: the blend dropdown, Opacity and Fill.
+/// The strip's slider-height rows: the blend dropdown, Opacity and Fill.
+/// The Lock row (0.198.0) is the fourth, as tall as its icon buttons
+/// ([`lock_row_height`]), which is at least one row.
 const CONTROL_ROWS: f32 = 3.0;
+
+/// The icon size of the Lock row's buttons.
+const LOCK_ICON_SIZE: widgets::IconSize = widgets::IconSize::Small;
+
+/// The Lock row's height: its buttons, or one row if they are shorter.
+fn lock_row_height(scales: &Scales) -> f32 {
+    widgets::icon_button_side(scales, LOCK_ICON_SIZE).max(widgets::row_height(scales))
+}
 
 fn strip_style(scales: &Scales) -> Style {
     #[allow(clippy::cast_precision_loss)]
@@ -165,7 +318,7 @@ fn strip_style(scales: &Scales) -> Style {
     let gap = length(scales.spacing.xs as f32);
     let row = widgets::row_height(scales);
     #[allow(clippy::cast_precision_loss)]
-    let chrome = 2.0 * scales.spacing.sm as f32 + 2.0 * scales.spacing.xs as f32;
+    let chrome = 2.0 * scales.spacing.sm as f32 + 3.0 * scales.spacing.xs as f32;
     Style {
         flex_direction: FlexDirection::Column,
         // Above the list (0.195.0): never shrunk; the list's viewport
@@ -173,7 +326,7 @@ fn strip_style(scales: &Scales) -> Style {
         flex_shrink: 0.0,
         min_size: Size {
             width: taffy::Dimension::ZERO,
-            height: length(CONTROL_ROWS * row + chrome),
+            height: length(CONTROL_ROWS * row + lock_row_height(scales) + chrome),
         },
         gap: Size {
             width: gap,
@@ -271,6 +424,33 @@ fn build(
     )?;
     let (_, opacity, opacity_readout) = slider_row(tree, root, scales, "Opacity")?;
     let (fill_row, fill, fill_readout) = slider_row(tree, root, scales, "Fill")?;
+    let mut lock_node = accesskit::Node::new(accesskit::Role::Group);
+    lock_node.set_label("Lock".to_owned());
+    let lock_row = tree.insert(
+        root,
+        control_row_style(scales),
+        lock_node,
+        WidgetKind::Container,
+    )?;
+    let caption = widgets::insert_label(tree, lock_row, scales, "Lock:")?;
+    let mut caption_style = tree.style(caption).cloned().unwrap_or_default();
+    caption_style.size.width = length(caption_width(scales));
+    tree.set_style(caption, caption_style)?;
+    let mut buttons = [lock_row; 4];
+    for (slot, toggle) in buttons.iter_mut().zip(LockToggle::ALL) {
+        let button = widgets::insert_icon_toggle_button(
+            tree,
+            lock_row,
+            scales,
+            toggle.label(),
+            toggle.icon(),
+            LOCK_ICON_SIZE,
+            false,
+        )?;
+        widgets::set_button_description(tree, button, Some(toggle.description()))?;
+        *slot = button;
+    }
+    let [lock_transparency, lock_pixels, lock_position, lock_all] = buttons;
     let controls = LayerControls {
         root,
         opacity,
@@ -279,6 +459,11 @@ fn build(
         fill_readout,
         fill_row,
         blend,
+        lock_row,
+        lock_transparency,
+        lock_pixels,
+        lock_position,
+        lock_all,
     };
     set_disabled(tree, controls, true, false)?;
     Ok(controls)
@@ -309,6 +494,14 @@ fn set_disabled(
         (controls.fill_readout, fill_disabled),
     ] {
         changed |= widgets::set_label_disabled(tree, readout, off)?;
+    }
+    for toggle in LockToggle::ALL {
+        let button = controls.lock_button(toggle);
+        if matches!(tree.payload(button), Some(WidgetKind::Button(state)) if state.disabled != disabled)
+        {
+            widgets::set_button_disabled(tree, button, disabled)?;
+            changed = true;
+        }
     }
     if widgets::dropdown_state(tree, controls.blend)?.is_disabled() != disabled {
         widgets::set_dropdown_disabled(tree, controls.blend, disabled)?;
@@ -431,6 +624,11 @@ pub fn sync_layer_controls(
     )?;
     if captured.is_some() {
         changed |= sync_layer_readouts(tree, controls)?;
+    }
+    let lock = layers.lock(id).unwrap_or_default();
+    for toggle in LockToggle::ALL {
+        changed |=
+            widgets::set_button_toggled(tree, controls.lock_button(toggle), toggle.is_on(lock))?;
     }
     // A group lists Pass Through first and anything else does not list it
     // at all (0.179.0), so the options follow the active layer's kind.
@@ -886,5 +1084,97 @@ mod tests {
             (value - 100.0).abs() < 1e-9,
             "uncaptured, the document wins, got {value}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{LockToggle, insert_layer_controls, sync_layer_controls};
+    use crate::workspace::build_workspace;
+    use aurora_doc::{LayerLock, LayerTree};
+    use aurora_widgets::widgets::WidgetKind;
+
+    fn scales() -> aurora_theme::Scales {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        match aurora_theme::Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn the_toggles_flip_individually_and_all_sets_or_clears_all_three() {
+        let none = LayerLock::none();
+        assert_eq!(
+            LockToggle::Transparency.pressed(none),
+            LayerLock {
+                transparency: true,
+                ..none
+            }
+        );
+        assert_eq!(LockToggle::All.pressed(none), LayerLock::all());
+        assert_eq!(LockToggle::All.pressed(LayerLock::all()), none);
+        let two = LayerLock {
+            transparency: true,
+            pixels: true,
+            position: false,
+        };
+        assert_eq!(
+            LockToggle::All.pressed(two),
+            LayerLock::all(),
+            "partial -> all"
+        );
+        assert!(!LockToggle::All.is_on(two));
+        assert!(LockToggle::All.is_on(LayerLock::all()));
+        assert_eq!(
+            LockToggle::Position.pressed(LayerLock::all()),
+            LayerLock {
+                position: false,
+                ..LayerLock::all()
+            }
+        );
+        assert_eq!(LockToggle::Pixels.history_label(none), "Lock image pixels");
+        assert_eq!(
+            LockToggle::Pixels.history_label(LayerLock::all()),
+            "Unlock image pixels"
+        );
+        assert_eq!(
+            LockToggle::All.history_label(LayerLock::all()),
+            "Unlock all"
+        );
+    }
+
+    /// The strip's floor (now four rows: blend, Opacity, Fill and the Lock
+    /// row, 0.198.0) holds its content, and the Lock row's buttons are
+    /// disabled with no active layer.
+    #[test]
+    fn the_strip_holds_four_rows_and_the_lock_buttons_follow_having_a_layer() {
+        let scales = scales();
+        let mut ws = build_workspace(&scales);
+        let layers = LayerTree::new();
+        let controls = match insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        ws.tree.compute_layout(1280.0, 900.0);
+        let Some(strip) = ws.tree.bounds(controls.root) else {
+            unreachable!("laid out");
+        };
+        let Some(lock_row) = ws.tree.bounds(controls.lock_row) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            lock_row.y + i64::from(lock_row.height) <= strip.y + i64::from(strip.height),
+            "the Lock row ends inside the strip: {lock_row:?} in {strip:?}"
+        );
+        for toggle in LockToggle::ALL {
+            let id = controls.lock_button(toggle);
+            assert_eq!(controls.lock_toggle_for(id), Some(toggle));
+            assert!(matches!(
+                ws.tree.payload(id),
+                Some(WidgetKind::Button(state)) if state.disabled
+            ));
+        }
+        assert!(sync_layer_controls(&mut ws.tree, controls, &layers, None, None).is_ok());
     }
 }

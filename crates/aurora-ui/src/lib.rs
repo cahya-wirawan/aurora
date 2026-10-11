@@ -78,9 +78,9 @@ pub use history_panel::{
     HistoryRows, HistoryStep, UNDONE_STATE, populate_history_panel, populate_history_panel_rows,
 };
 pub use layer_controls::{
-    LayerControls, blend_mode_at, blend_mode_index, blend_mode_index_for, blend_mode_label,
-    blend_mode_options, blend_mode_options_for, insert_layer_controls, layer_controls_contains,
-    sync_layer_controls, sync_layer_readouts,
+    LayerControls, LockToggle, blend_mode_at, blend_mode_index, blend_mode_index_for,
+    blend_mode_label, blend_mode_options, blend_mode_options_for, insert_layer_controls,
+    layer_controls_contains, sync_layer_controls, sync_layer_readouts,
 };
 pub use layer_toolbar::{
     DELETE_UNAVAILABLE, LAYER_TOOLBAR_ICON_SIZE, LAYER_TOOLBAR_LABEL, LayerAction, LayerToolbar,

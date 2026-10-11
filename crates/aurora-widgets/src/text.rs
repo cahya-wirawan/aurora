@@ -506,7 +506,7 @@ pub fn text_runs(
                 // the trailing text's width (no text engine is available
                 // here), so the two never overlap.
                 let left = full.0 + token_px(state.label_inset);
-                let right = full.0 + full.2 - pad;
+                let right = full.0 + full.2 - pad - token_px(state.right_inset);
                 let reserve = state.trailing.as_ref().map_or(0.0, |text| {
                     #[allow(clippy::cast_precision_loss)]
                     let chars = text.chars().count() as f32;
