@@ -42,6 +42,10 @@ wgpu = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
 half = { workspace = true }
+# The background compositor's own thread pool (0.188.0): it folds several
+# view tiles at once (`background_composite`). PRD §8's chosen crate for
+# CPU tile parallelism, already a workspace dependency via `aurora-gpu`.
+rayon = { workspace = true }
 # `command_palette_style`'s own real `taffy::Style` (`Position::Absolute`
 # positioning for the command palette) -- was dev-only until this crate
 # actually needed to construct one in production code, not just tests.

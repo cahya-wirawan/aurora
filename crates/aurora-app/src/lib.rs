@@ -12426,7 +12426,7 @@ fn apply_mask(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
     mask_surface: Option<aurora_tile::SurfaceId>,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     doc_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> Vec<half::f16> {
@@ -12564,6 +12564,77 @@ fn apply_mask(
     masked
 }
 
+/// Where the CPU fold path reads source tiles from (0.188.0): the four
+/// [`aurora_tile::TileStore`] operations [`composite_roots_into_tile`] and
+/// everything under it use, and nothing else. A `TileStore` is one, and
+/// behaves exactly as it always did (`texels` is
+/// [`aurora_tile::TileStore::get`]). The parallel background
+/// compositor's `SharedMirror` is the other: several threads fold
+/// against one mirror store at once. Taken as `&mut dyn TileSource`
+/// rather than as a generic, so the fold path is compiled once.
+pub(crate) trait TileSource {
+    /// [`aurora_tile::TileStore::contains_tile`].
+    fn contains_tile(&self, surface: aurora_tile::SurfaceId, id: aurora_tile::TileId) -> bool;
+    /// [`aurora_tile::TileStore::content_version`].
+    fn content_version(&self, surface: aurora_tile::SurfaceId, id: aurora_tile::TileId) -> u64;
+    /// [`aurora_tile::TileStore::serial`]: what the drop-shadow cache keys on.
+    fn serial(&self) -> u64;
+    /// A tile's texels, as [`aurora_tile::TileStore::get`] reads them
+    /// (paging in when needed). The fold path asks
+    /// [`TileSource::contains_tile`] first, so it never reads a tile that
+    /// is not held.
+    ///
+    /// # Errors
+    ///
+    /// [`aurora_tile::TileError`] when paging the tile in fails.
+    fn texels(
+        &mut self,
+        surface: aurora_tile::SurfaceId,
+        id: aurora_tile::TileId,
+    ) -> Result<SourceTexels<'_>, aurora_tile::TileError>;
+}
+
+/// A source tile's texels: borrowed from a store, or a reference count on
+/// its copy-on-write buffer ([`aurora_tile::TileStore::peek_shared`]).
+pub(crate) enum SourceTexels<'a> {
+    Borrowed(&'a [half::f16]),
+    Shared(std::sync::Arc<Vec<half::f16>>),
+}
+
+impl std::ops::Deref for SourceTexels<'_> {
+    type Target = [half::f16];
+
+    fn deref(&self) -> &[half::f16] {
+        match self {
+            Self::Borrowed(texels) => texels,
+            Self::Shared(texels) => texels,
+        }
+    }
+}
+
+impl TileSource for aurora_tile::TileStore {
+    fn contains_tile(&self, surface: aurora_tile::SurfaceId, id: aurora_tile::TileId) -> bool {
+        aurora_tile::TileStore::contains_tile(self, surface, id)
+    }
+
+    fn content_version(&self, surface: aurora_tile::SurfaceId, id: aurora_tile::TileId) -> u64 {
+        aurora_tile::TileStore::content_version(self, surface, id)
+    }
+
+    fn serial(&self) -> u64 {
+        aurora_tile::TileStore::serial(self)
+    }
+
+    fn texels(
+        &mut self,
+        surface: aurora_tile::SurfaceId,
+        id: aurora_tile::TileId,
+    ) -> Result<SourceTexels<'_>, aurora_tile::TileError> {
+        self.get(surface, id)
+            .map(|tile| SourceTexels::Borrowed(tile.texels()))
+    }
+}
+
 /// The shared, per-composite-pass half of [`resolve_tile`]'s recursion
 /// bounds: a monotone node budget, plus a one-shot "already reported"
 /// flag. `depth`, the other half, stays a plain by-value parameter,
@@ -12621,11 +12692,17 @@ impl CompositeBudget {
     /// `layers`, with nothing reported yet.
     fn for_pass(layers: &aurora_doc::LayerTree) -> Self {
         // A new composite pass, for the shadow cache's eviction policy.
-        SHADOW_CACHE.with(|cache| {
-            if let Ok(mut cache) = cache.try_borrow_mut() {
-                cache.begin_pass();
-            }
-        });
+        let _ = with_shadow_cache(ShadowCache::begin_pass);
+        Self::for_tile_of_pass(layers)
+    }
+
+    /// A budget for one more tile of a pass already begun (0.188.0): what
+    /// [`Self::for_pass`] returns, without beginning a new shadow-cache
+    /// pass. The parallel background compositor gives each tile its own,
+    /// since a budget's node count is per tile anyway
+    /// ([`Self::next_tile`]); only `reported`'s once-per-pass warning
+    /// becomes once per tile there.
+    fn for_tile_of_pass(layers: &aurora_doc::LayerTree) -> Self {
         Self {
             nodes: layers.len(),
             reported: false,
@@ -13067,7 +13144,7 @@ fn admit_composite_node(
 fn resolve_tile(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -13232,7 +13309,7 @@ fn resolve_tile(
 fn pixel_layer_texels(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -13258,7 +13335,7 @@ fn pixel_layer_texels(
 fn pixel_layer_texels_unprofiled(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -13313,8 +13390,8 @@ fn pixel_layer_texels_unprofiled(
         if !store.contains_tile(surface, tile_id) {
             return None;
         }
-        match store.get(surface, tile_id) {
-            Ok(tile) => tile.texels().to_vec(),
+        match store.texels(surface, tile_id) {
+            Ok(tile) => tile.to_vec(),
             Err(err) => {
                 // Recorded, not just logged: the live canvas is
                 // content to skip this layer and repaint, but the
@@ -13448,20 +13525,20 @@ thread_local! {
 fn shadow_tile_coverage(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile: CompositeTileAt,
     own: Option<&[half::f16]>,
     geometry: aurora_core::effects::ShadowGeometry,
     budget: &mut CompositeBudget,
-) -> Option<std::rc::Rc<Vec<f32>>> {
+) -> Option<std::sync::Arc<Vec<f32>>> {
     let key = shadow_cache_key(id, layers, store, tile, geometry)?;
-    if let Some(hit) = SHADOW_CACHE.with(|cache| cache.try_borrow_mut().ok()?.get(&key)) {
+    if let Some(hit) = with_shadow_cache(|cache| cache.get(&key)).flatten() {
         return Some(hit);
     }
     #[cfg(test)]
     SHADOW_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
-    let coverage = std::rc::Rc::new(profiled(ProfileSlot::ShadowMiss, || {
+    let coverage = std::sync::Arc::new(profiled(ProfileSlot::ShadowMiss, || {
         compute_shadow_tile_coverage(id, layers, store, tile, own, geometry, budget)
     })?);
     // Review RC-1: a source or mask tile that failed to page in was
@@ -13469,18 +13546,15 @@ fn shadow_tile_coverage(
     // in the key have not changed, so caching it would keep serving it.
     // Recompute next time instead, as the rest of the composite does.
     if budget.store_errors == errors_before {
-        SHADOW_CACHE.with(|cache| {
-            if let Ok(mut cache) = cache.try_borrow_mut() {
-                cache.insert(key, std::rc::Rc::clone(&coverage));
-            }
-        });
+        let _ = with_shadow_cache(|cache| cache.insert(key, std::sync::Arc::clone(&coverage)));
     }
     Some(coverage)
 }
 
-/// The most the drop-shadow coverage cache holds per thread (0.182.0
+/// The most one drop-shadow coverage cache holds (0.182.0
 /// review): 256 MiB, i.e. 1,024 tiles of 256² `f32`. Past it the least
-/// recently used tile is dropped.
+/// recently used tile is dropped. One thread-local cache per non-pool
+/// thread, and one shared cache for the background worker and its pool.
 const SHADOW_CACHE_BYTES: usize = 256 << 20;
 
 /// One cached tile's size.
@@ -13523,8 +13597,8 @@ struct ShadowCacheKey {
 type ShadowStamp = (u64, u64);
 
 #[derive(Default)]
-struct ShadowCache {
-    entries: std::collections::HashMap<ShadowCacheKey, (ShadowStamp, std::rc::Rc<Vec<f32>>)>,
+pub(crate) struct ShadowCache {
+    entries: std::collections::HashMap<ShadowCacheKey, (ShadowStamp, std::sync::Arc<Vec<f32>>)>,
     order: std::collections::BTreeMap<ShadowStamp, ShadowCacheKey>,
     clock: u64,
     pass: u64,
@@ -13535,18 +13609,18 @@ impl ShadowCache {
         self.pass += 1;
     }
 
-    fn get(&mut self, key: &ShadowCacheKey) -> Option<std::rc::Rc<Vec<f32>>> {
+    fn get(&mut self, key: &ShadowCacheKey) -> Option<std::sync::Arc<Vec<f32>>> {
         self.clock += 1;
         let stamp = (self.pass, self.clock);
         let (old, coverage) = self.entries.get_mut(key)?;
         let previous = std::mem::replace(old, stamp);
-        let coverage = std::rc::Rc::clone(coverage);
+        let coverage = std::sync::Arc::clone(coverage);
         self.order.remove(&previous);
         self.order.insert(stamp, key.clone());
         Some(coverage)
     }
 
-    fn insert(&mut self, key: ShadowCacheKey, coverage: std::rc::Rc<Vec<f32>>) {
+    fn insert(&mut self, key: ShadowCacheKey, coverage: std::sync::Arc<Vec<f32>>) {
         let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
         if let Some((old, _)) = self.entries.remove(&key) {
             self.order.remove(&old);
@@ -13571,9 +13645,56 @@ impl ShadowCache {
 }
 
 thread_local! {
-    /// Drop-shadow coverage tiles, per thread (compositing runs on one).
+    /// Drop-shadow coverage tiles of this thread; the background worker's pool
+    /// threads use the shared cache instead.
     static SHADOW_CACHE: std::cell::RefCell<ShadowCache> =
         std::cell::RefCell::new(ShadowCache::default());
+}
+
+/// One drop-shadow coverage cache several threads share (0.188.0): the
+/// parallel background compositor's, so its pool's threads hit each
+/// other's entries (a tile is folded by whichever thread picks it up, a
+/// different one from job to job) and the pool as a whole stays within
+/// [`SHADOW_CACHE_BYTES`] instead of that much per thread. The lock is
+/// held only for a lookup or an insert, never while a coverage is
+/// computed (two threads missing the same key compute the same value,
+/// and the second insert replaces the first).
+pub(crate) type SharedShadowCache = std::sync::Arc<std::sync::Mutex<ShadowCache>>;
+
+thread_local! {
+    /// This thread's [`SharedShadowCache`], when it has one (0.188.0):
+    /// set on the background compositor's worker and pool threads by
+    /// [`use_shared_shadow_cache`], `None` (so [`SHADOW_CACHE`]) on every
+    /// other thread.
+    static SHARED_SHADOW_CACHE: std::cell::RefCell<Option<SharedShadowCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Routes this thread's drop-shadow coverage through `cache` (0.188.0),
+/// or back to its own [`SHADOW_CACHE`] with `None`.
+pub(crate) fn use_shared_shadow_cache(cache: Option<SharedShadowCache>) {
+    SHARED_SHADOW_CACHE.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = cache;
+        }
+    });
+}
+
+/// Runs `f` on this thread's drop-shadow coverage cache: the shared one
+/// when [`use_shared_shadow_cache`] set one, else [`SHADOW_CACHE`].
+/// `None` only when the thread-local is already borrowed (a re-entrant
+/// call), as before: the caller then simply computes without caching.
+fn with_shadow_cache<R>(f: impl FnOnce(&mut ShadowCache) -> R) -> Option<R> {
+    let shared =
+        SHARED_SHADOW_CACHE.with(|slot| slot.try_borrow().ok().and_then(|slot| slot.clone()));
+    if let Some(shared) = shared {
+        let mut cache = match shared.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        return Some(f(&mut cache));
+    }
+    SHADOW_CACHE.with(|cache| cache.try_borrow_mut().ok().map(|mut cache| f(&mut cache)))
 }
 
 #[cfg(test)]
@@ -13585,7 +13706,7 @@ thread_local! {
 /// The versions of every tile of `surface` (whose tile grid starts at
 /// document `origin`) overlapping the document rect `window` of `side`².
 fn surface_window_versions(
-    store: &aurora_tile::TileStore,
+    store: &dyn TileSource,
     surface: aurora_tile::SurfaceId,
     origin: (i64, i64),
     window: (i64, i64),
@@ -13621,7 +13742,7 @@ fn surface_window_versions(
 fn shadow_cache_key(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &aurora_tile::TileStore,
+    store: &dyn TileSource,
     tile: CompositeTileAt,
     geometry: aurora_core::effects::ShadowGeometry,
 ) -> Option<ShadowCacheKey> {
@@ -13685,7 +13806,7 @@ fn shadow_cache_key(
 fn compute_shadow_tile_coverage(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile: CompositeTileAt,
     own: Option<&[half::f16]>,
     geometry: aurora_core::effects::ShadowGeometry,
@@ -13929,7 +14050,7 @@ fn fold_layer_with_effects(
     accumulator: &mut [half::f16],
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14193,11 +14314,14 @@ fn shown_shadow_coverages<'a>(
     fx: &'a aurora_core::LayerEffects,
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile: CompositeTileAt,
     own: Option<&[half::f16]>,
     budget: &mut CompositeBudget,
-) -> Vec<(&'a aurora_core::effects::DropShadow, std::rc::Rc<Vec<f32>>)> {
+) -> Vec<(
+    &'a aurora_core::effects::DropShadow,
+    std::sync::Arc<Vec<f32>>,
+)> {
     let mut shadows = Vec::new();
     for shadow in fx.drop_shadows.iter().filter(|s| fx.shows(s.gate)) {
         let geometry = shadow.geometry();
@@ -14214,7 +14338,7 @@ fn shown_shadow_coverages<'a>(
 /// knocks out, in its own mode at `shadow opacity × layer opacity`.
 fn fold_shadows_beneath(
     accumulator: &mut [half::f16],
-    shadows: &[(&aurora_core::effects::DropShadow, std::rc::Rc<Vec<f32>>)],
+    shadows: &[(&aurora_core::effects::DropShadow, std::sync::Arc<Vec<f32>>)],
     shape: &[half::f16],
     opacity: f32,
     doc_origin: (i64, i64),
@@ -14286,7 +14410,7 @@ fn fold_layer_into(
     accumulator: &mut [half::f16],
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14388,7 +14512,7 @@ fn fold_pass_through_group(
     accumulator: &mut [half::f16],
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14554,7 +14678,7 @@ fn apply_adjustment_layer(
     accumulator: &mut [half::f16],
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     doc_origin: (i64, i64),
     depth: usize,
     budget: &mut CompositeBudget,
@@ -14725,7 +14849,7 @@ fn is_opaque_pass_through(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerI
 fn opaque_cover_texels(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14788,7 +14912,7 @@ fn opaque_cover_texels(
 fn fold_plan_for_tile(
     context: &[aurora_doc::LayerId],
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14820,7 +14944,7 @@ fn fold_plan_for_tile(
 fn search_cover(
     nodes: &[aurora_doc::LayerId],
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14885,7 +15009,7 @@ fn fold_context_into(
     accumulator: &mut [half::f16],
     nodes: &[aurora_doc::LayerId],
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -14956,7 +15080,7 @@ fn fold_planned_node(
     id: aurora_doc::LayerId,
     rest: PlanRef<'_>,
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -15088,7 +15212,7 @@ fn fold_planned_node(
 /// Every caller that does not care can discard it.
 fn composite_roots_into_tile(
     layers: &aurora_doc::LayerTree,
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
@@ -20885,7 +21009,7 @@ impl LayerWindow {
 /// though masking otherwise fails open.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_layer_window(
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     surface: aurora_tile::SurfaceId,
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
@@ -20900,7 +21024,7 @@ fn read_layer_window(
 /// [`read_layer_window`]'s body, under [`profiled`] (0.183.0).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_layer_window_unprofiled(
-    store: &mut aurora_tile::TileStore,
+    store: &mut dyn TileSource,
     surface: aurora_tile::SurfaceId,
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
@@ -20961,7 +21085,7 @@ fn read_layer_window_unprofiled(
             if !store.contains_tile(surface, tile_id) {
                 continue;
             }
-            let src = match store.get(surface, tile_id) {
+            let src = match store.texels(surface, tile_id) {
                 Ok(src) => src,
                 Err(err) => {
                     // Same reason as `resolve_tile`'s own direct
@@ -20999,7 +21123,7 @@ fn read_layer_window_unprofiled(
                     continue;
                 }
             };
-            let texels = src.texels();
+            let texels: &[half::f16] = &src;
             // First real source tile for this window: now, and only
             // now, is a destination buffer worth having.
             let out = out.get_or_insert_with(|| {
@@ -76306,7 +76430,7 @@ mod tests {
                     if cache.get(&key(i)).is_some() {
                         hits += 1;
                     } else {
-                        cache.insert(key(i), std::rc::Rc::new(vec![0.0]));
+                        cache.insert(key(i), std::sync::Arc::new(vec![0.0]));
                     }
                     assert!(cache.entries.len() <= cap);
                     assert_eq!(cache.order.len(), cache.entries.len());
@@ -76317,7 +76441,7 @@ mod tests {
             // A later pass that needs other tiles evicts the old ones.
             cache.begin_pass();
             for i in 10_000..10_000 + cap {
-                cache.insert(key(i), std::rc::Rc::new(vec![0.0]));
+                cache.insert(key(i), std::sync::Arc::new(vec![0.0]));
             }
             assert!(cache.get(&key(0)).is_none());
             assert!(cache.get(&key(10_000)).is_some());

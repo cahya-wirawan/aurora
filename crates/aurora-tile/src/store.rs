@@ -1011,6 +1011,18 @@ impl TileStore {
             || self.paged_out.contains_key(&key)
     }
 
+    /// A **resident** tile's texels, shared (0.188.0): the store's own
+    /// copy-on-write buffer, a reference count and no copy. `None` for a
+    /// tile that is evicted, pending or absent. Never pages in,
+    /// materializes, evicts or bumps LRU recency, so it takes `&self`:
+    /// it is what lets several threads read one store at once behind a
+    /// read lock (`aurora-app`'s parallel background compositor), going
+    /// through [`Self::get`] only for a tile that is not resident.
+    #[must_use]
+    pub fn peek_shared(&self, surface: SurfaceId, id: TileId) -> Option<Arc<Vec<half::f16>>> {
+        self.resident.peek(&(surface, id)).map(Tile::shared_texels)
+    }
+
     /// An upper bound on the bytes [`Self::snapshot_tile`] would copy for
     /// `(surface, id)`, from what the store already knows and **without
     /// any I/O** (0.152.0 review R2): a resident tile's texel bytes, a
@@ -3360,6 +3372,35 @@ mod tests {
     }
 
     // -- Eviction/revisit race (PLAN.md M1.1) --
+
+    #[test]
+    fn peek_shared_reads_only_resident_tiles_and_never_materializes() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+        assert!(store.peek_shared(s, id).is_none(), "absent: nothing");
+        assert!(!store.contains_tile(s, id), "and nothing materialized");
+        let texels = vec![half::f16::from_f32(0.25); crate::tile::SAMPLES];
+        store.insert_share(s, id, super::TileShare::Texels(Arc::new(texels.clone())));
+        let Some(shared) = store.peek_shared(s, id) else {
+            unreachable!("resident after insert_share");
+        };
+        assert_eq!(shared.as_slice(), texels.as_slice());
+        let Ok(Some(super::TileShare::Texels(own))) = store.share_tile(s, id) else {
+            unreachable!("resident tile shares texels");
+        };
+        assert!(
+            Arc::ptr_eq(&shared, &own),
+            "the store's own buffer, not a copy"
+        );
+        store.insert_share(
+            s,
+            id,
+            super::TileShare::Encoded(Arc::new(crate::codec::encode(&texels))),
+        );
+        assert!(store.peek_shared(s, id).is_none(), "evicted: not peeked");
+        assert!(!store.is_resident(s, id), "and not paged in by the peek");
+    }
 
     /// The decisive, fully deterministic proof that the `pending` fast
     /// path works: constructs, **by hand**, the exact state `make_room`

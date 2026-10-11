@@ -26,7 +26,73 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.187.0): the active document gets a bigger share of
+**Latest (2026-10-11, 0.188.0): the background compositor folds a job's
+tiles in parallel (round R4 of the large-template performance plan; ADR
+0012's 0.188.0 addendum).**
+- **Design.** The worker owns a rayon pool of
+  `background_composite::composite_threads()` threads
+  (`available_parallelism − 1`, at least 1; never the global pool). It folds
+  one tile per task (`par_iter().with_max_len(1)`). During a job the mirror
+  sits in a `Mutex`, and each task reads it through a `SharedMirror`.
+  - A resident tile is an `Arc` taken under the lock (new
+    `aurora_tile::TileStore::peek_shared`, `&self`), copied outside it.
+  - A tile that is not resident pages in under the lock.
+  - The keys a task read are promoted in the LRU before its page-ins and
+    when it finishes.
+- **One fold path.** `composite_roots_into_tile` and the 20 functions
+  under it take `&mut dyn TileSource` (`contains_tile`, `content_version`,
+  `serial`, `texels`: the only four store calls they ever made).
+  `TileStore`'s implementation is the old behaviour (`texels` = `get`), so
+  the synchronous path, export, histogram and the GPU path are unchanged.
+- **Caches.** One drop-shadow coverage cache (`SharedShadowCache`, a
+  `Mutex`, coverage now `Arc`) serves the worker thread and its pool. It is
+  still keyed by the store serial and capped at 256 MiB for the pool
+  together. The UI thread keeps its own. Curves LUTs (8) and scratch
+  buffers (≤ 4 × 512 KiB) stay per thread: about 2 MiB of LUTs plus 2 MiB of scratch per
+  thread, about 28 MiB across 7 threads.
+- **Few cores.** With 2 cores the pool has 1 thread, which measured
+  ~25% slower than 0.187.0's sequential fold (3.70 s vs 2.97 s, not
+  investigated); only machines with 3+ cores gain. Evicted tiles still held
+  by a running task stay outside the residency budget, bounded per thread.
+- **Rules kept.** A task checks the job's generation before it starts, so a
+  newer job, cancel or shutdown stops the pool starting tiles; at most one
+  tile per thread finishes. Every 0.186.0 install rule (generation,
+  document, origin, `unchanged_since`, provisional tiles) is untouched.
+  The mirror stays in its document's pool group.
+- **Measured (Nyepi, release, this 8-core box, 7 threads; 40 view
+  tiles).** Each pair below is 0.187.0 → 0.188.0.
+  - Warm structural edit to final pixels, 16,384-tile pool: **2.97 s →
+    0.62 s**.
+  - First job after open: 7.02 s → 1.51 s.
+  - 2,048-tile pool, active share: warm 5.03–5.07 s → 2.37–2.71 s; first
+    8.49 s → 3.10 s. Page-ins are serialized under the lock, so less gain
+    here.
+  - RSS after the first job and three edits, 16,384 pool: 3,217 → 3,368 MiB.
+  - The same warm edit on a one-thread pool in the new build is 3.70 s, a
+    ~25 % per-thread overhead against 0.187.0's 2.97 s. Not investigated.
+  - **Not measured:** other OSes, fewer cores, UI frame time or brush
+    latency while the pool runs.
+- **Tests** (`background_composite_tests.rs`). The equality helpers now
+  force a 4-thread pool. The `Gate` tests use a 1-thread pool, so "one
+  tile sent, the rest not started" stays exact. New tests:
+  - `a_job_folded_on_several_threads_equals_the_sync_composite` (a
+    `TaskGate` holds tasks until two threads run, at budgets 256 and 4);
+  - `a_cancel_stops_the_pool_starting_tiles_and_shutdown_joins`;
+  - `the_pools_shadow_cache_never_mixes_two_documents_up`;
+  - `composite_threads_leaves_a_core_and_is_at_least_one`;
+  - aurora-tile's `peek_shared_reads_only_resident_tiles_and_never_materializes`.
+  - The Nyepi measurement test now also skips when its file is absent, and
+    re-measures the warm edit on one thread.
+  - Stress: the compositor tests ran 20× under 12 `yes` processes, 0
+    failures.
+- **Mutations** (each restored, sha256 checked), all killed:
+  - a tile sent to the transposed slot (14 tests);
+  - the cancel check dropped (4, including the new cancel test);
+  - the shadow key without the store serial (killed only by the new
+    two-document test);
+  - a miss returning blank instead of paging in (5).
+
+**Previously (2026-10-11, 0.187.0): the active document gets a bigger share of
 the tile residency pool (design-owner decision, Cahya, 2026-10-11: "the active
 document gets a bigger share", a pending open counts; the weighting is
 engineering's, ADR 0011's 0.187.0 addendum).**
