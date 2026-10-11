@@ -26,7 +26,55 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.192.0): bounds for small machines — a machine with
+**Latest (2026-10-11, 0.192.1): the live canvas was washed out on an sRGB
+surface — `canvas.wgsl` encoded the picture twice. Fixed (canvas shader and a
+log line only).**
+- **Evidence from the user's screenshot** of `6739968.psd` (Mac, Metal),
+  registered to Photoshop's merged image at zoom 0.96, offset (120, 36), over
+  ~1M smooth pixels in 16-level bins: greys match sRGB-encode(true) within one
+  level (true 215 -> shown 235, predicted 236; 231 -> 243, 244; 242 -> 248,
+  249). An alpha-over-white wash does not fit: per-channel linear fits give
+  slope 0.64/0.72/0.73 with intercepts 96/80/79 (three different alphas), and
+  bright greys barely move while mid greys lift a lot. The saturated red is
+  the one poor match (true 105/19/17, shown 161/90/87, encode predicts
+  172/77/73). **Hypothesis, not measured:** the macOS screenshot's colour
+  management (Display P3) accounts for that residual.
+- **Cause.** `choose_surface_format` prefers an sRGB-aware swapchain; an sRGB
+  target re-encodes whatever the fragment returns. Widgets and the clear
+  colour linearize for that case; `canvas.wgsl` returned the atlas's
+  already-encoded rgb unchanged, so every document's canvas was encoded
+  twice. The canvas tests all rendered into `Rgba8Unorm`, which stores bytes
+  as given, so none could see it.
+- **Ruled out headlessly.** Nyepi opened as the app does (active layer =
+  topmost pixel layer, bounds (-124, -36)), composited for a 2048x1536 view
+  on that grid with `recomposite_tiles`, matches the merged image (mean error
+  2.5 levels, saturated reds). Nyepi never takes the GPU path. The tile grid,
+  the CPU/worker composite, Pass Through, Fill and blends are not the cause.
+- **Fix.** `canvas.wgsl` has `override SRGB_TARGET: bool`; `CanvasPipeline::
+  pipeline` sets it from `target_format.is_srgb()`, and the fragment returns
+  `srgb_to_linear(encoded)` for such targets (a plain `*Unorm` target is
+  unchanged). `aurora-app` logs "window surface created" (format, `srgb`,
+  scale factor) once at startup.
+- **Tests** (`aurora-gpu` `render_test.rs`):
+  `canvas_pipeline_shows_the_same_encoded_bytes_on_an_srgb_target` (215 grey
+  reads 215 on `Rgba8Unorm` and `Rgba8UnormSrgb`) and
+  `canvas_output_ramp_reads_back_unchanged_on_every_target_format` (grey ramp,
+  pagoda red and green over four 8-bit formats). Mutation: forcing the
+  constant to 0.0 failed the first with "Rgba8UnormSrgb red: 236, want 215";
+  the same mutation on Apple M2 Pro/Metal gives grey 32->99, 64->137,
+  128->188, 215->237, red 105/19/17 -> 172/77/73, green 45/95/45 ->
+  117/164/117 on both sRGB formats, exact on both Unorm formats. Restored with
+  `sha256sum -c`.
+- **Verified:** on Vulkan/NVIDIA (RTX 3090) and on Apple M2 Pro/Metal, with
+  the ramp test (fix on: all four formats exact; fix off: both sRGB formats
+  double-encode). **Not verified:** the live window on the Mac. The user has
+  to re-take the screenshot.
+- **Not changed (separate issue, next round).** The live view draws layer
+  content outside the document canvas (no clip; export clips, Photoshop
+  clips), and the pan bound is the active layer's origin, so Nyepi opens with
+  the artboard offset by (+124, +36). See "Next action".
+
+**Previously (2026-10-11, 0.192.0): bounds for small machines — a machine with
 4 or fewer cores or 8 GiB or less of RAM gets a 64 MiB effects cache and no
 encode/decode overlap on a PSD open.**
 - **Decision (design owner, Cahya, 2026-10-11, #2).** "Mirror memory on
@@ -33763,6 +33811,8 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Next round (found with 0.192.1): clip the live canvas to the document.** The live view draws layer content that lies outside the canvas rectangle (Nyepi's layers reach (-2061,-646)-(3010,2693) on a 1080x1920 canvas), as white shapes and a transparent checkerboard beside the artboard, and its pan bound is the active layer's origin rather than the document's, so the artboard opens offset. Photoshop clips to the canvas. Decide the pasteboard styling and the pan bound with Cahya, then clip in the view (shader or tile selection) without touching export.
 
 **Follow-up from 0.190.0 closed in 0.191.1:** the `masks.psd` Stroke residual was the shadow knockout, not the stroke (see the Latest entry).
 

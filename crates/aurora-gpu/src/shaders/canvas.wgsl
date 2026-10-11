@@ -16,6 +16,20 @@ struct Canvas {
 @group(0) @binding(1) var canvas_smp: sampler;
 @group(0) @binding(2) var<uniform> canvas: Canvas;
 
+// 0.192.1: set by the pipeline when the render target is an sRGB-aware
+// format (`TextureFormat::is_srgb`). The atlas, the checkerboard and the
+// `over` below are all sRGB-*encoded* values; an sRGB target re-encodes
+// whatever the fragment returns on store, so without this the canvas was
+// encoded twice (a 215/255 grey came out 235), the washed-out look. A
+// plain `*Unorm` target stores the encoded value as it is.
+override SRGB_TARGET: bool = false;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3<f32>(0.0)) + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -102,5 +116,6 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     // `canvas_pipeline_does_not_bleed_transparent_black_across_a_hard_alpha_edge`
     // is the negative control for the *domain* -- it fails against the
     // straight-domain formula, measured, not assumed.
-    return vec4<f32>(c.rgb + bg * (1.0 - c.a), 1.0);
+    let encoded = c.rgb + bg * (1.0 - c.a);
+    return vec4<f32>(select(encoded, srgb_to_linear(encoded), SRGB_TARGET), 1.0);
 }

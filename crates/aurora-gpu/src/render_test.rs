@@ -275,8 +275,29 @@ fn render_and_sample_pixels(
     target_size: (u32, u32),
     samples: &[(u32, u32)],
 ) -> Vec<[u8; 4]> {
+    render_and_sample_pixels_in(
+        device,
+        queue,
+        canvas,
+        residency,
+        target_size,
+        samples,
+        wgpu::TextureFormat::Rgba8Unorm,
+    )
+}
+
+/// [`render_and_sample_pixels`] into a target of any 8-bit RGBA `format`.
+fn render_and_sample_pixels_in(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &mut CanvasPipeline,
+    residency: &TileResidency,
+    target_size: (u32, u32),
+    samples: &[(u32, u32)],
+    format: wgpu::TextureFormat,
+) -> Vec<[u8; 4]> {
     let bind_group = canvas.bind_group(device, residency);
-    let pipeline = canvas.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
+    let pipeline = canvas.pipeline(device, format);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target"),
@@ -288,7 +309,7 @@ fn render_and_sample_pixels(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -1709,4 +1730,133 @@ fn canvas_pipeline_keeps_one_scale_while_panning_a_whole_tile() {
             );
         }
     }
+}
+
+/// 0.192.1: the canvas shader hands an sRGB-aware target linear light, so
+/// the hardware's re-encode on store leaves the document's own encoded
+/// values on screen. Before, a tile of encoded grey `215/255` read back
+/// as `235` (encoded twice), the washed-out live view. Fixture: an opaque
+/// grey tile, rendered into a plain and an sRGB target; both must read
+/// the same bytes.
+#[test]
+fn canvas_pipeline_shows_the_same_encoded_bytes_on_an_srgb_target() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+    let grey = 215.0_f32 / 255.0;
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [grey, grey, grey, 1.0],
+    );
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+    let mut canvas = CanvasPipeline::new(device);
+    let at = [(VIEWPORT.0 / 2, VIEWPORT.1 / 2)];
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    ] {
+        let pixel = render_and_sample_pixels_in(
+            device,
+            queue,
+            &mut canvas,
+            &residency,
+            VIEWPORT,
+            &at,
+            format,
+        );
+        let Some(&[r, g, b, _]) = pixel.first() else {
+            unreachable!("one sample");
+        };
+        for (channel, label) in [(r, "red"), (g, "green"), (b, "blue")] {
+            assert!(
+                (i32::from(channel) - 215).abs() <= 1,
+                "{format:?} {label}: {channel}, want 215 (235 means encoded twice)"
+            );
+        }
+    }
+}
+
+/// 0.192.1 diagnostic for a real Metal/DX12 adapter: prints, for each 8-bit
+/// target format a surface may use, what the canvas pipeline writes for a
+/// known grey ramp and the Nyepi pagoda red. Output equals input (within 1)
+/// on every format when the sRGB handling is right; `235` for `215` on an
+/// sRGB format is the double encode. Run:
+/// `AURORA_REQUIRE_GPU=1 cargo test -p aurora-gpu canvas_output_ramp -- --nocapture`
+#[test]
+fn canvas_output_ramp_reads_back_unchanged_on_every_target_format() {
+    use std::fmt::Write as _;
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let ramp: [[u8; 3]; 9] = [
+        [0, 0, 0],
+        [32, 32, 32],
+        [64, 64, 64],
+        [128, 128, 128],
+        [180, 180, 180],
+        [215, 212, 211],
+        [243, 240, 239],
+        [105, 19, 17],
+        [45, 95, 45],
+    ];
+    let mut bad = Vec::new();
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut line = format!("{format:?} srgb={}:", format.is_srgb());
+        for want in ramp {
+            let (_dir, mut store) = tile_store();
+            let surface = SurfaceId::from_raw(0);
+            let [r, g, b] = want.map(|v| f32::from(v) / 255.0);
+            paint(&mut store, surface, TileId { x: 0, y: 0 }, [r, g, b, 1.0]);
+            let mut residency = TileResidency::new(device, queue, VIEWPORT);
+            let _ = residency.sync(queue, &mut store, surface, false, usize::MAX);
+            let mut canvas = CanvasPipeline::new(device);
+            let at = [(VIEWPORT.0 / 2, VIEWPORT.1 / 2)];
+            let got = render_and_sample_pixels_in(
+                device,
+                queue,
+                &mut canvas,
+                &residency,
+                VIEWPORT,
+                &at,
+                format,
+            );
+            // A BGRA target reads back in B, G, R order.
+            let Some(&[c0, c1, c2, _]) = got.first() else {
+                unreachable!("one sample");
+            };
+            let out = if matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ) {
+                [c2, c1, c0]
+            } else {
+                [c0, c1, c2]
+            };
+            let _ = write!(line, " {want:?}->{out:?}");
+            if want
+                .iter()
+                .zip(out)
+                .any(|(a, b)| (i32::from(*a) - i32::from(b)).abs() > 1)
+            {
+                bad.push(format!("{format:?} {want:?} -> {out:?}"));
+            }
+        }
+        println!("{line}");
+    }
+    assert!(bad.is_empty(), "canvas output differs from input: {bad:?}");
 }
