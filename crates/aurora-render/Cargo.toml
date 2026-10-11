@@ -12,6 +12,14 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test-only hooks (0.184.0): `set_transparent_skip_enabled` and
+# `transparent_chunks_skipped`, for `aurora-app`'s skip-on/skip-off
+# differentials. Off in every shipping build, where the transparent-chunk
+# skip is unconditionally on and no thread-local is read. Same arrangement
+# as `aurora-doc`'s and `aurora-gpu`'s own `test-support` features.
+test-support = []
+
 [dependencies]
 aurora-core = { workspace = true }
 aurora-tile = { workspace = true }

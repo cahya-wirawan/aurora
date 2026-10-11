@@ -64,6 +64,8 @@ pub use composite::{
     CURVES_GPU_LUT_LEN, TileCompositor, composite_layer_into, composite_tile_cpu, curves_mode_code,
     transparent_tile, un_premultiply_in_place,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};

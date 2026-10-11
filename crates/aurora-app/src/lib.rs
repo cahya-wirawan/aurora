@@ -13219,6 +13219,9 @@ fn pixel_layer_texels(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> Option<Vec<half::f16>> {
+    if let Some(texels) = take_candidate_texels(id, doc_origin, reference_origin) {
+        return Some(texels);
+    }
     profiled(ProfileSlot::LayerTexels, || {
         pixel_layer_texels_unprofiled(
             id,
@@ -13902,7 +13905,7 @@ fn invalidate_painted_tiles(
 ///
 /// Effects are computed here, at composite time, from the stored settings
 /// — never baked into the layer's pixels. `infx` is not modelled (E6).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fold_layer_with_effects(
     accumulator: &mut [half::f16],
     id: aurora_doc::LayerId,
@@ -13960,37 +13963,71 @@ fn fold_layer_with_effects(
     let shadow_factor = if unit { 1.0 } else { opacity };
     fold_shadows_beneath(accumulator, &shadows, &shape, shadow_factor, doc_origin);
     let one = half::f16::from_f32(1.0);
+    // 0.184.0: steps 1-3 run only on the rows where the shape has coverage
+    // (`shape_row_runs`): step 3 never reads the interior elsewhere (its
+    // `t <= 0` texels are skipped), so leaving those rows uncomputed is
+    // exact by construction. A `Dissolve` overlay's dither depends on the
+    // texel's position in the whole tile, so it keeps the whole tile. The
+    // interior and source buffers come from a per-thread pool.
+    let row_restricted = fold_skips_enabled()
+        && !fx.color_overlays.iter().any(|overlay| {
+            fx.shows(overlay.gate)
+                && aurora_doc::BlendMode::from(overlay.blend_mode)
+                    == aurora_doc::BlendMode::Dissolve
+        });
+    let runs = if row_restricted {
+        shape_row_runs(&shape)
+    } else {
+        std::iter::once(0..aurora_tile::SAMPLES).collect()
+    };
     // Step 1: the content at full shape, alpha `F`, in the layer's mode
     // (`Dissolve` gates the final coverage instead, step 3).
-    let mut interior = accumulator.to_vec();
-    let mut source = shape.clone();
-    for texel in source.chunks_exact_mut(aurora_tile::CHANNELS) {
-        if let Some(alpha) = texel.get_mut(3) {
-            *alpha = one;
-        }
-    }
+    let mut interior = take_tile_scratch();
+    let mut source = take_tile_scratch();
     let content_mode = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
         aurora_doc::BlendMode::Normal
     } else {
         raw_blend_mode
     };
-    fold_texels_in_mode(&mut interior, &source, fill, content_mode, doc_origin);
+    for run in &runs {
+        if let (Some(inside), Some(acc), Some(src), Some(shape)) = (
+            interior.get_mut(run.clone()),
+            accumulator.get(run.clone()),
+            source.get_mut(run.clone()),
+            shape.get(run.clone()),
+        ) {
+            inside.copy_from_slice(acc);
+            src.copy_from_slice(shape);
+            for texel in src.chunks_exact_mut(aurora_tile::CHANNELS) {
+                if let Some(alpha) = texel.get_mut(3) {
+                    *alpha = one;
+                }
+            }
+            fold_texels_in_mode(inside, src, fill, content_mode, doc_origin);
+        }
+    }
     // Step 2: each shown overlay, bottom to top.
     for overlay in fx.color_overlays.iter().filter(|o| fx.shows(o.gate)) {
         let colour =
             [overlay.color.r, overlay.color.g, overlay.color.b, 1.0].map(half::f16::from_f32);
-        for texel in source.chunks_exact_mut(aurora_tile::CHANNELS) {
-            for (channel, value) in texel.iter_mut().zip(colour) {
-                *channel = value;
+        for run in &runs {
+            if let (Some(inside), Some(src)) =
+                (interior.get_mut(run.clone()), source.get_mut(run.clone()))
+            {
+                for texel in src.chunks_exact_mut(aurora_tile::CHANNELS) {
+                    for (channel, value) in texel.iter_mut().zip(colour) {
+                        *channel = value;
+                    }
+                }
+                fold_texels_in_mode(
+                    inside,
+                    src,
+                    overlay.opacity,
+                    aurora_doc::BlendMode::from(overlay.blend_mode),
+                    doc_origin,
+                );
             }
         }
-        fold_texels_in_mode(
-            &mut interior,
-            &source,
-            overlay.opacity,
-            aurora_doc::BlendMode::from(overlay.blend_mode),
-            doc_origin,
-        );
     }
     // Step 3: lay the interior down at shape × opacity.
     let coverage = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
@@ -14003,20 +14040,31 @@ fn fold_layer_with_effects(
     } else {
         opacity.clamp(0.0, 1.0)
     };
-    for ((out, inside), cover) in accumulator
-        .chunks_exact_mut(aurora_tile::CHANNELS)
-        .zip(interior.chunks_exact(aurora_tile::CHANNELS))
-        .zip(coverage.chunks_exact(aurora_tile::CHANNELS))
-    {
-        let t = (cover.get(3).map_or(0.0, |a| a.to_f32()) * scale).clamp(0.0, 1.0);
-        if t <= 0.0 {
+    for run in &runs {
+        let (Some(out), Some(inside), Some(cover)) = (
+            accumulator.get_mut(run.clone()),
+            interior.get(run.clone()),
+            coverage.get(run.clone()),
+        ) else {
             continue;
-        }
-        for (channel, &x) in out.iter_mut().zip(inside) {
-            let b = channel.to_f32();
-            *channel = half::f16::from_f32((x.to_f32() - b).mul_add(t, b));
+        };
+        for ((out, inside), cover) in out
+            .chunks_exact_mut(aurora_tile::CHANNELS)
+            .zip(inside.chunks_exact(aurora_tile::CHANNELS))
+            .zip(cover.chunks_exact(aurora_tile::CHANNELS))
+        {
+            let t = (cover.get(3).map_or(0.0, |a| a.to_f32()) * scale).clamp(0.0, 1.0);
+            if t <= 0.0 {
+                continue;
+            }
+            for (channel, &x) in out.iter_mut().zip(inside) {
+                let b = channel.to_f32();
+                *channel = half::f16::from_f32((x.to_f32() - b).mul_add(t, b));
+            }
         }
     }
+    return_tile_scratch(interior);
+    return_tile_scratch(source);
     if let Some(backdrop) = backdrop {
         let l = opacity.clamp(0.0, 1.0);
         for (channel, &below) in accumulator.iter_mut().zip(&backdrop) {
@@ -14025,6 +14073,99 @@ fn fold_layer_with_effects(
         }
     }
     true
+}
+
+/// The sample ranges of `shape`'s rows that hold any texel whose alpha is
+/// not `<= 0` (positive or NaN), merged into runs (0.184.0): the only rows
+/// [`fold_layer_with_effects`]' step 3 can write.
+fn shape_row_runs(shape: &[half::f16]) -> Vec<std::ops::Range<usize>> {
+    let row = aurora_tile::TILE as usize * aurora_tile::CHANNELS;
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (index, texels) in shape.chunks(row).enumerate() {
+        let active = texels
+            .chunks_exact(aurora_tile::CHANNELS)
+            .any(|texel| texel.get(3).is_some_and(|a| a.to_f32() > 0.0 || a.is_nan()));
+        if !active {
+            continue;
+        }
+        let start = index * row;
+        let end = start + texels.len();
+        match runs.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => runs.push(start..end),
+        }
+    }
+    runs
+}
+
+thread_local! {
+    /// Whole-tile `f16` buffers [`fold_layer_with_effects`] reuses across
+    /// tiles instead of allocating two per call (0.184.0).
+    static TILE_SCRATCH: std::cell::RefCell<Vec<Vec<half::f16>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A whole-tile buffer from this thread's pool, **with stale contents**:
+/// the caller overwrites every sample it reads.
+fn take_tile_scratch() -> Vec<half::f16> {
+    TILE_SCRATCH
+        .with(|pool| pool.try_borrow_mut().ok().and_then(|mut pool| pool.pop()))
+        .filter(|buffer| buffer.len() == aurora_tile::SAMPLES)
+        .unwrap_or_else(|| vec![half::f16::from_f32(0.0); aurora_tile::SAMPLES])
+}
+
+/// Returns a [`take_tile_scratch`] buffer to the pool (at most four kept).
+fn return_tile_scratch(buffer: Vec<half::f16>) {
+    TILE_SCRATCH.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut()
+            && pool.len() < 4
+        {
+            pool.push(buffer);
+        }
+    });
+}
+
+thread_local! {
+    /// Rejected cover candidates' texels (0.184.0, CU-1): read by the cover
+    /// search, kept for the candidate's own fold in the same composite tile
+    /// so the layer is read once. Keyed by layer and both origins; cleared
+    /// at both ends of [`composite_roots_into_tile`].
+    static CANDIDATE_TEXELS: std::cell::RefCell<Vec<CandidateTexels>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One [`CANDIDATE_TEXELS`] entry: layer, document origin, grid anchor,
+/// and the texels [`pixel_layer_texels`] returned for them.
+type CandidateTexels = (aurora_doc::LayerId, (i64, i64), (i64, i64), Vec<half::f16>);
+
+fn remember_candidate_texels(entry: CandidateTexels) {
+    CANDIDATE_TEXELS.with(|memo| {
+        if let Ok(mut memo) = memo.try_borrow_mut() {
+            memo.push(entry);
+        }
+    });
+}
+
+fn take_candidate_texels(
+    id: aurora_doc::LayerId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+) -> Option<Vec<half::f16>> {
+    CANDIDATE_TEXELS.with(|memo| {
+        let mut memo = memo.try_borrow_mut().ok()?;
+        let index = memo
+            .iter()
+            .position(|(l, d, r, _)| *l == id && *d == doc_origin && *r == reference_origin)?;
+        Some(memo.swap_remove(index).3)
+    })
+}
+
+fn clear_candidate_texels() {
+    CANDIDATE_TEXELS.with(|memo| {
+        if let Ok(mut memo) = memo.try_borrow_mut() {
+            memo.clear();
+        }
+    });
 }
 
 /// Each shown drop shadow of `fx` with its coverage on `tile`, in list
@@ -14591,7 +14732,13 @@ fn opaque_cover_texels(
         && texels
             .chunks_exact(aurora_tile::CHANNELS)
             .all(|texel| texel.get(3).map(|a| a.to_bits()) == Some(one));
-    opaque.then_some(texels)
+    if opaque {
+        return Some(texels);
+    }
+    if fold_skips_enabled() && scratch.store_errors == 0 {
+        remember_candidate_texels((id, doc_origin, reference_origin, texels));
+    }
+    None
 }
 
 /// Occlusion culling (0.183.0): finds the topmost cover in `context`
@@ -14929,6 +15076,14 @@ fn composite_roots_into_tile(
     budget: &mut CompositeBudget,
 ) -> (Vec<half::f16>, usize) {
     let mut composited = aurora_render::transparent_tile();
+    // 0.184.0 review (SK-3): the memo holds only this tile's own search
+    // results and is cleared on the way out, so it is empty here; the clear
+    // stays for release builds, where this assertion is compiled out.
+    debug_assert!(
+        CANDIDATE_TEXELS.with(|memo| memo.try_borrow().map_or(true, |memo| memo.is_empty())),
+        "the cover-candidate memo outlived a composite tile"
+    );
+    clear_candidate_texels();
     // Occlusion culling (0.183.0): fold from the topmost exactly-opaque
     // cover up, skipping every root below it (`fold_plan_for_tile`).
     let plan = fold_plan_for_tile(
@@ -15013,6 +15168,7 @@ fn composite_roots_into_tile(
     // `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`,
     // which asserts zero calls for a zero-fold tile and one for a tile
     // that folded a root.
+    clear_candidate_texels();
     if folded > 0 {
         aurora_render::un_premultiply_in_place(&mut composited);
         note_composite_straighten_pass();
@@ -16995,6 +17151,11 @@ thread_local! {
     /// Test-only: `true` turns occlusion culling off on this thread, for
     /// the cull-versus-uncull differentials.
     static COMPOSITE_CULLING_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: `true` turns the 0.184.0 fold skips off on this thread —
+    /// the effects path's row restriction and the cover-candidate texel
+    /// memo here, and `aurora_render`'s transparent-chunk skip (set with
+    /// it, [`set_fold_skips_for_tests`]).
+    static FOLD_SKIPS_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -17036,6 +17197,24 @@ fn occlusion_culling_enabled() -> bool {
 #[cfg(not(test))]
 const fn occlusion_culling_enabled() -> bool {
     true
+}
+
+/// Whether the 0.184.0 fold skips run: always in a shipping build.
+#[cfg(test)]
+fn fold_skips_enabled() -> bool {
+    !FOLD_SKIPS_DISABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn fold_skips_enabled() -> bool {
+    true
+}
+
+/// Test-only: turns every 0.184.0 fold skip on or off on this thread.
+#[cfg(test)]
+fn set_fold_skips_for_tests(enabled: bool) {
+    FOLD_SKIPS_DISABLED.with(|flag| flag.set(!enabled));
+    aurora_render::set_transparent_skip_enabled(enabled);
 }
 
 /// Test-only tally of [`recomposite_visible_tiles`]'s `write_composited`
@@ -75796,12 +75975,15 @@ mod tests {
             // 0.183.0: at the old benchmark budget (16) and the app's
             // (`TILE_BUDGET`), each with occlusion culling off (the 0.182.0
             // path) and on.
+            // 0.184.0: "0.183.0" = culling on, fold skips off; "0.184.0" =
+            // both on (the scratch pool cannot be switched off).
             for budget in [16, crate::TILE_BUDGET] {
-                for cull in [false, true] {
-                    println!("COST ==== budget {budget}, culling {cull} ====");
-                    crate::COMPOSITE_CULLING_DISABLED.with(|c| c.set(!cull));
-                    edit_costs(&bytes, budget, !cull && budget == 16);
-                    crate::COMPOSITE_CULLING_DISABLED.with(|c| c.set(false));
+                for skips in [false, true] {
+                    let label = if skips { "0.184.0" } else { "0.183.0" };
+                    println!("COST ==== budget {budget}, {label} ====");
+                    crate::set_fold_skips_for_tests(skips);
+                    edit_costs(&bytes, budget, false);
+                    crate::set_fold_skips_for_tests(true);
                 }
             }
         }
@@ -75846,6 +76028,10 @@ mod tests {
                 );
             }
             println!("BREAKDOWN {what}:   culled folds {}", now_culled - culled);
+            println!(
+                "BREAKDOWN {what}:   transparent chunks skipped (cumulative) {}",
+                aurora_render::transparent_chunks_skipped()
+            );
         }
 
         #[allow(clippy::too_many_lines)]
@@ -80262,8 +80448,19 @@ mod occlusion_cull_tests {
         )
     }
 
+    /// Culling and (0.184.0) every fold skip, on or off together: the
+    /// differentials compare the fully optimised composite with the plain one.
     fn set_culling(enabled: bool) {
         COMPOSITE_CULLING_DISABLED.with(|c| c.set(!enabled));
+        set_fold_skips_for_tests(enabled);
+    }
+
+    fn chunks_skipped() -> u64 {
+        aurora_render::transparent_chunks_skipped()
+    }
+
+    fn profile_calls(slot: ProfileSlot) -> u64 {
+        COMPOSITE_PROFILE.with(|p| p.get().slots.get(slot as usize).map_or(0, |s| s.0))
     }
 
     fn culled_folds() -> u64 {
@@ -80784,6 +80981,151 @@ mod occlusion_cull_tests {
         );
     }
 
+    // ---- 0.184.0: fold skips ----
+
+    /// Every one of the 27 modes, over an all-transparent source region and
+    /// a sparse source with one opaque texel, on a translucent backdrop:
+    /// skips on equal skips off, bit for bit, and the skip fires.
+    #[test]
+    fn every_mode_folds_a_transparent_region_and_a_sparse_texel_exactly() {
+        for mode in aurora_doc::BlendMode::ALL {
+            if mode == aurora_doc::BlendMode::PassThrough {
+                continue;
+            }
+            for sparse in [false, true] {
+                let (_d, mut store) = store_with_budget(64);
+                let mut layers = aurora_doc::LayerTree::new();
+                let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+                let top = layer(
+                    &mut layers,
+                    &mut store,
+                    None,
+                    rect(0, 0, 512, 512),
+                    &move |x, y| {
+                        if sparse && (x, y) == (77, 141) {
+                            [0.9, 0.3, 0.6, 1.0]
+                        } else if !sparse && y < 128 {
+                            opaque(x, y)
+                        } else {
+                            [0.0; 4]
+                        }
+                    },
+                );
+                ok(layers.set_blend_mode(top, mode));
+                ok(layers.set_opacity(top, 0.75));
+                let before = chunks_skipped();
+                let (_, _) = differential(&layers, &mut store, (0, 0));
+                assert!(
+                    chunks_skipped() > before,
+                    "{mode:?}, sparse {sparse}: nothing skipped"
+                );
+            }
+        }
+    }
+
+    /// A `Dissolve` colour overlay dithers by position in the whole tile,
+    /// so its layer keeps the whole-tile path; a shape that starts below
+    /// row 0 is what would expose a row-restricted dither.
+    #[test]
+    fn a_dissolve_overlay_keeps_the_whole_tile_effects_path() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let id = layer(&mut layers, &mut store, None, full_tile(), &|x, y| {
+            if (60..140).contains(&y) && (20..200).contains(&x) {
+                opaque(x, y)
+            } else {
+                [0.0; 4]
+            }
+        });
+        let fx = aurora_core::LayerEffects {
+            color_overlays: vec![aurora_core::effects::ColorOverlay {
+                blend_mode: aurora_core::effects::EffectBlendMode::Dissolve,
+                opacity: 0.5,
+                ..aurora_core::effects::ColorOverlay::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        };
+        ok(layers.set_effects(id, Some(fx)));
+        let (_, _) = differential(&layers, &mut store, (0, 0));
+    }
+
+    #[test]
+    fn rejected_cover_candidate_is_read_once() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        // A cover candidate by its metadata, rejected by its texels.
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        let before = profile_calls(ProfileSlot::LayerTexels);
+        let _ = tile_with(&layers, &mut store, (0, 0), true);
+        assert_eq!(
+            profile_calls(ProfileSlot::LayerTexels) - before,
+            1,
+            "searched and folded from one read"
+        );
+        let before = profile_calls(ProfileSlot::LayerTexels);
+        let _ = tile_with(&layers, &mut store, (0, 0), false);
+        assert_eq!(
+            profile_calls(ProfileSlot::LayerTexels) - before,
+            1,
+            "no search, one read"
+        );
+        let (_, _) = differential(&layers, &mut store, (0, 0));
+        let leftover = CANDIDATE_TEXELS.with(|m| m.try_borrow().map_or(1, |m| m.len()));
+        assert_eq!(leftover, 0, "the memo never outlives a composite tile");
+    }
+
+    /// The effects path's pooled buffers come back holding another layer's
+    /// pixels; reusing them must not leak those pixels into the result.
+    #[test]
+    fn effects_scratch_reuse_is_bit_identical() {
+        let (_d, mut store) = store_with_budget(64);
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = layer(&mut layers, &mut store, None, full_tile(), &translucent);
+        for (k, overlay_mode) in [
+            aurora_core::effects::EffectBlendMode::Multiply,
+            aurora_core::effects::EffectBlendMode::Normal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = layer(&mut layers, &mut store, None, full_tile(), &move |x, y| {
+                if (x - 60 - 70 * k as i64).abs() < 40 && (y - 90 - 50 * k as i64).abs() < 30 {
+                    opaque(y, x)
+                } else {
+                    [0.0; 4]
+                }
+            });
+            let fx = aurora_core::LayerEffects {
+                color_overlays: vec![aurora_core::effects::ColorOverlay {
+                    blend_mode: overlay_mode,
+                    opacity: 0.6,
+                    ..aurora_core::effects::ColorOverlay::default()
+                }],
+                drop_shadows: vec![aurora_core::effects::DropShadow {
+                    distance: 5.0,
+                    size: 3.0,
+                    ..aurora_core::effects::DropShadow::default()
+                }],
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+            // Fill below one and a non-Normal mode: the interior depends on
+            // its backdrop, so a stale buffer would show.
+            ok(layers.set_fill_opacity(id, 0.5));
+            ok(layers.set_blend_mode(id, aurora_doc::BlendMode::Multiply));
+        }
+        // Warm the pool with this tree's own buffers, then compare repeated
+        // optimised composites with the plain one.
+        let (plain, _) = tile_with(&layers, &mut store, (0, 0), false);
+        for _ in 0..3 {
+            let (warm, _) = tile_with(&layers, &mut store, (0, 0), true);
+            assert!(mismatches(&warm, &plain).is_empty());
+        }
+        let pooled = TILE_SCRATCH.with(|p| p.try_borrow().map_or(0, |p| p.len()));
+        assert!(pooled >= 2, "the pool is in use: {pooled}");
+    }
+
     /// A small seeded generator (xorshift64*), so failures reproduce.
     struct Rng(u64);
 
@@ -80872,13 +81214,41 @@ mod occlusion_cull_tests {
                 [r, g, b, if inside_hole { hole_alpha } else { 1.0 }]
             });
             ok(layers.set_blend_mode(id, mode));
-            if rng.chance(10) {
-                let fx = aurora_core::LayerEffects {
-                    drop_shadows: vec![aurora_core::effects::DropShadow {
-                        distance: 3.0,
-                        size: 2.0,
+            // 0.184.0 (CU-4): effects on about a quarter of pixel layers:
+            // shadows, colour overlays (any of four modes, `Dissolve` too) or both.
+            if rng.chance(GENERATED_EFFECTS_PERCENT) {
+                let shadows = if rng.chance(60) {
+                    vec![aurora_core::effects::DropShadow {
+                        distance: rng.below(8) as f32,
+                        size: rng.below(6) as f32,
                         ..aurora_core::effects::DropShadow::default()
-                    }],
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let overlays = if shadows.is_empty() || rng.chance(50) {
+                    let modes = [
+                        aurora_core::effects::EffectBlendMode::Normal,
+                        aurora_core::effects::EffectBlendMode::Multiply,
+                        aurora_core::effects::EffectBlendMode::Screen,
+                        aurora_core::effects::EffectBlendMode::Dissolve,
+                    ];
+                    vec![aurora_core::effects::ColorOverlay {
+                        blend_mode: rng.pick(&modes, aurora_core::effects::EffectBlendMode::Normal),
+                        color: aurora_core::effects::EffectColor {
+                            r: 0.2,
+                            g: 0.6,
+                            b: 0.9,
+                        },
+                        opacity: rng.pick(&[0.5, 1.0], 1.0),
+                        ..aurora_core::effects::ColorOverlay::default()
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let fx = aurora_core::LayerEffects {
+                    drop_shadows: shadows,
+                    color_overlays: overlays,
                     ..aurora_core::LayerEffects::default()
                 };
                 ok(layers.set_effects(id, Some(fx)));
@@ -80910,11 +81280,15 @@ mod occlusion_cull_tests {
         }
     }
 
+    /// How often the random-tree generator gives a pixel layer effects.
+    const GENERATED_EFFECTS_PERCENT: u64 = 25;
+
     #[test]
     fn random_trees_cull_equals_uncull() {
         let mut rng = Rng(0x0A0B_0C0D_1830_0001);
         let mut culled_total = 0;
         let mut trees_culled = 0;
+        let (skips0, effects0) = (chunks_skipped(), profile_calls(ProfileSlot::EffectsFold));
         let trees = 320;
         for tree in 0..trees {
             let (_d, mut store) = store_with_budget(512);
@@ -80938,7 +81312,21 @@ mod occlusion_cull_tests {
             culled_total += this_tree;
             trees_culled += usize::from(this_tree > 0);
         }
-        println!("random trees: {trees_culled}/{trees} culled, {culled_total} folds skipped");
+        let skips = chunks_skipped() - skips0;
+        let effects = profile_calls(ProfileSlot::EffectsFold) - effects0;
+        println!(
+            "random trees: {trees_culled}/{trees} culled, {culled_total} folds culled, \
+             {skips} transparent chunks skipped, {effects} effects folds"
+        );
+        // 0.184.0: the skips and effects (CU-4) really ran in this comparison.
+        assert!(
+            skips > 0,
+            "the generator must exercise the transparent skip"
+        );
+        assert!(
+            effects > 1000,
+            "the generator must exercise effects: {effects}"
+        );
         assert!(
             trees_culled >= trees / 10,
             "the generator must exercise culling"
@@ -81021,8 +81409,14 @@ mod occlusion_cull_tests {
             culled_files += usize::from(skipped > 0);
         }
         println!(
-            "corpus: {compared} of {} files compared, {culled_files} culled, {culled_total} folds skipped",
-            files.len()
+            "corpus: {compared} of {} files compared, {culled_files} culled, {culled_total} folds \
+             culled, {} transparent chunks skipped",
+            files.len(),
+            chunks_skipped()
+        );
+        assert!(
+            chunks_skipped() > 0,
+            "the corpus exercises the transparent skip"
         );
         assert!(compared > 100, "the harness opened {compared} files");
         assert!(culled_files > 0, "some corpus file culls");
@@ -81062,7 +81456,7 @@ mod occlusion_cull_tests {
         let skipped = culled_folds() - before;
         let bad = mismatches(&culled, &plain);
         println!(
-            "NYEPI cull differential: {} samples, {} differ, {skipped} folds culled",
+            "NYEPI cull + skip differential: {} samples, {} differ, {skipped} folds culled",
             plain.len(),
             bad.len()
         );

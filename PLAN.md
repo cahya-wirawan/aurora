@@ -26,7 +26,189 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.183.0): large-template performance, round R1 —
+**Latest (2026-10-11, 0.184.0): large-template performance, round R2 —
+the per-fold cost.** The 0.183.0 breakdown showed the folds themselves
+take the time. Nyepi's layers are canvas-sized but mostly empty, so this
+round stops the fold from working on empty source. All four changes are
+bit-identical; each is switched off on a test thread by
+`set_fold_skips_for_tests`. The differential tests compare culling and
+skips both on against both off.
+
+- **Transparent-chunk skip** (`aurora_render::composite_layer_into`,
+  `chunk_folds_to_backdrop`). A 64-texel chunk is left untouched when:
+  - every source alpha is `±0` and every source colour is in `[+0, 1]`;
+  - every destination texel is sign-clear and finite, with each colour
+    channel `<=` its alpha (all compared as `f16` bits).
+
+  This reaches every plain fold, the shadow folds, Curves and every
+  `Dissolve` (its gated texels are 0 or 1). A thread-local counter
+  (`transparent_chunks_skipped`) shows when it fires.
+- **Effects path, row restricted** (`fold_layer_with_effects`,
+  `shape_row_runs`). Steps 1–3 run only on rows where the shape has
+  coverage (alpha `> 0` or NaN). Step 3 never reads the interior where
+  `t <= 0`, so this is exact by construction, with no float argument
+  needed. A layer with a shown `Dissolve` overlay keeps the whole-tile
+  path, because its dither depends on position.
+- **Effects scratch pool** (`take_tile_scratch`/`return_tile_scratch`,
+  thread-local, at most 4 buffers). The two whole-tile buffers per call
+  are reused, and every sample read is overwritten first.
+- **CU-1: a rejected cover candidate is read once**
+  (`CANDIDATE_TEXELS`). The search keeps a rejected candidate's texels, and
+  that layer's own fold in the same composite tile takes them instead of
+  reading the layer again. The cache is keyed by layer and both origins,
+  never filled after a read error, and cleared at both ends of
+  `composite_roots_into_tile`. On Nyepi it saves only 22 reads per pass.
+- **CU-4.** `random_trees_cull_equals_uncull` now generates:
+  - shadows and colour overlays (Normal, Multiply, Screen, Dissolve) on
+    about 25 % of pixel layers;
+  - masks on layers and groups;
+  - translucent Pass Through groups.
+
+  It asserts that skips and more than 1,000 effects folds really ran.
+
+**Result: warm full composite 8.54 s → 5.41 s at budget 256** (−37 %), and
+9.58 s → 6.48 s at budget 16. **Open + first composite: 16.1 s → 12.8 s** at
+256. The targets (warm ≤ 3 s, open ≤ 10 s) are still **missed**. What
+remains is mostly reads: `pixel_layer_texels` takes 2.3 s, of which the
+windowed reads are 1.5 s, and 2,913 page-ins at budget 256. The residency
+budget is next, and its size is Cahya's call. `visible_tiles()` is still
+not clamped to the canvas (deferred).
+
+**0.184.0 review revision (SK-1–SK-3, before merge).**
+- **SK-2.** The transparent-skip switch and counter
+  (`set_transparent_skip_enabled`, `transparent_chunks_skipped` and their
+  thread-locals) now sit behind a new `aurora-render` feature,
+  `test-support`. `aurora-app` enables it from its dev-dependencies, as it
+  does for `aurora-doc` and `aurora-gpu`. Without the feature the skip is a
+  `const fn` returning `true`, so no thread-local is read and nothing is
+  exported. The flagless `cargo check --workspace --locked` compiles.
+- **SK-1.** `chunk_folds_to_backdrop`'s doc comment now gives the analytic
+  finiteness argument:
+  - `Cb = d/da <= 1`, since `d <= da` and division is correctly rounded;
+  - guarded divisors are at least `2^-24` (nonzero `f16`) or `2^-11`
+    (`1 - Cs` below one), so quotients stay at or below about `2^24`;
+  - `SetSat`/`ClipColor` ratios lie in `[0, 1]`;
+  - `SoftLight`'s `sqrt` sees only `Cb >= 0`.
+
+  A new test, `blend_rgb_is_finite_on_subnormal_and_near_one_operands_in_every_mode`,
+  sweeps every combination of zero, subnormal, tiny, near-one and one
+  operands, plus subnormal `d/da` backdrops, in all 26 modes.
+- **SK-3.** `composite_roots_into_tile` now has a `debug_assert!` that the
+  cover-candidate cache is empty on entry. The release-build clear stays.
+  No store serial was added to the key: the cache never outlives one
+  composite tile, and nothing writes to the store inside one.
+
+**0.184.0 addendum: exactness per mode, breakdown, performance, mutations
+and gate.**
+
+**Why the skip is exact in each mode.**
+- **Setup.** Take a source texel with alpha `±0`. `fold_texel`'s
+  `alpha = sa · opacity` is then `±0`: opacity is clamped to `[0, 1]`, and
+  the skip is off when it is NaN. So `inverse = 1` exactly, and each colour
+  channel is `d + (±0) · blended`.
+- **`blended` is finite.** The skip needs `blended = (1 − da)·s + da·B(Cb, Cs)`
+  to be finite. The predicate keeps `Cb = d/da` and `Cs` in `[0, 1]`, and
+  every one of the 26 modes `composite_layer_into` takes is finite on that
+  cube (`blend_rgb_is_finite_on_the_unit_cube_in_every_mode`, a 1/32 grid).
+  That covers:
+  - the guarded divisions in `ColorDodge`, `ColorBurn`, `Divide`,
+    `VividLight` and `HardMix`;
+  - `SoftLight`'s `sqrt`;
+  - the SetLum/ClipColor divisions in `Hue`/`Saturation`/`Color`/`Luminosity`.
+- **So the result is the backdrop.** The product is a zero, and `d + ±0`
+  is `d` bit for bit unless `d` is `-0.0`, which the predicate excludes.
+  Alpha is `±0 + da` = `da` for the same reason.
+- **Dissolve** reaches this function already resolved to `Normal` with
+  gated texels, so it is the `Normal` case.
+- **Pinned by tests.**
+  - `a_transparent_source_folds_to_the_backdrop_bit_for_bit_in_every_mode`
+    pins it over a grid: all 26 modes × 81 backdrops × 9 source colours ×
+    both zero alphas × opacity 0, 0.5 and 1.
+  - `the_skip_predicate_excludes_cases_where_the_fold_is_not_the_identity`
+    shows the exclusions are needed. A `-0.0` backdrop channel becomes
+    `+0.0`, a NaN source colour poisons the backdrop, and an alpha of 2^-12
+    visibly lifts black.
+- **Not skipped.** Out-of-range backdrops (a channel above its alpha,
+  negative, `-0.0`, non-finite) and out-of-range sources keep the full
+  fold. No mode was found where alpha 0 is inexact inside the predicate.
+
+Breakdown, warm full composite, release, budget 256 (16 in brackets):
+
+| | 0.183.0 config | 0.184.0 |
+|---|---|---|
+| total | 8.54 s (9.58) | 5.41 s (6.48) |
+| plain folds (1,599 calls) | 2,773 ms (2,784) | 1,522 ms (1,528) |
+| effects folds, inclusive (1,656) | 3,880 ms (4,051) | 2,042 ms (2,235) |
+| `pixel_layer_texels`, inclusive | 2,328 ms, 14,174 calls | 2,274 ms, 14,152 calls |
+| `read_layer_window` | 1,580 ms | 1,544 ms |
+| disk page-ins | 2,913 (4,249) | 2,913 (4,216) |
+
+Nyepi, every cost case (the 0.183.0 config is this build with the skips
+off; the scratch pool cannot be switched off):
+
+| case | 16, 0.183.0 | 16, 0.184.0 | 256, 0.183.0 | 256, 0.184.0 |
+|---|---|---|---|---|
+| open + first composite | 17.86 s | 14.56 s | 16.11 s | 12.79 s |
+| warm full composite | 9.58 s | 6.48 s | 8.54 s | 5.41 s |
+| visibility toggle | 9.43 s | 6.35 s | 8.36 s | 5.35 s |
+| opacity step (shadowed) | 9.44 s | 6.37 s | 8.50 s | 5.32 s |
+| dab, shadowed (3 tiles) | 0.96 s | 0.67 s | 0.86 s | 0.67 s |
+| dab, unshadowed (1 tile) | 0.20 s | 0.16 s | 0.20 s | 0.16 s |
+
+Differentials, optimised against plain, all bit-identical:
+- Nyepi: 8,294,400 samples, 0 differ.
+- Corpus: 235 files, 1,234,399 chunks skipped.
+- Random trees: 320 trees, 1,359,277 chunks skipped, 1,523 effects folds.
+- New synthetic tests:
+  - `every_mode_folds_a_transparent_region_and_a_sparse_texel_exactly`
+    (all 27 modes);
+  - `a_dissolve_overlay_keeps_the_whole_tile_effects_path`;
+  - `effects_scratch_reuse_is_bit_identical`;
+  - `rejected_cover_candidate_is_read_once`.
+
+Mutations (`AURORA_REQUIRE_GPU=1`, `aurora-render` lib tests plus
+`occlusion_cull_tests`, the original restored after each and its sha256
+checked): **7 of 7 killed**, after two tests were strengthened.
+
+| mutation | killed by |
+|---|---|
+| skip a nonzero but tiny alpha (`< 0x1000`) | the predicate-exclusion test, the corpus differential |
+| skip where alpha 0 is not exact (allow a `-0`/negative backdrop) | the predicate-exclusion test, random trees |
+| reuse a stale scratch buffer (no interior copy) | `effects_scratch_reuse_is_bit_identical`, random trees |
+| read a rejected candidate twice | `rejected_cover_candidate_is_read_once` |
+| generator never makes effects | random trees (effects-fold assertion) |
+| row-restrict a `Dissolve` overlay too | `a_dissolve_overlay_keeps_the_whole_tile_effects_path`, random trees |
+| row runs counting only alpha-1 rows | the corpus differential |
+
+Before strengthening, two of them survived. The stale scratch survived
+because the test layers had Fill 1 at `Normal`, which overwrites the
+interior. The `Dissolve` mutation was first written wrongly as a no-op, and
+then survived the random trees because their shapes start at row 0.
+
+Gate (one pass after the last code change, Linux, `/home` 41 G free):
+- `cargo fmt --all --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked` and
+  `cargo clippy --workspace --all-targets --all-features -D warnings` all
+  pass.
+- `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`: **3,454
+  passed, 0 failed, 68 ignored**.
+- `cargo doc … --document-private-items --keep-going` with `-D warnings`
+  is clean; `cargo deny check all` is ok; `check_contrast.py` passes.
+- Cross-clippy `-p aurora-app --all-targets` for `x86_64-pc-windows-gnu`
+  and `x86_64-apple-darwin` (with the lcms stub) is clean.
+
+**Re-run after the SK-1–SK-3 revision** (one pass after the last code
+change, `/home` 34 G free):
+- the same gate: **3,455 passed, 0 failed, 68 ignored** — the one extra
+  test is SK-1's edge-operand sweep;
+- `cargo doc`, `cargo deny check all`, `check_contrast.py` and both
+  cross-clippy targets all clean.
+
+After the mutation runs, clippy's `verbose_bit_mask` rewrote the
+alpha-zero test from `bits & 0x7FFF == 0` to the equivalent
+`bits << 1 == 0`.
+
+**Previously (2026-10-11, 0.183.0): large-template performance, round R1 —
 measured, then occlusion culling and a row-copy window read.** Measured
 first, on the user's Nyepi template (1080×1920, 277 nodes: 223 pixel
 layers, 54 groups, 0 adjustments, 47 layers drawing effects, 9 enabled
