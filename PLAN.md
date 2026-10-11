@@ -113,6 +113,8 @@ the near pan bound is the document's own corner whichever layer is active.**
 
 Review notes (0.193.0): the cost of the lost `same_origin` fast path for an active layer at a positive origin is not measured (it also moves that layer's shadow/stroke apron reads to the windowed branch). The clip edge is decided at pixel centres, so under fractional zoom (0.96, 1.5) it can be off by up to half a pixel; only exact boundaries and one fractional case (zoom 2) are tested. The brush test is near-algebraic and does not tie the clip rectangle to the pointer mapping. The 14 rewritten tests were not diffed by the reviewer.
 
+**Verified by the user on the Mac (2026-10-11):** after 0.192.1 and 0.193.0 the Nyepi PSD opens in the live Aurora window and "looks perfect" (Cahya, on Apple M2 Pro/Metal). This is a human's visual check of the real window, not a measured comparison; the unexplained earlier-Mac-checks contradiction in the 0.192.1 entry is still unexplained.
+
 **Previously (2026-10-11, 0.192.1): the live canvas was washed out on an sRGB
 surface — `canvas.wgsl` encoded the picture twice. Fixed (canvas shader and a
 log line only).**
