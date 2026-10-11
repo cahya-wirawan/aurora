@@ -197,6 +197,7 @@ fn worker_composite_equals_sync_composite_on_the_psd_corpus_subset() {
         println!("SKIPPED: corpus absent");
         return;
     }
+    let root_display = root.display().to_string();
     let mut pending = vec![root];
     let mut files = Vec::new();
     while let Some(dir) = pending.pop() {
@@ -213,6 +214,10 @@ fn worker_composite_equals_sync_composite_on_the_psd_corpus_subset() {
         }
     }
     files.sort();
+    if files.is_empty() {
+        println!("SKIPPED: corpus not fetched (no .psd under {root_display})");
+        return;
+    }
     let mut compared = 0;
     for path in files.iter().take(24) {
         let Ok(bytes) = std::fs::read(path) else {

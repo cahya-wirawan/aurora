@@ -26,7 +26,22 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.186.0): background CPU compositing, round R3 of
+**Latest (2026-10-11, 0.186.1): CI fix for a corpus test that never
+skipped (patch).** GitHub Actions failed on main (0.186.0) in
+`background_composite_tests::worker_composite_equals_sync_composite_on_the_psd_corpus_subset`
+with "only 0 corpus files compared". This is the same cause as 0.185.1: CI
+has `corpora/psd/reference/` but no PSD files in it, and this test, new
+in 0.186.0, skipped only when the directory was missing.
+
+Fix: the test now prints `SKIPPED` when no `.psd` file is present. Only
+the test changed. The whole workspace was run in a fresh worktree with no
+corpus (the same as CI) before merging.
+
+Lesson: knowing about 0.185.1 did not stop a new test repeating it. Every
+round that adds a corpus or `images/` test now gets a corpus-free worktree
+run before it merges.
+
+**Previously (2026-10-11, 0.186.0): background CPU compositing, round R3 of
 the large-template performance plan (ADR 0012; review revision BG-1, BG-2,
 BG-3 and MEM-1 included).** A CPU-path recomposite of the view no longer runs
 in the redraw handler. It runs on one worker thread (`aurora-app`'s
