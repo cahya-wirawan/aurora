@@ -2950,8 +2950,14 @@ fn a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one() {
         Err(err) => unreachable!("{err:?}"),
     };
     let (thrashed, held) = (composite(&mut small), composite(&mut pooled));
+    // A re-read of an evicted tile is a page-in from the scratch disk
+    // (`faults`) or, when the background writer has not landed it yet, a
+    // decode of its still-queued bytes (`pending_hits`): which one depends
+    // on writer timing (a fast CI runner saw only pending hits), so count
+    // both as "paged".
+    let small_stats = small.stats();
     assert!(
-        small.stats().evictions > 0 && small.stats().faults > 0,
+        small_stats.evictions > 0 && small_stats.faults + small_stats.pending_hits > 0,
         "the small store paged"
     );
     assert_eq!(

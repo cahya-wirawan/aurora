@@ -26,7 +26,16 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.195.0): round L2 of the Photoshop-style Layers panel — the
+**Latest (2026-10-11, 0.195.1): CI fix for a timing-dependent test (patch).** GitHub Actions (Ubuntu) failed on
+`document_tabs_tests::a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one` with
+"the small store paged". The test asserted `faults > 0` after re-reading evicted tiles, but a re-read is a
+page-in from the scratch disk (`faults`) only once the background writer has landed the tile; before that
+it decodes the still-queued bytes (`pending_hits`), so on a slow runner `faults` stays 0. It now counts
+`faults + pending_hits` as "paged" (the same class as lesson 3 in the CI notes: assert a bound, not a
+timing). The failure did not reproduce locally (0 of 40 runs under 12 CPU burners, before the fix), so
+the cause is inferred from the counters' definitions, not observed. Only the test changed.
+
+**Previously (2026-10-11, 0.195.0): round L2 of the Photoshop-style Layers panel — the
 rows, and the controls on top. Nobody has seen this panel in the live window on the
 Mac (or anywhere but a headless render).**
 - **Rows** (`aurora-ui` `layers_panel.rs`): every layer or group row is a *flat*,
