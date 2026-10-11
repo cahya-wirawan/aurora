@@ -373,6 +373,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
         | WidgetKind::Icon(_)
+        | WidgetKind::Thumbnail(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
@@ -986,6 +987,10 @@ mod tests {
             crate::widgets::IconSize::Small,
             crate::widgets::IconTone::Default,
             crate::widgets::IconAccess::Named("Eye".into()),
+        ));
+        // A thumbnail declares no action either.
+        ok(crate::widgets::insert_thumbnail(
+            &mut tree, root, &scales, 24,
         ));
         tree.compute_layout(800.0, 600.0);
         let _ = tree.take_damage();
@@ -1826,9 +1831,10 @@ mod tests {
             WidgetKind::DropIndicator(_) => 24,
             WidgetKind::RaisedPanel => 25,
             WidgetKind::Icon(_) => 26,
+            WidgetKind::Thumbnail(_) => 27,
         }
     }
-    const KIND_COUNT: usize = 27;
+    const KIND_COUNT: usize = 28;
 
     /// The data a well-formed request for `action` on `id` would carry.
     fn well_formed(f: &Fixture, id: WidgetId, action: Action) -> Option<ActionData> {

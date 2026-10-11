@@ -1849,7 +1849,9 @@ mod tests {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let row = aurora_widgets::widgets::row_height(&scales) as u32;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row
+            let cap = row
+                + crate::panel::content_panel_max_rows(&scales) as u32
+                    * crate::layer_row_height(&scales)
                 + crate::layer_toolbar::toolbar_px(&scales);
             for (name, panel, body) in [
                 ("layers", layers, ws.layers.body),
@@ -2161,6 +2163,37 @@ mod tests {
         }
     }
 
+    /// 0.197.0: the Layers cap is ten of the Layers panel's own 32 px rows
+    /// (381 px with the title and toolbar, was 271). At the default 900 px
+    /// window height Properties/History must stay usable beside a full
+    /// Layers panel, with and without the Curves editor shown: the rail's
+    /// remaining height goes to the Properties/History group, at least four
+    /// body rows.
+    #[test]
+    fn the_taller_layers_cap_leaves_properties_and_history_usable_at_900px() {
+        let scales = test_scales();
+        for curves in [false, true] {
+            let mut ws = build_workspace(&scales);
+            if curves {
+                let _ = with_curves_shown(&mut ws, &scales);
+            }
+            fill_panels(&mut ws, &scales, (true, true, true), 200);
+            ws.tree.compute_layout(1600.0, 900.0);
+            let layers = bounds_of(&ws, ws.layers.root);
+            let group = bounds_of(&ws, crate::workspace::test_group(&ws).root);
+            let rail = bounds_of(&ws, ws.rail);
+            println!(
+                "curves={curves}: rail {} px, layers {} px, properties+history group {} px",
+                rail.height, layers.height, group.height
+            );
+            assert_eq!(layers.height, 381, "title + 10 x 32 + 40 toolbar");
+            assert!(
+                group.height >= 21 * 6,
+                "the Properties/History group keeps a title, tabs and four rows: {group:?}"
+            );
+        }
+    }
+
     /// 0.162.0 AC-3: the Layers cap is the `size.content_panel_max_rows`
     /// token, not a constant — changing the token changes the cap.
     #[test]
@@ -2178,7 +2211,8 @@ mod tests {
             let layers = bounds_of(&ws, ws.layers.root);
             assert_eq!(
                 layers.height,
-                (1 + rows) * row + crate::layer_toolbar::toolbar_px(&scales),
+                row + rows * crate::layer_row_height(&scales)
+                    + crate::layer_toolbar::toolbar_px(&scales),
                 "a title row plus {rows} body rows: {layers:?}"
             );
         }
@@ -2204,7 +2238,9 @@ mod tests {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&scales) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row
+        let cap = row
+            + crate::panel::content_panel_max_rows(&scales) as u32
+                * crate::layer_row_height(&scales)
             + crate::layer_toolbar::toolbar_px(&scales);
         assert!(layers.height <= cap, "capped at the row cap: {layers:?}");
         assert!(

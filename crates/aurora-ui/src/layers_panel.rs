@@ -126,10 +126,11 @@ use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree, sanitize_display_name
 use aurora_theme::Scales;
 use aurora_widgets::icons::IconKind;
 use aurora_widgets::widgets::{
-    IconAccess, IconSize, IconTone, WidgetKind, icon_state, insert_icon, insert_tree_item,
-    insert_tree_view, row_height, set_icon_access, set_icon_kind, set_icon_tone,
-    set_tree_item_description, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,
-    set_tree_item_selected, set_tree_item_trailing,
+    IconAccess, IconSize, IconTone, ThumbnailImage, WidgetKind, icon_state, insert_icon,
+    insert_thumbnail, insert_tree_item, insert_tree_view, set_icon_access, set_icon_kind,
+    set_icon_tone, set_thumbnail_image, set_tree_item_description, set_tree_item_expanded,
+    set_tree_item_flat, set_tree_item_key, set_tree_item_row_height, set_tree_item_selected,
+    set_tree_item_trailing,
 };
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::{auto, length, percent};
@@ -200,6 +201,10 @@ pub fn populate_layers_panel(
     // History jump — must not reopen them.
     let collapsed = collapsed_layer_keys(tree, panel.body);
     clear_panel_body(tree, panel.body)?;
+    // `size.content_panel_max_rows` rows of *this* panel's rows (0.197.0).
+    #[allow(clippy::cast_precision_loss)]
+    let cap = crate::panel::content_panel_max_rows(scales) * layer_row_height(scales) as f32;
+    crate::panel::set_panel_content_cap(tree, panel, cap)?;
     let view = insert_tree_view(tree, panel.body, None)?;
     tree.set_style(view, tree_container_style())?;
     let mut rows = HashMap::new();
@@ -295,16 +300,33 @@ fn chevron_x(scales: &Scales, depth: usize) -> f32 {
     eye_column(scales) + gap + levels * step
 }
 
+/// The side of a row's thumbnail slot (0.197.0): `spacing.lg`, 24 logical
+/// px. Pixel layers show a [`ThumbnailImage`] in it, groups and adjustment
+/// layers a centred icon.
+#[must_use]
+pub fn layer_thumbnail_side(scales: &Scales) -> u32 {
+    scales.spacing.lg
+}
+
+/// A Layers row's own line height (0.197.0): the thumbnail slot plus
+/// `spacing.xxs` above and below, 32 px by default (the `row_height`
+/// token's 21 px holds no picture).
+#[must_use]
+pub fn layer_row_height(scales: &Scales) -> u32 {
+    layer_thumbnail_side(scales) + 2 * scales.spacing.xxs
+}
+
 /// The icon side (`spacing.md`).
 fn icon_side(scales: &Scales) -> f32 {
     aurora_widgets::widgets::icon_side(scales, IconSize::Small)
 }
 
-/// Where a row at `depth` starts its name: past the chevron and folder
-/// slots (one icon side each) and a `spacing.xs` gap.
+/// Where a row at `depth` starts its name: past the chevron slot (one icon
+/// side), the thumbnail slot and a `spacing.xs` gap.
 fn label_inset(scales: &Scales, depth: usize) -> u32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let inset = (chevron_x(scales, depth) + 2.0 * icon_side(scales)).round() as u32;
+    let inset = (chevron_x(scales, depth) + icon_side(scales)).round() as u32
+        + layer_thumbnail_side(scales);
     inset + scales.spacing.xs
 }
 
@@ -387,7 +409,17 @@ fn insert_layer_row(
     // In-row content: eye, then (groups) chevron and folder. Inserted
     // before any child row so the row's own children stay rows-last.
     let side = icon_side(scales);
-    let top = ((row_height(scales) - side) / 2.0).floor().max(0.0);
+    #[allow(clippy::cast_precision_loss)]
+    let (line, slot) = (
+        layer_row_height(scales) as f32,
+        layer_thumbnail_side(scales) as f32,
+    );
+    set_tree_item_row_height(tree, row, scales, layer_row_height(scales))?;
+    let top = ((line - side) / 2.0).floor().max(0.0);
+    // A group's folder or an adjustment's icon sits centred in the
+    // thumbnail slot; a pixel layer's thumbnail fills it.
+    let slot_x = chevron_x(scales, depth) + side;
+    let icon_in_slot_x = slot_x + ((slot - side) / 2.0).floor().max(0.0);
     let visible = layers.visible(id).unwrap_or(true);
     let eye = insert_icon(
         tree,
@@ -425,7 +457,32 @@ fn insert_layer_row(
             IconTone::Default,
             IconAccess::Decorative,
         )?;
-        place_icon(tree, folder, chevron_x(scales, depth) + side, top)?;
+        place_icon(tree, folder, icon_in_slot_x, top)?;
+    } else if matches!(layers.kind(id), Some(LayerKind::Adjustment(_))) {
+        let icon = insert_icon(
+            tree,
+            row,
+            scales,
+            IconKind::Adjustment,
+            IconSize::Small,
+            IconTone::Default,
+            IconAccess::Decorative,
+        )?;
+        place_icon(tree, icon, icon_in_slot_x, top)?;
+    } else {
+        let thumb = insert_thumbnail(tree, row, scales, layer_thumbnail_side(scales))?;
+        let mut style = tree
+            .style(thumb)
+            .cloned()
+            .ok_or(WidgetError::UnknownWidget(thumb))?;
+        style.position = Position::Absolute;
+        style.inset = taffy::Rect {
+            left: length(slot_x),
+            right: auto(),
+            top: length(((line - slot) / 2.0).floor().max(0.0)),
+            bottom: auto(),
+        };
+        tree.set_style(thumb, style)?;
     }
     rows.insert(row, id);
 
@@ -463,7 +520,9 @@ fn row_icons(
         match (&state.access, state.kind) {
             (IconAccess::Button { .. }, _) => eye = Some(child),
             (_, IconKind::ChevronRight | IconKind::ChevronDown) => chevron = Some(child),
-            (_, IconKind::FolderClosed | IconKind::FolderOpen) => folder = Some(child),
+            (_, IconKind::FolderClosed | IconKind::FolderOpen | IconKind::Adjustment) => {
+                folder = Some(child);
+            }
             _ => {}
         }
     }
@@ -529,12 +588,15 @@ pub fn sync_layer_row(
         changed |= set_icon_tone(tree, chevron, tone(false))?;
     }
     if let Some(folder) = folder {
-        let kind = if expanded {
-            IconKind::FolderOpen
-        } else {
-            IconKind::FolderClosed
-        };
-        changed |= set_icon_kind(tree, folder, kind)?;
+        // An adjustment layer's icon is not a folder: leave its picture.
+        if icon_state(tree, folder)?.kind != IconKind::Adjustment {
+            let kind = if expanded {
+                IconKind::FolderOpen
+            } else {
+                IconKind::FolderClosed
+            };
+            changed |= set_icon_kind(tree, folder, kind)?;
+        }
         changed |= set_icon_tone(tree, folder, tone(false))?;
     }
     Ok(changed)
@@ -593,6 +655,70 @@ pub fn layer_row_part<S: std::hash::BuildHasher>(
         current = tree.parent(id);
     }
     None
+}
+
+/// The Layers rows whose own line is within the panel's viewport plus
+/// `margin_rows` rows above and below it (0.197.0), from the laid-out
+/// bounds (a scrolled row's bounds already carry the scroll offset): what
+/// the thumbnail service computes for. A row's *line* is its first
+/// [`layer_row_height`] px (a group row's box also holds its children).
+/// Empty when the panel is collapsed, closed or not laid out.
+#[must_use]
+pub fn visible_layer_rows<S: std::hash::BuildHasher>(
+    tree: &WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    rows: &HashMap<WidgetId, LayerId, S>,
+    scales: &Scales,
+    margin_rows: u32,
+) -> Vec<(WidgetId, LayerId)> {
+    let Some(view) = tree.bounds(panel.viewport) else {
+        return Vec::new();
+    };
+    if view.height == 0 || view.width == 0 {
+        return Vec::new();
+    }
+    let line = i64::from(layer_row_height(scales));
+    let margin = line * i64::from(margin_rows);
+    let (top, bottom) = (view.y - margin, view.y + i64::from(view.height) + margin);
+    let mut shown: Vec<(i64, WidgetId, LayerId)> = rows
+        .iter()
+        .filter_map(|(&row, &layer)| {
+            let bounds = tree.bounds(row)?;
+            (bounds.y + line > top && bounds.y < bottom).then_some((bounds.y, row, layer))
+        })
+        .collect();
+    shown.sort_by_key(|&(y, row, _)| (y, row));
+    shown
+        .into_iter()
+        .map(|(_, row, layer)| (row, layer))
+        .collect()
+}
+
+/// The thumbnail slot of the Layers row `row` (a pixel layer's; `None` for a
+/// group or an adjustment layer, which show an icon).
+#[must_use]
+pub fn layer_row_thumbnail(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
+    tree.children(row)?
+        .iter()
+        .copied()
+        .find(|&child| matches!(tree.payload(child), Some(WidgetKind::Thumbnail(_))))
+}
+
+/// Shows `image` in `row`'s thumbnail slot (`None` blanks it). Returns
+/// whether anything changed; `false` for a row with no slot.
+///
+/// # Errors
+///
+/// As [`set_thumbnail_image`].
+pub fn set_layer_row_thumbnail(
+    tree: &mut WidgetTree<WidgetKind>,
+    row: WidgetId,
+    image: Option<std::sync::Arc<ThumbnailImage>>,
+) -> Result<bool, WidgetError> {
+    match layer_row_thumbnail(tree, row) {
+        Some(slot) => set_thumbnail_image(tree, slot, image),
+        None => Ok(false),
+    }
 }
 
 /// The row after (`forward`) or before `row` in on-screen order (a
@@ -1563,8 +1689,8 @@ mod tests {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let cap = crate::panel::content_panel_max_rows(&scales) as usize;
             #[allow(clippy::cast_possible_truncation)]
-            let expected =
-                (21 * (1 + count.clamp(1, cap))) as u32 + crate::layer_toolbar::toolbar_px(&scales);
+            let expected = (21 + crate::layer_row_height(&scales) * count.clamp(1, cap) as u32)
+                + crate::layer_toolbar::toolbar_px(&scales);
             assert_eq!(
                 layers_bounds.height, expected,
                 "content-sized up to the cap at {count} layers"
@@ -2231,5 +2357,195 @@ mod tests {
             super::layer_row_description(&layers, a),
             "Group, Multiply, hidden"
         );
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_slot_tests {
+    use super::*;
+    use aurora_core::Rect;
+
+    fn scales() -> Scales {
+        match Scales::from_toml_str(include_str!("../../../design/tokens/scales.toml")) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn rect() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }
+    }
+
+    fn row_of(rows: &HashMap<WidgetId, LayerId>, layer: LayerId) -> WidgetId {
+        match rows.iter().find(|&(_, &id)| id == layer) {
+            Some((&row, _)) => row,
+            None => unreachable!("a row per layer"),
+        }
+    }
+
+    #[test]
+    fn pixel_rows_get_a_thumbnail_slot_and_groups_and_adjustments_an_icon() {
+        let scales = scales();
+        let mut layers = LayerTree::new();
+        let pixel = ok(layers.add_pixel_layer("Pixels", rect(), None));
+        let group = ok(layers.add_group("Group", None));
+        let child = ok(layers.add_pixel_layer("Child", rect(), Some(group)));
+        let curves = ok(layers.add_adjustment_layer_at(
+            "Curves",
+            aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::default()),
+            None,
+            0,
+        ));
+        let mut ws = crate::build_workspace(&scales);
+        let rows = ok(populate_layers_panel(
+            &mut ws.tree,
+            ws.layers,
+            &scales,
+            &layers,
+        ));
+        ws.tree.compute_layout(1600.0, 900.0);
+        let slot_side = layer_thumbnail_side(&scales);
+        assert_eq!(slot_side, 24);
+        assert_eq!(layer_row_height(&scales), 32);
+        for layer in [pixel, child] {
+            let row = row_of(&rows, layer);
+            let Some(slot) = layer_row_thumbnail(&ws.tree, row) else {
+                unreachable!("a pixel row has a slot");
+            };
+            let Some(b) = ws.tree.bounds(slot) else {
+                unreachable!("laid out");
+            };
+            assert_eq!((b.width, b.height), (24, 24));
+            let Some(r) = ws.tree.bounds(row) else {
+                unreachable!("laid out");
+            };
+            assert_eq!(b.y - r.y, 4, "centred in the 32 px line");
+            assert!(
+                ws.tree
+                    .accessibility(slot)
+                    .is_some_and(accesskit::Node::is_hidden)
+            );
+        }
+        assert!(layer_row_thumbnail(&ws.tree, row_of(&rows, group)).is_none());
+        assert!(layer_row_thumbnail(&ws.tree, row_of(&rows, curves)).is_none());
+        let has_icon = |tree: &WidgetTree<WidgetKind>, layer: LayerId, kind: IconKind| {
+            tree.children(row_of(&rows, layer))
+                .unwrap_or_default()
+                .iter()
+                .any(|&c| matches!(tree.payload(c), Some(WidgetKind::Icon(s)) if s.kind == kind))
+        };
+        assert!(has_icon(&ws.tree, curves, IconKind::Adjustment));
+        assert!(has_icon(&ws.tree, group, IconKind::FolderOpen));
+        // The row's line is the taller one; the label starts past the slot.
+        let Some(WidgetKind::TreeItem(state)) = ws.tree.payload(row_of(&rows, pixel)) else {
+            unreachable!("a tree row");
+        };
+        assert_eq!(state.row_height, 32);
+        assert_eq!(
+            state.label_inset,
+            32 + 8 + 16 + 24 + 8,
+            "eye column, gap, chevron, slot, gap"
+        );
+        // Syncing an adjustment row keeps its icon (it is not a folder).
+        let curves_row = row_of(&rows, curves);
+        ok(sync_layer_row(&mut ws.tree, curves_row, &layers, curves));
+        assert!(has_icon(&ws.tree, curves, IconKind::Adjustment));
+        // A thumbnail's picture round-trips through the row helpers.
+        let image = std::sync::Arc::new(ok(
+            ThumbnailImage::new(0, 0, 2, 2, vec![[0.5; 4]; 4]).ok_or("fits")
+        ));
+        let row = row_of(&rows, pixel);
+        assert!(ok(set_layer_row_thumbnail(
+            &mut ws.tree,
+            row,
+            Some(image.clone())
+        )));
+        assert!(!ok(set_layer_row_thumbnail(&mut ws.tree, row, Some(image))));
+        assert!(!ok(set_layer_row_thumbnail(
+            &mut ws.tree,
+            row_of(&rows, group),
+            None
+        )));
+    }
+
+    #[test]
+    fn the_content_cap_is_ten_of_the_layers_own_rows_and_survives_a_resizing() {
+        let scales = scales();
+        let mut layers = LayerTree::new();
+        for i in 0..30 {
+            ok(layers.add_pixel_layer(format!("L{i}"), rect(), None));
+        }
+        let mut ws = crate::build_workspace(&scales);
+        let _ = ok(populate_layers_panel(
+            &mut ws.tree,
+            ws.layers,
+            &scales,
+            &layers,
+        ));
+        let cap = |ws: &crate::Workspace| {
+            ws.tree
+                .style(ws.layers.viewport)
+                .map(|s| s.max_size.height.value())
+        };
+        assert_eq!(cap(&ws), Some(320.0), "10 rows x 32 px");
+        ok(crate::set_panel_sizing(
+            &mut ws.tree,
+            ws.layers,
+            crate::PanelSizing::Content,
+            &scales,
+        ));
+        assert_eq!(
+            cap(&ws),
+            Some(320.0),
+            "a re-sizing that stays Content keeps it"
+        );
+        ws.tree.compute_layout(1600.0, 900.0);
+        let Some(viewport) = ws.tree.bounds(ws.layers.viewport) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(viewport.height, 320);
+    }
+
+    #[test]
+    fn only_rows_near_the_viewport_are_visible_and_scrolling_moves_the_window() {
+        let scales = scales();
+        let mut layers = LayerTree::new();
+        for i in 0..100 {
+            ok(layers.add_pixel_layer(format!("L{i}"), rect(), None));
+        }
+        let mut ws = crate::build_workspace(&scales);
+        let rows = ok(populate_layers_panel(
+            &mut ws.tree,
+            ws.layers,
+            &scales,
+            &layers,
+        ));
+        ws.tree.compute_layout(1600.0, 900.0);
+        let first = visible_layer_rows(&ws.tree, ws.layers, &rows, &scales, 2);
+        // A 320 px viewport is 10 rows; two rows of margin below it.
+        assert!((10..=13).contains(&first.len()), "{} rows", first.len());
+        // The topmost layer (index 0 is topmost = last added) leads.
+        assert_eq!(first.first().map(|r| r.1), layers.roots().first().copied());
+        let _ = ok(ws.tree.scroll_by(ws.layers.body, 32.0 * 50.0));
+        ws.tree.compute_layout(1600.0, 900.0);
+        let later = visible_layer_rows(&ws.tree, ws.layers, &rows, &scales, 2);
+        assert!((10..=15).contains(&later.len()), "{} rows", later.len());
+        assert_ne!(first.first().map(|r| r.1), later.first().map(|r| r.1));
+        assert!(later.iter().all(|r| !first.iter().any(|f| f.1 == r.1)));
+        // A collapsed panel shows nothing.
+        let empty = visible_layer_rows(&ws.tree, ws.layers, &HashMap::new(), &scales, 2);
+        assert!(empty.is_empty());
     }
 }

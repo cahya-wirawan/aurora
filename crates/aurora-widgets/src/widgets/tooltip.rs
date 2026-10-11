@@ -495,6 +495,7 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::CurveEditorPoint(_)
         | WidgetKind::Label(_)
         | WidgetKind::Icon(_)
+        | WidgetKind::Thumbnail(_)
         | WidgetKind::DropIndicator(_) => false,
     }
 }
@@ -1254,6 +1255,7 @@ mod tests {
             WidgetKind::DropIndicator(_) => 24,
             WidgetKind::RaisedPanel => 25,
             WidgetKind::Icon(_) => 26,
+            WidgetKind::Thumbnail(_) => 27,
         }
     }
 

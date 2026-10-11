@@ -279,14 +279,52 @@ pub fn set_panel_sizing(
     let display = tree
         .style(panel.viewport)
         .map_or(Display::Flex, |style| style.display);
-    tree.set_style(
-        panel.viewport,
-        Style {
-            display,
-            ..viewport_style(sizing, scales)
-        },
-    )?;
+    // A content cap another module set for its own row height
+    // ([`set_panel_content_cap`], the Layers panel's taller rows) survives
+    // a re-sizing that stays `Content`.
+    let kept_cap = (sizing == PanelSizing::Content && panel_sizing(tree, panel)? == sizing)
+        .then(|| {
+            tree.style(panel.viewport)
+                .map(|style| style.max_size.height)
+        })
+        .flatten();
+    let mut style = Style {
+        display,
+        ..viewport_style(sizing, scales)
+    };
+    if let Some(cap) = kept_cap {
+        style.max_size.height = cap;
+    }
+    tree.set_style(panel.viewport, style)?;
     Ok(())
+}
+
+/// Sets the height a [`PanelSizing::Content`] panel's viewport stops growing
+/// at to `height` logical px (0.197.0), in place of the default
+/// `size.content_panel_max_rows` x `row_height`: the Layers panel's rows are
+/// taller than a text row, and the token counts *rows*, so its cap is that
+/// many of its own rows. A re-sizing that stays `Content` keeps it
+/// ([`set_panel_sizing`]). Returns whether the style changed.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.viewport` doesn't exist.
+pub fn set_panel_content_cap(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    height: f32,
+) -> Result<bool, WidgetError> {
+    let mut style = tree
+        .style(panel.viewport)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(panel.viewport))?;
+    let wanted = length(height);
+    if style.max_size.height == wanted {
+        return Ok(false);
+    }
+    style.max_size.height = wanted;
+    tree.set_style(panel.viewport, style)?;
+    Ok(true)
 }
 
 /// The `[body | scrollbar]` row (0.146.0, [`PanelHandle::viewport`]):

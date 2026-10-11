@@ -162,6 +162,7 @@ mod scrollbar;
 mod slider;
 mod tab_bar;
 mod text_field;
+mod thumbnail;
 pub(crate) use text_field::floor_char_boundary;
 mod tooltip;
 mod tree_view;
@@ -237,11 +238,16 @@ pub use text_field::{
     set_text_field_caret, set_text_field_disabled, set_text_field_scroll, single_line_paste,
     text_field_state, with_text_field_mut,
 };
+pub use thumbnail::{
+    THUMBNAIL_TEXELS, ThumbnailImage, ThumbnailState, insert_thumbnail, set_thumbnail_image,
+    thumbnail_state,
+};
 pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{
     MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
     set_tree_item_disabled, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,
-    set_tree_item_label, set_tree_item_selected, set_tree_item_trailing,
+    set_tree_item_label, set_tree_item_row_height, set_tree_item_selected, set_tree_item_trailing,
+    tree_item_row_height,
 };
 
 use accesskit::{Node, Role};
@@ -432,6 +438,11 @@ pub enum WidgetKind {
     /// created by `icon.rs`'s [`insert_icon`]. Decorative (AT-`hidden`) or
     /// named (`Role::Image`); never focusable, no actions.
     Icon(IconState),
+    /// A thumbnail (0.197.0): a square slot showing a picture the owner
+    /// computed over a checkerboard (`paint::thumbnail_gradients`),
+    /// created by `thumbnail.rs`'s [`insert_thumbnail`]. AT-`hidden`,
+    /// never focusable, no actions.
+    Thumbnail(ThumbnailState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

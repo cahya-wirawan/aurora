@@ -26,7 +26,85 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.196.0): round L3 of the Photoshop-style Layers panel — the bottom
+**Latest (2026-10-11, 0.197.0): round L4 of the Photoshop-style Layers panel — layer
+thumbnails. Nobody has seen them in the live window on the Mac (or anywhere but a headless
+render at scale 2 and the unit tests).**
+Series status: L1 icons (0.194.0), L2 rows and controls (0.195.0), L3 toolbar + New Group
+(0.196.0) and **L4 thumbnails (this round)** done; next **L5** Lock (model + UI) and the Kind
+filter; Channels/Paths tabs later.
+- **What it shows.** A pixel layer's row has a 24 px (`spacing.lg`) thumbnail in place of L2's blank
+  spacer: an aspect-fit picture of the layer's bounds over the canvas's checkerboard where it is
+  transparent. Adjustment (Curves) rows show `IconKind::Adjustment`; groups keep the folder (both
+  centred in the same slot). A hidden layer's picture stays, undimmed (no existing dimming
+  mechanism). Until a picture is ready the slot is blank: no layout jump.
+- **Rows grew 21 -> 32 px** (`TreeItemState::row_height`, `set_tree_item_row_height`: top padding,
+  min height, highlight, focus ring and label box follow). Per the design owner the Layers panel
+  still shows `size.content_panel_max_rows` (10) rows before scrolling: its cap is now 10 x 32 =
+  320 px (`set_panel_content_cap`, applied by `populate_layers_panel`, kept across a re-sizing), so
+  the panel is 381 px with title and toolbar (was 271). At a 900 px window (tested): Properties +
+  History group 231 px without the Curves editor and 452 px with it; no panel is pushed off.
+  Pinned tests changed knowingly (`the_layers_cap_follows_...`, the crowded-panel and long-list
+  caps, `a_crowded_layers_panel_never_starves_...`: 21 + 32 x rows + toolbar).
+- **Design (ADR 0013).** Lazy: only pixel rows within two rows of the viewport
+  (`visible_layer_rows`), at most 4 jobs per loop turn. Bounded: a thumbnail reads at most **16
+  tiles chosen among the tiles that exist** (`plan` probes the grid with `contains_tile`, at most
+  4,096 cells, a regular lattice beyond that). With <= 16 existing tiles: the exact area average of
+  the layer's bounds (so a layer painted in a corner is not blank); with more: a *sampled* picture
+  (one existing tile per coarse bucket, an 8 x 8 window per texel, about 1/100 of the area on a
+  4096 px layer, so photographic detail aliases). Off the UI thread: the UI thread takes
+  `TileStore::share_tile_without_io` shares (Arc clones, never a page-in or decode); a tile that
+  exists only on scratch is read on the UI thread, **at most 8 per turn across all layers**, the
+  rest deferred to the next turn; the queue's room is checked before any share is taken. One worker
+  (`aurora-layer-thumbnails`, newest-wins queue of 8, generation ids, a `ThumbnailReady` wake)
+  decodes and downsamples to a 48 x 48 premultiplied picture (non-finite samples count as 0). No
+  second store, no pool member. Cache: per layer, stamped from the sampled tiles' `content_version`s
+  plus the existing-tile count (a dab or pixel undo misses only that layer; a new tile refreshes;
+  opacity, visibility, blend edits hit); the plan is memoised on the new `TileStore::content_epoch`
+  and re-derived at most every 100 ms per layer; LRU, 256 pictures / 8 MiB; a changing layer refreshes
+  at most every 250 ms and once after the last change; a document switch clears everything; a
+  deleted layer's entry is dropped. Rows far from the viewport are blanked.
+  **Remaining blindness:** an edit inside an existing but unsampled tile of a layer with more than 16
+  existing tiles changes no picture; pixels outside a layer's `bounds` are ignored; tiles between
+  probe-lattice points of a layer over ~16,000 px a side are unseen.
+- **Paint.** New `WidgetKind::Thumbnail` (`aurora-widgets`, `widgets/thumbnail.rs`): a
+  vertex-coloured `ColorMesh` of run-merged flat rectangles over the checkerboard, on the largest
+  of a 48/24/12/6 texel grid whose texels are not smaller than a physical pixel (1 texel per
+  physical pixel at 1x and 2x), cut exactly to a clipping ancestor, AT-hidden. The checkerboard
+  shades are the canvas shader's two literals, exposed as `aurora_gpu::CHECKERBOARD_SHADES` and
+  pinned against the shader's source (they are **not** tokens; none added). Missing tokens worth
+  the design owner's eye: a checkerboard pair, and a "dimmed" state for hidden layers.
+- **Nyepi (release, this box; `nyepi_layer_thumbnails`):** 12 rows in the viewport window (8 pixel
+  layers; of 277 rows / 223 layers), 8 jobs, **32 tiles shared** (<= 16 per layer; 19 before the
+  sampling moved to existing tiles), UI-thread time **0.54 ms**, wall 26 ms, resident tiles 0 -> 0 (nothing paged in: faults +0, pending hits +0),
+  RSS 301 -> 307 MiB; `nyepi_layers_panel_populate` still 1.08 ms.
+- **Gate:** 3,722 workspace tests pass with `AURORA_REQUIRE_GPU=1` on the RTX 3090 (0 failed, 76 ignored; 3,667 before this round). Two existing tests were edited knowingly (the Layers scrollbar press tolerance: the measured error is 1.03e-5 px and the tolerance is now 1e-4, tightened from the first draft's 0.01; the replace-document descendant count 3 -> 4 for the thumbnail slot).
+- **Tests:** sampler (solid, gradient exact area averages, half-transparent premultiplied,
+  transparent-white no-bleed, aspect/centre, multi-tile, missing tile, smaller than a tile, the
+  <= 16-tile bound over ten sizes up to 300,000 px, sparse uniform), cache (LRU, byte cap, newest
+  kept, no leaked bytes), queue (coalescing, full queue), service with the real worker (picture
+  and wake, structural edit hits / dab misses only its layer, 250 ms throttle, deleted layer, document
+  switch drops cache and in-flight result, stale-generation job skipped, stale result discarded,
+  100 layers with 10 visible compute 10, <= 4 jobs per turn, shutdown joins, rows show and blank),
+  widget (picture, texel runs, checkerboard shades from the constant, translucent compositing,
+  clipping cut exactly, texel pitch at 1x/2x, hidden node; repaint cost: twelve noisy 48 x 48 pictures at 2x
+  are 110,592 vertices (2.5 MiB) and 165,888 indices (0.6 MiB), **0.59 ms CPU per repaint**, measured, no
+  mesh cache added), panel (slots and icons, label inset,
+  cap 320 px, visible rows follow the scroll). Mutations (each killed, restored, sha256 checked):
+  stamp ignoring `content_version` (2 tests); stale generation installing (needed a new
+  test that injects a stale result: the first mutation survived the existing suite);
+  thumbnails for all layers (3 tests); alpha ignored (2 tests); after the review: the plan
+  ignoring which tiles exist (4 tests), the scratch cap removed (2), the stamp ignoring the
+  existing-tile count (needed a direct stamp test), the queue room not checked (needed a test that
+  fills the queue by hand; a first draft of it passed vacuously because a new document clears the queue).
+- **Not done / disclosed:** the remaining blindness above; the repaint rebuilds the mesh (0.59 ms,
+  3.2 MiB of buffers for twelve noisy thumbnails at 2x) and uploads it each time the panel is drawn;
+  the UI thread reads at most 8 scratch tiles per turn (not measured on a cold paged store beyond the
+  capped-read test); no hidden-layer dimming;
+  `update_layer_thumbnails` (the App seam) is covered through the service and row tests, not by an
+  App-level event-loop test; interactive feel, a 2x display and a screen reader not checked.
+  Panel PNG: `layers-panel.png` (scale 2) and `layers-panel-1x.png` from `write_layers_panel_png`.
+
+**Previously (2026-10-11, 0.196.0): round L3 of the Photoshop-style Layers panel — the bottom
 toolbar and a New Group command. Nobody has seen this toolbar in the live window on the Mac
 (or anywhere but a headless render at scale 2 and the unit tests).**
 Series status: L1 icons (0.194.0) done, L2 rows and controls (0.195.0) done, **L3 toolbar +

@@ -218,7 +218,7 @@ fn write_layers_panel_png() {
     // The sample document: an expanded group holding an expanded group, a
     // hidden layer and a Multiply layer; a collapsed group; a Background.
     let mut layers = LayerTree::new();
-    let _background = ok(layers.add_pixel_layer("Background", bounds(), None));
+    let background = ok(layers.add_pixel_layer("Background", bounds(), None));
     let post2 = ok(layers.add_group("Post 2", None));
     let logo = ok(layers.add_pixel_layer("Logo", bounds(), Some(post2)));
     ok(layers.set_visible(logo, false));
@@ -226,11 +226,19 @@ fn write_layers_panel_png() {
     ok(layers.set_blend_mode(vso, BlendMode::Multiply));
     let effect = ok(layers.add_group("Effect", Some(post2)));
     ok(layers.set_blend_mode(effect, BlendMode::Normal));
-    let _glow = ok(layers.add_pixel_layer("Glow", bounds(), Some(effect)));
+    let glow = ok(layers.add_pixel_layer("Glow", bounds(), Some(effect)));
     let post1 = ok(layers.add_group("Post 1", None));
-    let _child = ok(layers.add_pixel_layer("Title", bounds(), Some(post1)));
+    let child = ok(layers.add_pixel_layer("Title", bounds(), Some(post1)));
     ok(layers.set_blend_mode(post1, BlendMode::SoftLight));
     ok(layers.add_group("Post 3", None).map(|_| ()));
+    ok(layers
+        .add_adjustment_layer_at(
+            "Curves 1",
+            aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::default()),
+            None,
+            0,
+        )
+        .map(|_| ()));
 
     let mut ws = crate::build_workspace(&scales);
     let rows = ok(crate::populate_layers_panel(
@@ -244,6 +252,59 @@ fn write_layers_panel_png() {
             .find(|&(_, &id)| id == layer)
             .map(|(&row, _)| row)
     };
+    // Synthetic pictures for the thumbnails (the app's worker makes the
+    // real ones): an opaque gradient, a translucent disc, a wide strip and
+    // a half-transparent tile, so the checkerboard shows.
+    let picture = |x: u32, y: u32, w: u32, h: u32, f: &dyn Fn(u32, u32) -> [f32; 4]| {
+        let mut texels = Vec::new();
+        for j in 0..h {
+            for i in 0..w {
+                texels.push(f(i, j));
+            }
+        }
+        std::sync::Arc::new(
+            aurora_widgets::widgets::ThumbnailImage::new(x, y, w, h, texels)
+                .unwrap_or_else(|| unreachable!("fits the grid")),
+        )
+    };
+    let gradient = picture(0, 0, 48, 48, &|i, j| {
+        let (r, g) = (i as f32 / 47.0, j as f32 / 47.0);
+        [r, g, 0.4, 1.0]
+    });
+    let disc = picture(0, 0, 48, 48, &|i, j| {
+        let (dx, dy) = (i as f32 - 23.5, j as f32 - 23.5);
+        if dx * dx + dy * dy < 400.0 {
+            [0.8, 0.2, 0.2, 1.0].map(|v| v)
+        } else {
+            [0.0; 4]
+        }
+    });
+    let strip = picture(0, 14, 48, 20, &|i, _| {
+        let a = if i < 24 { 1.0 } else { 0.5 };
+        [0.1 * a, 0.5 * a, 0.9 * a, a]
+    });
+    let half = picture(8, 0, 32, 48, &|_, j| {
+        if j < 24 {
+            [0.9, 0.9, 0.2, 1.0]
+        } else {
+            [0.0; 4]
+        }
+    });
+    for (layer, image) in [
+        (background, &gradient),
+        (logo, &disc),
+        (vso, &half),
+        (glow, &strip),
+        (child, &gradient),
+    ] {
+        if let Some(row) = row_of(layer) {
+            ok(crate::set_layer_row_thumbnail(
+                &mut ws.tree,
+                row,
+                Some(std::sync::Arc::clone(image)),
+            ));
+        }
+    }
     // Collapse "Post 1" the way the app does (rows removed, icons synced).
     let Some(post1_row) = row_of(post1) else {
         unreachable!("a row per layer");

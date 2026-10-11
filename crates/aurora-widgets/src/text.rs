@@ -58,7 +58,7 @@ use aurora_theme::{Color, Scales, Theme};
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     TextFieldState, UnderlineStyle, WidgetKind, checkbox_metrics, composition_segments,
-    floor_char_boundary, row_height,
+    floor_char_boundary,
 };
 
 /// Horizontal alignment of a run inside its content box.
@@ -484,7 +484,7 @@ pub fn text_runs(
         WidgetKind::TreeItem(state) => {
             // One row tall, like the selection fill: a row's own box
             // grows to contain its children.
-            let height = row_height(scales).min(full.3);
+            let height = crate::widgets::tree_item_row_height(state, scales).min(full.3);
             let color = if state.selected {
                 theme.text.on_accent
             } else {

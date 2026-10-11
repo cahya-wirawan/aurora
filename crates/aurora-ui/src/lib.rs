@@ -90,12 +90,14 @@ pub use layer_toolbar::{
 #[cfg(test)]
 mod layers_panel_render;
 pub use layers_panel::{
-    LayerRowPart, layer_row_description, layer_row_neighbor, layer_row_part, populate_layers_panel,
-    reset_layers_panel, set_layer_row_selected, sync_layer_row,
+    LayerRowPart, layer_row_description, layer_row_height, layer_row_neighbor, layer_row_part,
+    layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel, reset_layers_panel,
+    set_layer_row_selected, set_layer_row_thumbnail, sync_layer_row, visible_layer_rows,
 };
 pub use panel::{
     FLOATING_DESCRIPTION, PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel,
-    panel_is_closed, panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_sizing,
+    panel_is_closed, panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_content_cap,
+    set_panel_sizing,
 };
 pub use panel_group::{
     PanelGroup, follow_panel_group_tab, insert_panel_group, is_panel_group_tab,
