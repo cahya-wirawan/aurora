@@ -14,9 +14,13 @@ use rayon::prelude::*;
 
 use crate::error::GpuError;
 
-/// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`,
-/// two `vec2<f32>`s, 16 bytes total.
-const UNIFORM_SIZE: u64 = 16;
+/// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`
+/// (two `vec2<f32>`s) and `doc_clip` (a `vec4<f32>`), 32 bytes total.
+const UNIFORM_SIZE: u64 = 32;
+
+/// `doc_clip` when no document rectangle is set: covers every position
+/// the viewport's `0..1` space can take, so nothing is clipped.
+const NO_CLIP: [f32; 4] = [-1.0e9, -1.0e9, 1.0e9, 1.0e9];
 
 /// Bytes one tile upload costs — `f16` samples, `SAMPLES` per tile.
 const TILE_BYTES: usize = SAMPLES * 2;
@@ -897,6 +901,10 @@ pub struct TileResidency {
     /// panning under one tile not visibly moving anything). Folded into
     /// [`Self::write_uniform`]'s `scroll` alongside `origin * TILE`.
     sub_tile: (f32, f32),
+    /// The document rectangle `(x0, y0, x1, y1)` in this atlas's own
+    /// document-local pixels (the space [`Self::set_origin`] takes), or
+    /// `None` for no clip. See [`Self::set_document_clip`].
+    doc_clip: Option<(f32, f32, f32, f32)>,
 }
 
 impl TileResidency {
@@ -1023,6 +1031,7 @@ impl TileResidency {
             slots: HashMap::new(),
             origin: TileId { x: 0, y: 0 },
             sub_tile: (0.0, 0.0),
+            doc_clip: None,
         };
         residency.write_uniform(queue, viewport_px, 1.0);
         residency
@@ -1156,6 +1165,20 @@ impl TileResidency {
         self.write_uniform(queue, viewport_px, zoom);
     }
 
+    /// Clips what the canvas draws to the document rectangle (0.193.0):
+    /// `rect` is `(x0, y0, x1, y1)` in the same document-local pixels
+    /// [`Self::set_origin`] takes (the document position minus the grid
+    /// anchor, so a document at the anchor is `(0, 0, w, h)`), `None`
+    /// for no clip. Fragments whose centre lies outside it are discarded
+    /// by `canvas.wgsl`, so the target keeps whatever the pass cleared
+    /// it to (the app background) and the checkerboard is drawn only
+    /// inside. Takes effect on the next [`Self::set_origin`], which
+    /// rewrites the uniform (the app calls it every frame); a non-finite
+    /// or empty rectangle clips everything, never nothing.
+    pub fn set_document_clip(&mut self, rect: Option<(f32, f32, f32, f32)>) {
+        self.doc_clip = rect;
+    }
+
     /// Rebuilds the atlas at a new `viewport_px` — the real fix for the
     /// limitation this struct's own doc comment used to name. There is
     /// no in-place way to resize a `wgpu::Texture`, so this reconstructs
@@ -1197,9 +1220,11 @@ impl TileResidency {
         }
         let origin = self.origin;
         let sub_tile = self.sub_tile;
+        let doc_clip = self.doc_clip;
         *self = Self::new(device, queue, viewport_px);
         self.origin = origin;
         self.sub_tile = sub_tile;
+        self.doc_clip = doc_clip;
         self.write_uniform(queue, viewport_px, 1.0);
     }
 
@@ -1443,13 +1468,7 @@ impl TileResidency {
         // `saturating_add`, but re-deriving `tex_w`/`tex_h` from them is
         // still a `u32` multiply and must not reintroduce the overflow
         // panic those two functions exist to close.
-        let capped = Self::grid_for(viewport_px);
-        let floor = Self::zoom_floor(
-            viewport_px,
-            grid.0.min(capped.0).saturating_mul(TILE) as f32,
-            grid.1.min(capped.1).saturating_mul(TILE) as f32,
-        );
-        let zoom = Self::guard_zoom(zoom).max(floor);
+        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
         // Absolute scroll (origin in texels, a genuinely fractional
         // position -- `origin * TILE` plus the sub-tile remainder), then
         // wrapped into [0, tex_w)/[0, tex_h) for the repeat sampler --
@@ -1479,10 +1498,68 @@ impl TileResidency {
         ]
     }
 
+    /// The zoom `uniform_values` actually renders at: the caller's, made
+    /// sane by [`Self::guard_zoom`] and raised to the atlas's floor.
+    fn rendered_zoom_value(grid: (u32, u32), viewport_px: (u32, u32), zoom: f32) -> f32 {
+        let capped = Self::grid_for(viewport_px);
+        let floor = Self::zoom_floor(
+            viewport_px,
+            grid.0.min(capped.0).saturating_mul(TILE) as f32,
+            grid.1.min(capped.1).saturating_mul(TILE) as f32,
+        );
+        Self::guard_zoom(zoom).max(floor)
+    }
+
+    /// `canvas.wgsl`'s `doc_clip`: `rect` (document-local pixels) mapped
+    /// into the viewport's `0..1` space, the space `vs_canvas` hands the
+    /// fragment as `t`. A texel at document-local `p` is at
+    /// `t = (p - scroll) * zoom / viewport`, `scroll` being the window's
+    /// unwrapped top-left (`origin * TILE + sub_tile`) -- the inverse of
+    /// the `uv` mapping `uniform_values` writes. `None` is [`NO_CLIP`];
+    /// a non-finite rectangle collapses to an empty one that clips all.
+    fn clip_values(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        rect: Option<(f32, f32, f32, f32)>,
+    ) -> [f32; 4] {
+        let Some((x0, y0, x1, y1)) = rect else {
+            return NO_CLIP;
+        };
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite())
+            || viewport_px.0 == 0
+            || viewport_px.1 == 0
+        {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
+        let scroll = (
+            (origin.x * TILE) as f32 + sub_tile.0,
+            (origin.y * TILE) as f32 + sub_tile.1,
+        );
+        let to_t = |p: f32, scroll: f32, extent: u32| (p - scroll) * zoom / extent as f32;
+        [
+            to_t(x0, scroll.0, viewport_px.0),
+            to_t(y0, scroll.1, viewport_px.1),
+            to_t(x1, scroll.0, viewport_px.0),
+            to_t(y1, scroll.1, viewport_px.1),
+        ]
+    }
+
     fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
         let values = Self::uniform_values(self.grid, self.origin, self.sub_tile, viewport_px, zoom);
+        let clip = Self::clip_values(
+            self.grid,
+            self.origin,
+            self.sub_tile,
+            viewport_px,
+            zoom,
+            self.doc_clip,
+        );
         let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
-        for value in values {
+        for value in values.into_iter().chain(clip) {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         queue.write_buffer(&self.uniform_buffer, 0, &bytes);
@@ -4056,6 +4133,80 @@ mod tests {
                 ((1, 1), TileId { x: 1, y: 1 }),
             ],
             "a second, unlimited call must finish the backlog"
+        );
+    }
+
+    #[test]
+    // Exact by construction: whole-number viewport fractions.
+    #[allow(clippy::float_cmp)]
+    fn clip_values_map_the_document_rectangle_into_viewport_space() {
+        let viewport = (256, 256);
+        let grid = TileResidency::grid_for(viewport);
+        // No clip: huge, clips nothing.
+        let none = TileResidency::clip_values(
+            grid,
+            TileId { x: 0, y: 0 },
+            (0.0, 0.0),
+            viewport,
+            1.0,
+            None,
+        );
+        assert!(none[0] < -1.0e6 && none[1] < -1.0e6 && none[2] > 1.0e6 && none[3] > 1.0e6);
+        // View at the grid origin, zoom 1: a rectangle at (64, 64)-(192, 192)
+        // is a quarter to three quarters of the viewport.
+        let at_origin = TileResidency::clip_values(
+            grid,
+            TileId { x: 0, y: 0 },
+            (0.0, 0.0),
+            viewport,
+            1.0,
+            Some((64.0, 64.0, 192.0, 192.0)),
+        );
+        assert_eq!(at_origin, [0.25, 0.25, 0.75, 0.75]);
+        // Scrolled by a whole tile plus a sub-tile (256 + 20) at zoom 2:
+        // t = (p - scroll) * zoom / viewport.
+        let panned = TileResidency::clip_values(
+            grid,
+            TileId { x: 1, y: 1 },
+            (20.0, 20.0),
+            viewport,
+            2.0,
+            Some((276.0, 276.0, 340.0, 340.0)),
+        );
+        assert_eq!(panned, [0.0, 0.0, 0.5, 0.5]);
+        // A non-finite rectangle clips everything rather than nothing.
+        let bad = TileResidency::clip_values(
+            grid,
+            TileId { x: 0, y: 0 },
+            (0.0, 0.0),
+            viewport,
+            1.0,
+            Some((f32::NAN, 0.0, 10.0, 10.0)),
+        );
+        assert_eq!(bad, [0.0; 4]);
+    }
+
+    #[test]
+    // Exact by construction: whole-number viewport fractions.
+    #[allow(clippy::float_cmp)]
+    fn clip_values_use_the_floored_zoom_the_uniform_uses() {
+        // Below the atlas's zoom floor the canvas renders at the floor, and
+        // the clip must follow that, not the requested zoom.
+        let viewport = (300, 300);
+        let grid = TileResidency::grid_for(viewport);
+        let floor = TileResidency::rendered_zoom_value(grid, viewport, 0.001);
+        assert!(floor > 0.5 && floor < 0.6, "{floor}");
+        let clip = TileResidency::clip_values(
+            grid,
+            TileId { x: 0, y: 0 },
+            (0.0, 0.0),
+            viewport,
+            0.001,
+            Some((0.0, 0.0, 300.0, 300.0)),
+        );
+        assert!(
+            (clip[2] - floor).abs() < 1e-6 && (clip[3] - floor).abs() < 1e-6,
+            "{clip:?}"
         );
     }
 }

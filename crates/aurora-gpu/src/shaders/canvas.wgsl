@@ -10,6 +10,13 @@
 struct Canvas {
     uv_offset: vec2<f32>,
     uv_scale: vec2<f32>,
+    // 0.193.0: the document rectangle in the viewport's own 0..1 space
+    // (x0, y0, x1, y1). A fragment whose centre lies outside it is
+    // discarded, leaving whatever the pass cleared the target to (the
+    // app background), so layer content that reaches past the canvas is
+    // never shown and neither is the checkerboard there. With no
+    // document (tests, the demo) the rectangle is huge and clips nothing.
+    doc_clip: vec4<f32>,
 };
 
 @group(0) @binding(0) var canvas_tex: texture_2d<f32>;
@@ -33,6 +40,8 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    // Position across the viewport, 0..1 (top-left origin).
+    @location(1) t: vec2<f32>,
 };
 
 // Fullscreen triangle; no vertex buffer.
@@ -43,11 +52,18 @@ fn vs_canvas(@builtin(vertex_index) i: u32) -> VsOut {
     let y = f32(i & 2u);
     out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
     out.uv = vec2<f32>(x, y) * canvas.uv_scale + canvas.uv_offset;
+    out.t = vec2<f32>(x, y);
     return out;
 }
 
 @fragment
 fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
+    // Outside the document: not drawn (0.193.0). Before the texture
+    // sample so the discarded area costs nothing and shows nothing.
+    if (in.t.x < canvas.doc_clip.x || in.t.y < canvas.doc_clip.y
+        || in.t.x >= canvas.doc_clip.z || in.t.y >= canvas.doc_clip.w) {
+        discard;
+    }
     let c = textureSample(canvas_tex, canvas_smp, in.uv);
     // Checkerboard behind transparent areas, as any image editor shows.
     let sq = floor(in.pos.xy / 8.0);

@@ -11239,7 +11239,8 @@ fn active_pixel_layer(
 }
 
 /// The document-space point every composite `aurora_tile::TileId` is
-/// measured from — the active layer's own `bounds.x`/`bounds.y`, or
+/// measured from — the active layer's own `bounds.x`/`bounds.y` capped at
+/// the document's corner (`min(bounds, 0)` per axis, 0.193.0), or
 /// `(0, 0)` when there is no active layer or it isn't a pixel layer
 /// (the same absent-precondition honesty [`active_pixel_layer`] already
 /// uses).
@@ -11264,7 +11265,15 @@ fn composite_reference_origin(
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
 ) -> (i64, i64) {
-    active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, bounds)| (bounds.x, bounds.y))
+    // 0.193.0: never right of / below the document's own corner. A tile
+    // id is unsigned, so the grid cannot show anything left of or above
+    // its anchor; an anchor at a layer origin inside the document (say
+    // (300, 150)) would make the document's top-left unreachable, and
+    // the pan bound is the document rectangle. A layer at a negative
+    // origin (Nyepi's (-124, -36)) still anchors the grid exactly as
+    // before.
+    active_pixel_layer(layers, active_layer)
+        .map_or((0, 0), |(_, bounds)| (bounds.x.min(0), bounds.y.min(0)))
 }
 
 /// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
@@ -11368,12 +11377,20 @@ fn pan_bounds(
     active_layer: Option<aurora_doc::LayerId>,
     canvas_size: Option<(f32, f32)>,
 ) -> PanBounds {
-    let min_doc = active_layer_origin(layers, active_layer);
+    // 0.193.0: the near edge is the document's own top-left corner,
+    // whichever layer is active (it used to be that layer's origin, which
+    // offset the artboard by the layer's negative origin and hid the
+    // document's left/top part behind a positive one). The grid anchor
+    // ([`active_layer_origin`]) is never right of or below it, so the
+    // corner is always addressable. The far edge is still measured from
+    // the anchor, as `TileResidency::set_origin` clamps it.
+    let anchor = active_layer_origin(layers, active_layer);
+    let min_doc = (0.0, 0.0);
     PanBounds {
         min_doc,
         max_doc: (
-            min_doc.0 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
-            min_doc.1 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+            anchor.0 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+            anchor.1 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
         ),
         canvas_size: canvas_size.unwrap_or((0.0, 0.0)),
     }
@@ -23818,6 +23835,22 @@ fn canvas_local_origin(view: &aurora_ui::CanvasView, layer_origin: (f32, f32)) -
     (doc_x - layer_origin.0, doc_y - layer_origin.1)
 }
 
+/// The document rectangle in the composite grid's own pixels — what
+/// [`aurora_gpu::TileResidency::set_document_clip`] takes (0.193.0): the
+/// document's `(0, 0)..(width, height)` minus the grid anchor
+/// ([`active_layer_origin`]), the same offset [`canvas_local_origin`]
+/// subtracts, so the clip lands on the document wherever the anchor is.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn document_clip_rect(canvas_size: (u32, u32), anchor: (f32, f32)) -> (f32, f32, f32, f32) {
+    (
+        -anchor.0,
+        -anchor.1,
+        canvas_size.0 as f32 - anchor.0,
+        canvas_size.1 as f32 - anchor.1,
+    )
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -28390,6 +28423,10 @@ impl App {
                     if let Some(canvas_size) =
                         canvas_area_physical_size(&self.workspace, self.scale_factor)
                     {
+                        residency.set_document_clip(Some(document_clip_rect(
+                            self.doc.canvas_size,
+                            active_layer_origin(&self.doc.layers, self.doc.active_layer),
+                        )));
                         residency.set_origin(
                             gpu.queue(),
                             canvas_local_origin(
@@ -29400,23 +29437,24 @@ mod tests {
         composite_document, composite_reference_origin, composite_roots_into_tile,
         composite_surface_id, continue_drag, crash_recovery_dialog_actions,
         crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, display_file_name, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, install_startup_panels,
-        is_aur_path, is_psd_path, layer_for_surface, layer_local_point, load_document_view,
-        load_scales, load_theme, logical_point, logical_size, mark_active_layer_row,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_failure_message, open_image, open_open_failed_dialog, open_psd_document, open_route,
-        open_tile_store, palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo,
-        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, psd_report_dialog_actions, psd_report_message,
-        read_aur_for_open, recomposite_visible_tiles, reconcile_layer_rows, recover_document,
-        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
-        resolve_tile, route_accessibility_action, run_command, run_dialog_action,
-        run_shutdown_cleanup, sample_pixel, save_failure_message, select_layer, shift_bounds,
+        demo_document, display_file_name, dissolve_gate, document_canvas_size, document_clip_rect,
+        document_from_image, document_qualifies_for_gpu_compositing, effective_residency_zoom,
+        eraser_stroke_mut, export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, hash_position, hash_to_unit_f32, incomplete_composite_message,
+        install_startup_panels, is_aur_path, is_psd_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_active_layer_row, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_failure_message, open_image,
+        open_open_failed_dialog, open_psd_document, open_route, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        psd_report_dialog_actions, psd_report_message, read_aur_for_open,
+        recomposite_visible_tiles, reconcile_layer_rows, recover_document, replace_document,
+        replace_document_pixels, reset_canvas_view, resized_rail_width, resolve_tile,
+        route_accessibility_action, run_command, run_dialog_action, run_shutdown_cleanup,
+        sample_pixel, save_failure_message, select_layer, shift_bounds,
         skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
         status_info, sync_status_bar, take_gpu_blend_dispatch_count, tile_overlaps_doc_rect,
         tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
@@ -29841,30 +29879,45 @@ mod tests {
         }
     }
 
-    /// [`pan_bounds`] for a synthetic one-layer document whose active
-    /// layer sits at `min_doc`, at an unknown canvas size — what the
-    /// many pan-clamping tests below want when what they care about is
-    /// the near edge and not which document produced it.
-    ///
-    /// Goes through the real `pan_bounds` rather than building a
-    /// `PanBounds` literal, deliberately: a literal here would be a
-    /// second copy of the `min_doc + MAX_DOC_ORIGIN_PX` derivation, and
-    /// a test that pins a far bound the production path would not
-    /// actually produce is worse than no test.
-    #[allow(clippy::cast_possible_truncation)]
+    /// A [`PanBounds`] whose near edge is `min_doc` and whose far edge is
+    /// that plus the document ceiling, at an unknown canvas size, for the
+    /// many tests below that exercise how the view *reacts* to a moved
+    /// bound (re-anchoring a live stroke, clamping a drag) and do not
+    /// care which document produced it. Since 0.193.0 [`pan_bounds`]
+    /// itself always puts the near edge at the document corner, so these
+    /// tests build the value directly; [`pan_bounds`] has its own tests
+    /// (`the_pan_bound_is_the_document_corner_*`).
     fn bounds_at(min_doc: (f32, f32), canvas_size: Option<(f32, f32)>) -> PanBounds {
-        let mut layers = aurora_doc::LayerTree::new();
-        let bounds = aurora_core::Rect {
-            x: min_doc.0 as i64,
-            y: min_doc.1 as i64,
-            width: 10,
-            height: 10,
+        PanBounds {
+            min_doc,
+            max_doc: (
+                min_doc.0 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+                min_doc.1 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+            ),
+            canvas_size: canvas_size.unwrap_or((0.0, 0.0)),
+        }
+    }
+
+    /// [`two_layers_one_moved`] with `b` at the *negative* origin
+    /// `(-300, -150)` -- the only kind of layer origin that still moves
+    /// the grid anchor (and so the far pan bound) since 0.193.0.
+    fn two_layers_one_negative() -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let (workspace, mut layers, rows, a, b) = two_layers_one_moved();
+        let negative = aurora_core::Rect {
+            x: -300,
+            y: -150,
+            ..moved_layer_bounds()
         };
-        let id = match layers.add_pixel_layer("bound", bounds, None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        pan_bounds(&layers, Some(id), canvas_size)
+        if let Err(err) = layers.set_bounds(b, negative) {
+            unreachable!("{err:?}");
+        }
+        (workspace, layers, rows, a, b)
     }
 
     /// A `LayerTree` with `a` at the document origin and `b` moved to
@@ -32460,34 +32513,30 @@ mod tests {
         // Equivalently, in document space: the canvas area's own
         // top-left corner cannot show anything before `b`'s own corner.
         let (doc_x, doc_y) = view.to_document((0.0, 0.0));
-        assert!(doc_x >= 300.0 - 1e-3, "{doc_x}");
-        assert!(doc_y >= 150.0 - 1e-3, "{doc_y}");
+        // Since 0.193.0 the near bound is the document's own corner
+        // whichever layer is active, so selecting `b` (at 300, 150) does
+        // not move the view: it stays at the corner, not at `b`'s origin.
+        assert!((-1e-3..1.0).contains(&doc_x), "{doc_x}");
+        assert!((-1e-3..1.0).contains(&doc_y), "{doc_y}");
     }
 
-    /// The negative control for the test above: the same active-layer
-    /// change with only the *old* layer's bound ever applied — which is
-    /// exactly what this crate did before `clamp_pan_to_active_layer`
-    /// existed. Asserts the divergence is large, not marginal, so this
-    /// cannot pass by a coincidence of small numbers.
+    /// Since 0.193.0 the divergence this used to demonstrate cannot
+    /// happen on the near edge: the near bound is the document corner and
+    /// the grid anchor is never right of or below it, so a view clamped
+    /// against one layer has a non-negative surface-local origin under
+    /// every other layer's anchor too, with no re-clamp at all.
     #[test]
-    fn an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents() {
-        let (_workspace, layers, _layer_rows, a, b) = two_layers_one_moved();
+    fn an_active_layer_change_cannot_make_the_local_origin_negative() {
+        let (_workspace, layers, _layer_rows, a, b) = two_layers_one_negative();
         let mut view = CanvasView::new();
         view.pan_by((40.0, 40.0));
-        // Clamped against `a` only — the boundary as it was *before* the
-        // active layer changed.
         clamp_pan_to_active_layer(&mut view, &layers, Some(a), None);
-
-        // The active layer becomes `b`, and nothing re-clamps.
-        let (local_x, local_y) = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
-        assert!(
-            local_x < -100.0,
-            "without the re-clamp the local origin is far negative on x: {local_x}"
-        );
-        assert!(
-            local_y < -50.0,
-            "without the re-clamp the local origin is far negative on y: {local_y}"
-        );
+        for layer in [a, b] {
+            let (local_x, local_y) =
+                canvas_local_origin(&view, active_layer_origin(&layers, Some(layer)));
+            assert!(local_x >= -1e-3, "{local_x}");
+            assert!(local_y >= -1e-3, "{local_y}");
+        }
     }
 
     /// The evidence that the *open* paths are genuinely exposed, not
@@ -32554,10 +32603,9 @@ mod tests {
         }
         // And that is exactly the state the open paths hand to
         // `reset_canvas_view`.
-        assert_eq!(
-            active_layer_origin(&recovered, Some(active)),
-            (300.0, 150.0)
-        );
+        // The grid anchor is capped at the document corner (0.193.0); the
+        // layer's own origin is what the bounds assertion above pins.
+        assert_eq!(active_layer_origin(&recovered, Some(active)), (0.0, 0.0));
     }
 
     /// The autosave pair above is what `App::new`'s own crash-recovery
@@ -32621,10 +32669,12 @@ mod tests {
             unreachable!("the reopened document has pixel layers");
         };
         assert_eq!(
-            active_layer_origin(&reopened, Some(active)),
-            (300.0, 150.0),
+            reopened.bounds(active).map(|b| (b.x, b.y)),
+            Some((300, 150)),
             "a moved layer's own origin must survive the user-facing .aur round trip"
         );
+        // ... while the grid anchor is capped at the document corner.
+        assert_eq!(active_layer_origin(&reopened, Some(active)), (0.0, 0.0));
 
         // And that origin, fed through the very step the open path runs,
         // is what the clamp is for.
@@ -32829,9 +32879,12 @@ mod tests {
             unreachable!("{err:?}");
         }
         let (mid_x, mid_y) = canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        // Since 0.193.0 a positive layer origin no longer moves the near
+        // bound, so the drag cannot violate it; the commit's clamp stays
+        // as the idempotent guard it is.
         assert!(
-            mid_x < -100.0 && mid_y < -50.0,
-            "setup: mid-drag the bound really is violated, which is what the commit has to close: ({mid_x}, {mid_y})"
+            mid_x >= -1e-3 && mid_y >= -1e-3,
+            "mid-drag the near bound holds without a clamp: ({mid_x}, {mid_y})"
         );
 
         commit_ending_drag(
@@ -32966,8 +33019,8 @@ mod tests {
         let (before_x, before_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
         assert!(
-            before_x < -100.0 && before_y < -50.0,
-            "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
+            before_x >= -1e-3 && before_y >= -1e-3,
+            "since 0.193.0 the undo cannot reopen a near-edge divergence: ({before_x}, {before_y})"
         );
 
         after_undo_redo(
@@ -33250,11 +33303,12 @@ mod tests {
             "setup: the interrupted move still records its own step"
         );
         let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+        // Since 0.193.0 the near bound is the document corner for every
+        // layer, so the two orders no longer leave different pans; what is
+        // left to pin is that the view ends on the corner.
         assert!(
-            (doc_x - 500.0).abs() < 1e-3 && (doc_y - 500.0).abs() < 1e-3,
-            "the move must be committed against `a`'s own dragged origin (500, 500) before the \
-             selection relaxes the bound to `b`'s (300, 150); selecting first would leave this at \
-             (300, 150): ({doc_x}, {doc_y})"
+            doc_x.abs() < 1e-3 && doc_y.abs() < 1e-3,
+            "the view must end on the document corner: ({doc_x}, {doc_y})"
         );
     }
 
@@ -33395,7 +33449,8 @@ mod tests {
     /// cached `TileId` now names a *different* document-space window.
     #[test]
     fn switching_to_a_layer_at_a_different_origin_invalidates_every_cached_tile() {
-        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        // `b` at a negative origin: the only kind that moves the anchor.
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_negative();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
@@ -65649,6 +65704,176 @@ mod tests {
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
     }
 
+    // -- 0.193.0: the near pan bound is the document rectangle, whichever
+    // layer is active, and the canvas is clipped to it --
+
+    /// A pixel layer named `name` at `(x, y)` in a fresh tree.
+    fn one_layer_at(x: i64, y: i64) -> (aurora_doc::LayerTree, aurora_doc::LayerId) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x,
+            y,
+            width: 40,
+            height: 40,
+        };
+        match layers.add_pixel_layer("layer", bounds, None) {
+            Ok(id) => (layers, id),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// Pans as far up and left as the bound allows and returns where the
+    /// canvas area's top-left corner then is, in document space.
+    fn corner_after_panning_to_the_extreme(
+        layers: &aurora_doc::LayerTree,
+        active: Option<aurora_doc::LayerId>,
+        canvas: Option<(f32, f32)>,
+        zoom: f32,
+    ) -> (f32, f32) {
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), zoom);
+        view.pan_by((100_000.0, 100_000.0));
+        clamp_pan_to_active_layer(&mut view, layers, active, canvas);
+        view.to_document((0.0, 0.0))
+    }
+
+    #[test]
+    fn the_pan_bound_is_the_document_corner_for_a_layer_at_a_negative_origin() {
+        // Nyepi: the active layer's bounds start at (-124, -36). The
+        // document's top-left may reach the view's corner; the view may no
+        // longer sit at the layer's origin, 124 px up and left of it.
+        let (layers, id) = one_layer_at(-124, -36);
+        let bound = pan_bounds(&layers, Some(id), None);
+        assert_eq!(bound.min_doc, (0.0, 0.0));
+        for zoom in [0.5, 1.0, 2.0] {
+            assert_eq!(
+                corner_after_panning_to_the_extreme(&layers, Some(id), None, zoom),
+                (0.0, 0.0),
+                "zoom {zoom}"
+            );
+        }
+        // The render anchor is still the layer's origin, so the document
+        // corner sits (124, 36) inside the grid: addressable, not negative.
+        assert_eq!(active_layer_origin(&layers, Some(id)), (-124.0, -36.0));
+        let mut view = CanvasView::new();
+        clamp_pan_to_active_layer(&mut view, &layers, Some(id), None);
+        assert_eq!(
+            canvas_local_origin(&view, active_layer_origin(&layers, Some(id))),
+            (124.0, 36.0)
+        );
+    }
+
+    #[test]
+    fn the_pan_bound_is_the_document_corner_for_a_layer_inside_the_document() {
+        // A layer entirely inside the document, at (300, 150), used to pin
+        // the view there and hide the document's own left and top.
+        let (layers, id) = one_layer_at(300, 150);
+        assert_eq!(pan_bounds(&layers, Some(id), None).min_doc, (0.0, 0.0));
+        assert_eq!(
+            corner_after_panning_to_the_extreme(&layers, Some(id), None, 1.0),
+            (0.0, 0.0)
+        );
+        // The grid anchor is capped at the corner, so the corner is
+        // addressable (a tile id is unsigned).
+        assert_eq!(active_layer_origin(&layers, Some(id)), (0.0, 0.0));
+        assert_eq!(composite_reference_origin(&layers, Some(id)), (0, 0));
+    }
+
+    #[test]
+    fn the_pan_bound_is_the_document_corner_with_no_active_layer_or_at_the_origin() {
+        let (layers, id) = one_layer_at(0, 0);
+        for active in [None, Some(id)] {
+            assert_eq!(
+                corner_after_panning_to_the_extreme(&layers, active, None, 1.0),
+                (0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn the_pan_bound_is_the_document_corner_for_a_mixed_sign_origin() {
+        // Negative on x only: x anchors at the layer, y at the document.
+        let (layers, id) = one_layer_at(-50, 80);
+        assert_eq!(composite_reference_origin(&layers, Some(id)), (-50, 0));
+        assert_eq!(
+            corner_after_panning_to_the_extreme(&layers, Some(id), None, 1.0),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn the_near_bound_holds_for_a_canvas_area_bigger_or_smaller_than_the_view() {
+        // The canvas size only enters the far bound; the near bound is the
+        // corner at every size, as before.
+        let (layers, id) = one_layer_at(-124, -36);
+        for canvas in [(10.0, 10.0), (1_600.0, 900.0), (400_000.0, 400_000.0)] {
+            assert_eq!(
+                corner_after_panning_to_the_extreme(&layers, Some(id), Some(canvas), 1.0),
+                (0.0, 0.0),
+                "canvas {canvas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_brush_lands_under_the_cursor_with_a_misaligned_active_layer() {
+        // Window position -> document point (what the brush paints at)
+        // must equal the document point the renderer shows there, for an
+        // active layer at a negative origin, inside the document, and at
+        // the corner, at scale factor 1 and 2.
+        for (ox, oy) in [(-124_i64, -36_i64), (300, 150), (0, 0)] {
+            let (layers, id) = one_layer_at(ox, oy);
+            for scale in [1.0_f32, 2.0] {
+                let mut view = CanvasView::new();
+                view.zoom_at((0.0, 0.0), 1.5);
+                view.pan_by((-200.0, -90.0));
+                clamp_pan_to_active_layer(&mut view, &layers, Some(id), Some((1_000.0, 800.0)));
+                let anchor = active_layer_origin(&layers, Some(id));
+                let local = canvas_local_origin(&view, anchor);
+                let zoom = effective_residency_zoom(view.zoom(), f64::from(scale));
+                for pointer in [(0.0_f32, 0.0_f32), (123.0, 77.0), (640.0, 480.0)] {
+                    let painted = view.to_document(pointer);
+                    // The renderer: grid-local origin plus the physical
+                    // pixel offset over the physical zoom, plus the anchor.
+                    let shown = (
+                        anchor.0 + local.0 + pointer.0 * scale / zoom,
+                        anchor.1 + local.1 + pointer.1 * scale / zoom,
+                    );
+                    assert!(
+                        (painted.0 - shown.0).abs() < 1e-3 && (painted.1 - shown.1).abs() < 1e-3,
+                        "layer ({ox},{oy}) scale {scale} pointer {pointer:?}: paint {painted:?} vs render {shown:?}"
+                    );
+                    // And the layer-local point the dab lands on is the
+                    // document point minus the layer's own origin.
+                    let bounds = aurora_core::Rect {
+                        x: ox,
+                        y: oy,
+                        width: 40,
+                        height: 40,
+                    };
+                    let lp = layer_local_point(bounds, painted);
+                    assert!((lp.0 - (painted.0 - ox as f32)).abs() < 1e-3);
+                    assert!((lp.1 - (painted.1 - oy as f32)).abs() < 1e-3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_document_clip_is_the_document_rectangle_relative_to_the_grid_anchor() {
+        // 1080 x 1920 at an anchor of (-124, -36): the document spans
+        // (124, 36)-(1204, 1956) in the grid's own pixels.
+        assert_eq!(
+            document_clip_rect((1080, 1920), (-124.0, -36.0)),
+            (124.0, 36.0, 1204.0, 1956.0)
+        );
+        // Anchored at the corner it is (0, 0)-(w, h).
+        assert_eq!(
+            document_clip_rect((1080, 1920), (0.0, 0.0)),
+            (0.0, 0.0, 1080.0, 1920.0)
+        );
+    }
+
     // -- the same bug at the document's *far* edge (0.57.10) --
     //
     // The clamps above close the near edge, where
@@ -65672,21 +65897,19 @@ mod tests {
         // (`canvas_local_origin(view, active_layer_origin(..))`) and
         // clamps that to `[0, MAX_DOC_ORIGIN_PX]` -- mapping that range
         // back into document space adds the layer origin to both ends.
-        let (_, layers, _, a, b) = two_layers_one_moved();
+        let (_, layers, _, a, b) = two_layers_one_negative();
         let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
 
         let at_origin = pan_bounds(&layers, Some(a), None);
         assert_eq!(at_origin.min_doc, (0.0, 0.0));
         assert_eq!(at_origin.max_doc, (ceiling, ceiling));
 
-        // The moved layer's own bounds are (300, 150) -- both ends of
-        // the bound move with it, and the *extent* between them stays
-        // exactly the ceiling.
+        // The moved layer's own bounds are (-300, -150) -- the grid
+        // anchor, and so the far end of the bound, move with it (0.193.0:
+        // the near end is always the document corner).
         let moved = pan_bounds(&layers, Some(b), None);
-        assert_eq!(moved.min_doc, (300.0, 150.0));
-        assert_eq!(moved.max_doc, (300.0 + ceiling, 150.0 + ceiling));
-        assert_eq!(moved.max_doc.0 - moved.min_doc.0, ceiling);
-        assert_eq!(moved.max_doc.1 - moved.min_doc.1, ceiling);
+        assert_eq!(moved.min_doc, (0.0, 0.0));
+        assert_eq!(moved.max_doc, (-300.0 + ceiling, -150.0 + ceiling));
     }
 
     /// **The headline test.** Panning wildly past the document's far
@@ -65704,7 +65927,7 @@ mod tests {
     /// agree" means.
     #[test]
     fn panning_far_past_the_document_end_keeps_render_and_paint_in_agreement() {
-        let (_, layers, _, _, b) = two_layers_one_moved();
+        let (_, layers, _, _, b) = two_layers_one_negative();
         let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
         let canvas = (1_600.0_f32, 900.0_f32);
 
@@ -65726,7 +65949,7 @@ mod tests {
         // bound, not merely somewhere no-longer-past it.
         let far = view.to_document(canvas);
         assert!(
-            (far.0 - (300.0 + ceiling)).abs() <= 1.0 && (far.1 - (150.0 + ceiling)).abs() <= 1.0,
+            (far.0 - (ceiling - 300.0)).abs() <= 1.0 && (far.1 - (ceiling - 150.0)).abs() <= 1.0,
             "the far corner must be pinned on max_doc; got {far:?}"
         );
     }
@@ -65734,7 +65957,7 @@ mod tests {
     #[test]
     fn the_far_pan_bound_without_the_new_clamp_is_the_divergence_this_prevents() {
         // The negative control for the test above, spelled the way
-        // `an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents`
+        // `an_active_layer_change_cannot_make_the_local_origin_negative`
         // already spells its own: exactly what this crate did before
         // 0.57.10 -- the near clamp alone -- and how far outside the
         // renderer's honoured range it leaves the origin.
@@ -65763,7 +65986,7 @@ mod tests {
         // distance on any display where that is not 1.0 -- so this
         // builds a real laid-out workspace at a 2x scale factor and
         // confirms the bound lands on the logical size.
-        let (mut workspace, layers, _, _, b) = two_layers_one_moved();
+        let (mut workspace, layers, _, _, b) = two_layers_one_negative();
         workspace.tree.compute_layout(1_600.0, 900.0);
         let Some(logical) = canvas_area_logical_size(&workspace) else {
             unreachable!("the canvas area always has bounds once laid out");
@@ -65788,8 +66011,8 @@ mod tests {
 
         let at_logical = view.to_document(logical);
         assert!(
-            (at_logical.0 - (300.0 + ceiling)).abs() <= 1.0
-                && (at_logical.1 - (150.0 + ceiling)).abs() <= 1.0,
+            (at_logical.0 - (ceiling - 300.0)).abs() <= 1.0
+                && (at_logical.1 - (ceiling - 150.0)).abs() <= 1.0,
             "the far corner must land on max_doc at the *logical* canvas size; \
              got {at_logical:?}"
         );
@@ -65932,7 +66155,7 @@ mod tests {
         // violates the bound with neither the active layer nor its
         // bounds having changed at all, and nothing else on the resize
         // path catches it.
-        let (_, layers, _, _, b) = two_layers_one_moved();
+        let (_, layers, _, _, b) = two_layers_one_negative();
         let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
         let small = (800.0_f32, 600.0_f32);
         let grown = (1_600.0_f32, 1_200.0_f32);
@@ -65942,7 +66165,7 @@ mod tests {
         pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
         let pinned = view.to_document(small);
         assert!(
-            (pinned.0 - (300.0 + ceiling)).abs() <= 1.0,
+            (pinned.0 - (ceiling - 300.0)).abs() <= 1.0,
             "setup: pinned exactly on the far bound at the small canvas; \
              got {pinned:?}"
         );
