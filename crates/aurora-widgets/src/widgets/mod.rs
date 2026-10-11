@@ -167,7 +167,8 @@ mod tooltip;
 mod tree_view;
 
 pub use button::{
-    ButtonState, insert_button, insert_toggle_button, set_button_disabled, set_button_pressed,
+    ButtonState, icon_button_side, insert_button, insert_icon_button, insert_toggle_button,
+    set_button_description, set_button_disabled, set_button_hovered, set_button_pressed,
     set_button_toggled,
 };
 pub use checkbox::{

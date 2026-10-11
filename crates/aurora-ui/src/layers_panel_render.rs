@@ -272,6 +272,19 @@ fn write_layers_panel_png() {
         Some(vso),
         None,
     ));
+    // The toolbar: Delete enabled (a pixel layer survives), the Group
+    // button hovered to show the tint.
+    ok(crate::sync_layer_toolbar(
+        &mut ws.tree,
+        &ws.layer_toolbar,
+        true,
+    ));
+    let group_button = ws.layer_toolbar.button_for(crate::LayerAction::Group);
+    ok(crate::set_layer_toolbar_hover(
+        &mut ws.tree,
+        &ws.layer_toolbar,
+        group_button,
+    ));
     // Scale 2 is the user's Retina case; scale 1 is written beside it.
     for (scale, name) in [
         (2.0_f32, review_png("layers-panel.png")),
@@ -289,7 +302,7 @@ fn write_layers_panel_png() {
         );
         let (w, h) = (
             (panel.width as f32 * scale) as u32,
-            ((panel.height as f32).min(420.0) * scale) as u32,
+            (panel.height as f32 * scale) as u32,
         );
         let mut crop = Vec::with_capacity((w * h * 4) as usize);
         for y in y0..y0 + h {

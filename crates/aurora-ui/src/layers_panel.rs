@@ -1196,7 +1196,7 @@ mod tests {
 
         let mut focus = aurora_widgets::FocusManager::new();
         let mut visited = Vec::new();
-        for _ in 0..7 + ws.tools.buttons.len() {
+        for _ in 0..10 + ws.tools.buttons.len() {
             match focus.focus_next(&mut ws.tree) {
                 Some(id) => visited.push(id),
                 None => unreachable!("the workspace has focusable widgets"),
@@ -1214,6 +1214,18 @@ mod tests {
         }
         expected.push(ws.layers.root);
         expected.extend_from_slice(&row_ids);
+        // 0.196.0: then the toolbar's enabled buttons (Adjustment, Group, New
+        // Layer; Link, Fx, Mask and — with no active layer synced — Delete
+        // are disabled and are no stops).
+        for action in [
+            crate::LayerAction::Adjustment,
+            crate::LayerAction::Group,
+            crate::LayerAction::NewLayer,
+        ] {
+            if let Some(button) = ws.layer_toolbar.button_for(action) {
+                expected.push(button);
+            }
+        }
         // 0.164.0: then the group's selected tab (roving focus: one stop
         // per tab row) and the shown tab panel; History is hidden.
         let Ok(bar) =
@@ -1551,7 +1563,8 @@ mod tests {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let cap = crate::panel::content_panel_max_rows(&scales) as usize;
             #[allow(clippy::cast_possible_truncation)]
-            let expected = (21 * (1 + count.clamp(1, cap))) as u32;
+            let expected =
+                (21 * (1 + count.clamp(1, cap))) as u32 + crate::layer_toolbar::toolbar_px(&scales);
             assert_eq!(
                 layers_bounds.height, expected,
                 "content-sized up to the cap at {count} layers"

@@ -440,6 +440,8 @@ pub fn text_runs(
         })
     };
     let runs = match kind {
+        // An icon button's label is only its accessible name (0.196.0).
+        WidgetKind::Button(state) if state.icon.is_some() => vec![],
         WidgetKind::Button(state) => vec![run(
             &state.label,
             rgba(

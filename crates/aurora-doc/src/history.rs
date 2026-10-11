@@ -437,13 +437,20 @@ fn describe(op: &LayerOp) -> String {
     match op {
         LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
         LayerOp::Restore(removed) => {
-            let name = removed
+            let (name, noun) = removed
                 .entries
                 .iter()
                 .take(MAX_ROOT_SEARCH_ENTRIES)
                 .find(|(entry_id, _)| *entry_id == removed.root)
-                .map_or("layer", |(_, entry)| entry.name.as_str());
-            format!("Added layer \"{}\"", sanitize_display_name(name))
+                .map_or(("layer", "layer"), |(_, entry)| {
+                    let noun = if matches!(entry.kind, LayerKind::Group { .. }) {
+                        "group"
+                    } else {
+                        "layer"
+                    };
+                    (entry.name.as_str(), noun)
+                });
+            format!("Added {noun} \"{}\"", sanitize_display_name(name))
         }
         LayerOp::Reparent { id, .. } => format!("Moved layer #{}", id.to_raw()),
         LayerOp::Rename { id, name } => {
@@ -933,6 +940,59 @@ impl History {
                     },
                 ),
             )],
+        }));
+        self.push(LayerOp::RemoveById(id));
+        Ok(id)
+    }
+
+    /// Adds an empty group at sibling position `index` of `parent`
+    /// ([`LayerTree::add_group_at`]) with `blend_mode` from its first
+    /// moment, as **one** undo step (0.196.0, New Group): undo removes
+    /// the group, redo restores it with that mode intact.
+    ///
+    /// No new `LayerOp` variant: the journal's `Restore` carries the
+    /// whole captured entry, blend mode included, so the mode is
+    /// recorded in the same op that adds the group (and the existing
+    /// `RemoveById`/`Restore` pair re-captures it on every undo/redo
+    /// cycle). `blend_mode` is applied through
+    /// [`LayerTree::set_blend_mode`], so every rule it enforces holds
+    /// (a group accepts every mode, `PassThrough` included).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::add_group_at`], and
+    /// [`LayerTree::set_blend_mode`]'s. Nothing is recorded and the tree
+    /// is left as it was when either fails.
+    pub fn add_group_at(
+        &mut self,
+        tree: &mut LayerTree,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+        index: usize,
+        blend_mode: BlendMode,
+    ) -> Result<LayerId, DocError> {
+        let name = name.into();
+        let id = tree.add_group_at(name.clone(), parent, index)?;
+        if let Err(err) = tree.set_blend_mode(id, blend_mode) {
+            // Take the half-made group back out so the failed call
+            // changes nothing (the id stays consumed, as everywhere).
+            let _ = tree.remove_capturing(id);
+            return Err(err);
+        }
+        let landed = current_index(tree, id, parent).unwrap_or(index);
+        let mut entry = LayerEntry::new(
+            name,
+            parent,
+            LayerKind::Group {
+                children: Vec::new(),
+            },
+        );
+        entry.blend_mode = blend_mode;
+        self.journal.push(LayerOp::Restore(RemovedSubtree {
+            root: id,
+            parent,
+            index: landed,
+            entries: vec![(id, entry)],
         }));
         self.push(LayerOp::RemoveById(id));
         Ok(id)
@@ -2523,6 +2583,105 @@ mod tests {
                 children: Vec::new()
             })
         );
+    }
+
+    /// 0.196.0, New Group: the group is born Pass Through in the same
+    /// step, and undo/redo remove and re-add it with the mode intact.
+    #[test]
+    fn add_group_at_is_one_step_that_keeps_its_blend_mode_through_undo_redo() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let a = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match history.add_pixel_layer(&mut tree, "b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // roots = [b, a]; a group at index 1 sits between them.
+        let g = match history.add_group_at(&mut tree, "Group 1", None, 1, BlendMode::PassThrough) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.roots(), [b, g, a]);
+        assert_eq!(tree.blend_mode(g), Some(BlendMode::PassThrough));
+        assert_eq!(tree.opacity(g), Some(1.0));
+        assert_eq!(tree.visible(g), Some(true));
+        assert_eq!(
+            history.last_journal_description().as_deref(),
+            Some("Added group \"Group 1\"")
+        );
+        // One step: a single undo removes it, a second would remove `b`.
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(g));
+        assert_eq!(tree.roots(), [b, a]);
+        assert!(tree.contains(b), "only the group's own step was undone");
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.roots(), [b, g, a]);
+        assert_eq!(tree.blend_mode(g), Some(BlendMode::PassThrough));
+        // Undo again: the re-captured entry still carries the mode.
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_mode(g), Some(BlendMode::PassThrough));
+    }
+
+    #[test]
+    fn add_group_at_replays_and_reloads_from_its_journal_with_the_mode() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(parent) = history.add_group(&mut tree, "outer", None) else {
+            unreachable!("root exists");
+        };
+        let Ok(inner) = history.add_group_at(
+            &mut tree,
+            "Group 1",
+            Some(parent),
+            0,
+            BlendMode::PassThrough,
+        ) else {
+            unreachable!("parent is a group");
+        };
+        let replayed = match history.replay() {
+            Ok(replayed) => replayed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.blend_mode(inner), Some(BlendMode::PassThrough));
+        assert_eq!(replayed.parent(inner), Some(parent));
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let loaded = match History::load_journal(&bytes).and_then(|h| h.replay()) {
+            Ok(loaded) => loaded,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(loaded.blend_mode(inner), Some(BlendMode::PassThrough));
+    }
+
+    #[test]
+    fn add_group_at_refuses_a_pixel_parent_and_records_nothing() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(pixel) = history.add_pixel_layer(&mut tree, "p", bounds(), None) else {
+            unreachable!("root exists");
+        };
+        let before = history.journal_descriptions().len();
+        assert!(
+            history
+                .add_group_at(&mut tree, "g", Some(pixel), 0, BlendMode::PassThrough)
+                .is_err()
+        );
+        assert_eq!(history.journal_descriptions().len(), before);
+        assert_eq!(tree.len(), 1);
     }
 
     #[test]

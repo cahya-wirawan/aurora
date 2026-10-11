@@ -42,6 +42,7 @@ pub mod document_tabs;
 pub mod gallery_panel;
 pub mod history_panel;
 pub mod layer_controls;
+pub mod layer_toolbar;
 pub mod layers_panel;
 pub mod panel;
 pub mod panel_group;
@@ -80,6 +81,11 @@ pub use layer_controls::{
     LayerControls, blend_mode_at, blend_mode_index, blend_mode_index_for, blend_mode_label,
     blend_mode_options, blend_mode_options_for, insert_layer_controls, layer_controls_contains,
     sync_layer_controls, sync_layer_readouts,
+};
+pub use layer_toolbar::{
+    DELETE_UNAVAILABLE, LAYER_TOOLBAR_ICON_SIZE, LAYER_TOOLBAR_LABEL, LayerAction, LayerToolbar,
+    insert_layer_toolbar, is_layer_toolbar_button, layer_toolbar_contains, layer_toolbar_height,
+    set_layer_toolbar_hover, sync_layer_toolbar,
 };
 #[cfg(test)]
 mod layers_panel_render;

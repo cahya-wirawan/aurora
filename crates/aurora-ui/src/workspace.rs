@@ -44,6 +44,7 @@ use taffy::style_helpers::TaffyZero as _;
 use taffy::{Dimension, Display, FlexDirection, Style};
 
 use crate::dock::{DockArrangement, DockPanel, DockPlacement};
+use crate::layer_toolbar::{LayerToolbar, insert_layer_toolbar};
 use crate::panel::{
     PanelHandle, PanelSizing, close_panel, insert_panel, panel_is_closed, panel_is_collapsed,
     set_panel_collapsed, set_panel_sizing,
@@ -98,6 +99,9 @@ pub struct Workspace {
     pub root: WidgetId,
     /// The left tools panel (0.160.0) — the root's first child.
     pub tools: ToolsPanel,
+    /// The Layers panel's bottom toolbar (0.196.0) — the last child of
+    /// the Layers panel's root, below the list.
+    pub layer_toolbar: LayerToolbar,
     /// The column holding [`Self::options_bar`] above
     /// [`Self::canvas_area`] (0.160.0); it is what grows and shrinks with
     /// the window.
@@ -415,6 +419,7 @@ fn rail_style(width: f32) -> Style {
 /// same "can't fail against ids of its own making" shape
 /// `aurora_widgets::widgets::new_tree` itself already has).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_workspace(scales: &Scales) -> Workspace {
     let (mut tree, root) = widgets::new_tree(Style {
         flex_direction: FlexDirection::Row,
@@ -493,6 +498,10 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Ok(panel) => panel,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
+    let layer_toolbar = match insert_layer_toolbar(&mut tree, layers, scales) {
+        Ok(toolbar) => toolbar,
+        Err(err) => unreachable!("the Layers panel was just inserted: {err:?}"),
+    };
     // 0.164.0: Properties and History share one slot as tabs; Layers
     // stays on its own (Photoshop keeps Layers separate and groups
     // History with other panels). Two non-empty titles and an in-range
@@ -533,6 +542,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         tree,
         root,
         tools,
+        layer_toolbar,
         canvas_column,
         options_bar,
         document_tabs,
@@ -1509,7 +1519,10 @@ mod tests {
         // hidden tab, takes no space.
         assert_eq!(
             (layers_bounds.height, properties_bounds.height),
-            (2 * row, row),
+            (
+                2 * row + crate::layer_toolbar::toolbar_px(&test_scales()),
+                row
+            ),
             "an empty content-sized panel is its title (or tab) plus one row"
         );
         assert_eq!(bar_bounds.height, row, "the tab row is one row");
@@ -1550,12 +1563,12 @@ mod tests {
         };
         assert_eq!(
             group_bounds.height,
-            800 - 2 * row,
+            800 - 2 * row - crate::layer_toolbar::toolbar_px(&test_scales()),
             "the group fills the rest"
         );
         assert_eq!(
             history_bounds.height,
-            800 - 3 * row,
+            800 - 3 * row - crate::layer_toolbar::toolbar_px(&test_scales()),
             "History under its tab row"
         );
         assert_eq!(
@@ -1836,7 +1849,8 @@ mod tests {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let row = aurora_widgets::widgets::row_height(&scales) as u32;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row;
+            let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row
+                + crate::layer_toolbar::toolbar_px(&scales);
             for (name, panel, body) in [
                 ("layers", layers, ws.layers.body),
                 ("properties", properties, ws.properties.body),
@@ -2164,7 +2178,7 @@ mod tests {
             let layers = bounds_of(&ws, ws.layers.root);
             assert_eq!(
                 layers.height,
-                (1 + rows) * row,
+                (1 + rows) * row + crate::layer_toolbar::toolbar_px(&scales),
                 "a title row plus {rows} body rows: {layers:?}"
             );
         }
@@ -2190,7 +2204,8 @@ mod tests {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&scales) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row;
+        let cap = (1 + crate::panel::content_panel_max_rows(&scales) as u32) * row
+            + crate::layer_toolbar::toolbar_px(&scales);
         assert!(layers.height <= cap, "capped at the row cap: {layers:?}");
         assert!(
             ws.tree
@@ -2219,7 +2234,7 @@ mod tests {
     }
 
     /// AC-4: a rail barely taller than every panel's floor (title, one
-    /// body row, one row per controls strip: 145 + 63 + 42 = 250 px since 0.195.0, whose Layers controls strip — blend, Opacity and Fill — is three rows above the list) holds
+    /// body row, one row per controls strip: 145 + 63 + 42 = 250 px since 0.195.0, 290 px since 0.196.0 (the 40 px Layers toolbar row), whose Layers controls strip — blend, Opacity and Fill — is three rows above the list) holds
     /// every part of every panel at one row or more, each inside its own
     /// panel — the Curves strip and the Layers controls strip included.
     /// The floor is what M9/M10/M11 of 0.161.0's mutation matrix remove.
@@ -2235,15 +2250,15 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         fill_panels(&mut ws, &scales, (true, false, true), 20);
-        ws.tree.compute_layout(1274.0, 254.0);
-        assert_stacked_inside_the_rail(&ws, "1274 x 254");
+        ws.tree.compute_layout(1274.0, 294.0);
+        assert_stacked_inside_the_rail(&ws, "1274 x 294");
         // 0.164.0: History is the other tab of Properties' slot; it is
         // checked with its own tab shown, below.
         let mut history_shown = build_workspace(&scales);
         fill_panels(&mut history_shown, &scales, (true, false, true), 20);
         super::show_history_tab(&mut history_shown);
-        history_shown.tree.compute_layout(1274.0, 254.0);
-        assert_stacked_inside_the_rail(&history_shown, "1274 x 254, History shown");
+        history_shown.tree.compute_layout(1274.0, 294.0);
+        assert_stacked_inside_the_rail(&history_shown, "1274 x 294, History shown");
         let (Some(rows), Some(panel)) = (
             history_shown.tree.bounds(history_shown.history.viewport),
             history_shown.tree.bounds(history_shown.history.root),

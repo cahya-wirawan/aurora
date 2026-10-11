@@ -1018,9 +1018,11 @@ mod tests {
         // grouped panel has no title slot of its own: an 837px body, 39
         // whole rows plus 18px of the 40th, whose centre (829.5px) is in.
         assert_eq!(
-            reachable, 40,
-            "837px of History body divided by 21px rows -- the rows that fit really work, \
-             and the other 163 are clipped until scrolled"
+            reachable, 38,
+            // 0.196.0: Layers' own floor grew by the 40 px toolbar row, so the
+            // History body is 797 px: 37 whole rows plus 20px of the 38th.
+            "797px of History body divided by 21px rows -- the rows that fit really work, \
+             and the other 165 are clipped until scrolled"
         );
     }
 

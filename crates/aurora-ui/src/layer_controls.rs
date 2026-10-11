@@ -750,8 +750,13 @@ mod tests {
         let children = ws.tree.children(ws.layers.root).unwrap_or_default();
         assert_eq!(
             children,
-            &[ws.layers.header, controls.root, ws.layers.viewport],
-            "title, controls, list"
+            &[
+                ws.layers.header,
+                controls.root,
+                ws.layers.viewport,
+                ws.layer_toolbar.root
+            ],
+            "title, controls, list, toolbar"
         );
         let labels: Vec<Option<String>> = [controls.opacity, controls.fill]
             .iter()

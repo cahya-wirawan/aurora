@@ -4610,6 +4610,9 @@ enum AccessibilityReaction {
     /// A `Click` on a tools-panel button (0.160.0): the app runs
     /// [`AppCommand::SelectTool`] for it ([`AccessibilityEffects::select_tool`]).
     SelectTool(aurora_ui::Tool),
+    /// A `Click` on a Layer actions toolbar button (0.196.0): the app
+    /// runs that action ([`AccessibilityEffects::layer_action`]).
+    LayerAction(aurora_ui::LayerAction),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -4708,6 +4711,8 @@ fn route_accessibility_action(
                 AccessibilityReaction::ToggleVisibility(layer_id)
             } else if let Some(tool) = tool_button_target(workspace, id) {
                 AccessibilityReaction::SelectTool(tool)
+            } else if let Some(action) = workspace.layer_toolbar.action_for(id) {
+                AccessibilityReaction::LayerAction(action)
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
@@ -4884,6 +4889,9 @@ struct AccessibilityEffects {
     /// A document tab position whose "×" an assistive technology clicked
     /// (0.175.0); the App closes that document (`App::close_document_tab`).
     close_tab: Option<usize>,
+    /// A Layer actions toolbar button an assistive technology clicked
+    /// (0.196.0); the App runs it (`App::run_layer_action`).
+    layer_action: Option<aurora_ui::LayerAction>,
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -5173,6 +5181,16 @@ fn apply_accessibility_action(
         AccessibilityReaction::ToolControl(outcome) => {
             apply_tool_control_accessibility(cx, outcome);
         }
+        AccessibilityReaction::LayerAction(action) => {
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                select_tool: None,
+                dialog: None,
+                close_tab: None,
+                layer_action: Some(action),
+            };
+        }
         AccessibilityReaction::SelectTool(tool) => {
             return AccessibilityEffects {
                 relayout: true,
@@ -5180,6 +5198,7 @@ fn apply_accessibility_action(
                 select_tool: Some(tool),
                 dialog: None,
                 close_tab: None,
+                layer_action: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -5209,6 +5228,7 @@ fn apply_accessibility_action(
                 select_tool: None,
                 dialog: None,
                 close_tab: Some(index),
+                layer_action: None,
             };
         }
         AccessibilityReaction::PanelStrip(panel) => {
@@ -5246,6 +5266,7 @@ fn apply_accessibility_action(
         select_tool: None,
         dialog: dialog_result,
         close_tab: None,
+        layer_action: None,
     }
 }
 
@@ -5510,6 +5531,10 @@ enum ActivatedCommand {
     /// only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewCurves`].
     NewCurvesLayer,
+    /// New Group (0.196.0): palette, the macOS `Layer` menu and the Layers
+    /// toolbar only, no shortcut. Run by [`perform_layer_command`] as
+    /// [`LayerCommand::NewGroup`].
+    NewGroup,
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
@@ -5668,6 +5693,7 @@ const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
 const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
+const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -5732,6 +5758,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
     ];
     commands.extend(
         PANEL_MOVE_COMMANDS
@@ -5917,6 +5944,9 @@ fn activate_command(
     if id == COMMAND_LAYER_NEW_CURVES {
         return Some(ActivatedCommand::NewCurvesLayer);
     }
+    if id == COMMAND_LAYER_NEW_GROUP {
+        return Some(ActivatedCommand::NewGroup);
+    }
     tracing::warn!(command = id, "unknown command activated");
     None
 }
@@ -5999,6 +6029,9 @@ enum WidgetOwner {
     /// The left tools panel's buttons (0.160.0): a click selects a tool
     /// through [`AppCommand::SelectTool`].
     ToolsPanel,
+    /// A button of the Layers panel's bottom toolbar (0.196.0): an
+    /// activation runs [`App::run_layer_action`].
+    LayerToolbar,
     /// A panel tab group's tab bar (0.164.0, `aurora_ui::PanelGroup`): a
     /// click, an arrow key or `Home`/`End` selects a tab in the widget
     /// layer, then [`follow_panel_tabs`] shows that tab's panel.
@@ -6434,6 +6467,9 @@ fn widget_owner(
     }
     if is_tool_button(tree, id) {
         return Some(WidgetOwner::ToolsPanel);
+    }
+    if aurora_ui::is_layer_toolbar_button(tree, id) {
+        return Some(WidgetOwner::LayerToolbar);
     }
     if aurora_ui::is_panel_group_tab(tree, id) {
         return Some(WidgetOwner::PanelTabs);
@@ -7456,8 +7492,19 @@ fn sync_layer_controls(
     active_layer: Option<aurora_doc::LayerId>,
     captured: Option<WidgetId>,
 ) -> bool {
+    let toolbar_changed = match aurora_ui::sync_layer_toolbar(
+        &mut workspace.tree,
+        &workspace.layer_toolbar,
+        delete_allowed(layers, active_layer),
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the Layers-panel toolbar");
+            false
+        }
+    };
     let Some(controls) = state.controls else {
-        return false;
+        return toolbar_changed;
     };
     match aurora_ui::sync_layer_controls(
         &mut workspace.tree,
@@ -7466,12 +7513,55 @@ fn sync_layer_controls(
         active_layer,
         captured,
     ) {
-        Ok(changed) => changed,
+        Ok(changed) => changed || toolbar_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the Layers-panel controls");
-            false
+            toolbar_changed
         }
     }
+}
+
+/// The Layer actions button a widget outcome activated, if it is an
+/// activation (a pointer release over it, or `Space`/`Enter`).
+fn layer_toolbar_click(
+    workspace: &aurora_ui::Workspace,
+    outcome: &PointerOutcome,
+) -> Option<aurora_ui::LayerAction> {
+    match outcome {
+        PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => {
+            workspace.layer_toolbar.action_for(*id)
+        }
+        _ => None,
+    }
+}
+
+/// The [`LayerCommand`] a Layer actions toolbar button runs (0.196.0).
+/// Link, Fx and Mask are permanent disabled placeholders and run nothing
+/// (a disabled button never activates; this is the second guard).
+fn layer_action_command(action: aurora_ui::LayerAction) -> Option<LayerCommand> {
+    use aurora_ui::LayerAction;
+    match action {
+        LayerAction::NewLayer => Some(LayerCommand::New),
+        LayerAction::Delete => Some(LayerCommand::Delete),
+        LayerAction::Adjustment => Some(LayerCommand::NewCurves),
+        LayerAction::Group => Some(LayerCommand::NewGroup),
+        LayerAction::Link | LayerAction::Fx | LayerAction::Mask => None,
+    }
+}
+
+/// Whether Delete Layer would be accepted for `active` (0.196.0): there is
+/// an active node, and a pixel layer would remain outside its subtree.
+/// The one rule [`delete_layer`] refuses by and the toolbar's Delete
+/// button is enabled by.
+fn delete_allowed(layers: &aurora_doc::LayerTree, active: Option<aurora_doc::LayerId>) -> bool {
+    let Some(target) = active.filter(|&id| layers.contains(id)) else {
+        return false;
+    };
+    let doomed = subtree_ids(layers, target);
+    layer_ids_in_order(layers).into_iter().any(|id| {
+        !doomed.contains(&id)
+            && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+    })
 }
 
 /// Mirrors `tool` into the left tools panel (0.160.0): its button on,
@@ -8781,6 +8871,7 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW, "New Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_GROUP, "New Group", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -22143,6 +22234,10 @@ enum LayerCommand {
     /// directly above the active node, placed exactly where
     /// [`Self::New`] places a pixel layer, made active.
     NewCurves,
+    /// New Group (0.196.0): an empty Pass Through group directly above the
+    /// active node, placed exactly where [`Self::New`] places a layer,
+    /// made active. See [`new_group`].
+    NewGroup,
 }
 
 /// Everything [`perform_layer_command`] touches, borrowed from `App` (or
@@ -22260,12 +22355,41 @@ fn layer_at_or_near(
 /// literally named "Layer n" — so deleting "Layer 2" of three and adding
 /// again gives "Layer 4", never a second "Layer 3".
 fn next_layer_name(layers: &aurora_doc::LayerTree) -> String {
+    next_numbered_name(layers, "Layer ")
+}
+
+/// `"<prefix>N"`, one past the largest `N` any existing layer is literally
+/// named `"<prefix>n"` (`prefix` carries its trailing space).
+fn next_numbered_name(layers: &aurora_doc::LayerTree, prefix: &str) -> String {
     let highest = layer_ids_in_order(layers)
         .into_iter()
-        .filter_map(|id| layers.name(id)?.strip_prefix("Layer ")?.parse::<u64>().ok())
+        .filter_map(|id| layers.name(id)?.strip_prefix(prefix)?.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    format!("Layer {}", highest.saturating_add(1))
+    format!("{prefix}{}", highest.saturating_add(1))
+}
+
+/// New Group (0.196.0): an empty group named "Group N" at
+/// [`new_layer_placement`], **Pass Through from its first moment**
+/// (Photoshop's default; `History::add_group_at` records the mode in the
+/// same undo step, so undo and redo carry it and no new journal op
+/// exists). Returns its id, or `None` (logged) if the tree refused.
+fn new_group(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_numbered_name(cx.layers, "Group ");
+    match cx.history.add_group_at(
+        cx.layers,
+        name,
+        placement.parent,
+        placement.index,
+        aurora_doc::BlendMode::PassThrough,
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(?err, "New Group was refused by the layer tree");
+            None
+        }
+    }
 }
 
 /// A new layer's `bounds`: the document's own extent (`canvas_size`,
@@ -22387,15 +22511,7 @@ fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand>
         return None;
     };
     let position = layer_position(cx.layers, target)?;
-    let doomed = subtree_ids(cx.layers, target);
-    let survivor = layer_ids_in_order(cx.layers).into_iter().any(|id| {
-        !doomed.contains(&id)
-            && matches!(
-                cx.layers.kind(id),
-                Some(aurora_doc::LayerKind::Pixel { .. })
-            )
-    });
-    if !survivor {
+    if !delete_allowed(cx.layers, Some(target)) {
         tracing::info!("Delete Layer refused: it would leave the document with no pixel layer");
         return None;
     }
@@ -22464,6 +22580,9 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
         }),
         LayerCommand::Delete => delete_layer(cx),
         LayerCommand::NewCurves => new_curves_layer(cx).map(|id| AppliedLayerCommand {
+            next_active: Some(id),
+        }),
+        LayerCommand::NewGroup => new_group(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
         }),
     };
@@ -24761,6 +24880,9 @@ impl App {
             },
             request,
         );
+        if let Some(action) = effects.layer_action {
+            self.run_layer_action(action);
+        }
         if let Some(tool) = effects.select_tool {
             self.select_tool_command(tool);
         }
@@ -24852,6 +24974,11 @@ impl App {
                         self.select_tool_command(tool);
                     }
                 }
+                WidgetOwner::LayerToolbar => {
+                    if let Some(action) = layer_toolbar_click(&self.workspace, &outcome) {
+                        self.run_layer_action(action);
+                    }
+                }
                 // A linked panel bar is never focused, so no key reaches it.
                 // A tab key has already shown its panel
                 // (`route_widget_key` -> `follow_panel_tabs`).
@@ -24932,6 +25059,7 @@ impl App {
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
+            Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -25100,6 +25228,14 @@ impl App {
         }
         self.push_accessibility();
         self.needs_redraw = true;
+    }
+
+    /// Runs one Layer actions toolbar button (0.196.0). Link, Fx and Mask
+    /// are permanent placeholders and run nothing.
+    fn run_layer_action(&mut self, action: aurora_ui::LayerAction) {
+        if let Some(command) = layer_action_command(action) {
+            self.run_layer_command(command);
+        }
     }
 
     /// Runs New Layer / Delete Layer ([`perform_layer_command`]) against
@@ -26814,6 +26950,7 @@ impl App {
             return;
         }
         self.update_gallery_hover(Some(position));
+        self.update_toolbar_hover(Some(position));
 
         if let Some(resize) = self.rail_resize {
             let new_width = resized_rail_width(resize, position.0);
@@ -27582,6 +27719,7 @@ impl App {
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
+            Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -27792,6 +27930,14 @@ impl App {
             {
                 self.select_tool_command(tool);
             }
+            if routed.owner == Some(WidgetOwner::LayerToolbar)
+                && let Some(action) = routed
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| layer_toolbar_click(&self.workspace, outcome))
+            {
+                self.run_layer_action(action);
+            }
             // Any path that dropped the slider's capture -- a press
             // elsewhere resetting a stale one, a modal's cancel -- ends
             // the drag's pending undo step here (`settle_pending_opacity`).
@@ -27818,6 +27964,29 @@ impl App {
             self.update_gallery_hover(self.pointer_position);
         }
         true
+    }
+
+    /// Tints the Layer actions toolbar button under the pointer
+    /// (0.196.0; `None`: the pointer left the window or something else
+    /// owns it — a modal, a canvas drag, a rail resize).
+    fn update_toolbar_hover(&mut self, position: Option<(f32, f32)>) {
+        let busy = self.dialog.is_some()
+            || self.command_palette.is_some()
+            || self.drag.is_some()
+            || self.rail_resize.is_some();
+        let hovered = position
+            .filter(|_| !busy)
+            .and_then(|point| self.workspace.tree.hit_test(point))
+            .filter(|&id| aurora_ui::is_layer_toolbar_button(&self.workspace.tree, id));
+        match aurora_ui::set_layer_toolbar_hover(
+            &mut self.workspace.tree,
+            &self.workspace.layer_toolbar,
+            hovered,
+        ) {
+            Ok(true) => self.needs_redraw = true,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(?err, "toolbar hover failed"),
+        }
     }
 
     /// Reports the pointer (`None`: it left the window) to the gallery's
@@ -29292,6 +29461,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.gallery_click.release_capture();
                 self.settle_layer_controls_drag();
                 self.update_gallery_hover(None);
+                self.update_toolbar_hover(None);
             }
             _ => {}
         }
@@ -31699,6 +31869,7 @@ mod tests {
                         select_tool: Some(tool),
                         dialog: None,
                         close_tab: None,
+                        layer_action: None,
                     },
                     "{tool:?}"
                 );
@@ -31893,6 +32064,7 @@ mod tests {
             select_tool: None,
             dialog: None,
             close_tab: None,
+            layer_action: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -36601,6 +36773,51 @@ mod tests {
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
+        let _ = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &crate::ToolSettings::default(),
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::FocusNext,
+        );
+        // 0.196.0: then the Layer actions toolbar's enabled buttons —
+        // Link, Fx and Mask are disabled and Delete starts disabled.
+        // The FocusNext above already landed on the first of them.
+        assert_eq!(
+            focus.focused(),
+            workspace
+                .layer_toolbar
+                .button_for(aurora_ui::LayerAction::Adjustment)
+        );
+        for action in [
+            aurora_ui::LayerAction::Group,
+            aurora_ui::LayerAction::NewLayer,
+        ] {
+            let _ = run_command(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut tool,
+                &crate::ToolSettings::default(),
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                None,
+                &mut undo_order,
+                AppCommand::FocusNext,
+            );
+            assert_eq!(
+                focus.focused(),
+                workspace.layer_toolbar.button_for(action),
+                "{action:?}"
+            );
+        }
         let _ = run_command(
             &mut workspace,
             &mut focus,
@@ -68583,7 +68800,9 @@ mod tests {
     #[test]
     fn a_press_outside_the_gallery_is_not_the_gallerys() {
         let mut rig = GalleryRig::open();
-        let layers = rig.centre(rig.workspace.layers.root);
+        // The list's viewport, not the panel's centre: the 0.196.0
+        // toolbar owns the panel's bottom row (and is its own owner).
+        let layers = rig.centre(rig.workspace.layers.viewport);
         let canvas = rig.centre(rig.workspace.canvas_area);
         assert_eq!(rig.pointer(PointerPhase::Down, layers), None);
         assert_eq!(rig.pointer(PointerPhase::Down, canvas), None);
@@ -70617,6 +70836,361 @@ mod tests {
                 assert!(rig.run(LayerCommand::NewCurves));
                 let second = only_new_root(&rig, &before);
                 assert_eq!(rig.layers.name(second), Some("Curves 2"));
+            }
+
+            // -- New Group and the Layer actions toolbar (0.196.0) ----------
+
+            fn step_labels(rig: &Rig) -> Vec<String> {
+                rig.undo_order
+                    .history_steps()
+                    .iter()
+                    .map(|step| step.label.to_owned())
+                    .collect()
+            }
+
+            #[test]
+            fn new_group_is_pass_through_above_the_active_layer_one_step_and_active() {
+                let (mut rig, [top, mid, bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewGroup));
+                let group = only_new_root(&rig, &before);
+                assert_eq!(rig.layers.roots(), &[top, group, mid, bottom]);
+                assert_eq!(rig.layers.name(group), Some("Group 1"));
+                assert!(
+                    rig.layers
+                        .kind(group)
+                        .is_some_and(aurora_doc::LayerKind::is_group)
+                );
+                assert_eq!(
+                    rig.layers.blend_mode(group),
+                    Some(aurora_doc::BlendMode::PassThrough)
+                );
+                assert_eq!(rig.layers.opacity(group), Some(1.0));
+                assert_eq!(rig.layers.visible(group), Some(true));
+                assert_eq!(rig.active, Some(group));
+                assert_eq!(
+                    step_labels(&rig).last().map(String::as_str),
+                    Some("Added group \"Group 1\"")
+                );
+                // A childless Pass Through group shows no blend label.
+                let row = row_of(&rig.layer_rows, group);
+                assert_eq!(
+                    aurora_ui::layer_row_description(&rig.layers, group),
+                    "Group"
+                );
+                let _ = row;
+                rig.assert_coherent();
+                // The controls follow: its blend dropdown lists Pass Through first.
+                let Some(controls) = rig.state.controls else {
+                    unreachable!("built");
+                };
+                assert!(matches!(
+                    rig.workspace.tree.payload(controls.blend),
+                    Some(aurora_widgets::widgets::WidgetKind::Dropdown(state))
+                        if state.selected() == Some(0)
+                ));
+                // One undo step; undo and redo keep the mode.
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(!rig.layers.contains(group));
+                assert_eq!(rig.layers.roots(), before.as_slice());
+                assert_eq!(rig.active, Some(mid));
+                assert!(rig.undo_redo(AppCommand::Redo));
+                assert_eq!(
+                    rig.layers.blend_mode(group),
+                    Some(aurora_doc::BlendMode::PassThrough)
+                );
+                assert_eq!(rig.layers.roots(), &[top, group, mid, bottom]);
+                rig.assert_coherent();
+            }
+
+            #[test]
+            fn new_group_goes_above_an_active_group_never_inside_and_numbers_on() {
+                let mut layers = LayerTree::new();
+                let bottom = match layers.add_pixel_layer("Background", SMALL, None) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let outer = match layers.add_group("Group 7", None) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let child = match layers.add_pixel_layer("Inside", SMALL, Some(outer)) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let mut rig = Rig::new(layers, Some(outer));
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewGroup));
+                let group = only_new_root(&rig, &before);
+                assert_eq!(
+                    rig.layers.roots(),
+                    &[group, outer, bottom],
+                    "above, not inside"
+                );
+                assert_eq!(rig.layers.children(outer), Some(&[child][..]));
+                assert_eq!(
+                    rig.layers.name(group),
+                    Some("Group 8"),
+                    "one past the highest"
+                );
+                assert!(rig.run(LayerCommand::NewGroup));
+                let names: Vec<_> = rig
+                    .layers
+                    .roots()
+                    .iter()
+                    .filter_map(|id| rig.layers.name(*id))
+                    .collect();
+                assert_eq!(names, ["Group 9", "Group 8", "Group 7", "Background"]);
+                // Nested: with a layer inside the group active, the new group
+                // is its sibling inside that group.
+                rig.active = Some(child);
+                assert!(rig.run(LayerCommand::NewGroup));
+                assert_eq!(rig.layers.children(outer).map(<[_]>::len), Some(2));
+                rig.assert_coherent();
+            }
+
+            fn click_toolbar(
+                rig: &mut Rig,
+                action: aurora_ui::LayerAction,
+            ) -> Option<aurora_ui::LayerAction> {
+                let Some(id) = rig.workspace.layer_toolbar.button_for(action) else {
+                    unreachable!("built");
+                };
+                let Some(b) = rig.workspace.tree.bounds(id) else {
+                    unreachable!("laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let at = (
+                    b.x as f32 + b.width as f32 / 2.0,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                let mut hit = crate::NoTextHit;
+                let mut result = None;
+                for phase in [
+                    aurora_widgets::PointerPhase::Down,
+                    aurora_widgets::PointerPhase::Up,
+                ] {
+                    let routed = crate::route_widget_pointer(
+                        &mut rig.workspace,
+                        &mut rig.focus,
+                        &mut None,
+                        rig.state.controls.as_ref(),
+                        None,
+                        &mut rig.click,
+                        &rig.scales,
+                        false,
+                        phase,
+                        at,
+                        Modifiers::default(),
+                        &mut hit,
+                    );
+                    if phase == aurora_widgets::PointerPhase::Down && !action.is_placeholder() {
+                        assert_eq!(routed.owner, Some(crate::WidgetOwner::LayerToolbar));
+                    }
+                    if let Some(outcome) = routed.outcome.as_ref() {
+                        result = result.or(crate::layer_toolbar_click(&rig.workspace, outcome));
+                    }
+                }
+                result
+            }
+
+            /// What `App::run_layer_action` does for `action`, on the rig.
+            fn run_action(rig: &mut Rig, action: aurora_ui::LayerAction) -> bool {
+                crate::layer_action_command(action).is_some_and(|command| rig.run(command))
+            }
+
+            #[test]
+            fn every_enabled_toolbar_button_click_yields_its_action_and_one_undo_step() {
+                use aurora_ui::LayerAction;
+                for (action, label_prefix) in [
+                    (LayerAction::NewLayer, "Added layer \"Layer 3\""),
+                    (LayerAction::Adjustment, "Added layer \"Curves 1\""),
+                    (LayerAction::Group, "Added group \"Group 1\""),
+                    (LayerAction::Delete, "Removed layer #"),
+                ] {
+                    let (mut rig, [_, mid, _]) = Rig::three();
+                    let _ = sync_layer_controls(
+                        &mut rig.workspace,
+                        &rig.state,
+                        &rig.layers,
+                        rig.active,
+                        None,
+                    );
+                    assert_eq!(click_toolbar(&mut rig, action), Some(action), "{action:?}");
+                    let count = rig.layers.len();
+                    let steps = step_labels(&rig).len();
+                    assert!(run_action(&mut rig, action), "{action:?}");
+                    assert_eq!(step_labels(&rig).len(), steps + 1, "{action:?}: one step");
+                    assert!(
+                        step_labels(&rig)
+                            .last()
+                            .is_some_and(|l| l.starts_with(label_prefix)),
+                        "{action:?}: {:?}",
+                        step_labels(&rig)
+                    );
+                    if action == LayerAction::Delete {
+                        assert_eq!(rig.layers.len(), count - 1);
+                        assert_ne!(rig.active, Some(mid));
+                        assert!(rig.active.is_some_and(|id| rig.layers.contains(id)));
+                    } else {
+                        assert_eq!(rig.layers.len(), count + 1);
+                        assert!(rig.active.is_some_and(|id| id != mid));
+                    }
+                    assert!(rig.undo_redo(AppCommand::Undo), "{action:?}");
+                    assert_eq!(rig.layers.len(), count, "{action:?}: undone");
+                    rig.assert_coherent();
+                }
+            }
+
+            #[test]
+            fn disabled_placeholders_do_nothing_on_click_key_or_assistive_click() {
+                use aurora_ui::LayerAction;
+                let (mut rig, _) = Rig::three();
+                let _ = sync_layer_controls(
+                    &mut rig.workspace,
+                    &rig.state,
+                    &rig.layers,
+                    rig.active,
+                    None,
+                );
+                let steps = step_labels(&rig).len();
+                let count = rig.layers.len();
+                for action in [LayerAction::Link, LayerAction::Fx, LayerAction::Mask] {
+                    assert_eq!(click_toolbar(&mut rig, action), None, "{action:?} click");
+                    let Some(id) = rig.workspace.layer_toolbar.button_for(action) else {
+                        unreachable!("built");
+                    };
+                    // Keyboard: a disabled button cannot take focus.
+                    let _ = rig.focus.focus(&mut rig.workspace.tree, id);
+                    assert_ne!(rig.focus.focused(), Some(id), "{action:?} focus");
+                    // Assistive technology: the declared-action gate refuses.
+                    let request = accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: id,
+                        data: None,
+                    };
+                    let reaction = crate::route_accessibility_action(
+                        &mut rig.workspace,
+                        &mut rig.focus,
+                        None,
+                        &rig.layer_rows,
+                        rig.state.controls.as_ref(),
+                        None,
+                        &request,
+                    );
+                    assert!(
+                        matches!(reaction, crate::AccessibilityReaction::Rejected(_)),
+                        "{action:?}: {reaction:?}"
+                    );
+                    assert!(!run_action(&mut rig, action));
+                }
+                assert_eq!(rig.layers.len(), count);
+                assert_eq!(step_labels(&rig).len(), steps);
+            }
+
+            #[test]
+            fn an_assistive_click_and_enter_on_an_enabled_button_reach_its_action() {
+                use aurora_ui::LayerAction;
+                let (mut rig, _) = Rig::three();
+                let Some(id) = rig.workspace.layer_toolbar.button_for(LayerAction::Group) else {
+                    unreachable!("built");
+                };
+                let request = accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                    target_node: id,
+                    data: None,
+                };
+                let reaction = crate::route_accessibility_action(
+                    &mut rig.workspace,
+                    &mut rig.focus,
+                    None,
+                    &rig.layer_rows,
+                    rig.state.controls.as_ref(),
+                    None,
+                    &request,
+                );
+                assert!(
+                    matches!(
+                        reaction,
+                        crate::AccessibilityReaction::LayerAction(LayerAction::Group)
+                    ),
+                    "{reaction:?}"
+                );
+                // Keyboard: focus it, press Enter.
+                assert!(rig.focus.focus(&mut rig.workspace.tree, id).is_ok());
+                let outcome = aurora_widgets::handle_widget_key(
+                    &mut rig.workspace.tree,
+                    &mut rig.focus,
+                    aurora_widgets::shortcut::NamedKey::Enter,
+                    Modifiers::default(),
+                );
+                let clicked = match outcome {
+                    Ok(KeyOutcome::Handled(outcome)) => {
+                        crate::layer_toolbar_click(&rig.workspace, &outcome)
+                    }
+                    _ => None,
+                };
+                assert_eq!(clicked, Some(LayerAction::Group));
+            }
+
+            #[test]
+            fn delete_is_disabled_for_the_last_pixel_layer_and_follows_the_document() {
+                let mut layers = LayerTree::new();
+                let only = match layers.add_pixel_layer("Only", SMALL, None) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let mut rig = Rig::new(layers, Some(only));
+                let delete = |rig: &Rig| {
+                    rig.workspace
+                        .layer_toolbar
+                        .button_for(aurora_ui::LayerAction::Delete)
+                        .and_then(|id| match rig.workspace.tree.payload(id) {
+                            Some(aurora_widgets::widgets::WidgetKind::Button(s)) => {
+                                Some(s.disabled)
+                            }
+                            _ => None,
+                        })
+                };
+                assert!(!crate::delete_allowed(&rig.layers, rig.active));
+                assert_eq!(
+                    delete(&rig),
+                    Some(true),
+                    "disabled for the last pixel layer"
+                );
+                // The command agrees: it refuses and records nothing.
+                assert!(!rig.run(LayerCommand::Delete));
+                // A second layer makes it available.
+                assert!(rig.run(LayerCommand::New));
+                assert!(crate::delete_allowed(&rig.layers, rig.active));
+                assert_eq!(delete(&rig), Some(false));
+                // A group holding the only other pixel layers is not deletable.
+                rig.active = None;
+                let _ =
+                    sync_layer_controls(&mut rig.workspace, &rig.state, &rig.layers, None, None);
+                assert_eq!(delete(&rig), Some(true), "no active node");
+            }
+
+            #[test]
+            fn the_toolbar_survives_a_command_and_focus_stays_on_its_button() {
+                use aurora_ui::LayerAction;
+                let (mut rig, _) = Rig::three();
+                let ids: Vec<_> = rig
+                    .workspace
+                    .layer_toolbar
+                    .buttons
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .collect();
+                let Some(group) = rig.workspace.layer_toolbar.button_for(LayerAction::Group) else {
+                    unreachable!("built");
+                };
+                assert!(rig.focus.focus(&mut rig.workspace.tree, group).is_ok());
+                assert!(rig.run(LayerCommand::NewGroup));
+                assert!(ids.iter().all(|id| rig.workspace.tree.contains(*id)));
+                assert_eq!(rig.focus.focused(), Some(group), "focus is not lost");
             }
 
             #[test]
