@@ -33,6 +33,13 @@ pub(super) struct ReadEffects {
     /// Some value was out of range and clamped, or instances past the
     /// cap were dropped.
     pub clamped: bool,
+    /// Shown outer glows with a gradient colour (`Grad`), which are not
+    /// stored (0.191.0): the positional `.aur` format has no place for a
+    /// gradient, and drawing one in a single colour would be wrong.
+    pub glow_gradients: u32,
+    /// Shown outer glows with a contour other than Linear, stored and
+    /// drawn with a Linear one (0.191.0).
+    pub glow_contours: u32,
 }
 
 /// Why a layer's effects were not read.
@@ -231,6 +238,7 @@ fn count_on(
 }
 
 /// Maps a parsed effects descriptor. See the module docs.
+#[allow(clippy::too_many_lines)]
 pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffects, Unreadable> {
     let mut ctx = Ctx { clamped: false };
     let mut fx = LayerEffects {
@@ -294,7 +302,19 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             color: ctx.color(e)?,
         });
     }
+    let mut glow_gradients = 0u32;
+    let mut glow_contours = 0u32;
     for e in instances(d, b"OrGl", None, &mut ctx)? {
+        let shown = fx.enabled && gate(e)?.on();
+        if e.get(b"Grad").is_some() {
+            // A gradient glow has no `Clr `; keeping it as a solid glow of
+            // the default colour would draw the wrong thing.
+            glow_gradients += u32::from(shown);
+            continue;
+        }
+        if shown && !linear_contour(e)? {
+            glow_contours += 1;
+        }
         let precise = match e.get(b"GlwT").map(|v| v.enum_value().ok_or(Unreadable)) {
             None | Some(Ok(b"SfBL")) => false,
             Some(Ok(b"PrBL")) => true,
@@ -325,5 +345,7 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
     Ok(ReadEffects {
         effects: fx,
         clamped: ctx.clamped,
+        glow_gradients,
+        glow_contours,
     })
 }

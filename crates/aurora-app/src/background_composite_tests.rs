@@ -1469,6 +1469,69 @@ fn the_workers_composite_equals_the_synchronous_one_with_strokes() {
     worker.shutdown();
 }
 
+/// 0.191.0: a layer with two outer glows (Screen and Normal, one with a
+/// spread) and a drop shadow, across tile boundaries, composites the same on
+/// the worker's pool as synchronously, bit for bit, and a glow reaches a
+/// tile the layer never painted.
+#[test]
+fn the_workers_composite_equals_the_synchronous_one_with_outer_glows() {
+    let (_d, mut store) = store_with_budget(256);
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 512, 256),
+        &|x, y| {
+            if (200..250).contains(&x) && (90..150).contains(&y) {
+                opaque(y, x)
+            } else {
+                [0.0; 4]
+            }
+        },
+    );
+    let glow = |size, spread, rgb: [f32; 3], mode| aurora_core::effects::OuterGlow {
+        size,
+        spread,
+        color: aurora_core::effects::EffectColor {
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+        },
+        blend_mode: mode,
+        opacity: 0.8,
+        ..aurora_core::effects::OuterGlow::default()
+    };
+    let fx = aurora_core::LayerEffects {
+        outer_glows: vec![
+            glow(
+                60.0,
+                0.0,
+                [1.0, 0.8, 0.2],
+                aurora_core::effects::EffectBlendMode::Screen,
+            ),
+            glow(
+                20.0,
+                0.5,
+                [0.0, 0.5, 1.0],
+                aurora_core::effects::EffectBlendMode::Normal,
+            ),
+        ],
+        drop_shadows: vec![aurora_core::effects::DropShadow::default()],
+        ..aurora_core::LayerEffects::default()
+    };
+    ok(layers.set_effects(id, Some(fx)));
+    let tiles = grid((512, 256));
+    let mut worker = CompositeWorker::with_threads(noop_waker(), PARALLEL_THREADS);
+    let mut cache = CompositeCache::default();
+    assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+    let _ = worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT);
+    let have = read_composite(&mut store, &tiles);
+    let want = sync_composite(&layers, &mut store, &tiles);
+    assert_same(&have, &want, "outer glows, worker against synchronous");
+    worker.shutdown();
+}
+
 #[test]
 fn composite_threads_leaves_a_core_and_is_at_least_one() {
     let threads = background_composite::composite_threads();

@@ -139,7 +139,7 @@ pub fn stroke_coverage(
 
 /// For every pixel, the squared distance to the nearest site and that
 /// site's index (`NO_SITE` when none). Ties between equally near sites
-/// resolve by position only (the rule of [`envelope`]).
+/// resolve by position only (the rule of the parabola envelope).
 fn nearest_sites(
     alphas: &[f32],
     side: usize,
