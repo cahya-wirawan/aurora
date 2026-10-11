@@ -26,7 +26,125 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.189.0): opening a PSD is about twice as fast
+**Latest (2026-10-11, 0.190.0): layer effects, round E4 — Stroke is drawn
+(solid colour, on pixel layers, on the CPU).**
+- **What is drawn.** Each shown `FrFX` / `frameFXMulti` stroke whose fill is
+  solid colour (`PntT` `SClr`), in list order, on a pixel layer:
+  - *Outside* covers the pixels `size` beyond the layer's edge, *Inside*
+    `size` within it, *Center* half of `size` each way. Where: an inside
+    stroke is a **topmost interior effect** (over the colour overlays, clipped
+    by the layer's shape, so Fill 0 hides the content and not the stroke); an
+    outside stroke is folded after the content is laid down and is not clipped
+    to it (it can land on tiles the layer never painted).
+  - Its own mode (all 27) and `Opct`; layer opacity fades it (outside: like a
+    shadow, so inside the DS-2 "unit" when the layer has shadows), **Fill does
+    not**. Colour is the stored RGB. The style scale `Scl ` is not applied
+    (measured for shadows, not for strokes).
+  - **Edge distance** (`aurora_filters::stroke_coverage`, new `stroke.rs`): an
+    exact squared Euclidean distance transform in integers (lower envelope of
+    parabolas with exact fraction comparisons, nearest-site tracking), then a
+    sub-pixel correction from the nearest site's alpha: a pixel with alpha `a`
+    has its edge `a - 0.5` px beyond its centre, so `distance = |p - q| -
+    (a - 0.5)`; coverage = `clamp(width + 0.5 - distance, 0, 1)`; the outside
+    plane is multiplied by `1 - alpha` (an anti-aliased edge pixel is stroked
+    only where the shape is not). Window-independent bit for bit (tie rules
+    depend on relative order only), so tiles are seamless; tested against a
+    brute-force transform and a cropped window.
+  - **Where it reads**: the same bounded apron window as the shadow
+    (`read_shape_window`, the E3 reader factored out, ≤ 25 cells); `Stroke::geometry`
+    gives the apron `ceil(reach) + 1`, capped at `MAX_SHADOW_APRON`
+    (unreachable for a valid file: sizes are ≤ 250; `Note::StrokeSizeCapped`
+    and a test cover a hand-built oversize stroke). Masks: the shape is
+    alpha × mask coverage, as for the shadow, so a stroke follows the masked
+    shape (Photoshop's "layer mask hides effects" flag is not modelled; not
+    compared with Photoshop).
+  - **Caches and invalidation**: coverage planes go into the E3 shared
+    cache (`ShadowCacheKey` gained a `kind` byte; the stroke's size and side
+    and the window's content versions are in the key; colour, opacity, mode,
+    Fill and layer opacity are not, so those edits hit; an all-zero plane is
+    cached as an empty vector). `effect_reach_rects` grows dab and pixel-undo
+    rects by a stroke's apron (no offset). `layer_renders_effects` now includes
+    a shown solid stroke, so such a layer refuses the GPU path; a layer whose
+    only stroke is gradient/pattern keeps it.
+  - **Not drawn, reported**: gradient and pattern strokes (kept with the layer;
+    the open note now reads "N gradient, pattern or other non-solid stroke
+    effect(s) isn't shown"), strokes on groups (E9), the "clipped overlays"
+    note now also counts strokes. The PSD-save item ("N layers' effects
+    aren't saved to .psd yet") is unchanged and covers them.
+- **Reference.** `effects/stroke-effects.psd` has Photoshop strokes on raster
+  (pixel) layers, and Photoshop's merged image is the reference. **The stroke
+  pixels of its "Raster Rectangle" and "Raster Ellipse" (3 px solid green,
+  Outside, over semi-transparent art, including the partly covered edge pixel)
+  match Photoshop's merged image within one level**
+  (`outside_stroke_pixels_match_photoshops_merged_image`). Per layer (mean
+  per channel over the layer's box + 6 px, before → after): Raster Rectangle
+  113.3/0.0/113.3 → 0.15/20.3/20.5; Raster Ellipse 105.9/0.0/105.9 →
+  0.33/14.6/15.0; Raster OutsetFrame 90.2/0.0/90.2 → 0.12/10.0/10.1; Raster
+  InsetFrame 25.7/25.7/0.0 → **0/0/0 (exact)**; Raster CenterFrame
+  77.7/25.5/52.2 → 9.75/0.37/9.38. The remaining error on the rasters is
+  their interior (Photoshop's colour there differs: a gradient/other effect
+  Aurora does not draw), not the stroke. Whole-file errors (max / mean per
+  channel, before → after): `effects/stroke-effect-transparent-shape.psd`
+  153 / 34.66, 52.00, 34.66 → **0 / 0 / 0 / 0**; `effects/shape-fx2.psd`
+  57.82, 63.18, 69.87 → 12.42, 41.88, 69.87; `layer_effects.psd` 10.32,
+  8.55, 9.82 → 8.94, 7.14, 8.42; `effects/double-stroke-effects.psd`
+  12.20, 37.69, 37.19 → 12.20, 13.20, 36.40; `layer_comps.psd` 4.46, 9.84,
+  15.73 → 3.90, 9.35, 15.63; `advanced-blending.psd` 93.87, 91.46, 89.36 →
+  93.39, 90.98, 88.88. **Worse**: `effects/stroke-effects.psd` 58.24, 23.20,
+  44.64 → 37.90, 24.94, 27.30 (red and blue better, green worse: the shape
+  layers' strokes follow their *pixel* alpha, which here is a gradient fade,
+  not the vector shape Photoshop strokes; gradient and pattern strokes are
+  not drawn); `effects/stroke-composite.psd` blue 26.10 → 27.21 (its strokes
+  are on clipped layers, shown unclipped); `masks.psd` 0.2007, 0.1571,
+  0.1460 → 0.2256, 0.1821, 0.1710 and `masks.psb` likewise (one 2 px, 10 %
+  black Outside stroke on 'Rectangle 2' is drawn at 10 % but Photoshop's
+  image there is darker by only ~2 levels over the shadow: **unexplained**,
+  not hand-tuned away). Nyepi has no strokes (only drop shadows and colour
+  overlays), so it is unchanged. Not measured: Photoshop's own treatment of
+  a stroke over a semi-transparent edge beyond the one fixture, Center and
+  Inside against a *raster* reference beyond the exact Inside frame.
+- **Tests (new).** Filter: window independence, brute-force transform,
+  smooth edge, degenerate inputs. Core: geometry by position, capping,
+  solid-only. App: outside/inside/centre formulas on a square, mode and
+  opacity, layer opacity fades and Fill does not (outside and inside), two
+  strokes in both orders, seam (bitwise against one big window, two layer
+  origins), never-painted tile, bounded reads and the cap, invalidation
+  (dab, pixel undo), cache hit/miss, GPU refusal, the mask case (weak: an
+  unpainted mask hides nothing), the Photoshop pixel reference (skips
+  without the file), worker equals synchronous with three strokes. io: the
+  notes and the PSD-save item for gradient and pattern strokes.
+- **Gate.** `AURORA_REQUIRE_GPU=1 cargo test --workspace --no-fail-fast`:
+  3,537 passed, 0 failed, 72 ignored (3,511 before). fmt, layering, style,
+  `cargo check --locked`, clippy `-D warnings`, rustdoc `-D warnings`, `cargo
+  deny`, contrast, and Windows (`x86_64-pc-windows-gnu`) and macOS
+  (`x86_64-apple-darwin`) clippy on aurora-app/core/io/filters are clean. The
+  corpus-free worktree run (detached `HEAD` plus the changed files; no corpus
+  or images) passed 3,537, failed 0, ignored 72. No timing-sensitive test was
+  added, so no 12-`yes` stress run.
+- **Mutations** (each really run, backed up and restored with sha256 checked;
+  `cargo test -p aurora-app -p aurora-core -p aurora-filters --lib`): inside
+  and outside swapped — killed (11); apron too small by one — killed by the
+  core geometry tests, and, **after review of the first run found the app tests
+  survived it** (the seam shape's edges were too far from the tile boundary),
+  by a new seam fixture whose edge sits exactly one stroke width from the
+  boundary; Fill applied to the outside stroke — killed (3); Fill applied to
+  the inside stroke — killed (3); blend mode ignored — killed (3); dirty-rect
+  inflation removed for strokes — killed (invalidation test); GPU refusal
+  removed — killed (14; the refusal test among them); outside stroke on a blank
+  tile ignored — killed (never-painted-tile test); cache key without the
+  stroke size — killed (two-strokes test); layer opacity not applied to the
+  outside stroke — killed. Disclosed: the geometry's `+ 1` in the apron is
+  conservative (a source's reach is strictly under `width + alpha`), so
+  removing only the `+ 1` is an equivalent mutant.
+- **Known weaknesses.** The mask test is weak (an unpainted mask hides
+  nothing); a shape layer is stroked along its pixel alpha, not its vector
+  shape; Center and Inside were compared with a raster reference only on the
+  one exact Inside frame; the `masks.psd` residual above is unexplained;
+  gradient/pattern strokes, strokes on groups, clipped layers' clipping and
+  `infx` are not modelled; the style scale `Scl ` is not applied to strokes
+  (unmeasured).
+
+**Previously (2026-10-11, 0.189.0): opening a PSD is about twice as fast
 (round R5 of the large-template performance plan, open time).**
 - **Measured first** (release, Nyepi, 4,021 tiles, 8 hardware threads, a box
   with load average ~4 from other users, so absolute numbers are noisy).
@@ -1318,7 +1436,8 @@ parser, model and storage; no visual change.** The effects plan (planner,
 2026-10-10) is ten rounds: **E1** parser/model/storage (this one), **E2**
 Fill applied everywhere plus Color Overlay (all 27 modes; the GPU refusal is
 wired in), **E3** Drop Shadow (apron reader, offset, spread, blur,
-knockout, global light, dirty-rect inflation), **E4** Stroke, **E5** Outer
+knockout, global light, dirty-rect inflation), **E4** Stroke (done in
+0.190.0), **E5** Outer
 Glow, **E6** inner effects and `infx`, **E7** writing `lfx2` back, **E8**
 effects on the GPU, **E9** effects on groups, **E10** an effects UI (needs
 Cahya). **Decision: the PSD-write rounds R4 (Curves `curv` write) and R5
@@ -33403,6 +33522,9 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**First follow-up from 0.190.0 (open, unexplained):** on `corpora/psd/reference/psd-tools-fixtures/masks.psd` layer "Rectangle 2" (a solid-colour shape layer with both a vector mask and a user mask) a 2 px, 10 % black Outside stroke darkens Aurora's merged image by ~22 levels where Photoshop's darkens by ~2. The stroke formula is consistent; suspects are (a) a drop shadow whose silhouette should include the outside stroke, (b) Photoshop not applying the stroke through the mask ("layer mask hides effects" semantics) or stroking the vector shape instead of pixel alpha, (c) the stack above or below. Diagnose by comparing stroke-on/off and shadow-on/off against Photoshop's merged image at one ring pixel before relying on masked strokes.
+
 
 **Addendum 2026-10-10 (0.179.0) — real Pass Through groups.**
 

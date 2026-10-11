@@ -384,6 +384,57 @@ impl Default for Stroke {
     }
 }
 
+/// A stroke resolved to pixels for drawing (0.190.0).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeGeometry {
+    /// How far the stroke reaches outside the layer's edge, pixels.
+    pub outside: f32,
+    /// How far it reaches inside the edge, pixels.
+    pub inside: f32,
+    /// The window margin a tile needs to draw it exactly: the larger
+    /// reach, rounded up, plus one pixel for the edge's anti-aliasing,
+    /// never above [`MAX_SHADOW_APRON`].
+    pub apron: u32,
+    /// The size had to be reduced to fit [`MAX_SHADOW_APRON`].
+    pub capped: bool,
+}
+
+impl Stroke {
+    /// This stroke in pixels. Outside reaches `size` past the edge, Inside
+    /// `size` within it, Center half of `size` each way. The style's scale
+    /// (`Scl `) is not applied, as for a drop shadow (measured there; not
+    /// measured for strokes). With `size` held to [`MAX_EFFECT_SIZE`] the
+    /// cap is a bound that holds whatever the limits, not one a valid file
+    /// reaches.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn geometry(&self) -> StrokeGeometry {
+        let size = if self.size.is_finite() {
+            self.size.max(0.0)
+        } else {
+            0.0
+        };
+        let (mut outside, mut inside) = match self.position {
+            StrokePosition::Outside => (size, 0.0),
+            StrokePosition::Inside => (0.0, size),
+            StrokePosition::Center => (size / 2.0, size / 2.0),
+        };
+        let room = (MAX_SHADOW_APRON - 1) as f32;
+        let capped = outside > room || inside > room;
+        if capped {
+            outside = outside.min(room);
+            inside = inside.min(room);
+        }
+        let reach = outside.max(inside).ceil() as u32;
+        StrokeGeometry {
+            outside,
+            inside,
+            apron: (reach + 1).min(MAX_SHADOW_APRON),
+            capped,
+        }
+    }
+}
+
 /// An outer glow (`OrGl`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OuterGlow {
@@ -581,6 +632,23 @@ impl LayerEffects {
         self.strokes.iter().filter(|e| self.shows(e.gate)).count()
     }
 
+    /// The solid-colour strokes Photoshop would draw and Aurora draws
+    /// (0.190.0).
+    #[must_use]
+    pub fn shown_color_strokes(&self) -> usize {
+        self.strokes
+            .iter()
+            .filter(|e| self.shows(e.gate) && e.fill == StrokeFill::Color)
+            .count()
+    }
+
+    /// The gradient and pattern strokes Photoshop would draw and Aurora
+    /// does not (0.190.0).
+    #[must_use]
+    pub fn shown_unrendered_strokes(&self) -> usize {
+        self.shown_strokes() - self.shown_color_strokes()
+    }
+
     /// The outer glows Photoshop would draw.
     #[must_use]
     pub fn shown_outer_glows(&self) -> usize {
@@ -686,5 +754,71 @@ mod tests {
         let bytes = postcard::to_allocvec(&fx).unwrap_or_default();
         let back: Result<LayerEffects, _> = postcard::from_bytes(&bytes);
         assert_eq!(back.ok(), Some(fx));
+    }
+
+    #[test]
+    fn stroke_geometry_reaches_by_position() {
+        let mut s = Stroke {
+            size: 6.0,
+            ..Stroke::default()
+        };
+        let g = s.geometry();
+        assert_eq!(
+            (g.outside, g.inside, g.apron, g.capped),
+            (6.0, 0.0, 7, false)
+        );
+        s.position = StrokePosition::Inside;
+        let g = s.geometry();
+        assert_eq!((g.outside, g.inside, g.apron), (0.0, 6.0, 7));
+        s.position = StrokePosition::Center;
+        let g = s.geometry();
+        assert_eq!((g.outside, g.inside, g.apron), (3.0, 3.0, 4));
+        // A fractional size rounds the apron up.
+        s.size = 2.5;
+        assert_eq!(s.geometry().apron, 3);
+    }
+
+    #[test]
+    fn stroke_geometry_is_capped_and_total() {
+        let mut s = Stroke {
+            size: MAX_EFFECT_SIZE,
+            ..Stroke::default()
+        };
+        let g = s.geometry();
+        assert!(
+            !g.capped && g.apron <= MAX_SHADOW_APRON,
+            "a valid size is never capped"
+        );
+        // Not reachable from a file (E1 clamps), but total all the same.
+        s.size = 10_000.0;
+        let g = s.geometry();
+        assert!(g.capped && g.apron == MAX_SHADOW_APRON);
+        assert!(g.outside < MAX_SHADOW_APRON as f32);
+        for bad in [f32::NAN, f32::INFINITY, -4.0] {
+            s.size = bad;
+            let g = s.geometry();
+            assert!(g.outside <= (MAX_SHADOW_APRON as f32), "{bad}");
+            assert!(g.apron <= MAX_SHADOW_APRON);
+        }
+    }
+
+    #[test]
+    fn only_solid_colour_strokes_are_drawn() {
+        let mut fx = LayerEffects::default();
+        fx.strokes.push(Stroke::default());
+        fx.strokes.push(Stroke {
+            fill: StrokeFill::Gradient,
+            ..Stroke::default()
+        });
+        fx.strokes.push(Stroke {
+            fill: StrokeFill::Pattern,
+            ..Stroke::default()
+        });
+        let mut off = Stroke::default();
+        off.gate.enabled = false;
+        fx.strokes.push(off);
+        assert_eq!(fx.shown_strokes(), 3);
+        assert_eq!(fx.shown_color_strokes(), 1);
+        assert_eq!(fx.shown_unrendered_strokes(), 2);
     }
 }

@@ -862,7 +862,7 @@ fn per_kind_effect_notes_on_open() {
             V::List(vec![shadow(true, true, 1.0), shadow(true, true, 2.0)]),
         ),
         (b"SoFi", V::Obj(vec![])),
-        (b"FrFX", V::Obj(vec![])),
+        (b"FrFX", V::Obj(vec![(b"PntT", V::Enum(b"FrFl", b"GrFl"))])),
         (b"OrGl", V::Obj(vec![])),
         (b"ebbl", V::Obj(vec![])),
         (b"IrGl", V::Obj(vec![(b"enab", V::Bool(false))])),
@@ -885,7 +885,7 @@ fn per_kind_effect_notes_on_open() {
     );
     let items = doc.report.items.join("\n");
     for needle in [
-        "1 stroke effect isn't shown yet",
+        "1 gradient, pattern or other non-solid stroke effect isn't shown",
         "1 outer glow isn't shown yet",
         "1 other effect (inner shadow, inner glow, bevel",
         "1 layer with layer effects (shadows, strokes, glows): the effects aren't shown.",
@@ -1116,7 +1116,9 @@ fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
     );
     let items = doc.report.items.join("\n");
     assert!(
-        items.contains("1 colour overlay or drop shadow on clipped layers is drawn unclipped"),
+        items.contains(
+            "1 colour overlay, drop shadow or stroke on clipped layers is drawn unclipped"
+        ),
         "only the clipped layer's: {items}"
     );
     assert!(!items.contains("isn't shown yet"), "{items}");
@@ -1196,4 +1198,96 @@ fn uglg_uses_resource_1037_not_local_angle() {
     let shadow = fx.and_then(|fx| fx.drop_shadows.first());
     assert_eq!(shadow.map(|s| (s.angle, s.local_angle)), Some((90.0, 0.0)));
     assert_eq!(shadow.map(|s| s.geometry().offset), Some((0, 10)));
+}
+
+/// 0.190.0: a pixel layer's solid-colour stroke is drawn, so it is not
+/// "not shown"; a gradient or pattern stroke never is, and neither is any
+/// stroke on a group (E9). A clipped layer's stroke is reported as drawn
+/// unclipped. The PSD-save report still itemises a layer whose only
+/// effect is an undrawn stroke.
+#[test]
+fn stroke_notes_on_open_and_psd_save() {
+    let solid = effects_block(&[(b"FrFX", V::Obj(vec![]))]);
+    let gradient = effects_block(&[(b"FrFX", V::Obj(vec![(b"PntT", V::Enum(b"FrFl", b"GrFl"))]))]);
+    let pattern = effects_block(&[(b"FrFX", V::Obj(vec![(b"PntT", V::Enum(b"FrFl", b"Ptrn"))]))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::pixels("solid", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", solid.clone()))),
+                    TestLayer::pixels("clipped", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]]).with(|l| {
+                        l.clipping = 1;
+                        l.blocks.push((*b"lfx2", solid.clone()));
+                    }),
+                    TestLayer::pixels("grad", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", gradient.clone()))),
+                    TestLayer::pixels("pat", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", pattern.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    assert!(
+        items.contains("2 gradient, pattern or other non-solid stroke effects aren't shown"),
+        "{items}"
+    );
+    assert!(
+        items.contains(
+            "1 colour overlay, drop shadow or stroke on clipped layers is drawn unclipped"
+        ),
+        "{items}"
+    );
+    // A group's stroke is not shown, whatever its fill.
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::divider(),
+                    TestLayer::pixels("inside", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]]),
+                    TestLayer::group("g", *b"norm")
+                        .with(|l| l.blocks.push((*b"lfx2", solid.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    assert!(
+        items.contains("1 gradient, pattern or other non-solid stroke effect isn't shown"),
+        "{items}"
+    );
+    // The kept data: the gradient stroke is stored and still counted.
+    let fx = find(&doc.layers, "g").and_then(|id| doc.layers.effects(id));
+    assert_eq!(fx.map(LayerEffects::shown_strokes), Some(1));
+    // PSD save: a layer with only a gradient stroke is itemised.
+    let mut layers = LayerTree::new();
+    let mut history = aurora_doc::History::new();
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let mut fx = LayerEffects::default();
+    fx.strokes.push(aurora_core::effects::Stroke {
+        fill: aurora_core::effects::StrokeFill::Gradient,
+        ..aurora_core::effects::Stroke::default()
+    });
+    if let Err(err) = layers.set_effects(id, Some(fx)) {
+        unreachable!("{err:?}");
+    }
+    let opts = super::write::PsdSaveOptions::default();
+    let items = match super::write::psd_save_preflight(&layers, (4, 4), opts) {
+        Ok(report) => report.items.join("\n"),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert!(
+        items.contains("1 layer's effects aren't saved to .psd yet"),
+        "{items}"
+    );
 }

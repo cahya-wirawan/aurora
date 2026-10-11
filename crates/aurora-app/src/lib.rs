@@ -13479,16 +13479,19 @@ fn content_opacity(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> O
 }
 
 /// Whether `id` has an effect this round actually draws (0.181.0): a
-/// pixel layer with a shown colour overlay. What refuses the GPU fast path
+/// pixel layer with a shown colour overlay, drop shadow (0.182.0) or
+/// solid-colour stroke (0.190.0). What refuses the GPU fast path
 /// ([`document_qualifies_for_gpu_compositing`]); a layer whose only shown
 /// effects are not drawn yet (shadows, strokes, glows, the rest) keeps the
 /// GPU path, since both paths draw exactly the same pixels for it.
 #[must_use]
 fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
     matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
-        && layers
-            .effects(id)
-            .is_some_and(|fx| fx.shown_color_overlays() > 0 || fx.shown_drop_shadows() > 0)
+        && layers.effects(id).is_some_and(|fx| {
+            fx.shown_color_overlays() > 0
+                || fx.shown_drop_shadows() > 0
+                || fx.shown_color_strokes() > 0
+        })
 }
 
 /// Where a composite tile sits: its document-space origin and the
@@ -13575,6 +13578,8 @@ const SHADOW_CACHE_ENTRY_BYTES: usize =
 /// coverage does not depend on them, so those edits hit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShadowCacheKey {
+    /// What the entry is (0.190.0): [`CoverageKind`] as a byte.
+    kind: u8,
     store: u64,
     surface: aurora_tile::SurfaceId,
     layer_origin: (i64, i64),
@@ -13737,6 +13742,15 @@ fn surface_window_versions(
     }
 }
 
+/// What a [`ShadowCacheKey`] entry holds (0.190.0): the cache is shared by
+/// every kind of per-tile effect coverage, and the kind is part of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageKind {
+    DropShadow = 0,
+    StrokeOutside = 1,
+    StrokeInside = 2,
+}
+
 /// [`ShadowCacheKey`] for one shadow on one tile; `None` for a layer with
 /// no surface.
 fn shadow_cache_key(
@@ -13746,13 +13760,39 @@ fn shadow_cache_key(
     tile: CompositeTileAt,
     geometry: aurora_core::effects::ShadowGeometry,
 ) -> Option<ShadowCacheKey> {
+    coverage_cache_key(
+        id,
+        layers,
+        store,
+        tile,
+        CoverageKind::DropShadow,
+        geometry.offset,
+        geometry.apron,
+        (geometry.choke, geometry.blur_radius),
+    )
+}
+
+/// [`ShadowCacheKey`] for one effect's coverage on one tile: the source
+/// window is the tile grown by `apron` and translated by minus `offset`;
+/// `params` are the effect's own numbers (a stroke's size as `f32` bits).
+#[allow(clippy::too_many_arguments)]
+fn coverage_cache_key(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &dyn TileSource,
+    tile: CompositeTileAt,
+    kind: CoverageKind,
+    offset: (i64, i64),
+    apron: u32,
+    params: (u32, u32),
+) -> Option<ShadowCacheKey> {
     let surface = layers.surface_id(id)?;
     let t = i64::from(aurora_tile::TILE);
-    let apron = i64::from(geometry.apron);
+    let apron = i64::from(apron);
     let side = t + 2 * apron;
     let window = (
-        tile.doc_origin.0 - geometry.offset.0 - apron,
-        tile.doc_origin.1 - geometry.offset.1 - apron,
+        tile.doc_origin.0 - offset.0 - apron,
+        tile.doc_origin.1 - offset.1 - apron,
     );
     let layer_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
     let mut versions = Vec::new();
@@ -13787,16 +13827,12 @@ fn shadow_cache_key(
         )
     });
     Some(ShadowCacheKey {
+        kind: kind as u8,
         store: store.serial(),
         surface,
         layer_origin,
         doc_origin: tile.doc_origin,
-        geometry: (
-            geometry.offset.0,
-            geometry.offset.1,
-            geometry.choke,
-            geometry.blur_radius,
-        ),
+        geometry: (offset.0, offset.1, params.0, params.1),
         mask,
         versions,
     })
@@ -13812,13 +13848,43 @@ fn compute_shadow_tile_coverage(
     geometry: aurora_core::effects::ShadowGeometry,
     budget: &mut CompositeBudget,
 ) -> Option<Vec<f32>> {
-    let t = i64::from(aurora_tile::TILE);
     let apron = i64::from(geometry.apron);
+    let side_usize = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron).ok()?;
+    let alpha = read_shape_window(id, layers, store, tile, own, geometry.offset, apron, budget)?;
+    let coverage = aurora_filters::shadow_coverage(
+        &alpha,
+        side_usize,
+        geometry.choke as usize,
+        geometry.blur_radius as usize,
+        aurora_tile::TILE as usize,
+    );
+    (!coverage.is_empty()).then_some(coverage)
+}
+
+/// The layer's *shape* (content alpha × mask, no Fill) under the
+/// `(256 + 2·apron)`² window of `tile` grown by `apron` and translated by
+/// minus `offset` (the effect at `p` comes from the shape at `p - offset`),
+/// assembled from the composite-grid cells it overlaps, each read through
+/// [`pixel_layer_texels`]; cells with nothing stored are skipped without a
+/// page-in, and `None` when no cell had anything. Shared by drop shadows
+/// (0.182.0) and strokes (0.190.0).
+#[allow(clippy::too_many_arguments)]
+fn read_shape_window(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    offset: (i64, i64),
+    apron: i64,
+    budget: &mut CompositeBudget,
+) -> Option<Vec<f32>> {
+    let t = i64::from(aurora_tile::TILE);
     let side = t + 2 * apron;
     let side_usize = usize::try_from(side).ok()?;
     let window = (
-        tile.doc_origin.0 - geometry.offset.0 - apron,
-        tile.doc_origin.1 - geometry.offset.1 - apron,
+        tile.doc_origin.0 - offset.0 - apron,
+        tile.doc_origin.1 - offset.1 - apron,
     );
     let same_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y)) == tile.reference_origin;
     let cell_lo = (
@@ -13876,15 +13942,166 @@ fn compute_shadow_tile_coverage(
             }
         }
     }
-    let alpha = alpha?;
-    let coverage = aurora_filters::shadow_coverage(
-        &alpha,
-        side_usize,
-        geometry.choke as usize,
-        geometry.blur_radius as usize,
-        aurora_tile::TILE as usize,
+    alpha
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many stroke coverage windows were computed (a
+    /// window is one read and one pass for every plane the stroke missed).
+    static STROKE_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One stroke's coverage on one composite tile (0.190.0): `outside` is
+/// folded over the content (already scaled by `1 - shape`), `inside` into
+/// the interior, which the layer's shape then clips. `None` for a plane
+/// with nothing in it on this tile.
+#[derive(Default)]
+struct StrokePlanes {
+    outside: Option<std::sync::Arc<Vec<f32>>>,
+    inside: Option<std::sync::Arc<Vec<f32>>>,
+}
+
+/// `stroke`'s coverage planes on `tile` (0.190.0), through the shared
+/// coverage cache ([`ShadowCacheKey`]: the window's content versions, the
+/// layer's origin, the mask settings and the stroke's size and side — and
+/// not its colour, opacity, mode, Fill or the layer's opacity, which edits
+/// hit). The source is the layer's *shape* (content alpha × mask, no
+/// Fill) under a `(256 + 2A)`² window, `A` the stroke's apron — the same
+/// bounded read a shadow does ([`read_shape_window`], at most 25 cells),
+/// so a stroke reaches tiles the layer never painted. An inside plane is
+/// only wanted where the layer has content on the tile. An empty vector in
+/// the cache means "nothing here" and is cached too, so a tile deep inside
+/// a big shape is not recomputed.
+fn stroke_tile_planes(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    stroke: &aurora_core::effects::Stroke,
+    budget: &mut CompositeBudget,
+) -> StrokePlanes {
+    let geometry = stroke.geometry();
+    let mut wanted = Vec::new();
+    if geometry.outside > 0.0 {
+        wanted.push((CoverageKind::StrokeOutside, geometry.outside));
+    }
+    if geometry.inside > 0.0 && own.is_some() {
+        wanted.push((CoverageKind::StrokeInside, geometry.inside));
+    }
+    let mut planes = StrokePlanes::default();
+    let mut missing = Vec::new();
+    for (kind, width) in wanted {
+        let Some(key) = coverage_cache_key(
+            id,
+            layers,
+            store,
+            tile,
+            kind,
+            (0, 0),
+            geometry.apron,
+            (width.to_bits(), 0),
+        ) else {
+            continue;
+        };
+        match with_shadow_cache(|cache| cache.get(&key)).flatten() {
+            Some(hit) => keep_plane(&mut planes, kind, &hit),
+            None => missing.push((kind, width, key)),
+        }
+    }
+    if missing.is_empty() {
+        return planes;
+    }
+    #[cfg(test)]
+    STROKE_COMPUTES.with(|n| n.set(n.get() + 1));
+    let errors_before = budget.store_errors;
+    let apron = i64::from(geometry.apron);
+    let Some(alpha) = read_shape_window(id, layers, store, tile, own, (0, 0), apron, budget) else {
+        return planes;
+    };
+    let Ok(side) = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron) else {
+        return planes;
+    };
+    for (kind, width, key) in missing {
+        let which = if kind == CoverageKind::StrokeInside {
+            aurora_filters::StrokeSide::Inside
+        } else {
+            aurora_filters::StrokeSide::Outside
+        };
+        let coverage = std::sync::Arc::new(aurora_filters::stroke_coverage(
+            &alpha,
+            side,
+            aurora_tile::TILE as usize,
+            width,
+            which,
+        ));
+        // As for a shadow (review RC-1): a degraded read is not kept.
+        if budget.store_errors == errors_before {
+            let _ = with_shadow_cache(|cache| cache.insert(key, std::sync::Arc::clone(&coverage)));
+        }
+        keep_plane(&mut planes, kind, &coverage);
+    }
+    planes
+}
+
+fn keep_plane(planes: &mut StrokePlanes, kind: CoverageKind, plane: &std::sync::Arc<Vec<f32>>) {
+    if plane.is_empty() {
+        return;
+    }
+    match kind {
+        CoverageKind::StrokeOutside => planes.outside = Some(std::sync::Arc::clone(plane)),
+        CoverageKind::StrokeInside => planes.inside = Some(std::sync::Arc::clone(plane)),
+        CoverageKind::DropShadow => {}
+    }
+}
+
+/// Each shown solid-colour stroke of `fx` with its planes on `tile`, in
+/// list order.
+fn shown_stroke_planes<'a>(
+    fx: &'a aurora_core::LayerEffects,
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    budget: &mut CompositeBudget,
+) -> Vec<(&'a aurora_core::effects::Stroke, StrokePlanes)> {
+    fx.strokes
+        .iter()
+        .filter(|s| fx.shows(s.gate) && s.fill == aurora_core::effects::StrokeFill::Color)
+        .map(|stroke| {
+            (
+                stroke,
+                stroke_tile_planes(id, layers, store, tile, own, stroke, budget),
+            )
+        })
+        .collect()
+}
+
+/// Folds one coverage `plane` (a slice of texels' worth, matching `target`)
+/// in `stroke`'s colour onto `target` (premultiplied, the accumulator and
+/// the interior alike), at the stroke's opacity × `factor`, in its own
+/// mode.
+fn fold_stroke_plane(
+    target: &mut [half::f16],
+    plane: &[f32],
+    stroke: &aurora_core::effects::Stroke,
+    factor: f32,
+    doc_origin: (i64, i64),
+) {
+    let [r, g, b] = [stroke.color.r, stroke.color.g, stroke.color.b].map(half::f16::from_f32);
+    let mut source = Vec::with_capacity(plane.len() * aurora_tile::CHANNELS);
+    for &cover in plane {
+        source.extend([r, g, b, half::f16::from_f32(cover)]);
+    }
+    fold_texels_in_mode(
+        target,
+        &source,
+        stroke.opacity * factor,
+        aurora_doc::BlendMode::from(stroke.blend_mode),
+        doc_origin,
     );
-    (!coverage.is_empty()).then_some(coverage)
 }
 
 /// Copies `cell`'s alpha (a 256² straight RGBA tile at document
@@ -13924,10 +14141,11 @@ fn copy_cell_alpha(
 }
 
 /// Grows `rects` (document space) by where a layer's shown drop shadows
-/// reach (0.182.0): each rect shifted by every shadow's offset and grown
-/// by its apron, kept alongside the original. A layer without shown
-/// shadows gets `rects` back unchanged. So editing a shadowed layer also
-/// repaints the tiles its shadow falls on.
+/// and strokes reach (0.182.0, 0.190.0): each rect shifted by every
+/// shadow's offset and grown by its apron (a stroke's: its apron, no
+/// offset), kept alongside the original. A layer without shown shadows or
+/// strokes gets `rects` back unchanged. So editing such a layer also
+/// repaints the tiles its effects fall on.
 fn effect_reach_rects(
     layers: &aurora_doc::LayerTree,
     layer: aurora_doc::LayerId,
@@ -13940,13 +14158,29 @@ fn effect_reach_rects(
     if !layer_renders_effects(layers, layer) {
         return out;
     }
-    for shadow in fx.drop_shadows.iter().filter(|s| fx.shows(s.gate)) {
-        let g = shadow.geometry();
-        let a = i64::from(g.apron);
+    // `(offset, apron)` of every drawn effect: a shadow's own, a stroke's
+    // apron with no offset (0.190.0).
+    let mut reaches: Vec<((i64, i64), u32)> = fx
+        .drop_shadows
+        .iter()
+        .filter(|s| fx.shows(s.gate))
+        .map(|shadow| {
+            let g = shadow.geometry();
+            (g.offset, g.apron)
+        })
+        .collect();
+    reaches.extend(
+        fx.strokes
+            .iter()
+            .filter(|s| fx.shows(s.gate) && s.fill == aurora_core::effects::StrokeFill::Color)
+            .map(|stroke| ((0, 0), stroke.geometry().apron)),
+    );
+    for (offset, apron) in reaches {
+        let a = i64::from(apron);
         for r in rects {
             out.push(aurora_core::Rect {
-                x: r.x + g.offset.0 - a,
-                y: r.y + g.offset.1 - a,
+                x: r.x + offset.0 - a,
+                y: r.y + offset.1 - a,
                 width: r
                     .width
                     .saturating_add(u32::try_from(2 * a).unwrap_or(u32::MAX)),
@@ -14085,7 +14319,14 @@ fn fold_layer_with_effects(
         reference_origin,
     };
     let shadows = shown_shadow_coverages(fx, id, layers, store, tile, own.as_deref(), budget);
-    if own.is_none() && shadows.is_empty() {
+    // 0.190.0: each shown solid-colour stroke's coverage. An outside stroke
+    // lands on tiles the layer never painted, like a shadow, so a blank
+    // `own` ends the fold only when nothing reaches the tile.
+    let strokes = shown_stroke_planes(fx, id, layers, store, tile, own.as_deref(), budget);
+    if own.is_none()
+        && shadows.is_empty()
+        && !strokes.iter().any(|(_, planes)| planes.outside.is_some())
+    {
         return false;
     }
     let shape = own.unwrap_or_else(aurora_render::transparent_tile);
@@ -14114,6 +14355,10 @@ fn fold_layer_with_effects(
             fx.shows(overlay.gate)
                 && aurora_doc::BlendMode::from(overlay.blend_mode)
                     == aurora_doc::BlendMode::Dissolve
+        })
+        && !strokes.iter().any(|(stroke, planes)| {
+            planes.inside.is_some()
+                && aurora_doc::BlendMode::from(stroke.blend_mode) == aurora_doc::BlendMode::Dissolve
         });
     let runs = if row_restricted {
         shape_row_runs(&shape)
@@ -14169,6 +14414,23 @@ fn fold_layer_with_effects(
             }
         }
     }
+    // Step 2b (0.190.0): each shown stroke's inside plane, over the
+    // overlays (Photoshop's order: the stroke is the topmost interior
+    // effect), at the stroke's opacity in its own mode. Fill does not fade
+    // it; the shape (step 3) clips it.
+    for (stroke, planes) in &strokes {
+        let Some(plane) = &planes.inside else {
+            continue;
+        };
+        for run in &runs {
+            if let (Some(inside), Some(cover)) = (
+                interior.get_mut(run.clone()),
+                plane.get(run.start / aurora_tile::CHANNELS..run.end / aurora_tile::CHANNELS),
+            ) {
+                fold_stroke_plane(inside, cover, stroke, 1.0, doc_origin);
+            }
+        }
+    }
     // Step 3: lay the interior down at shape × opacity.
     let coverage = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
         dissolve_gate(&shape, opacity, doc_origin)
@@ -14205,6 +14467,15 @@ fn fold_layer_with_effects(
     }
     return_tile_scratch(interior);
     return_tile_scratch(source);
+    // Step 4 (0.190.0): each shown stroke's outside plane over the laid-down
+    // layer, in list order, at the stroke's opacity × the layer's opacity
+    // (as a shadow's, beneath this). Fill does not fade it; the plane is
+    // already zero where the shape is opaque.
+    for (stroke, planes) in &strokes {
+        if let Some(plane) = &planes.outside {
+            fold_stroke_plane(accumulator, plane, stroke, shadow_factor, doc_origin);
+        }
+    }
     if let Some(backdrop) = backdrop {
         let l = opacity.clamp(0.0, 1.0);
         for (channel, &below) in accumulator.iter_mut().zip(&backdrop) {
@@ -75353,9 +75624,10 @@ mod tests {
         use super::*;
         use crate::{
             APRON_CELL_READS, CompositeTileAt, SHADOW_CACHE, SHADOW_CACHE_BYTES,
-            SHADOW_CACHE_ENTRY_BYTES, SHADOW_COMPUTES, ShadowCache, ShadowCacheKey,
-            effect_reach_rects, fold_layer_into, invalidate_painted_tiles, layer_renders_effects,
-            layer_shows_effects, pixel_layer_texels, shadow_tile_coverage, stroke_invalidation,
+            SHADOW_CACHE_ENTRY_BYTES, SHADOW_COMPUTES, STROKE_COMPUTES, ShadowCache,
+            ShadowCacheKey, effect_reach_rects, fold_layer_into, invalidate_painted_tiles,
+            layer_renders_effects, layer_shows_effects, pixel_layer_texels, shadow_tile_coverage,
+            stroke_invalidation, stroke_tile_planes,
         };
 
         const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
@@ -75588,9 +75860,12 @@ mod tests {
             let (_, cpu_unfilled) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
             ok(layers.set_fill_opacity(mul, 0.5));
             ok(layers.set_fill_opacity(top, 0.3));
-            // A stroke is not drawn yet, so it must not refuse the GPU.
+            // A gradient stroke is not drawn, so it must not refuse the GPU.
             let fx = aurora_core::LayerEffects {
-                strokes: vec![aurora_core::effects::Stroke::default()],
+                strokes: vec![aurora_core::effects::Stroke {
+                    fill: aurora_core::effects::StrokeFill::Gradient,
+                    ..aurora_core::effects::Stroke::default()
+                }],
                 ..aurora_core::LayerEffects::default()
             };
             ok(layers.set_effects(top, Some(fx)));
@@ -75840,7 +76115,10 @@ mod tests {
             no_shadow.gate.enabled = false;
             let fx = aurora_core::LayerEffects {
                 drop_shadows: vec![no_shadow],
-                strokes: vec![aurora_core::effects::Stroke::default()],
+                strokes: vec![aurora_core::effects::Stroke {
+                    fill: aurora_core::effects::StrokeFill::Gradient,
+                    ..aurora_core::effects::Stroke::default()
+                }],
                 outer_glows: vec![aurora_core::effects::OuterGlow::default()],
                 color_overlays: vec![off],
                 ..aurora_core::LayerEffects::default()
@@ -76427,6 +76705,7 @@ mod tests {
             let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
             assert_eq!(cap, 1024);
             let key = |i: usize| ShadowCacheKey {
+                kind: 0,
                 store: 1,
                 surface: aurora_tile::SurfaceId::from_raw(1),
                 layer_origin: (0, 0),
@@ -76869,33 +77148,40 @@ mod tests {
         const EFFECTS_CORPUS_EXPECTED: &[(&str, f64, [f64; 3])] = &[
             // 0.181.0: Fill 28/255 on a shape with a colour overlay (now drawn); blend-if/knockout and clipping still not applied. Before it (0.180.0): 255 / 95.81, 90.41, 86.53 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
-            ("advanced-blending.psd", 255.0, [93.8710, 91.4632, 89.3564]),
+            // 0.190.0: Rectangle 1 outside stroke drawn; before: 255 / 93.8710, 91.4632, 89.3564.
+            ("advanced-blending.psd", 255.0, [93.3922, 90.9844, 88.8776]),
             // 0.181.0: Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before it (0.180.0): 255 / 56.29, 63.67, 69.87 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
-            ("effects/shape-fx2.psd", 255.0, [57.8164, 63.1807, 69.8682]),
+            // 0.190.0: Inner stroke now drawn; before 0.190.0: max 255 / 57.8164, 63.1807, 69.8682.
+            ("effects/shape-fx2.psd", 255.0, [12.4180, 41.8770, 69.8682]),
             // 0.181.0: overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before it (0.180.0): 255 / 43.94, 47.46, 22.82 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
+            // 0.190.0: Inner strokes now drawn (on clipped layers shown unclipped: blue is worse, red and green better); before: 255 / 52.6774, 53.5591, 26.0986.
             (
                 "effects/stroke-composite.psd",
                 255.0,
-                [52.6774, 53.5591, 26.0986],
+                [45.1914, 46.6338, 27.2065],
             ),
             // 0.181.0: Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before it (0.180.0): 255 / 220.34, 52.00, 220.34 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
+            // 0.190.0: Inside stroke on a Fill-0 shape now drawn: exact; before: 153 / 34.6641, 51.9961, 34.6641.
             (
                 "effects/stroke-effect-transparent-shape.psd",
-                153.0,
-                [34.6641, 51.9961, 34.6641],
+                0.0,
+                [0.0000, 0.0000, 0.0000],
             ),
             // 0.181.0: two colour overlays now drawn; shadows, glows, bevels, strokes still not. Before it (0.180.0): 191 / 109.21, 106.14, 108.66 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 168, mean 10.990, 9.186, 10.466.
-            ("layer_effects.psd", 168.0, [10.3246, 8.5522, 9.8170]),
+            // 0.190.0: Text stroke now drawn; before: 168 / 10.3246, 8.5522, 9.8170.
+            ("layer_effects.psd", 168.0, [8.9371, 7.1427, 8.4219]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
-            ("masks.psd", 65.0, [0.2007, 0.1571, 0.1460]),
+            // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 is drawn darker than Photoshop shows it (unexplained residual); before: 65 / 0.2007, 0.1571, 0.1460.
+            ("masks.psd", 65.0, [0.2257, 0.1822, 0.1710]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.28, 1.28, 1.29 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 59, mean 1.109, 1.108, 1.107.
-            ("masks.psb", 59.0, [0.1183, 0.1171, 0.1163]),
+            // 0.190.0: As masks.psd; before: 59 / 0.1183, 0.1171, 0.1163.
+            ("masks.psb", 59.0, [0.1433, 0.1421, 0.1413]),
             // 0.181.0: Fill 171/255: now an exact match. Before it (0.180.0): 56 / 0.00, 56.00, 56.00 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             ("opacity-fill.psd", 0.0, [0.0000, 0.0000, 0.0000]),
@@ -76932,25 +77218,29 @@ mod tests {
                 [31.1161, 23.8722, 19.5429],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
+            // 0.190.0: Outside and inside strokes drawn; before: 255 / 12.2021, 37.6904, 37.1924.
             (
                 "effects/double-stroke-effects.psd",
                 255.0,
-                [12.2021, 37.6904, 37.1924],
+                [12.2022, 13.2022, 36.4034],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             ("effects/shape-fx.psd", 0.0, [0.0000, 0.0000, 0.0000]),
             // 0.182.0: unchanged by drawing drop shadows.
+            // 0.190.0: Solid strokes drawn (raster ones match Photoshop pixel for pixel); shape layers differ in their gradient fill, gradient and pattern strokes are not drawn, green is worse; before: 255 / 58.2448, 23.1956, 44.6420.
             (
                 "effects/stroke-effects.psd",
                 255.0,
-                [58.2448, 23.1956, 44.6420],
+                [37.9004, 24.9445, 27.3005],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             ("fill_adjustments.psd", 240.0, [133.1256, 58.7064, 39.0855]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
-            ("layer_comps.psd", 162.0, [4.4585, 9.8399, 15.7286]),
+            // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
+            ("layer_comps.psd", 136.0, [3.8984, 9.3481, 15.6275]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
-            ("layer_comps.psb", 182.0, [4.2692, 9.7118, 15.7745]),
+            // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
+            ("layer_comps.psb", 124.0, [3.8034, 9.3190, 15.7356]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
             ("layer_params.psd", 244.0, [4.8987, 4.8851, 4.2994]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
@@ -76964,6 +77254,480 @@ mod tests {
                 [3.0836, 5.4152, 4.1538],
             ),
         ];
+
+        // ---- 0.190.0 (E4): strokes ----
+
+        use aurora_core::effects::StrokePosition;
+
+        fn stroke(
+            position: StrokePosition,
+            size: f32,
+            rgb: [f32; 3],
+        ) -> aurora_core::effects::Stroke {
+            aurora_core::effects::Stroke {
+                position,
+                size,
+                color: aurora_core::effects::EffectColor {
+                    r: rgb[0],
+                    g: rgb[1],
+                    b: rgb[2],
+                },
+                opacity: 1.0,
+                blend_mode: aurora_core::effects::EffectBlendMode::Normal,
+                ..aurora_core::effects::Stroke::default()
+            }
+        }
+
+        fn set_strokes(
+            layers: &mut aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+            strokes: Vec<aurora_core::effects::Stroke>,
+        ) {
+            let fx = aurora_core::LayerEffects {
+                strokes,
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+        }
+
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        const CLEAR: [f32; 4] = [0.0; 4];
+
+        /// A 40 x 40 white square at (100, 100) with one stroke of `position`
+        /// and `size`.
+        fn stroked_square(
+            position: StrokePosition,
+            size: f32,
+        ) -> (
+            tempfile::TempDir,
+            aurora_tile::TileStore,
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+        ) {
+            let (dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 40, 40));
+            set_strokes(
+                &mut layers,
+                id,
+                vec![stroke(position, size, [1.0, 0.0, 0.0])],
+            );
+            (dir, store, layers, id)
+        }
+
+        #[test]
+        fn outside_stroke_surrounds_the_shape_and_leaves_it_alone() {
+            let (_d, mut store, layers, _) = stroked_square(StrokePosition::Outside, 3.0);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for (x, y, want) in [
+                (99, 120, RED),
+                (98, 120, RED),
+                (97, 120, RED),
+                (96, 120, CLEAR),
+                (140, 120, RED),
+                (142, 120, RED),
+                (143, 120, CLEAR),
+                (120, 97, RED),
+                (120, 142, RED),
+                (120, 120, WHITE),
+                (100, 120, WHITE),
+                (139, 120, WHITE),
+            ] {
+                near(texel(&acc, x, y), want);
+            }
+            // The corner is rounded: (97, 97) is 3 * sqrt(2) - 0.5 away.
+            near(texel(&acc, 97, 97), CLEAR);
+        }
+
+        #[test]
+        fn inside_stroke_stays_within_the_shape() {
+            let (_d, mut store, layers, _) = stroked_square(StrokePosition::Inside, 3.0);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for (x, y, want) in [
+                (99, 120, CLEAR),
+                (100, 120, RED),
+                (102, 120, RED),
+                (103, 120, WHITE),
+                (136, 120, WHITE),
+                (137, 120, RED),
+                (138, 120, RED),
+                (139, 120, RED),
+                (140, 120, CLEAR),
+                (120, 100, RED),
+                (120, 120, WHITE),
+            ] {
+                near(texel(&acc, x, y), want);
+            }
+        }
+
+        #[test]
+        fn center_stroke_is_half_inside_and_half_outside() {
+            let (_d, mut store, layers, _) = stroked_square(StrokePosition::Center, 4.0);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for (x, y, want) in [
+                (97, 120, CLEAR),
+                (98, 120, RED),
+                (99, 120, RED),
+                (100, 120, RED),
+                (101, 120, RED),
+                (102, 120, WHITE),
+                (120, 120, WHITE),
+                (138, 120, RED),
+                (141, 120, RED),
+                (142, 120, CLEAR),
+            ] {
+                near(texel(&acc, x, y), want);
+            }
+        }
+
+        /// The stroke's own colour, opacity and mode, over what is below.
+        #[test]
+        fn stroke_uses_its_own_mode_and_opacity() {
+            for (mode, opacity, want) in [
+                // Normal at 0.5 over mid grey.
+                (
+                    aurora_core::effects::EffectBlendMode::Normal,
+                    0.5,
+                    [0.75, 0.25, 0.25, 1.0],
+                ),
+                // Multiply by red at 0.5: r unchanged, g and b halved again.
+                (
+                    aurora_core::effects::EffectBlendMode::Multiply,
+                    0.5,
+                    [0.5, 0.25, 0.25, 1.0],
+                ),
+                (
+                    aurora_core::effects::EffectBlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.0, 0.0, 1.0],
+                ),
+            ] {
+                let (_d, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _below = solid(&mut layers, &mut store, None, [0.5, 0.5, 0.5, 1.0]);
+                let id = painted(&mut layers, &mut store, (0, 0), (5, 5, 1, 1));
+                let mut s = stroke(StrokePosition::Outside, 1.0, [1.0, 0.0, 0.0]);
+                s.blend_mode = mode;
+                s.opacity = opacity;
+                set_strokes(&mut layers, id, vec![s]);
+                near(texel(&composite(&layers, &mut store), 4, 5), want);
+            }
+        }
+
+        /// Layer opacity fades the stroke; Fill does not.
+        #[test]
+        fn layer_opacity_fades_the_stroke_and_fill_does_not() {
+            let (_d, mut store, mut layers, id) = stroked_square(StrokePosition::Outside, 3.0);
+            ok(layers.set_fill_opacity(id, 0.0));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&acc, 99, 120), RED);
+            near(texel(&acc, 120, 120), CLEAR);
+            ok(layers.set_fill_opacity(id, 1.0));
+            ok(layers.set_opacity(id, 0.5));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&acc, 99, 120), [0.5, 0.0, 0.0, 0.5]);
+            near(texel(&acc, 120, 120), [0.5, 0.5, 0.5, 0.5]);
+            // An inside stroke at Fill 0: the content is hidden, the stroke is not.
+            let (_d, mut store, mut layers, id) = stroked_square(StrokePosition::Inside, 3.0);
+            ok(layers.set_fill_opacity(id, 0.0));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&acc, 100, 120), RED);
+            near(texel(&acc, 120, 120), CLEAR);
+        }
+
+        #[test]
+        fn two_strokes_draw_in_list_order() {
+            for red_first in [true, false] {
+                let (_d, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 40, 40));
+                let red = stroke(StrokePosition::Outside, 2.0, [1.0, 0.0, 0.0]);
+                let blue = stroke(StrokePosition::Outside, 4.0, [0.0, 0.0, 1.0]);
+                let list = if red_first {
+                    vec![red, blue]
+                } else {
+                    vec![blue, red]
+                };
+                set_strokes(&mut layers, id, list);
+                let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                let blue_px = [0.0, 0.0, 1.0, 1.0];
+                // x = 99 and 98 are under both strokes; the later one wins.
+                let top = if red_first { blue_px } else { RED };
+                near(texel(&acc, 99, 120), top);
+                near(texel(&acc, 98, 120), top);
+                // x = 97 and 96 are under the wider (blue) one only.
+                near(texel(&acc, 97, 120), blue_px);
+                near(texel(&acc, 96, 120), blue_px);
+                near(texel(&acc, 95, 120), CLEAR);
+            }
+        }
+
+        /// Tile by tile equals one big window, bit for bit, at the corners
+        /// of four tiles. The shape's right edge is 8 px before the tile
+        /// boundary, exactly the stroke's width, so a window one pixel too
+        /// narrow loses a source that matters.
+        #[test]
+        fn stroke_is_seamless_across_tile_boundaries() {
+            for origin in [(0_i64, 0_i64), (-300, -300)] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, origin, (220, 231, 29, 50));
+                let st = stroke(StrokePosition::Outside, 8.0, [1.0, 0.0, 0.0]);
+                set_strokes(&mut layers, id, vec![st.clone()]);
+                let a = i64::from(st.geometry().apron);
+                let side = 512 + 2 * a;
+                let side_u = usize::try_from(side).unwrap_or(0);
+                let mut alpha = vec![0.0_f32; side_u * side_u];
+                for y in 0..side {
+                    for x in 0..side {
+                        let (sx, sy) = (x - a, y - a);
+                        if (220..249).contains(&sx)
+                            && (231..281).contains(&sy)
+                            && let Some(v) =
+                                alpha.get_mut(usize::try_from(y * side + x).unwrap_or(0))
+                        {
+                            *v = 1.0;
+                        }
+                    }
+                }
+                let reference = aurora_filters::stroke_coverage(
+                    &alpha,
+                    side_u,
+                    512,
+                    8.0,
+                    aurora_filters::StrokeSide::Outside,
+                );
+                assert!(!reference.is_empty());
+                for (tx, ty) in [(0_i64, 0_i64), (1, 0), (0, 1), (1, 1)] {
+                    let mut budget = CompositeBudget::for_pass(&layers);
+                    let at = CompositeTileAt {
+                        doc_origin: (tx * 256, ty * 256),
+                        reference_origin: (0, 0),
+                    };
+                    let planes =
+                        stroke_tile_planes(id, &layers, &mut store, at, None, &st, &mut budget);
+                    let Some(cov) = planes.outside else {
+                        unreachable!("the stroke reaches every corner tile");
+                    };
+                    for (i, v) in cov.iter().enumerate() {
+                        let (x, y) = (
+                            i % 256 + usize::try_from(tx).unwrap_or(0) * 256,
+                            i / 256 + usize::try_from(ty).unwrap_or(0) * 256,
+                        );
+                        assert_eq!(
+                            v.to_bits(),
+                            reference.get(y * 512 + x).map_or(0, |r| r.to_bits()),
+                            "{origin:?} ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn stroke_lands_on_tiles_the_layer_never_painted() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (250, 128, 1, 1));
+            set_strokes(
+                &mut layers,
+                id,
+                vec![stroke(StrokePosition::Outside, 10.0, [1.0, 0.0, 0.0])],
+            );
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            assert!(!store.contains_tile(surface, aurora_tile::TileId { x: 1, y: 0 }));
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let (tile, folded) = composite_roots_into_tile(
+                &layers,
+                &mut store,
+                aurora_tile::TileId { x: 1, y: 0 },
+                (256, 0),
+                (0, 0),
+                &mut budget,
+            );
+            assert_eq!(folded, 1);
+            // The painted texel is at x = 250: x = 259 is 9 - 0.5 away.
+            assert!((alpha_at(&tile, 3, 128) - 1.0).abs() < TOL);
+            assert!(alpha_at(&tile, 20, 128).abs() < TOL, "past the reach");
+        }
+
+        /// The window is bounded whatever the size asked for: at most the
+        /// 25 cells of `MAX_SHADOW_APRON`, and a size beyond it is drawn
+        /// narrower.
+        #[test]
+        fn stroke_reads_are_bounded_and_the_size_is_capped() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (1000, 1000, 40, 40));
+            let huge = stroke(StrokePosition::Outside, 100_000.0, [1.0, 0.0, 0.0]);
+            let g = huge.geometry();
+            assert!(g.capped && g.apron <= aurora_core::effects::MAX_SHADOW_APRON);
+            APRON_CELL_READS.with(|n| n.set(0));
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let at = CompositeTileAt {
+                doc_origin: (768, 768),
+                reference_origin: (0, 0),
+            };
+            let planes = stroke_tile_planes(id, &layers, &mut store, at, None, &huge, &mut budget);
+            assert!(planes.outside.is_some());
+            let reads = APRON_CELL_READS.with(std::cell::Cell::get);
+            assert!(reads <= 25, "{reads} cells");
+        }
+
+        #[test]
+        fn editing_a_stroked_layer_invalidates_the_apron_tiles() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (250, 100, 1, 1));
+            let neighbour = aurora_tile::TileId { x: 1, y: 0 };
+            let own = aurora_tile::TileId { x: 0, y: 0 };
+            for stroked in [false, true] {
+                if stroked {
+                    set_strokes(
+                        &mut layers,
+                        id,
+                        vec![stroke(StrokePosition::Outside, 10.0, [1.0, 0.0, 0.0])],
+                    );
+                }
+                let mut cache = CompositeCache::default();
+                cache.mark_current(own);
+                cache.mark_current(neighbour);
+                invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
+                assert!(!cache.is_current(own));
+                assert_eq!(cache.is_current(neighbour), !stroked, "stroked {stroked}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let CompositeInvalidation::Regions(rects) =
+                stroke_invalidation(&layers, surface, &[own])
+            else {
+                unreachable!("a pixel stroke is narrow");
+            };
+            assert!(rects.len() > 1, "{rects:?}");
+            // A gradient stroke draws nothing, so reaches nothing.
+            let mut grad = stroke(StrokePosition::Outside, 10.0, [1.0, 0.0, 0.0]);
+            grad.fill = aurora_core::effects::StrokeFill::Gradient;
+            set_strokes(&mut layers, id, vec![grad]);
+            assert_eq!(effect_reach_rects(&layers, id, &[]).len(), 0);
+            assert!(!layer_renders_effects(&layers, id));
+        }
+
+        #[test]
+        fn a_layer_with_a_shown_stroke_refuses_the_gpu_fast_path() {
+            let (_dir, mut store, mut layers, id) = stroked_square(StrokePosition::Outside, 3.0);
+            assert!(layer_renders_effects(&layers, id));
+            assert!(!document_qualifies_for_gpu_compositing(&layers));
+            let mut off = stroke(StrokePosition::Outside, 3.0, [1.0, 0.0, 0.0]);
+            off.gate.enabled = false;
+            set_strokes(&mut layers, id, vec![off]);
+            assert!(!layer_renders_effects(&layers, id));
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+            let _ = &mut store;
+        }
+
+        /// Stroke coverage is cached on the content: colour, opacity, mode
+        /// and layer-opacity edits hit, a dab on the layer's tile misses
+        /// and shows no stale stroke.
+        #[test]
+        fn stroke_cache_hits_on_style_edits_and_misses_on_a_dab() {
+            let (_dir, mut store, mut layers, id) = stroked_square(StrokePosition::Outside, 3.0);
+            clear_shadow_cache();
+            let start = STROKE_COMPUTES.with(std::cell::Cell::get);
+            let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let first = STROKE_COMPUTES.with(std::cell::Cell::get) - start;
+            assert_eq!(first, 1);
+            let mut edited = stroke(StrokePosition::Outside, 3.0, [0.0, 1.0, 0.0]);
+            edited.opacity = 0.5;
+            edited.blend_mode = aurora_core::effects::EffectBlendMode::Multiply;
+            set_strokes(&mut layers, id, vec![edited]);
+            ok(layers.set_opacity(id, 0.7));
+            let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert_eq!(
+                STROKE_COMPUTES.with(std::cell::Cell::get) - start,
+                first,
+                "style edits hit"
+            );
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            if let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 })
+                && let Some(t) = tile.texels_mut().get_mut((120 * 256 + 60) * 4 + 3)
+            {
+                *t = half::f16::from_f32(1.0);
+            }
+            let after = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert!(STROKE_COMPUTES.with(std::cell::Cell::get) - start > first);
+            clear_shadow_cache();
+            assert_eq!(after, composite_tile_at(&layers, &mut store, 0, 0, (0, 0)));
+        }
+
+        /// A masked layer's stroke follows the masked shape (as a shadow's
+        /// does): where the mask hides the whole shape there is no stroke.
+        #[test]
+        fn a_stroke_follows_the_layer_shape_including_its_mask() {
+            let (_d, mut store, mut layers, id) = stroked_square(StrokePosition::Outside, 2.0);
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 256,
+            };
+            ok(layers.add_mask(id, bounds));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let content = alpha_at(&acc, 120, 120);
+            let stroke_px = alpha_at(&acc, 99, 120);
+            println!("MASK content {content} stroke {stroke_px}");
+            assert!(
+                (content - stroke_px).abs() < TOL,
+                "stroke exists exactly when the masked shape does"
+            );
+        }
+
+        /// 0.190.0 reference: `effects/stroke-effects.psd`'s raster layers
+        /// ("Raster Rectangle", "Raster Ellipse": 3 px solid-green Outside
+        /// strokes on semi-transparent pixel art) match Photoshop's own
+        /// merged image at every stroke pixel, including the partly covered
+        /// edge pixel. (The layers' interiors differ: that is their
+        /// gradient fill, not the stroke.)
+        #[test]
+        fn outside_stroke_pixels_match_photoshops_merged_image() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../corpora/psd/reference/psd-tools-fixtures/effects/stroke-effects.psd");
+            let Ok(bytes) = std::fs::read(&path) else {
+                println!("SKIPPED: corpus file not present");
+                return;
+            };
+            let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {
+                println!("SKIPPED: no merged image");
+                return;
+            };
+            let (_scratch, mut store) = real_tile_store();
+            let (_document, image) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            // (x, y) of the three stroke pixels left of each layer's edge.
+            for (x0, y) in [(61_u32, 14_u32), (91, 14)] {
+                for x in x0..x0 + 3 {
+                    let got = image_pixel(&image, x, y);
+                    let want = image_pixel(&merged, x, y);
+                    let a = f64::from(got[3]);
+                    for c in 0..3 {
+                        let g = f64::from(got.get(c).copied().unwrap_or(0.0)) * a + (1.0 - a);
+                        let w = f64::from(want.get(c).copied().unwrap_or(0.0));
+                        assert!(
+                            ((g * 255.0).round() - (w * 255.0).round()).abs() <= 1.0,
+                            "({x}, {y}) channel {c}: {g} vs {w}"
+                        );
+                    }
+                }
+            }
+        }
 
         #[test]
         fn effects_corpus_files_composite_like_photoshops_merged_image() {
