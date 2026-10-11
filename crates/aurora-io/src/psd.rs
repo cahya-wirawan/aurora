@@ -424,6 +424,7 @@ enum Note {
     ShadowContourNotApplied,
     EffectScaleNotApplied,
     ShadowSizeCapped,
+    StrokeSizeCapped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
     StrokesNotShown,
@@ -575,7 +576,8 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "it" } else { "they" },
         ),
         Note::ClippedOverlaysUnclipped => format!(
-            "{n} colour overlay{s} or drop shadow{s} on clipped layers {is} drawn unclipped, \
+            "{n} colour overlay{s}, drop shadow{s} or stroke{s} on clipped layers {is} drawn \
+             unclipped, \
              over the layer's whole shape, because Aurora doesn't have clipping masks yet."
         ),
         Note::EffectScaleNotApplied => format!(
@@ -587,6 +589,11 @@ fn note_text(note: Note, n: u64) -> String {
         }
         Note::ShadowContourNotApplied => format!(
             "{n} drop shadow{s} with a contour other than Linear {is} drawn with a Linear one."
+        ),
+        Note::StrokeSizeCapped => format!(
+            "{n} stroke{s} {is} too wide to draw at full width and {is} shown narrower \
+             (Aurora draws a stroke up to {} pixels from the layer's edge for now).",
+            aurora_core::effects::MAX_SHADOW_APRON - 1
         ),
         Note::ShadowSizeCapped => format!(
             "{n} drop shadow{s} {is} too large to draw at full size and {is} shown smaller \
@@ -606,7 +613,8 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "it is" } else { "they are" }
         ),
         Note::StrokesNotShown => format!(
-            "{n} stroke effect{s} {is}n't shown yet; {} kept with the layer.",
+            "{n} gradient, pattern or other non-solid stroke effect{s} {is}n't shown (Aurora \
+             draws solid-colour strokes on pixel layers only); {} kept with the layer.",
             if one { "it is" } else { "they are" }
         ),
         Note::OuterGlowsNotShown => format!(
@@ -2789,7 +2797,9 @@ fn note_unsupported_kept(
                     // is shown unclipped, so it covers more than Photoshop's.
                     notes.add_n(
                         Note::ClippedOverlaysUnclipped,
-                        (fx.shown_color_overlays() + fx.shown_drop_shadows()) as u64,
+                        (fx.shown_color_overlays()
+                            + fx.shown_drop_shadows()
+                            + fx.shown_color_strokes()) as u64,
                     );
                 }
                 // 0.182.0 review (DS-4): the style's scale is not applied;
@@ -2810,6 +2820,14 @@ fn note_unsupported_kept(
                         notes.add(Note::ShadowSizeCapped);
                     }
                 }
+                // 0.190.0: solid-colour strokes are drawn too.
+                for stroke in fx.strokes.iter().filter(|e| {
+                    fx.shows(e.gate) && e.fill == aurora_core::effects::StrokeFill::Color
+                }) {
+                    if stroke.geometry().capped {
+                        notes.add(Note::StrokeSizeCapped);
+                    }
+                }
             } else {
                 notes.add_n(Note::DropShadowsNotShown, fx.shown_drop_shadows() as u64);
                 notes.add_n(
@@ -2817,7 +2835,14 @@ fn note_unsupported_kept(
                     fx.shown_color_overlays() as u64,
                 );
             }
-            notes.add_n(Note::StrokesNotShown, fx.shown_strokes() as u64);
+            // Gradient and pattern strokes are never drawn; every stroke on a
+            // layer that draws no effects (a group) is not shown either.
+            let undrawn = if overlays_drawn {
+                fx.shown_unrendered_strokes()
+            } else {
+                fx.shown_strokes()
+            };
+            notes.add_n(Note::StrokesNotShown, undrawn as u64);
             notes.add_n(Note::OuterGlowsNotShown, fx.shown_outer_glows() as u64);
             notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
             if read.clamped {

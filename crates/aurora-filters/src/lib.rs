@@ -8,9 +8,11 @@
 
 pub mod curves;
 pub mod shadow;
+pub mod stroke;
 
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
 pub use shadow::shadow_coverage;
+pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};
 
 /// The crate's own name, kept from the skeleton so CI's crate-name check
 /// still has something to check.
