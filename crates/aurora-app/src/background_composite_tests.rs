@@ -13,13 +13,20 @@ use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_mins(2);
 
+/// The pool size the equality and cancellation tests force (0.188.0), so
+/// they fold on several threads even on a one- or two-core runner.
+const PARALLEL_THREADS: usize = 4;
+
 fn noop_waker() -> Waker {
     Arc::new(|| {})
 }
 
 /// A waker that blocks the worker thread — right after it has sent a tile
 /// — until the test opens it, so a test can act while a job is
-/// genuinely in flight.
+/// genuinely in flight. Tests built on it use a one-thread pool
+/// (0.188.0): the gate holds the only thread, so "one tile sent, the rest
+/// not started" stays exact; [`TaskGate`]'s tests are the several-thread
+/// versions.
 #[derive(Default)]
 struct Gate {
     state: Mutex<(bool, usize)>,
@@ -135,7 +142,8 @@ fn worker_composite(
     tiles: &[aurora_tile::TileId],
 ) -> (Vec<Vec<half::f16>>, usize) {
     let _ = store.forget_surface(composite_surface_id());
-    let mut worker = CompositeWorker::new(noop_waker());
+    // 0.188.0: always a several-thread pool, whatever the machine.
+    let mut worker = CompositeWorker::with_threads(noop_waker(), PARALLEL_THREADS);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(layers, store, &mut cache), tiles.to_vec()));
     let installed = worker.wait_until_idle(Some(&mut target(layers, store, &mut cache)), WAIT);
@@ -285,7 +293,7 @@ fn a_dab_during_a_job_is_never_overwritten_by_the_stale_tile() {
     let (layers, size) = fixture(&mut store);
     let tiles = grid(size);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
     gate.wait_blocked();
@@ -313,7 +321,7 @@ fn a_superseded_generation_is_dropped() {
     let (layers, size) = fixture(&mut store);
     let tiles = grid(size);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
     gate.wait_blocked();
@@ -350,7 +358,7 @@ fn an_undo_during_a_job_composites_the_undone_state() {
     let before = layers.visible(text);
     ok(history.set_visible(&mut layers, text, !before.unwrap_or(true)));
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
     gate.wait_blocked();
@@ -377,7 +385,7 @@ fn a_document_switch_or_close_during_a_job_installs_nothing_into_the_other_docum
     let (_e, mut store_b) = store_with_budget(256);
     let (layers_b, _) = fixture(&mut store_b);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache_a = CompositeCache::default();
     let mut cache_b = CompositeCache::default();
     assert!(worker.dispatch(
@@ -416,7 +424,7 @@ fn shutdown_cancels_the_job_in_flight() {
     let (layers, size) = fixture(&mut store);
     let tiles = grid(size);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
     gate.wait_blocked();
@@ -472,6 +480,29 @@ fn a_structural_edit_ships_no_tiles_and_a_dab_ships_only_its_own() {
     assert_same(&have, &want, "after mirror deltas");
 }
 
+/// Nyepi's warm structural edit (show `top` again) on a one-thread pool:
+/// the sequential figure from the same build (0.188.0).
+fn one_thread_warm_edit(
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tiles: &[aurora_tile::TileId],
+    top: aurora_doc::LayerId,
+) -> Duration {
+    let mut single = CompositeWorker::with_threads(noop_waker(), 1);
+    let mut cache = CompositeCache::default();
+    assert!(single.dispatch(&mut target(layers, store, &mut cache), tiles.to_vec()));
+    let _ = single.wait_until_idle(Some(&mut target(layers, store, &mut cache)), WAIT * 5);
+    ok(layers.set_visible(top, true));
+    cache.bump();
+    let started = Instant::now();
+    assert!(single.dispatch(&mut target(layers, store, &mut cache), tiles.to_vec()));
+    let _ = single.wait_until_idle(Some(&mut target(layers, store, &mut cache)), WAIT * 5);
+    let elapsed = started.elapsed();
+    ok(layers.set_visible(top, false));
+    single.shutdown();
+    elapsed
+}
+
 /// AC-1/AC-4 measurements on the real template (release recommended):
 /// UI-thread time of a dispatch, time to final pixels, and a dab.
 #[test]
@@ -481,6 +512,10 @@ fn worker_composite_equals_sync_composite_on_nyepi_and_measures_it() {
         println!("SKIPPED: AURORA_EFFECTS_PSD not set");
         return;
     };
+    if !std::path::Path::new(&path).is_file() {
+        println!("SKIPPED: AURORA_EFFECTS_PSD names no file");
+        return;
+    }
     let bytes = ok(std::fs::read(&path));
     let document = ok(open_psd_document(&bytes));
     let (_d, mut store) = store_with_budget(16_384);
@@ -534,13 +569,21 @@ fn worker_composite_equals_sync_composite_on_nyepi_and_measures_it() {
 
     // A dab on the bottom layer's tile (0, 0), composited synchronously
     // (at most `SYNC_TILE_LIMIT` tiles), exactly as 0.185.0 did.
+    // 0.188.0: the same warm edit on a one-thread pool, for the
+    // sequential figure from the same build.
+    let one_thread = one_thread_warm_edit(&mut layers, &mut store, &tiles, top);
     println!(
-        "NYEPI background composite: {} tiles, {held} source tiles held; sync full composite \
-         {sync_time:?}; first dispatch {first_dispatch:?} (shipped {shipped}), final pixels \
-         {first_final:?}; structural edit dispatch {edit_dispatch:?} (shipped {edit_shipped}), \
-         final pixels {edit_final:?}",
+        "NYEPI background composite ({} pool threads): {} tiles, {held} source tiles held; sync \
+         full composite {sync_time:?}; first dispatch {first_dispatch:?} (shipped {shipped}), \
+         final pixels {first_final:?}; structural edit dispatch {edit_dispatch:?} (shipped \
+         {edit_shipped}), final pixels {edit_final:?}; the same warm edit on a one-thread pool \
+         {one_thread:?}",
+        background_composite::composite_threads(),
         tiles.len()
     );
+    // The one-thread worker's installs went into a cache of its own.
+    cache.bump();
+    settle(&mut worker, &layers, &mut store, &mut cache, &tiles);
     let painted = (0..u64::try_from(layers.len()).unwrap_or(0).saturating_mul(4)).find_map(|raw| {
         let id = aurora_doc::LayerId::from_raw(raw);
         let surface = layers.surface_id(id)?;
@@ -577,7 +620,7 @@ fn a_superseded_generations_stale_tile_never_installs_under_the_new_job() {
     let (layers, size) = fixture(&mut store);
     let tiles = grid(size);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache = CompositeCache::default();
     assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
     gate.wait_blocked();
@@ -749,7 +792,7 @@ fn app_wiring_a_switch_mid_job_cancels_and_installs_nothing() {
     let (_e, mut store_b) = store_with_budget(256);
     let (layers_b, _) = fixture(&mut store_b);
     let gate = Arc::new(Gate::default());
-    let mut worker = CompositeWorker::new(Gate::waker(&gate));
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
     let mut cache_a = CompositeCache::default();
     let mut cache_b = CompositeCache::default();
     dispatch_or_composite_tiles(
@@ -815,7 +858,7 @@ fn a_continuous_drag_shows_provisional_tiles_that_are_never_current() {
     let tiles = grid(size);
     let first = aurora_tile::TileId { x: 0, y: 0 };
     let steps = Arc::new(Steps::default());
-    let mut worker = CompositeWorker::new(Steps::waker(&steps));
+    let mut worker = CompositeWorker::with_threads(Steps::waker(&steps), 1);
     let mut cache = CompositeCache::default();
     let top = top_layer(&layers);
     ok(layers.set_opacity(top, 0.1));
@@ -1164,5 +1207,206 @@ fn nyepi_active_share_against_the_equal_split_at_2048() {
             "the shares stay within the pool plus one floor"
         );
         worker.shutdown();
+    }
+}
+
+/// Holds every pool task just before it folds, until opened, counting
+/// arrivals: the several-thread counterpart of [`Gate`] (0.188.0).
+#[derive(Default)]
+struct TaskGate {
+    state: Mutex<(bool, usize)>,
+    changed: Condvar,
+}
+
+impl TaskGate {
+    fn hooks(gate: &Arc<Self>) -> background_composite::TestHooks {
+        let gate = Arc::clone(gate);
+        background_composite::TestHooks {
+            before_tile: Some(Arc::new(move || {
+                let Ok(mut state) = gate.state.lock() else {
+                    return;
+                };
+                state.1 += 1;
+                gate.changed.notify_all();
+                let start = Instant::now();
+                while !state.0 && start.elapsed() < Duration::from_secs(20) {
+                    let Ok((next, _)) = gate.changed.wait_timeout(state, Duration::from_millis(20))
+                    else {
+                        return;
+                    };
+                    state = next;
+                }
+            })),
+            ..background_composite::TestHooks::default()
+        }
+    }
+
+    /// Waits until at least `n` tasks are held.
+    fn wait_arrivals(&self, n: usize) -> usize {
+        let start = Instant::now();
+        let Ok(mut state) = self.state.lock() else {
+            unreachable!("gate poisoned");
+        };
+        while state.1 < n {
+            assert!(start.elapsed() < WAIT, "only {} tasks arrived", state.1);
+            let Ok((next, _)) = self.changed.wait_timeout(state, Duration::from_millis(20)) else {
+                unreachable!("gate poisoned");
+            };
+            state = next;
+        }
+        state.1
+    }
+
+    fn open(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.0 = true;
+        }
+        self.changed.notify_all();
+    }
+}
+
+/// 0.188.0: a job folded on several pool threads at once (forced: every
+/// task waits until a second thread has also started one) is bit-identical
+/// to the synchronous composite, with resident and with evicted sources.
+#[test]
+fn a_job_folded_on_several_threads_equals_the_sync_composite() {
+    for budget in [256, 4] {
+        let (_d, mut store) = store_with_budget(budget);
+        let (layers, size) = fixture(&mut store);
+        let tiles = grid(size);
+        assert!(tiles.len() > PARALLEL_THREADS);
+        let gate = Arc::new(TaskGate::default());
+        let mut worker = CompositeWorker::with_threads(noop_waker(), PARALLEL_THREADS);
+        worker.set_hooks(TaskGate::hooks(&gate));
+        let mut cache = CompositeCache::default();
+        assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+        let _ = gate.wait_arrivals(2);
+        gate.open();
+        let installed =
+            worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT);
+        assert_eq!(
+            installed,
+            tiles.len(),
+            "budget {budget}: every tile installed"
+        );
+        assert!(
+            worker.threads_used() >= 2,
+            "budget {budget}: only {} thread(s) composited",
+            worker.threads_used()
+        );
+        let have = read_composite(&mut store, &tiles);
+        let want = sync_composite(&layers, &mut store, &tiles);
+        assert_same(
+            &have,
+            &want,
+            &format!("{PARALLEL_THREADS} threads, budget {budget}"),
+        );
+        worker.shutdown();
+    }
+}
+
+/// 0.188.0: a cancel stops the pool *starting* tiles. With every pool
+/// thread held inside a tile, a cancel and a shutdown finish only those
+/// (at most one per thread), never the rest of the job, and the join
+/// returns.
+#[test]
+fn a_cancel_stops_the_pool_starting_tiles_and_shutdown_joins() {
+    let (_d, mut store) = store_with_budget(256);
+    let (layers, size) = fixture(&mut store);
+    let tiles = grid(size);
+    assert!(tiles.len() > PARALLEL_THREADS);
+    let gate = Arc::new(TaskGate::default());
+    let mut worker = CompositeWorker::with_threads(noop_waker(), PARALLEL_THREADS);
+    worker.set_hooks(TaskGate::hooks(&gate));
+    let mut cache = CompositeCache::default();
+    assert!(worker.dispatch(&mut target(&layers, &mut store, &mut cache), tiles.clone()));
+    let _ = gate.wait_arrivals(2);
+    worker.cancel();
+    gate.open();
+    let started = Instant::now();
+    worker.shutdown();
+    assert!(worker.thread_finished(), "shutdown joins the worker");
+    assert!(
+        started.elapsed() < Duration::from_mins(1),
+        "the join is bounded by the tiles in progress"
+    );
+    assert!(
+        worker.composited() <= PARALLEL_THREADS,
+        "only the tiles in progress finish: {} of {} composited",
+        worker.composited(),
+        tiles.len()
+    );
+}
+
+/// 0.188.0: the pool's shared drop-shadow cache is keyed by the mirror's
+/// store serial. Two documents whose shadowed layer has the same surface
+/// id, the same mirror content version and the same geometry but a
+/// different shape must not share a coverage tile across a mirror reset.
+#[test]
+fn the_pools_shadow_cache_never_mixes_two_documents_up() {
+    let build = |store: &mut aurora_tile::TileStore, at: i64| {
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = layer(
+            &mut layers,
+            store,
+            None,
+            rect(0, 0, 256, 256),
+            &move |x, y| {
+                if (x - at).abs() < 40 && (y - at).abs() < 30 {
+                    opaque(y, x)
+                } else {
+                    [0.0; 4]
+                }
+            },
+        );
+        let fx = aurora_core::LayerEffects {
+            drop_shadows: vec![aurora_core::effects::DropShadow {
+                distance: 8.0,
+                size: 10.0,
+                ..aurora_core::effects::DropShadow::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        };
+        ok(layers.set_effects(id, Some(fx)));
+        layers
+    };
+    let (_d, mut store_a) = store_with_budget(256);
+    let (_e, mut store_b) = store_with_budget(256);
+    let layers_a = build(&mut store_a, 80);
+    let layers_b = build(&mut store_b, 170);
+    let tiles = grid((256, 256));
+    let mut worker = CompositeWorker::with_threads(noop_waker(), PARALLEL_THREADS);
+    let mut cache_a = CompositeCache::default();
+    assert!(worker.dispatch(
+        &mut target(&layers_a, &mut store_a, &mut cache_a),
+        tiles.clone()
+    ));
+    let _ = worker.wait_until_idle(
+        Some(&mut target(&layers_a, &mut store_a, &mut cache_a)),
+        WAIT,
+    );
+    let mut cache_b = CompositeCache::default();
+    assert!(worker.dispatch(
+        &mut target(&layers_b, &mut store_b, &mut cache_b),
+        tiles.clone()
+    ));
+    let _ = worker.wait_until_idle(
+        Some(&mut target(&layers_b, &mut store_b, &mut cache_b)),
+        WAIT,
+    );
+    let have = read_composite(&mut store_b, &tiles);
+    let want = sync_composite(&layers_b, &mut store_b, &tiles);
+    assert_same(&have, &want, "document B after A on the same pool");
+    worker.shutdown();
+}
+
+#[test]
+fn composite_threads_leaves_a_core_and_is_at_least_one() {
+    let threads = background_composite::composite_threads();
+    assert!(threads >= 1);
+    if let Ok(available) = std::thread::available_parallelism()
+        && available.get() > 1
+    {
+        assert_eq!(threads, available.get() - 1);
     }
 }

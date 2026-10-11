@@ -20,8 +20,23 @@
 //! The worker composites with the very same
 //! [`crate::composite_roots_into_tile`] the synchronous path uses, against
 //! the mirror, so a result is bit-identical to a synchronous composite of
-//! the same document state. Its shadow and Curves LUT caches are the
-//! thread-locals of its own thread, keyed by the mirror's own serial.
+//! the same document state.
+//!
+//! **In parallel (0.188.0, ADR 0012's addendum).** The worker owns a
+//! rayon pool of [`composite_threads`] threads (`available_parallelism`
+//! − 1, at least one, so the UI thread and the brush keep a core) and
+//! folds a job's tiles on it, one tile per task. The mirror sits behind a
+//! `Mutex` for the duration of a job and each task reads it through a
+//! [`SharedMirror`]: a resident tile is a reference count taken under the
+//! lock ([`aurora_tile::TileStore::peek_shared`]) and copied outside it;
+//! only a tile that is not resident pages in under the lock. The fold path
+//! reads every store through [`crate::TileSource`], so it is the same
+//! code, and each tile's result is a pure function of the mirror's
+//! content and the job's tree: bit-identical to the sequential fold. The
+//! pool's threads share one drop-shadow coverage cache
+//! ([`crate::SharedShadowCache`], one `SHADOW_CACHE_BYTES` cap for the
+//! whole pool, keyed by the mirror's serial); Curves LUTs and scratch
+//! buffers stay per thread (bounded, see the addendum).
 //!
 //! **Installing.** The UI drains results in `about_to_wait`
 //! ([`CompositeWorker::drain`]); a result installs only if (1) its job is
@@ -37,11 +52,11 @@
 //! 0.186.0 entry.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use aurora_tile::{SurfaceId, TileId, TileShare, TileStore};
+use rayon::prelude::*;
 
 /// At most this many stale tiles are composited synchronously in the
 /// redraw handler instead of on the worker — the brush's own case (a dab
@@ -57,6 +72,16 @@ const SUPERSEDED_KEPT: usize = 4;
 
 /// The generation a cancelled worker sees: never a real job's.
 const CANCELLED: u64 = u64::MAX;
+
+/// How many threads the background compositor's pool folds tiles on
+/// (0.188.0): one fewer than the machine's available parallelism, and at
+/// least one, so the UI thread (and the brush, which composites its own
+/// dab synchronously) always keeps a core. A machine whose parallelism
+/// cannot be read gets one.
+#[must_use]
+pub(crate) fn composite_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+}
 
 type TileKey = (SurfaceId, TileId);
 
@@ -150,9 +175,24 @@ pub(crate) struct CompositeWorker {
     shut_down: bool,
     /// Tiles the worker thread has composited, over its whole life.
     composited: Arc<std::sync::atomic::AtomicUsize>,
+    /// The pool's thread count ([`composite_threads`] unless a test asked).
+    threads: usize,
     /// Test-only: what the last dispatch shipped, for the snapshot-size tests.
     #[cfg(test)]
     pub(crate) last_shipped: usize,
+    /// Test-only hooks into the pool's tasks.
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// Test-only hooks into the pool's tasks: which threads composited a tile,
+/// and a callback each task runs just before it folds (after its cancel
+/// check), so a test can hold tasks in flight.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestHooks {
+    pub(crate) threads: Arc<Mutex<HashSet<std::thread::ThreadId>>>,
+    pub(crate) before_tile: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for CompositeWorker {
@@ -167,6 +207,11 @@ impl std::fmt::Debug for CompositeWorker {
 
 impl CompositeWorker {
     pub(crate) fn new(waker: Waker) -> Self {
+        Self::with_threads(waker, composite_threads())
+    }
+
+    /// A worker whose pool has `threads` threads (at least one).
+    pub(crate) fn with_threads(waker: Waker, threads: usize) -> Self {
         Self {
             waker,
             tx: None,
@@ -184,9 +229,26 @@ impl CompositeWorker {
             finished: false,
             shut_down: false,
             composited: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            threads: threads.max(1),
             #[cfg(test)]
             last_shipped: 0,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         }
+    }
+
+    /// Test-only: installs `hooks` (before the first dispatch, which
+    /// starts the thread).
+    #[cfg(test)]
+    pub(crate) fn set_hooks(&mut self, hooks: TestHooks) {
+        self.hooks = hooks;
+    }
+
+    /// Test-only: how many distinct pool threads have composited a tile.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn threads_used(&self) -> usize {
+        self.hooks.threads.lock().map_or(0, |threads| threads.len())
     }
 
     /// Whether a job is in flight.
@@ -290,14 +352,28 @@ impl CompositeWorker {
         let waker = Arc::clone(&self.waker);
         let composited = Arc::clone(&self.composited);
         let mirror_resident = Arc::clone(&self.mirror_resident);
+        let threads = self.threads;
+        #[cfg(test)]
+        let hooks = self.hooks.clone();
         let spawned = std::thread::Builder::new()
             .name("aurora-composite".into())
             .spawn(move || {
-                let counters = Counters {
+                // One drop-shadow cache for this thread and the whole pool.
+                let shadows = crate::SharedShadowCache::default();
+                crate::use_shared_shadow_cache(Some(Arc::clone(&shadows)));
+                let pool = build_pool(threads, &shadows);
+                let context = WorkerContext {
+                    latest: &latest,
+                    wake_pending: &wake_pending,
+                    waker: &waker,
                     composited: &composited,
                     mirror_resident: &mirror_resident,
+                    pool: pool.as_ref(),
+                    #[cfg(test)]
+                    hooks,
                 };
-                worker_loop(&to_rx, &from_tx, &latest, &wake_pending, &waker, &counters);
+                worker_loop(&to_rx, &from_tx, &context);
+                crate::use_shared_shadow_cache(None);
             });
         match spawned {
             Ok(handle) => {
@@ -514,9 +590,11 @@ impl CompositeWorker {
     }
 
     /// Stops the worker for good (quit): cancels the job in flight, closes
-    /// the channel and joins the thread, which finishes at most the one
-    /// tile it is compositing. Its mirror store is dropped on that thread,
-    /// before the session's scratch directory is removed.
+    /// the channel and joins the thread. The pool starts no new tile once
+    /// the cancel lands, and finishes only the tiles already in progress
+    /// (at most one per pool thread, side by side, so about one tile's
+    /// time). Its mirror store is dropped on that thread, before the
+    /// session's scratch directory is removed.
     pub(crate) fn shutdown(&mut self) {
         self.shut_down = true;
         self.cancel();
@@ -619,27 +697,224 @@ fn new_mirror(source: &mut TileStore) -> Option<TileStore> {
     }
 }
 
-/// The worker's published counters.
-struct Counters<'a> {
+/// The pool the worker folds a job's tiles on: [`composite_threads`]
+/// threads (or a test's count) whose drop-shadow coverage goes through
+/// `shadows`. `None` if rayon cannot start it; the worker then folds
+/// sequentially on its own thread, as before 0.188.0.
+fn build_pool(threads: usize, shadows: &crate::SharedShadowCache) -> Option<rayon::ThreadPool> {
+    let shadows = Arc::clone(shadows);
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .thread_name(|index| format!("aurora-composite-{index}"))
+        .start_handler(move |_| crate::use_shared_shadow_cache(Some(Arc::clone(&shadows))))
+        .build()
+    {
+        Ok(pool) => Some(pool),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "couldn't start the compositor's thread pool; folding on one thread"
+            );
+            None
+        }
+    }
+}
+
+/// What the worker thread shares with its pool's tasks.
+struct WorkerContext<'a> {
+    latest: &'a AtomicU64,
+    wake_pending: &'a AtomicBool,
+    waker: &'a Waker,
+    /// Tiles composited over the worker's whole life.
     composited: &'a std::sync::atomic::AtomicUsize,
+    /// The mirror's resident tile count after the last job (MEM-1).
     mirror_resident: &'a std::sync::atomic::AtomicUsize,
+    pool: Option<&'a rayon::ThreadPool>,
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+impl WorkerContext<'_> {
+    /// Wakes the event loop, at most once until the UI drains.
+    fn wake(&self) {
+        if !self.wake_pending.swap(true, Ordering::SeqCst) {
+            (self.waker)();
+        }
+    }
+}
+
+/// Locks the mirror. A poisoned lock (a task panicked while holding it,
+/// which a release build's `panic = "abort"` never sees) is used as is:
+/// the store's own state is never left half-updated by a reader.
+fn lock(store: &Mutex<TileStore>) -> MutexGuard<'_, TileStore> {
+    match store.lock() {
+        Ok(store) => store,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// One pool task's view of the mirror (0.188.0): a [`crate::TileSource`]
+/// several threads read at once. A resident tile costs a lock, a lookup
+/// and a reference count; its texels are copied by the fold outside the
+/// lock. A tile that is not resident pages in under the lock (decoding
+/// there, so page-ins are serialized; a warm mirror has none). Reads never
+/// bump LRU recency under the lock themselves; the keys read are promoted
+/// in one go before a page-in and when the task finishes, so a page-in's
+/// eviction spares what the job is using.
+struct SharedMirror<'a> {
+    store: &'a Mutex<TileStore>,
+    serial: u64,
+    hits: Vec<TileKey>,
+}
+
+impl SharedMirror<'_> {
+    /// Promotes the resident tiles this task has read (LRU recency only;
+    /// nothing a fold sees).
+    fn promote(store: &mut TileStore, hits: &mut Vec<TileKey>) {
+        for (surface, id) in hits.drain(..) {
+            if store.is_resident(surface, id) {
+                let _ = store.get(surface, id);
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        if !self.hits.is_empty() {
+            Self::promote(&mut lock(self.store), &mut self.hits);
+        }
+    }
+}
+
+impl crate::TileSource for SharedMirror<'_> {
+    fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
+        lock(self.store).contains_tile(surface, id)
+    }
+
+    fn content_version(&self, surface: SurfaceId, id: TileId) -> u64 {
+        lock(self.store).content_version(surface, id)
+    }
+
+    fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    fn texels(
+        &mut self,
+        surface: SurfaceId,
+        id: TileId,
+    ) -> Result<crate::SourceTexels<'_>, aurora_tile::TileError> {
+        let mut store = lock(self.store);
+        if let Some(texels) = store.peek_shared(surface, id) {
+            self.hits.push((surface, id));
+            return Ok(crate::SourceTexels::Shared(texels));
+        }
+        if !store.contains_tile(surface, id) {
+            // `TileStore::get` would materialize a blank here; the fold
+            // path never asks (it checks `contains_tile` first), and a
+            // shared mirror must not change what other tasks' `contains_tile`
+            // answers mid-job, so it reads the same blank without storing it.
+            return Ok(crate::SourceTexels::Shared(Arc::new(vec![
+                half::f16::ZERO;
+                aurora_tile::SAMPLES
+            ])));
+        }
+        Self::promote(&mut store, &mut self.hits);
+        store.get(surface, id)?;
+        let texels = match store.peek_shared(surface, id) {
+            Some(texels) => texels,
+            None => Arc::new(store.get(surface, id)?.texels().to_vec()),
+        };
+        Ok(crate::SourceTexels::Shared(texels))
+    }
+}
+
+/// Folds `tiles` against `mirror` on the pool (or, without one, on this
+/// thread), sending each finished tile as it completes. A task first
+/// checks the job is still the latest: a newer job, a cancel or a
+/// shutdown stops the pool from *starting* tiles, and only those already
+/// in progress finish. Returns `true` when the UI's receiver is gone.
+fn composite_job(
+    context: &WorkerContext<'_>,
+    job: &JobTiles<'_>,
+    mirror: &Mutex<TileStore>,
+    tx: &mpsc::Sender<FromWorker>,
+) -> bool {
+    let serial = lock(mirror).serial();
+    let gone = AtomicBool::new(false);
+    let one = |tile_id: TileId| {
+        if gone.load(Ordering::SeqCst) || context.latest.load(Ordering::SeqCst) != job.generation {
+            return;
+        }
+        #[cfg(test)]
+        {
+            if let Ok(mut threads) = context.hooks.threads.lock() {
+                threads.insert(std::thread::current().id());
+            }
+            if let Some(hook) = context.hooks.before_tile.as_ref() {
+                hook();
+            }
+        }
+        let mut source = SharedMirror {
+            store: mirror,
+            serial,
+            hits: Vec::new(),
+        };
+        let doc_origin = crate::composite_tile_doc_origin(job.reference_origin, tile_id);
+        let mut budget = crate::CompositeBudget::for_tile_of_pass(job.layers);
+        let (texels, _folded) = crate::composite_roots_into_tile(
+            job.layers,
+            &mut source,
+            tile_id,
+            doc_origin,
+            job.reference_origin,
+            &mut budget,
+        );
+        source.finish();
+        context.composited.fetch_add(1, Ordering::SeqCst);
+        if tx
+            .send(FromWorker::Tile {
+                generation: job.generation,
+                tile_id,
+                texels,
+            })
+            .is_err()
+        {
+            gone.store(true, Ordering::SeqCst);
+            return;
+        }
+        context.wake();
+    };
+    match context.pool {
+        // One tile per task (`with_max_len(1)`): tiles cost very
+        // different amounts (an empty one next to a shadowed one), so the
+        // pool balances them by stealing single tiles.
+        Some(pool) => pool.install(|| {
+            job.tiles
+                .par_iter()
+                .with_max_len(1)
+                .for_each(|&tile_id| one(tile_id));
+        }),
+        None => job.tiles.iter().for_each(|&tile_id| one(tile_id)),
+    }
+    gone.load(Ordering::SeqCst)
+}
+
+/// The parts of a [`CompositeJob`] its pool tasks read (the job itself
+/// also carries the mirror deltas, which are not theirs to see).
+struct JobTiles<'a> {
+    generation: u64,
+    layers: &'a aurora_doc::LayerTree,
+    reference_origin: (i64, i64),
+    tiles: &'a [TileId],
 }
 
 fn worker_loop(
     rx: &mpsc::Receiver<ToWorker>,
     tx: &mpsc::Sender<FromWorker>,
-    latest: &AtomicU64,
-    wake_pending: &AtomicBool,
-    waker: &Waker,
-    counters: &Counters<'_>,
+    context: &WorkerContext<'_>,
 ) {
     let mut mirror: Option<TileStore> = None;
     let mut expected: HashSet<TileKey> = HashSet::new();
-    let wake = || {
-        if !wake_pending.swap(true, Ordering::SeqCst) {
-            waker();
-        }
-    };
     while let Ok(first) = rx.recv() {
         // Every queued job's deltas apply in order (they are cumulative);
         // only the newest is composited.
@@ -649,7 +924,7 @@ fn worker_loop(
                 ToWorker::Job(job) => job,
                 ToWorker::Release => {
                     mirror = None;
-                    counters.mirror_resident.store(0, Ordering::SeqCst);
+                    context.mirror_resident.store(0, Ordering::SeqCst);
                     expected.clear();
                     newest = None;
                     continue;
@@ -671,7 +946,10 @@ fn worker_loop(
             }
             newest = Some(job);
         }
-        let (Some(job), Some(store)) = (newest, mirror.as_mut()) else {
+        let Some(job) = newest else {
+            continue;
+        };
+        let Some(mut store) = mirror.take() else {
             continue;
         };
         // Anything the mirror holds that the UI store doesn't (a tile a
@@ -682,37 +960,31 @@ fn worker_loop(
                 store.forget_tile(key.0, key.1);
             }
         }
-        let mut budget = crate::CompositeBudget::for_pass(&job.layers);
-        for &tile_id in &job.tiles {
-            if latest.load(Ordering::SeqCst) != job.generation {
-                break;
-            }
-            let doc_origin = crate::composite_tile_doc_origin(job.reference_origin, tile_id);
-            budget.next_tile(&job.layers);
-            let (texels, _folded) = crate::composite_roots_into_tile(
-                &job.layers,
-                store,
-                tile_id,
-                doc_origin,
-                job.reference_origin,
-                &mut budget,
-            );
-            counters.composited.fetch_add(1, Ordering::SeqCst);
-            if tx
-                .send(FromWorker::Tile {
-                    generation: job.generation,
-                    tile_id,
-                    texels,
-                })
-                .is_err()
-            {
-                return;
-            }
-            wake();
-        }
-        counters
+        // A new pass for the (shared) drop-shadow cache's eviction policy.
+        let _pass = crate::CompositeBudget::for_pass(&job.layers);
+        let shared = Mutex::new(store);
+        let gone = composite_job(
+            context,
+            &JobTiles {
+                generation: job.generation,
+                layers: &job.layers,
+                reference_origin: job.reference_origin,
+                tiles: &job.tiles,
+            },
+            &shared,
+            tx,
+        );
+        let store = match shared.into_inner() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        context
             .mirror_resident
             .store(store.resident_len(), Ordering::SeqCst);
+        mirror = Some(store);
+        if gone {
+            return;
+        }
         if tx
             .send(FromWorker::Done {
                 generation: job.generation,
@@ -721,6 +993,6 @@ fn worker_loop(
         {
             return;
         }
-        wake();
+        context.wake();
     }
 }
