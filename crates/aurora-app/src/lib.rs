@@ -12601,6 +12601,12 @@ impl CompositeBudget {
     /// A budget for the first tile of a fresh composite pass over
     /// `layers`, with nothing reported yet.
     fn for_pass(layers: &aurora_doc::LayerTree) -> Self {
+        // A new composite pass, for the shadow cache's eviction policy.
+        SHADOW_CACHE.with(|cache| {
+            if let Ok(mut cache) = cache.try_borrow_mut() {
+                cache.begin_pass();
+            }
+        });
         Self {
             nodes: layers.len(),
             reported: false,
@@ -13360,7 +13366,463 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
     matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
         && layers
             .effects(id)
-            .is_some_and(|fx| fx.shown_color_overlays() > 0)
+            .is_some_and(|fx| fx.shown_color_overlays() > 0 || fx.shown_drop_shadows() > 0)
+}
+
+/// Where a composite tile sits: its document-space origin and the
+/// composite grid's anchor.
+#[derive(Debug, Clone, Copy)]
+struct CompositeTileAt {
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: composite-grid cells [`shadow_tile_coverage`] found
+    /// stored content in (each one `TileStore::get` for a same-origin,
+    /// unmasked layer).
+    static APRON_CELL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One drop shadow's coverage on composite tile `tile` (0.182.0), or
+/// `None` when no source pixel reaches it.
+///
+/// The source is the layer's *shape* (content alpha × mask, no Fill: a
+/// shadow does not fade with Fill) under a `(256 + 2A)`² window — `A` the
+/// shadow's apron — translated by minus the shadow's offset, since the
+/// shadow at `p` comes from the shape at `p - offset`. The window is
+/// assembled from the composite-grid cells it overlaps, each read through
+/// [`pixel_layer_texels`] (so masks and windowed layers behave exactly as
+/// they do for the content), cells with nothing stored skipped without a
+/// page-in; `own` is the composite tile's own shape, reused when its cell
+/// is in the window. At most 25 cells for [`aurora_core::effects::
+/// MAX_SHADOW_APRON`]. Never the whole layer (invariant §7.3.1). The
+/// window is then dilated and blurred by [`aurora_filters::shadow_coverage`]
+/// and cropped to the tile.
+fn shadow_tile_coverage(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    geometry: aurora_core::effects::ShadowGeometry,
+    budget: &mut CompositeBudget,
+) -> Option<std::rc::Rc<Vec<f32>>> {
+    let key = shadow_cache_key(id, layers, store, tile, geometry)?;
+    if let Some(hit) = SHADOW_CACHE.with(|cache| cache.try_borrow_mut().ok()?.get(&key)) {
+        return Some(hit);
+    }
+    #[cfg(test)]
+    SHADOW_COMPUTES.with(|n| n.set(n.get() + 1));
+    let errors_before = budget.store_errors;
+    let coverage = std::rc::Rc::new(compute_shadow_tile_coverage(
+        id, layers, store, tile, own, geometry, budget,
+    )?);
+    // Review RC-1: a source or mask tile that failed to page in was
+    // skipped (or failed open), so this coverage is degraded; the versions
+    // in the key have not changed, so caching it would keep serving it.
+    // Recompute next time instead, as the rest of the composite does.
+    if budget.store_errors == errors_before {
+        SHADOW_CACHE.with(|cache| {
+            if let Ok(mut cache) = cache.try_borrow_mut() {
+                cache.insert(key, std::rc::Rc::clone(&coverage));
+            }
+        });
+    }
+    Some(coverage)
+}
+
+/// The most the drop-shadow coverage cache holds per thread (0.182.0
+/// review): 256 MiB, i.e. 1,024 tiles of 256² `f32`. Past it the least
+/// recently used tile is dropped.
+const SHADOW_CACHE_BYTES: usize = 256 << 20;
+
+/// One cached tile's size.
+const SHADOW_CACHE_ENTRY_BYTES: usize =
+    aurora_tile::TILE as usize * aurora_tile::TILE as usize * std::mem::size_of::<f32>();
+
+/// What a drop shadow's coverage on one composite tile depends on — and
+/// nothing else (0.182.0 review): the store and the layer's surface, the
+/// layer's origin (a Move changes it), the tile's document position, the
+/// shadow's pixel geometry (any `SetEffects` that changes offset, spread
+/// or size), the enabled mask's settings, and the content version
+/// (`TileStore::content_version`) of every layer tile and mask tile under
+/// the source window. A dab, a pixel undo or redo, an open, a mask edit or
+/// a forgotten tile changes a version, so the entry is simply never found
+/// again — no eviction call can be forgotten, and a stale shadow needs a
+/// key collision, which equality on the whole key rules out. Opacity,
+/// blend mode, Fill, visibility, colour and other layers are not in it:
+/// coverage does not depend on them, so those edits hit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShadowCacheKey {
+    store: u64,
+    surface: aurora_tile::SurfaceId,
+    layer_origin: (i64, i64),
+    doc_origin: (i64, i64),
+    geometry: (i64, i64, u32, u32),
+    mask: Option<(i64, i64, u32, u32, bool, u32)>,
+    versions: Vec<(bool, u32, u32, bool, u64)>,
+}
+
+/// The shadow coverage cache (0.182.0 review): least recently used
+/// first, but **never an entry already used in the current composite
+/// pass** (RC-2). A pass visits its (shadow, tile) pairs in order, so plain
+/// LRU would evict each entry just before the next pass reuses it once a
+/// pass needs more than the cap; here, when every entry has been used this
+/// pass, a new one is simply not kept, so the first [`SHADOW_CACHE_BYTES`]
+/// worth of the pass survives to the next and only the rest recompute.
+/// Entries left over from earlier passes (old versions after an edit, a
+/// closed document) are what gets evicted. Eviction is `O(log n)` through
+/// `order`, keyed `(last pass used, use stamp)`.
+type ShadowStamp = (u64, u64);
+
+#[derive(Default)]
+struct ShadowCache {
+    entries: std::collections::HashMap<ShadowCacheKey, (ShadowStamp, std::rc::Rc<Vec<f32>>)>,
+    order: std::collections::BTreeMap<ShadowStamp, ShadowCacheKey>,
+    clock: u64,
+    pass: u64,
+}
+
+impl ShadowCache {
+    fn begin_pass(&mut self) {
+        self.pass += 1;
+    }
+
+    fn get(&mut self, key: &ShadowCacheKey) -> Option<std::rc::Rc<Vec<f32>>> {
+        self.clock += 1;
+        let stamp = (self.pass, self.clock);
+        let (old, coverage) = self.entries.get_mut(key)?;
+        let previous = std::mem::replace(old, stamp);
+        let coverage = std::rc::Rc::clone(coverage);
+        self.order.remove(&previous);
+        self.order.insert(stamp, key.clone());
+        Some(coverage)
+    }
+
+    fn insert(&mut self, key: ShadowCacheKey, coverage: std::rc::Rc<Vec<f32>>) {
+        let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
+        if let Some((old, _)) = self.entries.remove(&key) {
+            self.order.remove(&old);
+        }
+        while self.entries.len() >= cap {
+            let Some((&oldest, _)) = self.order.iter().next() else {
+                break;
+            };
+            if oldest.0 >= self.pass {
+                // Everything was used this pass: keep them, drop the new one.
+                return;
+            }
+            if let Some(victim) = self.order.remove(&oldest) {
+                self.entries.remove(&victim);
+            }
+        }
+        self.clock += 1;
+        let stamp = (self.pass, self.clock);
+        self.order.insert(stamp, key.clone());
+        self.entries.insert(key, (stamp, coverage));
+    }
+}
+
+thread_local! {
+    /// Drop-shadow coverage tiles, per thread (compositing runs on one).
+    static SHADOW_CACHE: std::cell::RefCell<ShadowCache> =
+        std::cell::RefCell::new(ShadowCache::default());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many shadow coverage tiles were computed (misses).
+    static SHADOW_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The versions of every tile of `surface` (whose tile grid starts at
+/// document `origin`) overlapping the document rect `window` of `side`².
+fn surface_window_versions(
+    store: &aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    origin: (i64, i64),
+    window: (i64, i64),
+    side: i64,
+    is_mask: bool,
+    out: &mut Vec<(bool, u32, u32, bool, u64)>,
+) {
+    let t = i64::from(aurora_tile::TILE);
+    let lo = (
+        (window.0 - origin.0).div_euclid(t),
+        (window.1 - origin.1).div_euclid(t),
+    );
+    let hi = (
+        (window.0 + side - 1 - origin.0).div_euclid(t),
+        (window.1 + side - 1 - origin.1).div_euclid(t),
+    );
+    for ty in lo.1.max(0)..=hi.1 {
+        for tx in lo.0.max(0)..=hi.0 {
+            let (Ok(x), Ok(y)) = (u32::try_from(tx), u32::try_from(ty)) else {
+                continue;
+            };
+            let id = aurora_tile::TileId { x, y };
+            let held = store.contains_tile(surface, id);
+            if held {
+                out.push((is_mask, x, y, held, store.content_version(surface, id)));
+            }
+        }
+    }
+}
+
+/// [`ShadowCacheKey`] for one shadow on one tile; `None` for a layer with
+/// no surface.
+fn shadow_cache_key(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &aurora_tile::TileStore,
+    tile: CompositeTileAt,
+    geometry: aurora_core::effects::ShadowGeometry,
+) -> Option<ShadowCacheKey> {
+    let surface = layers.surface_id(id)?;
+    let t = i64::from(aurora_tile::TILE);
+    let apron = i64::from(geometry.apron);
+    let side = t + 2 * apron;
+    let window = (
+        tile.doc_origin.0 - geometry.offset.0 - apron,
+        tile.doc_origin.1 - geometry.offset.1 - apron,
+    );
+    let layer_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+    let mut versions = Vec::new();
+    surface_window_versions(
+        store,
+        surface,
+        layer_origin,
+        window,
+        side,
+        false,
+        &mut versions,
+    );
+    let mask = layers.mask(id).filter(|m| m.enabled).map(|m| {
+        if let Some(mask_surface) = layers.mask_surface_id(id) {
+            surface_window_versions(
+                store,
+                mask_surface,
+                (m.bounds.x, m.bounds.y),
+                window,
+                side,
+                true,
+                &mut versions,
+            );
+        }
+        (
+            m.bounds.x,
+            m.bounds.y,
+            m.bounds.width,
+            m.bounds.height,
+            m.inverted,
+            m.density.to_bits(),
+        )
+    });
+    Some(ShadowCacheKey {
+        store: store.serial(),
+        surface,
+        layer_origin,
+        doc_origin: tile.doc_origin,
+        geometry: (
+            geometry.offset.0,
+            geometry.offset.1,
+            geometry.choke,
+            geometry.blur_radius,
+        ),
+        mask,
+        versions,
+    })
+}
+
+/// [`shadow_tile_coverage`]'s computation, uncached.
+fn compute_shadow_tile_coverage(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    geometry: aurora_core::effects::ShadowGeometry,
+    budget: &mut CompositeBudget,
+) -> Option<Vec<f32>> {
+    let t = i64::from(aurora_tile::TILE);
+    let apron = i64::from(geometry.apron);
+    let side = t + 2 * apron;
+    let side_usize = usize::try_from(side).ok()?;
+    let window = (
+        tile.doc_origin.0 - geometry.offset.0 - apron,
+        tile.doc_origin.1 - geometry.offset.1 - apron,
+    );
+    let same_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y)) == tile.reference_origin;
+    let cell_lo = (
+        (window.0 - tile.reference_origin.0).div_euclid(t),
+        (window.1 - tile.reference_origin.1).div_euclid(t),
+    );
+    let cell_hi = (
+        (window.0 + side - 1 - tile.reference_origin.0).div_euclid(t),
+        (window.1 + side - 1 - tile.reference_origin.1).div_euclid(t),
+    );
+    let mut alpha: Option<Vec<f32>> = None;
+    for cy in cell_lo.1..=cell_hi.1 {
+        for cx in cell_lo.0..=cell_hi.0 {
+            let cell_origin = (
+                tile.reference_origin.0 + cx * t,
+                tile.reference_origin.1 + cy * t,
+            );
+            let (Ok(ux), Ok(uy)) = (u32::try_from(cx), u32::try_from(cy)) else {
+                if same_origin {
+                    continue;
+                }
+                // A windowed layer ignores the id; only the origin counts.
+                let read = pixel_layer_texels(
+                    id,
+                    layers,
+                    store,
+                    aurora_tile::TileId { x: 0, y: 0 },
+                    cell_origin,
+                    tile.reference_origin,
+                    budget,
+                );
+                if let Some(cell) = read {
+                    copy_cell_alpha(&mut alpha, &cell, cell_origin, window, side_usize);
+                }
+                continue;
+            };
+            let cell_id = aurora_tile::TileId { x: ux, y: uy };
+            let read = if let (true, Some(own)) = (cell_origin == tile.doc_origin, own) {
+                Some(own.to_vec())
+            } else {
+                pixel_layer_texels(
+                    id,
+                    layers,
+                    store,
+                    cell_id,
+                    cell_origin,
+                    tile.reference_origin,
+                    budget,
+                )
+            };
+            if let Some(cell) = read {
+                #[cfg(test)]
+                APRON_CELL_READS.with(|n| n.set(n.get() + 1));
+                copy_cell_alpha(&mut alpha, &cell, cell_origin, window, side_usize);
+            }
+        }
+    }
+    let alpha = alpha?;
+    let coverage = aurora_filters::shadow_coverage(
+        &alpha,
+        side_usize,
+        geometry.choke as usize,
+        geometry.blur_radius as usize,
+        aurora_tile::TILE as usize,
+    );
+    (!coverage.is_empty()).then_some(coverage)
+}
+
+/// Copies `cell`'s alpha (a 256² straight RGBA tile at document
+/// `cell_origin`) into the `side`² window at document `window`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+fn copy_cell_alpha(
+    alpha: &mut Option<Vec<f32>>,
+    cell: &[half::f16],
+    cell_origin: (i64, i64),
+    window: (i64, i64),
+    side: usize,
+) {
+    let t = i64::from(aurora_tile::TILE);
+    let side_i = side as i64;
+    let out = alpha.get_or_insert_with(|| vec![0.0; side * side]);
+    let x_lo = cell_origin.0.max(window.0);
+    let x_hi = (cell_origin.0 + t).min(window.0 + side_i);
+    let y_lo = cell_origin.1.max(window.1);
+    let y_hi = (cell_origin.1 + t).min(window.1 + side_i);
+    for y in y_lo..y_hi {
+        let src_row = ((y - cell_origin.1) * t) as usize;
+        let dst_row = ((y - window.1) * side_i) as usize;
+        for x in x_lo..x_hi {
+            let src = (src_row + (x - cell_origin.0) as usize) * aurora_tile::CHANNELS + 3;
+            if let (Some(a), Some(d)) = (
+                cell.get(src),
+                out.get_mut(dst_row + (x - window.0) as usize),
+            ) {
+                *d = a.to_f32();
+            }
+        }
+    }
+}
+
+/// Grows `rects` (document space) by where a layer's shown drop shadows
+/// reach (0.182.0): each rect shifted by every shadow's offset and grown
+/// by its apron, kept alongside the original. A layer without shown
+/// shadows gets `rects` back unchanged. So editing a shadowed layer also
+/// repaints the tiles its shadow falls on.
+fn effect_reach_rects(
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+    rects: &[aurora_core::Rect],
+) -> Vec<aurora_core::Rect> {
+    let mut out = rects.to_vec();
+    let Some(fx) = layers.effects(layer) else {
+        return out;
+    };
+    if !layer_renders_effects(layers, layer) {
+        return out;
+    }
+    for shadow in fx.drop_shadows.iter().filter(|s| fx.shows(s.gate)) {
+        let g = shadow.geometry();
+        let a = i64::from(g.apron);
+        for r in rects {
+            out.push(aurora_core::Rect {
+                x: r.x + g.offset.0 - a,
+                y: r.y + g.offset.1 - a,
+                width: r
+                    .width
+                    .saturating_add(u32::try_from(2 * a).unwrap_or(u32::MAX)),
+                height: r
+                    .height
+                    .saturating_add(u32::try_from(2 * a).unwrap_or(u32::MAX)),
+            });
+        }
+    }
+    out
+}
+
+/// What a brush or eraser dab on `layer` invalidates (0.182.0): the
+/// painted layer tiles as document rects, grown by the layer's shadow
+/// reach ([`effect_reach_rects`]).
+fn invalidate_painted_tiles(
+    cache: &mut CompositeCache,
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+    painted: &[aurora_tile::TileId],
+    reference_origin: (i64, i64),
+) {
+    for &tile in painted {
+        cache.invalidate(tile);
+    }
+    let Some(bounds) = layers.bounds(layer) else {
+        return;
+    };
+    let t = i64::from(aurora_tile::TILE);
+    let rects: Vec<aurora_core::Rect> = painted
+        .iter()
+        .map(|tile| aurora_core::Rect {
+            x: bounds.x + i64::from(tile.x) * t,
+            y: bounds.y + i64::from(tile.y) * t,
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+        })
+        .collect();
+    let reach = effect_reach_rects(layers, layer, &rects);
+    if reach.len() > rects.len() {
+        cache.invalidate_doc_rects(&reach, reference_origin);
+    }
 }
 
 /// Folds a pixel layer that draws layer effects into `accumulator`
@@ -13439,7 +13901,7 @@ fn fold_layer_with_effects(
     ) else {
         return false;
     };
-    let Some(shape) = pixel_layer_texels(
+    let own = pixel_layer_texels(
         id,
         layers,
         store,
@@ -13447,12 +13909,33 @@ fn fold_layer_with_effects(
         doc_origin,
         reference_origin,
         budget,
-    ) else {
-        return false;
+    );
+    // Step 0 (0.182.0): each shown drop shadow, beneath the content, in
+    // list order (bottom to top; unverified against Photoshop). A shadow
+    // can land on a tile the layer never painted, so a blank `own` does
+    // not end the fold while a shadow still reaches this tile.
+    let tile = CompositeTileAt {
+        doc_origin,
+        reference_origin,
     };
+    let shadows = shown_shadow_coverages(fx, id, layers, store, tile, own.as_deref(), budget);
+    if own.is_none() && shadows.is_empty() {
+        return false;
+    }
+    let shape = own.unwrap_or_else(aurora_render::transparent_tile);
     let raw_blend_mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
+    let dissolve = raw_blend_mode == aurora_doc::BlendMode::Dissolve;
+    // 0.182.0 review (DS-2): with shadows, the shadows, content and
+    // overlays are composed as one unit over the backdrop and the unit is
+    // then faded by layer opacity — so at opacity < 1 an opaque layer
+    // still hides its own shadow, as in Photoshop. (A `Dissolve` layer's
+    // dither already carries its opacity, so its shadows are faded by it.)
+    let unit = !dissolve && !shadows.is_empty();
+    let backdrop = (unit && opacity < 1.0).then(|| accumulator.to_vec());
+    let shadow_factor = if unit { 1.0 } else { opacity };
+    fold_shadows_beneath(accumulator, &shadows, &shape, shadow_factor, doc_origin);
     let one = half::f16::from_f32(1.0);
     // Step 1: the content at full shape, alpha `F`, in the layer's mode
     // (`Dissolve` gates the final coverage instead, step 3).
@@ -13492,7 +13975,7 @@ fn fold_layer_with_effects(
     } else {
         shape
     };
-    let scale = if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+    let scale = if dissolve || unit {
         1.0
     } else {
         opacity.clamp(0.0, 1.0)
@@ -13511,7 +13994,76 @@ fn fold_layer_with_effects(
             *channel = half::f16::from_f32((x.to_f32() - b).mul_add(t, b));
         }
     }
+    if let Some(backdrop) = backdrop {
+        let l = opacity.clamp(0.0, 1.0);
+        for (channel, &below) in accumulator.iter_mut().zip(&backdrop) {
+            let b = below.to_f32();
+            *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(l, b));
+        }
+    }
     true
+}
+
+/// Each shown drop shadow of `fx` with its coverage on `tile`, in list
+/// order, leaving out those that do not reach it.
+fn shown_shadow_coverages<'a>(
+    fx: &'a aurora_core::LayerEffects,
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    budget: &mut CompositeBudget,
+) -> Vec<(&'a aurora_core::effects::DropShadow, std::rc::Rc<Vec<f32>>)> {
+    let mut shadows = Vec::new();
+    for shadow in fx.drop_shadows.iter().filter(|s| fx.shows(s.gate)) {
+        let geometry = shadow.geometry();
+        if let Some(coverage) = shadow_tile_coverage(id, layers, store, tile, own, geometry, budget)
+        {
+            shadows.push((shadow, coverage));
+        }
+    }
+    shadows
+}
+
+/// Folds each drop shadow's `coverage` onto `accumulator` beneath the
+/// layer (0.182.0): the shadow colour at coverage × (1 − shape) when it
+/// knocks out, in its own mode at `shadow opacity × layer opacity`.
+fn fold_shadows_beneath(
+    accumulator: &mut [half::f16],
+    shadows: &[(&aurora_core::effects::DropShadow, std::rc::Rc<Vec<f32>>)],
+    shape: &[half::f16],
+    opacity: f32,
+    doc_origin: (i64, i64),
+) {
+    for (shadow, coverage) in shadows {
+        let colour = [shadow.color.r, shadow.color.g, shadow.color.b].map(half::f16::from_f32);
+        let mut source = Vec::with_capacity(shape.len());
+        for (cover, texel) in coverage
+            .as_slice()
+            .iter()
+            .zip(shape.chunks_exact(aurora_tile::CHANNELS))
+        {
+            // Knockout (`layerConceals`): the layer's own *shape* hides its
+            // shadow, whatever its Fill — the point of the option is a
+            // Fill-0 layer showing its shadow only outside its shape.
+            let hidden = if shadow.knocks_out {
+                texel.get(3).map_or(0.0, |a| a.to_f32().clamp(0.0, 1.0))
+            } else {
+                0.0
+            };
+            let [r, g, b] = colour;
+            source.extend([r, g, b, half::f16::from_f32(cover * (1.0 - hidden))]);
+        }
+        // Layer opacity fades the shadow; Fill does not.
+        fold_texels_in_mode(
+            accumulator,
+            &source,
+            shadow.opacity * opacity,
+            aurora_doc::BlendMode::from(shadow.blend_mode),
+            doc_origin,
+        );
+    }
 }
 
 /// Folds straight-alpha `texels` into `accumulator` at `opacity` in
@@ -19111,21 +19663,22 @@ fn stroke_invalidation(
         return CompositeInvalidation::Everything;
     };
     let tile_size = i64::from(aurora_tile::TILE);
-    CompositeInvalidation::Regions(
-        tiles
-            .iter()
-            .map(|tile| aurora_core::Rect {
-                x: bounds
-                    .x
-                    .saturating_add(i64::from(tile.x).saturating_mul(tile_size)),
-                y: bounds
-                    .y
-                    .saturating_add(i64::from(tile.y).saturating_mul(tile_size)),
-                width: aurora_tile::TILE,
-                height: aurora_tile::TILE,
-            })
-            .collect(),
-    )
+    let rects: Vec<aurora_core::Rect> = tiles
+        .iter()
+        .map(|tile| aurora_core::Rect {
+            x: bounds
+                .x
+                .saturating_add(i64::from(tile.x).saturating_mul(tile_size)),
+            y: bounds
+                .y
+                .saturating_add(i64::from(tile.y).saturating_mul(tile_size)),
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+        })
+        .collect();
+    // 0.182.0: a shadowed layer's pixel undo/redo repaints its shadow's
+    // reach too.
+    CompositeInvalidation::Regions(effect_reach_rects(layers, layer, &rects))
 }
 
 /// What a [`read_layer_window`] call is reading, which decides how a
@@ -24748,9 +25301,14 @@ impl App {
             self.current_colour,
             &mut self.drag,
         );
-        for &tile in outcome.painted() {
-            self.doc.composite_cache.invalidate(tile);
-        }
+        let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
+        invalidate_painted_tiles(
+            &mut self.doc.composite_cache,
+            &self.doc.layers,
+            layer_id,
+            outcome.painted(),
+            reference_origin,
+        );
         // One line per broken tile per *stroke*, not per dab and not per
         // tile per dab -- see `unwarned_failures`. Every fresh failure
         // gets its own line (0.57.0): a radius-24 dab spans up to four
@@ -24805,9 +25363,14 @@ impl App {
             self.current_colour,
             &mut self.drag,
         );
-        for &tile in outcome.painted() {
-            self.doc.composite_cache.invalidate(tile);
-        }
+        let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
+        invalidate_painted_tiles(
+            &mut self.doc.composite_cache,
+            &self.doc.layers,
+            layer_id,
+            outcome.painted(),
+            reference_origin,
+        );
         // One line per broken tile per stroke, every one of them --
         // `Self::paint_dab`'s own reasoning, mirrored.
         let fresh = unwarned_failures(&mut self.drag, &outcome);
@@ -31855,10 +32418,23 @@ mod tests {
                     }
                 }
             }
-            for y in y0.max(0)..=y1.min(i64::from(h) - 1) {
-                for x in x0.max(0)..=x1.min(i64::from(w) - 1) {
-                    if let Some(slot) = in_overlay.get_mut((y * i64::from(w) + x) as usize) {
-                        *slot = true;
+            if x1 < x0 {
+                continue;
+            }
+            // 0.182.0: grown by where the layer's shadows reach.
+            let painted = aurora_core::Rect {
+                x: x0,
+                y: y0,
+                width: (x1 - x0 + 1) as u32,
+                height: (y1 - y0 + 1) as u32,
+            };
+            for r in super::effect_reach_rects(layers, id, &[painted]) {
+                let (rx1, ry1) = (r.x + i64::from(r.width) - 1, r.y + i64::from(r.height) - 1);
+                for y in r.y.max(0)..=ry1.min(i64::from(h) - 1) {
+                    for x in r.x.max(0)..=rx1.min(i64::from(w) - 1) {
+                        if let Some(slot) = in_overlay.get_mut((y * i64::from(w) + x) as usize) {
+                            *slot = true;
+                        }
                     }
                 }
             }
@@ -73485,7 +74061,12 @@ mod tests {
     /// 0.181.0 (E2): Fill applied everywhere, and Color Overlay drawn.
     mod fill_and_overlay_tests {
         use super::*;
-        use crate::{fold_layer_into, layer_renders_effects, layer_shows_effects};
+        use crate::{
+            APRON_CELL_READS, CompositeTileAt, SHADOW_CACHE, SHADOW_CACHE_BYTES,
+            SHADOW_CACHE_ENTRY_BYTES, SHADOW_COMPUTES, ShadowCache, ShadowCacheKey,
+            effect_reach_rects, fold_layer_into, invalidate_painted_tiles, layer_renders_effects,
+            layer_shows_effects, pixel_layer_texels, shadow_tile_coverage, stroke_invalidation,
+        };
 
         const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
         const TOL: f32 = 2.0e-3;
@@ -73717,9 +74298,9 @@ mod tests {
             let (_, cpu_unfilled) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
             ok(layers.set_fill_opacity(mul, 0.5));
             ok(layers.set_fill_opacity(top, 0.3));
-            // A drop shadow is not drawn yet, so it must not refuse the GPU.
+            // A stroke is not drawn yet, so it must not refuse the GPU.
             let fx = aurora_core::LayerEffects {
-                drop_shadows: vec![aurora_core::effects::DropShadow::default()],
+                strokes: vec![aurora_core::effects::Stroke::default()],
                 ..aurora_core::LayerEffects::default()
             };
             ok(layers.set_effects(top, Some(fx)));
@@ -73965,8 +74546,10 @@ mod tests {
                 1.0,
             );
             off.gate.enabled = false;
+            let mut no_shadow = aurora_core::effects::DropShadow::default();
+            no_shadow.gate.enabled = false;
             let fx = aurora_core::LayerEffects {
-                drop_shadows: vec![aurora_core::effects::DropShadow::default()],
+                drop_shadows: vec![no_shadow],
                 strokes: vec![aurora_core::effects::Stroke::default()],
                 outer_glows: vec![aurora_core::effects::OuterGlow::default()],
                 color_overlays: vec![off],
@@ -73978,55 +74561,976 @@ mod tests {
             assert!(document_qualifies_for_gpu_compositing(&layers));
         }
 
+        // ---- 0.182.0 (E3): drop shadows ----
+
+        fn shadow(
+            angle: f32,
+            distance: f32,
+            size: f32,
+            spread: f32,
+        ) -> aurora_core::effects::DropShadow {
+            aurora_core::effects::DropShadow {
+                blend_mode: aurora_core::effects::EffectBlendMode::Normal,
+                opacity: 1.0,
+                use_global_light: false,
+                angle,
+                local_angle: angle,
+                distance,
+                spread,
+                size,
+                knocks_out: false,
+                ..aurora_core::effects::DropShadow::default()
+            }
+        }
+
+        fn set_shadows(
+            layers: &mut aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+            shadows: Vec<aurora_core::effects::DropShadow>,
+        ) {
+            let fx = aurora_core::LayerEffects {
+                drop_shadows: shadows,
+                ..aurora_core::LayerEffects::default()
+            };
+            ok(layers.set_effects(id, Some(fx)));
+        }
+
+        /// An empty pixel layer at `origin`, with `rect` (document space)
+        /// painted opaque white.
+        fn painted(
+            layers: &mut aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            origin: (i64, i64),
+            rect: (i64, i64, i64, i64),
+        ) -> aurora_doc::LayerId {
+            let b = aurora_core::Rect {
+                x: origin.0,
+                y: origin.1,
+                width: 4096,
+                height: 4096,
+            };
+            let id = ok(layers.add_pixel_layer("p", b, None));
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let t = i64::from(aurora_tile::TILE);
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    let (lx, ly) = (x - origin.0, y - origin.1);
+                    let (Ok(tx), Ok(ty)) = (u32::try_from(lx / t), u32::try_from(ly / t)) else {
+                        unreachable!("inside the layer");
+                    };
+                    let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: tx, y: ty })
+                    else {
+                        unreachable!("writable");
+                    };
+                    let i = usize::try_from(((ly % t) * t + lx % t) * 4).unwrap_or(0);
+                    for (k, v) in tile.texels_mut().iter_mut().skip(i).take(4).enumerate() {
+                        let _ = k;
+                        *v = half::f16::from_f32(1.0);
+                    }
+                    tile.mark_dirty(aurora_core::Rect {
+                        x: 0,
+                        y: 0,
+                        width: aurora_tile::TILE,
+                        height: aurora_tile::TILE,
+                    });
+                }
+            }
+            id
+        }
+
+        /// The CPU composite (premultiplied) of composite tile `(tx, ty)`
+        /// with the grid anchored at `reference`.
+        fn composite_tile_at(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+            tx: i64,
+            ty: i64,
+            reference: (i64, i64),
+        ) -> Vec<half::f16> {
+            let t = i64::from(aurora_tile::TILE);
+            let mut acc = aurora_render::transparent_tile();
+            let mut budget = CompositeBudget::for_pass(layers);
+            let id = aurora_tile::TileId {
+                x: u32::try_from(tx).unwrap_or(0),
+                y: u32::try_from(ty).unwrap_or(0),
+            };
+            for &layer in layers.roots().iter().rev() {
+                let _ = fold_layer_into(
+                    &mut acc,
+                    layer,
+                    layers,
+                    store,
+                    id,
+                    (reference.0 + tx * t, reference.1 + ty * t),
+                    reference,
+                    1,
+                    &mut budget,
+                );
+            }
+            acc
+        }
+
+        fn alpha_at(acc: &[half::f16], x: usize, y: usize) -> f32 {
+            texel(acc, x, y)[3]
+        }
+
+        /// Mean error per channel over a document rect of a corpus file.
+        fn region_error(relative: &str, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<[f64; 3]> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../corpora/psd/reference/psd-tools-fixtures")
+                .join(relative);
+            let bytes = std::fs::read(&path).ok()?;
+            let merged = aurora_io::decode_psd_merged_image(&bytes).ok()?;
+            let (_scratch, mut store) = real_tile_store();
+            let (_document, image) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            let mut sum = [0.0_f64; 3];
+            let mut n = 0.0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let got = image_pixel(&image, x, y);
+                    let want = image_pixel(&merged, x, y);
+                    let a = f64::from(got[3]);
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        let g = f64::from(got.get(c).copied().unwrap_or(0.0)) * a + (1.0 - a);
+                        let w = f64::from(want.get(c).copied().unwrap_or(0.0));
+                        *s += ((g * 255.0).round() - (w * 255.0).round()).abs();
+                    }
+                    n += 1.0;
+                }
+            }
+            Some(sum.map(|s| s / n))
+        }
+
+        #[test]
+        fn shadow_offset_follows_photoshop_angle_y_down() {
+            for (angle, at) in [
+                (0.0, (90, 100)),
+                (90.0, (100, 110)),
+                (120.0, (105, 109)),
+                (180.0, (110, 100)),
+                (30.0, (91, 105)),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 1, 1));
+                ok(layers.set_fill_opacity(id, 0.0));
+                set_shadows(&mut layers, id, vec![shadow(angle, 10.0, 0.0, 0.0)]);
+                let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                assert!(
+                    (alpha_at(&acc, at.0, at.1) - 1.0).abs() < TOL,
+                    "{angle}: {at:?}"
+                );
+                let total: f32 = acc
+                    .chunks_exact(4)
+                    .map(|p| p.get(3).map_or(0.0, |a| a.to_f32()))
+                    .sum();
+                assert!(
+                    (total - 1.0).abs() < TOL,
+                    "{angle}: exactly one dot, {total}"
+                );
+            }
+        }
+
+        /// Shadow coverage computed tile by tile matches one big window,
+        /// bit for bit: same-origin and at a negative layer origin.
+        #[test]
+        fn shadow_is_seamless_across_tile_boundaries() {
+            for origin in [(0_i64, 0_i64), (-300, -300)] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, origin, (226, 231, 40, 50));
+                let sh = shadow(120.0, 7.0, 20.0, 0.25);
+                set_shadows(&mut layers, id, vec![sh.clone()]);
+                let g = sh.geometry();
+                let a = i64::from(g.apron);
+                // The reference: one window over doc [0, 512)², built directly.
+                let side = 512 + 2 * a;
+                let side_u = usize::try_from(side).unwrap_or(0);
+                let mut alpha = vec![0.0_f32; side_u * side_u];
+                for y in 0..side {
+                    for x in 0..side {
+                        let (sx, sy) = (x - a - g.offset.0, y - a - g.offset.1);
+                        if (226..266).contains(&sx)
+                            && (231..281).contains(&sy)
+                            && let Some(v) =
+                                alpha.get_mut(usize::try_from(y * side + x).unwrap_or(0))
+                        {
+                            *v = 1.0;
+                        }
+                    }
+                }
+                let reference = aurora_filters::shadow_coverage(
+                    &alpha,
+                    side_u,
+                    g.choke as usize,
+                    g.blur_radius as usize,
+                    512,
+                );
+                for (tx, ty) in [(0_i64, 0_i64), (1, 0), (0, 1), (1, 1)] {
+                    let mut budget = CompositeBudget::for_pass(&layers);
+                    let at = CompositeTileAt {
+                        doc_origin: (tx * 256, ty * 256),
+                        reference_origin: (0, 0),
+                    };
+                    let Some(cov) =
+                        shadow_tile_coverage(id, &layers, &mut store, at, None, g, &mut budget)
+                    else {
+                        unreachable!("the shadow reaches every corner tile");
+                    };
+                    for (i, v) in cov.iter().enumerate() {
+                        let (x, y) = (
+                            i % 256 + usize::try_from(tx).unwrap_or(0) * 256,
+                            i / 256 + usize::try_from(ty).unwrap_or(0) * 256,
+                        );
+                        assert_eq!(
+                            v.to_bits(),
+                            reference.get(y * 512 + x).map_or(0, |r| r.to_bits()),
+                            "{origin:?} ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn shadow_lands_on_tiles_the_layer_never_painted() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (250, 128, 1, 1));
+            set_shadows(&mut layers, id, vec![shadow(180.0, 20.0, 0.0, 0.0)]);
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            assert!(!store.contains_tile(surface, aurora_tile::TileId { x: 1, y: 0 }));
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let (tile, folded) = composite_roots_into_tile(
+                &layers,
+                &mut store,
+                aurora_tile::TileId { x: 1, y: 0 },
+                (256, 0),
+                (0, 0),
+                &mut budget,
+            );
+            assert_eq!(folded, 1);
+            assert!((alpha_at(&tile, 14, 128) - 1.0).abs() < TOL);
+        }
+
+        #[test]
+        fn spread_100_is_hard_edged_dilation() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 1, 1));
+            ok(layers.set_fill_opacity(id, 0.0));
+            set_shadows(&mut layers, id, vec![shadow(90.0, 0.0, 3.0, 1.0)]);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for y in 94..107 {
+                for x in 94..107 {
+                    let inside = (97..=103).contains(&x) && (97..=103).contains(&y);
+                    let want = if inside { 1.0 } else { 0.0 };
+                    assert!((alpha_at(&acc, x, y) - want).abs() < TOL, "({x}, {y})");
+                }
+            }
+        }
+
+        /// The fitted size → blur mapping, pinned (see PLAN.md 0.182.0 for
+        /// the fit on `layer_effects.psd`).
+        #[test]
+        fn blur_constant_fit_on_fixture() {
+            assert!((aurora_core::effects::SHADOW_BLUR_RADIUS_PER_PX - 0.45).abs() < f32::EPSILON);
+            // `layer_effects.psd`: size 41 (its `Scl ` is not applied).
+            assert_eq!(aurora_core::effects::shadow_blur_box_radius(41.0), 18);
+            assert_eq!(aurora_core::effects::shadow_blur_box_radius(0.0), 0);
+            // The fit's own region: the "Drop Shadow" text and the shadow
+            // below it, x 60..610, y 225..420.
+            let Some(mean) = region_error("layer_effects.psd", 60, 225, 610, 420) else {
+                println!("SKIPPED: corpus file not present");
+                return;
+            };
+            println!("FIT layer_effects.psd shadow region mean {mean:?}");
+            for (got, want) in mean.iter().zip(SHADOW_FIT_REGION_MEAN) {
+                assert!(*got <= want + 1e-3, "{mean:?}");
+            }
+        }
+
+        /// Knockout: the layer's shape hides its own shadow whatever its
+        /// Fill; off, a Fill-0 layer shows its shadow under its shape.
+        #[test]
+        fn knockout_hides_shadow_under_content() {
+            for knocks_out in [true, false] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 20, 20));
+                ok(layers.set_fill_opacity(id, 0.0));
+                let mut sh = shadow(90.0, 0.0, 0.0, 0.0);
+                sh.knocks_out = knocks_out;
+                set_shadows(&mut layers, id, vec![sh]);
+                let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                let want = if knocks_out { 0.0 } else { 1.0 };
+                assert!(
+                    (alpha_at(&acc, 110, 110) - want).abs() < TOL,
+                    "knockout {knocks_out}"
+                );
+            }
+        }
+
+        #[test]
+        fn layer_opacity_scales_shadow_fill_does_not() {
+            for fill in [1.0, 0.25] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 1, 1));
+                ok(layers.set_opacity(id, 0.5));
+                ok(layers.set_fill_opacity(id, fill));
+                set_shadows(&mut layers, id, vec![shadow(90.0, 5.0, 0.0, 0.0)]);
+                let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                assert!((alpha_at(&acc, 100, 105) - 0.5).abs() < TOL, "fill {fill}");
+            }
+        }
+
+        #[test]
+        fn huge_size_or_distance_is_capped_and_reported_and_reads_bounded_tiles() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            // Every tile of a 10 × 10 block stored.
+            let id = painted(&mut layers, &mut store, (0, 0), (0, 0, 2560, 2560));
+            // The largest valid size is not capped (apron 339 px)...
+            let largest = shadow(45.0, 0.0, aurora_core::effects::MAX_EFFECT_SIZE, 0.0).geometry();
+            assert_eq!((largest.apron, largest.capped), (339, false));
+            // ...an out-of-range one (never from a file: `validate` refuses
+            // it) is capped, and would be reported on open.
+            for (distance, size) in [(0.0, 2000.0), (2000.0, 250.0), (30_000.0, 4.0)] {
+                let sh = shadow(45.0, distance, size, 0.1);
+                let fx = aurora_core::LayerEffects {
+                    drop_shadows: vec![sh.clone()],
+                    ..aurora_core::LayerEffects::default()
+                };
+                let g = sh.geometry();
+                assert!(g.apron <= aurora_core::effects::MAX_SHADOW_APRON);
+                assert_eq!(g.capped, size > 1000.0, "{distance} {size}");
+                // `set_effects` refuses the 2000 px one, so its coverage is
+                // asked for directly.
+                if layers.set_effects(id, Some(fx)).is_err() {
+                    let _ = layers.set_effects(id, None);
+                    APRON_CELL_READS.with(|n| n.set(0));
+                    let mut budget = CompositeBudget::for_pass(&layers);
+                    let at = CompositeTileAt {
+                        doc_origin: (5 * 256, 5 * 256),
+                        reference_origin: (0, 0),
+                    };
+                    let _ = shadow_tile_coverage(id, &layers, &mut store, at, None, g, &mut budget);
+                    let reads = APRON_CELL_READS.with(std::cell::Cell::get);
+                    assert!(reads <= 25, "{distance} {size}: {reads} cells");
+                    continue;
+                }
+                APRON_CELL_READS.with(|n| n.set(0));
+                let _ = composite_tile_at(&layers, &mut store, 5, 5, (0, 0));
+                let reads = APRON_CELL_READS.with(std::cell::Cell::get);
+                assert!(reads <= 25, "{distance} {size}: {reads} cells");
+            }
+        }
+
+        #[test]
+        fn editing_a_shadowed_layer_invalidates_the_apron_tiles() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (250, 100, 1, 1));
+            let neighbour = aurora_tile::TileId { x: 1, y: 0 };
+            let own = aurora_tile::TileId { x: 0, y: 0 };
+            for shadowed in [false, true] {
+                if shadowed {
+                    set_shadows(&mut layers, id, vec![shadow(180.0, 10.0, 2.0, 0.0)]);
+                }
+                let mut cache = CompositeCache::default();
+                cache.mark_current(own);
+                cache.mark_current(neighbour);
+                invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
+                assert!(!cache.is_current(own));
+                assert_eq!(
+                    cache.is_current(neighbour),
+                    !shadowed,
+                    "shadowed {shadowed}"
+                );
+            }
+            // Pixel undo goes the same way.
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let CompositeInvalidation::Regions(rects) =
+                stroke_invalidation(&layers, surface, &[own])
+            else {
+                unreachable!("a pixel stroke is narrow");
+            };
+            assert!(rects.len() > 1, "{rects:?}");
+        }
+
+        #[test]
+        fn a_layer_with_a_shown_shadow_refuses_the_gpu_fast_path() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+            set_shadows(
+                &mut layers,
+                id,
+                vec![aurora_core::effects::DropShadow::default()],
+            );
+            assert!(layer_renders_effects(&layers, id));
+            assert!(!document_qualifies_for_gpu_compositing(&layers));
+            let mut off = aurora_core::effects::DropShadow::default();
+            off.gate.enabled = false;
+            set_shadows(&mut layers, id, vec![off]);
+            assert!(document_qualifies_for_gpu_compositing(&layers));
+        }
+
+        // ---- 0.182.0 review: the shadow coverage cache ----
+
+        fn clear_shadow_cache() {
+            SHADOW_CACHE.with(|c| {
+                if let Ok(mut c) = c.try_borrow_mut() {
+                    *c = ShadowCache::default();
+                }
+            });
+        }
+
+        fn computes() -> usize {
+            SHADOW_COMPUTES.with(std::cell::Cell::get)
+        }
+
+        /// Composites tiles (0, 0) and (1, 0); returns both buffers.
+        fn two_tiles(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<Vec<half::f16>> {
+            vec![
+                composite_tile_at(layers, store, 0, 0, (0, 0)),
+                composite_tile_at(layers, store, 1, 0, (0, 0)),
+            ]
+        }
+
+        /// The same composite with the cache emptied first: what a stale
+        /// entry would differ from.
+        fn fresh(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<Vec<half::f16>> {
+            clear_shadow_cache();
+            two_tiles(layers, store)
+        }
+
+        /// A shadowed layer (content at the right edge of tile 0, shadow
+        /// reaching into tile 1) above an unshadowed one.
+        fn cache_fixture(
+            store: &mut aurora_tile::TileStore,
+        ) -> (
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+            aurora_doc::LayerId,
+        ) {
+            let mut layers = aurora_doc::LayerTree::new();
+            let plain = solid(&mut layers, store, None, [0.2, 0.4, 0.6, 1.0]);
+            let shadowed = painted(&mut layers, store, (0, 0), (240, 100, 12, 12));
+            set_shadows(&mut layers, shadowed, vec![shadow(180.0, 8.0, 6.0, 0.0)]);
+            (layers, shadowed, plain)
+        }
+
+        #[test]
+        fn shadow_cache_hits_on_visibility_and_opacity_edits() {
+            let (_dir, mut store) = real_tile_store();
+            let (mut layers, shadowed, plain) = cache_fixture(&mut store);
+            clear_shadow_cache();
+            let start = computes();
+            let _ = two_tiles(&layers, &mut store);
+            let first = computes() - start;
+            assert_eq!(first, 2, "one shadow on each of two tiles");
+            ok(layers.set_visible(plain, false));
+            let _ = two_tiles(&layers, &mut store);
+            ok(layers.set_opacity(shadowed, 0.4));
+            ok(layers.set_blend_mode(shadowed, aurora_doc::BlendMode::Multiply));
+            ok(layers.set_fill_opacity(shadowed, 0.5));
+            let after = two_tiles(&layers, &mut store);
+            assert_eq!(computes() - start, first, "structural edits hit the cache");
+            assert_eq!(after, fresh(&layers, &mut store));
+        }
+
+        #[test]
+        fn shadow_cache_misses_on_a_dab_within_reach_only() {
+            let (_dir, mut store) = real_tile_store();
+            let (layers, shadowed, _) = cache_fixture(&mut store);
+            let Some(surface) = layers.surface_id(shadowed) else {
+                unreachable!("pixel layer");
+            };
+            clear_shadow_cache();
+            let _ = two_tiles(&layers, &mut store);
+            // A dab far outside both windows: no recompute.
+            let start = computes();
+            let _ = store.get_mut(surface, aurora_tile::TileId { x: 9, y: 9 });
+            let _ = two_tiles(&layers, &mut store);
+            assert_eq!(computes(), start, "outside the reach");
+            // A dab on the shadowed layer's own tile: both recompute, and
+            // the picture is the fresh one.
+            if let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 })
+                && let Some(t) = tile.texels_mut().get_mut((100 * 256 + 230) * 4 + 3)
+            {
+                *t = half::f16::from_f32(1.0);
+            }
+            let after = two_tiles(&layers, &mut store);
+            assert_eq!(computes() - start, 2, "inside the reach");
+            assert_eq!(after, fresh(&layers, &mut store), "no stale shadow");
+        }
+
+        #[test]
+        fn shadow_cache_misses_on_set_effects_move_mask_and_undo() {
+            let (_dir, mut store) = real_tile_store();
+            let (mut layers, shadowed, _) = cache_fixture(&mut store);
+            let Some(surface) = layers.surface_id(shadowed) else {
+                unreachable!("pixel layer");
+            };
+            let check =
+                |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore, what: &str| {
+                    let start = computes();
+                    let after = two_tiles(layers, store);
+                    assert!(computes() > start, "{what}: recomputed");
+                    assert_eq!(after, fresh(layers, store), "{what}: no stale shadow");
+                };
+            clear_shadow_cache();
+            let _ = two_tiles(&layers, &mut store);
+            set_shadows(&mut layers, shadowed, vec![shadow(180.0, 14.0, 6.0, 0.0)]);
+            check(&layers, &mut store, "SetEffects");
+            let Some(b) = layers.bounds(shadowed) else {
+                unreachable!("bounds");
+            };
+            ok(layers.set_bounds(shadowed, aurora_core::Rect { x: b.x + 5, ..b }));
+            check(&layers, &mut store, "Move");
+            ok(layers.add_mask(
+                shadowed,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 246,
+                    height: 256,
+                },
+            ));
+            check(&layers, &mut store, "mask added");
+            ok(layers.set_mask_density(shadowed, 0.5));
+            check(&layers, &mut store, "mask density");
+            // Undo restores a tile's old pixels through the store's write
+            // path; emulated here with a write back of the same tile.
+            let saved = store
+                .get(surface, aurora_tile::TileId { x: 0, y: 0 })
+                .map(|t| t.texels().to_vec())
+                .unwrap_or_default();
+            if let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+                tile.texels_mut().copy_from_slice(&saved);
+            }
+            check(&layers, &mut store, "undo");
+        }
+
+        #[test]
+        fn shadow_cache_respects_its_memory_cap() {
+            let mut cache = ShadowCache::default();
+            let cap = SHADOW_CACHE_BYTES / SHADOW_CACHE_ENTRY_BYTES;
+            assert_eq!(cap, 1024);
+            let key = |i: usize| ShadowCacheKey {
+                store: 1,
+                surface: aurora_tile::SurfaceId::from_raw(1),
+                layer_origin: (0, 0),
+                doc_origin: (i64::try_from(i).unwrap_or(0) * 256, 0),
+                geometry: (0, 0, 0, 0),
+                mask: None,
+                versions: Vec::new(),
+            };
+            // RC-2: a pass that needs more than the cap, twice in order.
+            for pass in 0..2 {
+                cache.begin_pass();
+                let mut hits = 0;
+                for i in 0..cap + 200 {
+                    if cache.get(&key(i)).is_some() {
+                        hits += 1;
+                    } else {
+                        cache.insert(key(i), std::rc::Rc::new(vec![0.0]));
+                    }
+                    assert!(cache.entries.len() <= cap);
+                    assert_eq!(cache.order.len(), cache.entries.len());
+                }
+                assert_eq!(hits, if pass == 0 { 0 } else { cap }, "pass {pass}");
+            }
+            assert_eq!(cache.entries.len(), cap);
+            // A later pass that needs other tiles evicts the old ones.
+            cache.begin_pass();
+            for i in 10_000..10_000 + cap {
+                cache.insert(key(i), std::rc::Rc::new(vec![0.0]));
+            }
+            assert!(cache.get(&key(0)).is_none());
+            assert!(cache.get(&key(10_000)).is_some());
+        }
+
+        /// RC-1: a source tile that fails to page in leaves a degraded
+        /// shadow, which is not cached: the next frame recomputes it.
+        #[test]
+        fn a_shadow_degraded_by_a_read_failure_is_not_cached() {
+            let Ok(dir) = tempfile::tempdir() else {
+                unreachable!("tempdir");
+            };
+            let Some(budget) = std::num::NonZeroUsize::new(1) else {
+                unreachable!("1 is non-zero");
+            };
+            let Ok(mut store) = aurora_tile::TileStore::new(dir.path().to_path_buf(), budget)
+            else {
+                unreachable!("usable store");
+            };
+            let mut layers = aurora_doc::LayerTree::new();
+            let b = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height: 256,
+            };
+            let id = ok(layers.add_pixel_layer("p", b, None));
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            set_shadows(&mut layers, id, vec![shadow(90.0, 0.0, 6.0, 0.0)]);
+            // Tile 0 painted, then evicted to disk by painting tile 1.
+            fill_solid(
+                &mut store,
+                surface,
+                aurora_tile::TileId { x: 0, y: 0 },
+                [1.0; 4],
+            );
+            fill_solid(
+                &mut store,
+                surface,
+                aurora_tile::TileId { x: 1, y: 0 },
+                [1.0; 4],
+            );
+            if store.flush().is_err() {
+                unreachable!("flush");
+            }
+            let files: Vec<_> = std::fs::read_dir(dir.path())
+                .map(|d| {
+                    d.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| is_tile_file(p))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(files.len(), 1, "{files:?}");
+            for f in &files {
+                let bytes = std::fs::read(f).unwrap_or_default();
+                let _ = std::fs::write(f, bytes.get(..bytes.len() / 2).unwrap_or(&[]));
+            }
+            clear_shadow_cache();
+            let start = computes();
+            for _ in 0..2 {
+                let mut budget = CompositeBudget::for_pass(&layers);
+                let at = CompositeTileAt {
+                    doc_origin: (256, 0),
+                    reference_origin: (0, 0),
+                };
+                let own = pixel_layer_texels(
+                    id,
+                    &layers,
+                    &mut store,
+                    aurora_tile::TileId { x: 1, y: 0 },
+                    (256, 0),
+                    (0, 0),
+                    &mut budget,
+                );
+                let g = shadow(90.0, 0.0, 6.0, 0.0).geometry();
+                let cov = shadow_tile_coverage(
+                    id,
+                    &layers,
+                    &mut store,
+                    at,
+                    own.as_deref(),
+                    g,
+                    &mut budget,
+                );
+                assert!(cov.is_some(), "tile 1 itself is readable");
+                assert!(budget.store_errors > 0, "setup: tile 0 must fail to read");
+            }
+            assert_eq!(
+                computes() - start,
+                2,
+                "recomputed every frame, never cached"
+            );
+            let cached = SHADOW_CACHE.with(|c| c.try_borrow().map_or(0, |c| c.entries.len()));
+            assert_eq!(cached, 0);
+        }
+
+        /// DS-2: at layer opacity 0.5 with knockout off, an opaque layer
+        /// still hides its own shadow (shadow + content fade as one unit).
+        #[test]
+        fn layer_opacity_fades_shadow_and_content_as_one_unit() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 20, 20));
+            ok(layers.set_opacity(id, 0.5));
+            let mut sh = shadow(90.0, 0.0, 0.0, 0.0);
+            sh.color = aurora_core::effects::EffectColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+            };
+            set_shadows(&mut layers, id, vec![sh]);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // White content at 0.5, no black shadow showing through.
+            near(texel(&acc, 110, 110), [0.5, 0.5, 0.5, 0.5]);
+        }
+
+        /// 0.182.0 review (DS-1): what each kind of edit costs on the
+        /// user's Nyepi file (`AURORA_EFFECTS_PSD`; release build for real
+        /// numbers). Full composites (`composite_document`) stand for
+        /// structural edits, which repaint every tile; a dab or undo
+        /// repaints only the composite tiles in its reach.
+        #[test]
+        #[ignore = "needs a local PSD named by AURORA_EFFECTS_PSD"]
+        #[allow(clippy::too_many_lines)]
+        fn a_local_effects_psd_edit_costs() {
+            let Some(path) = std::env::var_os("AURORA_EFFECTS_PSD") else {
+                println!("SKIPPED: AURORA_EFFECTS_PSD not set");
+                return;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                unreachable!("unreadable");
+            };
+            clear_shadow_cache();
+            let (_scratch, mut store) = real_tile_store();
+            let started = std::time::Instant::now();
+            let (document, _image) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            println!("COST open + first composite {:?}", started.elapsed());
+            let (w, h) = document.canvas_size;
+            let mut layers = document.layers;
+            let mut all = layers.roots().to_vec();
+            let mut ids = Vec::new();
+            while let Some(id) = all.pop() {
+                all.extend(layers.children(id).unwrap_or(&[]));
+                ids.push(id);
+            }
+            let shadowed = ids.iter().copied().find(|&id| {
+                matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+                    && layers
+                        .effects(id)
+                        .is_some_and(|fx| fx.shown_drop_shadows() > 0)
+            });
+            let plain = ids.iter().copied().find(|&id| {
+                matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+                    && layers.visible(id) == Some(true)
+                    && !layer_renders_effects(&layers, id)
+            });
+            let (Some(shadowed), Some(plain)) = (shadowed, plain) else {
+                unreachable!("the file has both kinds");
+            };
+            let full =
+                |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore, what: &str| {
+                    let t = std::time::Instant::now();
+                    let _ = composite_document(layers, store, w, h);
+                    println!("COST {what}: {:?}", t.elapsed());
+                };
+            full(&layers, &mut store, "warm full composite (no edit)");
+            ok(layers.set_visible(plain, false));
+            full(
+                &layers,
+                &mut store,
+                "visibility toggle of an unshadowed layer",
+            );
+            let op = layers.opacity(shadowed).unwrap_or(1.0);
+            ok(layers.set_opacity(shadowed, op * 0.9));
+            full(&layers, &mut store, "opacity step on a shadowed layer");
+            // Dabs: write one stored tile of the layer, repaint the
+            // composite tiles in its reach.
+            for (what, id) in [("shadowed", shadowed), ("unshadowed", plain)] {
+                let (Some(surface), Some(b)) = (layers.surface_id(id), layers.bounds(id)) else {
+                    continue;
+                };
+                let tsz = i64::from(aurora_tile::TILE);
+                let mut stored = None;
+                'find: for ty in 0..16_u32 {
+                    for tx in 0..16_u32 {
+                        let tile = aurora_tile::TileId { x: tx, y: ty };
+                        if store.contains_tile(surface, tile) {
+                            stored = Some(tile);
+                            break 'find;
+                        }
+                    }
+                }
+                let Some(tile) = stored else {
+                    continue;
+                };
+                let saved = store
+                    .get(surface, tile)
+                    .map(|t| t.texels().to_vec())
+                    .unwrap_or_default();
+                let rect = aurora_core::Rect {
+                    x: b.x + i64::from(tile.x) * tsz,
+                    y: b.y + i64::from(tile.y) * tsz,
+                    width: aurora_tile::TILE,
+                    height: aurora_tile::TILE,
+                };
+                let reach = effect_reach_rects(&layers, id, &[rect]);
+                let mut tiles = std::collections::BTreeSet::new();
+                for r in &reach {
+                    for ty in r.y.div_euclid(tsz)..=(r.y + i64::from(r.height) - 1).div_euclid(tsz)
+                    {
+                        for tx in
+                            r.x.div_euclid(tsz)..=(r.x + i64::from(r.width) - 1).div_euclid(tsz)
+                        {
+                            if (0..i64::from(w)).contains(&(tx * tsz))
+                                && (0..i64::from(h)).contains(&(ty * tsz))
+                            {
+                                tiles.insert((tx, ty));
+                            }
+                        }
+                    }
+                }
+                for step in ["dab", "undo"] {
+                    if let Ok(t) = store.get_mut(surface, tile) {
+                        if step == "undo" {
+                            t.texels_mut().copy_from_slice(&saved);
+                        } else if let Some(a) = t.texels_mut().get_mut(3) {
+                            *a = half::f16::from_f32(1.0);
+                        }
+                    }
+                    let t = std::time::Instant::now();
+                    for &(tx, ty) in &tiles {
+                        let mut budget = CompositeBudget::for_pass(&layers);
+                        let _ = composite_roots_into_tile(
+                            &layers,
+                            &mut store,
+                            aurora_tile::TileId {
+                                x: u32::try_from(tx).unwrap_or(0),
+                                y: u32::try_from(ty).unwrap_or(0),
+                            },
+                            (tx * tsz, ty * tsz),
+                            (0, 0),
+                            &mut budget,
+                        );
+                    }
+                    println!(
+                        "COST {step} on a {what} layer: {} tiles, {:?}",
+                        tiles.len(),
+                        t.elapsed()
+                    );
+                }
+            }
+        }
+
+        /// Mean error per channel over `layer_effects.psd`'s shadow region
+        /// at the fitted blur mapping (0.45, no `Scl `), measured 0.182.0.
+        /// No blur: 9.53/6.99/8.15; `Scl ` applied at 0.30: 5.89/3.70/4.70.
+        const SHADOW_FIT_REGION_MEAN: [f64; 3] = [5.3437, 2.6871, 3.9125];
+
         /// The corpus fixtures with colour overlays or Fill below 100 %
         /// and a merged image: `(file, max error over all channels, mean
         /// error per channel)` measured after 0.181.0 (8-bit levels; CPU
         /// compositor, deterministic). The before (0.180.0) numbers are in
         /// PLAN.md's 0.181.0 addendum.
         const EFFECTS_CORPUS_EXPECTED: &[(&str, f64, [f64; 3])] = &[
-            // Fill 28/255 on a shape with a colour overlay (now drawn); blend-if/knockout and clipping still not applied. Before (0.180.0): max 3e+02, mean 95.806, 90.406, 86.526.
+            // 0.181.0: Fill 28/255 on a shape with a colour overlay (now drawn); blend-if/knockout and clipping still not applied. Before it (0.180.0): 255 / 95.81, 90.41, 86.53 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             ("advanced-blending.psd", 255.0, [93.8710, 91.4632, 89.3564]),
-            // Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before (0.180.0): max 3e+02, mean 56.294, 63.672, 69.868.
+            // 0.181.0: Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before it (0.180.0): 255 / 56.29, 63.67, 69.87 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             ("effects/shape-fx2.psd", 255.0, [57.8164, 63.1807, 69.8682]),
-            // overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before (0.180.0): max 3e+02, mean 43.937, 47.462, 22.816.
+            // 0.181.0: overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before it (0.180.0): 255 / 43.94, 47.46, 22.82 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             (
                 "effects/stroke-composite.psd",
                 255.0,
                 [52.6774, 53.5591, 26.0986],
             ),
-            // Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before (0.180.0): max 3e+02, mean 220.336, 51.996, 220.336.
+            // 0.181.0: Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before it (0.180.0): 255 / 220.34, 52.00, 220.34 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             (
                 "effects/stroke-effect-transparent-shape.psd",
                 153.0,
                 [34.6641, 51.9961, 34.6641],
             ),
-            // two colour overlays now drawn; shadows, glows, bevels, strokes still not. Before (0.180.0): max 2e+02, mean 109.205, 106.142, 108.661.
-            ("layer_effects.psd", 168.0, [10.9903, 9.1865, 10.4665]),
-            // Fill 0 'divider' shape no longer drawn. Before (0.180.0): max 2e+02, mean 1.359, 1.322, 1.317.
-            ("masks.psd", 65.0, [1.1912, 1.1477, 1.1366]),
-            // Fill 0 'divider' shape no longer drawn. Before (0.180.0): max 2e+02, mean 1.276, 1.282, 1.287.
-            ("masks.psb", 59.0, [1.1088, 1.1077, 1.1069]),
-            // Fill 171/255: now an exact match. Before (0.180.0): max 6e+01, mean 0.000, 56.000, 56.000.
+            // 0.181.0: two colour overlays now drawn; shadows, glows, bevels, strokes still not. Before it (0.180.0): 191 / 109.21, 106.14, 108.66 (max / mean per channel).
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 168, mean 10.990, 9.186, 10.466.
+            ("layer_effects.psd", 168.0, [10.3246, 8.5522, 9.8170]),
+            // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
+            ("masks.psd", 65.0, [0.2007, 0.1571, 0.1460]),
+            // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.28, 1.28, 1.29 (max / mean per channel).
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 59, mean 1.109, 1.108, 1.107.
+            ("masks.psb", 59.0, [0.1183, 0.1171, 0.1163]),
+            // 0.181.0: Fill 171/255: now an exact match. Before it (0.180.0): 56 / 0.00, 56.00, 56.00 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             ("opacity-fill.psd", 0.0, [0.0000, 0.0000, 0.0000]),
-            // Fill 128/255 applied: within one level. Before (0.180.0): max 8e+01, mean 20.700, 19.690, 19.698.
+            // 0.181.0: Fill 128/255 applied: within one level. Before it (0.180.0): 81 / 20.70, 19.69, 19.70 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             (
                 "transparency/clip-opacity.psd",
                 1.0,
                 [0.1123, 0.1172, 0.1201],
             ),
-            // Fill 0 text hidden; its other effect is not drawn yet. Before (0.180.0): max 2e+02, mean 18.220, 6.352, 16.774.
+            // 0.181.0: Fill 0 text hidden; its other effect is not drawn yet. Before it (0.180.0): 204 / 18.22, 6.35, 16.77 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             (
                 "transparency/fill-opacity.psd",
                 204.0,
                 [18.2197, 21.3564, 10.9336],
             ),
-            // no real merged image (Maximize Compatibility off, stored blank white); clipping not applied. Before (0.180.0): max 3e+02, mean 2.600, 2.600, 2.600.
+            // 0.181.0: no real merged image (Maximize Compatibility off, stored blank white); clipping not applied. Before it (0.180.0): 255 / 2.60, 2.60, 2.60 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             ("blend-and-clipping.psd", 255.0, [2.6003, 2.6003, 2.6003]),
-            // no real merged image (stored blank white): Aurora (255, 246, 206) at (16, 16) vs psd-tools' composite (254, 245, 206). Before (0.180.0): max 0e+00, mean 0.000, 0.000, 0.000.
+            // 0.181.0: no real merged image (stored blank white): Aurora (255, 246, 206) at (16, 16) vs psd-tools' composite (254, 245, 206). Before it (0.180.0): 0 / 0.00, 0.00, 0.00 (max / mean per channel).
+            // 0.182.0: unchanged by drawing drop shadows.
             (
                 "effects/effects-enabled.psd",
                 49.0,
                 [0.0000, 9.0000, 49.0000],
+            ),
+            // 0.182.0: unchanged by drawing drop shadows.
+            ("clipping-mask2.psd", 255.0, [50.8407, 65.1006, 53.0559]),
+            // 0.182.0: unchanged by drawing drop shadows.
+            (
+                "effect-stroke-gradient.psd",
+                255.0,
+                [31.1161, 23.8722, 19.5429],
+            ),
+            // 0.182.0: unchanged by drawing drop shadows.
+            (
+                "effects/double-stroke-effects.psd",
+                255.0,
+                [12.2021, 37.6904, 37.1924],
+            ),
+            // 0.182.0: unchanged by drawing drop shadows.
+            ("effects/shape-fx.psd", 0.0, [0.0000, 0.0000, 0.0000]),
+            // 0.182.0: unchanged by drawing drop shadows.
+            (
+                "effects/stroke-effects.psd",
+                255.0,
+                [58.2448, 23.1956, 44.6420],
+            ),
+            // 0.182.0: unchanged by drawing drop shadows.
+            ("fill_adjustments.psd", 240.0, [133.1256, 58.7064, 39.0855]),
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
+            ("layer_comps.psd", 162.0, [4.4585, 9.8399, 15.7286]),
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
+            ("layer_comps.psb", 182.0, [4.2692, 9.7118, 15.7745]),
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
+            ("layer_params.psd", 244.0, [4.8987, 4.8851, 4.2994]),
+            // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
+            ("layer_params.psb", 244.0, [4.8987, 4.8851, 4.2994]),
+            // 0.182.0: unchanged by drawing drop shadows.
+            ("patterns.psd", 105.0, [12.4678, 13.5450, 13.8416]),
+            // 0.182.0: unchanged by drawing drop shadows.
+            (
+                "transparency/knockout-isolated-groups.psd",
+                100.0,
+                [3.0836, 5.4152, 4.1538],
             ),
         ];
 
@@ -74071,12 +75575,18 @@ mod tests {
                 return;
             };
             let path = std::path::PathBuf::from(path);
+            let started = std::time::Instant::now();
             let Some(diff) = psd_merged_diff(&path, "local") else {
                 unreachable!("could not read {}", path.display());
             };
             println!(
-                "EFFECTS max {:?} mean {:?} | overlay boxes: max {} mean {:?} over {} px",
-                diff.max, diff.mean, diff.overlay_max, diff.overlay_mean, diff.overlay_pixels
+                "EFFECTS max {:?} mean {:?} | effect boxes: max {} mean {:?} over {} px | open + composite + diff {:?}",
+                diff.max,
+                diff.mean,
+                diff.overlay_max,
+                diff.overlay_mean,
+                diff.overlay_pixels,
+                started.elapsed()
             );
         }
     }
@@ -77973,8 +79483,8 @@ mod effects_gpu_predicate_tests {
             unreachable!("{err:?}");
         }
         assert!(super::layer_shows_effects(&layers, id));
-        // A drop shadow is not drawn yet (E3), so the GPU path is kept.
-        assert!(super::document_qualifies_for_gpu_compositing(&layers));
+        // Drawn since 0.182.0 (E3), so the GPU path is refused.
+        assert!(!super::document_qualifies_for_gpu_compositing(&layers));
         fx.enabled = false;
         if let Err(err) = layers.set_effects(id, Some(fx.clone())) {
             unreachable!("{err:?}");
