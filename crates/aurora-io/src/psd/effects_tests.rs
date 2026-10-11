@@ -885,7 +885,6 @@ fn per_kind_effect_notes_on_open() {
     );
     let items = doc.report.items.join("\n");
     for needle in [
-        "2 drop shadows aren't shown yet",
         "1 stroke effect isn't shown yet",
         "1 outer glow isn't shown yet",
         "1 other effect (inner shadow, inner glow, bevel",
@@ -894,8 +893,10 @@ fn per_kind_effect_notes_on_open() {
     ] {
         assert!(items.contains(needle), "{needle:?} missing from\n{items}");
     }
-    // 0.181.0: a pixel layer's colour overlay is drawn, so not reported.
+    // 0.181.0/0.182.0: a pixel layer's colour overlay and drop shadows are
+    // drawn, so not reported as not shown.
     assert!(!items.contains("colour overlay"), "{items}");
+    assert!(!items.contains("drop shadow"), "{items}");
     // The effects are on the layer, as data; nothing on the other two.
     let fx = find(&doc.layers, "a").and_then(|id| doc.layers.effects(id));
     assert_eq!(fx.map(|fx| fx.drop_shadows.len()), Some(2));
@@ -1115,7 +1116,7 @@ fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
     );
     let items = doc.report.items.join("\n");
     assert!(
-        items.contains("1 colour overlay on clipped layers is drawn unclipped"),
+        items.contains("1 colour overlay or drop shadow on clipped layers is drawn unclipped"),
         "only the clipped layer's: {items}"
     );
     assert!(!items.contains("isn't shown yet"), "{items}");
@@ -1125,4 +1126,74 @@ fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
         fx.map(aurora_core::LayerEffects::shown_color_overlays),
         Some(1)
     );
+}
+
+/// 0.182.0: a pixel layer's drop shadows are drawn, so not "not shown";
+/// noise is reported (a non-Linear contour likewise); a group's shadows
+/// are still not shown (E9). A capped size cannot come from a valid file
+/// (see `MAX_SHADOW_APRON`).
+#[test]
+fn drop_shadow_notes_on_open() {
+    let mut odd = match shadow(true, true, 4.0) {
+        V::Obj(items) => items,
+        _ => Vec::new(),
+    };
+    odd.retain(|(k, _)| *k != b"Nose" && *k != b"blur");
+    odd.push((b"Nose", V::Unit(b"#Prc", 10.0)));
+    odd.push((b"blur", V::Unit(b"#Pxl", 250.0)));
+    let odd = effects_block(&[(b"Scl ", V::Unit(b"#Prc", 400.0)), (b"DrSh", V::Obj(odd))]);
+    let plain = effects_block(&[(b"DrSh", shadow(true, true, 4.0))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::divider(),
+                    TestLayer::pixels("inside", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", plain.clone()))),
+                    TestLayer::group("g", *b"norm")
+                        .with(|l| l.blocks.push((*b"lfx2", plain.clone()))),
+                    TestLayer::pixels("odd", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", odd.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    for needle in [
+        "1 drop shadow isn't shown yet",
+        "1 drop shadow with noise is drawn without the noise.",
+        "1 layer style with an effect scale other than 100 % is drawn at the effects' stored sizes",
+    ] {
+        assert!(items.contains(needle), "{needle:?} missing from\n{items}");
+    }
+}
+
+/// 0.182.0: a `uglg` shadow is drawn at the document's global angle
+/// (resource 1037), not its own `lagl`: with a global 90° and a local 0°
+/// it falls straight down.
+#[test]
+fn uglg_uses_resource_1037_not_local_angle() {
+    let mut items = match shadow(true, true, 10.0) {
+        V::Obj(items) => items,
+        _ => Vec::new(),
+    };
+    items.retain(|(k, _)| *k != b"uglg" && *k != b"lagl");
+    items.push((b"uglg", V::Bool(true)));
+    items.push((b"lagl", V::Unit(b"#Ang", 0.0)));
+    let block = effects_block(&[(b"DrSh", V::Obj(items))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.resources = global_angle_resource(90);
+                p.layers = vec![
+                    TestLayer::pixels("a", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let fx = find(&doc.layers, "a").and_then(|id| doc.layers.effects(id));
+    let shadow = fx.and_then(|fx| fx.drop_shadows.first());
+    assert_eq!(shadow.map(|s| (s.angle, s.local_angle)), Some((90.0, 0.0)));
+    assert_eq!(shadow.map(|s| s.geometry().offset), Some((0, 10)));
 }

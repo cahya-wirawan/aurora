@@ -26,7 +26,293 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.181.0): layer effects, round E2 — Fill applied
+**Latest (2026-10-11, 0.182.0): layer effects, round E3 — Drop Shadow
+drawn, with a shadow-coverage cache (review revision).** A pixel layer's shown drop shadows (`DrSh`, or `lmfx`'s
+`dropShadowMulti` in list order, bottom to top — unverified against
+Photoshop, no corpus file has two on one layer) are drawn on the CPU in
+`fold_layer_with_effects`, **beneath** the content: each is folded onto the
+backdrop in its own mode (Multiply by default, any of the 27) at
+`shadow opacity × layer opacity`, before the content and overlays. The
+shadow pipeline (`shadow_tile_coverage` in `aurora-app`,
+`aurora_filters::shadow_coverage`, `DropShadow::geometry` in
+`aurora_core::effects`):
+
+- **Source:** the layer's *shape* (content alpha × mask, through
+  `pixel_layer_texels`, so masks and windowed layers behave as for the
+  content). **No Fill** — a shadow does not fade with Fill.
+- **Offset:** y down, `dx = −d·cos θ`, `dy = +d·sin θ`, rounded; 120° falls
+  down-right. A translation of the source window, not apron growth. `uglg`
+  shadows use resource 1037's global angle (resolved at import since E1).
+- **Spread `s`:** choke = round(size·s), a square max filter (row then
+  column); blur = size·(1 − s).
+- **Blur:** three separable box passes of radius
+  `shadow_blur_box_radius(blur) = round(0.45 · blur)` — the one fitted
+  mapping (`SHADOW_BLUR_RADIUS_PER_PX`), **provisional** (one fixture). Computed in exact Q24 fixed point
+  (`u64` running sums, round-half-up division), so a pixel's value depends
+  only on the source around it and never on where a tile's window starts:
+  **seamless across tiles, bit for bit** (tested against one big window,
+  at a same-origin and at a negative layer origin).
+- **Colour:** the shadow colour at alpha = blurred coverage × opacity.
+- **Knockout (`layerConceals`):** coverage × (1 − shape). Decision: the
+  layer's *shape* hides its own shadow whatever its Fill — the option's
+  purpose is a Fill-0 (or translucent) layer showing its shadow only
+  outside its shape, so multiplying by `shape × fill` would defeat it at
+  Fill 0. With knockout off, a Fill-0 layer shows its shadow under itself.
+- **Scale (`Scl `) is not applied — measured, not assumed.**
+  `layer_effects.psd` stores 208.33 %; Photoshop's merged image shows its
+  shadow reaching ~63 px below the text (distance 18 + size 41), not the
+  ~123 px a 208 % multiplier gives, and the fit agrees (below). The user's
+  Nyepi file stores 416.67 % with sizes up to 144, which would mean 600 px
+  blurs. `Scl ` stays stored data.
+- **Apron:** `A = choke + 3·r`, capped at `MAX_SHADOW_APRON` = 384 px
+  (deviation from the plan's 512, to meet the ≤ 25-tile read bound: a
+  `256 + 2·384 = 1024` px window spans at most 5 tiles per axis). With sizes
+  held to 250 by validation and the 0.45 mapping the largest valid apron is
+  339 px, so **the cap cannot be reached by a valid file** today; it is
+  kept as a bound, tested on an out-of-range shadow, and the "shown
+  smaller" note (`ShadowSizeCapped`) exists for it.
+- **Reads:** the window is assembled from the composite-grid cells it
+  overlaps; cells with nothing stored are skipped through `contains_tile`
+  (no page-in); the composite tile's own shape is reused when its cell is
+  in the window. Never the whole layer (invariant §7.3.1).
+- **Empty tiles:** a layer with shown shadows is folded on a tile it never
+  painted when its shadow reaches it (`fold_layer_with_effects` no longer
+  stops at a blank own tile while a shadow covers the tile;
+  `composite_roots_into_tile` counts it as folded).
+- **Invalidation:** `effect_reach_rects` grows a shadowed layer's dirty
+  rects by each shadow's offset and apron; brush/eraser dabs
+  (`invalidate_painted_tiles`) and pixel undo/redo (`stroke_invalidation`)
+  use it. `SetEffects` is structural (full bump); a live Move already bumps
+  the whole cache.
+- **GPU:** `layer_renders_effects` now includes shown drop shadows, so a
+  visible root layer with one refuses the GPU fast path (and takes the
+  effects CPU path); a layer whose only shown effects are strokes, glows or
+  the rest keeps the GPU.
+- **Notes on PSD open:** a pixel layer's drop shadows are no longer "not
+  shown"; noise > 0 (`ShadowNoiseNotApplied`), a non-Linear contour
+  (`ShadowContourNotApplied`) and a capped size are reported; a group's
+  shadows are still "not shown" (E9); a clipped layer's shadows join the
+  "drawn unclipped" line. PSD save still lists effects as not saved.
+
+**0.182.0 addendum: blur fit, accuracy, performance, gate and mutations.**
+
+*Blur fit* (`layer_effects.psd`, its "Drop Shadow" text layer: Multiply,
+black, 35 %, distance 18, size 41, angle 90 global, spread 0; region x
+60..610, y 225..420; mean error per channel against Photoshop's merged
+image):
+
+| Mapping | Mean error R / G / B |
+|---|---|
+| no blur | 9.53 / 6.99 / 8.15 |
+| `Scl ` applied, k = 0.15 / 0.25 / 0.30 / 0.40 / 0.50 | 6.56/4.25/5.30, 5.91/3.70/4.70, **5.89/3.70/4.70**, 6.17/3.95/5.00, 6.60/4.36/5.49 |
+| no `Scl `, k = 0.30 / 0.40 / **0.45** / 0.50 / 0.55 / 0.60 / 0.70 | 6.01/3.26/4.53, 5.38/2.69/3.93, **5.34/2.69/3.91**, 5.55/2.94/4.14, 5.66/3.09/4.28, 5.77/3.22/4.39, 5.97/3.47/4.62 |
+
+Chosen: no `Scl `, k = 0.45 (three box passes of radius `r` ≈ a Gaussian of
+σ ≈ r, so σ ≈ 0.45 × size). One fixture only; pinned by
+`blur_constant_fit_on_fixture`.
+
+*Accuracy* (CPU composite against each file's merged image, 8-bit levels,
+max / mean per channel; files whose numbers changed; every other file in
+`effects_corpus_files_composite_like_photoshops_merged_image` — now 24,
+including 12 newly listed shadow fixtures: `clipping-mask2`,
+`effect-stroke-gradient`, `effects/double-stroke-effects`,
+`effects/shape-fx`, `effects/stroke-effects`, `fill_adjustments`,
+`layer_comps.psd/.psb`, `layer_params.psd/.psb`, `patterns`,
+`transparency/knockout-isolated-groups` — is unchanged, its shadows being
+on groups, on clipped or shape layers drawn elsewhere, turned off, or
+hidden under other content):
+
+| File | Before (0.181.0) | After |
+|---|---|---|
+| layer_effects.psd | 168 / 10.99, 9.19, 10.47 | 168 / 10.32, 8.55, 9.82 |
+| masks.psd | 65 / 1.19, 1.15, 1.14 | 65 / 0.20, 0.16, 0.15 |
+| masks.psb | 59 / 1.11, 1.11, 1.11 | 59 / 0.12, 0.12, 0.12 |
+| layer_comps.psd | 162 / 6.74, 12.12, 18.00 | 162 / 4.46, 9.84, 15.73 |
+| layer_comps.psb | 182 / 6.80, 12.25, 18.37 | 182 / 4.27, 9.71, 15.77 |
+| layer_params.psd | 245 / 4.48, 7.85, 9.77 | 244 / 4.90, 4.89, 4.30 |
+| layer_params.psb | 245 / 4.48, 7.85, 9.77 | 244 / 4.90, 4.89, 4.30 |
+
+`layer_params` red got slightly worse (4.48 → 4.90) while green and blue
+halved; nothing else got worse. The "before" column was measured with the
+shadow loop disabled inside the new path, which differs from 0.181.0 only
+by `f16` rounding of the interior. **Nyepi** (`AURORA_EFFECTS_PSD`, release,
+`a_local_effects_psd_against_its_merged_image`): globally **max 105 → 25,
+mean 2.653/2.674/2.687 → 0.318/0.425/0.452**. The shadowed layers' boxes
+(painted bounding box grown by each shadow's reach) cover the whole
+1920 × 1080 canvas here, so the in-box figures equal the global ones.
+
+*Performance* (first candidate, superseded by the review revision below;
+same test, release, two runs each, open + full CPU
+composite + diff of the 1920 × 1080 file): **13.1 s before, 24.9–25.1 s
+after**, so drawing the 38 shadows (17 at size 65, 21 at size 144; aprons
+up to 195 px, windows up to 646² px) costs about **11.8 s for the whole
+document, ~0.3 s per 256² composite tile on average**. This is a full
+recomposite (open, a structural change); a dab repaints only the tiles in
+the shadow's reach, but each of those still recomputes the shadow from
+scratch. Against the open 60 FPS finding this is a regression for
+shadowed documents, disclosed rather than optimised: the box blur runs
+over the whole window on every pass and nothing is cached between tiles
+(no effect cache, as planned), and the effects path is CPU-only (E8).
+
+**Review revision (judge REVISE at 0.82; DS-1 to DS-6).** **DS-1, the UI
+freeze — measured first.** Compositing runs synchronously on the UI
+thread, and the first E3 candidate recomputed every shown shadow on every
+tile from scratch. Fix, in two parts:
+
+1. **A drop-shadow coverage cache** (`SHADOW_CACHE` in `aurora-app`, a
+   per-thread LRU of 256² `f32` coverage tiles, **capped at 256 MiB =
+   1,024 tiles**). It is keyed (`ShadowCacheKey`) on everything coverage
+   depends on and nothing else: the store's serial
+   (`TileStore::serial`, new), the layer's surface and origin, the tile's
+   document position, the shadow's pixel geometry, the enabled mask's
+   settings, and the **content version of every layer tile and mask tile
+   under the source window** (`TileStore::content_version`, new in
+   `aurora-tile`: a store-wide counter stamped on every `get_mut`,
+   insert and forget, one entry per stored tile, never paging in). So a
+   dab, a pixel undo or redo, an open, a mask edit, a Move or a
+   `SetEffects` produces a key that is simply never found again, and
+   there is no eviction call to forget; a stale shadow would need two
+   different inputs with equal keys, which whole-key equality rules out.
+   Opacity, blend mode, Fill, visibility, shadow colour and other layers
+   are not in the key, because coverage does not depend on them, so
+   those edits hit. Entries for a closed document are not dropped
+   explicitly; they age out of the LRU (bounded).
+2. **A cheaper miss** (`aurora_filters::shadow_coverage`): each pass now
+   computes only the region the passes after it read (the centre grown by
+   their remaining radii); the vertical box pass keeps running column
+   sums and walks rows (DS-3: no per-column `Vec`, no column-wise
+   access); two reused buffers. A new naive-reference test pins the
+   trimmed passes bit for bit.
+
+Measured on Nyepi (release, `a_local_effects_psd_edit_costs`, whole
+1920 × 1080 document; the live app recomposites only the visible tiles,
+so these are the worst case of a full-canvas view). "Before E3" is this
+build with the shadow loop switched off; "no cache" is this build with
+the cache switched off (the first candidate's filter was slower still: its
+open + composite + diff was 24.9 s against 13.1 s):
+
+| Edit | Before E3 | E3, no cache | **E3, cached** |
+|---|---|---|---|
+| open + first composite | 12.2 s | 20.9 s | 21.0 s (cold: every tile misses) |
+| full recomposite, no edit | 9.1 s | 17.9 s | **11.1 s** |
+| visibility toggle of an unshadowed layer | 9.1 s | 17.8 s | **11.0 s** |
+| opacity step on a shadowed layer | 9.1 s | 17.7 s | **11.0 s** |
+| dab on a shadowed layer (its 3 reach tiles) | 0.74 s | 1.49 s | **0.99 s** |
+| undo of it | 0.73 s | 1.51 s | **0.94 s** |
+| dab on an unshadowed layer (1 tile) | 0.19 s | 0.33 s | **0.21 s** |
+| undo of it | 0.18 s | 0.32 s | **0.20 s** |
+
+So cache-hit edits cost about 22 % more than before E3 (the effects path
+itself, not the shadow maths), a dab on a shadowed layer is bounded by
+its reach tiles, and a dab on an unshadowed layer is back to its pre-E3
+cost. **The freeze is not gone**: this file's CPU composite was already
+~9 s for a full recomposite before E3 (many full-canvas layers, CPU
+path), a pre-existing finding this round does not touch; the first
+composite after open still pays every shadow once (+8.8 s). The shadow
+pipeline and the rest of the CPU compositor still run on the UI thread
+(invariant §7.3.4 is not met for this path; the async/progressive
+renderer is the named fix, not this round's).
+
+**DS-2, fold order:** with shadows, the shadows, content and overlays are
+now composed as one unit over the backdrop and the unit is faded by layer
+opacity (`result = B + (U − B)·L`), so at opacity < 1 an opaque layer
+still hides its own shadow (`layer_opacity_fades_shadow_and_content_as_one_unit`).
+Without shadows nothing changes; a `Dissolve` layer keeps fading its
+shadows directly (its dither already carries opacity). **DS-4:** an open
+note now says "N layer styles with an effect scale other than 100 % are
+drawn at the effects' stored sizes (the scale isn't applied)". **DS-5:**
+k = 0.45 is **provisional**: one fixture fitted it. **DS-6:** the freeze
+figures are the table above. Corpus and Nyepi accuracy are unchanged by
+the revision (the pins hold; Nyepi's numbers are identical).
+
+New tests: `shadow_cache_hits_on_visibility_and_opacity_edits` (a
+computation counter: two computes, then none across a visibility toggle,
+opacity, blend and Fill change, and the picture equals a fresh
+uncached composite), `shadow_cache_misses_on_a_dab_within_reach_only`,
+`shadow_cache_misses_on_set_effects_move_mask_and_undo` (each path
+recomputes and matches a fresh composite — undo emulated by a write-back
+through the store, the path a real undo takes), `shadow_cache_respects_its_memory_cap`,
+`layer_opacity_fades_shadow_and_content_as_one_unit`, the filter's
+`trimmed_passes_match_a_naive_reference`, and `aurora-tile`'s
+`content_version_changes_on_every_write_and_forget`.
+
+Revision mutations (same procedure, all killed; the E3 set S1–S4 and
+S6–S10 re-run on the revised code and killed again):
+
+| Mutation | Killed by |
+|---|---|
+| cache never evicted on a dab (content versions not in the key) | `shadow_cache_misses_on_a_dab_within_reach_only`, `shadow_cache_misses_on_set_effects_move_mask_and_undo` |
+| cache not keyed on geometry | `shadow_cache_misses_on_set_effects_move_mask_and_undo` |
+| no eviction on Move (layer origin not in the key) | `shadow_cache_misses_on_set_effects_move_mask_and_undo` |
+| no eviction on SetEffects (offset not in the key) | `shadow_cache_misses_on_set_effects_move_mask_and_undo` |
+| mask not keyed | `shadow_cache_misses_on_set_effects_move_mask_and_undo` |
+
+**Second review revision (re-judge REVISE at 0.89; RC-1 to RC-3).**
+**RC-1:** a shadow computed while a source or mask tile failed to page in
+(the cell is skipped, or the mask fails open) is no longer cached: the
+coverage is kept only when the pass's store-error count did not move
+during the computation, so the next frame recomputes it, as the rest of
+the composite retries (`a_shadow_degraded_by_a_read_failure_is_not_cached`,
+a real truncated scratch file). **RC-2:** the cache's eviction no longer
+thrashes under an in-order pass larger than the cap. Each entry carries
+the composite pass it was last used in (`CompositeBudget::for_pass`
+starts a pass); eviction takes the least recently used entry *not used in
+the current pass*, and when every entry was used this pass a new one is
+simply not kept. So a pass needing more than 1,024 (shadow, tile) pairs
+keeps the first 1,024 it visits and recomputes only the rest each pass
+(the limit, disclosed); leftovers from earlier passes (old versions after
+an edit, a closed document) are what gets evicted.
+`shadow_cache_respects_its_memory_cap` now scans `cap + 200` keys twice
+in order and requires all 1,024 retained keys to hit on the second pass,
+and checks a later pass's keys evict the old ones. (The Curves histogram
+composites its sample tiles each as its own pass, so a histogram refresh
+can evict up to its 16 tiles' shadow entries from the canvas pass; minor.)
+**RC-3:** eviction is `O(log n)` (a `BTreeMap` ordered by `(last pass,
+use stamp)` beside the `HashMap`), and the cache's 256 MiB is **on top of**
+the tile store's residency budget, per compositing thread (there is one).
+Nyepi edit costs re-measured after RC-2 (release): warm full recomposite
+11.4 s, visibility toggle 11.3 s, opacity step 11.3 s, dab on a shadowed
+layer 1.1 s (3 tiles), its undo 0.96 s, dab/undo on an unshadowed layer
+0.21 s — within noise of the first revision (this file stays under the
+cap). Mutations, both killed: degraded shadow always cached →
+`a_shadow_degraded_by_a_read_failure_is_not_cached`; plain LRU (current
+pass not protected) → `shadow_cache_respects_its_memory_cap`.
+
+*Gate*, one pass after the last code change (RTX 3090, `/home` 41G free
+before): `cargo fmt --check`, layering, no-hardcoded-style, `cargo check
+--locked`, workspace clippy `-D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+--workspace --no-fail-fast` — **3,428 passed, 0 failed, 67 ignored**
+after the second review revision (3,427 after the first, 3,420 / 66
+before either; 22 new in all, the new ignored ones being the Nyepi
+accuracy and edit-cost measurements); `cargo doc --document-private-items` with `-D warnings` clean;
+`cargo deny check all` ok; `check_contrast.py` passes; cross-clippy
+(`aurora-app --all-targets`) for `x86_64-pc-windows-gnu` and
+`x86_64-apple-darwin` clean. Tested headlessly and on a real GPU only; no
+shadow has been compared with Photoshop by a human.
+
+Ten mutations, each backed up, applied, run under `AURORA_REQUIRE_GPU=1`
+(RTX 3090), restored and sha256-checked against the backup — all killed:
+
+| Mutation | Killed by |
+|---|---|
+| `uglg` branch dropped (local angle always) | `uglg_uses_resource_1037_not_local_angle`, `global_angle_resource_is_read_and_defaults_to_120` |
+| `dy` negated | `shadow_offset_follows_photoshop_angle_y_down`, `layer_opacity_scales_shadow_fill_does_not`, the blur fit, the corpus pin |
+| apron tiles skipped (own cell only) | `shadow_is_seamless_across_tile_boundaries`, `shadow_lands_on_tiles_the_layer_never_painted`, the blur fit, the corpus pin |
+| no apron in the empty-tile check | `shadow_lands_on_tiles_the_layer_never_painted` |
+| Fill applied to the shadow | `layer_opacity_scales_shadow_fill_does_not`, `knockout_hides_shadow_under_content`, `shadow_offset_…`, `spread_100_…` |
+| dirty-rect inflation removed | `editing_a_shadowed_layer_invalidates_the_apron_tiles` |
+| GPU refusal for shadows removed | `a_layer_with_a_shown_shadow_refuses_the_gpu_fast_path`, the E1 predicate test |
+| apron cap removed | `huge_size_or_distance_is_capped_and_reported_and_reads_bounded_tiles` |
+| knockout removed | `knockout_hides_shadow_under_content`, the blur fit, the corpus pin |
+| blur ignored | `shadow_is_seamless_across_tile_boundaries`, the blur fit, the corpus pin |
+
+After the mutations, a clippy `too_many_lines` fix moved the shadow fold
+into `fold_shadows_beneath` (verbatim). Knockout-removed was re-run on the
+moved code and killed again; Fill-applied-to-the-shadow no longer compiles
+there (the helper has no Fill in scope), which is the structural form of
+the same guarantee.
+
+**Previously (2026-10-11, 0.181.0): layer effects, round E2 — Fill applied
 everywhere, and Color Overlay drawn.** **Fill** (`iOpa`, "fill opacity"),
 stored since 0.144.0 but never composited, is now applied wherever a
 layer's content is composited: `aurora-app`'s `content_opacity` (opacity ×
@@ -171,7 +457,7 @@ kills it):
 | pixel-layer overlays still reported on open | `colour_overlays_are_reported_only_on_groups`, `per_kind_effect_notes_on_open` |
 | clipped-layer overlay report removed (M11) | `overlays_on_clipped_layers_are_reported_as_drawn_unclipped` |
 
-**Previously (2026-10-10, 0.180.0): layer effects, round E1 — descriptor
+**Earlier (2026-10-10, 0.180.0): layer effects, round E1 — descriptor
 parser, model and storage; no visual change.** The effects plan (planner,
 2026-10-10) is ten rounds: **E1** parser/model/storage (this one), **E2**
 Fill applied everywhere plus Color Overlay (all 27 modes; the GPU refusal is

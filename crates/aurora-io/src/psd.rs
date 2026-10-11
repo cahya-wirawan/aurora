@@ -420,6 +420,10 @@ enum Note {
     VectorMaskDisabledDropped,
     ClippingDropped,
     ClippedOverlaysUnclipped,
+    ShadowNoiseNotApplied,
+    ShadowContourNotApplied,
+    EffectScaleNotApplied,
+    ShadowSizeCapped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
     StrokesNotShown,
@@ -571,8 +575,23 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "it" } else { "they" },
         ),
         Note::ClippedOverlaysUnclipped => format!(
-            "{n} colour overlay{s} on clipped layers {is} drawn unclipped, over the layer's \
-             whole shape, because Aurora doesn't have clipping masks yet."
+            "{n} colour overlay{s} or drop shadow{s} on clipped layers {is} drawn unclipped, \
+             over the layer's whole shape, because Aurora doesn't have clipping masks yet."
+        ),
+        Note::EffectScaleNotApplied => format!(
+            "{n} layer style{s} with an effect scale other than 100 % {is} drawn at the \
+             effects' stored sizes (the scale isn't applied)."
+        ),
+        Note::ShadowNoiseNotApplied => {
+            format!("{n} drop shadow{s} with noise {is} drawn without the noise.")
+        }
+        Note::ShadowContourNotApplied => format!(
+            "{n} drop shadow{s} with a contour other than Linear {is} drawn with a Linear one."
+        ),
+        Note::ShadowSizeCapped => format!(
+            "{n} drop shadow{s} {is} too large to draw at full size and {is} shown smaller \
+             (Aurora draws a shadow up to {} pixels past the layer for now).",
+            aurora_core::effects::MAX_SHADOW_APRON
         ),
         Note::ClippingDropped => format!(
             "{n} clipped layer{s} {is} shown unclipped — Aurora doesn't have clipping masks \
@@ -2599,17 +2618,37 @@ fn note_unsupported_kept(
         }
         Some(Ok(read)) => {
             let fx = &read.effects;
-            notes.add_n(Note::DropShadowsNotShown, fx.shown_drop_shadows() as u64);
-            if !overlays_drawn {
+            if overlays_drawn {
+                if record.clipping != 0 {
+                    // Review of 0.181.0: the effect is drawn, but the layer
+                    // is shown unclipped, so it covers more than Photoshop's.
+                    notes.add_n(
+                        Note::ClippedOverlaysUnclipped,
+                        (fx.shown_color_overlays() + fx.shown_drop_shadows()) as u64,
+                    );
+                }
+                // 0.182.0 review (DS-4): the style's scale is not applied;
+                // say so where it would matter.
+                if fx.shows_any() && (fx.scale - 100.0).abs() > 1e-3 {
+                    notes.add(Note::EffectScaleNotApplied);
+                }
+                // 0.182.0: drop shadows are drawn on pixel layers; what is
+                // not faithful about each is reported.
+                for shadow in fx.drop_shadows.iter().filter(|e| fx.shows(e.gate)) {
+                    if shadow.noise > 0.0 {
+                        notes.add(Note::ShadowNoiseNotApplied);
+                    }
+                    if !shadow.linear_contour {
+                        notes.add(Note::ShadowContourNotApplied);
+                    }
+                    if shadow.geometry().capped {
+                        notes.add(Note::ShadowSizeCapped);
+                    }
+                }
+            } else {
+                notes.add_n(Note::DropShadowsNotShown, fx.shown_drop_shadows() as u64);
                 notes.add_n(
                     Note::ColorOverlaysNotShown,
-                    fx.shown_color_overlays() as u64,
-                );
-            } else if record.clipping != 0 {
-                // Review of 0.181.0: the overlay is drawn, but the layer is
-                // shown unclipped, so it covers more than Photoshop's.
-                notes.add_n(
-                    Note::ClippedOverlaysUnclipped,
                     fx.shown_color_overlays() as u64,
                 );
             }

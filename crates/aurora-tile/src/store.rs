@@ -363,6 +363,16 @@ pub struct TileStore {
     /// distinct tiles ever evicted -- invariant §7.3.1 broken by the
     /// back door, for no gain over a single `u64`.
     write_generation: u64,
+    /// 0.182.0: a content version per stored tile, minted from
+    /// [`Self::version_counter`] whenever the tile may have changed
+    /// ([`Self::get_mut`], [`Self::insert_encoded`], [`Self::insert_staged`])
+    /// and dropped when it is forgotten — one entry per tile the store
+    /// holds, the same order as [`Self::paged_out`]. See
+    /// [`Self::content_version`].
+    content_versions: HashMap<(SurfaceId, TileId), u64>,
+    version_counter: u64,
+    /// Distinct for every `TileStore` this process constructs.
+    serial: u64,
     budget: NonZeroUsize,
     scratch_dir: PathBuf,
     /// A component of every filename this store writes, distinct for
@@ -622,6 +632,12 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// than propagating an error — the pid and counter still make the
 /// result unique within any one process, and the store must not fail to
 /// open because the clock is unavailable.
+/// A process-wide serial for [`TileStore::serial`].
+fn next_store_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn instance_token() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -671,12 +687,44 @@ impl TileStore {
             staged: HashSet::new(),
             evicted_dirty: HashSet::new(),
             write_generation: 0,
+            content_versions: HashMap::new(),
+            version_counter: 0,
+            serial: next_store_serial(),
             budget,
             scratch_dir,
             instance: instance_token(),
             writer: BackgroundWriter::spawn(),
             stats: Stats::default(),
         })
+    }
+
+    /// A number that changes whenever tile `id` of `surface` may have
+    /// changed content (0.182.0): every [`Self::get_mut`], insert and
+    /// forget. `0` for a tile never written through those (absent, or
+    /// only ever materialized blank by [`Self::get`]). Never pages
+    /// anything in. Two equal readings with [`Self::contains_tile`]
+    /// equal too mean the content is unchanged in between — what a cache
+    /// of anything derived from tile content (a drop shadow's blur) keys
+    /// on.
+    #[must_use]
+    pub fn content_version(&self, surface: SurfaceId, id: TileId) -> u64 {
+        self.content_versions
+            .get(&(surface, id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Distinct for every `TileStore` this process constructs (0.182.0),
+    /// so a cache shared across stores never mixes up their surfaces.
+    #[must_use]
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    fn bump_content_version(&mut self, surface: SurfaceId, id: TileId) {
+        self.version_counter = self.version_counter.wrapping_add(1);
+        self.content_versions
+            .insert((surface, id), self.version_counter);
     }
 
     /// Returns the tile at `id` on `surface`, paging it in or creating it
@@ -700,6 +748,7 @@ impl TileStore {
     /// Returns [`TileError`] if paging in from the scratch disk fails.
     pub fn get_mut(&mut self, surface: SurfaceId, id: TileId) -> Result<&mut Tile, TileError> {
         self.ensure_resident(surface, id)?;
+        self.bump_content_version(surface, id);
         match self.resident.get_mut(&(surface, id)) {
             Some(tile) => Ok(tile),
             None => unreachable!("ensure_resident just inserted this key"),
@@ -976,6 +1025,7 @@ impl TileStore {
         if self.contains_tile(surface, id) {
             self.forget_tile(surface, id);
         }
+        self.bump_content_version(surface, id);
         self.forgotten_while_pending.remove(&key);
         let bytes = tile.0;
         let path = self.tile_path(surface, id);
@@ -1045,6 +1095,7 @@ impl TileStore {
         if tile.dir.owner != self.instance || !tile.dir.path.starts_with(&self.scratch_dir) {
             return Err(TileError::ForeignStagedTile);
         }
+        self.bump_content_version(surface, id);
         let Some(path) = tile.path.take() else {
             return Err(TileError::ForeignStagedTile);
         };
@@ -1100,6 +1151,7 @@ impl TileStore {
     /// disclosed it.)
     pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
         let key = (surface, id);
+        self.content_versions.remove(&key);
         let held = self.contains_tile(surface, id);
         // Deletes the scratch file *before* the mapping that names it
         // is dropped -- `discard_stale_scratch_file` reads the path out
@@ -1200,6 +1252,8 @@ impl TileStore {
     /// moment the store is fullest. One pass over the keys, testing
     /// each against the requested set, is O(tiles held) instead.
     pub fn forget_surfaces(&mut self, surfaces: &HashSet<SurfaceId>) -> usize {
+        self.content_versions
+            .retain(|(held, _), _| !surfaces.contains(held));
         let mut keys: HashSet<(SurfaceId, TileId)> = HashSet::new();
         keys.extend(
             self.resident
@@ -5079,5 +5133,46 @@ mod insert_encoded_tests {
                 .all(|s| s.to_bits() == 0),
             "nothing of the old resident tile survives"
         );
+    }
+}
+
+#[cfg(test)]
+mod content_version_tests {
+    use super::*;
+
+    #[test]
+    fn content_version_changes_on_every_write_and_forget() {
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let Some(budget) = NonZeroUsize::new(4) else {
+            return;
+        };
+        let Ok(mut store) = TileStore::new(dir.path().to_path_buf(), budget) else {
+            return;
+        };
+        let other = TileStore::new(dir.path().join("b"), budget);
+        let surface = SurfaceId::from_raw(7);
+        let id = TileId { x: 1, y: 2 };
+        assert_eq!(store.content_version(surface, id), 0);
+        let _ = store.get(surface, id);
+        assert_eq!(
+            store.content_version(surface, id),
+            0,
+            "a read is not a write"
+        );
+        let _ = store.get_mut(surface, id);
+        let first = store.content_version(surface, id);
+        assert_ne!(first, 0);
+        let _ = store.get_mut(surface, id);
+        let second = store.content_version(surface, id);
+        assert_ne!(second, first);
+        assert!(store.forget_tile(surface, id));
+        assert_eq!(store.content_version(surface, id), 0);
+        let _ = store.get_mut(surface, id);
+        assert!(![0, first, second].contains(&store.content_version(surface, id)));
+        if let Ok(other) = other {
+            assert_ne!(other.serial(), store.serial());
+        }
     }
 }

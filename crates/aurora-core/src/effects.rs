@@ -220,6 +220,98 @@ impl Default for DropShadow {
     }
 }
 
+/// The largest apron, in pixels, a drop shadow may need around a
+/// composite tile (0.182.0): dilation radius plus three box-blur radii.
+/// Past it the shadow is drawn smaller ([`ShadowGeometry::capped`]). With
+/// sizes held to [`MAX_EFFECT_SIZE`] and [`SHADOW_BLUR_RADIUS_PER_PX`] at
+/// 0.45 the largest apron a valid shadow needs is 339 px (size 250, no
+/// spread), so the cap is a bound that holds whatever the mapping, not one
+/// a valid file reaches today. At
+/// 384 the source window is `256 + 2 * 384 = 1024` px a side, which spans
+/// at most five 256-px tiles per axis, so one shadow on one tile reads at
+/// most 25 source tiles.
+pub const MAX_SHADOW_APRON: u32 = 384;
+
+/// What the fitted size → blur mapping multiplies the blur part of a
+/// shadow's size (pixels) by to get one box-blur pass's radius: three
+/// passes of radius `r` approximate a Gaussian of sigma `sqrt(r(r + 1))`,
+/// so this is roughly sigma per pixel of size. Fitted on
+/// `layer_effects.psd`'s drop shadow (size 41, distance 18) against
+/// Photoshop's merged image, over the shadow's region: mean error per
+/// channel 9.53/6.99/8.15 levels with no blur, 5.38/2.69/3.93 at 0.40,
+/// **5.34/2.69/3.91 at 0.45**, 5.55/2.94/4.14 at 0.50 and 5.77/3.22/4.39
+/// at 0.60 (0.182.0; PLAN.md has the table).
+pub const SHADOW_BLUR_RADIUS_PER_PX: f32 = 0.45;
+
+/// The one size → blur mapping (0.182.0): the radius, in pixels, of each
+/// of the three box-blur passes a shadow's blur of `blur_px` uses.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn shadow_blur_box_radius(blur_px: f32) -> u32 {
+    if blur_px.is_finite() && blur_px > 0.0 {
+        (blur_px * SHADOW_BLUR_RADIUS_PER_PX)
+            .round()
+            .min(f32::from(u16::MAX)) as u32
+    } else {
+        0
+    }
+}
+
+/// A drop shadow resolved to pixels for drawing (0.182.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowGeometry {
+    /// Where the shadow lands relative to the content, document pixels,
+    /// y down: `(-d cos θ, d sin θ)`, rounded.
+    pub offset: (i64, i64),
+    /// The spread's dilation radius, pixels.
+    pub choke: u32,
+    /// Each of the three box-blur passes' radius, pixels.
+    pub blur_radius: u32,
+    /// `choke + 3 * blur_radius`: how far the shadow reaches past the
+    /// source, never above [`MAX_SHADOW_APRON`].
+    pub apron: u32,
+    /// The size had to be reduced to fit [`MAX_SHADOW_APRON`].
+    pub capped: bool,
+}
+
+impl DropShadow {
+    /// This shadow in pixels. Size and distance are used as stored: the
+    /// style's scale (`Scl `, [`LayerEffects::scale`]) is **not** applied,
+    /// measured rather than assumed — `layer_effects.psd` stores `Scl `
+    /// 208.33 %, and Photoshop's merged image shows its shadow reaching
+    /// about 63 px below the text (distance 18 + size 41), not the ~123 px
+    /// a 208 % scale would give; the user's Nyepi file stores 416.67 %
+    /// with sizes up to 144. Spread is a fraction of size.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn geometry(&self) -> ShadowGeometry {
+        let size = self.size.max(0.0);
+        let spread = self.spread.clamp(0.0, 1.0);
+        let distance = f64::from(self.distance.max(0.0));
+        let theta = f64::from(self.angle).to_radians();
+        let offset = (
+            (-distance * theta.cos()).round() as i64,
+            (distance * theta.sin()).round() as i64,
+        );
+        let mut choke = (size * spread).round().min(f32::from(u16::MAX)) as u32;
+        let mut blur_radius = shadow_blur_box_radius(size * (1.0 - spread));
+        let wanted = choke.saturating_add(blur_radius.saturating_mul(3));
+        let capped = wanted > MAX_SHADOW_APRON;
+        if capped {
+            let f = f64::from(MAX_SHADOW_APRON) / f64::from(wanted);
+            choke = (f64::from(choke) * f).floor() as u32;
+            blur_radius = (f64::from(blur_radius) * f).floor() as u32;
+        }
+        ShadowGeometry {
+            offset,
+            choke,
+            blur_radius,
+            apron: choke + 3 * blur_radius,
+            capped,
+        }
+    }
+}
+
 /// A colour overlay (`SoFi`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ColorOverlay {
