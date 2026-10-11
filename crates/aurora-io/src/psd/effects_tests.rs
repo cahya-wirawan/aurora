@@ -863,7 +863,7 @@ fn per_kind_effect_notes_on_open() {
         ),
         (b"SoFi", V::Obj(vec![])),
         (b"FrFX", V::Obj(vec![(b"PntT", V::Enum(b"FrFl", b"GrFl"))])),
-        (b"OrGl", V::Obj(vec![])),
+        (b"OrGl", V::Obj(vec![(b"GlwT", V::Enum(b"BETE", b"PrBL"))])),
         (b"ebbl", V::Obj(vec![])),
         (b"IrGl", V::Obj(vec![(b"enab", V::Bool(false))])),
     ]);
@@ -886,7 +886,7 @@ fn per_kind_effect_notes_on_open() {
     let items = doc.report.items.join("\n");
     for needle in [
         "1 gradient, pattern or other non-solid stroke effect isn't shown",
-        "1 outer glow isn't shown yet",
+        "1 outer glow isn't shown (Aurora draws Softer, solid-colour glows",
         "1 other effect (inner shadow, inner glow, bevel",
         "1 layer with layer effects (shadows, strokes, glows): the effects aren't shown.",
         "1 layer has layer effects that couldn't be read",
@@ -1290,4 +1290,69 @@ fn stroke_notes_on_open_and_psd_save() {
         items.contains("1 layer's effects aren't saved to .psd yet"),
         "{items}"
     );
+}
+
+// ---------------------------------------------------------------------
+// 0.191.0 (E5): outer glows
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_gradient_outer_glow_is_counted_and_not_stored_and_a_contour_is_counted() {
+    let read = mapped(&effects_block(&[(
+        b"OrGl",
+        V::Obj(vec![(b"Grad", V::Obj(vec![]))]),
+    )]));
+    assert!(read.effects.outer_glows.is_empty());
+    assert_eq!((read.glow_gradients, read.glow_contours), (1, 0));
+    // A gradient glow that is switched off is not counted.
+    let read = mapped(&effects_block(&[(
+        b"OrGl",
+        V::Obj(vec![(b"Grad", V::Obj(vec![])), (b"enab", V::Bool(false))]),
+    )]));
+    assert_eq!(read.glow_gradients, 0);
+    // A non-linear contour keeps the glow and is counted; a linear one is not.
+    let read = mapped(&effects_block(&[(
+        b"OrGl",
+        V::Obj(vec![(b"TrnS", V::Obj(vec![(b"Crv ", V::List(vec![]))]))]),
+    )]));
+    assert_eq!(read.effects.outer_glows.len(), 1);
+    assert_eq!((read.glow_gradients, read.glow_contours), (0, 1));
+    let read = mapped(&effects_block(&[(b"OrGl", V::Obj(vec![]))]));
+    assert_eq!(read.glow_contours, 0);
+}
+
+#[test]
+fn outer_glow_notes_name_what_is_not_drawn() {
+    let block = effects_block(&[(
+        b"OrGl",
+        V::Obj(vec![
+            (b"Nose", V::Unit(b"#Prc", 20.0)),
+            (b"TrnS", V::Obj(vec![(b"Crv ", V::List(vec![]))])),
+        ]),
+    )]);
+    let precise = effects_block(&[(b"OrGl", V::Obj(vec![(b"GlwT", V::Enum(b"BETE", b"PrBL"))]))]);
+    let gradient = effects_block(&[(b"OrGl", V::Obj(vec![(b"Grad", V::Obj(vec![]))]))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::pixels("soft", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                    TestLayer::pixels("precise", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", precise.clone()))),
+                    TestLayer::pixels("gradient", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", gradient.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    for needle in [
+        "1 outer glow with noise is drawn without the noise.",
+        "1 outer glow with a contour other than Linear is drawn with a Linear one.",
+        // The Precise one and the gradient one.
+        "2 outer glows aren't shown (Aurora draws Softer, solid-colour glows",
+    ] {
+        assert!(items.contains(needle), "{needle:?} missing from\n{items}");
+    }
 }

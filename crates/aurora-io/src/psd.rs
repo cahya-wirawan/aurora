@@ -425,6 +425,9 @@ enum Note {
     EffectScaleNotApplied,
     ShadowSizeCapped,
     StrokeSizeCapped,
+    GlowNoiseNotApplied,
+    GlowContourNotApplied,
+    GlowSizeCapped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
     StrokesNotShown,
@@ -590,6 +593,17 @@ fn note_text(note: Note, n: u64) -> String {
         Note::ShadowContourNotApplied => format!(
             "{n} drop shadow{s} with a contour other than Linear {is} drawn with a Linear one."
         ),
+        Note::GlowNoiseNotApplied => {
+            format!("{n} outer glow{s} with noise {is} drawn without the noise.")
+        }
+        Note::GlowContourNotApplied => format!(
+            "{n} outer glow{s} with a contour other than Linear {is} drawn with a Linear one."
+        ),
+        Note::GlowSizeCapped => format!(
+            "{n} outer glow{s} {is} too large to draw at full size and {is} shown smaller \
+             (Aurora draws a glow up to {} pixels past the layer for now).",
+            aurora_core::effects::MAX_SHADOW_APRON
+        ),
         Note::StrokeSizeCapped => format!(
             "{n} stroke{s} {is} too wide to draw at full width and {is} shown narrower \
              (Aurora draws a stroke up to {} pixels from the layer's edge for now).",
@@ -618,8 +632,9 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "it is" } else { "they are" }
         ),
         Note::OuterGlowsNotShown => format!(
-            "{n} outer glow{s} {is}n't shown yet; {} kept with the layer.",
-            if one { "it is" } else { "they are" }
+            "{n} outer glow{s} {is}n't shown (Aurora draws Softer, solid-colour glows on pixel \
+             layers only; a Precise glow's settings are kept with the layer, a gradient \
+             glow's are not)."
         ),
         Note::OtherEffectsNotShown => format!(
             "{n} other effect{s} (inner shadow, inner glow, bevel, satin, gradient or pattern \
@@ -2776,6 +2791,7 @@ fn note_unsupported(
 
 /// [`note_unsupported`], with `effects_kept` false for a record whose
 /// effects are dropped rather than stored (an adjustment layer).
+#[allow(clippy::too_many_lines)]
 fn note_unsupported_kept(
     record: &Record,
     outcome: &MaskOutcome,
@@ -2799,7 +2815,8 @@ fn note_unsupported_kept(
                         Note::ClippedOverlaysUnclipped,
                         (fx.shown_color_overlays()
                             + fx.shown_drop_shadows()
-                            + fx.shown_color_strokes()) as u64,
+                            + fx.shown_color_strokes()
+                            + fx.shown_soft_glows()) as u64,
                     );
                 }
                 // 0.182.0 review (DS-4): the style's scale is not applied;
@@ -2820,6 +2837,20 @@ fn note_unsupported_kept(
                         notes.add(Note::ShadowSizeCapped);
                     }
                 }
+                // 0.191.0: Softer outer glows are drawn too.
+                for glow in fx
+                    .outer_glows
+                    .iter()
+                    .filter(|e| fx.shows(e.gate) && !e.precise)
+                {
+                    if glow.noise > 0.0 {
+                        notes.add(Note::GlowNoiseNotApplied);
+                    }
+                    if glow.geometry().capped {
+                        notes.add(Note::GlowSizeCapped);
+                    }
+                }
+                notes.add_n(Note::GlowContourNotApplied, u64::from(read.glow_contours));
                 // 0.190.0: solid-colour strokes are drawn too.
                 for stroke in fx.strokes.iter().filter(|e| {
                     fx.shows(e.gate) && e.fill == aurora_core::effects::StrokeFill::Color
@@ -2843,7 +2874,17 @@ fn note_unsupported_kept(
                 fx.shown_strokes()
             };
             notes.add_n(Note::StrokesNotShown, undrawn as u64);
-            notes.add_n(Note::OuterGlowsNotShown, fx.shown_outer_glows() as u64);
+            // Precise glows and (on a group) every glow are not drawn;
+            // gradient glows were not stored at all.
+            let glows_undrawn = if overlays_drawn {
+                fx.shown_unrendered_glows()
+            } else {
+                fx.shown_outer_glows()
+            };
+            notes.add_n(
+                Note::OuterGlowsNotShown,
+                glows_undrawn as u64 + u64::from(read.glow_gradients),
+            );
             notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
             if read.clamped {
                 notes.add(Note::EffectsClamped);

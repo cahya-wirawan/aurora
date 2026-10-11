@@ -26,7 +26,122 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.190.0): layer effects, round E4 — Stroke is drawn
+**Latest (2026-10-11, 0.191.0): layer effects, round E5 — Softer Outer Glow
+is drawn (solid colour, on pixel layers, on the CPU).**
+- **What is drawn.** Each shown `OrGl` / `outerGlowMulti` glow with the
+  *Softer* technique (`GlwT` `SfBL`) and a solid colour, in list order, on a
+  pixel layer:
+  - The glow is the layer's **shape** (alpha × mask coverage, no Fill),
+    dilated by the spread (`size × spread`) and blurred by three box passes
+    of radius `round(0.45 × size × (1 − spread))` — the drop shadow's
+    machinery (`aurora_filters::shadow_coverage`) with **no offset** — in the
+    glow's colour, in its own blend mode (all 27; Photoshop's default is
+    Screen) at its `Opct`, folded **beneath the content**. Layer opacity fades
+    it (as for a shadow: with a shadow or glow present the glows, shadows,
+    content and effects are one unit faded by layer opacity); **Fill does
+    not**. The style scale `Scl ` is not applied (as for shadows).
+  - **No knockout**: unlike a drop shadow's default, the layer's own shape
+    does not remove the glow under it, so the glow shows through a Fill-0 or
+    translucent layer (`the_layer_does_not_knock_the_glow_out`). **This follows
+    the round's brief and is not verified against Photoshop**: no fixture has
+    a glow on a layer whose content is translucent. Photoshop may in fact clear
+    the glow under the shape (the common "Fill 0 + glow" look); if so, the
+    follow-up is one multiply in `fold_glows_beneath`.
+  - **Order against a shadow on the same layer**: shadows first, then glows
+    (glow above the shadow), then the content — the planner's note and
+    Adobe's documented effect stack; no fixture has both on one layer, and
+    psd-tools does not render either, so this is **not measured**
+    (`a_glow_sits_above_the_shadow_and_beneath_the_content`).
+  - **Radius**: the shadow's 0.45 box-radius-per-pixel mapping is reused
+    (`GLOW_BLUR_RADIUS_PER_PX`, its own constant, same value). Fitted on
+    `layer_effects.psd`'s "Outer Glow" layer (white, Screen, 35 %, size 41,
+    spread 0), over the 49 × 48 px margins left and right of its text, against
+    Photoshop's merged image (mean abs error per channel, 8-bit levels; the
+    three channels are equal there): no glow **4.353**; radius 10: 2.903, 14:
+    2.426, 16: 2.239, **18 (= 0.45 × 41): 2.163**, 20: 2.181, 22: 2.268, 26:
+    2.536, 30: 2.800. So 18 is the minimum and the shared mapping needs no
+    refit.
+  - **Where it reads / caches / invalidates**: the E3/E4 bounded apron window
+    (`read_shape_window`, ≤ 25 cells, `MAX_SHADOW_APRON` 384; the geometry is
+    capped and `Note::GlowSizeCapped` says so). Coverage planes go into the
+    shared cache under a new `CoverageKind::OuterGlow` (not reusing the
+    drop-shadow kind, although a no-offset shadow computes the same plane:
+    separate kinds let one be refitted without serving the other stale
+    entries; cost: a layer with a glow and a same-size shadow computes two
+    planes). Colour, opacity, mode, Fill and layer-opacity edits hit; a dab
+    or pixel undo within the reach misses. `effect_reach_rects` grows by a
+    glow's apron (no offset); `layer_renders_effects` includes a shown Softer
+    glow, so such a layer **refuses the GPU path**. A glow lands on tiles the
+    layer never painted.
+- **Not drawn, reported.** *Precise* (`GlwT` `PrBL`): kept as data, listed as
+  "isn't shown"; no solid Precise fixture to fit against. *Gradient* glows
+  (a `Grad` key): **not stored** (the positional `.aur` effects format has no
+  place for a gradient and a field can't be added without a new version;
+  storing one as a solid glow would draw the wrong thing), counted at read
+  (`ReadEffects::glow_gradients`) and reported as "isn't shown ... a gradient
+  glow's [settings] are not [kept]". Noise (`Nose` > 0) and a non-Linear
+  contour: drawn without / with a Linear one and said so
+  (`GlowNoiseNotApplied`, `GlowContourNotApplied`, the latter counted at read).
+  Glows on groups stay "not shown" (E9). A glow's `Opct` over a clipped layer
+  is counted in the "shown unclipped" note.
+- **Reference numbers (Photoshop's merged image).** `layer_effects.psd` is
+  the only corpus file with an enabled Softer glow. Whole file, mean per
+  channel, before → after: 8.9371, 7.1427, 8.4219 → **8.5358, 6.7384,
+  8.0221** (max 168, unchanged — a shadow/bevel/other-layer pixel). The
+  glow-only margins: 4.35 → 2.16 levels. **The 2.16 residual is unexplained**:
+  candidates are Photoshop's falloff being a different shape than three
+  boxes (the same family of residual the shadow fit had, 2.7–5.3), the
+  white text's own AA pixels, and the Bevel/Emboss/Inner-Glow layers'
+  Photoshop-only effects near the strips; it was not hand-tuned away.
+  `layer_params.psd` / `.psb` carry an enabled *gradient* glow: unchanged
+  (not drawn). Every other corpus file's glows are switched off or absent, so
+  their numbers are unchanged; Nyepi has no enabled glows (only drop shadows
+  and colour overlays) and is unchanged.
+- **Tests (new).** core/io: gradient and contour counters, notes for noise,
+  contour, Precise and gradient; the existing note test now uses a Precise
+  glow. App: the formula against a one-shot blur, symmetry (no offset),
+  spread 100 %, seam (bitwise against a single big window, two layer origins,
+  a shape whose edge is exactly one apron — 54 px — from the tile boundary,
+  and one pixel short of it), never-painted tile, bounded reads and the cap,
+  mode (Normal/Screen/Multiply) and opacity on an opaque backdrop, layer
+  opacity fades and Fill does not, no knockout, glow above shadow, dab and
+  pixel-undo invalidation and the reach rect, GPU refusal (and not for off,
+  Precise or master-off), Precise bit-identical to no glow, cache kinds and
+  hits, the Photoshop reference (skips without the file), worker equals
+  synchronous with two glows and a shadow.
+- **Mutations** (13, each really run with `cargo test -p aurora-core -p
+  aurora-app -p aurora-io --lib`, backed up, restored and sha256-checked): glow
+  knocked out under the layer - killed (`the_layer_does_not_knock_the_glow_out`
+  and the corpus pin); Fill applied to the glow - killed (2); blend mode
+  ignored - killed (`glow_uses_its_own_mode_and_opacity`); dirty-rect
+  inflation removed for glows - killed (invalidation test); GPU refusal
+  removed - killed (10); apron too small by one - killed (the seam test with
+  the edge exactly one apron from the boundary, and the bounded-reads test);
+  glow/shadow order swapped - killed; glow cache kind shared with the shadow
+  - killed; glow opacity ignored - killed (3, with the reference test);
+  Precise drawn - killed (5); glows left out of the layer-opacity unit -
+  killed; never-painted tile ignored - killed (3). **One survived its first
+  run**: layer opacity not applied to the glow (with a glow the content is a
+  faded unit, so the factor reaches `fold_glows_beneath` as 1.0 except for a
+  Dissolve layer); `a_dissolve_layers_glow_is_faded_by_its_opacity_directly`
+  was added and kills it.
+- **Gate** (RTX 3090, `/home` 26-32G free): fmt, layering, no-hardcoded-style,
+  `cargo check --locked`, clippy `-D warnings` (first run found two
+  `too_many_lines`, a `nonminimal_bool` and test lints, fixed), `AURORA_REQUIRE_GPU=1
+  cargo test --workspace --no-fail-fast` **3,556 passed, 0 failed, 72 ignored**
+  (3,537 before), rustdoc `-D warnings` (found a broken intra-doc link to a
+  nonexistent `envelope` in 0.190.0's `stroke.rs`; reworded), `cargo deny`,
+  contrast, and Windows/macOS clippy on aurora-app/core/io/filters clean. The
+  corpus-free worktree run (detached `HEAD` plus the changed files; no
+  psd corpus, no `images/`): 3,556 passed, 0 failed, 72 ignored.
+- **Older `.aur` files.** A `.aur` saved by 0.190.0 or earlier from a PSD with an enabled gradient glow stored it as a white, default-colour solid glow that was never drawn. From 0.191.0 such a glow is drawn as a solid default-colour Softer glow. New opens no longer store gradient glows. Not guarded on `.aur` load.
+- **Known weaknesses.** No knockout under the layer and glow-above-shadow
+  order are both unverified against Photoshop; the 2.16-level residual on the
+  one fixture is unexplained; Precise and gradient glows are not drawn;
+  glows on groups, clipping and `infx` are not modelled; the radius is
+  fitted on one size (41) and one fixture.
+
+**Previously (2026-10-11, 0.190.0): layer effects, round E4 — Stroke is drawn
 (solid colour, on pixel layers, on the CPU).**
 - **What is drawn.** Each shown `FrFX` / `frameFXMulti` stroke whose fill is
   solid colour (`PntT` `SClr`), in list order, on a pixel layer:
@@ -1438,7 +1553,7 @@ Fill applied everywhere plus Color Overlay (all 27 modes; the GPU refusal is
 wired in), **E3** Drop Shadow (apron reader, offset, spread, blur,
 knockout, global light, dirty-rect inflation), **E4** Stroke (done in
 0.190.0), **E5** Outer
-Glow, **E6** inner effects and `infx`, **E7** writing `lfx2` back, **E8**
+Glow (done in 0.191.0), **E6** inner effects and `infx`, **E7** writing `lfx2` back, **E8**
 effects on the GPU, **E9** effects on groups, **E10** an effects UI (needs
 Cahya). **Decision: the PSD-write rounds R4 (Curves `curv` write) and R5
 (PSB) now come after the effects rounds.** **The Fill finding, carried to

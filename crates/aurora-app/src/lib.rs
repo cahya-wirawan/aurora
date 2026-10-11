@@ -13479,8 +13479,8 @@ fn content_opacity(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> O
 }
 
 /// Whether `id` has an effect this round actually draws (0.181.0): a
-/// pixel layer with a shown colour overlay, drop shadow (0.182.0) or
-/// solid-colour stroke (0.190.0). What refuses the GPU fast path
+/// pixel layer with a shown colour overlay, drop shadow (0.182.0),
+/// solid-colour stroke (0.190.0) or Softer outer glow (0.191.0). What refuses the GPU fast path
 /// ([`document_qualifies_for_gpu_compositing`]); a layer whose only shown
 /// effects are not drawn yet (shadows, strokes, glows, the rest) keeps the
 /// GPU path, since both paths draw exactly the same pixels for it.
@@ -13491,6 +13491,7 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
             fx.shown_color_overlays() > 0
                 || fx.shown_drop_shadows() > 0
                 || fx.shown_color_strokes() > 0
+                || fx.shown_soft_glows() > 0
         })
 }
 
@@ -13534,7 +13535,66 @@ fn shadow_tile_coverage(
     geometry: aurora_core::effects::ShadowGeometry,
     budget: &mut CompositeBudget,
 ) -> Option<std::sync::Arc<Vec<f32>>> {
-    let key = shadow_cache_key(id, layers, store, tile, geometry)?;
+    effect_tile_coverage(
+        CoverageKind::DropShadow,
+        id,
+        layers,
+        store,
+        tile,
+        own,
+        geometry,
+        budget,
+    )
+}
+
+/// One outer glow's coverage on composite tile `tile` (0.191.0), or `None`
+/// when no source pixel reaches it: [`shadow_tile_coverage`]'s maths with
+/// no offset (the glow's [`aurora_core::effects::OuterGlow::geometry`]),
+/// under its own [`CoverageKind`] so the two can be refitted apart.
+fn glow_tile_coverage(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    geometry: aurora_core::effects::ShadowGeometry,
+    budget: &mut CompositeBudget,
+) -> Option<std::sync::Arc<Vec<f32>>> {
+    effect_tile_coverage(
+        CoverageKind::OuterGlow,
+        id,
+        layers,
+        store,
+        tile,
+        own,
+        geometry,
+        budget,
+    )
+}
+
+/// The cached, bounded coverage of a blurred silhouette effect (a shadow
+/// or a glow) on one tile.
+#[allow(clippy::too_many_arguments)]
+fn effect_tile_coverage(
+    kind: CoverageKind,
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    geometry: aurora_core::effects::ShadowGeometry,
+    budget: &mut CompositeBudget,
+) -> Option<std::sync::Arc<Vec<f32>>> {
+    let key = coverage_cache_key(
+        id,
+        layers,
+        store,
+        tile,
+        kind,
+        geometry.offset,
+        geometry.apron,
+        (geometry.choke, geometry.blur_radius),
+    )?;
     if let Some(hit) = with_shadow_cache(|cache| cache.get(&key)).flatten() {
         return Some(hit);
     }
@@ -13749,27 +13809,9 @@ enum CoverageKind {
     DropShadow = 0,
     StrokeOutside = 1,
     StrokeInside = 2,
-}
-
-/// [`ShadowCacheKey`] for one shadow on one tile; `None` for a layer with
-/// no surface.
-fn shadow_cache_key(
-    id: aurora_doc::LayerId,
-    layers: &aurora_doc::LayerTree,
-    store: &dyn TileSource,
-    tile: CompositeTileAt,
-    geometry: aurora_core::effects::ShadowGeometry,
-) -> Option<ShadowCacheKey> {
-    coverage_cache_key(
-        id,
-        layers,
-        store,
-        tile,
-        CoverageKind::DropShadow,
-        geometry.offset,
-        geometry.apron,
-        (geometry.choke, geometry.blur_radius),
-    )
+    /// An outer glow (0.191.0): a shadow's maths without offset or
+    /// knockout, its own kind so a refit of one never serves the other.
+    OuterGlow = 3,
 }
 
 /// [`ShadowCacheKey`] for one effect's coverage on one tile: the source
@@ -14052,7 +14094,7 @@ fn keep_plane(planes: &mut StrokePlanes, kind: CoverageKind, plane: &std::sync::
     match kind {
         CoverageKind::StrokeOutside => planes.outside = Some(std::sync::Arc::clone(plane)),
         CoverageKind::StrokeInside => planes.inside = Some(std::sync::Arc::clone(plane)),
-        CoverageKind::DropShadow => {}
+        CoverageKind::DropShadow | CoverageKind::OuterGlow => {}
     }
 }
 
@@ -14174,6 +14216,13 @@ fn effect_reach_rects(
             .iter()
             .filter(|s| fx.shows(s.gate) && s.fill == aurora_core::effects::StrokeFill::Color)
             .map(|stroke| ((0, 0), stroke.geometry().apron)),
+    );
+    // 0.191.0: a Softer outer glow reaches its apron on every side.
+    reaches.extend(
+        fx.outer_glows
+            .iter()
+            .filter(|g| fx.shows(g.gate) && !g.precise)
+            .map(|glow| ((0, 0), glow.geometry().apron)),
     );
     for (offset, apron) in reaches {
         let a = i64::from(apron);
@@ -14319,12 +14368,16 @@ fn fold_layer_with_effects(
         reference_origin,
     };
     let shadows = shown_shadow_coverages(fx, id, layers, store, tile, own.as_deref(), budget);
+    // 0.191.0: each shown Softer outer glow's coverage, also able to land on
+    // a tile the layer never painted.
+    let glows = shown_glow_coverages(fx, id, layers, store, tile, own.as_deref(), budget);
     // 0.190.0: each shown solid-colour stroke's coverage. An outside stroke
     // lands on tiles the layer never painted, like a shadow, so a blank
     // `own` ends the fold only when nothing reaches the tile.
     let strokes = shown_stroke_planes(fx, id, layers, store, tile, own.as_deref(), budget);
     if own.is_none()
         && shadows.is_empty()
+        && glows.is_empty()
         && !strokes.iter().any(|(_, planes)| planes.outside.is_some())
     {
         return false;
@@ -14339,10 +14392,12 @@ fn fold_layer_with_effects(
     // then faded by layer opacity — so at opacity < 1 an opaque layer
     // still hides its own shadow, as in Photoshop. (A `Dissolve` layer's
     // dither already carries its opacity, so its shadows are faded by it.)
-    let unit = !dissolve && !shadows.is_empty();
+    let unit = !dissolve && (!shadows.is_empty() || !glows.is_empty());
     let backdrop = (unit && opacity < 1.0).then(|| accumulator.to_vec());
     let shadow_factor = if unit { 1.0 } else { opacity };
     fold_shadows_beneath(accumulator, &shadows, &shape, shadow_factor, doc_origin);
+    // 0.191.0: glows sit above the shadows and beneath the content.
+    fold_glows_beneath(accumulator, &glows, shadow_factor, doc_origin);
     let one = half::f16::from_f32(1.0);
     // 0.184.0: steps 1-3 run only on the rows where the shape has coverage
     // (`shape_row_runs`): step 3 never reads the interior elsewhere (its
@@ -14602,6 +14657,63 @@ fn shown_shadow_coverages<'a>(
         }
     }
     shadows
+}
+
+/// Each shown Softer outer glow of `fx` with its coverage on `tile`, in
+/// list order, leaving out those that do not reach it (0.191.0). A Precise
+/// glow is not drawn.
+fn shown_glow_coverages<'a>(
+    fx: &'a aurora_core::LayerEffects,
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile: CompositeTileAt,
+    own: Option<&[half::f16]>,
+    budget: &mut CompositeBudget,
+) -> Vec<(
+    &'a aurora_core::effects::OuterGlow,
+    std::sync::Arc<Vec<f32>>,
+)> {
+    let mut glows = Vec::new();
+    for glow in fx
+        .outer_glows
+        .iter()
+        .filter(|g| fx.shows(g.gate) && !g.precise)
+    {
+        let geometry = glow.geometry();
+        if let Some(coverage) = glow_tile_coverage(id, layers, store, tile, own, geometry, budget) {
+            glows.push((glow, coverage));
+        }
+    }
+    glows
+}
+
+/// Folds each outer glow's `coverage` onto `accumulator` beneath the layer
+/// (0.191.0): the glow colour at its coverage, in its own mode at `glow
+/// opacity × layer opacity`. **The layer's shape does not knock the glow
+/// out** (unlike a shadow's default): the glow shows through a
+/// translucent or Fill-0 layer; the content is laid down on top of it.
+/// Fill does not fade it.
+fn fold_glows_beneath(
+    accumulator: &mut [half::f16],
+    glows: &[(&aurora_core::effects::OuterGlow, std::sync::Arc<Vec<f32>>)],
+    opacity: f32,
+    doc_origin: (i64, i64),
+) {
+    for (glow, coverage) in glows {
+        let [r, g, b] = [glow.color.r, glow.color.g, glow.color.b].map(half::f16::from_f32);
+        let mut source = Vec::with_capacity(coverage.len() * aurora_tile::CHANNELS);
+        for &cover in coverage.as_slice() {
+            source.extend([r, g, b, half::f16::from_f32(cover)]);
+        }
+        fold_texels_in_mode(
+            accumulator,
+            &source,
+            glow.opacity * opacity,
+            aurora_doc::BlendMode::from(glow.blend_mode),
+            doc_origin,
+        );
+    }
 }
 
 /// Folds each drop shadow's `coverage` onto `accumulator` beneath the
@@ -76119,7 +76231,11 @@ mod tests {
                     fill: aurora_core::effects::StrokeFill::Gradient,
                     ..aurora_core::effects::Stroke::default()
                 }],
-                outer_glows: vec![aurora_core::effects::OuterGlow::default()],
+                outer_glows: vec![aurora_core::effects::OuterGlow {
+                    // Softer glows are drawn since 0.191.0; Precise is not.
+                    precise: true,
+                    ..aurora_core::effects::OuterGlow::default()
+                }],
                 color_overlays: vec![off],
                 ..aurora_core::LayerEffects::default()
             };
@@ -77173,7 +77289,8 @@ mod tests {
             // 0.181.0: two colour overlays now drawn; shadows, glows, bevels, strokes still not. Before it (0.180.0): 191 / 109.21, 106.14, 108.66 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 168, mean 10.990, 9.186, 10.466.
             // 0.190.0: Text stroke now drawn; before: 168 / 10.3246, 8.5522, 9.8170.
-            ("layer_effects.psd", 168.0, [8.9371, 7.1427, 8.4219]),
+            // 0.191.0: The Outer Glow (Softer, white, Screen 35 %, size 41) on the "Outer Glow" text is drawn; before: 168 / 8.9371, 7.1427, 8.4219. Over the margins left and right of that text alone the mean falls 4.35 -> 2.16 levels (`the_fitted_glow_radius_reduces_the_error_against_photoshops_merged_image`).
+            ("layer_effects.psd", 168.0, [8.5358, 6.7384, 8.0221]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
             // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 is drawn darker than Photoshop shows it (unexplained residual); before: 65 / 0.2007, 0.1571, 0.1460.
@@ -77784,6 +77901,8 @@ mod tests {
                 started.elapsed()
             );
         }
+
+        include!("outer_glow_tests.rs");
     }
 }
 

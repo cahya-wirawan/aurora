@@ -285,30 +285,44 @@ impl DropShadow {
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn geometry(&self) -> ShadowGeometry {
-        let size = self.size.max(0.0);
-        let spread = self.spread.clamp(0.0, 1.0);
         let distance = f64::from(self.distance.max(0.0));
         let theta = f64::from(self.angle).to_radians();
         let offset = (
             (-distance * theta.cos()).round() as i64,
             (distance * theta.sin()).round() as i64,
         );
-        let mut choke = (size * spread).round().min(f32::from(u16::MAX)) as u32;
-        let mut blur_radius = shadow_blur_box_radius(size * (1.0 - spread));
-        let wanted = choke.saturating_add(blur_radius.saturating_mul(3));
-        let capped = wanted > MAX_SHADOW_APRON;
-        if capped {
-            let f = f64::from(MAX_SHADOW_APRON) / f64::from(wanted);
-            choke = (f64::from(choke) * f).floor() as u32;
-            blur_radius = (f64::from(blur_radius) * f).floor() as u32;
-        }
-        ShadowGeometry {
-            offset,
-            choke,
-            blur_radius,
-            apron: choke + 3 * blur_radius,
-            capped,
-        }
+        spread_blur_geometry(self.size, self.spread, SHADOW_BLUR_RADIUS_PER_PX, offset)
+    }
+}
+
+/// The geometry a shadow and an outer glow share (0.191.0): a spread
+/// (choke) of `size * spread` pixels and a blur of the rest, three box
+/// passes of `round(per_px * size * (1 - spread))`, reduced to fit
+/// [`MAX_SHADOW_APRON`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn spread_blur_geometry(size: f32, spread: f32, per_px: f32, offset: (i64, i64)) -> ShadowGeometry {
+    let size = size.max(0.0);
+    let spread = spread.clamp(0.0, 1.0);
+    let mut choke = (size * spread).round().min(f32::from(u16::MAX)) as u32;
+    let blur = size * (1.0 - spread);
+    let mut blur_radius = if blur.is_finite() && blur > 0.0 {
+        (blur * per_px).round().min(f32::from(u16::MAX)) as u32
+    } else {
+        0
+    };
+    let wanted = choke.saturating_add(blur_radius.saturating_mul(3));
+    let capped = wanted > MAX_SHADOW_APRON;
+    if capped {
+        let f = f64::from(MAX_SHADOW_APRON) / f64::from(wanted);
+        choke = (f64::from(choke) * f).floor() as u32;
+        blur_radius = (f64::from(blur_radius) * f).floor() as u32;
+    }
+    ShadowGeometry {
+        offset,
+        choke,
+        blur_radius,
+        apron: choke + 3 * blur_radius,
+        capped,
     }
 }
 
@@ -469,6 +483,23 @@ impl Default for OuterGlow {
             size: 5.0,
             noise: 0.0,
         }
+    }
+}
+
+/// What the glow's blur size → box radius mapping multiplies by
+/// (0.191.0). Fitted on `layer_effects.psd`'s Outer Glow (Softer, size 41,
+/// Screen white at 35 %) against Photoshop's merged image; PLAN.md has the
+/// table.
+pub const GLOW_BLUR_RADIUS_PER_PX: f32 = 0.45;
+
+impl OuterGlow {
+    /// This glow in pixels (0.191.0): a [`DropShadow`] without an offset.
+    /// Size is used as stored (the style's `Scl ` is not applied, as for
+    /// shadows); spread is a fraction of size. The apron is capped at
+    /// [`MAX_SHADOW_APRON`] like a shadow's.
+    #[must_use]
+    pub fn geometry(&self) -> ShadowGeometry {
+        spread_blur_geometry(self.size, self.spread, GLOW_BLUR_RADIUS_PER_PX, (0, 0))
     }
 }
 
@@ -656,6 +687,22 @@ impl LayerEffects {
             .iter()
             .filter(|e| self.shows(e.gate))
             .count()
+    }
+
+    /// The outer glows Aurora draws (0.191.0): shown and Softer.
+    #[must_use]
+    pub fn shown_soft_glows(&self) -> usize {
+        self.outer_glows
+            .iter()
+            .filter(|e| self.shows(e.gate) && !e.precise)
+            .count()
+    }
+
+    /// The outer glows Photoshop would draw and Aurora does not (0.191.0):
+    /// the Precise technique.
+    #[must_use]
+    pub fn shown_unrendered_glows(&self) -> usize {
+        self.shown_outer_glows() - self.shown_soft_glows()
     }
 
     /// The not-yet-modelled effects Photoshop would draw.
