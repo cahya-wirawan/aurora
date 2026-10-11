@@ -70,6 +70,7 @@
 pub mod action;
 mod caret;
 mod error;
+pub mod icons;
 mod input;
 mod measure;
 mod paint;

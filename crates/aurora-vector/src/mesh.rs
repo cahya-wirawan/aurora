@@ -1,8 +1,9 @@
 //! Tessellating a [`crate::Path`] into GPU-ready triangles.
 
 use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor, StrokeOptions,
-    StrokeTessellator, StrokeVertex, StrokeVertexConstructor, VertexBuffers,
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor, LineCap,
+    LineJoin, StrokeOptions, StrokeTessellator, StrokeVertex, StrokeVertexConstructor,
+    VertexBuffers,
 };
 
 use crate::error::VectorError;
@@ -134,9 +135,38 @@ pub fn stroke(path: &Path, width: f32, tolerance: f32) -> Result<Mesh, VectorErr
     })
 }
 
+/// [`stroke`] with **round caps and round joins** (0.194.0): the stroke
+/// style line icons want, where [`stroke`]'s butt caps and mitred joins
+/// leave a sharp tip a spike beyond the path (an eye's corners, a
+/// chevron's point) and flat, square-cut line ends. A round stroke never
+/// reaches further than half its width from the path, so a path inside a
+/// box stays inside it once inset by half the width.
+///
+/// # Errors
+///
+/// See [`VectorError`].
+pub fn stroke_rounded(path: &Path, width: f32, tolerance: f32) -> Result<Mesh, VectorError> {
+    let mut buffers: VertexBuffers<Point, u32> = VertexBuffers::new();
+    let mut tessellator = StrokeTessellator::new();
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_cap(LineCap::Round)
+        .with_line_join(LineJoin::Round)
+        .with_tolerance(tolerance);
+    tessellator.tessellate_path(
+        &path.inner,
+        &options,
+        &mut BuffersBuilder::new(&mut buffers, PositionOnly),
+    )?;
+    Ok(Mesh {
+        vertices: buffers.vertices,
+        indices: buffers.indices,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TOLERANCE, fill, stroke, tolerance_for_scale_factor};
+    use super::{DEFAULT_TOLERANCE, fill, stroke, stroke_rounded, tolerance_for_scale_factor};
     use crate::path::PathBuilder;
     use crate::point::Point;
     use crate::shapes::rounded_rect;
@@ -223,6 +253,35 @@ mod tests {
         assert!(
             extent(&wide) > extent(&narrow),
             "a wider stroke must reach further outward from the same path"
+        );
+    }
+
+    #[test]
+    fn a_rounded_stroke_of_an_open_line_reaches_past_its_ends_and_a_butt_one_does_not() {
+        let mut builder = PathBuilder::new();
+        builder
+            .move_to(Point::new(10.0, 10.0))
+            .line_to(Point::new(20.0, 10.0))
+            .end();
+        let line = builder.build();
+        let min_x = |mesh: &super::Mesh| mesh.vertices.iter().map(|v| v.x).fold(f32::MAX, f32::min);
+        let (Ok(butt), Ok(round)) = (
+            stroke(&line, 4.0, DEFAULT_TOLERANCE),
+            stroke_rounded(&line, 4.0, DEFAULT_TOLERANCE),
+        ) else {
+            unreachable!("an open line strokes");
+        };
+        assert!(min_x(&butt) >= 10.0 - 1e-3, "butt caps stop at the end");
+        assert!(
+            min_x(&round) <= 8.1,
+            "a round cap extends half the width past the end"
+        );
+        assert!(
+            round
+                .vertices
+                .iter()
+                .all(|v| (v.y - 10.0).abs() <= 2.0 + 1e-3),
+            "and never further sideways than half the width"
         );
     }
 

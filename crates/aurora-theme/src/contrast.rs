@@ -171,6 +171,64 @@ const GATED_PAIRS: &[GatedPair] = &[
         foreground: |t| t.accent.primary,
         background: |t| t.surface.panel,
     },
+    // 0.194.0 (Layers panel round L1): the icon set is drawn in
+    // `icon.default` and `icon.secondary` on every surface an icon sits on,
+    // and `icon.on_accent` on the selected-row accent fill (WCAG 1.4.11,
+    // graphical objects: 3:1). `icon.disabled` is not gated.
+    GatedPair {
+        label: "icon.default on surface.panel",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.panel,
+    },
+    GatedPair {
+        label: "icon.default on surface.app",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.app,
+    },
+    GatedPair {
+        label: "icon.default on surface.raised",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.raised,
+    },
+    GatedPair {
+        label: "icon.default on surface.sunken",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.sunken,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.panel",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.panel,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.app",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.app,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.raised",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.raised,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.sunken",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.sunken,
+    },
+    GatedPair {
+        label: "icon.on_accent on accent.primary",
+        floor: 3.0,
+        foreground: |t| t.icon.on_accent,
+        background: |t| t.accent.primary,
+    },
 ];
 
 /// One gated pair's result: whether `theme` clears the WCAG floor for it.
@@ -272,8 +330,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            20,
-            "expected all 20 gated pairs to be checked"
+            29,
+            "expected all 29 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -308,8 +366,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            20,
-            "expected all 20 gated pairs to be checked"
+            29,
+            "expected all 29 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -344,8 +402,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            20,
-            "expected all 20 gated pairs to be checked"
+            29,
+            "expected all 29 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -380,8 +438,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            20,
-            "expected all 20 gated pairs to be checked"
+            29,
+            "expected all 29 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -416,8 +474,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            20,
-            "expected all 20 gated pairs to be checked"
+            29,
+            "expected all 29 gated pairs to be checked"
         );
         for result in &results {
             assert!(

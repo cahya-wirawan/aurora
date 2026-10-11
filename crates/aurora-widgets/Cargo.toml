@@ -51,3 +51,6 @@ wgpu = { workspace = true }
 aurora-gpu = { workspace = true, features = ["test-support"] }
 accesskit_consumer = { workspace = true }
 aurora-testkit = { workspace = true }
+# Only the ignored `render_test::icons::write_icon_review_sheet`, which
+# writes a review PNG (the testkit's own encoder is private).
+png = { workspace = true }

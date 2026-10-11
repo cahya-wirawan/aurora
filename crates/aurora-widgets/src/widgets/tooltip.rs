@@ -494,6 +494,7 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::CurveEditor(_)
         | WidgetKind::CurveEditorPoint(_)
         | WidgetKind::Label(_)
+        | WidgetKind::Icon(_)
         | WidgetKind::DropIndicator(_) => false,
     }
 }
@@ -1252,6 +1253,7 @@ mod tests {
             WidgetKind::Label(_) => 23,
             WidgetKind::DropIndicator(_) => 24,
             WidgetKind::RaisedPanel => 25,
+            WidgetKind::Icon(_) => 26,
         }
     }
 
@@ -1385,12 +1387,21 @@ mod tests {
         ));
         ok(insert_label(&mut tree, root, &scales, "Size"));
         ok(super::super::insert_drop_indicator(&mut tree, root));
+        ok(super::super::insert_icon(
+            &mut tree,
+            root,
+            &scales,
+            crate::icons::IconKind::Eye,
+            super::super::IconSize::Small,
+            super::super::IconTone::Default,
+            super::super::IconAccess::Decorative,
+        ));
         let mut shown = ok(Tooltip::new(&tree, button, &scales, "x", DELAY));
         show(&mut tree, &mut shown, Instant::now());
 
         let mut ids = Vec::new();
         all_ids(&tree, root, &mut ids);
-        let mut seen = [false; 25];
+        let mut seen = [false; 27];
         for id in ids {
             let Some(kind) = tree.payload(id) else {
                 unreachable!("live");
@@ -1409,7 +1420,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, [true; 25], "every WidgetKind was built and asked");
+        assert_eq!(seen, [true; 27], "every WidgetKind was built and asked");
     }
 
     #[test]
